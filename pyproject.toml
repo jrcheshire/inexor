@@ -1,0 +1,90 @@
+[project]
+name = "inexor"
+description = "Exactly reversible, compressed-state differentiable N-body: a JAX particle-mesh code with fixed-point integer phase space and a bit-exact-replay adjoint."
+authors = [{ name = "James Cheshire", email = "cheshire@caltech.edu" }]
+maintainers = [{ name = "James Cheshire", email = "cheshire@caltech.edu" }]
+requires-python = ">=3.11"
+readme = "README.md"
+license = "BSD-3-Clause"
+dynamic = ["version"]   # single-sourced from src/inexor/__init__.py
+
+dependencies = [
+  "jax>=0.4.30",
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/inexor/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/inexor"]
+
+# ---------------------------------------------------------------------------
+# pixi config. `pixi.lock` is committed; co-commit it on any dependency change.
+# default env = CPU jax (osx-arm64 dev + linux CI); gpu env = linux-64 CUDA 12
+# (albireo / generic x86 CUDA). A linux-aarch64 CUDA feature (TACC Vista
+# Grace-Hopper, xcat pattern) is deliberately deferred to M2 when GPU runs
+# start -- see docs/roadmap.md.
+# ---------------------------------------------------------------------------
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+[tool.pixi.dependencies]
+python = ">=3.11"
+numpy = "*"
+scipy = "*"          # host-side float64 background integrals (precision island)
+matplotlib = "*"     # diagnostics / M0 probe plots
+pytest = "*"
+pytest-xdist = "*"
+ruff = "*"
+
+[tool.pixi.pypi-dependencies]
+inexor = { path = ".", editable = true }
+
+[tool.pixi.feature.jax.dependencies]
+jax = "*"            # conda-forge jaxlib is CPU-only in the default env
+
+# GPU env: linux-64 CUDA (albireo x86 box / generic CUDA node). cuda 12
+# matches current drivers; jaxlib build selector picks the CUDA wheel.
+# NOTE: pixi 0.72 warns that [system-requirements] is deprecated for inline
+# platform tables, but 0.72 does not yet PARSE the inline form (errors:
+# "expected a string, found table") -- keep this form until pixi accepts the
+# replacement, then migrate.
+[tool.pixi.feature.gpu]
+platforms = ["linux-64"]
+[tool.pixi.feature.gpu.system-requirements]
+cuda = "12"
+[tool.pixi.feature.gpu.dependencies]
+jax = "*"
+jaxlib = { version = "*", build = "*cuda*" }
+cuda-version = "12.*"
+
+[tool.pixi.environments]
+default = ["jax"]
+gpu = ["gpu"]
+
+[tool.pixi.tasks]
+# `-n auto` (pytest-xdist) parallelizes across cores; OMP_NUM_THREADS=1 pins one
+# thread per worker -- JAX-CPU otherwise grabs every core per process and
+# oversubscribes (same rationale + measured win as sfbfs/jht). env is per-task.
+test = { cmd = "pytest -n auto", env = { OMP_NUM_THREADS = "1" } }
+test-fast = { cmd = "pytest -m 'not slow' -n auto", env = { OMP_NUM_THREADS = "1" } }
+lint = "ruff check"
+format = "ruff format"
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "slow: heavy validation / oracle-parity test; run by the full suite, not the fast gate",
+]

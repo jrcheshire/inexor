@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "inexor"
+abstract: >-
+  Exactly reversible, compressed-state differentiable N-body: a JAX
+  particle-mesh code with fixed-point integer phase space (12 or 6 bytes
+  per particle) and a bit-exact-replay adjoint whose memory is independent
+  of the number of time steps.
+type: software
+authors:
+  - family-names: Cheshire
+    given-names: James
+    email: cheshire@caltech.edu
+    affiliation: California Institute of Technology
+version: 0.0.1.dev0
+license: BSD-3-Clause

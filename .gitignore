@@ -1,0 +1,16 @@
+# pixi
+.pixi/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# data artifacts / run outputs (hash-record big artifacts in PROVENANCE instead)
+data/
+runs/
+
+# OS
+.DS_Store
