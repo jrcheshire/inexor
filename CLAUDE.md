@@ -9,9 +9,15 @@ own production mocks; mbody owns MLX/Apple-Silicon).
 
 ## Current milestone
 
-**pre-M0.** Bootstrap complete (2026-07-10): design docs only, no
-implementation. Next session opens M0 (kill-or-confirm probes R1-R5) in plan
-mode first, per the master-plan-hierarchy convention.
+**M0 in progress** (opened 2026-07-12; plan
+`~/.claude/plans/let-s-put-the-rubber-composed-penguin.md`). Shared probe
+module `scripts/_m0_common.py` (self-checks green) + all five probe scripts
+written. CPU verdicts in (`runs/m0/`): R2 range PASS / noise-bar for gate
+review; R4 (THE gate) PASS-shaped -- g_STE within the FD reference's own SE
+at production int16, anchor O(q) slopes +1.0..+2.2, no K growth; R5 strict
+PASS at flagship-equivalent 64 levels. R1/R3 CUDA legs await albireo's RTX
+3050 (JC's Secure-Boot fix, Mon 2026-07-13); then the gate review with JC
+(verdict ADRs -> decisions.md, R4 threshold negotiated, roadmap ticked).
 
 ## Doc map (read before proposing anything)
 
