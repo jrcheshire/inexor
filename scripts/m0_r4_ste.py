@@ -584,6 +584,21 @@ def main():
             slope = None
             if len(es) >= 2:
                 slope = float(np.polyfit(np.log(qs), np.log(es), 1)[0])
+            # anchor-based O(q) slope: |g_STE - g_float| is measurable at EVERY
+            # q (FD-based e(q) starves: sub-SE at fine q, no plateau at coarse
+            # q). Conflates STE error with the physical quantized-vs-float
+            # difference, but both vanish as q -> 0 and the kill question is
+            # "does gradient error scale with q" -- this answers it robustly.
+            qa, ea = [], []
+            for B, m in q_configs:
+                e = [x for x in results["entries"]
+                     if x["B"] == B and x["m"] == m and x["K"] == K0
+                     and x["loss"] == loss_name and x["param"] == pname]
+                if e and abs(e[0]["g_ste"] - e[0]["g_float"]) > 0:
+                    qa.append(e[0]["q_rel"])
+                    ea.append(abs(e[0]["g_ste"] - e[0]["g_float"]))
+            slope_anchor = (float(np.polyfit(np.log(qa), np.log(ea), 1)[0])
+                            if len(ea) >= 3 else None)
             e16 = [x for x in results["entries"]
                    if x["B"] == 16 and x["m"] == 0 and x["K"] == K0
                    and x["loss"] == loss_name and x["param"] == pname]
@@ -594,7 +609,8 @@ def main():
             else:
                 sig16 = None
             verdict[f"{loss_name}/{pname}"] = dict(
-                oq_slope=slope, rel_err_int16=rel16, nsigma_int16=sig16
+                oq_slope=slope, oq_slope_anchor=slope_anchor,
+                rel_err_int16=rel16, nsigma_int16=sig16
             )
     results["verdict"] = verdict
 
@@ -604,7 +620,8 @@ def main():
 
     print("\nR4 verdict inputs (threshold = measure-then-negotiate with JC):")
     for k, v in verdict.items():
-        print(f"  {k}: O(q) slope p = {v['oq_slope']}, "
+        print(f"  {k}: O(q) slope p = {v['oq_slope']} "
+              f"(anchor-based p = {v['oq_slope_anchor']}), "
               f"rel err @ int16 = {v['rel_err_int16']}, "
               f"nsigma vs FD SE = {v['nsigma_int16']}")
     print(f"total wall: {(time.time() - t0) / 60:.1f} min; outputs: {out.resolve()}")
