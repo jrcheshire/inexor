@@ -95,8 +95,69 @@ Readings:
 
 ## S6 — parity gates + deficit attribution
 
-TBD (gates ratified with JC against the floors above; m1_deficit.py matrix:
-{ZA, 2LPT} x K x integrator x resolution x deconvolve x {EH98, CAMB}).
+### DISCO-DJ gap: ATTRIBUTED, closed at machine precision (2026-07-13)
+
+The inexor <-> DISCO-DJ parity gap decomposes into exactly THREE named
+convention differences, each verified against discodj 0.0.2 source
+(`nbody/acc.py`, `core/kernels.py`, `nbody/steppers/dkd_pi_integrator.py`,
+`disco_stepper.py`); probes: `scripts/m1_kernel_probe.py`,
+`scripts/m1_force_probe.py`.
+
+1. **Force operator — Nyquist plane in the order-0 gradient kernel.**
+   DISCO-DJ zeroes the Nyquist plane of ik in the gradient direction; the
+   mbody lineage keeps -i k_nyq. With that one change, the two PM force
+   operators agree on the same particle configuration to
+   **rms 7e-8 relative (f64 FFT roundoff)** — there is NO other force
+   difference (probe: m1_force_probe --side disco/inexor).
+2. **BullFrog alpha — true-LCDM D2 vs EdS relation.** DISCO-DJ evaluates
+   alpha with its tabulated second-order growth D2plus(a); mbody/inexor use
+   the EdS relation E = -(3/7) D^2 on exact LCDM D (documented mbody
+   approximation, ~0.8% in D2 at z=0).
+3. **Midpoint/drift convention for explicit a-step arrays.** With time_var
+   given as an array, DISCO-DJ's internal time is the STEP INDEX, so
+   a_mid = (a0+a1)/2 (arithmetic in a; disco_stepper.internal_to_a linear
+   interp) and the two D-drift halves are UNEQUAL (dd1/dd2 = 1.0008 at
+   64^3 K=10 leading step); mbody/inexor use D_mid = (D0+D1)/2 with equal
+   halves.
+
+**Closure test**: replaying inexor's f64 float path with (1)+(2)+(3) —
+zeroed-Nyquist kernel + DISCO-DJ's exact dumped runtime coefficients
+(m1_force_probe --side coeffs / --side replay) — reproduces disco_final to
+
+| config | rms dx [cells] | max dP/P | max 1-r |
+|---|---|---|---|
+| 64^3 K=10 | 1.6e-8 | 4.1e-9 | 7.1e-15 |
+| 128^3 K=40 | 2.2e-8 | 1.9e-8 | 2.1e-14 |
+
+i.e. **f64 roundoff**. The raw stock-vs-disco numbers in the S5 tables are
+therefore CHARACTERIZED CONVENTION DIFFERENCES between two converged
+integrators, not errors: the K-scan (K=1/10/80 at 64^3: rms 4.7e-2 /
+3.6e-3 / 3.7e-3 cells) shows the raw gap converging to the fixed
+operator/coefficient difference, and the growth tables agree to 5e-7 so
+none of it is D(a).
+
+Supporting negative results (recorded to prevent re-derivation): zeroing
+Nyquist alone halves the displacement rms but moves dP/P by only ~4e-4 —
+the P-ratio share of the gap is dominated by (2)+(3), the displacement-rms
+share by (1). DISCO-DJ's background has no radiation (Omega_r None), same
+as ours.
+
+### Proposed DISCO-DJ Tier-A gate (for ratification)
+
+Gate on the CONVENTION-ADAPTED comparison (the replay above), which pins
+the shared physics rather than the convention choices:
+- rms displacement <= 1e-6 cells (measured 2.2e-8: ~50x headroom)
+- max |dP/P| <= 1e-6, max 1-r <= 1e-12 (measured 1.9e-8 / 2.1e-14)
+
+The raw (stock-convention) comparison is documented, not gated — its size
+is set by DISCO-DJ's kernel/coefficient conventions, outside inexor's
+control. mbody Tier-A gate proposal: rms <= 1e-4 cells / |dP/P| <= 1e-5
+(measured 1.6e-5 / 1.4e-6 at 128^3 K=40 vs its own 1e-6-cell floor).
+
+### 4%-deficit attribution matrix
+
+TBD (m1_deficit.py: {ZA, 2LPT} x K x integrator x resolution x deconvolve
+x {EH98, CAMB}).
 
 ## S7 — deneb CUDA legs + 512^3 smoke
 
