@@ -192,3 +192,24 @@ decision here is locked until explicitly re-litigated with JC.
   stepping trips a gate with ~50x headroom rather than hiding in convention
   noise. The convention ledger doubles as the suspect list for the M0 ~4%
   low-k deficit (S6 matrix).
+
+## D-014 — M1 Tier-B quantization gate (5e-4 end-to-end)
+- **Status:** accepted (JC, 2026-07-13).
+- **Context:** the end-to-end int16 quantization error at the production
+  config (128^3, K=40, BullFrog, int paint) is k-flat at 1-3e-4 in |dP/P|
+  (max 2.8e-4), is PURE phase-space quantization (the f32-kernel share is
+  4e-7), and sits below the PM method's own floors in every band — mesh
+  floor 9x at low k, ~2000x mid; stepping floor except at low k where
+  BullFrog's linear exactness makes that floor artificially tiny
+  (docs/m1-results.md Tier-B table; scripts/m1_quant_gate.py).
+- **Decision:** Tier-B gate = **max |dP/P| (int16 vs evolve_float f64,
+  matched schedule, production config) <= 5e-4**, PLUS the strict invariant
+  that the quantization error stays below the PM mesh floor in every k band.
+  D-010's 1e-4 bar REMAINS IN FORCE for the like-for-like ladder-budget
+  statistic it was ratified on (M0-R2); it is a different measurement and
+  is not relaxed by this ADR.
+- **Consequences:** the paper's "compression is free" claim (CUBE-style)
+  is backed by a measured floor comparison, not an analogy; frac_bits=12 /
+  c_growth=2.5 stand as production defaults with ~2x gate headroom. If a
+  future config trips the gate, the escalation path is frac_bits 13 or
+  c_growth tuning, costed against the ladder budget first.
