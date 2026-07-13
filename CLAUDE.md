@@ -9,15 +9,23 @@ own production mocks; mbody owns MLX/Apple-Silicon).
 
 ## Current milestone
 
-**M0 in progress** (opened 2026-07-12; plan
-`~/.claude/plans/let-s-put-the-rubber-composed-penguin.md`). Shared probe
-module `scripts/_m0_common.py` (self-checks green) + all five probe scripts
-written. CPU verdicts in (`runs/m0/`): R2 range PASS / noise-bar for gate
-review; R4 (THE gate) PASS-shaped -- g_STE within the FD reference's own SE
-at production int16, anchor O(q) slopes +1.0..+2.2, no K growth; R5 strict
-PASS at flagship-equivalent 64 levels. R1/R3 CUDA legs await albireo's RTX
-3050 (JC's Secure-Boot fix, Mon 2026-07-13); then the gate review with JC
-(verdict ADRs -> decisions.md, R4 threshold negotiated, roadmap ticked).
+**M0 probes COMPLETE, gate review pending** (opened 2026-07-12; CUDA legs
+2026-07-13; plan `~/.claude/plans/let-s-put-the-rubber-composed-penguin.md`).
+All five verdicts in (`runs/m0/`): R1 authoritative PASS on CUDA (deneb RTX
+3050) -- 100/100 seeds x all 5 drivers + wrap-adversarial exact, with the
+force on paint="int" (the f32-paint default fails densely on GPU exactly as
+Sec. 5 predicts; failure run archived in runs/m0/r1_gpu_f32paint/). R3 PASS
+at 2^26/384^3 (the 3050 is the 6 GB variant; 512^3 uniform corroboration
+archived) -- int paint 10/10 bit-identical incl. retrace + clustered
+worst-case, and FASTER than f32 (0.79-0.85x; f32+deterministic-ops flag
+costs 1.37-1.78x f32). R2 range PASS / noise-bar for gate review; R4 (THE
+gate) PASS-shaped -- g_STE within the FD reference's own SE at production
+int16, anchor O(q) slopes +1.0..+2.2, no K growth; R5 strict PASS at
+flagship-equivalent 64 levels. NEXT: the M0 gate review with JC (verdict
+ADRs -> decisions.md, R4 threshold + R2 noise bar negotiated, go/pivot/stop,
+roadmap ticked). Note for R4 talking points: its CPU gradients ran through
+the f32-paint force (the intended VJP twin), while production primal is int
+paint -- state this at threshold negotiation.
 
 ## Doc map (read before proposing anything)
 
