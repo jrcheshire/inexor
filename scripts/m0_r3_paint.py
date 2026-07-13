@@ -177,7 +177,10 @@ def main():
             if line:
                 detflag[flavor] = json.loads(line[-1])["t_f32_detflag"]
             else:
-                print(f"  [{flavor:9s}] detflag subprocess failed: {r.stderr[-300:]}")
+                errfile = out / f"detflag_{flavor}.stderr"
+                errfile.write_text(r.stderr + "\n---stdout---\n" + r.stdout)
+                print(f"  [{flavor:9s}] detflag subprocess failed (rc {r.returncode}); "
+                      f"full output: {errfile}")
 
     for flavor in ("uniform", "lattice", "clustered"):
         pos = positions(flavor, n_part, L, N, jax.random.PRNGKey(1)).reshape(
