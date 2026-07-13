@@ -56,8 +56,8 @@ origin; deneb has no GitHub key. Deneb's RTX 3050 is the 6 GB variant.
   (release blocker; never "Jamie").
 - Commit as you go; do NOT `git push` unless told (JC manages the remote —
   private GitHub until further notice).
-- Ask before resource-heavy local runs (shared laptop). CUDA runs: Vista or
-  albireo (once its GPU lands); state machine/queue up front.
+- Ask before resource-heavy local runs (shared laptop). CUDA runs: deneb (via
+  Slurm; RTX 3050 6 GB) or Vista; state machine/queue up front.
 
 ## Reference code (read-only from here)
 

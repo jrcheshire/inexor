@@ -29,7 +29,7 @@ packages = ["src/inexor"]
 # ---------------------------------------------------------------------------
 # pixi config. `pixi.lock` is committed; co-commit it on any dependency change.
 # default env = CPU jax (osx-arm64 dev + linux CI); gpu env = linux-64 CUDA 12
-# (albireo / generic x86 CUDA). A linux-aarch64 CUDA feature (TACC Vista
+# (deneb / generic x86 CUDA). A linux-aarch64 CUDA feature (TACC Vista
 # Grace-Hopper, xcat pattern) is deliberately deferred to M2 when GPU runs
 # start -- see docs/roadmap.md.
 # ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ inexor = { path = ".", editable = true }
 [tool.pixi.feature.jax.dependencies]
 jax = "*"            # conda-forge jaxlib is CPU-only in the default env
 
-# GPU env: linux-64 CUDA (albireo x86 box / generic CUDA node). cuda 12
+# GPU env: linux-64 CUDA (deneb RTX 3050 6 GB / generic CUDA node). cuda 12
 # matches current drivers; jaxlib build selector picks the CUDA wheel.
 # NOTE: pixi 0.72 warns that [system-requirements] is deprecated for inline
 # platform tables, but 0.72 does not yet PARSE the inline form (errors:

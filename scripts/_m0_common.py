@@ -1,5 +1,11 @@
 """Shared support for the inexor M0 kill-or-confirm probes (R1-R5).
 
+FROZEN (M1 close, 2026-07-13): this module and the m0_r*.py probes are an
+ARCHIVE of the M0 verdict artifacts (decisions.md D-010). The physics has
+migrated to src/inexor/ (bit-match asserted by tests/test_m0_bridge.py
+during the migration). Do not extend; edit only to keep the self-checks
+runnable.
+
 Probe-support code, not package code (see docs/roadmap.md: M0 exit artifacts are
 standalone scripts). The codec and step primitives ARE written to the exact spec
 of docs/architecture.md Secs. 3-8, because R1 certifies the same bits that R4
