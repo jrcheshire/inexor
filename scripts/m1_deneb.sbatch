@@ -3,7 +3,12 @@
 #SBATCH -w deneb
 #SBATCH --gres=gpu:1
 #SBATCH -c 8
+#SBATCH --mem=16G
 #SBATCH -t 8:00:00
+# --mem is REQUIRED here: the partition default (124000M, sized for antares's
+# 128 GB) exceeds deneb's 56 GB and makes the job permanently unschedulable.
+# 16G is ample (the heavy buffers live on the GPU); with OverSubscribe=OK this
+# also lets the job co-schedule beside CPU jobs instead of waiting them out.
 #SBATCH -o %x-%j.log
 # M1 S7 authoritative CUDA legs (plan tender-stargazing-map):
 #   1. full pytest suite in the gpu env (tier-0 exact reversibility + the
