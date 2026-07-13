@@ -154,7 +154,9 @@ def main():
         x0, w0, cs = make_state(seed)
         x0h, w0h = np.asarray(x0), np.asarray(w0)
         for name, drv in drivers.items():
-            x, w = drv(x0, w0, cs)
+            # fresh device copies: the donate driver consumes its inputs (real deletion
+            # on GPU; CPU ignores donation, which is why CPU smokes never tripped this)
+            x, w = drv(x0.copy(), w0.copy(), cs)
             ok = bool(np.array_equal(np.asarray(x), x0h) and np.array_equal(np.asarray(w), w0h))
             if not ok:
                 fails[name].append(seed)
