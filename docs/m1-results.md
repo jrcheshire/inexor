@@ -207,6 +207,31 @@ seed") decomposes into three quantified pieces, none an integrator error
    colour at the DC mode and tripped the table-range guard — DC-safe
    evaluation + regression test (tests/test_ic.py).
 
+### Tier-B quantization gate measurement (m1_quant_gate.py, 128^3 K=40)
+
+CUBE-style floor comparison, all arms from the same injected ICs vs the
+evolve_float f64 reference (runs/m1/quant_gate_n128k40log_bullfrog_lpt2_s0.json):
+
+| arm | rms [cells] | max dP/P | dP/P low-k | k<0.4 | mid | Nyquist |
+|---|---|---|---|---|---|---|
+| quant (int16 production) | 8.3e-3 | 2.8e-4 | 1.3e-4 | 2.0e-4 | 2.8e-4 | 9.0e-5 |
+| step floor (K vs 2K) | 7.7e-4 | 3.2e-3 | 1.8e-6 | 1.7e-4 | 2.8e-3 | 3.2e-3 |
+| mesh floor (n vs 2n force) | 2.7e-1 | 5.3e-1 | 1.2e-3 | 5.1e-2 | 4.3e-1 | 5.3e-1 |
+| f32-kernel share (f32 vs f64 float) | 2.4e-6 | 4.0e-7 | — | — | — | — |
+
+Readings:
+- The int16 error is **k-flat at 1-3e-4** and is **pure phase-space
+  quantization** (the f32-kernel share is 4e-7 — three orders below).
+- **Below the PM mesh floor in every band** (9x margin at low k, ~2000x
+  mid); below the stepping floor everywhere except low k, where BullFrog's
+  linear-growth exactness makes the stepping floor artificially tiny
+  (1.8e-6) — the governing method floor there is the mesh arm's 1.2e-3.
+- Relation to the D-010 1e-4 bar: that bar was ratified on M0-R2's
+  like-for-like ladder-budget statistic; this end-to-end Tier-B statistic
+  is a different measurement and needs its own gate number (JC's call) —
+  quoted candidates: max |dP/P| <= 5e-4 at the production config (measured
+  2.8e-4) plus the strict below-mesh-floor invariant per band.
+
 ## S7 — deneb CUDA legs + 512^3 smoke
 
 TBD.
