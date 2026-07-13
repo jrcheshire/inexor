@@ -162,3 +162,33 @@ decision here is locked until explicitly re-litigated with JC.
   refusal instead of silent garbage; the remainder-ledger fallback (D-005)
   remains the unbuilt escape hatch if a near-zero-alpha schedule is ever
   genuinely needed.
+
+## D-013 — M1 Tier-A parity gates (mbody + DISCO-DJ)
+- **Status:** accepted (JC, 2026-07-13; "green light" after the attribution
+  review).
+- **Context:** floor-first protocol (plan tender-stargazing-map S5/S6).
+  Measured floors: mbody repeats at ~1e-6 cells rms (Metal f32 CIC scatter);
+  DISCO-DJ repeats bit-identical (JAX f64 CPU, fresh-trace included). The raw
+  inexor <-> DISCO-DJ gap was ATTRIBUTED to three named convention choices
+  (docs/m1-results.md S6): (1) Nyquist plane zeroed in DISCO-DJ's order-0 ik
+  gradient kernel — the ONLY force-operator difference (7e-8 residual);
+  (2) BullFrog alpha from tabulated true-LCDM D2 vs mbody's EdS relation;
+  (3) explicit-a-array midpoint = arithmetic in a with unequal D-drift halves
+  vs mbody's D-midpoint equal halves. The convention-adapted replay
+  reproduces disco_final to rms 2.2e-8 cells / |dP/P| 1.9e-8 (f64 roundoff).
+- **Decision:** two permanent Tier-A parity gates, run by the harness
+  (scripts/m1_*), gated against the shared physics:
+  - **mbody arm** (injected matched ICs, stock conventions): rms <= 1e-4
+    cells, max |dP/P| <= 1e-5. (Measured at 128^3 K=40: 1.6e-5 / 1.4e-6.)
+  - **DISCO-DJ arm** (convention-adapted replay, m1_force_probe --side
+    coeffs/replay): rms <= 1e-6 cells, max |dP/P| <= 1e-6, max 1-r <= 1e-12.
+    (Measured: 2.2e-8 / 1.9e-8 / 2.1e-14.)
+  The raw stock-vs-DISCO-DJ comparison is documented in m1-results.md as a
+  characterized convention difference, NOT gated: its size is set by
+  DISCO-DJ's kernel/coefficient choices, outside inexor's control.
+- **Consequences:** inexor's forward physics is pinned to BOTH references at
+  their respective information limits (mbody at its f32 floor, DISCO-DJ at
+  f64 roundoff); any future regression in force kernel, LPT, growth, or
+  stepping trips a gate with ~50x headroom rather than hiding in convention
+  noise. The convention ledger doubles as the suspect list for the M0 ~4%
+  low-k deficit (S6 matrix).
