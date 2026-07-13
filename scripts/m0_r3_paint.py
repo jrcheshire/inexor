@@ -151,6 +151,25 @@ def main():
         flavors={},
     )
 
+    # --xla_gpu_deterministic_ops arm (GPU only; process-global -> re-exec).
+    # Must run BEFORE the flavor loop: the parent's XLA pool keeps its high-water
+    # mark once the big paints have run, and the child OOMs on a 6 GB card.
+    detflag = {}
+    if authoritative:
+        for flavor in ("uniform", "clustered"):
+            env = dict(os.environ)
+            env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "") + " --xla_gpu_deterministic_ops=true")
+            env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+            cmd = [sys.executable, __file__, "--mode", "detflag-bench", "--flavor", flavor,
+                   "--log2-n", str(args.log2_n), "--mesh", str(args.mesh),
+                   "--frac-bits", str(args.frac_bits), "--log2-chunk", str(args.log2_chunk)]
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            line = [ln for ln in r.stdout.splitlines() if ln.startswith("{")]
+            if line:
+                detflag[flavor] = json.loads(line[-1])["t_f32_detflag"]
+            else:
+                print(f"  [{flavor:9s}] detflag subprocess failed: {r.stderr[-300:]}")
+
     for flavor in ("uniform", "lattice", "clustered"):
         pos = positions(flavor, n_part, L, N, jax.random.PRNGKey(1)).reshape(
             n_chunks, chunk, 3
@@ -189,26 +208,10 @@ def main():
         # position build double-buffers ~2.6 GB of dead arrays (OOM on a 6 GB card)
         del pos, ref_i, ref_f
 
-    # --xla_gpu_deterministic_ops arm (GPU only; process-global -> re-exec)
-    if authoritative:
-        for flavor in ("uniform", "clustered"):
-            env = dict(os.environ)
-            env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "") + " --xla_gpu_deterministic_ops=true")
-            # the parent's XLA pool stays resident for the child's lifetime; without
-            # this the child OOMs at startup on small (6 GB) cards
-            env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-            cmd = [sys.executable, __file__, "--mode", "detflag-bench", "--flavor", flavor,
-                   "--log2-n", str(args.log2_n), "--mesh", str(args.mesh),
-                   "--frac-bits", str(args.frac_bits), "--log2-chunk", str(args.log2_chunk)]
-            r = subprocess.run(cmd, env=env, capture_output=True, text=True)
-            line = [ln for ln in r.stdout.splitlines() if ln.startswith("{")]
-            if line:
-                d = json.loads(line[-1])
-                results["flavors"][flavor]["t_f32_detflag"] = d["t_f32_detflag"]
-                print(f"  [{flavor:9s}] f32+detflag: {d['t_f32_detflag'] * 1e3:8.1f} ms "
-                      f"({d['t_f32_detflag'] / results['flavors'][flavor]['t_f32']:.2f}x f32)")
-            else:
-                print(f"  [{flavor:9s}] detflag subprocess failed: {r.stderr[-300:]}")
+    for flavor, t in detflag.items():
+        results["flavors"][flavor]["t_f32_detflag"] = t
+        print(f"  [{flavor:9s}] f32+detflag: {t * 1e3:8.1f} ms "
+              f"({t / results['flavors'][flavor]['t_f32']:.2f}x f32)")
 
     with open(out / "r3_results.json", "w") as fh:
         json.dump(results, fh, indent=1,
