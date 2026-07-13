@@ -6,9 +6,28 @@ reversible (JANUS pattern) and the reverse-mode adjoint an exact replay with
 memory independent of the number of time steps -- at 12 (or 6) bytes per
 particle of persistent state (CUBE pattern).
 
-Status: pre-M0 (design documents only; see docs/architecture.md and
-docs/roadmap.md). No implementation yet.
+Status: M1 (forward PM). The forward path (BullFrog w-frame ladder +
+exact-KDK/FastPM integer integrators, deterministic int paint, ZA/2LPT/f_NL
+ICs) is package code; the custom_vjp exact-replay adjoint is M2. M0's five
+kill-or-confirm probes all passed (docs/decisions.md D-010..D-012).
+
+House rule: this library NEVER touches jax.config -- callers opt into x64.
 """
+
+from .config import PLANCK, BoxConfig, Cosmology, QuantConfig, TimeConfig
+from .integrate import evolve, evolve_float, replay_roundtrip, simulate
+
+__all__ = [
+    "PLANCK",
+    "BoxConfig",
+    "Cosmology",
+    "QuantConfig",
+    "TimeConfig",
+    "evolve",
+    "evolve_float",
+    "replay_roundtrip",
+    "simulate",
+]
 
 __version__ = "0.0.1.dev0"
 __author__ = "James Cheshire"
