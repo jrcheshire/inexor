@@ -45,7 +45,10 @@ F32 = jnp.float32
 
 def make_painters(N, L, frac_bits, n_chunks):
     """Chunked paints, jitted whole (scan over chunks carrying the mesh)."""
-    scale = jnp.float32(2.0**frac_bits)
+    # np scalar, NOT jnp: jnp.float32(x) creates a device array, which initializes
+    # the CUDA backend (and preallocates the pool) at make_painters time -- the
+    # parent must stay off the GPU until the detflag children have run
+    scale = np.float32(2.0**frac_bits)
 
     def chunk_body_int(mesh, pc):
         base, frac = mc._cic_pieces(pc, N, L)
@@ -127,7 +130,8 @@ def main():
     # own JAX/CUDA context (which preallocates the pool) before the detflag
     # children below have run -- on a 6 GB card the resident parent starves them.
     # The parent's backend then initializes lazily at the first paint, after the
-    # children have exited. (jax.jit decoration and make_painters are init-free.)
+    # children have exited. (make_painters must stay init-free: see the np-scalar
+    # note there; jnp.float32(x) is a device array, not a dtype cast.)
     if args.mode == "main":
         platform = subprocess.run(
             [sys.executable, "-c", "import jax; print(jax.default_backend())"],
