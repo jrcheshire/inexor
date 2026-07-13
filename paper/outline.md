@@ -50,7 +50,11 @@ do not cite each other).
 4. Performance: memory budget and the money plots.
 5. Science demo: field-level f_NL toy.
 6. Limitations (honest): PM-only forces; K <~ 12 int16+BullFrog range budget
-   (FastPM beyond); STE gradient bias at coarse quantization (measured, R4);
+   (FastPM beyond); schedule feasibility — every |alpha_k| >= 0.05 or the
+   ladder refuses: int16+BullFrog needs K >= 3 from a_i = 0.1 (alpha_1 =
+   0.018 at K = 2, on the zero-crossing) and lin-0.04 spacing dies near
+   K = 11, a structural constraint float BullFrog does not have (measured,
+   R2; D-012); STE gradient bias at coarse quantization (measured, R4);
    bit-exactness scoped to a process/device/XLA version; single-node (mesh
    memory dominance; two-level mesh as future work).
 

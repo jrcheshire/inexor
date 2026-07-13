@@ -62,7 +62,7 @@ decision here is locked until explicitly re-litigated with JC.
   setup-time float64 range assertions refuse unfit schedules.
 
 ## D-006 — int32-mesh CIC paint: determinism by associativity
-- **Status:** proposed (design pass, 2026-07-10); confirm via R3 measurements.
+- **Status:** accepted (R3 confirmed on CUDA, 2026-07-13 — see D-010).
 - **Context:** f32 scatter-add atomics are order-nondeterministic; bit-exact
   replay needs a deterministic primal force.
 - **Decision:** quantize CIC corner weights to fixed point, accumulate in an
@@ -99,3 +99,66 @@ decision here is locked until explicitly re-litigated with JC.
   in mbody.
 - **Consequences:** local dev runs JAX-CPU; authoritative
   determinism/performance results come from CUDA devices (Vista/albireo).
+
+## D-010 — M0 gate review: verdicts and GO
+- **Status:** accepted (JC, 2026-07-13 gate review).
+- **Context:** all five probes ran to verdict (CPU legs 2026-07-12; R1/R3
+  CUDA-authoritative on albireo/deneb's RTX 3050 [6 GB variant], 2026-07-13).
+  Thresholds were measure-then-negotiate per D-002. Probe outputs in
+  `runs/m0/` (gitignored); full logs beside them.
+- **Decision:**
+  - **R4 gate ratified at 7.5e-2 relative gradient error** at production
+    int16. Measured 9e-4..3e-2 across all six loss x param combos (within
+    0.03-0.26 sigma of the staircase-regression FD reference), anchor O(q)
+    slopes +1.0..+2.2, no K growth 3->12: **PASS**.
+  - **R2 noise bar ratified as <= 1e-4 relative P(k)** (the strict
+    below-stepping-floor criterion rejected as the governing bar — BullFrog
+    is near-exact at low k where that floor is ~1e-6). Measured pass with a
+    >= 3-bit s_w0 window: **PASS**.
+  - **R1 PASS** (authoritative CUDA): 100/100 seeds x all 5 drivers, exact
+    integer equality, wrap-adversarial exact; int-paint primal force. The
+    forbidden f32-paint configuration fails densely on the same hardware
+    (archived, `runs/m0/r1_gpu_f32paint/`) — the design's premise shown both
+    ways.
+  - **R3 PASS** (CUDA, 2^26/384^3 fallback; 512^3 uniform corroboration
+    archived): int paint 10/10 bit-identical incl. re-trace and the
+    clustered contention worst case; 0.79-0.85x f32 runtime (FASTER, vs the
+    >2x trigger); f32 + --xla_gpu_deterministic_ops costs 1.37-1.78x f32.
+  - **R5 strict PASS** (10-100x below the resolution floor at
+    flagship-equivalent 64 levels; error ladder discriminates).
+  - Single-seed R2/R5 matrices accepted (no second seed).
+  - **GO to M1.**
+- **Consequences:** both load-bearing bets validated; M1 opens with its own
+  milestone plan. s_w0 policy tightened (D-011); schedule feasibility
+  documented as a paper limitation (D-012). R4's gradients were measured
+  through the f32-paint force (the intended VJP twin, D-006) while the
+  production primal is the int paint — restate when M2 promotes the adjoint.
+
+## D-011 — s_w0 policy: c_growth 4.0 -> 2.5
+- **Status:** accepted (JC, 2026-07-13 gate review).
+- **Context:** the pre-R2 placeholder c_growth = 4.0 was ~1 bit conservative;
+  R2 measured the velocity growth factor at 1.94 (128^3, exact LCDM, K = 5-15
+  log schedules).
+- **Decision:** default c_growth = 2.5 (~0.3 bits of headroom over the
+  measured 1.94); margin 0.9 unchanged.
+- **Consequences:** ~0.6 bits returned to the velocity range budget; the
+  policy stays a default, not an assertion — D-005's setup-time float64
+  range checks still refuse unfit configurations.
+
+## D-012 — schedule feasibility is a documented constraint (K >= 3)
+- **Status:** accepted (JC, 2026-07-13 gate review).
+- **Context:** the w-frame ladder (D-005) inherits a feasibility condition
+  from BullFrog's alphas: a rung's bit cost diverges as |alpha_k| -> 0, and
+  the alphas depend only on the schedule (growth factors at step endpoints).
+  Measured: K = 2 from a_i = 0.1 has alpha_1 = 0.018 — below the guard, on
+  the zero-crossing — so two steps cannot run at int16+BullFrog; lin-0.04
+  crosses zero near K = 11. Float BullFrog has no such constraint (it just
+  integrates K = 2 inaccurately).
+- **Decision:** keep the |alpha_k| >= 0.05 setup-time guard; document
+  "int16+BullFrog needs K >= 3 from a_i = 0.1, and any schedule must keep
+  every |alpha_k| >= 0.05" as a paper limitation (paper/outline.md), not a
+  bug to engineer away.
+- **Consequences:** a reviewer sweeping K downward hits a loud, documented
+  refusal instead of silent garbage; the remainder-ledger fallback (D-005)
+  remains the unbuilt escape hatch if a near-zero-alpha schedule is ever
+  genuinely needed.

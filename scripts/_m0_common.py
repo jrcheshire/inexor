@@ -363,12 +363,13 @@ def ladder_constants(a_steps, cosmo, s_w0, s_x, alpha_floor=0.05, D_of_a=None):
     return Ladder(a_steps, D_steps, alphas, betas, dD, D_mid, P, c1, c2, kappa, s_w0, s_x)
 
 
-def s_w0_policy(v_max0, P_final, c_growth=4.0, margin=0.9):
+def s_w0_policy(v_max0, P_final, c_growth=2.5, margin=0.9):
     """Initial w scale so late-time |w| stays inside int16 (plan Sec. R2 formula).
 
     s_w0 = c_growth * max|v_0| / (margin * 32767 * |P_K|). c_growth is the
-    velocity growth factor over the run (measured by R2; ~2-4 expected --
-    the default 4.0 is a pre-R2 placeholder, revisit after R2 reports).
+    velocity growth factor over the run; R2 measured 1.94 (128^3 exact LCDM,
+    K=5-15 log schedules) -- default 2.5 ratified at the M0 gate review
+    (D-011).
     """
     return c_growth * v_max0 / (margin * 32767.0 * abs(P_final))
 

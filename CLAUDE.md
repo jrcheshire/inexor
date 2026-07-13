@@ -9,23 +9,19 @@ own production mocks; mbody owns MLX/Apple-Silicon).
 
 ## Current milestone
 
-**M0 probes COMPLETE, gate review pending** (opened 2026-07-12; CUDA legs
-2026-07-13; plan `~/.claude/plans/let-s-put-the-rubber-composed-penguin.md`).
-All five verdicts in (`runs/m0/`): R1 authoritative PASS on CUDA (deneb RTX
-3050) -- 100/100 seeds x all 5 drivers + wrap-adversarial exact, with the
-force on paint="int" (the f32-paint default fails densely on GPU exactly as
-Sec. 5 predicts; failure run archived in runs/m0/r1_gpu_f32paint/). R3 PASS
-at 2^26/384^3 (the 3050 is the 6 GB variant; 512^3 uniform corroboration
-archived) -- int paint 10/10 bit-identical incl. retrace + clustered
-worst-case, and FASTER than f32 (0.79-0.85x; f32+deterministic-ops flag
-costs 1.37-1.78x f32). R2 range PASS / noise-bar for gate review; R4 (THE
-gate) PASS-shaped -- g_STE within the FD reference's own SE at production
-int16, anchor O(q) slopes +1.0..+2.2, no K growth; R5 strict PASS at
-flagship-equivalent 64 levels. NEXT: the M0 gate review with JC (verdict
-ADRs -> decisions.md, R4 threshold + R2 noise bar negotiated, go/pivot/stop,
-roadmap ticked). Note for R4 talking points: its CPU gradients ran through
-the f32-paint force (the intended VJP twin), while production primal is int
-paint -- state this at threshold negotiation.
+**M0 PASSED — GO** (gate review with JC, 2026-07-13). All five probes PASS
+under the ratified thresholds: R4 gate 7.5e-2 relative gradient error
+(measured 9e-4..3e-2); R2 bar = relative P(k) <= 1e-4; R1 100/100 x 5
+drivers CUDA-exact; R3 int paint deterministic AND faster than f32; R5
+strict. Verdict ADRs D-010..D-012 in `docs/decisions.md` (incl. c_growth
+4.0 -> 2.5 and the K >= 3 schedule-feasibility paper limitation); probe
+outputs in `runs/m0/` (both laptop and deneb copies). NEXT: **M1 (forward
+PM)** — open it with a fresh detailed milestone plan (master-plan
+convention); real package code into `src/inexor/` (codec, painting, forces,
+lpt, ic, integrate), parity gates vs mbody + DISCO-DJ after measuring their
+own repro floors. Deneb git relay: bare repo `deneb:~/git/inexor.git`
+(remote `deneb`), working clone `deneb:~/spherex/inexor` — push here AND to
+origin; deneb has no GitHub key. Deneb's RTX 3050 is the 6 GB variant.
 
 ## Doc map (read before proposing anything)
 

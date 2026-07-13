@@ -7,7 +7,9 @@ artifacts; milestone plans set file-level steps. Tolerances marked "measure
 first" are set with JC after the floor is measured — never assumed, never
 relaxed silently.
 
-Current status: **pre-M0** (bootstrap 2026-07-10: repo + design docs only).
+Current status: **M0 PASSED — GO** (gate review 2026-07-13; verdicts + ratified
+thresholds in decisions.md D-010..D-012). Next: M1, opening with its own
+detailed milestone plan.
 
 ---
 
