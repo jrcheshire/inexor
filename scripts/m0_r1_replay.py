@@ -73,12 +73,8 @@ def make_drivers(force, force_j, s_x, K):
 
     step_fwd_j = jax.jit(lambda x, w, c: mc.step_fwd(x, w, c, force, s_x))
     step_rev_j = jax.jit(lambda x, w, c: mc.step_rev(x, w, c, force, s_x))
-    step_fwd_d = jax.jit(
-        lambda x, w, c: mc.step_fwd(x, w, c, force, s_x), donate_argnums=(0, 1)
-    )
-    step_rev_d = jax.jit(
-        lambda x, w, c: mc.step_rev(x, w, c, force, s_x), donate_argnums=(0, 1)
-    )
+    step_fwd_d = jax.jit(lambda x, w, c: mc.step_fwd(x, w, c, force, s_x), donate_argnums=(0, 1))
+    step_rev_d = jax.jit(lambda x, w, c: mc.step_rev(x, w, c, force, s_x), donate_argnums=(0, 1))
 
     def loop_driver(fwd, rev):
         def go(x0, w0, cs):
@@ -137,8 +133,9 @@ def main():
 
     t0 = time.time()
     results = dict(
-        config=dict(N=N, L=L, K=K, seeds=args.seeds, platform=platform,
-                    authoritative=authoritative),
+        config=dict(
+            N=N, L=L, K=K, seeds=args.seeds, platform=platform, authoritative=authoritative
+        ),
         drivers={},
     )
 
@@ -171,9 +168,11 @@ def main():
                     detail[name] = dict(seed=seed, n_diff=int(nz), max_abs_diff=mx)
                     np.savez(out / f"r1_fail_{name}_seed{seed}.npz", dx=dx, dw=dw)
         if seed % 20 == 19:
-            print(f"  seed {seed + 1}/{args.seeds} "
-                  f"({(time.time() - t0):.0f}s) fails so far: "
-                  f"{ {k: len(v) for k, v in fails.items()} }")
+            print(
+                f"  seed {seed + 1}/{args.seeds} "
+                f"({(time.time() - t0):.0f}s) fails so far: "
+                f"{ {k: len(v) for k, v in fails.items()} }"
+            )
 
     # wrap-adversarial arm (D-007): s_w0/64 -> w wraps int16 mid-run;
     # replay must still be exact. Drivers B and C.
@@ -187,15 +186,23 @@ def main():
         )
 
     results["drivers"] = {
-        name: dict(passed=args.seeds - len(f), failed=len(f), fail_seeds=f[:10],
-                   first_fail=detail.get(name))
+        name: dict(
+            passed=args.seeds - len(f),
+            failed=len(f),
+            fail_seeds=f[:10],
+            first_fail=detail.get(name),
+        )
         for name, f in fails.items()
     }
     results["wrap_adversarial"] = wrap_ok
 
     with open(out / "r1_results.json", "w") as fh:
-        json.dump(results, fh, indent=1,
-                  default=lambda o: o.item() if isinstance(o, np.generic) else str(o))
+        json.dump(
+            results,
+            fh,
+            indent=1,
+            default=lambda o: o.item() if isinstance(o, np.generic) else str(o),
+        )
 
     tag = "" if authoritative else " [NON-AUTHORITATIVE: CPU]"
     parts = [f"{n}={args.seeds - len(f)}/{args.seeds}" for n, f in fails.items()]

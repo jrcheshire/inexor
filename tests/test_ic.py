@@ -82,3 +82,18 @@ def test_bispectrum_template_squeezed_divergence():
     # linear in f_NL by construction
     b2 = local_bispectrum_template([(0.1, 0.1, 0.1)], PLANCK, f_NL=2.0)[0]
     assert b2 == pytest.approx(2.0 * b_equil, rel=1e-12)
+
+
+def test_gaussian_delta_table_backend_dc_safe():
+    # regression (S6 deficit matrix): the table backend refuses k outside its
+    # range, and the |k| grid contains the DC mode -- gaussian_delta must
+    # evaluate the colour DC-safely (the DC colour is zeroed regardless)
+    k_t = np.geomspace(1e-4, 1e2, 800)  # the density of the real pk_*.txt dumps
+    table = (k_t, linear_power(k_t, PLANCK))
+    d_tab = gaussian_delta(jax.random.PRNGKey(0), N, L, PLANCK, table=table, backend="table")
+    d_eh = gaussian_delta(jax.random.PRNGKey(0), N, L, PLANCK)
+    assert float(jnp.mean(d_tab)) == pytest.approx(0.0, abs=1e-6)
+    # same white noise + a table OF the eh98 spectrum -> near-identical field
+    # (only log-log interpolation error differs)
+    rms = float(jnp.sqrt(jnp.mean((d_tab - d_eh) ** 2) / jnp.mean(d_eh**2)))
+    assert rms < 1e-3

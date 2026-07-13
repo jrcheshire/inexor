@@ -154,10 +154,58 @@ is set by DISCO-DJ's kernel/coefficient conventions, outside inexor's
 control. mbody Tier-A gate proposal: rms <= 1e-4 cells / |dP/P| <= 1e-5
 (measured 1.6e-5 / 1.4e-6 at 128^3 K=40 vs its own 1e-6-cell floor).
 
-### 4%-deficit attribution matrix
+### 4%-deficit attribution: CLOSED (2026-07-13)
 
-TBD (m1_deficit.py: {ZA, 2LPT} x K x integrator x resolution x deconvolve
-x {EH98, CAMB}).
+The M0 observation ("evolved P(k) ~4% below linear at k = 0.025, 64^3, one
+seed") decomposes into three quantified pieces, none an integrator error
+(`scripts/m1_deficit.py`; runs/m1/deficit_matrix.json + deficit_seeds.json):
+
+1. **Bin-center binning artifact (estimator-side, deterministic).** In
+   fundamental-width shells the discrete modes sit at |k|/k_f in {1, sqrt2,
+   sqrt3, 2, ...} while the theory was read at bin centers; with P(k)
+   falling above the turnover, mode-averaged theory sits BELOW bin-center
+   theory by -13.4% / -6.8% / -4.4% / -1.1% in the lowest four shells
+   (64^3, L=256). Re-measured against MODE-AVERAGED theory, the IC field's
+   absolute P(k) is +0.5% +- 2.1% (100 seeds) — consistent with zero. Any
+   absolute-vs-theory reading at these bins MUST bin the theory like the
+   data (the M0 probe did not; its linspace binning has the same artifact
+   class).
+2. **Per-realization scatter.** The absolute metric scatters +-12% per seed
+   over the k <= 0.05 band (chi^2 statistics of ~tens of modes); single-seed
+   absolute readings at the fundamental bins are noise-dominated. The M0
+   "-4%" was one draw of artifact + scatter.
+3. **Real dynamics: growth suppression -2.6% +- 0.5%** (16-seed mean at
+   64^3 K=10 BullFrog 2LPT; seed scatter 2.0%), measured with the
+   variance-cancelling growth transfer T(k) = P_f/P_i vs (D_f/D_i)^2 (IC
+   realization, CIC window, and discreteness cancel). Attribution evidence:
+   - **K-independent** (K = 5/10/20/40 identical to 4 digits) and
+     **integrator-independent** (BullFrog/FastPM/exact within 0.15%
+     absolute, converging with K) -> not stepping.
+   - **ZA vs 2LPT differ by only 0.1%** -> not the LPT transient.
+   - **Reproduced by BOTH references to 4 digits** at the shared cell
+     (inexor -2.67%, mbody -2.67%, DISCO-DJ -2.65%) -> not an inexor
+     artifact; property of the shared PM dynamics.
+   - **Amplitude test**: deficit shrinks with IC amplitude but NOT purely
+     as amplitude^2 (-2.67% / -1.72% / -1.36% at amp 1 / 0.5 / 0.25) —
+     mode-coupling term + an amplitude-independent component.
+   - **Resolution/band tests**: band-limiting the 128^3 ICs at the 64^3
+     Nyquist changes nothing (-4.73% -> -4.72%); the same band-limited
+     realization on the 64^3 mesh gives -5.2% vs 128^3's -4.7% (small,
+     OPPOSITE sign to a discreteness story). The apparent 64^3 vs 128^3
+     doubling in the raw matrix is realization difference (different
+     seed-0 fields per resolution), inside the +-2% seed scatter.
+   - Spacing (log vs linear) and EH98-vs-CAMB table: no effect (<0.1%).
+
+   Verdict: a real, small, code-independent nonlinear growth suppression
+   at the near-fundamental bins of this (256 Mpc/h) box, 1-loop
+   mode-coupling class with large per-realization scatter. A quantitative
+   1-loop SPT cross-check of the -2.6% mean is deliberately deferred to
+   paper-time (PT kernel formulas to be verified against primary sources
+   before use — subagent/memory rule).
+
+   En route library fix: gaussian_delta(backend="table") evaluated the
+   colour at the DC mode and tripped the table-range guard — DC-safe
+   evaluation + regression test (tests/test_ic.py).
 
 ## S7 — deneb CUDA legs + 512^3 smoke
 

@@ -72,9 +72,7 @@ def test_ladder_guard_full_composition():
     in test_codec): rejects linear-0.04 K=11 under EdS growth, accepts
     log-0.1 K=10 under exact LCDM at ~5-bit cost."""
     with pytest.raises(ValueError, match="unfit schedule"):
-        ladder_for_schedule(
-            a_grid(0.04, 1.0, 11, "linear"), PLANCK, 1.0, 1.0, D_of_a=lambda a: a
-        )
+        ladder_for_schedule(a_grid(0.04, 1.0, 11, "linear"), PLANCK, 1.0, 1.0, D_of_a=lambda a: a)
     lad = ladder_for_schedule(a_grid(0.1, 1.0, 10, "log"), PLANCK, 1.0, 1.0)
     assert lad.n_steps == 10
     assert 4.0 < lad.bits_consumed < 6.5

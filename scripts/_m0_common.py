@@ -656,9 +656,7 @@ def linear_delta0(key, n_mesh, box_size, cosmo, fdtype=jnp.float32, amplitude=1.
     # |k| grid + sqrt(P) colour, host f64 then cast (precision island).
     kx = 2.0 * np.pi * np.fft.fftfreq(N, d=L / N)
     kz = 2.0 * np.pi * np.fft.rfftfreq(N, d=L / N)
-    kk = np.sqrt(
-        kx.reshape(N, 1, 1) ** 2 + kx.reshape(1, N, 1) ** 2 + kz.reshape(1, 1, -1) ** 2
-    )
+    kk = np.sqrt(kx.reshape(N, 1, 1) ** 2 + kx.reshape(1, N, 1) ** 2 + kz.reshape(1, 1, -1) ** 2)
     colour = np.sqrt(linear_power(kk.ravel(), cosmo).reshape(kk.shape) * N**3 / L**3)
     colour[0, 0, 0] = 0.0  # zero the mean mode
     npdt = np.float64 if fdtype == jnp.float64 else np.float32
@@ -812,8 +810,11 @@ def _self_checks():
     fmax = float(jnp.max(jnp.abs(gx.reshape(-1) - psi[:, 0])))
     scale = float(jnp.max(jnp.abs(psi[:, 0])))
     results.append(
-        _check("force kernel == ZA kernel (machine precision)", fmax < 1e-6 * scale,
-               f"max abs diff {fmax:.2e} vs scale {scale:.2e}")
+        _check(
+            "force kernel == ZA kernel (machine precision)",
+            fmax < 1e-6 * scale,
+            f"max abs diff {fmax:.2e} vs scale {scale:.2e}",
+        )
     )
 
     # 5. P(k) estimator recovers the input eh98 spectrum (binned, ~sample variance).
@@ -825,8 +826,11 @@ def _self_checks():
     rel = np.abs(pk[sel] / p_ref[sel] - 1.0)
     exp = 3.0 * np.sqrt(2.0 / nm[sel])  # ~3 sigma of the chi^2 sample variance
     results.append(
-        _check("P(k) estimator recovers eh98 within sample variance",
-               bool((rel < np.maximum(exp, 0.1)).all()), f"max rel dev {rel.max():.3f}")
+        _check(
+            "P(k) estimator recovers eh98 within sample variance",
+            bool((rel < np.maximum(exp, 0.1)).all()),
+            f"max rel dev {rel.max():.3f}",
+        )
     )
 
     # 6. paint_int vs paint_f32 agree to the fixed-point tolerance.
@@ -838,8 +842,11 @@ def _self_checks():
     # Bound: each corner deposit errs by <= 2^-(F+1); a cell collects ~lambda*8
     # deposits (lambda ~ 5 here) -> allow 32 deposits' worth.
     results.append(
-        _check(f"paint_int(F={F}) vs paint_f32 within 32*2^-{F + 1}", dmax < 32 * 2.0 ** -(F + 1),
-               f"max cell diff {dmax:.2e}")
+        _check(
+            f"paint_int(F={F}) vs paint_f32 within 32*2^-{F + 1}",
+            dmax < 32 * 2.0 ** -(F + 1),
+            f"max cell diff {dmax:.2e}",
+        )
     )
 
     # 7. CPU micro-replay A: synthetic deterministic force, 100 steps, exact bits.
@@ -895,8 +902,11 @@ def _self_checks():
     ok_rep = bool(jnp.array_equal(xi, x0i) and jnp.array_equal(wi, w0i))
     results.append(_check("micro-replay B: 16^3 BullFrog K=8 PM, exact bits", ok_rep))
     results.append(
-        _check("STE float twin primal bit-matches integer trajectory", twin_mismatch == 0,
-               f"{twin_mismatch} mismatched components")
+        _check(
+            "STE float twin primal bit-matches integer trajectory",
+            twin_mismatch == 0,
+            f"{twin_mismatch} mismatched components",
+        )
     )
 
     n_pass = sum(results)

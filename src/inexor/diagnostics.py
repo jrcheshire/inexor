@@ -22,9 +22,7 @@ def _k_grid(n_mesh, box_size):
     d = L / N
     k_1d = 2.0 * np.pi * np.fft.fftfreq(N, d=d)
     kz_1d = 2.0 * np.pi * np.fft.rfftfreq(N, d=d)
-    k_mag = np.sqrt(
-        k_1d[:, None, None] ** 2 + k_1d[None, :, None] ** 2 + kz_1d[None, None, :] ** 2
-    )
+    k_mag = np.sqrt(k_1d[:, None, None] ** 2 + k_1d[None, :, None] ** 2 + kz_1d[None, None, :] ** 2)
     return k_1d, kz_1d, k_mag
 
 
@@ -133,7 +131,9 @@ def overflow_report(max_w_per_step, warn_abs=None):
     mw = np.asarray(max_w_per_step, dtype=np.int64)
     hot = np.nonzero(mw > warn_abs)[0]
     for k in hot:
-        print(f"WARNING: |w| = {mw[k]} > {warn_abs} at step {k} -- int16 wrap imminent "
-              "(wrong physics, never wrong gradients; D-007)")
+        print(
+            f"WARNING: |w| = {mw[k]} > {warn_abs} at step {k} -- int16 wrap imminent "
+            "(wrong physics, never wrong gradients; D-007)"
+        )
     head = float(np.log2(32767.0 / max(int(mw.max()), 1)))
     return dict(max_w=int(mw.max()), n_warn=int(len(hot)), headroom_bits=head)

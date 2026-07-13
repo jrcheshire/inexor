@@ -133,10 +133,14 @@ def main():
     # children have exited. (make_painters must stay init-free: see the np-scalar
     # note there; jnp.float32(x) is a device array, not a dtype cast.)
     if args.mode == "main":
-        platform = subprocess.run(
-            [sys.executable, "-c", "import jax; print(jax.default_backend())"],
-            capture_output=True, text=True,
-        ).stdout.strip() or "unknown"
+        platform = (
+            subprocess.run(
+                [sys.executable, "-c", "import jax; print(jax.default_backend())"],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            or "unknown"
+        )
 
     paint_int_c, paint_f32_c, _ = make_painters(N, L, args.frac_bits, n_chunks)
 
@@ -155,12 +159,20 @@ def main():
         print("=" * 66)
         print(f"NON-AUTHORITATIVE: {platform!r} scatter is sequential; needs CUDA")
         print("=" * 66)
-    print(f"R3: n={n_part:.3e} particles, mesh {N}^3, F={args.frac_bits}, "
-          f"{n_chunks} chunks of 2^{args.log2_chunk}")
+    print(
+        f"R3: n={n_part:.3e} particles, mesh {N}^3, F={args.frac_bits}, "
+        f"{n_chunks} chunks of 2^{args.log2_chunk}"
+    )
 
     results = dict(
-        config=dict(n_part=n_part, mesh=N, frac_bits=args.frac_bits,
-                    n_chunks=n_chunks, platform=platform, authoritative=authoritative),
+        config=dict(
+            n_part=n_part,
+            mesh=N,
+            frac_bits=args.frac_bits,
+            n_chunks=n_chunks,
+            platform=platform,
+            authoritative=authoritative,
+        ),
         flavors={},
     )
 
@@ -171,11 +183,24 @@ def main():
     if authoritative:
         for flavor in ("uniform", "clustered"):
             env = dict(os.environ)
-            env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "") + " --xla_gpu_deterministic_ops=true")
+            env["XLA_FLAGS"] = env.get("XLA_FLAGS", "") + " --xla_gpu_deterministic_ops=true"
             env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-            cmd = [sys.executable, __file__, "--mode", "detflag-bench", "--flavor", flavor,
-                   "--log2-n", str(args.log2_n), "--mesh", str(args.mesh),
-                   "--frac-bits", str(args.frac_bits), "--log2-chunk", str(args.log2_chunk)]
+            cmd = [
+                sys.executable,
+                __file__,
+                "--mode",
+                "detflag-bench",
+                "--flavor",
+                flavor,
+                "--log2-n",
+                str(args.log2_n),
+                "--mesh",
+                str(args.mesh),
+                "--frac-bits",
+                str(args.frac_bits),
+                "--log2-chunk",
+                str(args.log2_chunk),
+            ]
             r = subprocess.run(cmd, env=env, capture_output=True, text=True)
             line = [ln for ln in r.stdout.splitlines() if ln.startswith("{")]
             if line:
@@ -183,13 +208,13 @@ def main():
             else:
                 errfile = out / f"detflag_{flavor}.stderr"
                 errfile.write_text(r.stderr + "\n---stdout---\n" + r.stdout)
-                print(f"  [{flavor:9s}] detflag subprocess failed (rc {r.returncode}); "
-                      f"full output: {errfile}")
+                print(
+                    f"  [{flavor:9s}] detflag subprocess failed (rc {r.returncode}); "
+                    f"full output: {errfile}"
+                )
 
     for flavor in ("uniform", "lattice", "clustered"):
-        pos = positions(flavor, n_part, L, N, jax.random.PRNGKey(1)).reshape(
-            n_chunks, chunk, 3
-        )
+        pos = positions(flavor, n_part, L, N, jax.random.PRNGKey(1)).reshape(n_chunks, chunk, 3)
         det_i, ref_i = determinism(paint_int_c, pos)
         # fresh-trace instance (new closure/executable), same input
         paint_int_c2, _, _ = make_painters(N, L, args.frac_bits, n_chunks)
@@ -212,32 +237,50 @@ def main():
         mass_err = float(jnp.max(jnp.abs(wsum - 2**args.frac_bits)) / 2.0**args.frac_bits)
         # max cell occupancy (int32 overflow headroom check)
         max_cell = int(jnp.max(ref_i)) * 2.0**-args.frac_bits
-        rec = dict(det_int=bool(det_i), det_int_retrace=det_retrace, det_f32=bool(det_f),
-                   n_diff_f32=n_diff_f32, t_int=t_int, t_f32=t_f32,
-                   slowdown=t_int / t_f32, mass_err=mass_err, max_cell=max_cell)
+        rec = dict(
+            det_int=bool(det_i),
+            det_int_retrace=det_retrace,
+            det_f32=bool(det_f),
+            n_diff_f32=n_diff_f32,
+            t_int=t_int,
+            t_f32=t_f32,
+            slowdown=t_int / t_f32,
+            mass_err=mass_err,
+            max_cell=max_cell,
+        )
         results["flavors"][flavor] = rec
-        print(f"  [{flavor:9s}] int: det={det_i} retrace={det_retrace} {t_int * 1e3:8.1f} ms | "
-              f"f32: det={det_f} (ndiff={n_diff_f32}) {t_f32 * 1e3:8.1f} ms | "
-              f"slowdown={rec['slowdown']:.2f}x mass_err={mass_err:.1e} "
-              f"max_cell={max_cell:.0f}")
+        print(
+            f"  [{flavor:9s}] int: det={det_i} retrace={det_retrace} {t_int * 1e3:8.1f} ms | "
+            f"f32: det={det_f} (ndiff={n_diff_f32}) {t_f32 * 1e3:8.1f} ms | "
+            f"slowdown={rec['slowdown']:.2f}x mass_err={mass_err:.1e} "
+            f"max_cell={max_cell:.0f}"
+        )
         # loop variables persist across iterations: without this, the next flavor's
         # position build double-buffers ~2.6 GB of dead arrays (OOM on a 6 GB card)
         del pos, ref_i, ref_f
 
     for flavor, t in detflag.items():
         results["flavors"][flavor]["t_f32_detflag"] = t
-        print(f"  [{flavor:9s}] f32+detflag: {t * 1e3:8.1f} ms "
-              f"({t / results['flavors'][flavor]['t_f32']:.2f}x f32)")
+        print(
+            f"  [{flavor:9s}] f32+detflag: {t * 1e3:8.1f} ms "
+            f"({t / results['flavors'][flavor]['t_f32']:.2f}x f32)"
+        )
 
     with open(out / "r3_results.json", "w") as fh:
-        json.dump(results, fh, indent=1,
-                  default=lambda o: o.item() if isinstance(o, np.generic) else str(o))
+        json.dump(
+            results,
+            fh,
+            indent=1,
+            default=lambda o: o.item() if isinstance(o, np.generic) else str(o),
+        )
 
     worst = max(r["slowdown"] for r in results["flavors"].values())
     all_det = all(r["det_int"] and r["det_int_retrace"] for r in results["flavors"].values())
     tag = "" if authoritative else " [NON-AUTHORITATIVE: CPU]"
-    print(f"\nR3{tag}: det={'10/10 identical' if all_det else 'FAIL'} "
-          f"worst slowdown={worst:.2f}x (trigger: >2x)")
+    print(
+        f"\nR3{tag}: det={'10/10 identical' if all_det else 'FAIL'} "
+        f"worst slowdown={worst:.2f}x (trigger: >2x)"
+    )
     print(f"   outputs: {out.resolve()}")
 
 

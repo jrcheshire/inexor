@@ -102,8 +102,10 @@ def main():
         mesh = mc.paint_f32(jnp.asarray(x, F32), N, L)
         return mc.pk_estimator(np.asarray(mesh, np.float64) - 1.0, L, n_bins=28, k_max=k_nyq)
 
-    print(f"R5: N={N}, L={L}, K={K}, B sweep {B_list} "
-          f"(levels {[2**b // N for b in B_list]}; flagship-equivalent = 64)")
+    print(
+        f"R5: N={N}, L={L}, K={K}, B sweep {B_list} "
+        f"(levels {[2**b // N for b in B_list]}; flagship-equivalent = 64)"
+    )
 
     step_f = make_step(force, L, None)
     tt = time.time()
@@ -157,9 +159,11 @@ def main():
             wall_s=time.time() - tt,
         )
         results["arms"].append(arm)
-        print(f"  [Xq B={B}] levels={arm['levels']:3d} band_max={arm['band_max']:.2e} "
-              f"pos_rms={arm['pos_rms']:.3e} force_rms_rel={arm['force_rms_rel']:.2e} "
-              f"({arm['wall_s']:.0f}s)")
+        print(
+            f"  [Xq B={B}] levels={arm['levels']:3d} band_max={arm['band_max']:.2e} "
+            f"pos_rms={arm['pos_rms']:.3e} force_rms_rel={arm['force_rms_rel']:.2e} "
+            f"({arm['wall_s']:.0f}s)"
+        )
 
     # verdict at flagship-equivalent levels (64): below the PM floors?
     sel = kkb <= 0.5 * k_nyq
@@ -174,15 +178,24 @@ def main():
         results["verdict"] = dict(strict=ok_strict, within_1e3=ok_margin, verdict=verdict)
 
     with open(out / "r5_results.json", "w") as fh:
-        json.dump(results, fh, indent=1,
-                  default=lambda o: o.item() if isinstance(o, np.generic) else str(o))
+        json.dump(
+            results,
+            fh,
+            indent=1,
+            default=lambda o: o.item() if isinstance(o, np.generic) else str(o),
+        )
 
     # figure
     fig, ax = plt.subplots(figsize=(7, 5))
     cmap = plt.cm.viridis
     for i, arm in enumerate(results["arms"]):
-        ax.loglog(kkb, np.abs(arm["ratio"]), color=cmap(i / max(len(B_list) - 1, 1)),
-                  lw=1.4, label=f"B={arm['B']} ({arm['levels']} levels)")
+        ax.loglog(
+            kkb,
+            np.abs(arm["ratio"]),
+            color=cmap(i / max(len(B_list) - 1, 1)),
+            lw=1.4,
+            label=f"B={arm['B']} ({arm['levels']} levels)",
+        )
         guide = kkb**2 * arm["sigma_B"] ** 2
         ax.loglog(kkb, guide, color=cmap(i / max(len(B_list) - 1, 1)), ls=":", lw=0.9)
     ax.loglog(kkb, step_floor, "k:", lw=1.4, label="stepping floor (K vs 2K)")
@@ -196,8 +209,10 @@ def main():
     fig.savefig(out / "r5_fig1_lattice.png", dpi=150)
     plt.close(fig)
 
-    print(f"\nR5 verdict at 64 levels: {verdict} "
-          f"(strict = below max(stepping, resolution) floor at all k <= 0.5 k_Nyq)")
+    print(
+        f"\nR5 verdict at 64 levels: {verdict} "
+        f"(strict = below max(stepping, resolution) floor at all k <= 0.5 k_Nyq)"
+    )
     print(f"total wall: {(time.time() - t0) / 60:.1f} min; outputs: {out.resolve()}")
 
 

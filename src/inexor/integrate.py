@@ -164,12 +164,17 @@ def kdk_table(a_steps, cosmo, integrator="exact"):
         a0, a1 = float(a_steps[i]), float(a_steps[i + 1])
         a_c = 0.5 * (a0 + a1)
         if integrator == "exact":
-            co[i] = (kick_factor(a0, a_c, cosmo), drift_factor(a0, a1, cosmo),
-                     kick_factor(a_c, a1, cosmo))
+            co[i] = (
+                kick_factor(a0, a_c, cosmo),
+                drift_factor(a0, a1, cosmo),
+                kick_factor(a_c, a1, cosmo),
+            )
         elif integrator == "fastpm":
-            co[i] = (fastpm_kick_factor(a0, a_c, a0, cosmo),
-                     fastpm_drift_factor(a0, a1, a_c, cosmo),
-                     fastpm_kick_factor(a_c, a1, a1, cosmo))
+            co[i] = (
+                fastpm_kick_factor(a0, a_c, a0, cosmo),
+                fastpm_drift_factor(a0, a1, a_c, cosmo),
+                fastpm_kick_factor(a_c, a1, a1, cosmo),
+            )
         else:
             raise ValueError(f"integrator must be 'exact' or 'fastpm', got {integrator!r}")
     return co
@@ -364,8 +369,9 @@ def run_scan(x, w, consts, step, force_fn, s_x, reverse=False, fdtype=jnp.float3
     return x, w
 
 
-def run_perstep(x, w, consts, step, force_fn, s_x, reverse=False, fdtype=jnp.float32,
-                monitor=False, donate=True):
+def run_perstep(
+    x, w, consts, step, force_fn, s_x, reverse=False, fdtype=jnp.float32, monitor=False, donate=True
+):
     """Per-step-jit driver: python loop over ONE compiled executable with buffer
     donation (production driver; guarantees fwd/rev share compiled programs and
     in-place carry semantics -- Sec. 9 ceiling (1)). monitor=True collects
@@ -408,8 +414,21 @@ def _kdk_setup(box, time, quant, cosmo, p_max0, fdtype):
     return table, kdk_consts(table, s_w0, box.s_x, fdtype), s_w0, g_ratio
 
 
-def evolve(box, time, quant, cosmo, x0_f, v0_f, *, driver="scan", paint="int",
-           frac_bits=None, return_int_state=False, monitor=False, fdtype=jnp.float32):
+def evolve(
+    box,
+    time,
+    quant,
+    cosmo,
+    x0_f,
+    v0_f,
+    *,
+    driver="scan",
+    paint="int",
+    frac_bits=None,
+    return_int_state=False,
+    monitor=False,
+    fdtype=jnp.float32,
+):
     """Quantized forward evolution: floats in, floats out (integer inside).
 
     x0_f: physical positions (n, 3) in [0, L); v0_f: D-time velocities dx/dD
@@ -465,8 +484,9 @@ def evolve_float(box, time, cosmo, x0_f, v0_f, *, paint="f32", fdtype=jnp.float3
         coeffs = bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo))
         x, v = x0_f.astype(fdtype), v0_f.astype(fdtype)
         for c in coeffs:
-            x, v = float_step_bullfrog(x, v, tuple(np.asarray(c, np.float64)), force_fn,
-                                       box.box_size)
+            x, v = float_step_bullfrog(
+                x, v, tuple(np.asarray(c, np.float64)), force_fn, box.box_size
+            )
         return x, v
     table = kdk_table(a_steps, cosmo, time.integrator)
     x = x0_f.astype(fdtype)
@@ -476,8 +496,19 @@ def evolve_float(box, time, cosmo, x0_f, v0_f, *, paint="f32", fdtype=jnp.float3
     return x, p_to_v(p, time.a_final, cosmo)
 
 
-def replay_roundtrip(box, time, quant, cosmo, x0_f, v0_f, *, driver="scan",
-                     paint="int", s_w0_div=1.0, fdtype=jnp.float32):
+def replay_roundtrip(
+    box,
+    time,
+    quant,
+    cosmo,
+    x0_f,
+    v0_f,
+    *,
+    driver="scan",
+    paint="int",
+    s_w0_div=1.0,
+    fdtype=jnp.float32,
+):
     """Tier-0 primitive: encode once, K forward + K reverse, EXACT integer
     equality with the initial state. s_w0_div shrinks s_w0 to force mid-run w
     wraps (the R1 wrap-adversarial arm; D-007). Returns (ok, n_diff)."""
@@ -513,8 +544,18 @@ def replay_roundtrip(box, time, quant, cosmo, x0_f, v0_f, *, driver="scan",
     return n_diff == 0, n_diff
 
 
-def simulate(box, time, quant, cosmo, seed=0, f_NL=0.0, lpt_order=2, amplitude=1.0,
-             quantized=True, **evolve_kw):
+def simulate(
+    box,
+    time,
+    quant,
+    cosmo,
+    seed=0,
+    f_NL=0.0,
+    lpt_order=2,
+    amplitude=1.0,
+    quantized=True,
+    **evolve_kw,
+):
     """IC -> LPT -> evolve, the mbody leapfrog() analog. Returns (x_f, v_f[, ...]).
 
     quantized=False routes through evolve_float (never-quantized reference).

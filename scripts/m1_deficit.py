@@ -114,10 +114,43 @@ def run_cell(n, K, integ, lpt_order, seed=0, pk_source="eh98", spacing="log"):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument(
+        "--seeds",
+        type=int,
+        default=0,
+        help="ALSO sweep this many seeds at the headline cell (64^3 K=10 "
+        "bullfrog 2LPT) -- the mean pins the deficit against its "
+        "large per-realization scatter",
+    )
     ap.add_argument("--out", default=os.path.join(M.RUNS, "deficit_matrix.json"))
     args = ap.parse_args()
 
     cells = []
+    if args.seeds:
+        gds, ads = [], []
+        for seed in range(args.seeds):
+            c = run_cell(64, 10, "bullfrog", 2, seed=seed)
+            cells.append(c)
+            gds.append(c["growth_dev_lowk"])
+            ads.append(c["abs_dev_lowk"])
+            print(
+                f"seed={seed:2d}: growth_dev {c['growth_dev_lowk']:+.4f}  "
+                f"abs_dev {c['abs_dev_lowk']:+.4f}  ic_dev {c['ic_dev_lowk']:+.4f}"
+            )
+        gds, ads = np.array(gds), np.array(ads)
+        print(
+            f"SEED SWEEP (n={args.seeds}): growth_dev mean {gds.mean():+.4f} "
+            f"+- {gds.std(ddof=1) / np.sqrt(len(gds)):.4f} (scatter {gds.std(ddof=1):.4f}); "
+            f"abs_dev mean {ads.mean():+.4f} (scatter {ads.std(ddof=1):.4f})"
+        )
+        out = dict(
+            meta=M.make_meta("inexor", "deficit-seeds", dict(klow=KLOW, n_seeds=args.seeds), REPO),
+            cells=cells,
+        )
+        with open(os.path.join(M.RUNS, "deficit_seeds.json"), "w") as f:
+            json.dump(out, f, indent=1)
+        return
+
     if args.quick:
         combos = [(64, 10, "bullfrog", 1), (64, 10, "bullfrog", 2)]
     else:

@@ -224,9 +224,7 @@ class IntPipe:
                 g = force(x1.astype(F32) * s_x)
                 wp = mc.isub(w, mc.rint_i(c.kappa * g))
                 xp = mc.imask_sub(x1, mc.rint_i(c.c1 * wp.astype(F32)), B)
-                _, vjp = jax.vjp(
-                    lambda a, b: step_float1(a, b, c), xp.astype(F32), wp.astype(F32)
-                )
+                _, vjp = jax.vjp(lambda a, b: step_float1(a, b, c), xp.astype(F32), wp.astype(F32))
                 xb, wb = vjp((xb, wb))
                 return (xp, wp, xb, wb), None
 
@@ -397,10 +395,14 @@ def fd_analysis(loss_of_theta, theta0, eps_list, loss_scale, n_reg=11):
         lp, xp_, wp_ = loss_of_theta(theta0 + eps)
         lm, xm_, wm_ = loss_of_theta(theta0 - eps)
         flips = int(jnp.sum(xp_ != xm_)) + int(jnp.sum(wp_ != wm_))
-        sweep.append(dict(
-            eps=float(eps), g=float((lp - lm) / (2 * eps)), flips=flips,
-            dL=float(abs(lp - lm)),
-        ))
+        sweep.append(
+            dict(
+                eps=float(eps),
+                g=float((lp - lm) / (2 * eps)),
+                flips=flips,
+                dL=float(abs(lp - lm)),
+            )
+        )
     # plateau: widest contiguous window, >= 1 decade, g within 10% of window
     # median, flips >= 1e4, dL >= 100 * f32 loss noise at both ends
     valid = [s for s in sweep]
@@ -498,8 +500,10 @@ def main():
     same = bool(
         jnp.array_equal(xa, xb.astype(jnp.int32)) and jnp.array_equal(wa, wb.astype(jnp.int16))
     )
-    print(f"[gate] imask(B=16) trajectory == uint16/int16 production path: "
-          f"{'PASS' if same else 'FAIL'}")
+    print(
+        f"[gate] imask(B=16) trajectory == uint16/int16 production path: "
+        f"{'PASS' if same else 'FAIL'}"
+    )
     if not same:
         raise SystemExit("production-path bit-identity failed; fix before any verdict")
 
@@ -535,35 +539,52 @@ def main():
                 lval = float(lot(jnp.asarray(th0, F32))[0])
                 g_ste, (gx0, gv0), _ = pipe.field_grad_eager(kind, th0, loss_name)
                 g_scan = pipe.grad_scan_driver(kind, th0, loss_name)
-                g_flt, _ = (FloatPipe(suk) if K != K0 else fp).grad(kind, th0, loss_name) \
-                    if K != K0 else fp.grad(kind, th0, loss_name)
+                g_flt, _ = (
+                    (FloatPipe(suk) if K != K0 else fp).grad(kind, th0, loss_name)
+                    if K != K0
+                    else fp.grad(kind, th0, loss_name)
+                )
                 fd = fd_analysis(lot, th0, eps_list, abs(lval))
                 # cosine of field gradients vs the float anchor (production q only)
                 cos = None
                 if (B, m) == (16, 0):
-                    fgx, fgv = (FloatPipe(suk) if K != K0 else fp).field_grad(
-                        kind, th0, loss_name
+                    fgx, fgv = (FloatPipe(suk) if K != K0 else fp).field_grad(kind, th0, loss_name)
+                    cos = cosine(
+                        np.concatenate([gx0.ravel(), gv0.ravel()]),
+                        np.concatenate([fgx.ravel(), fgv.ravel()]),
                     )
-                    cos = cosine(np.concatenate([gx0.ravel(), gv0.ravel()]),
-                                 np.concatenate([fgx.ravel(), fgv.ravel()]))
                 ent = dict(
-                    B=B, m=m, K=K, loss=loss_name, param=pname, loss_val=lval,
+                    B=B,
+                    m=m,
+                    K=K,
+                    loss=loss_name,
+                    param=pname,
+                    loss_val=lval,
                     q_rel=2.0 ** (16 - B),
-                    g_ste=g_ste, g_scan=g_scan, g_float=g_flt,
+                    g_ste=g_ste,
+                    g_scan=g_scan,
+                    g_float=g_flt,
                     driver_rel_diff=abs(g_ste - g_scan) / max(abs(g_ste), 1e-30),
                     fd_valid=fd["valid"],
-                    g_fd=fd.get("slope"), fd_se=fd.get("se"),
-                    fd_window=fd.get("window"), fd_sweep=fd["sweep"],
+                    g_fd=fd.get("slope"),
+                    fd_se=fd.get("se"),
+                    fd_window=fd.get("window"),
+                    fd_sweep=fd["sweep"],
                     cos_vs_float=cos,
                     wall_s=time.time() - tt,
                 )
                 results["entries"].append(ent)
-                fdtxt = (f"g_FD={fd['slope']:+.4e}+-{fd['se']:.1e}" if fd["valid"]
-                         else "FD INVALID (no plateau)")
-                print(f"  [B={B} m={m} K={K:2d} {loss_name:4s} {pname:3s}] "
-                      f"g_STE={g_ste:+.4e} g_scan={g_scan:+.4e} g_flt={g_flt:+.4e} "
-                      f"{fdtxt} cos={cos if cos is None else round(cos, 6)} "
-                      f"({ent['wall_s']:.0f}s)")
+                fdtxt = (
+                    f"g_FD={fd['slope']:+.4e}+-{fd['se']:.1e}"
+                    if fd["valid"]
+                    else "FD INVALID (no plateau)"
+                )
+                print(
+                    f"  [B={B} m={m} K={K:2d} {loss_name:4s} {pname:3s}] "
+                    f"g_STE={g_ste:+.4e} g_scan={g_scan:+.4e} g_flt={g_flt:+.4e} "
+                    f"{fdtxt} cos={cos if cos is None else round(cos, 6)} "
+                    f"({ent['wall_s']:.0f}s)"
+                )
 
     # ------------------------------------------------------------------
     # verdict: O(q) slope + int16 relative error + K trend
@@ -573,9 +594,15 @@ def main():
         for _, _, pname in params:
             es, qs = [], []
             for B, m in q_configs:
-                e = [x for x in results["entries"]
-                     if x["B"] == B and x["m"] == m and x["K"] == K0
-                     and x["loss"] == loss_name and x["param"] == pname]
+                e = [
+                    x
+                    for x in results["entries"]
+                    if x["B"] == B
+                    and x["m"] == m
+                    and x["K"] == K0
+                    and x["loss"] == loss_name
+                    and x["param"] == pname
+                ]
                 if e and e[0]["fd_valid"]:
                     err = abs(e[0]["g_ste"] - e[0]["g_fd"])
                     if err > 3 * e[0]["fd_se"]:  # below FD SE = indistinguishable
@@ -591,17 +618,28 @@ def main():
             # "does gradient error scale with q" -- this answers it robustly.
             qa, ea = [], []
             for B, m in q_configs:
-                e = [x for x in results["entries"]
-                     if x["B"] == B and x["m"] == m and x["K"] == K0
-                     and x["loss"] == loss_name and x["param"] == pname]
+                e = [
+                    x
+                    for x in results["entries"]
+                    if x["B"] == B
+                    and x["m"] == m
+                    and x["K"] == K0
+                    and x["loss"] == loss_name
+                    and x["param"] == pname
+                ]
                 if e and abs(e[0]["g_ste"] - e[0]["g_float"]) > 0:
                     qa.append(e[0]["q_rel"])
                     ea.append(abs(e[0]["g_ste"] - e[0]["g_float"]))
-            slope_anchor = (float(np.polyfit(np.log(qa), np.log(ea), 1)[0])
-                            if len(ea) >= 3 else None)
-            e16 = [x for x in results["entries"]
-                   if x["B"] == 16 and x["m"] == 0 and x["K"] == K0
-                   and x["loss"] == loss_name and x["param"] == pname]
+            slope_anchor = float(np.polyfit(np.log(qa), np.log(ea), 1)[0]) if len(ea) >= 3 else None
+            e16 = [
+                x
+                for x in results["entries"]
+                if x["B"] == 16
+                and x["m"] == 0
+                and x["K"] == K0
+                and x["loss"] == loss_name
+                and x["param"] == pname
+            ]
             rel16 = None
             if e16 and e16[0]["fd_valid"]:
                 rel16 = abs(e16[0]["g_ste"] - e16[0]["g_fd"]) / abs(e16[0]["g_fd"])
@@ -609,8 +647,10 @@ def main():
             else:
                 sig16 = None
             verdict[f"{loss_name}/{pname}"] = dict(
-                oq_slope=slope, oq_slope_anchor=slope_anchor,
-                rel_err_int16=rel16, nsigma_int16=sig16
+                oq_slope=slope,
+                oq_slope_anchor=slope_anchor,
+                rel_err_int16=rel16,
+                nsigma_int16=sig16,
             )
     results["verdict"] = verdict
 
@@ -620,10 +660,12 @@ def main():
 
     print("\nR4 verdict inputs (threshold = measure-then-negotiate with JC):")
     for k, v in verdict.items():
-        print(f"  {k}: O(q) slope p = {v['oq_slope']} "
-              f"(anchor-based p = {v['oq_slope_anchor']}), "
-              f"rel err @ int16 = {v['rel_err_int16']}, "
-              f"nsigma vs FD SE = {v['nsigma_int16']}")
+        print(
+            f"  {k}: O(q) slope p = {v['oq_slope']} "
+            f"(anchor-based p = {v['oq_slope_anchor']}), "
+            f"rel err @ int16 = {v['rel_err_int16']}, "
+            f"nsigma vs FD SE = {v['nsigma_int16']}"
+        )
     print(f"total wall: {(time.time() - t0) / 60:.1f} min; outputs: {out.resolve()}")
 
 
@@ -633,8 +675,15 @@ def make_figures(results, out, q_configs, Ks, losses, params):
     fig, axes = plt.subplots(1, len(params), figsize=(4.2 * len(params), 3.6), squeeze=False)
     for j, (_, _, pname) in enumerate(params):
         ax = axes[0][j]
-        e = [x for x in ents if x["B"] == 16 and x["m"] == 0 and x["K"] == results["config"]["K0"]
-             and x["loss"] == "band" and x["param"] == pname]
+        e = [
+            x
+            for x in ents
+            if x["B"] == 16
+            and x["m"] == 0
+            and x["K"] == results["config"]["K0"]
+            and x["loss"] == "band"
+            and x["param"] == pname
+        ]
         if e:
             sw = e[0]["fd_sweep"]
             ax.semilogx([s["eps"] for s in sw], [s["g"] for s in sw], "o-", color=OI[0], ms=4)
@@ -658,16 +707,27 @@ def make_figures(results, out, q_configs, Ks, losses, params):
         for pi, (_, _, pname) in enumerate(params):
             qs, es = [], []
             for B, m in q_configs:
-                e = [x for x in ents if x["B"] == B and x["m"] == m
-                     and x["K"] == results["config"]["K0"]
-                     and x["loss"] == loss_name and x["param"] == pname]
+                e = [
+                    x
+                    for x in ents
+                    if x["B"] == B
+                    and x["m"] == m
+                    and x["K"] == results["config"]["K0"]
+                    and x["loss"] == loss_name
+                    and x["param"] == pname
+                ]
                 if e and e[0]["fd_valid"]:
                     qs.append(e[0]["q_rel"])
                     es.append(abs(e[0]["g_ste"] - e[0]["g_fd"]) / abs(e[0]["g_fd"]))
             if qs:
-                ax.loglog(qs, es, marker="o", color=OI[pi % len(OI)],
-                          ls="-" if loss_name == "band" else "--",
-                          label=f"{loss_name}/{pname}")
+                ax.loglog(
+                    qs,
+                    es,
+                    marker="o",
+                    color=OI[pi % len(OI)],
+                    ls="-" if loss_name == "band" else "--",
+                    label=f"{loss_name}/{pname}",
+                )
     qq = np.array([1, 64.0])
     ax.loglog(qq, 1e-3 * qq, "k:", lw=1, label="slope 1 guide")
     ax.set_xlabel("quantization step / production int16 step")
@@ -683,8 +743,15 @@ def make_figures(results, out, q_configs, Ks, losses, params):
     for pi, (_, _, pname) in enumerate(params):
         Ks_s, rels, coss = [], [], []
         for K in sorted(set(Ks)):
-            e = [x for x in ents if x["B"] == 16 and x["m"] == 0 and x["K"] == K
-                 and x["loss"] == "band" and x["param"] == pname]
+            e = [
+                x
+                for x in ents
+                if x["B"] == 16
+                and x["m"] == 0
+                and x["K"] == K
+                and x["loss"] == "band"
+                and x["param"] == pname
+            ]
             if e and e[0]["fd_valid"]:
                 Ks_s.append(K)
                 rels.append(abs(e[0]["g_ste"] - e[0]["g_fd"]) / abs(e[0]["g_fd"]))

@@ -67,9 +67,7 @@ def make_float_step(force, L):
 def run_float(x0, v0, ladder, stepf):
     x, v = x0, v0
     for k in range(ladder.n_steps):
-        x, v = stepf(
-            x, v, 0.5 * ladder.dD[k], ladder.alphas[k], ladder.betas[k] / ladder.D_mid[k]
-        )
+        x, v = stepf(x, v, 0.5 * ladder.dD[k], ladder.alphas[k], ladder.betas[k] / ladder.D_mid[k])
     return np.asarray(x), np.asarray(v)
 
 
@@ -256,7 +254,9 @@ def main():
 
     # --- b sweep at fiducial K
     for b in B_OFFSETS:
-        if not (b == 0 and any(r["schedule"] == "log0.1" and r["K"] == Kf for r in results["runs"])):
+        if not (
+            b == 0 and any(r["schedule"] == "log0.1" and r["K"] == Kf for r in results["runs"])
+        ):
             vq_arm("log0.1", Kf, b)
 
     # --- alternate schedules at policy s_w0
@@ -271,8 +271,11 @@ def main():
     hd_gate = np.log2(1.0 / 0.9)  # the 0.9*32767 monitor line
     window = []
     for b in B_OFFSETS:
-        rr = [r for r in results["runs"] if r["schedule"] == "log0.1" and r["K"] == Kf
-              and r["b_off"] == b]
+        rr = [
+            r
+            for r in results["runs"]
+            if r["schedule"] == "log0.1" and r["K"] == Kf and r["b_off"] == b
+        ]
         if not rr:
             continue
         r = rr[0]
@@ -287,23 +290,36 @@ def main():
         # hard bar); abs = below 1e-4 relative everywhere in the band.
         ok_strict = bool((ratio <= floor).all())
         ok_abs = bool((ratio <= 1e-4).all())
-        window.append(dict(b=b, ok_range=ok_range, ok_noise_strict=ok_strict,
-                           ok_noise_1e4=ok_abs, ok=ok_range and ok_abs))
+        window.append(
+            dict(
+                b=b,
+                ok_range=ok_range,
+                ok_noise_strict=ok_strict,
+                ok_noise_1e4=ok_abs,
+                ok=ok_range and ok_abs,
+            )
+        )
     n_ok = sum(1 for wdw in window if wdw["ok"])
     n_strict = sum(1 for wdw in window if wdw["ok_range"] and wdw["ok_noise_strict"])
     verdict = "PASS" if n_ok >= 2 else "FAIL"
     results["verdict"] = dict(window=window, n_ok=n_ok, n_strict=n_strict, verdict=verdict)
 
     with open(out / "r2_results.json", "w") as fh:
-        json.dump(results, fh, indent=1,
-                  default=lambda o: o.item() if isinstance(o, np.generic) else str(o))
+        json.dump(
+            results,
+            fh,
+            indent=1,
+            default=lambda o: o.item() if isinstance(o, np.generic) else str(o),
+        )
 
     make_figures(results, floors, out, k_nyq, Kf, K_fid, B_OFFSETS)
 
     cg = [r["c_growth"] for r in results["runs"] if r["schedule"] == "log0.1"]
-    print(f"\nR2 verdict: {verdict} (b window: {n_ok}/{len(window)} pass "
-          f"[range + noise<1e-4]; {n_strict}/{len(window)} also below the strict "
-          f"stepping floor at ALL k<=0.5k_Nyq -- gate bar to be set with JC)")
+    print(
+        f"\nR2 verdict: {verdict} (b window: {n_ok}/{len(window)} pass "
+        f"[range + noise<1e-4]; {n_strict}/{len(window)} also below the strict "
+        f"stepping floor at ALL k<=0.5k_Nyq -- gate bar to be set with JC)"
+    )
     print(f"  measured c_growth (log0.1) = {np.mean(cg):.2f} (policy placeholder was 4.0)")
     print(f"  guard fired: {[g['K'] for g in results['guard'] if g['fired']]} (lin0.04)")
     print(f"  total wall: {(time.time() - t0) / 60:.1f} min")
@@ -326,8 +342,13 @@ def make_figures(results, floors, out, k_nyq, Kf, K_fid, B_OFFSETS):
             rr = [r for r in runs if r["schedule"] == sname and r["K"] == K and r["b_off"] == 0]
             if rr:
                 hw = np.log2(32767.0 / np.maximum(np.array(rr[0]["maxw"]), 1))
-                ax.plot(np.arange(len(hw)), hw, ls, color=cmap(i / max(len(K_fid) - 1, 1)),
-                        label=f"{sname} K={K}" if ls == "-" or K in (5, 10, 15) else None)
+                ax.plot(
+                    np.arange(len(hw)),
+                    hw,
+                    ls,
+                    color=cmap(i / max(len(K_fid) - 1, 1)),
+                    label=f"{sname} K={K}" if ls == "-" or K in (5, 10, 15) else None,
+                )
     ax.axhline(0.0, color="k", lw=1)
     ax.axhline(np.log2(1 / 0.9), color="k", lw=0.8, ls=":")
     ax.set_xlabel("step")
@@ -345,17 +366,21 @@ def make_figures(results, floors, out, k_nyq, Kf, K_fid, B_OFFSETS):
     for ax, (title, sel_fn, color_of) in zip(
         axes,
         [
-            (f"b sweep, log0.1 K={Kf}",
-             lambda r: r["schedule"] == "log0.1" and r["K"] == Kf,
-             lambda r: cmap((r["b_off"] - min(B_OFFSETS)) / (max(B_OFFSETS) - min(B_OFFSETS)))),
-            ("K sweep, log0.1 b=0",
-             lambda r: r["schedule"] == "log0.1" and r["b_off"] == 0,
-             lambda r: cmap(K_fid.index(r["K"]) / max(len(K_fid) - 1, 1))),
+            (
+                f"b sweep, log0.1 K={Kf}",
+                lambda r: r["schedule"] == "log0.1" and r["K"] == Kf,
+                lambda r: cmap((r["b_off"] - min(B_OFFSETS)) / (max(B_OFFSETS) - min(B_OFFSETS))),
+            ),
+            (
+                "K sweep, log0.1 b=0",
+                lambda r: r["schedule"] == "log0.1" and r["b_off"] == 0,
+                lambda r: cmap(K_fid.index(r["K"]) / max(len(K_fid) - 1, 1)),
+            ),
         ],
     ):
         for r in runs:
             if sel_fn(r):
-                lab = (f"b={r['b_off']:+d}" if "b sweep" in title else f"K={r['K']}")
+                lab = f"b={r['b_off']:+d}" if "b sweep" in title else f"K={r['K']}"
                 ax.loglog(r["k"], np.abs(r["pk_ratio"]), color=color_of(r), label=lab, lw=1.4)
         fl = np.interp(kk_f32, np.array(runs[0]["k"]), floors[Kf])
         ax.loglog(kk_f32, fl, "k:", lw=1.2, label="PM stepping floor (F vs F-2K)")

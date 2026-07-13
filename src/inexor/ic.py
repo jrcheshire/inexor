@@ -31,8 +31,9 @@ from .cosmology import growth_factor_md, linear_power, transfer_eh98
 C_OVER_H0 = 299792.458 / 100.0
 
 
-def gaussian_delta(key, n_mesh, box_size, cosmo, fdtype=jnp.float32, amplitude=1.0,
-                   backend="eh98", table=None):
+def gaussian_delta(
+    key, n_mesh, box_size, cosmo, fdtype=jnp.float32, amplitude=1.0, backend="eh98", table=None
+):
     """Seeded z=0 linear density on the mesh: white noise coloured by P(k).
 
     Convention: delta_k = rfftn(white) * sqrt(P(|k|) * N^3 / L^3), so the
@@ -45,11 +46,13 @@ def gaussian_delta(key, n_mesh, box_size, cosmo, fdtype=jnp.float32, amplitude=1
     # |k| grid + sqrt(P) colour, host f64 then cast (precision island).
     kx = 2.0 * np.pi * np.fft.fftfreq(N, d=L / N)
     kz = 2.0 * np.pi * np.fft.rfftfreq(N, d=L / N)
-    kk = np.sqrt(
-        kx.reshape(N, 1, 1) ** 2 + kx.reshape(1, N, 1) ** 2 + kz.reshape(1, 1, -1) ** 2
-    )
+    kk = np.sqrt(kx.reshape(N, 1, 1) ** 2 + kx.reshape(1, N, 1) ** 2 + kz.reshape(1, 1, -1) ** 2)
+    # DC-safe |k| for the colour evaluation: the table backend refuses k
+    # outside its range (incl. k = 0), and the DC colour is overwritten below.
+    kk_safe = kk.copy()
+    kk_safe[0, 0, 0] = kk.flat[1]
     colour = np.sqrt(
-        linear_power(kk.ravel(), cosmo, backend=backend, table=table).reshape(kk.shape)
+        linear_power(kk_safe.ravel(), cosmo, backend=backend, table=table).reshape(kk.shape)
         * N**3
         / L**3
     )
@@ -84,9 +87,7 @@ def poisson_factor(n_mesh, box_size, cosmo, z=0.0):
     N, L = n_mesh, box_size
     kx = 2.0 * np.pi * np.fft.fftfreq(N, d=L / N)
     kz = 2.0 * np.pi * np.fft.rfftfreq(N, d=L / N)
-    k_mag = np.sqrt(
-        kx.reshape(N, 1, 1) ** 2 + kx.reshape(1, N, 1) ** 2 + kz.reshape(1, 1, -1) ** 2
-    )
+    k_mag = np.sqrt(kx.reshape(N, 1, 1) ** 2 + kx.reshape(1, N, 1) ** 2 + kz.reshape(1, 1, -1) ** 2)
     M = poisson_M(k_mag, cosmo, z=z)
     return np.where(k_mag > 0, M, 1.0)
 
@@ -141,9 +142,9 @@ def local_bispectrum_template(triangles, cosmo, f_NL, z=0.0):
     for t, (k1, k2, k3) in enumerate(tris):
         M1, M2, M3 = M[k1], M[k2], M[k3]
         P1, P2, P3 = Pk[k1], Pk[k2], Pk[k3]
-        out[t] = 2.0 * f_NL * (
-            M3 / (M1 * M2) * P1 * P2
-            + M2 / (M1 * M3) * P1 * P3
-            + M1 / (M2 * M3) * P2 * P3
+        out[t] = (
+            2.0
+            * f_NL
+            * (M3 / (M1 * M2) * P1 * P2 + M2 / (M1 * M3) * P1 * P3 + M1 / (M2 * M3) * P2 * P3)
         )
     return out
