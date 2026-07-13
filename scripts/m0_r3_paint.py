@@ -123,7 +123,16 @@ def main():
     n_part = 2**args.log2_n
     n_chunks = max(1, 2 ** max(args.log2_n - args.log2_chunk, 0))
     chunk = n_part // n_chunks
-    platform = jax.devices()[0].platform
+    # Backend probe in a THROWAWAY subprocess: the parent must not initialize its
+    # own JAX/CUDA context (which preallocates the pool) before the detflag
+    # children below have run -- on a 6 GB card the resident parent starves them.
+    # The parent's backend then initializes lazily at the first paint, after the
+    # children have exited. (jax.jit decoration and make_painters are init-free.)
+    if args.mode == "main":
+        platform = subprocess.run(
+            [sys.executable, "-c", "import jax; print(jax.default_backend())"],
+            capture_output=True, text=True,
+        ).stdout.strip() or "unknown"
 
     paint_int_c, paint_f32_c, _ = make_painters(N, L, args.frac_bits, n_chunks)
 
