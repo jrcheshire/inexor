@@ -38,7 +38,10 @@ F32 = jnp.float32
 
 
 def build(N, L, K, cosmo):
-    force = mc.make_force_fn(N, L, N**3)
+    # paint="int" (D-006): R1 certifies the PRIMAL replay path, which mandates the
+    # deterministic integer paint. The f32-paint default fails here on GPU exactly as
+    # architecture.md Sec. 5 predicts (dense, not sparse: runs/m0/r1_gpu_f32paint/).
+    force = mc.make_force_fn(N, L, N**3, paint="int")
     force_j = jax.jit(force)
     s_x = L / 2.0**16
     lad_u = mc.ladder_constants(mc.a_grid(0.1, 1.0, K, "log"), cosmo, 1.0, 1.0)
