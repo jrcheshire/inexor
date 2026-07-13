@@ -194,6 +194,9 @@ def main():
         for flavor in ("uniform", "clustered"):
             env = dict(os.environ)
             env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "") + " --xla_gpu_deterministic_ops=true")
+            # the parent's XLA pool stays resident for the child's lifetime; without
+            # this the child OOMs at startup on small (6 GB) cards
+            env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
             cmd = [sys.executable, __file__, "--mode", "detflag-bench", "--flavor", flavor,
                    "--log2-n", str(args.log2_n), "--mesh", str(args.mesh),
                    "--frac-bits", str(args.frac_bits), "--log2-chunk", str(args.log2_chunk)]
