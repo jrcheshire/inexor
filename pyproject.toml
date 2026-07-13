@@ -76,6 +76,11 @@ platforms = ["osx-arm64", "linux-64"]
 [tool.pixi.feature.parity.dependencies]
 camb = "*"
 pyccl = "*"
+# camb 1.6.5's BBN-YHe setter chokes on numpy 2.5 + scipy 1.18 (1-element
+# array refuses scalar conversion at model.py:687); mbody's proven combo is
+# numpy 2.4 + scipy 1.17 -- pin this env to that class until camb catches up.
+numpy = "<2.5"
+scipy = "<1.18"
 
 [tool.pixi.environments]
 default = ["jax"]
