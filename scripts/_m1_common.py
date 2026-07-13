@@ -196,6 +196,40 @@ def pk(delta, n, L):
     return kc, PA
 
 
+def cic_window_modes(n, L):
+    """Field-level CIC window on the rfft grid: W(k) = prod_i sinc^2(k_i d / (2 pi)).
+
+    A single painted field deconvolves as delta_k / W (P(k) then gains 1/W^2);
+    numpy sinc(x) = sin(pi x)/(pi x), so sinc(k d / (2 pi)) = sin(k d/2)/(k d/2)."""
+    d = L / n
+    kx = 2.0 * np.pi * np.fft.fftfreq(n, d=d)
+    kz = 2.0 * np.pi * np.fft.rfftfreq(n, d=d)
+
+    def s(k1d):
+        return np.sinc(k1d * d / (2.0 * np.pi))
+
+    return s(kx)[:, None, None] ** 2 * s(kx)[None, :, None] ** 2 * s(kz)[None, None, :] ** 2
+
+
+def pk_deconvolved(delta, n, L):
+    """Auto power with single-paint CIC deconvolution (delta_k / W)."""
+    dk = np.fft.rfftn(delta) / cic_window_modes(n, L)
+    kx = 2.0 * np.pi * np.fft.fftfreq(n, d=L / n)
+    kz = 2.0 * np.pi * np.fft.rfftfreq(n, d=L / n)
+    kmag = np.sqrt(kx[:, None, None] ** 2 + kx[None, :, None] ** 2 + kz[None, None, :] ** 2).ravel()
+    norm = L**3 / n**6
+    pa = (np.abs(dk) ** 2 * norm).ravel()
+    kf = 2.0 * np.pi / L
+    knyq = np.pi * n / L
+    edges = np.arange(0.5 * kf, knyq + kf, kf)
+    kc = 0.5 * (edges[1:] + edges[:-1])
+    idx = np.digitize(kmag, edges) - 1
+    nb = len(kc)
+    sel = (idx >= 0) & (idx < nb)
+    cnt = np.maximum(np.bincount(idx[sel], minlength=nb).astype(np.float64), 1.0)
+    return kc, np.bincount(idx[sel], weights=pa[sel], minlength=nb) / cnt
+
+
 # ----- comparison metrics -----------------------------------------------------
 
 
