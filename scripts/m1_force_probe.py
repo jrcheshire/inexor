@@ -99,14 +99,22 @@ def side_coeffs(tag):
     c = dj.cosmo
 
     D1u = float(np.asarray(c._timetables["Dplus_unnormed_at_1"]))
-    Dp = lambda x: np.asarray(c.Dplus(x), dtype=np.float64)
-    Dpda = lambda x: np.asarray(c.Dplusda(x), dtype=np.float64)
-    D2p = lambda x: np.asarray(
-        c.get_interpolated_property(x, key_from="a", key_to="D2plus"), dtype=np.float64
-    )
-    D2pda = lambda x: np.asarray(
-        c.get_interpolated_property(x, key_from="a", key_to="D2plusda"), dtype=np.float64
-    )
+
+    def Dp(x):
+        return np.asarray(c.Dplus(x), dtype=np.float64)
+
+    def Dpda(x):
+        return np.asarray(c.Dplusda(x), dtype=np.float64)
+
+    def D2p(x):
+        return np.asarray(
+            c.get_interpolated_property(x, key_from="a", key_to="D2plus"), dtype=np.float64
+        )
+
+    def D2pda(x):
+        return np.asarray(
+            c.get_interpolated_property(x, key_from="a", key_to="D2plusda"), dtype=np.float64
+        )
 
     a_mid = 0.5 * (a[:-1] + a[1:])  # internal = step index -> arithmetic a midpoint
     all_D = Dp(a) * D1u
