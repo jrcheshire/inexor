@@ -164,6 +164,7 @@ def main():
         if not det_f:
             m2 = paint_f32_c(pos)
             n_diff_f32 = int(jnp.sum(m2 != ref_f))
+            del m2
         t_int = bench(paint_int_c, pos)
         t_f32 = bench(paint_f32_c, pos)
         # mass conservation of the quantized weights (subsample)
@@ -184,6 +185,9 @@ def main():
               f"f32: det={det_f} (ndiff={n_diff_f32}) {t_f32 * 1e3:8.1f} ms | "
               f"slowdown={rec['slowdown']:.2f}x mass_err={mass_err:.1e} "
               f"max_cell={max_cell:.0f}")
+        # loop variables persist across iterations: without this, the next flavor's
+        # position build double-buffers ~2.6 GB of dead arrays (OOM on a 6 GB card)
+        del pos, ref_i, ref_f
 
     # --xla_gpu_deterministic_ops arm (GPU only; process-global -> re-exec)
     if authoritative:
