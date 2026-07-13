@@ -67,9 +67,20 @@ jax = "*"
 jaxlib = { version = "*", build = "*cuda*" }
 cuda-version = "12.*"
 
+# Parity env: CAMB (+ pyccl cross-check) for the M1 parity harness ONLY --
+# the default env stays jax+numpy+scipy. mbody and DISCO-DJ are never
+# installed here; the harness exchanges npz files across their own pixi envs
+# (cross-process parity, plan tender-stargazing-map S5).
+[tool.pixi.feature.parity]
+platforms = ["osx-arm64", "linux-64"]
+[tool.pixi.feature.parity.dependencies]
+camb = "*"
+pyccl = "*"
+
 [tool.pixi.environments]
 default = ["jax"]
 gpu = ["gpu"]
+parity = ["jax", "parity"]
 
 [tool.pixi.tasks]
 # `-n auto` (pytest-xdist) parallelizes across cores; OMP_NUM_THREADS=1 pins one
