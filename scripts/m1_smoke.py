@@ -1,8 +1,14 @@
 """M1 S7: forward smoke at scale on CUDA (deneb RTX 3050, 6 GB).
 
 Attempts the M1-exit 512^3 forward run (2LPT ICs -> int16 BullFrog evolve,
-perstep driver with donation + max|w| monitor); on GPU OOM falls back to the
-PRE-AGREED 384^3 (documented, never silent -- plan tender-stargazing-map S7).
+perstep driver with donation + max|w| monitor); on GPU OOM falls back to 256^3
+(documented, never silent). NOTE: the plan's pre-agreed 384^3 fallback is
+INVALID against the package -- BoxConfig requires 2^16 % n_mesh == 0 (the
+exact-Lagrangian-site sublattice invariant, architecture.md Sec. 3), and the
+only divisors of 2^16 are powers of two, so 256^3 is the sole valid mesh below
+512^3. The M0 R3 probe ran 384 because _m0_common predates that invariant.
+512^3 (134M particles) overflows the deneb 3050's 6 GB at IC generation and is
+deferred to a larger-GPU env (Vista aarch64, M2).
 --roundtrip additionally runs the K-forward + K-reverse exact replay at the
 smoke size (the product claim, at scale).
 
@@ -95,7 +101,7 @@ def attempt(n, K, lpt_order, do_roundtrip):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--n", type=int, default=512)
-    ap.add_argument("--fallback", type=int, default=384)
+    ap.add_argument("--fallback", type=int, default=256)
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--lpt", type=int, default=2)
     ap.add_argument("--roundtrip", action="store_true")
@@ -109,7 +115,7 @@ def main():
         if "RESOURCE_EXHAUSTED" not in msg and "Out of memory" not in msg.lower():
             raise
         print(
-            f"{args.n}^3 OOM on this device -- falling back to the pre-agreed "
+            f"{args.n}^3 OOM on this device -- falling back to "
             f"{args.fallback}^3 (documented, not silent):\n  {msg.splitlines()[0]}"
         )
         rec = attempt(args.fallback, args.steps, args.lpt, args.roundtrip)
