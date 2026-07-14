@@ -14,6 +14,8 @@ kill-or-confirm probes all passed (docs/decisions.md D-010..D-012).
 House rule: this library NEVER touches jax.config -- callers opt into x64.
 """
 
+from importlib.metadata import version as _metadata_version
+
 from .adjoint import adjoint_grad_fnl, adjoint_grad_ic, evolve_grad
 from .config import PLANCK, BoxConfig, Cosmology, QuantConfig, TimeConfig
 from .integrate import evolve, evolve_float, replay_roundtrip, simulate
@@ -33,5 +35,10 @@ __all__ = [
     "simulate",
 ]
 
-__version__ = "0.0.1.dev0"
+# Single-sourced from pyproject.toml's [project] version. It is declared there
+# STATICALLY (not hatch-dynamic) because pixi must read this package's metadata
+# to solve foreign-platform envs -- notably the linux-aarch64 gpu env for Vista
+# -- and a dynamic version forces it to execute hatchling with an interpreter it
+# cannot have for a platform it cannot run. Do not reintroduce dynamic version.
+__version__ = _metadata_version("inexor")
 __author__ = "James Cheshire"

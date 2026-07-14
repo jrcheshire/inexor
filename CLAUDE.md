@@ -25,9 +25,10 @@ detailed milestone plan (master-plan convention): `adjoint.py` custom_vjp
 exact-replay adjoint, money plots, Vista aarch64 pixi feature lands here.
 
 Deneb git relay: bare repo `deneb:~/git/inexor.git` (remote `deneb`),
-working clone `deneb:~/spherex/inexor` — push here AND to origin; deneb has
-no GitHub key. Deneb's RTX 3050 is the 6 GB variant; jobs REQUIRE explicit
-`--mem` (see the umbrella albireo memory).
+working clone `deneb:~/spherex/inexor` — push here AND to origin. GitHub
+access is HTTPS + PAT (deneb has `credential.helper store`); never SSH.
+Deneb's RTX 3050 is the 6 GB variant; jobs REQUIRE explicit `--mem` (see the
+umbrella albireo memory).
 
 ## Doc map (read before proposing anything)
 

@@ -110,11 +110,20 @@ Exit: docs/m4-results.md; paper assembly (outline -> draft).
 - Two-level tiled mesh (CUBE2/sCOLA pattern) -> 2048^3-class meshes /
   beyond-HBM; re-opens determinism questions (sharded psums) — quarantined
   from the core design.
-- Vista linux-aarch64 pixi feature (xcat pattern) when GH200 runs become
-  routine.
+- ~~Vista linux-aarch64 pixi feature (xcat pattern)~~ **DONE at M2 S4**
+  (2026-07-14): folded into the existing `gpu` feature rather than a separate
+  one -- the specs were already right, only `platforms` was x86-only, so `gpu`
+  now spans linux-64 (deneb) + linux-aarch64 (Vista GH200). conda-forge does
+  ship an aarch64 CUDA jaxlib, so this is a committed-lock install with no
+  native solve on Vista. Required making `version` static (see below).
 - Public flip + PyPI: check `inexor` name availability BEFORE any release;
   author-field release-blocker checklist (pyproject authors/maintainers,
   CITATION.cff, __author__, built METADATA) — "James Cheshire" everywhere.
+  Version bumps go in `pyproject.toml` `[project] version` — the SINGLE source
+  since M2 S4; `src/inexor/__init__.py` reads it back via importlib.metadata.
+  Do NOT reintroduce `dynamic = ["version"]`: it breaks pixi's foreign-platform
+  solve (the aarch64 gpu env for Vista) because pixi must execute hatchling with
+  an interpreter it cannot have for a platform it cannot run.
 - CDF-shaped bins for *output* snapshot compression (not evolving state).
 - sCOLA-style spatial tiling (the far bigger memory lever, per the research
   session) — a separate project decision, not an inexor milestone yet.
