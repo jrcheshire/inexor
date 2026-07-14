@@ -43,13 +43,24 @@ export CUDA_VISIBLE_DEVICES=0
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export JAX_COMPILATION_CACHE_DIR=$SCRATCH/inexor-xla-cache
 
+# MANDATORY on any single-GPU node. The `test`/`test-det` tasks use
+# `pytest -n auto`; `auto` resolves to the CPU count (Vista's Grace host has 72)
+# and each xdist worker initializes JAX and preallocates MEM_FRACTION of the
+# SAME GH200. Deneb job 16 died exactly this way (workers fighting over one
+# card, GPU at 0%, "failures" that were really OOM). ONE process for GPU tests.
+export PYTEST_XDIST_AUTO_NUM_WORKERS=1
+
 echo "=== env ==="
 git log --oneline -1
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv || true
 pixi run -e gpu python -c "import jax; print(jax.__version__, jax.devices())"
 
 echo "=== full suite (gpu env, incl. slow tier-0 + test_adjoint) ==="
-OMP_NUM_THREADS=1 pixi run -e gpu python -m pytest tests/ -q
+# test-all = test (skips the detflag bit-equality tests on GPU, visibly) +
+# test-det (re-runs them in their OWN process under XLA deterministic ops --
+# XLA_FLAGS is read at backend init, so it cannot be set per test). Job 831091's
+# 4 failures were these tests hitting the nondeterministic f32 scatter-add.
+pixi run -e gpu test-all
 
 echo "=== M1's deferred 512^3 forward smoke + exact roundtrip ==="
 pixi run -e gpu python scripts/m1_smoke.py --roundtrip
