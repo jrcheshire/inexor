@@ -9,19 +9,25 @@ own production mocks; mbody owns MLX/Apple-Silicon).
 
 ## Current milestone
 
-**M0 PASSED — GO** (gate review with JC, 2026-07-13). All five probes PASS
-under the ratified thresholds: R4 gate 7.5e-2 relative gradient error
-(measured 9e-4..3e-2); R2 bar = relative P(k) <= 1e-4; R1 100/100 x 5
-drivers CUDA-exact; R3 int paint deterministic AND faster than f32; R5
-strict. Verdict ADRs D-010..D-012 in `docs/decisions.md` (incl. c_growth
-4.0 -> 2.5 and the K >= 3 schedule-feasibility paper limitation); probe
-outputs in `runs/m0/` (both laptop and deneb copies). NEXT: **M1 (forward
-PM)** — open it with a fresh detailed milestone plan (master-plan
-convention); real package code into `src/inexor/` (codec, painting, forces,
-lpt, ic, integrate), parity gates vs mbody + DISCO-DJ after measuring their
-own repro floors. Deneb git relay: bare repo `deneb:~/git/inexor.git`
-(remote `deneb`), working clone `deneb:~/spherex/inexor` — push here AND to
-origin; deneb has no GitHub key. Deneb's RTX 3050 is the 6 GB variant.
+**M1 (forward PM) DONE** (2026-07-13). Full package under `src/inexor/`;
+89 tests green. Forward PM validated: mbody parity at mbody's own repro
+floor (Tier A); DISCO-DJ gap attributed to 3 named conventions and closed
+at f64 roundoff -> gate D-013; M0 "4% deficit" decomposed (binning artifact
++ seed scatter + a real -2.6% code-independent mode-coupling suppression);
+Tier-B int16 = pure quantization below the PM mesh floor -> gate D-014;
+exact reversibility confirmed at scale on CUDA (256^3 roundtrip n_diff=0,
+deneb Slurm job 12). Record: `docs/m1-results.md`; ADRs D-013/D-014 in
+`docs/decisions.md`; plan `~/.claude/plans/tender-stargazing-map.md`.
+Deferred: 512^3 headline smoke (OOMs deneb's 6 GB 3050) -> a larger-GPU env
+(Vista aarch64) at M2. M0 PASSED — GO earlier same day (D-010..D-012;
+probe outputs `runs/m0/`). **NEXT: M2 (the adjoint)** — open it with a fresh
+detailed milestone plan (master-plan convention): `adjoint.py` custom_vjp
+exact-replay adjoint, money plots, Vista aarch64 pixi feature lands here.
+
+Deneb git relay: bare repo `deneb:~/git/inexor.git` (remote `deneb`),
+working clone `deneb:~/spherex/inexor` — push here AND to origin; deneb has
+no GitHub key. Deneb's RTX 3050 is the 6 GB variant; jobs REQUIRE explicit
+`--mem` (see the umbrella albireo memory).
 
 ## Doc map (read before proposing anything)
 

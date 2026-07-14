@@ -7,8 +7,9 @@ artifacts; milestone plans set file-level steps. Tolerances marked "measure
 first" are set with JC after the floor is measured — never assumed, never
 relaxed silently.
 
-Current status: **M0 PASSED — GO** (gate review 2026-07-13; verdicts + ratified
-thresholds in decisions.md D-010..D-012). Next: M1, opening with its own
+Current status: **M1 DONE** (2026-07-13; forward PM validated, results in
+docs/m1-results.md, gates D-013/D-014 in decisions.md). M0 PASSED — GO (gate
+review 2026-07-13; D-010..D-012). Next: M2 (the adjoint), opening with its own
 detailed milestone plan.
 
 ---
@@ -38,7 +39,16 @@ is measured-then-negotiated (open question #1 of the bootstrap plan).
 Exit artifacts: `scripts/m0_r{1..5}_*.py`, probe outputs under `runs/m0/`
 (gitignored, summarized in decisions.md), verdict ADR entries.
 
-## M1 — forward PM
+## M1 — forward PM  ✅ DONE (2026-07-13)
+
+Verdict: forward PM validated. mbody parity at mbody's own repro floor (Tier A,
+k-flat ~1e-6 dP/P); DISCO-DJ gap attributed to 3 named conventions and closed
+at f64 roundoff (2e-8 cells adapted replay) -> gate D-013; M0 "4% deficit"
+decomposed (binning artifact + seed scatter + a real -2.6% code-independent
+mode-coupling suppression); Tier-B int16 = pure quantization below the PM mesh
+floor -> gate D-014; exact reversibility confirmed at scale on CUDA (256^3
+n_diff=0). 512^3 headline run deferred to a larger-GPU env (Vista aarch64) at
+M2. Full record: docs/m1-results.md. Detailed plan: tender-stargazing-map.
 
 Scope: real package code. `codec.py` (int16 first), `painting.py`,
 `forces.py`, `lpt.py`, `ic.py`, `integrate.py` forward path (BullFrog +

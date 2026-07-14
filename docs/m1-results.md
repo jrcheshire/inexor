@@ -232,6 +232,63 @@ Readings:
   quoted candidates: max |dP/P| <= 5e-4 at the production config (measured
   2.8e-4) plus the strict below-mesh-floor invariant per band.
 
-## S7 — deneb CUDA legs + 512^3 smoke
+## S7 — deneb CUDA legs + at-scale smoke (2026-07-13)
 
-TBD.
+Authoritative CUDA re-confirmation on deneb's RTX 3050 (the **6 GB** variant),
+via Slurm (`scripts/m1_deneb.sbatch`; job 12). Two legs, `set -e` chained:
+
+1. **Full gpu-env pytest** — the tier-0 exact-reversibility and int-paint
+   determinism tests ARE the CUDA re-confirmation arms. **Clean** (all passed /
+   1 skipped for pyccl outside the parity env). This is the first suite run
+   with the M0->package migration bridge (`test_m0_bridge.py`) removed: it was
+   the temporary "package bit-matches the frozen `_m0_common` archive" check,
+   marked delete-at-M1-close, and its final CUDA run (job 10) confirmed every
+   meaningful arm bit-matches on GPU. Its lone failure was an f32-paint
+   bit-equality assert, which is invalid on GPU by construction — f32 CIC
+   scatter is non-associative, so two differently-compiled `paint_f32` programs
+   need not agree bit-for-bit (exactly R3's "f32 nondeterministic everywhere";
+   only int paint is bit-deterministic, and only int paint is on the reversible
+   path). Removed at M1 close as planned.
+
+2. **At-scale forward smoke + exact roundtrip** (`scripts/m1_smoke.py`,
+   `runs/m1/smoke_n256.json`; 2LPT ICs -> int16 BullFrog, perstep driver, K=10,
+   L=256 Mpc/h):
+
+   | leg | n | result |
+   |---|---|---|
+   | forward | 256^3 (16.7M particles) | 3.0 s, x_finite=True, no wrap |
+   | roundtrip (K fwd + K rev) | 256^3 | **exact=True, n_diff=0** (2.0 s) |
+
+   The n_diff=0 roundtrip is the product claim — bit-exact reversibility — now
+   demonstrated at scale on CUDA, not just in the unit tests. Velocity-frame
+   headroom: max|w| climbs monotonically to 27864 / 32767 = **0.85 of the int16
+   range** by the final step (`max_abs_w_per_step` in the json). No overflow
+   here, but ~15% margin — a longer schedule or higher sigma8 would eat into it;
+   the s_w0 policy governs this and stays a per-run diagnostic (W_ABS_WARN).
+
+**512^3 does not fit the 6 GB card**: OOMs at IC generation (the 134M-particle
+`max|v0|` reduce needs ~1.5 GiB on top of the 1.6 GB velocity array), even at
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`. Fell back to 256^3 (documented in the
+json: `fallback_used=True`, `oom_at_n=512`). The 512^3 headline run is deferred
+to a larger-GPU env (Vista aarch64, an M2 backlog item pending the aarch64 pixi
+feature).
+
+**Finding — the plan's pre-agreed 384^3 fallback was structurally invalid.**
+`BoxConfig` enforces `2^16 % n_mesh == 0` (the exact-Lagrangian-site sublattice
+invariant, architecture.md Sec. 3); 65536 / 384 = 170.67, and the only divisors
+of 2^16 are powers of two, so **256^3 is the sole valid mesh below 512^3**. The
+M0 R3 probe ran 384^3 only because `_m0_common` predates that invariant. Job 11
+surfaced this (raised `ValueError` after the 512^3 OOM); the fallback default
+was corrected 384 -> 256 (commit 26a235c).
+
+**Slurm ops** (recorded in the umbrella albireo memory): deneb jobs REQUIRE an
+explicit `--mem` — the partition default (124000M, sized for antares's 128 GB)
+exceeds deneb's 56 GB and makes the job permanently unschedulable (job 9 pended
+forever; fixed with `--mem=16G`). The gpu smoke co-schedules beside CPU jobs
+(OverSubscribe=OK).
+
+**M1 CLOSED.** Forward PM validated: mbody parity at mbody's own floor (Tier A),
+DISCO-DJ gap attributed to 3 conventions and closed at f64 roundoff, the M0
+"4% deficit" decomposed, Tier-B int16 quantization gated (D-014), and exact
+reversibility confirmed at scale on CUDA. Next: M2 (the adjoint), opening with
+its own detailed milestone plan.
