@@ -98,6 +98,14 @@ parity = ["jax", "parity"]
 # oversubscribes (same rationale + measured win as sfbfs/jht). env is per-task.
 test = { cmd = "pytest -n auto", env = { OMP_NUM_THREADS = "1" } }
 test-fast = { cmd = "pytest -m 'not slow' -n auto", env = { OMP_NUM_THREADS = "1" } }
+# `detflag` tests assert BIT equality and need XLA deterministic ops on GPU (the
+# f32 scatter-add is otherwise nondeterministic -- M2 S4, deneb jobs 14/15).
+# XLA_FLAGS is process-wide and read at backend init, so they need their OWN
+# process: `test` skips them visibly on GPU (tests/conftest.py), `test-det` runs
+# them. env is per-task, so the flag cannot leak into `test` -- which is exactly
+# why this is depends-on and not `test && test-det` in one cmd string.
+test-det = { cmd = "pytest -m detflag -n auto", env = { OMP_NUM_THREADS = "1", XLA_FLAGS = "--xla_gpu_deterministic_ops=true" } }
+test-all = { depends-on = ["test", "test-det"] }
 lint = "ruff check"
 format = "ruff format"
 
@@ -108,4 +116,5 @@ line-length = 100
 testpaths = ["tests"]
 markers = [
   "slow: heavy validation / oracle-parity test; run by the full suite, not the fast gate",
+  "detflag: asserts BIT equality of a float quantity; needs XLA deterministic ops on GPU (the f32 scatter-add is nondeterministic -- M2 S4). Run by `test-det` in its own process; `test` skips it on GPU. See tests/conftest.py",
 ]

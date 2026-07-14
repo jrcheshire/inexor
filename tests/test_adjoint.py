@@ -54,10 +54,21 @@ def test_grad_runs_and_shapes(integrator, driver):
     assert float(jnp.linalg.norm(gx)) > 0 and float(jnp.linalg.norm(gv)) > 0
 
 
+@pytest.mark.detflag
 @pytest.mark.parametrize("integrator", INTEGRATORS)
 def test_scan_perstep_grads_identical(integrator):
-    """Both drivers produce a bit-identical integer trajectory (M1), so the
-    residual -- and therefore the gradient -- is identical."""
+    """Both drivers produce a bit-identical integer trajectory, so the residual
+    -- and therefore the gradient -- is identical.
+
+    The premise is MEASURED, not assumed: deneb job 14 found the cross-driver
+    residual bitwise equal on CUDA (0/12288 in both x and w, all three
+    integrators). So this is a genuine canary for the drivers diverging.
+
+    detflag: on GPU the gradient is only reproducible under XLA deterministic
+    ops -- not because the drivers disagree (they do not) but because the f32
+    scatter-add in the STE twin's VJP is nondeterministic, so this would fail
+    scan-vs-scan too. See tests/conftest.py.
+    """
     time = _time(integrator)
     x0, v0 = _ics()
 
@@ -168,8 +179,17 @@ def test_adjoint_grad_ic_matches_float_path(integrator):
         assert float(g_adj[i]) * float(g_flt[i]) > 0  # same sign
 
 
+@pytest.mark.detflag
 def test_adjoint_grad_fnl_equals_ic_component():
-    """The scalar f_NL wrapper equals the f_NL component of the length-2 grad."""
+    """The scalar f_NL wrapper equals the f_NL component of the length-2 grad.
+
+    detflag for the same reason as above, but note this compares two DIFFERENT
+    compiled programs (the f_NL wrapper vs the length-2 IC wrapper). Deterministic
+    ops make each reproducible run to run; they do not oblige two different
+    programs to agree bit for bit, so the rel=1e-6 here may still be too tight.
+    It passed on deneb (rel 4.9e-7) and failed on Vista (rel 2.2e-6) -- the same
+    test, two draws -- which is what flagged the nondeterminism in the first place.
+    """
     time = _time("bullfrog")
     g_fnl = adjoint_grad_fnl(_bandpower_loss_field, BOX, time, QUANT, COSMO, f_NL=5.0)
     g_ic = adjoint_grad_ic(_bandpower_loss_field, BOX, time, QUANT, COSMO, theta=(5.0, 1.0))
