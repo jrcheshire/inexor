@@ -14,6 +14,7 @@ kill-or-confirm probes all passed (docs/decisions.md D-010..D-012).
 House rule: this library NEVER touches jax.config -- callers opt into x64.
 """
 
+from .adjoint import evolve_grad
 from .config import PLANCK, BoxConfig, Cosmology, QuantConfig, TimeConfig
 from .integrate import evolve, evolve_float, replay_roundtrip, simulate
 
@@ -25,6 +26,7 @@ __all__ = [
     "TimeConfig",
     "evolve",
     "evolve_float",
+    "evolve_grad",
     "replay_roundtrip",
     "simulate",
 ]
