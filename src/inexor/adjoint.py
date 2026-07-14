@@ -45,6 +45,8 @@ import jax.numpy as jnp
 
 from .codec import dequant_w, dequant_x, encode_w, encode_x
 from .forces import make_force_fn
+from .ic import linear_density
+from .lpt import lpt_ics
 from .integrate import (
     _bullfrog_setup,
     _G_f,
@@ -187,3 +189,58 @@ def _evolve_grad_bwd(box, time, quant, cosmo, driver, fdtype, residual, cot):
 
 
 evolve_grad.defvjp(_evolve_grad_fwd, _evolve_grad_bwd)
+
+
+# ============================================================================
+# IC-parameter gradient wrappers (mbody adjoint_grad_* parity)
+# ============================================================================
+#
+# Because evolve_grad is a genuine custom_vjp, jax.grad over the composed
+# IC -> LPT -> evolve_grad -> loss chain reproduces mbody's _reversible_ic_grad
+# five-stage skeleton automatically: the reverse replay sweep (evolve_grad's
+# bwd) followed by the single IC VJP (through lpt_ics + linear_density to
+# theta). No manual sweep here -- composition IS the mechanism. These wrappers
+# are eager (the s_w0 ladder build is host-side, Sec. 8 boundary).
+#
+# loss_field(x_f, v_f) -> scalar. f_NL is multiplicative inside linear_density;
+# amplitude multiplies delta0 outside (mbody convention). simulate's f_NL == 0
+# python branch is skipped here (f_NL may be a tracer): linear_density(f_NL)
+# equals gaussian_delta at f_NL = 0 to FFT round-off.
+
+
+def _evolved_loss(loss_field, box, time, quant, cosmo, seed, f_NL, amplitude, lpt_order, driver, fdtype):
+    key = jax.random.PRNGKey(seed)
+    delta0 = amplitude * linear_density(key, box.n_mesh, box.box_size, cosmo, f_NL=f_NL, fdtype=fdtype)
+    x0, v0 = lpt_ics(delta0, box.box_size, time.a_init, cosmo, order=lpt_order, fdtype=fdtype)
+    x_f, v_f = evolve_grad(box, time, quant, cosmo, driver, fdtype, x0, v0)
+    return loss_field(x_f, v_f)
+
+
+def adjoint_grad_fnl(
+    loss_field, box, time, quant, cosmo, *, seed=0, f_NL=0.0, amplitude=1.0,
+    lpt_order=2, driver="scan", fdtype=jnp.float32,
+):
+    """Scalar d(loss_field)/d f_NL through the exact-replay adjoint (mbody
+    adjoint_grad_fnl parity). loss_field(x_f, v_f) -> scalar."""
+
+    def g(fnl):
+        return _evolved_loss(
+            loss_field, box, time, quant, cosmo, seed, fnl, amplitude, lpt_order, driver, fdtype
+        )
+
+    return jax.grad(g)(jnp.asarray(f_NL, dtype=fdtype))
+
+
+def adjoint_grad_ic(
+    loss_field, box, time, quant, cosmo, *, seed=0, theta=(0.0, 1.0),
+    lpt_order=2, driver="scan", fdtype=jnp.float32,
+):
+    """Length-2 d(loss_field)/d[f_NL, amplitude] through the exact-replay
+    adjoint (mbody adjoint_grad_ic parity). theta = (f_NL, amplitude)."""
+
+    def g(th):
+        return _evolved_loss(
+            loss_field, box, time, quant, cosmo, seed, th[0], th[1], lpt_order, driver, fdtype
+        )
+
+    return jax.grad(g)(jnp.asarray(theta, dtype=fdtype))
