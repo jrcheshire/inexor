@@ -26,7 +26,7 @@ echo "=== env ==="
 git log --oneline -1
 pixi run -e gpu python -c "import jax; print(jax.__version__, jax.devices())"
 
-echo "=== full suite (gpu env, incl. slow tier-0 + m0 bridge) ==="
+echo "=== full suite (gpu env, incl. slow tier-0) ==="
 OMP_NUM_THREADS=1 pixi run -e gpu python -m pytest tests/ -q
 
 echo "=== 512^3 smoke + roundtrip (384^3 fallback) ==="
