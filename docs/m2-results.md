@@ -193,26 +193,108 @@ Caveat: 64^3/128^3 are small enough that launch overhead is a real fraction of
 the wall, so the ratios need not hold at 512^3. Pricing C properly would need a
 Vista run at scale; not bought, given the direction.
 
-### R6 peak-memory profile — PENDING
+### M1's deferred 512^3 exit claim — CLOSED (Vista job 831303)
 
-`scripts/m2_mem_profile.py` is written and CPU-smoked but its GPU legs are UNRUN:
-job 831091 aborted at pytest (`set -e`) before reaching the 512^3 smoke and the
-profile. Re-run of `m2_vista.sbatch` (now passing its test leg) carries both.
+`roundtrip 512^3 K=10: exact=True (n_diff=0), 6.4 s`. 134M particles, exactly
+reversible, zero differing integers, on one GH200. Deferred since M1 closed at
+256^3 purely for want of a big enough GPU; the aarch64 env unblocked it.
 
-Two notes already banked from building it. **One config per subprocess**, because
-XLA's `peak_bytes_in_use` is monotonic within a process with no reset API — a
-second config in the same process inherits the first's high-water mark, so
-in-process sequencing would have silently reported the running maximum rather
-than each peak. And **ceiling-1 cannot be settled by an n-sweep**: the carry and
-the transients both scale as n_part, so the slope is identical under both
-hypotheses; the script instead prints the measurement against both predictions at
-the same n (~8.5 vs ~13 GiB at 512^3 on Sec. 9's own transient estimate).
+### R6 peak-memory profile — MEASURED (Vista job 831303, deneb job 19)
 
-**Unit trap in the Sec. 9 budget**, found while testing the report path: an
-"80 GB" GPU is 80e9 B = **74.5 GiB**, so the budget's own upper end (75 GiB =
-80.5 GB) does NOT fit. The margin is thinner than the prose reads. Verdicts
-compare bytes; output prints both units. Whether Sec. 9's range wants restating
-is a call for once there is a measurement.
+| n_mesh | carry | ICs | fwd | adjoint | adj/carry |
+|---|---|---|---|---|---|
+| 256 | 0.562 | 1.220 | 2.188 | 7.689 | 13.67x |
+| 512 | 4.500 | 9.504 | 17.259 | **58.259** | **12.95x** |
+
+(GiB, ckpt on, GH200, 90.25 GiB usable.) The ratio sits at 12.0-13.7x across
+EVERY size 64^3..512^3 — a clean per-particle constant, so not fragmentation and
+not a scale artifact. Per particle, where Sec. 9 budgets ~68 (36 carry + ~32
+transients): **ICs 76, forward 138, adjoint 466**.
+
+**The 1024^3 flagship projects to ~466 GiB against the 80 GB claim — ~6x over.**
+Every size agrees (433-492 GiB). Sec. 9's 36 GiB carry was never the problem; it
+is the TRANSIENT budget that is wrong, by ~14x.
+
+**O(1)-in-steps HOLDS (deneb job 19)** — the decisive follow-up, because 466
+B/particle at K=10 is suspiciously close to 10 x ~45. Sweeping K=5..40 (8x) at
+64^3 and 128^3: peak ratio **1.00x, per-step slope 0.0 B/particle**, both sizes.
+Reversibility-as-checkpointing IS delivering step-independent memory.
+**Architecture Sec. 8's central premise — the reason the design exists — is
+intact**, and the 13x is a per-step transient (a lifetime problem) rather than
+retained per-step state (an architectural one). Note R6's own n-sweep could not
+have found this: carry and transients both scale as n_part, so K was the only
+axis that discriminates, and the profiler originally fixed it at 10.
+
+Two instrument notes. **One config per subprocess**: XLA's `peak_bytes_in_use` is
+monotonic within a process with no reset API, so in-process sequencing would
+silently report the running maximum rather than each peak. And **ceiling-1's
+verdict should be discounted**: the script prints "nearer: DOUBLE-BUFFERED", but
+measured 58.3 GiB is 4.5x above even the double-buffered prediction (13.0). The
+binary framing had no way to say "neither". Whatever holds the memory is not the
+scan carry.
+
+**Sec. 9's "~18% peak-VJP saving" from the within-step checkpoint does NOT
+reproduce**: the A/B measures **-2.5% to -7.2%** — rematerialization makes peak
+slightly worse. The number was inherited from mbody and never tested here.
+
+**Unit trap in Sec. 9's own budget**: an "80 GB" GPU is 80e9 B = **74.5 GiB**, so
+its stated upper end (75 GiB = 80.5 GB) does NOT fit. The margin is thinner than
+the prose reads. Verdicts compare bytes and print both units.
+
+### Attribution of the peak — INCONCLUSIVE (deneb job 20)
+
+`scripts/m2_mem_attrib.py` dumps XLA buffer assignment (`--xla_dump_to`). Tool
+choice, recorded because the alternatives look tempting: nsys cannot see this at
+all (JAX preallocates ONE arena and sub-allocates with BFC, so nsys reports a
+single cudaMalloc); ncu measures kernel counters, not allocations, and is blocked
+on Vista compute anyway (ERR_NVGPUCTRPERM — see xphot's
+`vista_gh_e2e_bench.sbatch`, which also documents py-spy being ptrace-blocked);
+`device_memory_profile` emits pprof binary needing the Go tool. Buffer assignment
+is a flag plus a text file.
+
+**What it establishes**: `jit_scan` is the largest module at **204 B/particle
+(64^3) / 240 B/particle (128^3)** on CUDA — roughly HALF the measured process
+peak (488 B/particle at 128^3); the remainder is ICs, carry, loss, other modules,
+fragmentation.
+
+**What it cannot establish**: ~81% of the module peak sits in a single
+`preallocated-temp` ARENA that this dump cannot decompose. This XLA build emits
+no peak-live set, and an exact decomposition needs a heap simulation over live
+ranges. **The instrument tells us which module, not what inside it.**
+
+**RETRACTED — do not reintroduce**: an earlier reading of this dump claimed "the
+meshes are nearly free (~21 B/particle) and ~288 B/particle (64%) is CIC corner
+weights + flat indices". That rested on grouping the arena's values by offset,
+which OVERCOUNTS: XLA assigns overlapping address ranges to values whose live
+ranges are disjoint in time, so distinct offsets do not imply coexistence. The
+bug was caught because the "decomposition" (333 B/particle) exceeded the
+allocation it claimed to decompose (240). The CIC-corner number was never
+measured. Its apparent corroboration — a CPU census totalling 451.3 B/particle
+against 452 measured on GPU — was two errors coinciding, not validation; the CPU
+census was ALSO overcounted, and CPU/GPU XLA fuse differently besides (CPU showed
+meshes ~21 B/particle, GPU ~73).
+
+**Next**: attribute by empirical bisect instead — stub out pieces (trivial force
+for the CIC path) and subtract, using `peak_bytes_in_use`, the one instrument
+here that has not misled. Free on deneb.
+
+### Where this leaves the milestone
+
+Standing, measured: exact reversibility at 512^3 on CUDA (n_diff=0); O(1) in
+steps; D-015 gradient fidelity; the determinism mechanism + the detflag decision;
+the aarch64 env.
+
+Broken, measured: Sec. 9's ABSOLUTE budget, by ~6-7x at 1024^3.
+
+Open: what the ~430 B/particle transient is, whether it is reducible, and --
+the question that actually decides the paper -- whether pmwd/DISCO-DJ pay the
+same transient. **P1 (claim 2) is a COMPARATIVE claim** ("max differentiable N
+per 80 GB GPU -- inexor vs pmwd vs DISCO-DJ"), and a force evaluation's CIC+FFT
+transients are a cost every PM adjoint pays. The architectural asymmetry the
+paper rests on (O(1) in K vs O(K) stored state) is confirmed intact. What the
+measurement kills is the 1024^3 TARGET, not obviously the claim: **512^3 with an
+exact-replay adjoint fits one GPU today at 58.3 GiB, measured.** Re-targeting is
+JC's call at the S4 gate.
 
 ### Operational lesson: `-n auto` is hostile on a single-GPU node
 

@@ -162,38 +162,52 @@ def main():
         print(f"  slot {a['id']:>3}: {a['size'] / npart:8.1f} B/particle  "
               f"{len(a['values']):>3} values   {a['flags'][:28]}")
 
-    # An allocation is ONE region. Values at the SAME offset time-share it (reuse);
-    # values at DIFFERENT offsets COEXIST. So the peak decomposes by OFFSET, not by
-    # value and not by allocation: each distinct offset is a live sub-buffer sized
-    # by its largest occupant. Naming a whole temp arena after its biggest single
-    # value (as a naive read does) is simply wrong -- the arena holds hundreds of
-    # values of different shapes.
-    subs = []
+    # THE ONLY VALID DECOMPOSITION available from this dump.
+    #
+    # Allocations are disjoint by construction, so summing ALLOCATION sizes is
+    # exact and sums to the module peak. Do NOT decompose an allocation by
+    # grouping its values by offset: XLA assigns OVERLAPPING address ranges to
+    # values whose live ranges are disjoint in time, so distinct offsets do not
+    # imply coexistence and "sum of max size per offset" OVERCOUNTS -- it can
+    # exceed the allocation it claims to decompose (it did: 333 vs 240 B/particle
+    # at n=128, which is how the bug was caught). Exactly decomposing an arena
+    # would need a heap simulation over live ranges; this XLA build dumps no
+    # peak-live set.
+    #
+    # So: label each allocation by its largest occupant's shape. Where an
+    # allocation holds values at several offsets it is an ARENA holding many
+    # shapes, and the label is a label, not a claim about its contents -- those
+    # rows are marked and excluded from the shape census rather than mislabelled.
     for a in big["allocs"]:
-        by_off = {}
-        for v in a["values"]:
-            cur = by_off.get(v["offset"])
-            if cur is None or v["size"] > cur["size"]:
-                by_off[v["offset"]] = v
-        for off, v in by_off.items():
-            subs.append({"alloc": a["id"], "offset": off, "size": v["size"],
-                         "name": v["name"], "shape": v["shape"].split("{")[0],
-                         "n_sharing": sum(1 for x in a["values"] if x["offset"] == off)})
-    subs.sort(key=lambda s: s["size"], reverse=True)
+        occ = max(a["values"], key=lambda v: v["size"], default=None)
+        a["shape"] = occ["shape"].split("{")[0] if occ else "?"
+        a["name"] = occ["name"] if occ else "(none)"
+        a["is_arena"] = len({v["offset"] for v in a["values"]}) > 1
 
-    print(f"\n--- top {_args.top} LIVE sub-buffers (grouped by offset) ---")
-    for s in subs[: _args.top]:
-        print(f"  {s['size'] / npart:8.1f} B/p  {s['shape']:<22} {s['name'][:36]:<36} "
-              f"(reused by {s['n_sharing']})")
+    allocs = sorted(big["allocs"], key=lambda a: a["size"], reverse=True)
+    print(f"\n--- top {_args.top} ALLOCATIONS (disjoint; these sum to the module peak) ---")
+    for a in allocs[: _args.top]:
+        tag = "ARENA (mixed shapes)" if a["is_arena"] else a["shape"]
+        print(f"  {a['size'] / npart:8.1f} B/p  {tag:<24} {a['name'][:30]:<30} "
+              f"{len(a['values']):>3} vals  {a['flags'][:16]}")
 
-    kinds = {}
-    for s in subs:
-        kinds[s["shape"]] = kinds.get(s["shape"], 0) + s["size"]
-    print("\n--- peak by array shape (the census that says WHAT is fat) ---")
-    tot_sub = sum(s["size"] for s in subs) or 1
+    kinds, arena = {}, 0
+    for a in big["allocs"]:
+        if a["is_arena"]:
+            arena += a["size"]
+        else:
+            kinds[a["shape"]] = kinds.get(a["shape"], 0) + a["size"]
+    total = big["peak_bytes"]
+    print("\n--- module peak by array shape (sums EXACTLY to the module peak) ---")
     for k, b in sorted(kinds.items(), key=lambda kv: kv[1], reverse=True)[:10]:
-        print(f"  {b / npart:8.1f} B/particle  {100 * b / tot_sub:5.1f}%   {k}")
-    print(f"  {'-' * 44}\n  {tot_sub / npart:8.1f} B/particle  100.0%   TOTAL (live sub-buffers)")
+        print(f"  {b / npart:8.1f} B/particle  {100 * b / total:5.1f}%   {k}")
+    if arena:
+        print(f"  {arena / npart:8.1f} B/particle  {100 * arena / total:5.1f}%   "
+              f"(arenas -- mixed shapes, not attributable from this dump)")
+    print(f"  {'-' * 46}\n  {total / npart:8.1f} B/particle  100.0%   MODULE PEAK")
+    print("\n  NB: this is ONE module's buffer assignment, not the process peak.")
+    print("  Compare against the measured process peak (m2_mem_profile): the")
+    print("  remainder lives in ICs, the carry, the loss, other modules, fragmentation.")
 
     os.makedirs(RUNS, exist_ok=True)
     # n in the filename: a fixed path lets a later size silently overwrite an
@@ -205,10 +219,11 @@ def main():
             "modules": [{"file": m["file"], "n_allocations": m["n_allocations"],
                          "peak_bytes": m["peak_bytes"],
                          "b_per_particle": m["peak_bytes"] / npart} for m in mods],
-            "top_sub_buffers": [{"size": s["size"], "b_per_particle": s["size"] / npart,
-                                 "shape": s["shape"], "name": s["name"],
-                                 "n_sharing": s["n_sharing"]} for s in subs[: _args.top]],
+            "top_allocations": [{"size": a["size"], "b_per_particle": a["size"] / npart,
+                                "shape": a["shape"], "name": a["name"],
+                                "is_arena": a["is_arena"]} for a in allocs[: _args.top]],
             "peak_by_shape": {k: v for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])},
+            "arena_bytes": arena, "module_peak_bytes": total,
         }, f, indent=1)
     print(f"\nwrote {path}")
     print("\n  Reference: Sec. 9 budgets ~68 B/particle total (36 carry + ~32 transients);")
