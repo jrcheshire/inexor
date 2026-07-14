@@ -142,6 +142,12 @@ def _evolve_grad_fwd(box, time, quant, cosmo, driver, fdtype, x0_f, v0_f):
 def _evolve_grad_bwd(box, time, quant, cosmo, driver, fdtype, residual, cot):
     x, w, consts, s_w0, s_out = residual
     x_f_bar, v_f_bar = cot
+    # Normalize incoming cotangents to fdtype: a downstream loss may paint in
+    # f32 (density_f32/paint_f32), handing back an f32 cotangent for x_f even
+    # under x64. The reverse sweep (step_float twin) runs in fdtype, so the
+    # scan carry must match it -- cast once here.
+    x_f_bar = x_f_bar.astype(fdtype)
+    v_f_bar = v_f_bar.astype(fdtype)
     force_int = make_force_fn(box, fdtype=fdtype, paint="int", frac_bits=quant.frac_bits)
     force_f32 = make_force_fn(box, fdtype=fdtype, paint="f32", frac_bits=quant.frac_bits)
     s_x = box.s_x
@@ -159,6 +165,8 @@ def _evolve_grad_bwd(box, time, quant, cosmo, driver, fdtype, residual, cot):
         wbar = (s_w0 / gf_final) * v_f_bar
         step_r, step_flt = step_kdk_rev, step_kdk_float
 
+    xb_dt, wb_dt = xbar.dtype, wbar.dtype  # carry invariant: output must match input
+
     def rev_body(carry, c):
         xc, wc, xb, wb = carry
         x_prev, w_prev = step_r(xc, wc, c, force_int, s_x, fdtype=fdtype)  # bit-exact replay
@@ -167,9 +175,12 @@ def _evolve_grad_bwd(box, time, quant, cosmo, driver, fdtype, residual, cot):
         # STE twin linearized at the replayed state; jax.checkpoint rematerializes
         # the per-step paint/read activations during its VJP (~18% peak saving).
         twin = jax.checkpoint(lambda a, b: step_flt(a, b, c, force_f32, s_x, fdtype=fdtype))
-        _, vjp = jax.vjp(twin, xf, wf)
-        xb, wb = vjp((xb, wb))
-        return (x_prev, w_prev, xb, wb), None
+        out, vjp = jax.vjp(twin, xf, wf)
+        # The VJP twin paints in f32 (paint_f32; D-006), so its output can weak-type
+        # to f32 -- align the carried cotangents to the twin output, run the VJP,
+        # then restore the carry's own dtype (scan requires input==output types).
+        gx, gw = vjp((xb.astype(out[0].dtype), wb.astype(out[1].dtype)))
+        return (x_prev, w_prev, gx.astype(xb_dt), gw.astype(wb_dt)), None
 
     (_, _, xbar_ic, wbar_ic), _ = jax.lax.scan(
         rev_body, (x, w, xbar, wbar), consts, reverse=True

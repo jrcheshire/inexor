@@ -17,8 +17,14 @@ from .painting import density_contrast
 
 
 def density_f32(x_f, box):
-    """Differentiable density contrast from particle positions (paint='f32')."""
-    return density_contrast(x_f, box.n_mesh, box.box_size, box.n_total, paint="f32")
+    """Differentiable density contrast from particle positions (paint='f32').
+
+    The int32-free f32 paint materializes an f32 mesh; cast back to the input
+    dtype so the loss stays dtype-consistent with the caller (mirrors
+    forces._cached_force_fn, which casts the force to fdtype). Under x64 this
+    keeps cotangents f64 through the adjoint's reverse sweep."""
+    d = density_contrast(x_f, box.n_mesh, box.box_size, box.n_total, paint="f32")
+    return d.astype(x_f.dtype)
 
 
 def _k_mag(n_mesh, box_size):
