@@ -213,3 +213,31 @@ decision here is locked until explicitly re-litigated with JC.
   c_growth=2.5 stand as production defaults with ~2x gate headroom. If a
   future config trips the gate, the escalation path is frac_bits 13 or
   c_growth tuning, costed against the ladder budget first.
+
+## D-015 — M2 gradient-fidelity gate (global-metric, floor-first)
+- **Status:** accepted (JC, 2026-07-13).
+- **Context:** M2's promoted adjoint = int-paint primal trajectory (bit-exact
+  replay) + f32-paint STE-twin VJP (D-006). The D-010 R4 gate (7.5e-2 relative
+  gradient error) was measured on the M0 twin probe and explicitly deferred for
+  restatement to M2. Floor-first measurement (scripts/m2_grad_gate.py, x64,
+  64^3, both integrators): the per-particle gradient of a band-power / field-L2
+  loss is intrinsically NOISE-DOMINATED -- the reference's own floors correlate
+  only ~0-0.7 per component (float-twin f32-vs-f64 corr ~0-0.06; central-FD-vs-
+  float corr 0.34-0.71), and FD of the QUANTIZED loss is invalid below the
+  lattice step (the R4 staircase). Against that, the adjoint reproduces the f64
+  float-path gradient GLOBALLY to median-rel 1.9e-4 (band_power) / 3.3e-3
+  (field_L2), corr > 0.9996, norm-ratio ~1.000; IC-param d/d[f_NL, amplitude]
+  to rel 6e-5..9e-4.
+- **Decision:** gate on GLOBAL metrics, NOT per-component max-rel or FD. Per
+  config x loss: **adjoint-vs-float input-grad median-rel (top-decile |ref|)
+  <= 1e-2 AND Pearson corr >= 0.999 AND |norm-ratio - 1| <= 1%**, and
+  **IC-param adjoint-vs-float rel <= 5e-3**. The R4 restatement (D-010) is the
+  headline: promoted-adjoint gradient error (worst median-rel) 3.3e-3 << 7.5e-2.
+  GATE PASS at 64^3 (both integrators). Gate-grade 128^3 K=40 + the CUDA arm
+  confirm on deneb (S4).
+- **Consequences:** the paper's "f32-speed gradients with f64-grade fidelity"
+  claim (core claim 3) is backed by a measured triangulation, not an assertion;
+  the f32-paint VJP twin (D-006) is validated as gradient-faithful despite the
+  int-paint primal. The reference-floor characterization also fixes the correct
+  gate REFERENCE for the money plots (P2): the float-replay drift is compared
+  globally, never per-component.
