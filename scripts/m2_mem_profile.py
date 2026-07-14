@@ -191,23 +191,66 @@ def _spawn(n_mesh, K, driver, checkpoint):
     return json.loads(p.stdout.strip().splitlines()[-1])
 
 
+def _report_k_scaling(recs):
+    """THE claim under test: reversibility IS the checkpointing, so the residual
+    is the final int state only and peak memory is O(1) in the number of steps
+    (architecture Sec. 8). If peak grows with K, that premise is not being
+    realized -- which would be an architectural failure, not a tuning problem.
+    Sec. 9's carry is K-independent BY CONSTRUCTION, so any K dependence in the
+    measured peak is per-step state that should not be alive at all.
+    """
+    ok = [r for r in recs if not r.get("error") and r.get("peak_adjoint")]
+    by_n = {}
+    for r in ok:
+        by_n.setdefault((r["n_mesh"], r["checkpoint"]), []).append(r)
+    swept = {k: sorted(v, key=lambda r: r["K"]) for k, v in by_n.items() if len({x["K"] for x in v}) > 1}
+    if not swept:
+        return
+    print("\n  --- O(1)-in-steps: does peak scale with K? (the Sec. 8 premise) ---")
+    print("  flat in K  => residual is O(1); the 13x excess is a fat per-step transient")
+    print("  linear in K => per-step state is being kept; reversibility-as-checkpointing")
+    print("                 is NOT delivering step-independent memory (architectural)")
+    for (n, ck), rs in sorted(swept.items()):
+        k0, kN = rs[0], rs[-1]
+        kr = kN["K"] / k0["K"]
+        pr = kN["peak_adjoint"] / k0["peak_adjoint"]
+        # per-step slope in bytes/particle: how much peak each extra step adds
+        slope = ((kN["peak_adjoint"] - k0["peak_adjoint"]) / (kN["K"] - k0["K"])) / kN["n_particles"]
+        if pr < 1.15:
+            verdict = "FLAT -> O(1) in steps HOLDS"
+        elif pr > 0.6 * kr:
+            verdict = "LINEAR in K -> O(1) VIOLATED"
+        else:
+            verdict = "partial K dependence -- neither clean"
+        print(f"\n  n={n} ckpt={str(ck)[:1]}:  K {k0['K']}->{kN['K']} ({kr:.0f}x) gives peak "
+              f"{pr:.2f}x   [{verdict}]")
+        print(f"    per-step slope {slope:7.1f} B/particle  (carry is {CARRY_BYTES_PER_PARTICLE}"
+              f" B/particle, K-independent by construction)")
+        for r in rs:
+            per_p = r["peak_adjoint"] / r["n_particles"]
+            print(f"      K={r['K']:<3} peak {_fmt_gib(r['peak_adjoint'])} GiB"
+                  f"   {per_p:7.1f} B/particle   {r['peak_adjoint'] / r['carry_bytes_analytic']:5.2f}x carry")
+
+
 def _report(recs):
     print("\n===== R6 peak device memory: exact-replay adjoint =====")
     lim = next((r.get("bytes_limit") for r in recs if r.get("bytes_limit")), None)
     dev = next((r.get("device") for r in recs if r.get("device")), "?")
     print(f"  device: {dev}   HBM limit: {_fmt_gib(lim)} GiB"
           if lim else f"  device: {dev}   HBM limit: unreported (CPU backend?)")
-    print("\n  n_mesh  ckpt   carry     ICs     fwd  adjoint   adj/carry   note")
+    print("\n  n_mesh   K  ckpt   carry     ICs     fwd  adjoint   adj/carry   note")
     for r in recs:
         if r.get("error"):
-            print(f"  {r['n_mesh']:>6}  {str(r['checkpoint'])[:1]}      "
-                  f"{'OOM' if r.get('oom') else 'ERR':>6}   {r['error'][:44]}")
+            print(f"  {r['n_mesh']:>6} {r['K']:>3}  {str(r['checkpoint'])[:1]}      "
+                  f"{'OOM' if r.get('oom') else 'ERR':>6}   {r['error'][:40]}")
             continue
         carry, adj = r["carry_bytes_analytic"], r["peak_adjoint"]
         ratio = f"{adj / carry:8.2f}x" if (adj and carry) else "       -"
-        print(f"  {r['n_mesh']:>6}  {str(r['checkpoint'])[:1]}   {_fmt_gib(carry)} "
+        print(f"  {r['n_mesh']:>6} {r['K']:>3}  {str(r['checkpoint'])[:1]}   {_fmt_gib(carry)} "
               f"{_fmt_gib(r['peak_after_ic'])} {_fmt_gib(r['peak_forward'])} "
               f"{_fmt_gib(adj)}  {ratio}")
+
+    _report_k_scaling(recs)
 
     # ---- checkpoint A/B (Sec. 9's inherited "~18% peak-VJP saving") ----
     print("\n  --- within-step jax.checkpoint A/B (Sec. 9 claims ~18% peak-VJP saving) ---")
@@ -255,6 +298,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--n", default="64,128,256", help="comma-separated n_mesh sweep")
     ap.add_argument("--steps", type=int, default=10, help="K (n_steps); carry is K-independent")
+    ap.add_argument("--k", default=None,
+                    help="comma-separated K sweep (overrides --steps). Tests the Sec. 8 "
+                         "O(1)-in-steps premise: peak must NOT grow with K.")
     ap.add_argument("--driver", default="perstep", choices=("scan", "perstep"),
                     help="FORWARD driver; the reverse sweep is lax.scan either way")
     ap.add_argument("--ab", action="store_true", help="also run the checkpoint-off leg")
@@ -268,13 +314,15 @@ def main():
         return
 
     ns = [int(x) for x in args.n.split(",") if x.strip()]
+    ks = [int(x) for x in args.k.split(",") if x.strip()] if args.k else [args.steps]
     ckpts = [True, False] if args.ab else [True]
     recs = []
     for n in ns:
-        for ck in ckpts:
-            print(f"[m2_mem_profile] n_mesh={n} K={args.steps} driver={args.driver} "
-                  f"checkpoint={ck} ...", flush=True)
-            recs.append(_spawn(n, args.steps, args.driver, ck))
+        for k in ks:
+            for ck in ckpts:
+                print(f"[m2_mem_profile] n_mesh={n} K={k} driver={args.driver} "
+                      f"checkpoint={ck} ...", flush=True)
+                recs.append(_spawn(n, k, args.driver, ck))
 
     _report(recs)
     os.makedirs(RUNS, exist_ok=True)
