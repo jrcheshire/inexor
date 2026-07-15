@@ -26,4 +26,16 @@ pixi run -e gpu python -c "import jax; print(jax.__version__, jax.devices())"
 echo "=== G2c accumulated codec gate at C-dev (floors first) ==="
 pixi run -e gpu python scripts/v2_g2c_accum_gate.py --config cdev
 
+# pre-agreed fallback: if any C-dev worker OOM'd the 6 GB card, rerun the
+# whole gate at C-dev/8 (same cell/spacing -> same codec quanta)
+if pixi run python - <<'EOF'
+import json, sys
+r = json.load(open("runs/v2/g2c_results.json"))
+sys.exit(0 if any(w.get("oom") for w in r["workers"].values()) else 1)
+EOF
+then
+  echo "=== C-dev OOM detected -> fallback: C-dev/8 ==="
+  pixi run -e gpu python scripts/v2_g2c_accum_gate.py --config cdev8
+fi
+
 echo "=== DONE ==="

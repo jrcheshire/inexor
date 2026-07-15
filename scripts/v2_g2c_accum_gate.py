@@ -126,7 +126,7 @@ def _coarse_mean_flow(x, v, L, n_coarse):
         counts = counts.at[flat].add(w, mode="promise_in_bounds")
         for c in range(3):
             mom = mom.at[c, flat].add(w * v[:, c], mode="promise_in_bounds")
-    n_empty = int(jnp.sum(counts == 0.0))
+    n_empty = jnp.sum(counts == 0.0)  # jnp scalar: this runs under jit
     vbar = mom / jnp.maximum(counts, 1e-12)[None, :]
     return vbar.reshape(3, n_coarse, n_coarse, n_coarse), n_empty
 
@@ -147,7 +147,7 @@ def _rt_vel_resid8(x, v, L, n_coarse, mode):
     vbar = cic_read_vector(vbar_mesh[0], vbar_mesh[1], vbar_mesh[2], x, n_coarse, L)
     r = v - vbar
     sigma = jnp.sqrt(jnp.mean(r**2))  # pooled per-component sigma
-    out_frac = float(jnp.mean(jnp.abs(r) > C_CLIP * sigma))
+    out_frac = jnp.mean(jnp.abs(r) > C_CLIP * sigma)  # jnp scalar (jit)
     if mode == "lin":
         q = 2.0 * C_CLIP * sigma / 256.0
         rq = jnp.rint(jnp.clip(r, -C_CLIP * sigma, C_CLIP * sigma) / q) * q
@@ -162,7 +162,13 @@ def _rt_vel_resid8(x, v, L, n_coarse, mode):
 
 
 def make_roundtrip(arm, L, n_fine, n_coarse):
-    """Per-step (x, v) -> (x', v', diag) roundtrip for a codec arm."""
+    """Per-step (x, v) -> (x', v', diag) roundtrip for a codec arm.
+
+    Pure jnp with a fixed diag structure per arm, so the whole step+roundtrip
+    can run under ONE jitted, donated program (the job-27 lesson: the eager
+    loop's per-op temporaries OOM the 6 GB card at configs the v1 per-step-jit
+    discipline handled fine).
+    """
 
     def rt(x, v):
         diag = {}
@@ -224,14 +230,24 @@ def run_single(args):
         except Exception:
             return None
 
+    # ONE jitted, donated step+roundtrip program reused across steps (the
+    # run_perstep discipline; job 27's eager loop OOM'd where v1's jit fit).
+    # Coefficients ride as a traced (3,) row, so all K steps share the program.
+    def step_and_rt(x_, v_, c_):
+        x_, v_ = float_step_bullfrog(x_, v_, (c_[0], c_[1], c_[2]), force_fn, L)
+        return rt(x_, v_)
+
+    step_jit = jax.jit(step_and_rt, donate_argnums=(0, 1))
+    coeffs_dev = jnp.asarray(coeffs, jnp.float32)
+
     diag_last = {}
     jax.block_until_ready(x)
     t0 = time.perf_counter()
-    for c in coeffs:
-        x, v = float_step_bullfrog(x, v, tuple(np.asarray(c, np.float64)), force_fn, L)
-        x, v, diag_last = rt(x, v)
+    for k in range(coeffs_dev.shape[0]):
+        x, v, diag_last = step_jit(x, v, coeffs_dev[k])
     x, v = jax.block_until_ready(x), jax.block_until_ready(v)
     wall = time.perf_counter() - t0
+    diag_last = {k: float(val) for k, val in diag_last.items()}
 
     os.makedirs(STATE_DIR, exist_ok=True)
     tag = f"{args.config}_{args.arm}_k{args.k}_m{n_mesh}"
@@ -422,13 +438,22 @@ def spawn(config, arm, k, mesh=None):
         cmd += ["--mesh", str(mesh)]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
-        tail = (p.stderr or "").strip().splitlines()
+        lines = (p.stderr or "").strip().splitlines()
+        # persist the whole stderr; surface the real exception, not JAX's
+        # trailing "For simplicity..." boilerplate (job 26/27 lesson)
+        err_dir = os.path.join(OUT_DIR, "g2c_errs")
+        os.makedirs(err_dir, exist_ok=True)
+        err_path = os.path.join(err_dir, f"{config}_{arm}_k{k}_m{mesh or 0}.err")
+        with open(err_path, "w") as fh:
+            fh.write(p.stderr or "")
+        exc = [t for t in lines if ("Error" in t or "Exception" in t) and "For simplicity" not in t]
         return dict(
             arm=arm,
             k=k,
             mesh=mesh,
-            error=tail[-1] if tail else f"exit {p.returncode}",
-            oom=any("RESOURCE_EXHAUSTED" in t or "Out of memory" in t for t in tail),
+            error=(exc[-1] if exc else (lines[-1] if lines else f"exit {p.returncode}")),
+            error_file=err_path,
+            oom=any("RESOURCE_EXHAUSTED" in t or "Out of memory" in t for t in lines),
         )
     line = [ln for ln in p.stdout.splitlines() if ln.startswith("WORKER_JSON ")][-1]
     return json.loads(line[len("WORKER_JSON ") :])
@@ -478,7 +503,12 @@ def main():
     for arm, k, mesh in legs:
         m = mesh or n_fine
         print(f"[worker] arm={arm} K={k} mesh={m} ...", flush=True)
-        runs[(arm, k, m)] = spawn(args.config, arm, k, mesh)
+        r = spawn(args.config, arm, k, mesh)
+        runs[(arm, k, m)] = r
+        if r.get("error"):
+            print(
+                f"    WORKER {'OOM' if r.get('oom') else 'FAILED'}: {r['error'][:110]}", flush=True
+            )
 
     results = dict(
         config=args.config,

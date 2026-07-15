@@ -12,6 +12,8 @@
 # (plan snuggly-dreaming-popcorn; kill line = pallas peak > 2x hand-managed).
 # Correctness gates run on CUDA here (interpret mode cannot: its atomic_add
 # is last-write-wins on duplicate indices).
+# ENV: gpu-pallas (pypi jax[cuda12]) -- conda-forge's CUDA jaxlib has no
+# Pallas GPU lowering (job 28). Same jax version as the gpu env.
 # Submit from ~/src/inexor on deneb:  sbatch scripts/v2_g1_deneb.sbatch
 
 set -e
@@ -22,13 +24,13 @@ export OMP_NUM_THREADS=1
 
 echo "=== env ==="
 git log --oneline -1
-pixi run -e gpu python -c "import jax; print(jax.__version__, jax.devices())"
+pixi run -e gpu-pallas python -c "import jax; print(jax.__version__, jax.devices())"
 
 echo "=== G1 kernel floor sweep (dense; correctness + determinism on CUDA) ==="
-pixi run -e gpu python scripts/v2_g1_kernel_floor.py
+pixi run -e gpu-pallas python scripts/v2_g1_kernel_floor.py
 
 echo "=== chunk-size sensitivity at the C-dev shape ==="
-pixi run -e gpu python scripts/v2_g1_kernel_floor.py --shapes 256:512 --chunk 1024
-pixi run -e gpu python scripts/v2_g1_kernel_floor.py --shapes 256:512 --chunk 16384
+pixi run -e gpu-pallas python scripts/v2_g1_kernel_floor.py --shapes 256:512 --chunk 1024
+pixi run -e gpu-pallas python scripts/v2_g1_kernel_floor.py --shapes 256:512 --chunk 16384
 
 echo "=== DONE ==="

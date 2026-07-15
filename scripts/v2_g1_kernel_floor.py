@@ -68,57 +68,70 @@ CORNERS = [(dx, dy, dz) for dx in (0, 1) for dy in (0, 1) for dz in (0, 1)]
 # ===========================================================================
 
 
-def _corner_flat_weight_k(pos, corner, n_mesh, cell):
+def _corner_flat_weight_k(px, py, pz, corner, n_mesh, cell):
     """Base cell + one corner's (flat index, weight), matching
-    painting._cic_pieces / _corner_flat_weight arithmetic (f32)."""
-    import jax
+    painting._cic_pieces / _corner_flat_weight arithmetic (f32).
+
+    Component-wise 1D form: Triton block dimensions must be powers of 2, so
+    the kernels take (chunk,) x/y/z arrays, never a (chunk, 3) block.
+    """
     import jax.numpy as jnp
 
-    xp = pos / cell
-    base_f = jnp.floor(xp)
-    frac = xp - base_f
-    base = jax.lax.stop_gradient(base_f).astype(jnp.int32)
     dx, dy, dz = corner
-    wlo = 1.0 - frac
-    wx = frac[:, 0] if dx else wlo[:, 0]
-    wy = frac[:, 1] if dy else wlo[:, 1]
-    wz = frac[:, 2] if dz else wlo[:, 2]
-    ix = (base[:, 0] + dx) % n_mesh
-    iy = (base[:, 1] + dy) % n_mesh
-    iz = (base[:, 2] + dz) % n_mesh
-    flat = (ix * n_mesh + iy) * n_mesh + iz
-    return flat, wx * wy * wz
+    flat = None
+    ws = []
+    for p, d in ((px, dx), (py, dy), (pz, dz)):
+        xp = p / cell
+        base_f = jnp.floor(xp)
+        frac = xp - base_f
+        # no stop_gradient: nothing differentiates through the kernel, and the
+        # extra primitive is one more thing for the Triton lowering to chew on
+        idx = (base_f.astype(jnp.int32) + d) % n_mesh
+        flat = idx if flat is None else flat * n_mesh + idx
+        ws.append(frac if d else 1.0 - frac)
+    return flat, ws[0] * ws[1] * ws[2]
 
 
-def _paint_kernel(pos_ref, mesh_in_ref, mesh_out_ref, *, n_mesh, cell, int_paint):
+def _paint_kernel(px_ref, py_ref, pz_ref, mesh_in_ref, mesh_out_ref, *, n_mesh, cell, int_paint):
     import jax.experimental.pallas.triton as plt
     import jax.numpy as jnp
 
     del mesh_in_ref  # aliased with mesh_out_ref; the zeros come in as input
-    pos = pos_ref[...]
+    px, py, pz = px_ref[...], py_ref[...], pz_ref[...]
     scale = np.float32(2.0**FRAC_BITS)
     for corner in CORNERS:
-        flat, w = _corner_flat_weight_k(pos, corner, n_mesh, cell)
+        flat, w = _corner_flat_weight_k(px, py, pz, corner, n_mesh, cell)
         if int_paint:
             plt.atomic_add(mesh_out_ref, (flat,), jnp.rint(w * scale).astype(jnp.int32))
         else:
             plt.atomic_add(mesh_out_ref, (flat,), w)
 
 
-def _gather_kernel(pos_ref, gx_ref, gy_ref, gz_ref, out_ref, *, n_mesh, cell):
+def _gather_kernel(
+    px_ref, py_ref, pz_ref, gx_ref, gy_ref, gz_ref, ox_ref, oy_ref, oz_ref, *, n_mesh, cell
+):
     import jax.numpy as jnp
 
-    pos = pos_ref[...]
-    n = pos.shape[0]
+    px, py, pz = px_ref[...], py_ref[...], pz_ref[...]
+    n = px.shape[0]
     ax = jnp.zeros((n,), jnp.float32)
     ay = jnp.zeros((n,), jnp.float32)
     az = jnp.zeros((n,), jnp.float32)
     for corner in CORNERS:
-        flat, w = _corner_flat_weight_k(pos, corner, n_mesh, cell)
+        flat, w = _corner_flat_weight_k(px, py, pz, corner, n_mesh, cell)
         ax = ax + w * gx_ref[flat]
         ay = ay + w * gy_ref[flat]
         az = az + w * gz_ref[flat]
-    out_ref[...] = jnp.stack([ax, ay, az], axis=1)
+    ox_ref[...] = ax
+    oy_ref[...] = ay
+    oz_ref[...] = az
+
+
+def _pos_components(positions):
+    """(n, 3) -> three (n,) arrays (Triton block dims must be powers of 2)."""
+    import jax.numpy as jnp
+
+    return tuple(jnp.asarray(positions[:, c]) for c in range(3))
 
 
 def pallas_paint(positions, n_mesh, box_size, chunk, int_paint, interpret):
@@ -132,18 +145,16 @@ def pallas_paint(positions, n_mesh, box_size, chunk, int_paint, interpret):
     dt = jnp.int32 if int_paint else jnp.float32
     mesh0 = jnp.zeros((n_mesh**3,), dtype=dt)
     kern = functools.partial(_paint_kernel, n_mesh=n_mesh, cell=cell, int_paint=int_paint)
+    c = pl.BlockSpec((chunk,), lambda i: (i,))
     return pl.pallas_call(
         kern,
         grid=(n // chunk,),
-        in_specs=[
-            pl.BlockSpec((chunk, 3), lambda i: (i, 0)),
-            pl.BlockSpec((n_mesh**3,), lambda i: (0,)),
-        ],
+        in_specs=[c, c, c, pl.BlockSpec((n_mesh**3,), lambda i: (0,))],
         out_specs=pl.BlockSpec((n_mesh**3,), lambda i: (0,)),
         out_shape=jax.ShapeDtypeStruct((n_mesh**3,), dt),
-        input_output_aliases={1: 0},
+        input_output_aliases={3: 0},
         interpret=interpret,
-    )(positions, mesh0)
+    )(*_pos_components(positions), mesh0)
 
 
 def pallas_gather(gx, gy, gz, positions, n_mesh, box_size, chunk, interpret):
@@ -155,15 +166,17 @@ def pallas_gather(gx, gy, gz, positions, n_mesh, box_size, chunk, interpret):
     n = positions.shape[0]
     cell = np.float32(box_size / n_mesh)
     kern = functools.partial(_gather_kernel, n_mesh=n_mesh, cell=cell)
+    c = pl.BlockSpec((chunk,), lambda i: (i,))
     m = pl.BlockSpec((n_mesh**3,), lambda i: (0,))
-    return pl.pallas_call(
+    out = pl.pallas_call(
         kern,
         grid=(n // chunk,),
-        in_specs=[pl.BlockSpec((chunk, 3), lambda i: (i, 0)), m, m, m],
-        out_specs=pl.BlockSpec((chunk, 3), lambda i: (i, 0)),
-        out_shape=jax.ShapeDtypeStruct((n, 3), jnp.float32),
+        in_specs=[c, c, c, m, m, m],
+        out_specs=[c, c, c],
+        out_shape=[jax.ShapeDtypeStruct((n,), jnp.float32)] * 3,
         interpret=interpret,
-    )(positions, gx.reshape(-1), gy.reshape(-1), gz.reshape(-1))
+    )(*_pos_components(positions), gx.reshape(-1), gy.reshape(-1), gz.reshape(-1))
+    return jnp.stack(out, axis=1)
 
 
 # ===========================================================================
