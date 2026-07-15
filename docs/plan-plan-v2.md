@@ -25,6 +25,7 @@ https://claude.ai/code/artifact/370ba948-b9ea-4e42-9c15-92dce10fdf55).
 | D-v2-5 | **Standalone project.** No collaboration angle for now (COCA hook dropped). |
 | D-v2-6 | **Same repo, v2.** v1's validated components carry; v1's thesis does not. |
 | D-v2-7 | **Squeezed-bispectrum tolerance = 15%** for tiled-vs-monolithic agreement (the G3 kill line). |
+| D-v2-8 | **Requirements chain pinned at seed V0** (JC, 2026-07-15; full ADR in `decisions.md`): general engine, NOT SPHEREx-anchored (disco-mocks/DISCO-DJ own main-line mocks); k_sci = 2.0 h/Mpc -> fine cell <= 0.31 Mpc/h; hybrid bias route (halo catalogs at calibration, field-level in production); n_p = 100; M_min DERIVED from the chain, reported per config; multipole-grade RSD bar (P0+P2 under D-v2-1); HMF 5% / halo-b1 2% at calibration; realizations 100 prod / O(5) calib; Sec 3 instrument ratified. |
 
 ## 1. Thesis
 
@@ -57,31 +58,56 @@ gate-measured numbers): ~10-16 B/p all-in -> 2048^3 on one Vista GH node;
 general-purpose tree/FMM; any differentiability work before a thread names it
 (D-v2-3); any capability claim before its premise gate.
 
-## 2. Requirements chain (numbers to PIN at V0)
+## 2. Requirements chain (PINNED at V0 — D-v2-8, JC 2026-07-15)
 
-The two locked decisions D-v2-1 + D-v2-2 combine into a resolution chain:
+Framing caution first (JC): v2 is a GENERAL memory-floor engine. Do not
+import goals, framing, or scale regimes from the SPHEREx-focused projects;
+disco-mocks + DISCO-DJ (incl. Alex Krolewski's work) own SPHEREx main-line
+mocks. The chain below is engine-intrinsic and runs off k_sci alone; the
+survey-side inputs examined at V0 are non-normative worklog context.
 
-- **Mass resolution.** m_p = 2.775e11 * Omega_m * (L/N_p)^3 h^-1 Msun
-  (~8.6e10 * (L/N_p in Mpc/h)^3 at Omega_m = 0.31). If the bias fit needs
-  halos of mass M_min with >= n_p particles, then L/N_p <=
-  (M_min / (n_p * 8.6e10))^(1/3) Mpc/h. Example: M_min = 1e12, n_p = 100
-  -> L/N_p <= 0.49 Mpc/h -> 2048^3 in a 1 Gpc/h box, or 4096^3 in 2 Gpc/h.
-  **V0 pins M_min, n_p, and the bias-fitting route** (FoF-style catalogs vs
-  field-level Lagrangian bias a la BACCO -- the latter relaxes halo-finding
-  but not resolution).
-- **Force / mesh resolution.** CUBE-grade validity needs k_sci <= 0.2 k_Nyq
-  of the fine mesh, i.e. cell <= 0.2 * pi / k_sci. k_sci = 0.5 h/Mpc ->
-  cell <= 1.26 Mpc/h; k_sci = 1.0 -> cell <= 0.63. With particle spacing
-  ~0.5 Mpc/h this puts the fine mesh at 1-2x the particle grid; at 4096^3
-  particles a global fine mesh (up to 8192^3, 2.2 TB in f32) is impossible
-  monolithically -- **the two-level tiled mesh is load-bearing, not an
-  optimization**.
-- **Velocity fidelity.** Halo-grade mocks may carry RSD; the velocity codec
-  bar (what error in what velocity statistic) is currently UNSET. V0 pins it
-  (SPHEREx photo-z smearing likely makes it loose; do not assume).
-- **Statistics + tolerances.** P(k) per band; squeezed bispectrum <= 15%
-  (D-v2-7); halo mass function / bias tolerance (V0); number of realizations
-  per config (drives the SU side of the tradeoff map).
+- **Force / mesh resolution (the root pin).** k_sci = 2.0 h/Mpc: statistics
+  numerically clean (D-v2-1: k <= 0.2 k_Nyq of the fine mesh) through the
+  k = 1-2 band where bias-model divergence must be attributable to the model,
+  not the mesh -> **fine cell <= 0.31 Mpc/h**. With mesh:particle ratio 1-2x
+  (G5 measures where the split lands), particle spacing lands at 0.31-0.63
+  Mpc/h; a global fine mesh at the hero scale (8192^3, 2.2 TB f32) is
+  impossible monolithically -- **the two-level tiled mesh is load-bearing,
+  not an optimization**.
+- **Mass resolution (DERIVED, not required).** m_p = 2.775e11 * Omega_m *
+  (L/N_p)^3 h^-1 Msun (~8.75e10 * (L/N_p in Mpc/h)^3 at Omega_m = 0.3153).
+  With n_p = 100 at the floor, the chain gives M_min ~= 2.6e11-2.2e12 Msun/h
+  depending on the mesh ratio. Each config REPORTS its M_min; no survey
+  frame enters the requirement (D-v2-8 item 4).
+- **Bias route = hybrid.** Halo catalogs (FoF/proxy) at calibration configs
+  fit/validate the bias model; production runs paint field-level Lagrangian
+  bias. Halo finder in scope, off the production critical path.
+- **Velocity fidelity = multipole-grade.** Codec + numerics error in P0 AND
+  P2 below the fine-mesh PM floor for k <= 0.2 k_Nyq (D-v2-1 applied to
+  redshift-space multipoles). This is G2c's velocity gate bar.
+- **Statistics + tolerances.** P(k): D-v2-1. Squeezed bispectrum <= 15%
+  (D-v2-7). Calibration configs: HMF within 5% of a calibrated reference,
+  halo b1 within 2% at k <= 0.25. Realizations: 100 per production config,
+  O(5) at calibration; covariance-grade ensembles out of scope.
+
+### v2 config table (V0; capacity numbers re-derived at V4 with gate-measured B/p)
+
+Named by hardware class. Mesh ratio provisionally 2x (cell = spacing/2);
+G5 may tighten it. Coarse mesh = fine/4 (PMFAST pattern). m_p = 1.1e10
+Msun/h and M_min(n_p=100) ~= 1.1e12 Msun/h at all three primary configs
+(spacing 0.5 Mpc/h, cell 0.25 <= 0.31 Mpc/h).
+
+| config | home | N_p | L [Mpc/h] | fine mesh | coarse |
+|---|---|---|---|---|---|
+| C-dev | deneb RTX 3050 6 GB / laptop CPU | 256^3 | 128 | 512^3 | 128^3 |
+| C-gh | 1x Vista GH200 (96 HBM + 116 LPDDR) | 2048^3 | 1024 | 4096^3 (tiled) | 1024^3 |
+| C-hero | 1x S3 H100 node (4x96 HBM + 1 TB + NVMe) | 4096^3 | 2048 | 8192^3 (tiled) | 2048^3 |
+| C-vol (optional) | as C-hero | 4096^3 | 2580 | 8192^3 (tiled) | 2048^3 |
+
+C-vol trades mass floor for volume at the bar's edge (spacing 0.63, cell
+0.315 ~ the 0.31 limit; M_min 2.2e12); it exists to make the volume<->M_min
+slider explicit, not as a commitment. Gate week runs on C-dev; C-gh is V3's
+target; C-hero/C-vol are V4 capacity checks.
 
 ## 3. The compute<->memory tradeoff map (D-v2-4)
 

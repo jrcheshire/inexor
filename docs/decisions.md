@@ -241,3 +241,53 @@ decision here is locked until explicitly re-litigated with JC.
   int-paint primal. The reference-floor characterization also fixes the correct
   gate REFERENCE for the money plots (P2): the float-replay drift is compared
   globally, never per-component.
+
+## D-v2-8 — v2 requirements chain (seed V0 pin)
+- **Status:** accepted (JC, 2026-07-15, seed V0).
+- **Context:** v2 is a GENERAL memory-floor PM N-body engine — "N-body that
+  takes less memory," full stop. It is deliberately NOT a SPHEREx main-line
+  mock producer (disco-mocks + DISCO-DJ own that role) and its goals, framing,
+  and scale regimes must not be assumed to mirror the SPHEREx-focused
+  projects (JC caution, 2026-07-15). Requirements below are pinned in
+  engine-intrinsic terms; the survey-specific inputs examined at V0 (v28 bin
+  table, abundance matching, per-bin Fisher) were demoted to non-normative
+  session context and live in the V0 worklog, not here.
+- **Decision (the chain — every item JC-ratified at V0):**
+  1. **k_sci = 2.0 h/Mpc.** Statistics must be numerically clean (below the
+     PM error floor, D-v2-1's k <= 0.2 k_Nyq criterion) through k = 2.0,
+     giving **fine-mesh cell <= 0.2*pi/k_sci = 0.31 Mpc/h**. Motivation:
+     bias-model studies need divergence in k in [1, 2] to be attributable to
+     the model, not the mesh. (The disco-mocks Quijote-config validation that
+     prompted this ran cell = 1.95 Mpc/h, k_Nyq = 1.61 h/Mpc: its k = 1-2
+     band lay at 0.6-1.25x Nyquist, numerically invalid by this criterion.)
+  2. **Bias route = hybrid.** Halo catalogs (FoF or proxy finder) at
+     CALIBRATION configs to fit/validate bias models; field-level Lagrangian
+     bias for PRODUCTION runs. The halo finder is in scope but off the
+     production critical path.
+  3. **n_p = 100** particles per halo at the mass floor (the standard bar for
+     halo-clustering/bias robustness).
+  4. **M_min is DERIVED, not required.** spacing = (mesh ratio) * cell with
+     mesh:particle ratio in [1, 2] (G5 measures where the split lands) ->
+     spacing 0.31-0.63 Mpc/h -> m_p ~= 2.6e9-2.2e10 Msun/h -> M_min(n_p=100)
+     ~= 2.6e11-2.2e12 Msun/h. Each config REPORTS its M_min; no tomographic
+     or survey-sample frame enters the requirement. If a consumer later needs
+     a lower M_min, that moves the config table, not the architecture.
+  5. **Velocity/RSD bar = multipole-grade.** Codec + numerics error in P0 AND
+     P2 below the fine-mesh PM floor for k <= 0.2 k_Nyq — D-v2-1 applied to
+     redshift-space multipoles. This is the G2c velocity-codec gate bar.
+  6. **Tolerances.** P(k): D-v2-1 (CUBE-grade vs the fine mesh). Squeezed
+     bispectrum: <= 15% (D-v2-7). Calibration configs: HMF within 5% of a
+     calibrated reference over M > M_min; halo b1 within 2% at k <= 0.25.
+  7. **Realizations.** Nominal production batch = 100; O(5) at calibration
+     configs (bias fitting is not a covariance job). Covariance-grade
+     ensembles (500-1000) are OUT OF SCOPE — that is disco-mocks' role.
+  8. **Cost-of-memory instrument ratified as specced** (plan-plan Sec 3:
+     every gate reports peak B/p all-in, wall/step, SU per
+     realization-equivalent; Pareto rule at V4; >5x SU for 2x memory needs
+     explicit JC sign-off).
+- **Consequences:** the requirement chain runs off k_sci alone — no survey
+  dependency to rot. The v2 config table (plan-plan Sec 2) frames capacity by
+  HARDWARE CLASS (deneb dev / single GH200 / S3 H100 node), not by survey
+  samples. Gate week (V1-V3) measures against these bars; V4 re-derives the
+  capacity numbers with gate-measured B/p. Tolerances are never relaxed
+  without JC (standing convention).
