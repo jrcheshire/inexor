@@ -104,10 +104,17 @@ def _single(n_mesh, K, f64):
     dj = DiscoDJ(dim=3, res=n_mesh, boxsize=M.BOX_SIZE, cosmo=dict(M.COSMO_DISCO),
                  precision="double" if f64 else "single")
     dj = dj.with_timetables()
-    # Their built-in EH98 avoids needing our pk file: the linear spectrum only
-    # sets the IC amplitude, and this measures MEMORY, not parity.
-    dj = dj.with_linear_ps(transfer_function="EH")
-    dj = dj.with_lpt(n_order=2)
+    # Their built-in Eisenstein-Hu (the default) avoids needing our pk file: the
+    # linear spectrum only sets the IC amplitude, and this measures MEMORY, not
+    # parity, so the Tcmb=2.72548-vs-2.7255 quibble that forces `from_file` in
+    # m1_run_disco.py is irrelevant here. Valid keys are "Eisenstein-Hu",
+    # "BBKS", "GeneticAlgorithm", "DiscoEB", "from_file", "none" -- NOT "EH",
+    # which is what job 21 died on.
+    dj = dj.with_linear_ps()
+    # NO with_lpt here: it belongs to the with_external_ics(delta=...) path and
+    # needs 'fphi' in the IC dict. We inject pos/vel directly (m1_run_disco.py's
+    # _evolve_injected), so LPT is not in the picture -- calling it raises
+    # KeyError: 'fphi' not found in initial conditions dictionary.
 
     n_part = n_mesh**3
     fplus_i = float(dj.cosmo.Fplus(a_i))
@@ -147,11 +154,21 @@ def _single(n_mesh, K, f64):
     jax.block_until_ready(g)
     peak_adj = peak()
 
+    # Guard against measuring a no-op. If the adjoint silently returned zeros
+    # (a broken trace, convert_to_numpy severing the graph, ...) the peak would
+    # be flatteringly small AND meaningless -- and it would look like a great
+    # result for DISCO-DJ. A real gradient is finite and nonzero.
+    gx = np.asarray(g[0])
+    gnorm = float(np.linalg.norm(gx))
+    finite = bool(np.all(np.isfinite(gx)))
+
     return {
         "code": "discodj", "n_mesh": n_mesh, "n_particles": n_part, "K": K,
         "f64": f64, "platform": dev.platform, "device": str(dev),
         "bytes_limit": limit(), "peak_after_ic": peak_ic,
         "peak_forward": peak_fwd, "peak_adjoint": peak_adj,
+        "grad_norm": gnorm, "grad_finite": finite,
+        "adjoint_ran": bool(finite and gnorm > 0.0),
     }
 
 
@@ -197,15 +214,22 @@ def main():
     print(f"  device: {next((r.get('device') for r in recs if r.get('device')), '?')}"
           f"   limit: {lim / GIB if lim else float('nan'):.3f} GiB   "
           f"precision: {'f64' if args.f64 else 'f32'}")
+    # A CPU backend exposes no memory_stats, so peaks are None there: the run is
+    # an API/plumbing smoke, not a measurement. Format defensively rather than
+    # dividing None by GIB (the m2_mem_profile _fmt_gib rule).
+    def g(v):
+        return "     -" if v is None else f"{v / GIB:6.3f}"
+
     print("\n  n_mesh    ICs      fwd  adjoint     B/particle (adjoint)")
     for r in recs:
         if r.get("error"):
             print(f"  {r['n_mesh']:>6}  {'OOM' if r.get('oom') else 'ERR'}: {r['error'][:56]}")
             continue
         a = r["peak_adjoint"]
-        print(f"  {r['n_mesh']:>6}  {r['peak_after_ic'] / GIB:6.3f}  "
-              f"{r['peak_forward'] / GIB:6.3f}  {a / GIB:6.3f}      "
-              f"{a / r['n_particles']:8.1f}")
+        bpp = f"{a / r['n_particles']:8.1f}" if a else "       - (no device stats: CPU?)"
+        flag = "" if r.get("adjoint_ran") else "   <-- ADJOINT DID NOT RUN (grad zero/non-finite)"
+        print(f"  {r['n_mesh']:>6}  {g(r['peak_after_ic'])}  {g(r['peak_forward'])}  "
+              f"{g(a)}      {bpp}{flag}")
 
     ok = [r for r in recs if not r.get("error") and r.get("peak_adjoint")]
     if len(ok) > 1:
