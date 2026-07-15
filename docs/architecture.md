@@ -20,6 +20,18 @@ adjoint with reverse-time replay — replays in floating point, drifting by up t
 reversible adjoint has the same class of wall at the float32 CIC scatter-add
 floor, ~1e-4 cells, `mbody/tests/test_integrate.py`).
 
+> **[2026-07-14 — READ `retrospective.md` BEFORE TRUSTING THE MOTIVATION ABOVE OR
+> THE THESIS BELOW.]** M2 S4/P1 measured both load-bearing claims and both
+> failed. (a) The "~5e-2 field-std drift" above is **pmwd's number, for pmwd's
+> *state* field, never verified on the code we benchmark against**: DISCO-DJ's f32
+> replay *gradient* error measures orders of magnitude smaller, and plausibly
+> smaller than inexor's OWN int16 quantization error (D-015: medrel 2e-4..3.3e-3).
+> (b) The memory thesis is swamped: the adjoint's peak is ~440-490 B/particle for
+> inexor AND for DISCO-DJ, so the 12 B/particle state saving is ~3% of peak and
+> the 36 GiB carry below was never the binding term — Sec. 9's *transient*
+> estimate is wrong by ~14x. Sec. 2's table and Sec. 9's budget are retained as
+> the design-time record, NOT as current fact.
+
 **inexor's thesis: put the phase space on a fixed-point integer lattice.** One
 design decision buys three properties:
 
