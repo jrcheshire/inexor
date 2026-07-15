@@ -307,7 +307,16 @@ def run_single(args):
     if args.impl == "pallas":
         if args.op == "paint_int":
             ref = paint_int(pos, n_mesh, L, FRAC_BITS).reshape(-1)
-            rec["n_diff_vs_xla"] = int(jnp.sum(out != ref))
+            d = np.asarray(out).astype(np.int64) - np.asarray(ref).astype(np.int64)
+            # discriminate failure modes (job 33: 63% of cells differed):
+            # all |d|==1 + equal mass -> rint boundary flips; mass ratio ~2 ->
+            # double-painting; big |d| + equal mass -> mis-indexed deposits
+            rec["n_diff_vs_xla"] = int(np.count_nonzero(d))
+            rec["diff_max_abs"] = int(np.abs(d).max())
+            rec["diff_n_abs1"] = int(np.sum(np.abs(d) == 1))
+            rec["mass_pallas_over_xla"] = float(
+                np.asarray(out).astype(np.int64).sum() / max(np.asarray(ref).astype(np.int64).sum(), 1)
+            )
             reps = [np.asarray(pallas_paint(pos, n_mesh, L, chunk, True, interp)) for _ in range(8)]
             rec["n_diff_run_to_run"] = int(sum(np.sum(r != reps[0]) for r in reps[1:]))
         elif args.op == "paint_f32":
@@ -315,9 +324,13 @@ def run_single(args):
             d = np.abs(np.asarray(out) - np.asarray(ref))
             rec["max_absdiff_vs_xla"] = float(d.max())
         elif args.op in ("gather", "composed"):
+            # gather over the SAME (XLA-painted) fields, isolating the gather
+            # kernel from any paint mismatch (job 33 conflated the two)
             g = counts_from_int(paint_int(pos, n_mesh, L, FRAC_BITS))
+            g3 = g.reshape(n_mesh, n_mesh, n_mesh)
+            out_iso = pallas_gather(g3, g3, g3, pos, n_mesh, L, chunk, interp)
             ref = cic_read_vector(g, g, g, pos, n_mesh, L)
-            d = np.abs(np.asarray(out) - np.asarray(ref))
+            d = np.abs(np.asarray(out_iso) - np.asarray(ref))
             denom = max(float(np.abs(np.asarray(ref)).max()), 1e-30)
             rec["max_reldiff_vs_xla"] = float(d.max() / denom)
 
