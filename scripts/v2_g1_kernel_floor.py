@@ -92,6 +92,23 @@ def _corner_flat_weight_k(px, py, pz, corner, n_mesh, cell):
     return flat, ws[0] * ws[1] * ws[2]
 
 
+def _rint_nonneg_halfeven(x):
+    """Round-half-even for NON-NEGATIVE x, from floor primitives only.
+
+    jnp.rint (lax round_p) has no Pallas Triton lowering (job 31:
+    "Unimplemented primitive ... round"). CIC corner weights are >= 0 and
+    w * 2^FRAC_BITS <= 4096 << 2^24, so floor/compare arithmetic below is
+    EXACT in f32 and reproduces jnp.rint bit-for-bit on this domain.
+    """
+    import jax.numpy as jnp
+
+    r = jnp.floor(x)
+    f = x - r
+    odd = r - 2.0 * jnp.floor(0.5 * r)  # exact parity for r < 2^24
+    up = (f > 0.5) | ((f == 0.5) & (odd == 1.0))
+    return r + up.astype(x.dtype)
+
+
 def _paint_kernel(px_ref, py_ref, pz_ref, mesh_in_ref, mesh_out_ref, *, n_mesh, cell, int_paint):
     import jax.experimental.pallas.triton as plt
     import jax.numpy as jnp
@@ -102,7 +119,9 @@ def _paint_kernel(px_ref, py_ref, pz_ref, mesh_in_ref, mesh_out_ref, *, n_mesh, 
     for corner in CORNERS:
         flat, w = _corner_flat_weight_k(px, py, pz, corner, n_mesh, cell)
         if int_paint:
-            plt.atomic_add(mesh_out_ref, (flat,), jnp.rint(w * scale).astype(jnp.int32))
+            plt.atomic_add(
+                mesh_out_ref, (flat,), _rint_nonneg_halfeven(w * scale).astype(jnp.int32)
+            )
         else:
             plt.atomic_add(mesh_out_ref, (flat,), w)
 
