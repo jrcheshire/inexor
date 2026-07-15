@@ -93,25 +93,40 @@ def _corner_flat_weight_k(px, py, pz, corner, n_mesh, cell):
 
 
 def _rint_nonneg_halfeven(x):
-    """Round-half-even for NON-NEGATIVE x, from floor primitives only.
+    """Round-half-even for NON-NEGATIVE x < 2^23, from floor/select/mul only.
 
     jnp.rint (lax round_p) has no Pallas Triton lowering (job 31:
-    "Unimplemented primitive ... round"). CIC corner weights are >= 0 and
-    w * 2^FRAC_BITS <= 4096 << 2^24, so floor/compare arithmetic below is
-    EXACT in f32 and reproduces jnp.rint bit-for-bit on this domain.
+    "Unimplemented primitive ... round"). Deliberately BOOLEAN-FREE: the
+    first floor-based version used `|`/`&` on comparison masks and lowered
+    without error but produced plain-floor behavior on CUDA (job 33: every
+    non-empty cell differed -- the Poisson 1-e^-1 = 63% signature). Here the
+    tie-and-odd conjunction is a PRODUCT of {0,1} floats instead.
+
+    y = floor(x + 0.5) (half-up), then subtract 1 on ties where y is odd:
+    exactly round-half-even for x >= 0. All steps exact in f32 for x < 2^23
+    (w * 2^FRAC_BITS <= 4096 here).
     """
     import jax.numpy as jnp
 
-    r = jnp.floor(x)
-    f = x - r
-    odd = r - 2.0 * jnp.floor(0.5 * r)  # exact parity for r < 2^24
-    up = (f > 0.5) | ((f == 0.5) & (odd == 1.0))
-    return r + up.astype(x.dtype)
+    y = jnp.floor(x + 0.5)
+    tie = jnp.where(y - x == 0.5, 1.0, 0.0)
+    odd = y - 2.0 * jnp.floor(0.5 * y)  # exact parity for y < 2^24
+    return y - tie * odd
 
 
 def _paint_kernel(px_ref, py_ref, pz_ref, mesh_in_ref, mesh_out_ref, *, n_mesh, cell, int_paint):
+    """int_paint accumulates EXACT INTEGER-VALUED f32 deposits via f32 atomics.
+
+    plt.atomic_add into an int32 (or uint32) ref is a SILENT NO-OP on this
+    Triton/sm_86 stack (jobs 33-34: all-zeros mesh; minimal repro 2026-07-15
+    -- f32 works, i32/u32 write nothing, i64/f64 unsupported). Workaround:
+    the rounded deposits are integers <= 2^FRAC_BITS carried in f32; integer
+    f32 addition is EXACT while cell sums stay < 2^24, so the accumulation is
+    order-independent -> deterministic, and converts losslessly to the int32
+    mesh (the 2^24 guard is checked by the caller). Production implications
+    (frac_bits budget vs CAS loop vs ffi vs upstream fix) are an M-v2-1 item.
+    """
     import jax.experimental.pallas.triton as plt
-    import jax.numpy as jnp
 
     del mesh_in_ref  # aliased with mesh_out_ref; the zeros come in as input
     px, py, pz = px_ref[...], py_ref[...], pz_ref[...]
@@ -119,9 +134,7 @@ def _paint_kernel(px_ref, py_ref, pz_ref, mesh_in_ref, mesh_out_ref, *, n_mesh, 
     for corner in CORNERS:
         flat, w = _corner_flat_weight_k(px, py, pz, corner, n_mesh, cell)
         if int_paint:
-            plt.atomic_add(
-                mesh_out_ref, (flat,), _rint_nonneg_halfeven(w * scale).astype(jnp.int32)
-            )
+            plt.atomic_add(mesh_out_ref, (flat,), _rint_nonneg_halfeven(w * scale))
         else:
             plt.atomic_add(mesh_out_ref, (flat,), w)
 
@@ -174,20 +187,24 @@ def pallas_paint(positions, n_mesh, box_size, chunk, int_paint, interpret):
 
     n = positions.shape[0]
     cell = np.float32(box_size / n_mesh)
-    dt = jnp.int32 if int_paint else jnp.float32
-    mesh0 = jnp.zeros((n_mesh**3,), dtype=dt)
+    mesh0 = jnp.zeros((n_mesh**3,), dtype=jnp.float32)  # f32 even for int paint (see kernel)
     kern = functools.partial(_paint_kernel, n_mesh=n_mesh, cell=cell, int_paint=int_paint)
     c = pl.BlockSpec((chunk,), lambda i: (i,))
-    return pl.pallas_call(
+    out = pl.pallas_call(
         kern,
         grid=(n // chunk,),
         in_specs=[c, c, c, pl.BlockSpec((n_mesh**3,), lambda i: (0,))],
         out_specs=pl.BlockSpec((n_mesh**3,), lambda i: (0,)),
-        out_shape=jax.ShapeDtypeStruct((n_mesh**3,), dt),
+        out_shape=jax.ShapeDtypeStruct((n_mesh**3,), jnp.float32),
         input_output_aliases={3: 0},
         interpret=interpret,
         **_triton_params(interpret),
     )(*_pos_components(positions), mesh0)
+    if int_paint:
+        # exact-integer f32 sums -> the raw int32 mesh (lossless below 2^24;
+        # the caller checks the guard via the returned mesh's max)
+        return out.astype(jnp.int32)
+    return out
 
 
 def pallas_gather(gx, gy, gz, positions, n_mesh, box_size, chunk, interpret):
@@ -307,6 +324,11 @@ def run_single(args):
     if args.impl == "pallas":
         if args.op == "paint_int":
             ref = paint_int(pos, n_mesh, L, FRAC_BITS).reshape(-1)
+            # f32-accumulation exactness guard (kernel docstring): all deposits
+            # integer-valued and every cell sum < 2^24 -> the f32 adds were
+            # exact and order-independent; above it the run is INVALID
+            rec["max_cell_sum"] = int(np.asarray(out).max())
+            rec["f32_exact_guard_ok"] = bool(rec["max_cell_sum"] + 2**FRAC_BITS < 2**24)
             d = np.asarray(out).astype(np.int64) - np.asarray(ref).astype(np.int64)
             # discriminate failure modes (job 33: 63% of cells differed):
             # all |d|==1 + equal mass -> rint boundary flips; mass ratio ~2 ->
@@ -315,7 +337,8 @@ def run_single(args):
             rec["diff_max_abs"] = int(np.abs(d).max())
             rec["diff_n_abs1"] = int(np.sum(np.abs(d) == 1))
             rec["mass_pallas_over_xla"] = float(
-                np.asarray(out).astype(np.int64).sum() / max(np.asarray(ref).astype(np.int64).sum(), 1)
+                np.asarray(out).astype(np.int64).sum()
+                / max(np.asarray(ref).astype(np.int64).sum(), 1)
             )
             reps = [np.asarray(pallas_paint(pos, n_mesh, L, chunk, True, interp)) for _ in range(8)]
             rec["n_diff_run_to_run"] = int(sum(np.sum(r != reps[0]) for r in reps[1:]))
