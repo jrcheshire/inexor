@@ -134,6 +134,19 @@ def _pos_components(positions):
     return tuple(jnp.asarray(positions[:, c]) for c in range(3))
 
 
+def _triton_params(interpret):
+    """Explicit Triton backend selection. jax 0.10 defaults pallas-GPU to
+    Mosaic GPU (jax_pallas_use_mosaic_gpu=True); on stacks where the Mosaic
+    backend fails to import (it targets Hopper+), compiler_params=None leaves
+    NO backend and raises the misleading "install jaxlib GPU" error (jobs
+    26-29). Ampere = Triton, requested explicitly."""
+    if interpret:
+        return {}
+    import jax.experimental.pallas.triton as plt
+
+    return dict(compiler_params=plt.CompilerParams())
+
+
 def pallas_paint(positions, n_mesh, box_size, chunk, int_paint, interpret):
     """Chunked atomic-add CIC paint into ONE preallocated mesh (aliased)."""
     import jax
@@ -154,6 +167,7 @@ def pallas_paint(positions, n_mesh, box_size, chunk, int_paint, interpret):
         out_shape=jax.ShapeDtypeStruct((n_mesh**3,), dt),
         input_output_aliases={3: 0},
         interpret=interpret,
+        **_triton_params(interpret),
     )(*_pos_components(positions), mesh0)
 
 
@@ -175,6 +189,7 @@ def pallas_gather(gx, gy, gz, positions, n_mesh, box_size, chunk, interpret):
         out_specs=[c, c, c],
         out_shape=[jax.ShapeDtypeStruct((n,), jnp.float32)] * 3,
         interpret=interpret,
+        **_triton_params(interpret),
     )(*_pos_components(positions), gx.reshape(-1), gy.reshape(-1), gz.reshape(-1))
     return jnp.stack(out, axis=1)
 
