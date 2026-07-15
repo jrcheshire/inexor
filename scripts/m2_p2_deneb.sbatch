@@ -43,15 +43,22 @@ echo "=== env ==="
 git log --oneline -1
 nvidia-smi --query-gpu=name,driver_version --format=csv || true
 
+# ORDER MATTERS. The DISCO-DJ arm runs FIRST because it is the arm that decides
+# the question; in job 23 the inexor arm ran first, OOM'd at K=40, and `set -e`
+# killed the job before DISCO-DJ ran at all -- half a plot, and the useless half.
 echo
-echo "########## arm 1: inexor -- adjoint vs its own f64 float path, by K ##########"
-# D-015's machinery, K axis opened. x64 is set inside the script (it needs a
-# clean f64 reference); this is a FIDELITY measurement, not the memory one.
-pixi run -e gpu python scripts/m2_grad_gate.py --k-sweep 5,10,20,40
-
-echo
-echo "########## arm 2: DISCO-DJ -- f32 vs its own f64, by K (+ P3 timing) ##########"
+echo "########## arm 1 (DECISIVE): DISCO-DJ -- f32 vs its own f64, by K (+ P3 timing) ##########"
 pixi run --manifest-path ~/src/disco-mocks/pixi.toml -e gpu \
   python scripts/m2_p2_disco_drift.py --n 64 --k 5,10,20,40
+
+echo
+echo "########## arm 2: inexor -- adjoint vs its own f64 float path, by K ##########"
+# D-015's machinery, K axis opened. x64 is set inside the script (it needs a
+# clean f64 reference); this is a FIDELITY measurement, not the memory one.
+# K=40 OOM'd deneb's 6 GB in job 23 (x64 + FD sampling is heavy, and the FD
+# reference is only needed for the floors, not the drift) -- K=5,10,20 fit and
+# already show the trend. `|| true`: an OOM at the top K must not discard the
+# DISCO-DJ arm above, which is the point of the job.
+pixi run -e gpu python scripts/m2_grad_gate.py --k-sweep 5,10,20 || true
 
 echo "=== DONE ==="
