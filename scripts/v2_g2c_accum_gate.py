@@ -436,7 +436,9 @@ def spawn(config, arm, k, mesh=None):
     ]
     if mesh:
         cmd += ["--mesh", str(mesh)]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    env = dict(os.environ)
+    env.pop("JAX_PLATFORMS", None)  # workers use the GPU; only the orchestrator is CPU-pinned
+    p = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if p.returncode != 0:
         lines = (p.stderr or "").strip().splitlines()
         # persist the whole stderr; surface the real exception, not JAX's
@@ -476,6 +478,13 @@ def main():
     if args.single:
         run_single(args)
         return
+
+    # The ORCHESTRATOR stays off the GPU: its own jax work (Kaiser check,
+    # stats painting) would otherwise preallocate XLA_PYTHON_CLIENT_MEM_FRACTION
+    # of the card and starve every worker (job 30: all 34 workers OOM'd on
+    # MiB-scale allocations of the 5% remainder). Workers get the GPU; this
+    # process computes statistics on CPU. Must be set before any jax import.
+    os.environ["JAX_PLATFORMS"] = "cpu"
 
     from inexor.config import Cosmology
 
