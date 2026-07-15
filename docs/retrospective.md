@@ -35,19 +35,38 @@ each is enough on its own:
    session (2026-07-10) to M2 S4 (2026-07-14) without anyone computing the
    equivalent quantity for the code we actually benchmark against.
 
-**Measured instead** (deneb, `scripts/m2_p2_disco_drift.py` + `m2_grad_gate.py
---k-sweep`; each code against ITS OWN f64 gradient, which is the comparison that
-does not fold in convention differences):
+**Measured instead** (deneb job 24, 64^3, `scripts/m2_p2_disco_drift.py` +
+`m2_grad_gate.py --k-sweep`; each code against ITS OWN f64 gradient, which is the
+comparison that does not fold in convention differences):
 
-| | gradient error vs own f64 |
-|---|---|
-| DISCO-DJ f32 float replay | see `runs/m2/p2_disco_drift.json` (CPU smoke at n=16: **~1e-5**, growing ~1.13x from K=3 to 6) |
-| inexor int16 adjoint (D-015) | **2e-4 .. 3.3e-3** (quantization + STE) |
+| K | DISCO-DJ f32 replay | inexor int16 (band_power) | inexor int16 (field_l2) |
+|---|---|---|---|
+| 5 | 3.963e-05 | 2.31e-04 | 2.72e-03 |
+| 10 | 4.259e-05 | 1.96e-04 | 3.11e-03 |
+| 20 | 3.965e-05 | 2.48e-04 | 4.54e-03 |
+| 40 | 3.446e-05 | — | — |
 
-If that ordering holds at scale, the design's position is: **inexor's own
-quantization error is larger than the float-replay error it exists to eliminate.**
-The thing being fixed was not broken at the level the design assumed, and the fix
-costs accuracy of its own.
+**Float-replay error does not accumulate with K.** Across an 8x change in steps it
+is FLAT and slightly *decreasing* (x0.87 from K=5 to 40). The design's motivating
+mechanism -- roundoff piling up over a float backward sweep, which exact replay
+cannot do -- is not present at any K we can reach. That was the last place the
+claim could have lived, since step-independence itself is table stakes (Sec. 3).
+
+And the ordering is against us at every K: **DISCO-DJ's f32 replay is 5x to 100x
+MORE accurate than inexor's int16 adjoint.** The design's own quantization error
+is larger than the float-replay error it exists to eliminate. The thing being
+fixed was not broken, and the fix costs more accuracy than it saves.
+
+Head to head, same card, same quantity (deneb, 64^3, K=10):
+
+| | gradient error | peak memory | adjoint wall |
+|---|---|---|---|
+| **DISCO-DJ f32** | **4e-5** | **437 B/particle** | **0.50 s** |
+| inexor int16 | 2e-4 .. 4.5e-3 | 488 B/particle | ~0.98 s |
+
+Worse on all three measurable axes. (Timing caveat: the two numbers come from
+different runs and inexor's includes a heavier loss, so read ~2x as directional.
+It is not, however, faster.)
 
 Note the subtlety that makes this easy to get wrong, and that we got wrong:
 "bit-exact" describes the **replay being reproducible**, NOT the gradient being
@@ -220,8 +239,25 @@ In rough order of what would have saved the most time:
    all measured working at 512^3 on CUDA. If a use case appears where *exactness*
    or *reproducibility* is the product (rather than memory), the machinery exists
    and is validated.
-5. **The honest surviving pitch, if any**: not memory, and not accuracy-vs-f32
-   (we are worse). It would have to be something exactness buys that neither f32
-   nor f64 replay gives — e.g. bitwise-reproducible gradients across runs/machines
-   for a workflow that needs it. That is a much narrower claim than the outline's,
-   and nobody has yet shown a use case that demands it.
+5. **The honest surviving pitch, if any**: not memory (worse than f32 replay), not
+   accuracy (5-100x worse than f32 replay), not speed (~2x slower), and not
+   long-rollout drift (float replay is flat in K — measured, the premise is
+   simply false). What is left is bitwise REPRODUCIBILITY: identical gradients
+   across runs, which float replay cannot promise and which inexor delivers on
+   the int path. Nobody has yet shown a workflow that needs it badly enough to
+   pay 2x wall and 100x accuracy. **If you cannot name that workflow first, do
+   not rebuild this.**
+
+## 8. The verdict, plainly
+
+M2 halted here. The mechanism is sound and does exactly what it was designed to
+do — 512^3 exact round trip, O(1) in steps, flat-in-K error. The design is not
+buggy; it is **aimed at a problem that measurement says does not exist**. Float
+replay at f32 is already accurate to ~4e-5 and stays there as K grows, so
+paying int16 quantization error (2e-4..4.5e-3), 12% more memory and ~2x wall to
+remove a drift of 4e-5 is a bad trade at every K tested.
+
+The paper as outlined (`paper/outline.md`) cannot be written: claim 1 (no replay
+drift) targets a drift that is negligible and non-accumulating; claim 2 (the
+1024^3 adjoint fits 80 GB where float state does not) is off by ~6x and points
+the wrong way. Both were measurable at M0 for about a day of free GPU time.
