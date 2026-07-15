@@ -109,12 +109,15 @@ dP0/P0 2.0e-2, dP2/P0 4.9e-2; **mesh (256 vs 128) dP/P 1.3e-1, dP0/P0
 | t9 | 9 | 40 | 319 | 0.052 | 1.3e-4 | 1.4e-4 | 4.9e-4 | below, ~3 orders |
 | t12 | 12 | 40 | 319 | 0.052 | 1.3e-4 | 1.4e-4 | 4.9e-4 | below (== t9 here) |
 
-Readings (verdict is JC's):
+Readings:
 - **6 B/p tier fails the accumulated gate** (both variants; error grows ~K;
   per-step re-clipping of the int8 velocity residual compounds -- outlier
   frac 1.8-3.8e-3/step). Kill-line ladder -> fall to 9 B/p.
 - **9 B/p tier passes with ~3 orders of margin** at every K, in P0 AND P2,
   and its roundtrip is FREE in wall (0.052 vs 0.051 s/step ref).
+- **VERDICT RATIFIED (JC, 2026-07-15): the v2 state tier = T9, 9 B/p**
+  (int8 cell-relative positions + int16 velocity), per the D-v2-8 kill
+  ladder as planned.
 - Evolution peak 319 B/p for every arm = the XLA monolithic force transient
   (G1's quarry); the codec never moves the peak.
 - One-shot -> accumulated: t9-class one-shot was 3.1e-5 (G2b int8-cellrel at
