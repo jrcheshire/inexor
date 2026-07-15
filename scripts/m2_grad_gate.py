@@ -200,10 +200,18 @@ def _check_gate(results):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--quick", action="store_true", help="64^3 only")
+    ap.add_argument("--k-sweep", default=None,
+                    help="P2 drift arm: comma-separated K at 64^3 bullfrog, replacing the "
+                         "gate configs. Float replay drift ACCUMULATES over steps while exact "
+                         "replay does not, so error-vs-K is the comparison that decides whether "
+                         "exact replay buys anything; a single K cannot show it.")
     args = ap.parse_args()
-    configs = [(64, 10, "bullfrog"), (64, 10, "fastpm")]
-    if not args.quick:
-        configs += [(64, 40, "bullfrog"), (128, 40, "bullfrog")]
+    if args.k_sweep:
+        configs = [(64, int(k), "bullfrog") for k in args.k_sweep.split(",") if k.strip()]
+    else:
+        configs = [(64, 10, "bullfrog"), (64, 10, "fastpm")]
+        if not args.quick:
+            configs += [(64, 40, "bullfrog"), (128, 40, "bullfrog")]
 
     results = []
     for n, K, integ in configs:
