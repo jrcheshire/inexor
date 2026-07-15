@@ -1,28 +1,35 @@
 # CLAUDE.md -- inexor
 
-Exactly reversible, compressed-state differentiable N-body in JAX: fixed-point
-integer phase space (int16 default / int8 opt-in) makes evolution bit-exactly
-reversible, so the adjoint is an exact replay with O(1)-in-steps memory at
-12 (or 6) bytes/particle. Methods-paper track (OJAp); James Cheshire's
-personal project — NOT SPHEREx-pipeline critical path (disco-mocks/DISCO-DJ
-own production mocks; mbody owns MLX/Apple-Silicon).
+**v2 (2026-07-14): memory-floor PM mock engine** — maximize (volume x
+halo-grade resolution) per single GPU/node; compute freely traded for memory.
+The v1 thesis (exactly reversible, compressed-state differentiable N-body)
+was HALTED 2026-07-14 — its premise measured false; read
+`docs/retrospective.md` before touching anything v1-motivated. v1's validated
+components (int16 codec, deterministic int paint, integrators, harness suite)
+carry forward. Methods track; James Cheshire's personal project — NOT
+SPHEREx-pipeline critical path (disco-mocks/DISCO-DJ own production mocks;
+mbody owns MLX/Apple-Silicon).
 
 ## Current milestone
 
-**M1 (forward PM) DONE** (2026-07-13). Full package under `src/inexor/`;
-89 tests green. Forward PM validated: mbody parity at mbody's own repro
-floor (Tier A); DISCO-DJ gap attributed to 3 named conventions and closed
-at f64 roundoff -> gate D-013; M0 "4% deficit" decomposed (binning artifact
-+ seed scatter + a real -2.6% code-independent mode-coupling suppression);
-Tier-B int16 = pure quantization below the PM mesh floor -> gate D-014;
-exact reversibility confirmed at scale on CUDA (256^3 roundtrip n_diff=0,
-deneb Slurm job 12). Record: `docs/m1-results.md`; ADRs D-013/D-014 in
-`docs/decisions.md`; plan `~/.claude/plans/tender-stargazing-map.md`.
-Deferred: 512^3 headline smoke (OOMs deneb's 6 GB 3050) -> a larger-GPU env
-(Vista aarch64) at M2. M0 PASSED — GO earlier same day (D-010..D-012;
-probe outputs `runs/m0/`). **NEXT: M2 (the adjoint)** — open it with a fresh
-detailed milestone plan (master-plan convention): `adjoint.py` custom_vjp
-exact-replay adjoint, money plots, Vista aarch64 pixi feature lands here.
+**v2 OPENED** (2026-07-14). Master strategy + session seeds:
+`docs/plan-plan-v2.md` — START THERE. Near-term sequence: seed V0
+(requirements pin + tradeoff frame, with JC) -> V1/V2/V3 (the gate week:
+G1 kernel floor, G2c accumulated codec gate, G5 two-level force split,
+G3 tile seams incl. squeezed bispectrum at the 15% bar, G4 GH200 coherent
+path) -> V4 (architecture freeze + build roadmap). Design-space study:
+`docs/design-study-2026-07-14.html` (artifact:
+https://claude.ai/code/artifact/370ba948-b9ea-4e42-9c15-92dce10fdf55).
+New probes: `scripts/v2_g2_residual_range.py`, `scripts/v2_g2b_codec_ladder.py`
+(results quoted in the plan-plan; outputs `runs/v2/`, gitignored).
+
+v1 record (closed): M0 PASSED — GO (D-010..D-012, `runs/m0/`); M1 forward PM
+DONE 2026-07-13 (mbody parity at its floor; DISCO-DJ gap attributed to 3
+conventions, gate D-013; Tier-B int16 below the mesh floor, gate D-014;
+512^3 exact roundtrip n_diff=0 on a GH200); **M2 (the adjoint) HALTED
+2026-07-14 — the premise measured false** (`docs/retrospective.md` is the
+read-first record; D-015 passed before the halt). v1 M3/M4 are cancelled;
+`docs/roadmap.md` stands as the v1 historical record.
 
 Deneb git relay: bare repo `deneb:~/git/inexor.git` (remote `deneb`),
 working clone `deneb:~/spherex/inexor` — push here AND to origin. GitHub
@@ -32,7 +39,15 @@ umbrella albireo memory).
 
 ## Doc map (read before proposing anything)
 
-- `docs/architecture.md` — THE design document. Every design decision with
+- `docs/plan-plan-v2.md` — **v2 master strategy + session seeds** (locked
+  decisions D-v2-1..7, gate week, seed prompts). The v2 entry point.
+- `docs/design-study-2026-07-14.html` — the v2 design-space study (measured
+  memory anatomy, approach catalog, synergy matrix, architectures A1-A5).
+- `docs/retrospective.md` — why v1 halted; methodology + trap list; read
+  before re-proposing anything v1-flavored.
+- `docs/architecture.md` — the v1 design document (header warning applies:
+  its motivation and Sec. 9 budget are the design-time record, NOT current
+  fact). Every design decision with
   rationale + [M0: Rn] risk tags. The w-frame ladder (Sec. 4), the
   deterministic int paint (Sec. 5), and the custom_vjp adjoint (Sec. 8) are
   the load-bearing novel pieces.
