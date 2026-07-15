@@ -319,14 +319,23 @@ def spawn(op, impl, n_part, n_mesh, chunk, reps, sparse, interpret):
         cmd.append("--interpret")
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
-        tail = (p.stderr or "").strip().splitlines()
+        lines = (p.stderr or "").strip().splitlines()
+        # keep the WHOLE stderr on disk; surface the real exception line, not
+        # JAX's trailing "For simplicity..." boilerplate (job 26 lesson)
+        err_dir = os.path.join(OUT_DIR, "g1_errs")
+        os.makedirs(err_dir, exist_ok=True)
+        err_path = os.path.join(err_dir, f"{op}_{impl}_{n_part}_{n_mesh}.err")
+        with open(err_path, "w") as fh:
+            fh.write(p.stderr or "")
+        exc = [t for t in lines if ("Error" in t or "Exception" in t) and "For simplicity" not in t]
         return dict(
             op=op,
             impl=impl,
             n_part=n_part,
             n_mesh=n_mesh,
-            error=tail[-1] if tail else f"exit {p.returncode}",
-            oom=any("RESOURCE_EXHAUSTED" in t or "Out of memory" in t for t in tail),
+            error=(exc[-1] if exc else (lines[-1] if lines else f"exit {p.returncode}")),
+            error_file=err_path,
+            oom=any("RESOURCE_EXHAUSTED" in t or "Out of memory" in t for t in lines),
         )
     line = [ln for ln in p.stdout.splitlines() if ln.startswith("WORKER_JSON ")][-1]
     return json.loads(line[len("WORKER_JSON ") :])
