@@ -99,8 +99,12 @@ def main():
     pos_codecs["int12_global"] = (np.rint(x_f / q12) * q12, 0.0)
     qcell8 = (L / N) / 256.0
     pos_codecs["int8_cellrel_CUBE"] = (np.rint(x_f / qcell8) * qcell8, 0.0)
-    for c, bits, name in [(6.0, 8, "int8_residZA_c6"), (8.0, 8, "int8_residZA_c8"),
-                          (6.0, 10, "int10_residZA_c6"), (6.0, 12, "int12_residZA_c6")]:
+    for c, bits, name in [
+        (6.0, 8, "int8_residZA_c6"),
+        (8.0, 8, "int8_residZA_c8"),
+        (6.0, 10, "int10_residZA_c6"),
+        (6.0, 12, "int12_residZA_c6"),
+    ]:
         quantum = 2 * c * sig_pos / (2**bits)
         rq, out = quantize_linear(r_pos, quantum, -c * sig_pos, c * sig_pos)
         pos_codecs[name] = (x_za + rq, out)
@@ -118,9 +122,11 @@ def main():
             "outlier_frac": outfrac,
         }
         results[name] = entry
-        print(f"  POS {name:22s} max|dP/P| {entry['max_dP_P']:.3e}  "
-              f"lowk {entry['lowk_dP_P']:.3e}  max|1-r| {entry['max_1mr']:.3e}  "
-              f"outliers {outfrac:.2e}")
+        print(
+            f"  POS {name:22s} max|dP/P| {entry['max_dP_P']:.3e}  "
+            f"lowk {entry['lowk_dP_P']:.3e}  max|1-r| {entry['max_1mr']:.3e}  "
+            f"outliers {outfrac:.2e}"
+        )
 
     # ---- velocity codecs (representation error only; positions carry P(k)) ----
     r_vel = v_f - v_za
@@ -150,8 +156,10 @@ def main():
             "outlier_frac": float(outfrac),
         }
         results[name] = entry
-        print(f"  VEL {name:22s} rms_err/sig_v {entry['rms_err_over_sigvfull']:.3e}  "
-              f"p99.9 err {entry['p999_err']:.3e}  outliers {entry['outlier_frac']:.2e}")
+        print(
+            f"  VEL {name:22s} rms_err/sig_v {entry['rms_err_over_sigvfull']:.3e}  "
+            f"p99.9 err {entry['p999_err']:.3e}  outliers {entry['outlier_frac']:.2e}"
+        )
 
     with open(f"{OUT_DIR}/g2b_results.json", "w") as fh:
         json.dump(results, fh, indent=2)

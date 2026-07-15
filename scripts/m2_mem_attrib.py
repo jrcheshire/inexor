@@ -110,14 +110,24 @@ def _parse_one(path):
         for line in f:
             h = _ALLOC_HDR.match(line)
             if h:
-                cur = {"id": int(h.group(1)), "size": int(h.group(2)),
-                       "flags": h.group(3).strip().rstrip(":"), "values": []}
+                cur = {
+                    "id": int(h.group(1)),
+                    "size": int(h.group(2)),
+                    "flags": h.group(3).strip().rstrip(":"),
+                    "values": [],
+                }
                 allocs.append(cur)
                 continue
             v = _VALUE.match(line)
             if v and cur is not None:
-                cur["values"].append({"name": v.group(1), "size": int(v.group(2)),
-                                      "offset": int(v.group(3)), "shape": v.group(4)})
+                cur["values"].append(
+                    {
+                        "name": v.group(1),
+                        "size": int(v.group(2)),
+                        "offset": int(v.group(3)),
+                        "shape": v.group(4),
+                    }
+                )
     return allocs, sum(a["size"] for a in allocs)
 
 
@@ -131,8 +141,14 @@ def parse_dump(dump_dir):
         allocs, total = _parse_one(path)
         if not allocs:
             continue
-        mods.append({"file": os.path.basename(path), "n_allocations": len(allocs),
-                     "peak_bytes": total, "allocs": allocs})
+        mods.append(
+            {
+                "file": os.path.basename(path),
+                "n_allocations": len(allocs),
+                "peak_bytes": total,
+                "allocs": allocs,
+            }
+        )
     if not mods:
         return None, f"{len(files)} file(s) found but no `allocation N: size` lines parsed"
     mods.sort(key=lambda m: m["peak_bytes"], reverse=True)
@@ -153,14 +169,18 @@ def main():
 
     print(f"\n--- XLA modules by peak (sum of allocation slots); {len(mods)} dumped ---")
     for m in mods[:6]:
-        print(f"  {m['peak_bytes'] / GIB:8.4f} GiB  {m['peak_bytes'] / npart:8.1f} B/particle"
-              f"  {m['n_allocations']:>4} slots   {m['file'][:58]}")
+        print(
+            f"  {m['peak_bytes'] / GIB:8.4f} GiB  {m['peak_bytes'] / npart:8.1f} B/particle"
+            f"  {m['n_allocations']:>4} slots   {m['file'][:58]}"
+        )
 
     big = mods[0]
     print(f"\n--- largest module: {big['file']} ---")
     for a in sorted(big["allocs"], key=lambda x: x["size"], reverse=True)[:4]:
-        print(f"  slot {a['id']:>3}: {a['size'] / npart:8.1f} B/particle  "
-              f"{len(a['values']):>3} values   {a['flags'][:28]}")
+        print(
+            f"  slot {a['id']:>3}: {a['size'] / npart:8.1f} B/particle  "
+            f"{len(a['values']):>3} values   {a['flags'][:28]}"
+        )
 
     # THE ONLY VALID DECOMPOSITION available from this dump.
     #
@@ -188,8 +208,10 @@ def main():
     print(f"\n--- top {_args.top} ALLOCATIONS (disjoint; these sum to the module peak) ---")
     for a in allocs[: _args.top]:
         tag = "ARENA (mixed shapes)" if a["is_arena"] else a["shape"]
-        print(f"  {a['size'] / npart:8.1f} B/p  {tag:<24} {a['name'][:30]:<30} "
-              f"{len(a['values']):>3} vals  {a['flags'][:16]}")
+        print(
+            f"  {a['size'] / npart:8.1f} B/p  {tag:<24} {a['name'][:30]:<30} "
+            f"{len(a['values']):>3} vals  {a['flags'][:16]}"
+        )
 
     kinds, arena = {}, 0
     for a in big["allocs"]:
@@ -202,8 +224,10 @@ def main():
     for k, b in sorted(kinds.items(), key=lambda kv: kv[1], reverse=True)[:10]:
         print(f"  {b / npart:8.1f} B/particle  {100 * b / total:5.1f}%   {k}")
     if arena:
-        print(f"  {arena / npart:8.1f} B/particle  {100 * arena / total:5.1f}%   "
-              f"(arenas -- mixed shapes, not attributable from this dump)")
+        print(
+            f"  {arena / npart:8.1f} B/particle  {100 * arena / total:5.1f}%   "
+            f"(arenas -- mixed shapes, not attributable from this dump)"
+        )
     print(f"  {'-' * 46}\n  {total / npart:8.1f} B/particle  100.0%   MODULE PEAK")
     print("\n  NB: this is ONE module's buffer assignment, not the process peak.")
     print("  Compare against the measured process peak (m2_mem_profile): the")
@@ -214,17 +238,38 @@ def main():
     # earlier one, and the census is exactly what we compare ACROSS sizes.
     path = os.path.join(RUNS, f"mem_attrib_n{_args.n}.json")
     with open(path, "w") as f:
-        json.dump({
-            "device": str(dev), "n_mesh": _args.n, "K": _args.steps, "n_particles": npart,
-            "modules": [{"file": m["file"], "n_allocations": m["n_allocations"],
-                         "peak_bytes": m["peak_bytes"],
-                         "b_per_particle": m["peak_bytes"] / npart} for m in mods],
-            "top_allocations": [{"size": a["size"], "b_per_particle": a["size"] / npart,
-                                "shape": a["shape"], "name": a["name"],
-                                "is_arena": a["is_arena"]} for a in allocs[: _args.top]],
-            "peak_by_shape": {k: v for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])},
-            "arena_bytes": arena, "module_peak_bytes": total,
-        }, f, indent=1)
+        json.dump(
+            {
+                "device": str(dev),
+                "n_mesh": _args.n,
+                "K": _args.steps,
+                "n_particles": npart,
+                "modules": [
+                    {
+                        "file": m["file"],
+                        "n_allocations": m["n_allocations"],
+                        "peak_bytes": m["peak_bytes"],
+                        "b_per_particle": m["peak_bytes"] / npart,
+                    }
+                    for m in mods
+                ],
+                "top_allocations": [
+                    {
+                        "size": a["size"],
+                        "b_per_particle": a["size"] / npart,
+                        "shape": a["shape"],
+                        "name": a["name"],
+                        "is_arena": a["is_arena"],
+                    }
+                    for a in allocs[: _args.top]
+                ],
+                "peak_by_shape": {k: v for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])},
+                "arena_bytes": arena,
+                "module_peak_bytes": total,
+            },
+            f,
+            indent=1,
+        )
     print(f"\nwrote {path}")
     print("\n  Reference: Sec. 9 budgets ~68 B/particle total (36 carry + ~32 transients);")
     print("  measured adjoint peak is ~466. Anything here at tens of B/particle is a lead.")

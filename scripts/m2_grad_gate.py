@@ -53,11 +53,11 @@ RUNS = os.path.join(REPO, "runs", "m2")
 # Ratified gate (JC, M2 S3) -- global metrics, NOT per-component/FD (the loss
 # gradient is per-particle noise-dominated; FD of the quantized loss is invalid
 # below the lattice -- R4 staircase). ADR D-015.
-GATE_MEDREL = 1e-2   # adjoint-vs-float input-grad median-rel (top-decile |ref|)
-GATE_CORR = 0.999    # Pearson correlation
-GATE_RATIO = 0.01    # |norm-ratio - 1|
-GATE_IC_REL = 5e-3   # IC-param d/d[f_NL,amp] adjoint-vs-float rel
-R4_GATE = 7.5e-2     # D-010 R4 bar (the restatement headline)
+GATE_MEDREL = 1e-2  # adjoint-vs-float input-grad median-rel (top-decile |ref|)
+GATE_CORR = 0.999  # Pearson correlation
+GATE_RATIO = 0.01  # |norm-ratio - 1|
+GATE_IC_REL = 5e-3  # IC-param d/d[f_NL,amp] adjoint-vs-float rel
+R4_GATE = 7.5e-2  # D-010 R4 bar (the restatement headline)
 
 
 def _global_metrics(a, b):
@@ -113,7 +113,9 @@ def run_config(n_mesh, K, integrator, f_NL0=5.0, fd_samples=24):
                 return loss_field(*evolve_grad(box, time, QUANT, COSMO, "scan", _fd, x0_, v0_))
 
             def lf(x0_, v0_, _fd=fdtype):
-                return loss_field(*evolve_float(box, time, COSMO, x0_, v0_, paint="f32", fdtype=_fd))
+                return loss_field(
+                    *evolve_float(box, time, COSMO, x0_, v0_, paint="f32", fdtype=_fd)
+                )
 
             gq = jax.grad(lq, argnums=(0, 1))(x0, v0)  # adjoint (quantized)
             gf = jax.grad(lf, argnums=(0, 1))(x0, v0)  # float-twin
@@ -142,11 +144,15 @@ def run_config(n_mesh, K, integrator, f_NL0=5.0, fd_samples=24):
 
         # ---- IC-param grads (d/df_NL, d/damplitude): adjoint vs float vs FD ----
         theta = (f_NL0, 1.0)
-        g_adj = adjoint_grad_ic(loss_field, box, time, QUANT, COSMO, theta=theta, fdtype=jnp.float64)
+        g_adj = adjoint_grad_ic(
+            loss_field, box, time, QUANT, COSMO, theta=theta, fdtype=jnp.float64
+        )
 
         def lf_ic(th):
             x0, v0 = _make_ic(n_mesh, box.box_size, th[0], th[1], jnp.float64)
-            return loss_field(*evolve_float(box, time, COSMO, x0, v0, paint="f32", fdtype=jnp.float64))
+            return loss_field(
+                *evolve_float(box, time, COSMO, x0, v0, paint="f32", fdtype=jnp.float64)
+            )
 
         g_flt = jax.grad(lf_ic)(jnp.asarray(theta, jnp.float64))
         # FD with per-parameter matched eps (f_NL is a large lever on a tiny term)
@@ -154,14 +160,20 @@ def run_config(n_mesh, K, integrator, f_NL0=5.0, fd_samples=24):
         fd_ic = []
         for i in range(2):
             d = jnp.zeros(2, jnp.float64).at[i].set(eps_ic[i])
-            fd_ic.append(float((lf_ic(jnp.asarray(theta) + d) - lf_ic(jnp.asarray(theta) - d)) / (2 * eps_ic[i])))
+            fd_ic.append(
+                float(
+                    (lf_ic(jnp.asarray(theta) + d) - lf_ic(jnp.asarray(theta) - d))
+                    / (2 * eps_ic[i])
+                )
+            )
         rec["ic_grad"] = {
             "param": ["f_NL", "amplitude"],
             "adjoint": [float(x) for x in g_adj],
             "float_twin": [float(x) for x in g_flt],
             "FD": fd_ic,
             "adjoint_vs_float_rel": [
-                abs(float(g_adj[i]) - float(g_flt[i])) / (abs(float(g_flt[i])) + 1e-30) for i in range(2)
+                abs(float(g_adj[i]) - float(g_flt[i])) / (abs(float(g_flt[i])) + 1e-30)
+                for i in range(2)
             ],
             "float_vs_FD_rel": [
                 abs(float(g_flt[i]) - fd_ic[i]) / (abs(fd_ic[i]) + 1e-30) for i in range(2)
@@ -186,8 +198,11 @@ def _check_gate(results):
             for comp in ("x", "v"):
                 m = rec[f"adjoint_vs_floattwin_{comp}_f64"]
                 worst = max(worst, m["medrel"])
-                ok = (m["medrel"] <= GATE_MEDREL and m["corr"] >= GATE_CORR
-                      and abs(m["ratio"] - 1.0) <= GATE_RATIO)
+                ok = (
+                    m["medrel"] <= GATE_MEDREL
+                    and m["corr"] >= GATE_CORR
+                    and abs(m["ratio"] - 1.0) <= GATE_RATIO
+                )
                 if not ok:
                     failures.append(f"{tag} [{lname}] grad-{comp}: {_fmt(m)}")
             for i, p in enumerate(rec["ic_grad"]["param"]):
@@ -200,11 +215,14 @@ def _check_gate(results):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--quick", action="store_true", help="64^3 only")
-    ap.add_argument("--k-sweep", default=None,
-                    help="P2 drift arm: comma-separated K at 64^3 bullfrog, replacing the "
-                         "gate configs. Float replay drift ACCUMULATES over steps while exact "
-                         "replay does not, so error-vs-K is the comparison that decides whether "
-                         "exact replay buys anything; a single K cannot show it.")
+    ap.add_argument(
+        "--k-sweep",
+        default=None,
+        help="P2 drift arm: comma-separated K at 64^3 bullfrog, replacing the "
+        "gate configs. Float replay drift ACCUMULATES over steps while exact "
+        "replay does not, so error-vs-K is the comparison that decides whether "
+        "exact replay buys anything; a single K cannot show it.",
+    )
     args = ap.parse_args()
     if args.k_sweep:
         configs = [(64, int(k), "bullfrog") for k in args.k_sweep.split(",") if k.strip()]
@@ -222,18 +240,28 @@ def main():
             print(f"  [{lname}]")
             print(f"    FLOOR float-twin f32-vs-f64: x {_fmt(rec['floor_floattwin_f32_vs_f64_x'])}")
             print(f"    FLOOR FD-vs-float-twin (f64): x {_fmt(rec['floor_FD_vs_floattwin_x'])}")
-            print(f"    GATE  adjoint-vs-float-twin (f64): x {_fmt(rec['adjoint_vs_floattwin_x_f64'])}")
-            print(f"    GATE  adjoint-vs-float-twin (f64): v {_fmt(rec['adjoint_vs_floattwin_v_f64'])}")
+            print(
+                f"    GATE  adjoint-vs-float-twin (f64): x {_fmt(rec['adjoint_vs_floattwin_x_f64'])}"
+            )
+            print(
+                f"    GATE  adjoint-vs-float-twin (f64): v {_fmt(rec['adjoint_vs_floattwin_v_f64'])}"
+            )
             ic = rec["ic_grad"]
-            print(f"    IC d/d[f_NL,amp] adjoint-vs-float rel {[f'{x:.2e}' for x in ic['adjoint_vs_float_rel']]}"
-                  f"  float-vs-FD rel {[f'{x:.2e}' for x in ic['float_vs_FD_rel']]}")
+            print(
+                f"    IC d/d[f_NL,amp] adjoint-vs-float rel {[f'{x:.2e}' for x in ic['adjoint_vs_float_rel']]}"
+                f"  float-vs-FD rel {[f'{x:.2e}' for x in ic['float_vs_FD_rel']]}"
+            )
 
     all_pass, worst, failures = _check_gate(results)
     print("\n===== GATE (ratified D-015) =====")
-    print(f"  median-rel <= {GATE_MEDREL}, corr >= {GATE_CORR}, |ratio-1| <= {GATE_RATIO}, "
-          f"IC-rel <= {GATE_IC_REL}")
-    print(f"  worst adjoint-vs-float median-rel = {worst:.2e}  (R4 restatement vs {R4_GATE}: "
-          f"{'PASS' if worst <= R4_GATE else 'FAIL'})")
+    print(
+        f"  median-rel <= {GATE_MEDREL}, corr >= {GATE_CORR}, |ratio-1| <= {GATE_RATIO}, "
+        f"IC-rel <= {GATE_IC_REL}"
+    )
+    print(
+        f"  worst adjoint-vs-float median-rel = {worst:.2e}  (R4 restatement vs {R4_GATE}: "
+        f"{'PASS' if worst <= R4_GATE else 'FAIL'})"
+    )
     print(f"  GATE: {'PASS' if all_pass else 'FAIL'}")
     for fl in failures:
         print(f"    FAIL {fl}")
@@ -241,11 +269,22 @@ def main():
     os.makedirs(RUNS, exist_ok=True)
     path = os.path.join(RUNS, "grad_gate.json")
     with open(path, "w") as f:
-        json.dump({
-            "gate": {"medrel": GATE_MEDREL, "corr": GATE_CORR, "ratio": GATE_RATIO,
-                     "ic_rel": GATE_IC_REL, "R4_reference": R4_GATE},
-            "gate_pass": all_pass, "worst_medrel": worst, "configs": results,
-        }, f, indent=1)
+        json.dump(
+            {
+                "gate": {
+                    "medrel": GATE_MEDREL,
+                    "corr": GATE_CORR,
+                    "ratio": GATE_RATIO,
+                    "ic_rel": GATE_IC_REL,
+                    "R4_reference": R4_GATE,
+                },
+                "gate_pass": all_pass,
+                "worst_medrel": worst,
+                "configs": results,
+            },
+            f,
+            indent=1,
+        )
     print(f"\nwrote {path}")
 
 

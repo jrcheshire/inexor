@@ -32,9 +32,7 @@ def _k_mag(n_mesh, box_size):
     N, L = n_mesh, box_size
     kx = 2.0 * np.pi * np.fft.fftfreq(N, d=L / N)
     kz = 2.0 * np.pi * np.fft.rfftfreq(N, d=L / N)
-    return np.sqrt(
-        kx.reshape(N, 1, 1) ** 2 + kx.reshape(1, N, 1) ** 2 + kz.reshape(1, 1, -1) ** 2
-    )
+    return np.sqrt(kx.reshape(N, 1, 1) ** 2 + kx.reshape(1, N, 1) ** 2 + kz.reshape(1, 1, -1) ** 2)
 
 
 def fundamental_k_edges(n_mesh, box_size, n_bins=8, k_min=None, k_max=None):

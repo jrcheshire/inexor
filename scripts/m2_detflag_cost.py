@@ -73,9 +73,15 @@ def run_size(n_mesh, K, repeats):
     grad = jax.grad(loss, argnums=(0, 1))
     adj_med, adj_lo, adj_hi = _median_time(lambda: grad(x0, v0), repeats)
     return {
-        "n_mesh": n_mesh, "K": K, "repeats": repeats,
-        "forward_s": fwd_med, "forward_min_s": fwd_lo, "forward_max_s": fwd_hi,
-        "adjoint_s": adj_med, "adjoint_min_s": adj_lo, "adjoint_max_s": adj_hi,
+        "n_mesh": n_mesh,
+        "K": K,
+        "repeats": repeats,
+        "forward_s": fwd_med,
+        "forward_min_s": fwd_lo,
+        "forward_max_s": fwd_hi,
+        "adjoint_s": adj_med,
+        "adjoint_min_s": adj_lo,
+        "adjoint_max_s": adj_hi,
         "bwd_derived_s": adj_med - fwd_med,
     }
 
@@ -97,12 +103,14 @@ def _compare():
         def r(x, y):
             return y / x if x > 0 else float("nan")
 
-        print(f"  {a['n_mesh']:>5}  {a['forward_s']:6.3f} {b['forward_s']:6.3f} "
-              f"{r(a['forward_s'], b['forward_s']):5.2f}x  "
-              f"{a['adjoint_s']:6.3f} {b['adjoint_s']:6.3f} "
-              f"{r(a['adjoint_s'], b['adjoint_s']):5.2f}x   "
-              f"{a['bwd_derived_s']:6.3f} {b['bwd_derived_s']:6.3f} "
-              f"{r(a['bwd_derived_s'], b['bwd_derived_s']):5.2f}x")
+        print(
+            f"  {a['n_mesh']:>5}  {a['forward_s']:6.3f} {b['forward_s']:6.3f} "
+            f"{r(a['forward_s'], b['forward_s']):5.2f}x  "
+            f"{a['adjoint_s']:6.3f} {b['adjoint_s']:6.3f} "
+            f"{r(a['adjoint_s'], b['adjoint_s']):5.2f}x   "
+            f"{a['bwd_derived_s']:6.3f} {b['bwd_derived_s']:6.3f} "
+            f"{r(a['bwd_derived_s'], b['bwd_derived_s']):5.2f}x"
+        )
     print("\n  M0 R3 priced detflag-f32 (the paint alone) at 1.37-1.78x.")
     print("  Forward rides paint_int (already deterministic) -> expect ~1.0x there;")
     print("  a forward ratio far from 1.0 means the flag does something unmodelled.")
@@ -131,14 +139,19 @@ def main():
     for n in [int(x) for x in args.n.split(",") if x.strip()]:
         rec = run_size(n, args.steps, args.repeats)
         sizes.append(rec)
-        print(f"  n={n:<5} forward {rec['forward_s']:.4f}s   adjoint {rec['adjoint_s']:.4f}s   "
-              f"bwd(derived) {rec['bwd_derived_s']:.4f}s")
+        print(
+            f"  n={n:<5} forward {rec['forward_s']:.4f}s   adjoint {rec['adjoint_s']:.4f}s   "
+            f"bwd(derived) {rec['bwd_derived_s']:.4f}s"
+        )
 
     os.makedirs(RUNS, exist_ok=True)
     path = os.path.join(RUNS, f"detflag_cost_{tag}.json")
     with open(path, "w") as f:
-        json.dump({"platform": dev.platform, "device": str(dev), "xla_flags": xla_flags,
-                   "sizes": sizes}, f, indent=1)
+        json.dump(
+            {"platform": dev.platform, "device": str(dev), "xla_flags": xla_flags, "sizes": sizes},
+            f,
+            indent=1,
+        )
     print(f"wrote {path}")
 
 

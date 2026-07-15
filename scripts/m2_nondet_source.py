@@ -92,8 +92,10 @@ def main():
     print(f"=== m2_nondet_source: {dev.platform} / {dev} / jax {jax.__version__} ===")
     print(f"    XLA_FLAGS={xla_flags!r}")
     if dev.platform == "cpu":
-        print("NOTE: CPU backend -- the effect is CUDA-only; expect all layers "
-              "deterministic here (plumbing check only).")
+        print(
+            "NOTE: CPU backend -- the effect is CUDA-only; expect all layers "
+            "deterministic here (plumbing check only)."
+        )
 
     key = jax.random.PRNGKey(0)
     d0 = gaussian_delta(key, BOX.n_mesh, BOX.box_size, COSMO, fdtype=jnp.float32)
@@ -118,8 +120,10 @@ def main():
         return jax.grad(loss, argnums=(0, 1))(x0, v0)
 
     layers = [
-        ("1. paint_int   (int scatter-add)", lambda: paint_int(x0, BOX.n_mesh, BOX.box_size,
-                                                               frac_bits=QUANT.frac_bits)),
+        (
+            "1. paint_int   (int scatter-add)",
+            lambda: paint_int(x0, BOX.n_mesh, BOX.box_size, frac_bits=QUANT.frac_bits),
+        ),
         ("2. paint_f32   (f32 scatter-add)", lambda: paint_f32(x0, BOX.n_mesh, BOX.box_size)),
         ("3. force_int   (PRIMAL path)", lambda: force_int(x0)),
         ("4. force_f32   (twin primal)", lambda: force_f32(x0)),
@@ -133,8 +137,10 @@ def main():
         r = _determinism(name, fn)
         recs.append(r)
         flag = "OK  " if r["deterministic"] else "NONDET"
-        print(f"  {flag}  {name:<40} {r['max_n_differing']:>6}/{r['n_total']:<6} differ"
-              f"   max_rel {r['max_rel']:.2e}")
+        print(
+            f"  {flag}  {name:<40} {r['max_n_differing']:>6}/{r['n_total']:<6} differ"
+            f"   max_rel {r['max_rel']:.2e}"
+        )
 
     print("\n--- reading ---")
     by = {r["layer"][0]: r["deterministic"] for r in recs}
@@ -165,8 +171,17 @@ def main():
     tag = "detflag" if "deterministic" in xla_flags else "default"
     path = os.path.join(RUNS, f"nondet_source_{tag}.json")
     with open(path, "w") as f:
-        json.dump({"platform": dev.platform, "device": str(dev), "jax": jax.__version__,
-                   "xla_flags": xla_flags, "layers": recs}, f, indent=1)
+        json.dump(
+            {
+                "platform": dev.platform,
+                "device": str(dev),
+                "jax": jax.__version__,
+                "xla_flags": xla_flags,
+                "layers": recs,
+            },
+            f,
+            indent=1,
+        )
     print(f"\nwrote {path}")
 
 

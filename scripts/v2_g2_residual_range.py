@@ -87,8 +87,10 @@ def main():
         v0_pred = psi1 - (D2i * f2i) / (D1i * f1i) * psi2
         dx0 = wrap_min_image(np.asarray(ics["x"]) - x0_pred, L)
         dv0 = np.asarray(ics["v_d"]) - v0_pred
-        print(f"[{tag}] IC reproduction: max|dx0| {np.abs(dx0).max():.3e} Mpc/h, "
-              f"max|dv0| {np.abs(dv0).max():.3e} (should be ~roundoff)")
+        print(
+            f"[{tag}] IC reproduction: max|dx0| {np.abs(dx0).max():.3e} Mpc/h, "
+            f"max|dv0| {np.abs(dv0).max():.3e} (should be ~roundoff)"
+        )
 
         x_f = np.asarray(fin["x"])
         v_f = np.asarray(fin["v_d"])
@@ -99,7 +101,7 @@ def main():
         v_2lpt = psi1 - (D2f * f2f) / (D1f * f1f) * psi2
 
         out = {}
-        print(f"[{tag}] L={L} n={n} cell={L/n:.3f} Mpc/h  D1(a_f)={D1f:.4f}")
+        print(f"[{tag}] L={L} n={n} cell={L / n:.3f} Mpc/h  D1(a_f)={D1f:.4f}")
         print("  -- positions (Mpc/h) --")
         stats("disp_full |x_f - q|", wrap_min_image(x_f - q, L), L, n, out)
         stats("resid vs ZA", wrap_min_image(x_f - x_za, L), L, n, out)
@@ -117,7 +119,7 @@ def main():
             out[f"quantum_int8_resid_c{int(c)}"] = q8_resid
             print(
                 f"  int8-resid quantum (range +-{int(c)} sigma): {q8_resid:.5f} Mpc/h"
-                f"  vs int16-global {q16_global:.5f}  -> ratio {q8_resid/q16_global:.2f}x"
+                f"  vs int16-global {q16_global:.5f}  -> ratio {q8_resid / q16_global:.2f}x"
             )
         out["quantum_int16_global"] = q16_global
         out["sigma_resid_percomp"] = float(sig)

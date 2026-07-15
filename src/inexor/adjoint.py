@@ -109,7 +109,9 @@ def _forward(box, time, quant, cosmo, x0_f, v0_f, driver, fdtype):
     if driver == "scan":
         x, w = run_scan(x_i.copy(), w_i.copy(), consts, step_f, force_int, box.s_x, fdtype=fdtype)
     elif driver == "perstep":
-        x, w = run_perstep(x_i.copy(), w_i.copy(), consts, step_f, force_int, box.s_x, fdtype=fdtype)
+        x, w = run_perstep(
+            x_i.copy(), w_i.copy(), consts, step_f, force_int, box.s_x, fdtype=fdtype
+        )
     else:
         raise ValueError(f"driver must be 'scan' or 'perstep', got {driver!r}")
     x_f, v_f = _decode(box, time, cosmo, x, w, s_out, fdtype)
@@ -182,9 +184,7 @@ def _evolve_grad_bwd(box, time, quant, cosmo, driver, fdtype, residual, cot):
         gx, gw = vjp((xb.astype(out[0].dtype), wb.astype(out[1].dtype)))
         return (x_prev, w_prev, gx.astype(xb_dt), gw.astype(wb_dt)), None
 
-    (_, _, xbar_ic, wbar_ic), _ = jax.lax.scan(
-        rev_body, (x, w, xbar, wbar), consts, reverse=True
-    )
+    (_, _, xbar_ic, wbar_ic), _ = jax.lax.scan(rev_body, (x, w, xbar, wbar), consts, reverse=True)
 
     # Unwind the ENCODE boundary (STE: rounding = identity):
     #   x_i_lat = x0_f / s_x                  -> x0_bar = x_lat_bar / s_x
@@ -219,17 +219,31 @@ evolve_grad.defvjp(_evolve_grad_fwd, _evolve_grad_bwd)
 # equals gaussian_delta at f_NL = 0 to FFT round-off.
 
 
-def _evolved_loss(loss_field, box, time, quant, cosmo, seed, f_NL, amplitude, lpt_order, driver, fdtype):
+def _evolved_loss(
+    loss_field, box, time, quant, cosmo, seed, f_NL, amplitude, lpt_order, driver, fdtype
+):
     key = jax.random.PRNGKey(seed)
-    delta0 = amplitude * linear_density(key, box.n_mesh, box.box_size, cosmo, f_NL=f_NL, fdtype=fdtype)
+    delta0 = amplitude * linear_density(
+        key, box.n_mesh, box.box_size, cosmo, f_NL=f_NL, fdtype=fdtype
+    )
     x0, v0 = lpt_ics(delta0, box.box_size, time.a_init, cosmo, order=lpt_order, fdtype=fdtype)
     x_f, v_f = evolve_grad(box, time, quant, cosmo, driver, fdtype, x0, v0)
     return loss_field(x_f, v_f)
 
 
 def adjoint_grad_fnl(
-    loss_field, box, time, quant, cosmo, *, seed=0, f_NL=0.0, amplitude=1.0,
-    lpt_order=2, driver="scan", fdtype=jnp.float32,
+    loss_field,
+    box,
+    time,
+    quant,
+    cosmo,
+    *,
+    seed=0,
+    f_NL=0.0,
+    amplitude=1.0,
+    lpt_order=2,
+    driver="scan",
+    fdtype=jnp.float32,
 ):
     """Scalar d(loss_field)/d f_NL through the exact-replay adjoint (mbody
     adjoint_grad_fnl parity). loss_field(x_f, v_f) -> scalar."""
@@ -243,8 +257,17 @@ def adjoint_grad_fnl(
 
 
 def adjoint_grad_ic(
-    loss_field, box, time, quant, cosmo, *, seed=0, theta=(0.0, 1.0),
-    lpt_order=2, driver="scan", fdtype=jnp.float32,
+    loss_field,
+    box,
+    time,
+    quant,
+    cosmo,
+    *,
+    seed=0,
+    theta=(0.0, 1.0),
+    lpt_order=2,
+    driver="scan",
+    fdtype=jnp.float32,
 ):
     """Length-2 d(loss_field)/d[f_NL, amplitude] through the exact-replay
     adjoint (mbody adjoint_grad_ic parity). theta = (f_NL, amplitude)."""

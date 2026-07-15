@@ -72,8 +72,13 @@ def _single(n_mesh, K, f64, repeats):
     a_steps = M.a_grid(M.A_INIT, M.A_FINAL, K, "log")
     a_i, a_f = float(a_steps[0]), float(a_steps[-1])
 
-    dj = DiscoDJ(dim=3, res=n_mesh, boxsize=M.BOX_SIZE, cosmo=dict(M.COSMO_DISCO),
-                 precision="double" if f64 else "single")
+    dj = DiscoDJ(
+        dim=3,
+        res=n_mesh,
+        boxsize=M.BOX_SIZE,
+        cosmo=dict(M.COSMO_DISCO),
+        precision="double" if f64 else "single",
+    )
     dj = dj.with_timetables().with_linear_ps()
     fplus_i = float(dj.cosmo.Fplus(a_i))
 
@@ -91,10 +96,19 @@ def _single(n_mesh, K, f64, repeats):
     def loss(pos, vel):
         dje = dj.with_external_ics(pos=pos, vel=vel * fplus_i)
         X, _P, _ = dje.run_nbody(
-            a_i, a_f, K, time_var=a_steps, stepper="bullfrog", method="pm",
-            res_pm=n_mesh, worder=2, antialias=0,
+            a_i,
+            a_f,
+            K,
+            time_var=a_steps,
+            stepper="bullfrog",
+            method="pm",
+            res_pm=n_mesh,
+            worder=2,
+            antialias=0,
             grad_kernel_order=0,  # they default to 4 (FD) -- the M1 lesson
-            laplace_kernel_order=0, deconvolve=False, convert_to_numpy=False,
+            laplace_kernel_order=0,
+            deconvolve=False,
+            convert_to_numpy=False,
         )
         return jax.numpy.sum(X.reshape(-1, 3) ** 2)
 
@@ -110,13 +124,20 @@ def _single(n_mesh, K, f64, repeats):
         jax.block_until_ready(gfn(xj, vj))
         ts.append(time.perf_counter() - t0)
 
-    return {"n_mesh": n_mesh, "K": K, "f64": f64, "grad": g.tolist(),
-            "adjoint_s": statistics.median(ts), "device": str(jax.devices()[0])}
+    return {
+        "n_mesh": n_mesh,
+        "K": K,
+        "f64": f64,
+        "grad": g.tolist(),
+        "adjoint_s": statistics.median(ts),
+        "device": str(jax.devices()[0]),
+    }
 
 
 def _metrics(a, b):
     """Mirrors m2_grad_gate._global_metrics exactly."""
     import numpy as np
+
     a, b = np.asarray(a).ravel(), np.asarray(b).ravel()
     ratio = float(np.linalg.norm(a) / np.linalg.norm(b))
     corr = float(np.corrcoef(a, b)[0, 1])
@@ -128,15 +149,33 @@ def _metrics(a, b):
 
 def _spawn(n_mesh, K, f64, repeats):
     import subprocess
-    cmd = [sys.executable, os.path.abspath(__file__), "--single", "--n", str(n_mesh),
-           "--k", str(K), "--repeats", str(repeats)] + (["--f64"] if f64 else [])
+
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--single",
+        "--n",
+        str(n_mesh),
+        "--k",
+        str(K),
+        "--repeats",
+        str(repeats),
+    ] + (["--f64"] if f64 else [])
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
-        err = [ln for ln in (p.stderr or "").strip().splitlines()
-               if ln.strip() and "For simplicity, JAX has removed" not in ln
-               and not ln.startswith(("  ", "Traceback"))]
-        return {"n_mesh": n_mesh, "K": K, "f64": f64,
-                "error": err[-1][:200] if err else f"exit {p.returncode}"}
+        err = [
+            ln
+            for ln in (p.stderr or "").strip().splitlines()
+            if ln.strip()
+            and "For simplicity, JAX has removed" not in ln
+            and not ln.startswith(("  ", "Traceback"))
+        ]
+        return {
+            "n_mesh": n_mesh,
+            "K": K,
+            "f64": f64,
+            "error": err[-1][:200] if err else f"exit {p.returncode}",
+        }
     return json.loads(p.stdout.strip().splitlines()[-1])
 
 
@@ -162,8 +201,15 @@ def main():
             rows.append({"K": K, "error": lo.get("error") or hi.get("error")})
             continue
         m = _metrics(lo["grad"], hi["grad"])
-        rows.append({"K": K, **m, "f32_adjoint_s": lo["adjoint_s"],
-                     "f64_adjoint_s": hi["adjoint_s"], "device": lo["device"]})
+        rows.append(
+            {
+                "K": K,
+                **m,
+                "f32_adjoint_s": lo["adjoint_s"],
+                "f64_adjoint_s": hi["adjoint_s"],
+                "device": lo["device"],
+            }
+        )
 
     print("\n===== P2: DISCO-DJ float-replay gradient error vs its OWN f64, by K =====")
     print("  (does float-replay error ACCUMULATE with steps? that is the question)")
@@ -172,8 +218,10 @@ def main():
         if r.get("error"):
             print(f"  {r['K']:>4}   ERR: {r['error'][:56]}")
             continue
-        print(f"  {r['K']:>4}   {r['medrel']:9.3e}  {r['corr']:.7f}  "
-              f"{abs(r['ratio'] - 1):9.3e}     {r['f32_adjoint_s']:7.3f}")
+        print(
+            f"  {r['K']:>4}   {r['medrel']:9.3e}  {r['corr']:.7f}  "
+            f"{abs(r['ratio'] - 1):9.3e}     {r['f32_adjoint_s']:7.3f}"
+        )
 
     ok = [r for r in rows if not r.get("error")]
     if len(ok) > 1:

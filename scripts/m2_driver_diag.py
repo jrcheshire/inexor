@@ -133,7 +133,9 @@ def run_integrator(integrator):
     xp, wp = res_p[0], res_p[1]
     rec["residual_x"] = _int_cmp(xs, xp)
     rec["residual_w"] = _int_cmp(ws, wp)
-    rec["residual_identical"] = rec["residual_x"]["bitwise_equal"] and rec["residual_w"]["bitwise_equal"]
+    rec["residual_identical"] = (
+        rec["residual_x"]["bitwise_equal"] and rec["residual_w"]["bitwise_equal"]
+    )
     # The scales are host-side floats and driver-independent by construction;
     # assert that rather than trust it, so "residual differs" can only mean the
     # integer state.
@@ -182,8 +184,10 @@ def main():
     dev = jax.devices()[0]
     print(f"=== m2_driver_diag: {dev.platform} / {dev} / jax {jax.__version__} ===")
     if dev.platform == "cpu":
-        print("NOTE: CPU backend -- the failures are CUDA-only, so this run is a "
-              "plumbing check and is EXPECTED to show everything identical.")
+        print(
+            "NOTE: CPU backend -- the failures are CUDA-only, so this run is a "
+            "plumbing check and is EXPECTED to show everything identical."
+        )
 
     recs = [run_integrator(i) for i in INTEGRATORS]
     fnl = run_fnl_vs_ic()
@@ -192,10 +196,12 @@ def main():
     print("    (the premise of test_scan_perstep_grads_identical)")
     for r in recs:
         rx, rw = r["residual_x"], r["residual_w"]
-        print(f"  {r['integrator']:<9} identical={str(r['residual_identical']):<5} "
-              f"x: {rx['n_differing']:>5}/{rx['n_total']} differ (max |d| {rx['max_abs_diff']})  "
-              f"w: {rw['n_differing']:>5}/{rw['n_total']} differ (max |d| {rw['max_abs_diff']})  "
-              f"scales_identical={r['scales_identical']}")
+        print(
+            f"  {r['integrator']:<9} identical={str(r['residual_identical']):<5} "
+            f"x: {rx['n_differing']:>5}/{rx['n_total']} differ (max |d| {rx['max_abs_diff']})  "
+            f"w: {rw['n_differing']:>5}/{rw['n_total']} differ (max |d| {rw['max_abs_diff']})  "
+            f"scales_identical={r['scales_identical']}"
+        )
 
     print("\n--- B: bwd determinism (same driver, same inputs, twice) ---")
     for r in recs:
@@ -205,24 +211,32 @@ def main():
     for r in recs:
         gx = r["grad_x_scan_vs_perstep"]
         gv = r["grad_v_scan_vs_perstep"]
-        print(f"  {r['integrator']:<9} dx: {gx['n_differing']:>5}/{gx['n_total']} differ  "
-              f"max_rel {gx['max_rel']:.2e}  med_rel {gx['median_rel']:.2e}  "
-              f"corr {gx['corr']:.9f}  ratio {gx['norm_ratio']:.9f}")
-        print(f"  {'':<9} dv: {gv['n_differing']:>5}/{gv['n_total']} differ  "
-              f"max_rel {gv['max_rel']:.2e}  med_rel {gv['median_rel']:.2e}  "
-              f"corr {gv['corr']:.9f}  ratio {gv['norm_ratio']:.9f}")
+        print(
+            f"  {r['integrator']:<9} dx: {gx['n_differing']:>5}/{gx['n_total']} differ  "
+            f"max_rel {gx['max_rel']:.2e}  med_rel {gx['median_rel']:.2e}  "
+            f"corr {gx['corr']:.9f}  ratio {gx['norm_ratio']:.9f}"
+        )
+        print(
+            f"  {'':<9} dv: {gv['n_differing']:>5}/{gv['n_total']} differ  "
+            f"max_rel {gv['max_rel']:.2e}  med_rel {gv['median_rel']:.2e}  "
+            f"corr {gv['corr']:.9f}  ratio {gv['norm_ratio']:.9f}"
+        )
 
     print("\n--- D: failure 4, adjoint_grad_fnl vs adjoint_grad_ic[0] ---")
-    print(f"  g_fnl {fnl['g_fnl']:.9g}  g_ic[0] {fnl['g_ic0']:.9g}  "
-          f"rel {fnl['rel_diff']:.2e}  (test asserts rel <= {fnl['test_gate_rel']:.0e}: "
-          f"{'PASS' if fnl['passes_current_gate'] else 'FAIL'})")
+    print(
+        f"  g_fnl {fnl['g_fnl']:.9g}  g_ic[0] {fnl['g_ic0']:.9g}  "
+        f"rel {fnl['rel_diff']:.2e}  (test asserts rel <= {fnl['test_gate_rel']:.0e}: "
+        f"{'PASS' if fnl['passes_current_gate'] else 'FAIL'})"
+    )
 
     print("\n--- reading ---")
     any_resid_differs = any(not r["residual_identical"] for r in recs)
     all_bwd_det = all(r["bwd_repeat_deterministic"] for r in recs)
     grads_differ = any(
-        not (r["grad_x_scan_vs_perstep"]["bitwise_equal"]
-             and r["grad_v_scan_vs_perstep"]["bitwise_equal"])
+        not (
+            r["grad_x_scan_vs_perstep"]["bitwise_equal"]
+            and r["grad_v_scan_vs_perstep"]["bitwise_equal"]
+        )
         for r in recs
     )
     if not grads_differ and fnl["passes_current_gate"]:
@@ -249,10 +263,17 @@ def main():
     os.makedirs(RUNS, exist_ok=True)
     path = os.path.join(RUNS, "driver_diag.json")
     with open(path, "w") as f:
-        json.dump({
-            "platform": dev.platform, "device": str(dev), "jax": jax.__version__,
-            "integrators": recs, "fnl_vs_ic": fnl,
-        }, f, indent=1)
+        json.dump(
+            {
+                "platform": dev.platform,
+                "device": str(dev),
+                "jax": jax.__version__,
+                "integrators": recs,
+                "fnl_vs_ic": fnl,
+            },
+            f,
+            indent=1,
+        )
     print(f"\nwrote {path}")
 
 

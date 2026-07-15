@@ -101,8 +101,13 @@ def _single(n_mesh, K, f64):
     a_steps = M.a_grid(M.A_INIT, M.A_FINAL, K, "log")
     a_i, a_f = float(a_steps[0]), float(a_steps[-1])
 
-    dj = DiscoDJ(dim=3, res=n_mesh, boxsize=M.BOX_SIZE, cosmo=dict(M.COSMO_DISCO),
-                 precision="double" if f64 else "single")
+    dj = DiscoDJ(
+        dim=3,
+        res=n_mesh,
+        boxsize=M.BOX_SIZE,
+        cosmo=dict(M.COSMO_DISCO),
+        precision="double" if f64 else "single",
+    )
     dj = dj.with_timetables()
     # Their built-in Eisenstein-Hu (the default) avoids needing our pk file: the
     # linear spectrum only sets the IC amplitude, and this measures MEMORY, not
@@ -132,10 +137,19 @@ def _single(n_mesh, K, f64):
     def evolve(pos, vel):
         dje = dj.with_external_ics(pos=pos, vel=vel * fplus_i)
         X, P, _ = dje.run_nbody(
-            a_i, a_f, K, time_var=a_steps, stepper="bullfrog", method="pm",
-            res_pm=n_mesh, worder=2, antialias=0,
-            grad_kernel_order=0,   # DISCO-DJ defaults to 4 (FD) -- M1 lesson
-            laplace_kernel_order=0, deconvolve=False, convert_to_numpy=False,
+            a_i,
+            a_f,
+            K,
+            time_var=a_steps,
+            stepper="bullfrog",
+            method="pm",
+            res_pm=n_mesh,
+            worder=2,
+            antialias=0,
+            grad_kernel_order=0,  # DISCO-DJ defaults to 4 (FD) -- M1 lesson
+            laplace_kernel_order=0,
+            deconvolve=False,
+            convert_to_numpy=False,
         )
         return X, P
 
@@ -145,7 +159,7 @@ def _single(n_mesh, K, f64):
 
     def loss(pos, vel):
         X, _P = evolve(pos, vel)
-        return jax.numpy.sum(X.reshape(-1, 3) ** 2)   # trivial; isolates the adjoint
+        return jax.numpy.sum(X.reshape(-1, 3) ** 2)  # trivial; isolates the adjoint
 
     jax.block_until_ready(loss(x0j, v0j))
     peak_fwd = peak()
@@ -163,18 +177,33 @@ def _single(n_mesh, K, f64):
     finite = bool(np.all(np.isfinite(gx)))
 
     return {
-        "code": "discodj", "n_mesh": n_mesh, "n_particles": n_part, "K": K,
-        "f64": f64, "platform": dev.platform, "device": str(dev),
-        "bytes_limit": limit(), "peak_after_ic": peak_ic,
-        "peak_forward": peak_fwd, "peak_adjoint": peak_adj,
-        "grad_norm": gnorm, "grad_finite": finite,
+        "code": "discodj",
+        "n_mesh": n_mesh,
+        "n_particles": n_part,
+        "K": K,
+        "f64": f64,
+        "platform": dev.platform,
+        "device": str(dev),
+        "bytes_limit": limit(),
+        "peak_after_ic": peak_ic,
+        "peak_forward": peak_fwd,
+        "peak_adjoint": peak_adj,
+        "grad_norm": gnorm,
+        "grad_finite": finite,
         "adjoint_ran": bool(finite and gnorm > 0.0),
     }
 
 
 def _spawn(n_mesh, K, f64):
-    cmd = [sys.executable, os.path.abspath(__file__), "--single",
-           "--n", str(n_mesh), "--steps", str(K)]
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--single",
+        "--n",
+        str(n_mesh),
+        "--steps",
+        str(K),
+    ]
     if f64:
         cmd.append("--f64")
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -183,12 +212,21 @@ def _spawn(n_mesh, K, f64):
         # Skip JAX's traceback-filtering boilerplate, which is NOT the error --
         # taking the last stderr line reports it and hides the real exception
         # (the m2_mem_profile bug).
-        real = [ln for ln in err if ln.strip()
-                and "For simplicity, JAX has removed" not in ln
-                and not ln.startswith(("  ", "Traceback"))]
-        return {"code": "discodj", "n_mesh": n_mesh, "K": K, "f64": f64,
-                "error": real[-1][:200] if real else f"exit {p.returncode}",
-                "oom": any("RESOURCE_EXHAUSTED" in ln or "Out of memory" in ln for ln in err)}
+        real = [
+            ln
+            for ln in err
+            if ln.strip()
+            and "For simplicity, JAX has removed" not in ln
+            and not ln.startswith(("  ", "Traceback"))
+        ]
+        return {
+            "code": "discodj",
+            "n_mesh": n_mesh,
+            "K": K,
+            "f64": f64,
+            "error": real[-1][:200] if real else f"exit {p.returncode}",
+            "oom": any("RESOURCE_EXHAUSTED" in ln or "Out of memory" in ln for ln in err),
+        }
     return json.loads(p.stdout.strip().splitlines()[-1])
 
 
@@ -211,9 +249,12 @@ def main():
 
     print("\n===== DISCO-DJ adjoint peak (the control for inexor's transient) =====")
     lim = next((r.get("bytes_limit") for r in recs if r.get("bytes_limit")), None)
-    print(f"  device: {next((r.get('device') for r in recs if r.get('device')), '?')}"
-          f"   limit: {lim / GIB if lim else float('nan'):.3f} GiB   "
-          f"precision: {'f64' if args.f64 else 'f32'}")
+    print(
+        f"  device: {next((r.get('device') for r in recs if r.get('device')), '?')}"
+        f"   limit: {lim / GIB if lim else float('nan'):.3f} GiB   "
+        f"precision: {'f64' if args.f64 else 'f32'}"
+    )
+
     # A CPU backend exposes no memory_stats, so peaks are None there: the run is
     # an API/plumbing smoke, not a measurement. Format defensively rather than
     # dividing None by GIB (the m2_mem_profile _fmt_gib rule).
@@ -228,15 +269,19 @@ def main():
         a = r["peak_adjoint"]
         bpp = f"{a / r['n_particles']:8.1f}" if a else "       - (no device stats: CPU?)"
         flag = "" if r.get("adjoint_ran") else "   <-- ADJOINT DID NOT RUN (grad zero/non-finite)"
-        print(f"  {r['n_mesh']:>6}  {g(r['peak_after_ic'])}  {g(r['peak_forward'])}  "
-              f"{g(a)}      {bpp}{flag}")
+        print(
+            f"  {r['n_mesh']:>6}  {g(r['peak_after_ic'])}  {g(r['peak_forward'])}  "
+            f"{g(a)}      {bpp}{flag}"
+        )
 
     ok = [r for r in recs if not r.get("error") and r.get("peak_adjoint")]
     if len(ok) > 1:
         pp = [r["peak_adjoint"] / r["n_particles"] for r in ok]
         spread = max(pp) / min(pp)
-        print(f"\n  scale-invariance across n: {min(pp):.1f}-{max(pp):.1f} B/particle "
-              f"({spread:.2f}x spread)")
+        print(
+            f"\n  scale-invariance across n: {min(pp):.1f}-{max(pp):.1f} B/particle "
+            f"({spread:.2f}x spread)"
+        )
         if spread > 1.25:
             print("  WARNING: not scale-invariant -> the comparison is not per-particle")
             print("  and extrapolating it is invalid. This is a STOP condition (plan).")
