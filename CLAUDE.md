@@ -31,11 +31,14 @@ conventions, gate D-013; Tier-B int16 below the mesh floor, gate D-014;
 read-first record; D-015 passed before the halt). v1 M3/M4 are cancelled;
 `docs/roadmap.md` stands as the v1 historical record.
 
-Deneb git relay: bare repo `deneb:~/git/inexor.git` (remote `deneb`),
-working clone `deneb:~/spherex/inexor` — push here AND to origin. GitHub
-access is HTTPS + PAT (deneb has `credential.helper store`); never SSH.
-Deneb's RTX 3050 is the 6 GB variant; jobs REQUIRE explicit `--mem` (see the
-umbrella albireo memory).
+Deneb working clone: `deneb:~/src/inexor` (fresh clone 2026-07-15, JC's
+`~/src` layout convention; origin = GitHub HTTPS + PAT via
+`credential.helper store`, never SSH — pulls from GitHub directly). The old
+`~/spherex/inexor` checkout is DELETED; sbatch scripts from v1/M-era assume
+the old path and are kept as historical record only — new sbatch scripts
+`cd ~/src/inexor`. The M-era bare relay `deneb:~/git/inexor.git` still
+exists but is unused. Deneb's RTX 3050 is the 6 GB variant; jobs REQUIRE
+explicit `--mem` (see the umbrella albireo memory).
 
 ## Doc map (read before proposing anything)
 
