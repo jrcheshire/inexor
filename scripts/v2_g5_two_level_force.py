@@ -2,11 +2,12 @@
 
 The question (plan-plan Sec 5, seed V2 / plan V2a): can a global COARSE mesh plus
 a FINE mesh in streamed tiles reproduce the monolithic fine-mesh force well
-enough to sit under the PM error floor? If yes the fine mesh leaves the memory
-budget and halo-grade resolution becomes affordable -- M3's premise, A2's spine.
-G5 also unblocks the C-dev G2c rerun (that gate fell back to C-dev/8 because the
-MONOLITHIC 512^3 force does not fit deneb's 6 GB, and t9/t12 are degenerate
-there), and feeds D-v2-8 item 4's open mesh:particle ratio.
+enough to sit under the bar? If yes the fine mesh leaves the memory budget and
+halo-grade resolution becomes affordable -- M3's premise, A2's spine. It also
+feeds D-v2-8 item 4's open mesh:particle ratio.
+VERDICT: PASSED (D-v2-10, JC 2026-07-16) against the D-v2-9 absolute bar.
+(NB the C-dev G2c rerun does NOT wait on this machinery -- that framing was a
+deneb-fit contortion; it runs monolithically on a config-table-home GPU.)
 
 Physics lives in v2_g5_core.py. Read runs/v2/g5_kernel_findings.md before
 touching the arms -- the kernel study is already done and it inverted two design
@@ -82,10 +83,14 @@ ERR_DIR = os.path.join(OUT_DIR, "g5_errs")
 # (n_part, L, n_fine, n_coarse). C-dev per D-v2-8's config table; coarse = fine/4
 # (PMFAST). cdev8 preserves fine cell AND spacing at 1/8 the volume -- the
 # pre-agreed G2c fallback rule -- so every scan point (all in CELLS) transfers
-# unchanged. smoke is the laptop path.
+# unchanged. smoke is the laptop path. cgh64 = C-gh at 1/64 volume, SAME cell
+# and spacing (the G5c box-ladder rung, D-v2-10): more long-wavelength power at
+# the pinned resolution, sized so the MONOLITHIC reference still fits one
+# GH200 node (n=1024 f64 force ~52 GB on the Grace host; f32 ~28 GB on HBM).
 CONFIGS = {
     "cdev": dict(n_part=256, L=128.0, n_fine=512, n_coarse=128),
     "cdev8": dict(n_part=128, L=64.0, n_fine=256, n_coarse=64),
+    "cgh64": dict(n_part=512, L=256.0, n_fine=1024, n_coarse=256),
     "smoke": dict(n_part=32, L=32.0, n_fine=64, n_coarse=16),
 }
 
@@ -350,7 +355,8 @@ def evolve_leg(args):
     # Dispatch on the two_level arm explicitly: `arm == "mono"` sent mono_half
     # (a MONO arm at a coarser mesh) down the two-level path, where tile=None
     # blew up as int(None). The mesh floor would have been silently missing.
-    force_fn = force_two_level if args.arm == "two_level" else force_mono
+    # startswith: G5c runs a (T, b) SCAN of two-level arms (two_level_T128_b32, ...).
+    force_fn = force_two_level if args.arm.startswith("two_level") else force_mono
     a_steps = a_grid(A_CONTROL, A_PIVOT, args.nsteps, "log")
     coeffs = bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo))
     fdt = jnp.float64 if args.fdtype == "f64" else jnp.float32
@@ -587,9 +593,11 @@ def spawn(kind, cfg, tag, platform="cpu", **kw):
         # Physics legs are CPU f64. Set (not pop) JAX_PLATFORMS -- G2c's spawn
         # only pops it -- and give the FFT threads, since a single-threaded
         # 512^3 f64 FFT is ~4 min of pure wall. The reference leg's wall is not
-        # a reported measurement, so this contaminates nothing.
+        # a reported measurement, so this contaminates nothing. G5_CPU_THREADS
+        # overrides the default 8 (Vista's Grace host has 72 cores; deneb's
+        # sbatch cgroup is 32).
         env["JAX_PLATFORMS"] = "cpu"
-        env["OMP_NUM_THREADS"] = "8"
+        env["OMP_NUM_THREADS"] = os.environ.get("G5_CPU_THREADS", "8")
     else:
         env.pop("JAX_PLATFORMS", None)
     p = subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -627,6 +635,35 @@ def main():
     ap.add_argument("--skip-capacity", action="store_true", help="no GPU legs (laptop smoke)")
     ap.add_argument("--skip-1024", action="store_true", help="skip the converged 2n mesh floor")
     ap.add_argument("--keep-forces", action="store_true")
+    # G5c flags (D-v2-10): the box-ladder coefficient run measures the RATIFIED
+    # family only, against the ABSOLUTE bar -- so the settled scans are skippable.
+    ap.add_argument(
+        "--families",
+        default="all",
+        choices=["all", "gauss"],
+        help="restrict split families (G5c: gauss only; the kernel study settled the rest)",
+    )
+    ap.add_argument(
+        "--skip-coarse",
+        action="store_true",
+        help="skip the coarse-arm assignment/matching scan (settled by the kernel study)",
+    )
+    ap.add_argument(
+        "--skip-floor-arms",
+        action="store_true",
+        help="skip the evolve mesh-floor arms (the D-v2-9 bar is absolute; floors not needed)",
+    )
+    ap.add_argument(
+        "--evolve-tiles",
+        default=None,
+        help="comma list of T:b two-level evolve arms, e.g. '128:32,256:32' (default: the pivot)",
+    )
+    ap.add_argument(
+        "--out-suffix",
+        default="",
+        help="suffix for the results json (e.g. '_vista' -> g5_results_<cfg>_vista.json), "
+        "so cross-machine runs never collide with the deneb job records",
+    )
     # worker-private
     ap.add_argument("--single", action="store_true", help=argparse.SUPPRESS)
     for f, d in (
@@ -721,14 +758,23 @@ def main():
         F[tag] = np.load(r["force_file"])
         return r
 
+    # Families under test: G5c (--families gauss) measures only the RATIFIED
+    # family; the full study runs all three. Everything downstream (validation
+    # required-list, coarse scan, tile scan) keys off this.
+    fam_specs = [("gauss", dict(alpha=1.0))]
+    if args.families == "all":
+        fam_specs += [("compact", dict(rout=4.0)), ("gauss_compact", dict(alpha=1.0, rout=4.0))]
+
+    # Two-level (T, b) evolve/capacity arms: --evolve-tiles or the pivot.
+    if args.evolve_tiles:
+        tb_list = [tuple(int(v) for v in s.split(":")) for s in args.evolve_tiles.split(",")]
+    else:
+        tb_list = [(n_f // 4, n_f // 16)]
+
     # ---- F0 / F1 / tile identity: the kaiser check --------------------------
     print("--- validation (if these fail, NO other G5 number may be read) ---")
     force("mono_f64", which="mono", nmesh=n_f, fdtype="f64")
-    for fam, kw in (
-        ("gauss", dict(alpha=1.0)),
-        ("compact", dict(rout=4.0)),
-        ("gauss_compact", dict(alpha=1.0, rout=4.0)),
-    ):
+    for fam, kw in fam_specs:
         lt, st = f"long_fine_{fam}", f"short_fine_{fam}"
         force(lt, which="long", nmesh=n_f, family=fam, **kw)
         force(st, which="short", nmesh=n_f, family=fam, **kw)
@@ -764,8 +810,8 @@ def main():
     # A missing check must FAIL, never silently drop out of the all(): the smoke
     # run had tileid crash, leaving all() over the surviving F1s -> a false "OK".
     # That is the "guard against no-op" class (retrospective Sec 5) and it is
-    # exactly how a broken gate looks clean.
-    required = ["F1_gauss", "F1_compact", "F1_gauss_compact", "tile_identity", "partition"]
+    # exactly how a broken gate looks clean. Required = the families under test.
+    required = [f"F1_{fam}" for fam, _ in fam_specs] + ["tile_identity", "partition"]
     missing = [r for r in required if r not in res["validation"]]
     for r in missing:
         res["validation"][r] = dict(ok=False, error="leg did not run or crashed")
@@ -814,16 +860,13 @@ def main():
         )
 
     # ---- coarse arms --------------------------------------------------------
-    print("\n--- coarse arm (vs each family's own long_fine; tiling excluded) ---")
-    print(
-        f"  {'family':>14} {'param':>12} {'assign':>7} {'match':>6} {'rms':>10} {'|T-1|':>9} "
-        f"{'1-r':>9}"
-    )
-    coarse_specs = [
-        ("gauss", dict(alpha=1.0)),
-        ("compact", dict(rout=4.0)),
-        ("gauss_compact", dict(alpha=1.0, rout=4.0)),
-    ]
+    coarse_specs = [] if args.skip_coarse else list(fam_specs)
+    if coarse_specs:
+        print("\n--- coarse arm (vs each family's own long_fine; tiling excluded) ---")
+        print(
+            f"  {'family':>14} {'param':>12} {'assign':>7} {'match':>6} {'rms':>10} {'|T-1|':>9} "
+            f"{'1-r':>9}"
+        )
     if args.pivot_only:
         coarse_specs = coarse_specs[:1]
     for fam, kw in coarse_specs:
@@ -857,8 +900,10 @@ def main():
     tile_specs = []
     for T in [n_f // 4] if args.pivot_only else [n_f // 8, n_f // 4, n_f // 2]:
         for b in [n_f // 16] if args.pivot_only else [n_f // 32, n_f // 16, n_f // 8]:
-            tile_specs.append(("gauss", dict(alpha=1.0), T, b))
-            tile_specs.append(("compact", dict(rout=4.0), T, b))
+            for fam, fkw in fam_specs:
+                if fam == "gauss_compact":
+                    continue  # the hybrid is settled (kernel study finding 3)
+                tile_specs.append((fam, dict(fkw), T, b))
     for fam, kw, T, b in tile_specs:
         ref = F.get(f"short_fine_{fam}")
         if ref is None:
@@ -884,30 +929,33 @@ def main():
     if not args.skip_evolve:
         print("\n--- evolution (THE arm D-v2-1 bars: dP/P of an EVOLVED field) ---")
         ev = {}
-        for arm, kw in (
-            ("mono", dict(nmesh=n_f)),
-            ("mono_half", dict(nmesh=n_f // 2)),
-            (
-                "two_level",
-                dict(
-                    nmesh=n_f,
-                    family="gauss",
-                    alpha=1.0,
-                    assign="tsc",
-                    match=True,
-                    tile=n_f // 4,
-                    buf=n_f // 16,
-                ),
-            ),
-        ):
+        evolve_arms = [("mono", dict(nmesh=n_f))]
+        if not args.skip_floor_arms:
+            evolve_arms.append(("mono_half", dict(nmesh=n_f // 2)))
+        for T, b in tb_list:
+            evolve_arms.append(
+                (
+                    f"two_level_T{T}_b{b}",
+                    dict(
+                        nmesh=n_f,
+                        family="gauss",
+                        alpha=1.0,
+                        assign="tsc",
+                        match=True,
+                        tile=T,
+                        buf=b,
+                    ),
+                )
+            )
+        for arm, kw in evolve_arms:
             t = tag_of("evolve", cfg, **{**kw, "a": A_PIVOT})
             r = W(spawn("evolve", cfg, t, platform="cpu", arm=arm, nsteps=N_STEPS, **kw))
             if "error" in r:
-                print(f"  !! {arm}: {r['error']}")
+                print(f"  !! {arm}: {r['error']}", flush=True)
                 continue
             with np.load(r["state_file"]) as f:
                 ev[arm] = f["x"]
-            print(f"  [{arm}] wall {r['wall_s']:.1f}s ({r['wall_per_step']:.2f} s/step)")
+            print(f"  [{arm}] wall {r['wall_s']:.1f}s ({r['wall_per_step']:.2f} s/step)", flush=True)
 
         # The mono-2n floor (1024 at C-dev): the CONVERGED reference the D-v2-1
         # bar really wants. f32 by necessity -- 1024^3 f64 is ~52 GB against a
@@ -943,11 +991,17 @@ def main():
                 print(
                     f"  {name:18s} |dP/P| on the band = {res['evolve'][name]['max_abs_gate']:.3e}"
                 )
-        if "mono" in ev and "two_level" in ev:
-            res["evolve"]["two_level"] = pk_ratio(ev["mono"], ev["two_level"], n_f, L, k_gate)
+        # One dP/P per two-level (T, b) arm; the FIRST one mirrors to the legacy
+        # "two_level" key so the headroom block and prior readers keep working.
+        for arm in [a for a, _ in evolve_arms if a.startswith("two_level")]:
+            if "mono" not in ev or arm not in ev:
+                continue
+            res["evolve"][arm] = pk_ratio(ev["mono"], ev[arm], n_f, L, k_gate)
+            if "two_level" not in res["evolve"]:
+                res["evolve"]["two_level"] = res["evolve"][arm]
             print(
-                f"  two-level          |dP/P| on the band = "
-                f"{res['evolve']['two_level']['max_abs_gate']:.3e}"
+                f"  {arm:18s} |dP/P| on the band = {res['evolve'][arm]['max_abs_gate']:.3e}",
+                flush=True,
             )
 
         # (kc)^2 validity check on the EVOLVED floor, the twin of the force-side
@@ -996,21 +1050,22 @@ def main():
         print("\n--- capacity: peak B/p on the GPU (all physics above was CPU f64) ---")
         print(f"  {'arm':>12} {'peak B/p':>10} {'peak MB':>9} {'wall s':>8}  note")
         cap = {}
-        legs = [
-            ("mono_gpu", dict(which="mono", nmesh=n_f, fdtype="f32")),
-            (
-                "tiled_gpu",
-                dict(
-                    which="short",
-                    nmesh=n_f,
-                    family="gauss",
-                    alpha=1.0,
-                    tile=n_f // 4,
-                    buf=n_f // 16,
-                    fdtype="f32",
-                ),
-            ),
-        ]
+        legs = [("mono_gpu", dict(which="mono", nmesh=n_f, fdtype="f32"))]
+        for T, b in tb_list:
+            legs.append(
+                (
+                    f"tiled_gpu_T{T}_b{b}",
+                    dict(
+                        which="short",
+                        nmesh=n_f,
+                        family="gauss",
+                        alpha=1.0,
+                        tile=T,
+                        buf=b,
+                        fdtype="f32",
+                    ),
+                )
+            )
         for name, kw in legs:
             r = W(spawn("force", cfg, tag_of("cap", cfg, **kw), platform="gpu", a=A_PIVOT, **kw))
             if "error" in r:
@@ -1047,11 +1102,12 @@ def main():
         res["capacity"] = cap
 
     print(
-        "\nVerdict vs the mesh floor is JC's call (D-v2-1 band, plan-plan V2 exit); "
-        "nothing self-ratified."
+        "\nBar = |dP/P| <= 3e-2 absolute in-band (D-v2-9) + the reported "
+        "split-to-discretization shape; operating (T, b) per config is V4's "
+        "Pareto call (D-v2-10). Nothing self-ratified."
     )
     os.makedirs(OUT_DIR, exist_ok=True)
-    path = os.path.join(OUT_DIR, f"g5_results_{cfg}.json")
+    path = os.path.join(OUT_DIR, f"g5_results_{cfg}{args.out_suffix}.json")
     with open(path, "w") as fh:
         json.dump(res, fh, indent=1)
     print(f"wrote {path}")
