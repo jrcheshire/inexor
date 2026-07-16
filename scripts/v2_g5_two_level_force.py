@@ -286,7 +286,13 @@ def evolve_leg(args):
     """
     import jax
 
-    jax.config.update("jax_enable_x64", True)
+    # The 1024 mesh floor CANNOT run f64 on deneb: 1024^3 f64 needs ~52 GB
+    # (delta 8.6 + dk 8.6 + kernel 8.6 + three g 25.8 + inv_k2 8.6) against a
+    # 56 GB host. In f32 it is ~28 GB and fits. That is safe here because F2
+    # measured f32-vs-f64 at ~3e-7 -- six orders below the ~1e-1 mesh floor this
+    # leg exists to establish -- and the error is common-mode across the pair.
+    if args.fdtype == "f64":
+        jax.config.update("jax_enable_x64", True)
     import jax.numpy as jnp
 
     from inexor.config import Cosmology
@@ -347,8 +353,9 @@ def evolve_leg(args):
     force_fn = force_two_level if args.arm == "two_level" else force_mono
     a_steps = a_grid(A_CONTROL, A_PIVOT, args.nsteps, "log")
     coeffs = bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo))
-    x = jnp.asarray(x_np, jnp.float64)
-    v = jnp.asarray(v_np, jnp.float64)
+    fdt = jnp.float64 if args.fdtype == "f64" else jnp.float32
+    x = jnp.asarray(x_np, fdt)
+    v = jnp.asarray(v_np, fdt)
     t0 = time.perf_counter()
     for c in coeffs:
         x, v = float_step_bullfrog(x, v, tuple(np.asarray(c, np.float64)), force_fn, L)
@@ -362,6 +369,7 @@ def evolve_leg(args):
         tag=args.tag,
         arm=args.arm,
         platform=dev.platform,
+        fdtype=args.fdtype,
         nmesh=args.nmesh,
         nsteps=args.nsteps,
         family=args.family,
@@ -412,25 +420,31 @@ def cic_paint_vector(pos, vals, n, L):
 
     The estimator side is numpy-only by convention (_m1_common's rule), so the
     force fields are painted here rather than on device.
+
+    np.bincount, NOT np.add.at: same 8-corner structure as _m1_common.cic_paint,
+    and add.at is the classic numpy slow path (~10x here). At C-dev this runs
+    8 corners x 3 components over 16.7M particles per call, on every coarse and
+    tile leg -- add.at would have put the ESTIMATOR, not the physics, on the
+    critical path of an overnight job.
     """
     d = L / n
-    xp = pos / d
-    base = np.floor(xp).astype(np.int64)
-    frac = xp - base
-    out = np.zeros((3, n**3), dtype=np.float64)
+    g = np.asarray(pos, dtype=np.float64) / d
+    i0 = np.floor(g).astype(np.int64)
+    frac = g - i0
+    out = np.zeros((3, n * n * n), dtype=np.float64)
     for dx in (0, 1):
+        wx = frac[:, 0] if dx else 1.0 - frac[:, 0]
+        ix = (i0[:, 0] + dx) % n
         for dy in (0, 1):
+            wy = frac[:, 1] if dy else 1.0 - frac[:, 1]
+            iy = (i0[:, 1] + dy) % n
             for dz in (0, 1):
-                wx = frac[:, 0] if dx else 1.0 - frac[:, 0]
-                wy = frac[:, 1] if dy else 1.0 - frac[:, 1]
                 wz = frac[:, 2] if dz else 1.0 - frac[:, 2]
+                iz = (i0[:, 2] + dz) % n
                 w = wx * wy * wz
-                ix = (base[:, 0] + dx) % n
-                iy = (base[:, 1] + dy) % n
-                iz = (base[:, 2] + dz) % n
                 flat = (ix * n + iy) * n + iz
                 for j in range(3):
-                    np.add.at(out[j], flat, w * vals[:, j])
+                    out[j] += np.bincount(flat, weights=w * vals[:, j], minlength=n * n * n)
     return out.reshape(3, n, n, n)
 
 
@@ -516,33 +530,25 @@ def seam_profile(g_ref, g_arm, pos, n_tile, cell, n_bins=8):
 
 
 def pk_ratio(x_a, x_b, n, L, k_gate):
-    """|dP/P| between two evolved particle sets, on the D-v2-1 band."""
+    """|dP/P| between two evolved particle sets, on the D-v2-1 band.
 
-    def delta(x):
-        d = L / n
-        xp = x / d
-        base = np.floor(xp).astype(np.int64)
-        frac = xp - base
-        m = np.zeros(n**3)
-        for dx in (0, 1):
-            for dy in (0, 1):
-                for dz in (0, 1):
-                    w = (
-                        (frac[:, 0] if dx else 1 - frac[:, 0])
-                        * (frac[:, 1] if dy else 1 - frac[:, 1])
-                        * (frac[:, 2] if dz else 1 - frac[:, 2])
-                    )
-                    flat = (((base[:, 0] + dx) % n) * n + ((base[:, 1] + dy) % n)) * n + (
-                        (base[:, 2] + dz) % n
-                    )
-                    np.add.at(m, flat, w)
-        return m.reshape(n, n, n) / (len(x) / n**3) - 1.0
+    Uses _m1_common.cic_paint -- the estimator-neutral, numpy-only instrument
+    every prior parity claim in this repo was measured with (m1-results, D-013),
+    so the evolution arm's dP/P is directly comparable to them rather than to a
+    fourth private paint.
+    """
+    sys.path.insert(0, HERE)
+    import _m1_common as M
 
     kmag = _k_grid(n, L).ravel()
     edges = _bin_edges(n, L)
     counts = np.histogram(kmag, bins=edges)[0]
-    pa = np.histogram(kmag, bins=edges, weights=(np.abs(np.fft.rfftn(delta(x_a))) ** 2).ravel())[0]
-    pb = np.histogram(kmag, bins=edges, weights=(np.abs(np.fft.rfftn(delta(x_b))) ** 2).ravel())[0]
+    pa = np.histogram(
+        kmag, bins=edges, weights=(np.abs(np.fft.rfftn(M.cic_paint(x_a, n, L))) ** 2).ravel()
+    )[0]
+    pb = np.histogram(
+        kmag, bins=edges, weights=(np.abs(np.fft.rfftn(M.cic_paint(x_b, n, L))) ** 2).ravel()
+    )[0]
     good = (counts > 0) & (pa > 0)
     kc = 0.5 * (edges[1:] + edges[:-1])[good]
     ratio = pb[good] / pa[good] - 1.0
@@ -619,6 +625,7 @@ def main():
     ap.add_argument("--pivot-only", action="store_true", help="skip the scans")
     ap.add_argument("--skip-evolve", action="store_true")
     ap.add_argument("--skip-capacity", action="store_true", help="no GPU legs (laptop smoke)")
+    ap.add_argument("--skip-1024", action="store_true", help="skip the converged 2n mesh floor")
     ap.add_argument("--keep-forces", action="store_true")
     # worker-private
     ap.add_argument("--single", action="store_true", help=argparse.SUPPRESS)
@@ -901,28 +908,85 @@ def main():
             with np.load(r["state_file"]) as f:
                 ev[arm] = f["x"]
             print(f"  [{arm}] wall {r['wall_s']:.1f}s ({r['wall_per_step']:.2f} s/step)")
-        if "mono" in ev and "mono_half" in ev:
-            res["evolve"]["mesh_floor"] = pk_ratio(ev["mono"], ev["mono_half"], n_f, L, k_gate)
-            print(
-                f"  MESH FLOOR |dP/P| on the band = "
-                f"{res['evolve']['mesh_floor']['max_abs_gate']:.3e}"
+
+        # The mono-2n floor (1024 at C-dev): the CONVERGED reference the D-v2-1
+        # bar really wants. f32 by necessity -- 1024^3 f64 is ~52 GB against a
+        # 56 GB host -- which is safe because F2 put f32-vs-f64 at ~3e-7, six
+        # orders under the ~1e-1 floor, and the error is common-mode across the
+        # pair. Skippable (--skip-1024) since it doubles the evolution wall.
+        if not args.skip_1024:
+            kw = dict(nmesh=2 * n_f)
+            t = tag_of("evolve", cfg, **{**kw, "a": A_PIVOT, "fdtype": "f32"})
+            r = W(
+                spawn(
+                    "evolve", cfg, t, platform="cpu", arm="mono", nsteps=N_STEPS, fdtype="f32", **kw
+                )
             )
+            if "error" in r:
+                note = "OOM -> 1024 floor unavailable" if r.get("oom") else r["error"]
+                print(f"  !! mono_double (n={2 * n_f}): {note}")
+                res["evolve"]["mono_double_error"] = note
+            else:
+                with np.load(r["state_file"]) as f:
+                    ev["mono_double"] = f["x"]
+                print(
+                    f"  [mono_double n={2 * n_f} f32] wall {r['wall_s']:.1f}s "
+                    f"({r['wall_per_step']:.2f} s/step)"
+                )
+
+        for name, lo, hi in (
+            ("mesh_floor_half", "mono_half", "mono"),
+            ("mesh_floor_double", "mono", "mono_double"),
+        ):
+            if lo in ev and hi in ev:
+                res["evolve"][name] = pk_ratio(ev[lo], ev[hi], n_f, L, k_gate)
+                print(
+                    f"  {name:18s} |dP/P| on the band = {res['evolve'][name]['max_abs_gate']:.3e}"
+                )
         if "mono" in ev and "two_level" in ev:
             res["evolve"]["two_level"] = pk_ratio(ev["mono"], ev["two_level"], n_f, L, k_gate)
             print(
-                f"  two-level |dP/P| on the band = {res['evolve']['two_level']['max_abs_gate']:.3e}"
+                f"  two-level          |dP/P| on the band = "
+                f"{res['evolve']['two_level']['max_abs_gate']:.3e}"
             )
-        if "mesh_floor" in res["evolve"] and "two_level" in res["evolve"]:
-            fl = res["evolve"]["mesh_floor"]["max_abs_gate"]
+
+        # (kc)^2 validity check on the EVOLVED floor, the twin of the force-side
+        # one: halving the cell should quarter the error. If it does not, the
+        # 2n rung is discreteness-dominated rather than mesh-dominated (risk R3),
+        # the "floor" is overestimated, the gate passes trivially, and the bar
+        # must be re-framed with JC against an absolute tolerance instead.
+        if "mesh_floor_half" in res["evolve"] and "mesh_floor_double" in res["evolve"]:
+            e1 = res["evolve"]["mesh_floor_half"]["max_abs_gate"]
+            e2 = res["evolve"]["mesh_floor_double"]["max_abs_gate"]
+            ok = bool(e2 and 2.0 <= e1 / e2 <= 8.0)
+            res["evolve"]["floor_scaling_check"] = dict(
+                e_half_vs_fine=e1,
+                e_fine_vs_double=e2,
+                ratio=(e1 / e2 if e2 else None),
+                expect="~4 if mesh-error-dominated ((kc)^2 law)",
+                ok=ok,
+            )
+            print(
+                f"  floor (kc)^2 check: ratio {e1 / e2:.2f} (expect ~4)  "
+                f"{'OK' if ok else 'SUSPECT -> floor contaminated, re-frame the bar with JC'}"
+            )
+
+        # Prefer the CONVERGED (2n) floor; fall back to fine-vs-half and say so.
+        floor_key = (
+            "mesh_floor_double" if "mesh_floor_double" in res["evolve"] else "mesh_floor_half"
+        )
+        if floor_key in res["evolve"] and "two_level" in res["evolve"]:
+            fl = res["evolve"][floor_key]["max_abs_gate"]
             tl = res["evolve"]["two_level"]["max_abs_gate"]
             res["evolve"]["headroom"] = dict(
                 floor=fl,
+                floor_from=floor_key,
                 two_level=tl,
                 headroom_ratio=(fl / tl if tl else None),
                 note="headroom = floor / split error; JC picks the config off the Pareto "
                 "curve, not a binary pass/fail (plan V2a, resolved 2026-07-15).",
             )
-            print(f"  HEADROOM (floor / split) = {fl / tl:.1f}x")
+            print(f"  HEADROOM (floor / split) = {fl / tl:.1f}x   [floor from {floor_key}]")
 
     # ---- capacity: the ONLY GPU legs (D-v2-4's instrument) ------------------
     # Everything above is CPU f64 on purpose, so it measures physics and nothing
