@@ -128,6 +128,16 @@ better -- but it is not measured, and the bar should not be read as comfortable.
 The knob is tile size (gauss tiles as ~2.0/P; error falls with BIGGER tiles,
 which costs memory) -- the V4 Pareto call, not a gate pass/fail.
 
+**VERDICT (2026-07-16): PASSED and ratified as D-v2-10.** The thin margin was
+subsequently framed as a gate-config artifact (deneb's 6 GB set the probe
+tile, and nothing will run at that operating point): error ∝ 1/P, the tile
+working set is absolute and box-independent (~415 MB at P = 192), and wall
+overhead is the padded-volume ratio, so the config-table homes buy 2-3x
+margin for a trivial memory cost. G5c (Vista) measures the two things this
+framing leans on: the 1/P coefficient under more long-wavelength power, and
+real capacity triples on C-gh-class hardware. The low-k dominance finding
+(clause 3) is unaffected and is assessed separately after G5c.
+
 ## Ops notes
 
 - Job 40: CPU-only, deneb, ~22 min wall, --mem=54G. IC gen was cheap (512^3

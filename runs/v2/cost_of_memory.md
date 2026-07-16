@@ -124,6 +124,43 @@ Readings:
   int16-grade); accumulated K=40 = 1.3e-4, x4 -- much kinder than the ~20x
   D-014 anchor suggested. t6's velocity residual is where accumulation bites.
 
+## V2a -- G5 two-level split (deneb job 39; verdict D-v2-10)
+
+Where these numbers may be USED (D-v2-10): performance/Pareto decisions are
+made from config-table-home measurements (G5c on Vista and later); the deneb
+rows below are the dev-ground record and the scaling-law evidence, not an
+operating point. Data: `runs/v2/g5_results_cdev.json` + the job 39 log.
+
+Capacity (GPU f32 force legs, gauss T128/b32 unless noted):
+
+| config | arm | peak B/p | peak MB | note |
+|---|---|---|---|---|
+| C-dev | mono | - | - | OOM (6 GB) = the capacity result |
+| C-dev | tiled (P=192) | 24.7 | 415.2 | absolute working set, box-independent |
+| cdev8 | mono | 377.0 | 790.6 | mono fits at 1/8 volume |
+| cdev8 | tiled (T64/b16, P=96) | 27.3 | 57.2 | 415/57 ~= (192/96)^3: the P^3 law |
+
+Evolution wall (CPU f64, 20 steps; wall ratio = the padded-volume ratio
+(1+2b/T)^3 = 3.375 at both points):
+
+| config | mono s/step | two-level s/step | ratio |
+|---|---|---|---|
+| C-dev (T128/b32) | 9.9 | 32.2 | 3.23x |
+| cdev8 (T64/b16) | 1.03 | 3.54 | 3.44x |
+
+Readings (ratified as D-v2-10, JC 2026-07-16):
+- Split evolved error 2.61e-2 vs the 3e-2 D-v2-9 bar at the probe config;
+  the split-to-discretization shape (clause 3) read alongside, not just the
+  max (`runs/v2/g5b_abs_transfer.md`).
+- Error is set by P ALONE (error x P flat at 0.5-0.7 across the (T,b) scan;
+  the two P=192 partitions agree to ~10%), memory by P^3 as an absolute
+  working set, wall overhead by the buffer fraction. Efficient frontier =
+  big tile + minimal buffer; the gate config (0.87 of bar) is a deneb-fit
+  artifact, and no production config will run there.
+- The 3.4x wall for a >=14x memory ratio is the accepted philosophy trade
+  (JC, verbatim in the 07-15 worklog): these sims are memory-expensive, not
+  time-expensive; subverting that is the point of v2.
+
 ## Older anchors (v1 record, for scale)
 
 - XLA-native forward evolution peaked ~126-138 B/p (v1 R6, m2-results).

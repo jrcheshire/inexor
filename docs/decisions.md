@@ -372,3 +372,60 @@ decision here is locked until explicitly re-litigated with JC.
   - Record: `runs/v2/g5b_abs_transfer.md`; figures `runs/v2/g5b_cdev_tolerance.png`
     (the bar) and `runs/v2/g5_cdev_band.png` (why the old floor failed). Probe:
     `scripts/v2_g5b_abs_transfer.py` (deneb job 40).
+
+## D-v2-10 — G5 verdict: PASS (A2's spine ratified); perf evaluation moves to the config-table homes
+- **Status:** accepted (JC, 2026-07-16, seed V2a close). Resolves the verdict
+  D-v2-9 left open; retires the G5 kill-line branch (A1 fallback / 4096^3 to
+  A4-only) unexercised.
+- **Decision:** the two-level split (gauss + TSC + matching) passes the D-v2-9
+  bar — 2.61e-2 vs 3e-2 in-band at the V2a probe config (tile 128 / buf 32,
+  P = 192, C-dev) — and is ratified as A2's spine. The clause-3 shape diagnostic
+  was read, not just the max: the split dominates C-dev's own discretization
+  error below k = 1.53 while clearing every D-v2-8 science bar.
+- **The 0.87-of-bar margin is a GATE-CONFIG ARTIFACT, not a product property.**
+  Three measured scalings, all from job 39, establish this:
+  1. **Error ∝ 1/P** (P = the padded tile period, in fine cells). Verified two
+     ways: error x P flat at 0.5-0.7 across the (T, b) scan, and the two P = 192
+     partitions (T128/b32 vs T64/b64) agree to ~10%. How P splits between tile
+     and buffer is error-irrelevant; the erfc buffer mechanism is absent
+     (kernel study, three signatures).
+  2. **Peak memory is an ABSOLUTE working set ∝ P^3, box-independent**, vs
+     monolithic's O(N^3): tiled 415 MB at P = 192 (C-dev) vs 57 MB at P = 96
+     (the cdev8 leg) = the P^3 law. Mono: 377 B/p where it fits (cdev8) and
+     OOM at C-dev on the 6 GB card — the memory ratio only improves with box
+     size, so C-dev understates the win everywhere else in the table.
+     (NB the "27.3 vs 377 B/p (~14x)" pair previously quoted for C-dev is
+     actually the cdev8 leg — job 39 log lines 158-161; at C-dev proper the
+     comparison is "tiled 24.7 B/p vs mono does-not-fit".)
+  3. **Wall overhead = the padded-volume ratio (1 + 2b/T)^3 = 3.375 at both
+     measured points**: 3.54/1.03 = 3.44x at cdev8 (T64/b16) and
+     32.2/9.9 = 3.23x at C-dev (T128/b32). It SHRINKS for bigger tiles; the
+     efficient frontier is big tile + minimal buffer.
+  Consequence: at the config-table homes a P = 384-512 tile costs 3-8 GB in
+  flight (trivial on a GH200/H100 node) and buys ~2-3x more margin. Nothing
+  will ever run at the gate's operating point.
+- **Framing (binding on future gates): performance/Pareto evaluation happens at
+  the config-table TACC homes (C-gh = one GH200, C-hero = one S3 H100 node).**
+  deneb is the correctness/dev ground and a free CUDA-path check — its 6 GB
+  card must not shape architecture decisions or gate configs again. Probe
+  fallbacks that existed only to fit deneb (the G2c cdev8 fallback; "G5
+  unblocks the G2c rerun") are contortions, deleted: the full C-dev G2c rerun
+  (where t9/t12 actually separate at 2^17 levels) runs MONOLITHICALLY on a
+  GH200 with no new machinery.
+- **The operating (T, b) per config is V4's Pareto call, NOT fixed here** —
+  informed by G5c (Vista GH200, launched at this close): cross-hardware
+  replication of the C-dev split number, a box ladder at fixed cell/spacing
+  (cgh64 = 512^3 / L 256) for the 1/P COEFFICIENT under more long-wavelength
+  power (it moved 3-4x between the kernel-study config and C-dev — the one
+  unknown that could erode the at-scale margin story), and real (B/p, wall)
+  capacity triples on the C-gh hardware class.
+- **Accepted with eyes open: the low-k architectural floor.** Below k ~ 1.5 the
+  split is the sim's dominant P(k) error (a coherent suppression, ~1% at
+  k = 0.5, plateauing ~2.5e-2 above k ~ 1.4); it shrinks as 1/P but its
+  structure is the architecture's, and a measured-transfer correction cannot
+  currently be claimed to remove it. Whether it is realization-stable enough
+  to correct as a transfer is DELIBERATELY a separate assessment, after G5c —
+  not folded into this verdict. D-v2-9 clause 3 keeps it visible per config.
+- **Record:** `runs/v2/g5_kernel_findings.md` (mechanism),
+  `runs/v2/g5b_abs_transfer.md` (bar), `runs/v2/cost_of_memory.md` (triples),
+  `runs/v2/g5_results_cdev.json` (job 39 data incl. the tile scan).

@@ -4,8 +4,16 @@ Running record of the G5 kernel study, 2026-07-15. Committed by exception from
 the gitignored `runs/` (`git add -f`), same rule as `cost_of_memory.md`: this is
 a RECORD, not run output, and it must survive machines.
 
-**Nothing here is ratified.** These are measured inputs to the V4 freeze; the
-verdict is JC's. All numbers are CPU f64, `scripts/v2_g5_core.py`.
+**VERDICT (2026-07-16): G5 PASSED — D-v2-10** (gauss + TSC + matching,
+2.61e-2 vs the 3e-2 D-v2-9 bar at tile 128 / buf 32). The "inverts M3's
+memory story" tension below was resolved by scale framing, not by a new
+knob: error ∝ 1/P but the tile working set is an ABSOLUTE ~O(P^3) cost,
+box-independent, so at the config-table homes (GH200/H100) big tiles are
+cheap and the buffer stays minimal. See D-v2-10 for the operating-point
+rule (V4) and the G5c follow-up measurement. The kernel-mechanism findings
+below stand unchanged.
+
+All numbers are CPU f64, `scripts/v2_g5_core.py`.
 
 ## Configuration of these measurements (READ THIS BEFORE QUOTING ANY NUMBER)
 

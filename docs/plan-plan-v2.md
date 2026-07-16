@@ -27,6 +27,7 @@ https://claude.ai/code/artifact/370ba948-b9ea-4e42-9c15-92dce10fdf55).
 | D-v2-7 | **Squeezed-bispectrum tolerance = 15%** for tiled-vs-monolithic agreement (the G3 kill line). |
 | D-v2-8 | **Requirements chain pinned at seed V0** (JC, 2026-07-15; full ADR in `decisions.md`): general engine, NOT SPHEREx-anchored (disco-mocks/DISCO-DJ own main-line mocks); k_sci = 2.0 h/Mpc -> fine cell <= 0.31 Mpc/h; hybrid bias route (halo catalogs at calibration, field-level in production); n_p = 100; M_min DERIVED from the chain, reported per config; multipole-grade RSD bar (P0+P2 under D-v2-1); HMF 5% / halo-b1 2% at calibration; realizations 100 prod / O(5) calib; Sec 3 instrument ratified. |
 | D-v2-9 | **P(k) fidelity bar is now ABSOLUTE** (JC, 2026-07-15, seed V2a; full ADR in `decisions.md`). D-v2-1's BAND stands (k <= 0.2 k_Nyq fine, so D-v2-8 clause 1 is unaffected); its "below the PM error floor" BAR is retired as unmeasurable at fixed particles and replaced by **\|dP/P\| <= 3e-2 in-band**, plus a **mandatory reported split-to-discretization ratio vs k**. Absolute because D-v2-8 pins the same fine cell across the whole config table, so it transfers unchanged. C-dev's own discretization error measured at 6.14e-2 in-band (job 40, a LOWER bound). NB **the split DOMINATES that error for k < 1.53** (7.4x at the fundamental) — max-over-band comparisons hide this, which is why the ratio clause is mandatory. |
+| D-v2-10 | **G5 verdict: PASS — A2's spine ratified** (JC, 2026-07-16; full ADR in `decisions.md`). 2.61e-2 vs the 3e-2 bar at the probe config (tile 128 / buf 32, C-dev). **The 0.87 margin is a gate-config artifact**: error ∝ 1/P, peak memory ∝ P^3 as an ABSOLUTE box-independent working set, wall overhead = the padded-volume ratio — so at the config-table homes tile size is a cheap accuracy dial. **Binding framing: performance/Pareto evaluation happens at the config-table TACC homes; deneb is the correctness/dev ground** — its 6 GB never shapes a gate config again (deneb-fit contortions deleted; the full C-dev G2c rerun runs monolithically on a GH200). Operating (T, b) per config = V4's Pareto call, informed by G5c (Vista: cross-hardware anchor + box-ladder 1/P coefficient + real capacity triples). The low-k architectural floor is accepted and assessed SEPARATELY (realization stability -> correctable-as-transfer question), after G5c. |
 
 ## 1. Thesis
 
@@ -120,7 +121,9 @@ mem-profiler discipline (one config per subprocess, `peak_bytes_in_use`,
 sweep the discriminating axis) extended with timing + SU accounting.
 
 Running record: `runs/v2/cost_of_memory.md` (a table + one figure), updated
-at V1/V2/V3. Expected points, roughly left (cheap-memory) to right:
+at V1/V2/V3. **Where it is measured (D-v2-10): performance/Pareto points come
+from the config-table TACC homes; deneb rows are dev-ground context, never
+architecture-deciding.** Expected points, roughly left (cheap-memory) to right:
 A3 sequential tiles (x3.2 compute), A4 NVMe-streamed, A2 PCIe-staged,
 A2 C2C-streamed (GH), A2 all-HBM, A1 monolithic. Decision rule at V4: stay on
 the Pareto front, B/p primary, but a point that buys 2x memory for >5x SU
@@ -221,6 +224,16 @@ freezes. Each seed's prompt is meant to be pasted at that session's start
   multiplier ~20x (D-014 calibration).
 
 ### V2 -- gate pair G5 (two-level force) + G3 (tile seams, squeezed-B)  [deneb]
+
+**STATUS (2026-07-16): split into V2a (G5) + V2b (G3). V2a is CLOSED — G5
+PASSED, D-v2-10 (records: `runs/v2/g5_kernel_findings.md`,
+`runs/v2/g5b_abs_transfer.md`; bar per D-v2-9). The kill branch below was
+retired unexercised. G5c (Vista GH200, one job) extends the close-out:
+cross-hardware anchor at cdev, box-ladder 1/P coefficient at cgh64, real
+(B/p, wall) capacity triples, plus the un-gated G2c full-C-dev rerun —
+monolithic on the GH200, NOT via split-force machinery (that dependency was
+a deneb-fit contortion, deleted per D-v2-10). V2b (G3) opens next; note the
+estimator is a PORT from mbody (`fields.py:174` + `ic.py:151`), not a build.**
 
 - **Goal:** (G5) PMFAST-pattern two-level force (global coarse 4x + fine
   tile + polynomial blend) vs monolithic fine mesh at 256^3: force-error
@@ -353,7 +366,7 @@ Placeholders; V4 writes their real seeds with gate-informed numbers:
 |---|---|---|
 | Pallas atomic-add path immature on our stack | V1/G1 | jax.ffi CUDA kernel fallback is in the same gate; X3 escalation path defined |
 | velocity codec fails the (unpinned) RSD bar | V1/G2c | 9 B/p and 12 B/p tiers are one-line fallbacks; V0 pins the bar before the gate runs |
-| two-level split error above the band | V2/G5 | A1 monolithic shape remains; capacity targets shift, project survives |
+| two-level split error above the band | V2/G5 | RESOLVED 2026-07-16: G5 passed (D-v2-10); A1 fallback retired unexercised |
 | tile seams fail 15% squeezed-B | V2/G3 | A3 dies only; negative result is publishable (P-C); A2 unaffected |
 | JAX cannot see GH LPDDR coherently | V3/G4 | explicit staging path measured in the same job; S3 nodes as alternative |
 | halo-grade quietly drags in PP/tree scope | V0, V4 | V0 pins the bias route first; PP-in-tiles is a V4 decision with its own gate, never a default |
