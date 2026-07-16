@@ -275,9 +275,10 @@ decision here is locked until explicitly re-litigated with JC.
   5. **Velocity/RSD bar = multipole-grade.** Codec + numerics error in P0 AND
      P2 below the fine-mesh PM floor for k <= 0.2 k_Nyq — D-v2-1 applied to
      redshift-space multipoles. This is the G2c velocity-codec gate bar.
-  6. **Tolerances.** P(k): D-v2-1 (CUBE-grade vs the fine mesh). Squeezed
-     bispectrum: <= 15% (D-v2-7). Calibration configs: HMF within 5% of a
-     calibrated reference over M > M_min; halo b1 within 2% at k <= 0.25.
+  6. **Tolerances.** P(k): D-v2-1 (CUBE-grade vs the fine mesh) — **the bar
+     half of this is SUPERSEDED by D-v2-9: absolute |dP/P| <= 3e-2 in-band.**
+     Squeezed bispectrum: <= 15% (D-v2-7). Calibration configs: HMF within 5%
+     of a calibrated reference over M > M_min; halo b1 within 2% at k <= 0.25.
   7. **Realizations.** Nominal production batch = 100; O(5) at calibration
      configs (bias fitting is not a covariance job). Covariance-grade
      ensembles (500-1000) are OUT OF SCOPE — that is disco-mocks' role.
@@ -291,3 +292,83 @@ decision here is locked until explicitly re-litigated with JC.
   samples. Gate week (V1-V3) measures against these bars; V4 re-derives the
   capacity numbers with gate-measured B/p. Tolerances are never relaxed
   without JC (standing convention).
+
+## D-v2-9 — the P(k) fidelity bar becomes ABSOLUTE (D-v2-1's floor half retired)
+- **Status:** accepted (JC, 2026-07-15, seed V2a). Supersedes the BAR half of
+  D-v2-1; D-v2-1's BAND half is untouched and still pins D-v2-8 clause 1.
+- **Context:** D-v2-1 bundled two separable things: a BAND (k <= 0.2 k_Nyq of
+  the fine mesh) and a BAR ("error below the PM error floor"). The band is
+  sound. The bar is not measurable as written.
+  Job 39 tried to measure that floor by refining the MESH at FIXED particles
+  (256^3 particles seen by a 256 / 512 / 1024 mesh). Its 1024 rung therefore ran
+  mesh:particle = 4 — four cells inside one interparticle gap — which resolves
+  two-body scattering the 512 run smooths over. Its (kc)^2 validity check failed
+  (1.35 force / 0.76 evolved against ~4) and failed decisively: e(256 vs 512) =
+  0.050 was SMALLER than e(512 vs 1024) = 0.066, i.e. the discrepancy GREW under
+  refinement, which mesh truncation error cannot do. The rung measured the onset
+  of discreteness, not convergence. **The split error itself was never in
+  question** — it is measured against mono at the SAME mesh with the SAME
+  particles, so the discretization is common-mode and cancels exactly. Only the
+  bar was broken.
+  Job 40 then measured C-dev's error on a ladder at FIXED mesh:particle = 2
+  (128^3/256, 256^3/512 = C-dev, 512^3/1024 = reference), matched phase (proven:
+  degenerate limit 5.9e-16, shared modes 6-7e-16). Result: **6.14e-2 in-band max**
+  (5.90e-2 Poisson-subtracted). The reference is itself unconverged, so this is a
+  **LOWER BOUND**, and it is not "the mesh transfer" narrowly — it bundles force
+  resolution, IC bandwidth and particle load. Richardson is unavailable: the
+  k-dependence is textbook (k^1.95 over k = 0.4-1.4) but the amplitude scales as
+  cell^1.27, not cell^2, because joint refinement moves IC bandwidth and particle
+  load too and only the force follows the mesh law.
+- **Decision:**
+  1. **Band: unchanged.** k <= 0.2 k_Nyq of the fine mesh (D-v2-1's surviving
+     half). D-v2-8 clause 1 (k_sci = 2.0 -> fine cell <= 0.31) is unaffected.
+  2. **Bar: |dP/P| <= 3e-2, ABSOLUTE, in-band**, for the two-level split against
+     monolithic at the same mesh. Replaces "below the PM error floor".
+  3. **Mandatory reported diagnostic (not gated): the split-to-discretization
+     ratio vs k.** A single max-over-band number provably hides an
+     order-of-magnitude low-k excess (below); the bar may not be read without
+     its shape.
+- **Rationale:** ABSOLUTE because D-v2-8 pins fine cell <= 0.31 for every config
+  in the table — C-dev / C-gh / C-hero differ in VOLUME, not resolution — so the
+  discretization error at fixed k is common to all three and the bar transfers
+  unchanged. A floor-relative bar would need re-measuring per config and would
+  re-open this contamination every time. 3e-2 is ~half the measured lower bound
+  (6.14e-2) on the config's own discretization error, so the split can never
+  dominate the band's high-k end where the bias-model purpose lives (k = 1-2).
+  The bar is deliberately NOT grounded on the low-k regime where the split does
+  dominate: no D-v2-8 science bar demands better there, and inventing one would
+  be unsupported.
+- **Consequences:**
+  - **The split is the DOMINANT P(k) error for k < 1.53** — 3.6x C-dev's own
+    discretization error at k = 0.5, 7.4x at the fundamental. The curves have
+    different shapes (discretization ~ k^2 throughout; the split rises then
+    PLATEAUS at ~2.5e-2 above k ~ 1.4) and both maxima land at the band edge,
+    the one place the ordering has already reversed. "2.6e-2 vs 6.1e-2,
+    subdominant" is therefore an artifact of comparing maxima of
+    differently-shaped curves — the same trap as job 39's "headroom 2.5x".
+    Clause 3 exists to keep that visible.
+  - In ABSOLUTE terms the low-k split error is small (<= 1.1% at k <= 0.5, 0.36%
+    at k <= 0.25) and clears every science bar in D-v2-8 (halo b1 within 2% at
+    k <= 0.25 implies ~4% on P(k) there). The real consequence is narrower: the
+    architecture leaves a ~1%-at-k=0.5 coherent suppression that the mesh error
+    does NOT dominate, so a measured-transfer correction (the omsoc pattern)
+    cannot later be used to claim sub-percent large-scale accuracy. That floor
+    is the architecture's, not the mesh's.
+  - Margin is thin and must be read as such: the V2a config (gauss + TSC +
+    matching, tile 128 / buf 32) measures 2.61e-2 = **0.87 of the bar**. The
+    lower-bound character of 6.14e-2 probably means the true margin is better,
+    but that is not measured. The knob is tile size (gauss tiles as ~2.0/P;
+    error falls with BIGGER tiles, which costs memory) — a V4 Pareto call.
+  - The G5 verdict is NOT decided here. This ADR supplies the bar it was blocked
+    on; the verdict stays JC's.
+  - **OPEN, deliberately not decided here: D-v2-8 clause 5 (the multipole-grade
+    RSD bar) invokes the SAME retired language** — "P0 and P2 below the
+    fine-mesh PM floor". It inherits this ADR's problem verbatim. It is left
+    alone because JC ratified a P(k) split bar, not an RSD one, and G2c's
+    verdict does not hinge on it: t9 passed by ~3 orders (1.3e-4 vs 1.3e-1), so
+    no plausible correction to that floor reopens the tier choice. If a later
+    gate needs the RSD bar to be tight, it needs a D-v2-9-style absolute number
+    first.
+  - Record: `runs/v2/g5b_abs_transfer.md`; figures `runs/v2/g5b_cdev_tolerance.png`
+    (the bar) and `runs/v2/g5_cdev_band.png` (why the old floor failed). Probe:
+    `scripts/v2_g5b_abs_transfer.py` (deneb job 40).

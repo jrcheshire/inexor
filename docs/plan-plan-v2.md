@@ -18,7 +18,7 @@ https://claude.ai/code/artifact/370ba948-b9ea-4e42-9c15-92dce10fdf55).
 
 | # | decision |
 |---|---|
-| D-v2-1 | **Fidelity bar = CUBE-grade with a fine mesh** (error below the PM error floor for k <= 0.2 k_Nyq of the FINE mesh; the mesh is made fine enough that every science k sits inside that range). D-014-grade is not required for v2 mocks. |
+| D-v2-1 | **Fidelity bar = CUBE-grade with a fine mesh** (error below the PM error floor for k <= 0.2 k_Nyq of the FINE mesh; the mesh is made fine enough that every science k sits inside that range). D-014-grade is not required for v2 mocks. **AMENDED by D-v2-9: the BAND half stands; the "below the PM error floor" BAR is retired — that floor is not measurable at fixed particles (job 39) — and is replaced by an absolute |dP/P| <= 3e-2 in-band.** |
 | D-v2-2 | **Science target = halo-grade**: resolution sufficient to fit the bias (halos small enough to host the tracer population). Exact numbers pinned at seed V0. |
 | D-v2-3 | **Differentiability deferred**: not in the initial build; acceptable as a later SECONDARY, SLOWER mode. Design must not preclude it (twin-kernel rule, Sec. 4). |
 | D-v2-4 | **Compute is generally worth less memory**, but the tradeoff gets MAPPED, not assumed: every gate reports (peak B/p, wall/step, SU) so a cost-of-memory curve accumulates (Sec. 3). |
@@ -26,6 +26,7 @@ https://claude.ai/code/artifact/370ba948-b9ea-4e42-9c15-92dce10fdf55).
 | D-v2-6 | **Same repo, v2.** v1's validated components carry; v1's thesis does not. |
 | D-v2-7 | **Squeezed-bispectrum tolerance = 15%** for tiled-vs-monolithic agreement (the G3 kill line). |
 | D-v2-8 | **Requirements chain pinned at seed V0** (JC, 2026-07-15; full ADR in `decisions.md`): general engine, NOT SPHEREx-anchored (disco-mocks/DISCO-DJ own main-line mocks); k_sci = 2.0 h/Mpc -> fine cell <= 0.31 Mpc/h; hybrid bias route (halo catalogs at calibration, field-level in production); n_p = 100; M_min DERIVED from the chain, reported per config; multipole-grade RSD bar (P0+P2 under D-v2-1); HMF 5% / halo-b1 2% at calibration; realizations 100 prod / O(5) calib; Sec 3 instrument ratified. |
+| D-v2-9 | **P(k) fidelity bar is now ABSOLUTE** (JC, 2026-07-15, seed V2a; full ADR in `decisions.md`). D-v2-1's BAND stands (k <= 0.2 k_Nyq fine, so D-v2-8 clause 1 is unaffected); its "below the PM error floor" BAR is retired as unmeasurable at fixed particles and replaced by **\|dP/P\| <= 3e-2 in-band**, plus a **mandatory reported split-to-discretization ratio vs k**. Absolute because D-v2-8 pins the same fine cell across the whole config table, so it transfers unchanged. C-dev's own discretization error measured at 6.14e-2 in-band (job 40, a LOWER bound). NB **the split DOMINATES that error for k < 1.53** (7.4x at the fundamental) — max-over-band comparisons hide this, which is why the ratio clause is mandatory. |
 
 ## 1. Thesis
 
@@ -85,7 +86,9 @@ survey-side inputs examined at V0 are non-normative worklog context.
 - **Velocity fidelity = multipole-grade.** Codec + numerics error in P0 AND
   P2 below the fine-mesh PM floor for k <= 0.2 k_Nyq (D-v2-1 applied to
   redshift-space multipoles). This is G2c's velocity gate bar.
-- **Statistics + tolerances.** P(k): D-v2-1. Squeezed bispectrum <= 15%
+- **Statistics + tolerances.** P(k): D-v2-1's band + **D-v2-9's absolute bar
+  (|dP/P| <= 3e-2 in-band)**, the floor half having been retired. Squeezed
+  bispectrum <= 15%
   (D-v2-7). Calibration configs: HMF within 5% of a calibrated reference,
   halo b1 within 2% at k <= 0.25. Realizations: 100 per production config,
   O(5) at calibration; covariance-grade ensembles out of scope.
@@ -229,7 +232,7 @@ freezes. Each seed's prompt is meant to be pasted at that session's start
   (A2's spine). G3: squeezed-B error number -> A3 verdict + A2 buffer sizing.
   Both -> cost-of-memory points (A3's x3.2 compute cost becomes a measured
   SU number).
-- **Kill:** G5 split error above the D-v2-1 band after kernel matching ->
+- **Kill:** G5 split error above the D-v2-9 bar after kernel matching ->
   A2 falls back to monolithic-per-node (A1 shape) and the 4096^3 target
   moves to A4-only. G3 squeezed-B > 15% at sane buffers -> A3 dies (A2
   unaffected); publish the negative (P-C) regardless.
