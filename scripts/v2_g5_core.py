@@ -101,6 +101,28 @@ FFT_FRIENDLY = (
     480,
     500,
     512,
+    # >512: needed by the cgh64 box ladder (n_fine=1024), whose tile512 arms
+    # want P = 512 + 2*b_fine = 576/640/768/1024 for b_fine = 32/64/128/256.
+    # The list stops at 1024 = the largest fine mesh in the config table
+    # (cdev 512, cdev8 256, cgh64 1024); the degeneracy guard forbids P > n_fine
+    # anyway. Entries <=512 are frozen -- they fix every already-measured tile
+    # selection, so nothing is appended below 512.
+    540,
+    576,
+    600,
+    640,
+    648,
+    720,
+    750,
+    768,
+    800,
+    810,
+    864,
+    900,
+    960,
+    972,
+    1000,
+    1024,
 )
 
 
