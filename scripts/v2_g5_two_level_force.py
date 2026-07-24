@@ -64,6 +64,7 @@ CPU smoke (laptop, seconds):
 """
 
 import argparse
+import hashlib
 import json
 import os
 import resource
@@ -99,6 +100,12 @@ A_PIVOT = 1.0  # clustered + caustic-rich: the short arm actually carries force
 A_CONTROL = 0.1  # quasi-linear control: the split error must be trivial here
 N_STEPS = 20
 
+# The live seed: SEED unless --seed says otherwise. Set ONCE by main() and
+# forwarded to every worker by spawn(). Seed 0 leaves every tag and state
+# filename byte-identical to the frozen G5/G5c artifacts (deneb jobs 39/40,
+# Vista 837404), so the v2_g6 ensemble cannot silently re-cut a measured number.
+_SEED = SEED
+
 
 def geometry(cfg):
     c = CONFIGS[cfg]
@@ -117,6 +124,8 @@ def geometry(cfg):
 
 def tag_of(kind, cfg, **kw):
     parts = [kind, cfg]
+    if int(_SEED) != 0:
+        parts.append(f"seed{int(_SEED)}")
     for k in (
         "family",
         "which",
@@ -162,9 +171,19 @@ def _host_rss_bytes():
     return int(r if sys.platform == "darwin" else r * 1024)
 
 
-def _load_config_state(cfg, a):
-    path = os.path.join(STATE_DIR, f"config_{cfg}_a{a}".replace(".", "p") + ".npz")
-    with np.load(path) as f:
+def _config_state_path(cfg, a, seed):
+    """Seed 0 keeps the frozen filename; every other seed gets its own.
+
+    The seed MUST be in the name. Without it seed 1 would load seed 0's state
+    and the ensemble would report perfect realization stability -- a wrong
+    answer indistinguishable from the answer we are hoping for.
+    """
+    s = "" if int(seed) == 0 else f"_seed{int(seed)}"
+    return os.path.join(STATE_DIR, f"config_{cfg}_a{a}".replace(".", "p") + s + ".npz")
+
+
+def _load_config_state(cfg, a, seed=0):
+    with np.load(_config_state_path(cfg, a, seed)) as f:
         return f["x"], f["v"]
 
 
@@ -187,13 +206,24 @@ def make_config_leg(args):
 
     g = geometry(args.config)
     cosmo = Cosmology()
-    key = jax.random.PRNGKey(SEED)
+    key = jax.random.PRNGKey(args.seed)
     d0 = ic.linear_density(key, g["n_part"], g["L"], cosmo, f_NL=0.0, fdtype=jnp.float64)
     x, v = lpt.lpt_ics(d0, g["L"], args.a, cosmo, order=2, fdtype=jnp.float64)
     os.makedirs(STATE_DIR, exist_ok=True)
-    path = os.path.join(STATE_DIR, f"config_{args.config}_a{args.a}".replace(".", "p") + ".npz")
-    np.savez(path, x=np.asarray(x, np.float64), v=np.asarray(v, np.float64))
-    return dict(kind="config", a=args.a, path=path, n_part=g["n_part"])
+    path = _config_state_path(args.config, args.a, args.seed)
+    x_np = np.asarray(x, np.float64)
+    np.savez(path, x=x_np, v=np.asarray(v, np.float64))
+    return dict(
+        kind="config",
+        a=args.a,
+        seed=int(args.seed),
+        path=path,
+        n_part=g["n_part"],
+        # The ensemble's own guard: two seeds that produced the same ICs would
+        # look like flawless realization stability. The aggregator hard-fails on
+        # a duplicate fingerprint rather than trusting the plumbing.
+        x_sha1=hashlib.sha1(x_np.tobytes()).hexdigest()[:16],
+    )
 
 
 def force_leg(args):
@@ -209,7 +239,7 @@ def force_leg(args):
 
     g = geometry(args.config)
     dev, peak = _peak_closure(jax)
-    x_np, _ = _load_config_state(args.config, args.a)
+    x_np, _ = _load_config_state(args.config, args.a, args.seed)
     d_f, d_c, L = g["fine_cell"], g["coarse_cell"], g["L"]
     n_total = g["n_part"] ** 3
 
@@ -310,8 +340,31 @@ def evolve_leg(args):
     L, d_f, d_c = g["L"], g["fine_cell"], g["coarse_cell"]
     n_total = g["n_part"] ** 3
     cosmo = Cosmology()
-    x_np, v_np = _load_config_state(args.config, A_CONTROL)
+    x_np, v_np = _load_config_state(args.config, A_CONTROL, args.seed)
     dev, peak = _peak_closure(jax)
+
+    # ---- tile-origin offset (v2_g6) -----------------------------------------
+    # Implemented as a TRANSLATION OF THE PARTICLES, not a re-origined tile
+    # lattice: the box is periodic, so moving every particle by +D is exactly
+    # equivalent to moving the tile lattice by -D, and it leaves
+    # tile_origin_extent / brick_buckets / the ownership test untouched. The
+    # tiling code is the thing under test; it must not be edited to run the test.
+    #
+    # D MUST be a whole number of COARSE cells (n_fine/n_coarse fine cells). An
+    # integer lattice translation is an exact symmetry of every global-mesh arm
+    # -- painting is a relabelling of cells, the kernels are diagonal in k -- so
+    # anything that survives the shift belongs to the tile lattice and nothing
+    # else. A finer shift would fold coarse-mesh phase error into the answer and
+    # the arm would no longer be a clean origin test.
+    shift_cells = int(args.tile_shift or 0)
+    if shift_cells:
+        step = g["n_fine"] // g["n_coarse"]
+        if shift_cells % step:
+            raise ValueError(
+                f"--tile-shift {shift_cells} must be a multiple of {step} "
+                f"(= n_fine/n_coarse) so the global arms stay exactly equivariant"
+            )
+        x_np = np.mod(x_np + shift_cells * d_f, L)
 
     r_s = None if args.alpha is None else args.alpha * d_c
     r_out = None if args.rout is None else args.rout * d_c
@@ -367,6 +420,13 @@ def evolve_leg(args):
         x, v = float_step_bullfrog(x, v, tuple(np.asarray(c, np.float64)), force_fn, L)
     wall = time.perf_counter() - t0
 
+    if shift_cells:
+        # Undo the translation so the saved state is directly comparable to the
+        # unshifted arms. P(k) would not care -- it is translation invariant --
+        # but the cross-spectrum r(k) would pick up exp(i k.D) and read as total
+        # decorrelation.
+        x = jnp.mod(x - shift_cells * d_f, L)
+
     os.makedirs(FORCE_DIR, exist_ok=True)
     path = os.path.join(FORCE_DIR, args.tag + ".npz")
     np.savez(path, x=np.asarray(x, np.float64), v=np.asarray(v, np.float64))
@@ -382,6 +442,8 @@ def evolve_leg(args):
         alpha=args.alpha,
         tile=args.tile,
         buf=args.buf,
+        tile_shift=shift_cells,
+        seed=int(args.seed),
         wall_s=wall,
         wall_per_step=wall / args.nsteps,
         state_file=path,
@@ -566,6 +628,58 @@ def pk_ratio(x_a, x_b, n, L, k_gate):
     )
 
 
+def pk_cross(x_a, x_b, n, L, k_gate):
+    """T(k) = P_cross/P_ref and 1 - r(k) between two EVOLVED particle sets.
+
+    THE DISCRIMINATOR v2_g6 turns on, and pk_ratio cannot supply it: a power
+    ratio is blind to phase, so it cannot tell a deterministic multiplicative
+    window (T != 1 with r = 1 -- CORRECTABLE by a measured transfer) from a
+    decorrelation (1 - r > 0 -- IRREDUCIBLE, no per-k factor removes it). This
+    is transfer_and_r's logic (the force-side instrument) moved onto the density
+    field, and it deliberately reuses _m1_common.cic_paint so the numbers stay
+    comparable to every prior parity claim in this repo rather than to a private
+    paint.
+
+    PROXY, stated not hidden: both fields are CIC-painted with the same window,
+    so the window cancels in T to first order but not exactly.
+    """
+    sys.path.insert(0, HERE)
+    import _m1_common as M
+
+    kmag = _k_grid(n, L).ravel()
+    edges = _bin_edges(n, L)
+    counts = np.histogram(kmag, bins=edges)[0]
+    ak = np.fft.rfftn(M.cic_paint(x_a, n, L)).ravel()
+    bk = np.fft.rfftn(M.cic_paint(x_b, n, L)).ravel()
+    saa = np.histogram(kmag, bins=edges, weights=(np.abs(ak) ** 2))[0]
+    sbb = np.histogram(kmag, bins=edges, weights=(np.abs(bk) ** 2))[0]
+    sab = np.histogram(kmag, bins=edges, weights=np.real(ak * np.conj(bk)))[0]
+    good = (counts > 0) & (saa > 0) & (sbb > 0)
+    kc = 0.5 * (edges[1:] + edges[:-1])[good]
+    T = sab[good] / saa[good]
+    r = sab[good] / np.sqrt(saa[good] * sbb[good])
+    band = kc <= k_gate
+    return dict(
+        k=kc.tolist(),
+        T=T.tolist(),
+        one_minus_r=(1.0 - r).tolist(),
+        max_abs_T_minus_1_gate=float(np.abs(T[band] - 1.0).max()) if band.any() else None,
+        max_one_minus_r_gate=float((1.0 - r)[band].max()) if band.any() else None,
+    )
+
+
+def shift_for_seed(seed, n_tile, step):
+    """A per-realization tile-origin offset, in FINE cells.
+
+    A multiple of `step` (= n_fine/n_coarse, so the global arms stay exactly
+    equivariant -- see evolve_leg), never 0, and strictly inside one tile period
+    (a shift of n_tile maps the lattice onto itself and is the identity check,
+    not an arm). Drawn from the seed so the ensemble is reproducible.
+    """
+    rng = np.random.default_rng(90000 + int(seed))
+    return int(step * rng.integers(1, max(2, int(n_tile) // int(step))))
+
+
 # ===========================================================================
 # orchestration
 # ===========================================================================
@@ -582,6 +696,10 @@ def spawn(kind, cfg, tag, platform="cpu", **kw):
         cfg,
         "--tag",
         tag,
+        # Always forwarded: a worker that silently defaulted to seed 0 would
+        # generate (or reload) the wrong ICs for the whole leg.
+        "--seed",
+        str(int(_SEED)),
     ]
     for k, v in kw.items():
         if v is None or v is False:
@@ -664,6 +782,28 @@ def main():
         help="suffix for the results json (e.g. '_vista' -> g5_results_<cfg>_vista.json), "
         "so cross-machine runs never collide with the deneb job records",
     )
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=SEED,
+        help="IC realization. 0 reproduces every frozen G5/G5c artifact bit for "
+        "bit (same tags, same state filenames); the v2_g6 ensemble sweeps it.",
+    )
+    ap.add_argument(
+        "--shift-arm",
+        action="store_true",
+        help="add a two-level evolve arm at the pivot (T, b) with the tile "
+        "lattice offset by a per-seed amount -- does the split error live in the "
+        "tile lattice or in the structure? (v2_g6)",
+    )
+    ap.add_argument(
+        "--shift-identity",
+        action="store_true",
+        help="add the two DEGENERATE-LIMIT arms for --shift-arm: a tiled arm "
+        "shifted by a full tile period (lattice maps onto itself) and a mono arm "
+        "shifted (global mesh is exactly equivariant). Both must reproduce their "
+        "unshifted twin, or no origin result means anything.",
+    )
     # worker-private
     ap.add_argument("--single", action="store_true", help=argparse.SUPPRESS)
     for f, d in (
@@ -685,11 +825,15 @@ def main():
         ("--clip", float, 10.0),
         ("--a", float, A_PIVOT),
         ("--nsteps", int, N_STEPS),
+        ("--tile-shift", int, 0),
     ):
         ap.add_argument(f, type=t, default=d, help=argparse.SUPPRESS)
     ap.add_argument("--fdtype", default="f64", choices=["f32", "f64"], help=argparse.SUPPRESS)
     ap.add_argument("--match", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    global _SEED
+    _SEED = int(args.seed)
 
     if args.single:
         run_single(args)
@@ -707,6 +851,8 @@ def main():
     k_gate = g["k_gate"]
     res = dict(
         config=cfg,
+        seed=int(args.seed),
+        ic_fingerprint={},
         geometry={k: (float(v) if isinstance(v, float) else v) for k, v in g.items()},
         pivot=dict(alpha=1.0, tile=n_f // 4, buf=None, family="gauss", assign="tsc", match=True),
         validation={},
@@ -743,9 +889,10 @@ def main():
     # ---- configurations -----------------------------------------------------
     for a in (A_PIVOT, A_CONTROL):
         t = tag_of("config", cfg, a=a)
-        W(spawn("config", cfg, t, a=a))
-        print(f"[config] a={a} done")
-    pos = _load_config_state(cfg, A_PIVOT)[0]
+        rec = W(spawn("config", cfg, t, a=a))
+        res["ic_fingerprint"][str(a)] = rec.get("x_sha1")
+        print(f"[config] a={a} seed={args.seed} sha1={rec.get('x_sha1')} done")
+    pos = _load_config_state(cfg, A_PIVOT, args.seed)[0]
 
     F = {}
 
@@ -932,20 +1079,32 @@ def main():
         evolve_arms = [("mono", dict(nmesh=n_f))]
         if not args.skip_floor_arms:
             evolve_arms.append(("mono_half", dict(nmesh=n_f // 2)))
+        tl_kw = dict(nmesh=n_f, family="gauss", alpha=1.0, assign="tsc", match=True)
         for T, b in tb_list:
+            evolve_arms.append((f"two_level_T{T}_b{b}", dict(**tl_kw, tile=T, buf=b)))
+
+        # ---- tile-origin arms (v2_g6) ---------------------------------------
+        # Same ICs, same (T, b), lattice moved. "Stable across seeds" and "locked
+        # to the tile grid" are different properties and the ensemble alone
+        # cannot separate them: the lattice is fixed in space while structure
+        # moves between realizations.
+        T0, b0 = tb_list[0]
+        step = n_f // n_c
+        if args.shift_identity:
+            # DEGENERATE LIMITS FIRST -- run before any origin number is read.
+            # A shift of one full tile period maps the lattice onto itself, so
+            # the tiled arm must reproduce its unshifted twin; and a mono arm is
+            # exactly equivariant under any lattice translation. If either moves,
+            # the shift plumbing is what moved, and it would read as a physical
+            # origin dependence.
             evolve_arms.append(
-                (
-                    f"two_level_T{T}_b{b}",
-                    dict(
-                        nmesh=n_f,
-                        family="gauss",
-                        alpha=1.0,
-                        assign="tsc",
-                        match=True,
-                        tile=T,
-                        buf=b,
-                    ),
-                )
+                (f"two_level_T{T0}_b{b0}_shift{T0}", dict(**tl_kw, tile=T0, buf=b0, tile_shift=T0))
+            )
+            evolve_arms.append((f"mono_shift{T0}", dict(nmesh=n_f, tile_shift=T0)))
+        if args.shift_arm:
+            d = shift_for_seed(args.seed, T0, step)
+            evolve_arms.append(
+                (f"two_level_T{T0}_b{b0}_shift{d}", dict(**tl_kw, tile=T0, buf=b0, tile_shift=d))
             )
         for arm, kw in evolve_arms:
             t = tag_of("evolve", cfg, **{**kw, "a": A_PIVOT})
@@ -993,14 +1152,22 @@ def main():
                 )
         # One dP/P per two-level (T, b) arm; the FIRST one mirrors to the legacy
         # "two_level" key so the headroom block and prior readers keep working.
-        for arm in [a for a, _ in evolve_arms if a.startswith("two_level")]:
+        for arm in [a for a, _ in evolve_arms if a.startswith(("two_level", "mono_shift"))]:
             if "mono" not in ev or arm not in ev:
                 continue
             res["evolve"][arm] = pk_ratio(ev["mono"], ev[arm], n_f, L, k_gate)
-            if "two_level" not in res["evolve"]:
+            # Phase as well as power: pk_ratio cannot separate a correctable
+            # window from an irreducible decorrelation (see pk_cross).
+            res["evolve"][arm]["cross"] = pk_cross(ev["mono"], ev[arm], n_f, L, k_gate)
+            if (
+                "two_level" not in res["evolve"]
+                and arm.startswith("two_level")
+                and "_shift" not in arm
+            ):
                 res["evolve"]["two_level"] = res["evolve"][arm]
             print(
-                f"  {arm:18s} |dP/P| on the band = {res['evolve'][arm]['max_abs_gate']:.3e}",
+                f"  {arm:26s} |dP/P| on the band = {res['evolve'][arm]['max_abs_gate']:.3e}  "
+                f"1-r = {res['evolve'][arm]['cross']['max_one_minus_r_gate']:.2e}",
                 flush=True,
             )
 
