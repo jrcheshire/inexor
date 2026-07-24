@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J inexor-v2-g5b
 #SBATCH -w deneb
-#SBATCH -c 32
+#SBATCH -c 64
 #SBATCH --mem=54G
 #SBATCH -t 8:00:00
 #SBATCH -o %x-%j.log
@@ -22,6 +22,18 @@
 # not sit behind a GPU job. It is NOT sent to antares despite its 124 GB: antares
 # lacks AVX-512 and the shared env/compilation cache can SIGILL there (umbrella
 # memory project_albireo_cluster).
+#
+# -c 64 = deneb's FULL CPU count as Slurm counts it (CPUTot=64: 32 cores x 2
+# threads, so this is schedulable and takes the node). It was -c 32, and that
+# cost ~5x wall: XLA-CPU sizes its Eigen threadpool from the MACHINE (`nproc` =
+# 64), not from the cgroup, and that pool SPIN-waits -- so a 32-CPU cgroup ran
+# ~2:1 oversubscribed in spin threads. Job 40's 256^3/512 evolve leg took 114.8 s
+# against 20.6 s for the same solve in job 39. Correctness is untouched, which is
+# why it does not announce itself; it just looks like the machine is slow. The
+# alternative fix is `XLA_FLAGS=--xla_cpu_multi_thread_eigen=false
+# intra_op_parallelism_threads=<n>` before the jax import, but this job's workers
+# run ONE AT A TIME (blocking subprocess.run) and want the whole node's FFT
+# threads anyway, so matching the cgroup to the machine is the simpler fix.
 #
 # --mem is REQUIRED: the partition default is sized for antares's 124 GB, exceeds
 # deneb's 56 GB, and the job pends FOREVER without it (V1, job 9). 54G is set by
