@@ -118,15 +118,19 @@
 # exists is skipped, so a resubmit picks up where a kill left off.
 #
 # OUTPUT (runs/ is gitignored; pull it back explicitly):
-#   runs/v2/g5_results_cgh64_seed{0..5}.json   per seed
-#   runs/v2/g6_split_stability_cgh64.{json,png} the ensemble aggregate
-# The TRANSPORT step is NOT run here: it needs the cdev and cdev8 aggregates,
-# which live on deneb and the laptop, and it is pure numpy over three small JSONs.
-# Run it on the laptop once g6_split_stability_cgh64.json is pulled back:
-#   pixi run python scripts/v2_g6b_calib_transport.py --small cdev  --big cgh64
-#   pixi run python scripts/v2_g6b_calib_transport.py --small cdev8 --big cgh64
-# Read the 8x and 64x low_k.median_frac against G6b's 0.229 -- that comparison
-# IS the verdict. The verdict itself is JC's gate call, not this script's.
+#   runs/v2/g5_results_cgh64_seed{0..5}.json          per seed
+#   runs/v2/g6_split_stability_cgh64.{json,png}       the ensemble aggregate
+#   runs/v2/g6b_transport_cdev_cgh64.{json,png}       the 8x transport
+#   runs/v2/g6b_transport_cdev8_cgh64.{json,png}      the 64x transport
+# The job runs the transport legs itself, so it emits the verdict card directly
+# rather than leaving a manual step. Those legs are pure numpy over three small
+# JSONs (sub-second) and they need the cdev and cdev8 aggregates, which are born
+# on deneb -- STAGE THEM FIRST or the two legs will exit with a clear "missing
+# ..." and the ensemble work above them is still saved:
+#   scp deneb:~/src/inexor/runs/v2/g6_split_stability_cdev{,8}.json \
+#       vista:~/src/inexor/runs/v2/
+# (Untracked run outputs, so hand-syncing them is the right route; source always
+# travels by git.) Verdict is JC's gate call, not this script's.
 
 cd ~/src/inexor
 export PATH="$HOME/.pixi/bin:$PATH"
@@ -165,5 +169,20 @@ done
 echo "=== aggregate cgh64 ==="
 pixi run -e gpu python scripts/v2_g6_split_stability.py --config cgh64 \
   --out-prefix g6_split_stability_cgh64
+
+# The two lever arms, cheapest-informative first. Each needs the corresponding
+# staged aggregate; a missing one exits this leg only (no set -e) and leaves the
+# ensemble above intact. Read the ABSOLUTE k<=0.5 residual against the 1.02e-3
+# the 8x rung paid and against cgh64's own leave-one-out, which the script prints
+# alongside; the fractional numbers are the cross-check, not the headline.
+for SMALL in cdev cdev8; do
+  AGG="runs/v2/g6_split_stability_${SMALL}.json"
+  if [ ! -f "$AGG" ]; then
+    echo "!! transport ${SMALL} -> cgh64 SKIPPED: $AGG not staged on this host"
+    continue
+  fi
+  echo "=== transport: ${SMALL} -> cgh64 ==="
+  pixi run -e gpu python scripts/v2_g6b_calib_transport.py --small "$SMALL" --big cgh64
+done
 
 echo "=== DONE ==="

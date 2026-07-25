@@ -23,9 +23,20 @@ RESOLUTION (changing the fine cell) is a DIFFERENT axis and NOT tested here --
 that asks whether you must re-calibrate when you change the production cell, a
 rare event; this asks whether you can calibrate cheaply at the production cell.
 
-Reads the per-config G6 aggregates (g6_split_stability_<cfg>.json). Reports the
-overlap agreement against the COMBINED calibration error (sigma/sqrt(N) of each
-mean); sets no pass threshold -- that is JC's gate call.
+Reads the per-config G6 aggregates (g6_split_stability_<cfg>.json). Sets no pass
+threshold -- that is JC's gate call.
+
+READ THE ABSOLUTE RESIDUAL FIRST (2026-07-25). |R_small - R_big| is what applying
+the small box's T-bar actually leaves behind, in the same units as D-v2-9's
+absolute bar, and the reference it should be read against is the big box's OWN
+leave-one-out residual -- the best any calibration achieves at that box. The
+fractional and sigma_calib statistics are cross-checks: the transfer's amplitude
+varies by an order of magnitude across the band, so dividing by it overstates
+disagreement exactly at the low-k end this test is about, and sigma_calib is so
+small (the means are cheap to pin) that physically irrelevant offsets show up as
+many sigma. The cdev8 -> cdev run read as "23% median, 3.5 sigma_calib" while the
+absolute residual was 1.02e-3 against an own-box leave-one-out of 9.9e-4 -- a 3%
+difference in the units that decide anything.
 
 Usage:
   pixi run python scripts/v2_g6b_calib_transport.py --small cdev8 --big cdev
@@ -94,6 +105,29 @@ def compare(small, big):
     denom = np.where(np.abs(Rb) > 0, np.abs(Rb), np.nan)
     frac = np.abs(diff) / denom
     low = kc <= LOW_K
+
+    def stats(m):
+        # ABSOLUTE first, deliberately. |diff| IS the residual left behind when the
+        # SMALL box's T-bar is applied to the big box, in the same units as
+        # D-v2-9's bar; read it against `uncorrected` (the split error the transfer
+        # exists to remove) and against the big box's own leave-one-out residual.
+        # The fractional statistic divides by a curve whose amplitude varies by an
+        # order of magnitude across the band, so it exaggerates disagreement
+        # exactly where the transfer is smallest -- which is the low-k end this
+        # whole test is about. It is a cross-check, not the headline.
+        return dict(
+            median_abs_resid=float(np.nanmedian(np.abs(diff)[m])),
+            max_abs_resid=float(np.nanmax(np.abs(diff)[m])),
+            median_uncorrected=float(np.nanmedian(np.abs(Rb)[m])),
+            max_uncorrected=float(np.nanmax(np.abs(Rb)[m])),
+            median_frac=float(np.nanmedian(frac[m])),
+            max_frac=float(np.nanmax(frac[m])),
+            # the difference measured in units of the combined calibration error:
+            # ~1 means the two means agree within how well each is pinned.
+            median_diff_in_sigma=float(np.nanmedian((np.abs(diff) / comb)[m])),
+            max_diff_in_sigma=float(np.nanmax((np.abs(diff) / comb)[m])),
+        )
+
     return dict(
         k=kc,
         R_small=Rs,
@@ -103,20 +137,8 @@ def compare(small, big):
         diff=diff,
         comb_err=comb,
         overlap=(float(lo), float(hi)),
-        band=dict(
-            median_frac=float(np.nanmedian(frac)),
-            max_frac=float(np.nanmax(frac)),
-            # the difference measured in units of the combined calibration error:
-            # ~1 means the two means agree within how well each is pinned.
-            median_diff_in_sigma=float(np.nanmedian(np.abs(diff) / comb)),
-            max_diff_in_sigma=float(np.nanmax(np.abs(diff) / comb)),
-        ),
-        low_k=dict(
-            k_max=LOW_K,
-            median_frac=float(np.nanmedian(frac[low])),
-            max_frac=float(np.nanmax(frac[low])),
-            median_diff_in_sigma=float(np.nanmedian((np.abs(diff) / comb)[low])),
-        ),
+        band=stats(np.ones_like(kc, dtype=bool)),
+        low_k=dict(k_max=LOW_K, **stats(low)),
     )
 
 
@@ -188,7 +210,29 @@ def main():
     print(f"overlap  : k in [{cmp_['overlap'][0]:.3f}, {cmp_['overlap'][1]:.3f}]\n")
 
     lo, bd = cmp_["low_k"], cmp_["band"]
-    print("--- agreement of the two ensemble-mean transfers over the overlap ---")
+    loo = None
+    try:
+        loo = float(aggs["big"]["arms"][0]["low_k"]["loo_residual_median"])
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    print("--- READ FIRST: residual left by applying the SMALL box's T-bar, "
+          "ABSOLUTE |dP/P| ---")
+    print("  (the units D-v2-9's bar is written in; compare against the big box's "
+          "OWN\n   leave-one-out residual, which is the best any calibration can do "
+          "at this box)")
+    print(f"  in-band : uncorrected {bd['median_uncorrected']:.3e} -> transported "
+          f"{bd['median_abs_resid']:.3e} median  (max {bd['max_abs_resid']:.3e})")
+    print(f"  k<={LOW_K}: uncorrected {lo['median_uncorrected']:.3e} -> transported "
+          f"{lo['median_abs_resid']:.3e} median  (max {lo['max_abs_resid']:.3e})")
+    if loo is not None:
+        print(f"           {args.big} own-box leave-one-out {loo:.3e} median "
+              f"-> transport costs x{lo['median_abs_resid'] / loo:.2f}")
+
+    print("\n--- cross-check: the same agreement in fractional and sigma_calib units ---")
+    print("  (fractional divides by a curve that varies by an order of magnitude "
+          "across\n   the band, so it overstates disagreement where the transfer is "
+          "small)")
     print(f"  in-band : {bd['median_frac']:.1%} median, {bd['max_frac']:.1%} max  |  "
           f"{bd['median_diff_in_sigma']:.1f} sigma_calib median")
     print(f"  k<={LOW_K}: {lo['median_frac']:.1%} median, {lo['max_frac']:.1%} max  |  "
@@ -199,9 +243,10 @@ def main():
         print(f"  {'MATCH' if abs(idx_s['index'] - idx_b['index']) < 0.15 else 'DIFFER'} "
               f"(delta index {abs(idx_s['index'] - idx_b['index']):.2f})")
 
-    print("\nVerdict is JC's: transport is established if the means agree to within the "
-          "combined calibration error (~few sigma_calib) over k <= 0.5 AND the low-k "
-          "indices match. No threshold is hard-coded here.")
+    print("\nVerdict is JC's: transport is established if the ABSOLUTE residual left by "
+          "the\nsmall box's T-bar is comparable to the big box's own leave-one-out "
+          "residual over\nk <= 0.5 AND the low-k indices match. No threshold is "
+          "hard-coded here.")
 
     out_prefix = args.out_prefix or f"g6b_transport_{args.small}_{args.big}"
     out = dict(
