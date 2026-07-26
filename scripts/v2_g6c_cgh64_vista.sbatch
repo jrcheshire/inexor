@@ -137,6 +137,22 @@ export PATH="$HOME/.pixi/bin:$PATH"
 export PYTHONUNBUFFERED=1
 export JAX_PLATFORMS=cpu
 export G5_CPU_THREADS=72
+# WHY THIS OVERRIDE (job 865844 died on it, 2026-07-25). The `gpu` feature
+# declares system-requirements cuda = "12", so pixi refuses to ACTIVATE the env
+# on any machine lacking the __cuda virtual package -- and a gg node has no GPU.
+# That check is pixi's, made before a single line of python runs; JAX_PLATFORMS
+# =cpu below cannot help, because nothing gets as far as importing jax. Every
+# leg of 865844 printed "unsupported-platform ... missing virtual packages:
+# __cuda >= 12" and exited, 11 times. Mocking the virtual package is pixi's own
+# documented remedy and is the right one here rather than switching envs: the
+# `gpu` env is the ONLY env installed on Vista (no compute-node package fetch),
+# it is locked for linux-aarch64, and it is the env that produced the cdev and
+# cdev8 aggregates on deneb and the cgh64 card in job 861849 -- so this rung of
+# the ladder stays numerically comparable to the rungs it is measured against.
+# Nothing touches CUDA: the value is a claim about the machine, not a request
+# for a device, and the probe's workers are plain sys.executable subprocesses
+# that never re-enter pixi.
+export CONDA_OVERRIDE_CUDA=12.0
 
 SEEDS="0 1 2 3 4 5"
 
@@ -148,8 +164,18 @@ free -g | head -2
 # --locked: fail loudly if the lock is stale rather than silently re-solving.
 # The `gpu` env is Vista's aarch64 env; JAX_PLATFORMS=cpu above plus the probe's
 # own per-worker setting keep every leg on the Grace cores, so no CUDA is touched.
+# CONDA_OVERRIDE_CUDA (see above) is what lets it activate on a GPU-less node.
 pixi install --locked -e gpu
 pixi run -e gpu python -c "import jax; print(jax.__version__, jax.devices())"
+# The one place `set -e` discipline WOULD have helped: the env is a prerequisite,
+# not an independent leg, so a failure here makes all 11 legs below fail
+# identically and bury the cause under repetition (job 865844). Stop instead.
+if ! pixi run -e gpu python -c "import jax" >/dev/null 2>&1; then
+  echo "!! ABORT: the 'gpu' env will not activate/import on this node -- fix the"
+  echo "!! env before spending the ensemble. Diagnostic:"
+  pixi run -e gpu python -c "import jax; print(jax.__version__, jax.devices())"
+  exit 1
+fi
 
 for S in $SEEDS; do
   OUT="runs/v2/g5_results_cgh64_seed${S}.json"
