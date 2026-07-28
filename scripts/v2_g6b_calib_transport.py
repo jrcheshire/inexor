@@ -38,6 +38,24 @@ many sigma. The cdev8 -> cdev run read as "23% median, 3.5 sigma_calib" while th
 absolute residual was 1.02e-3 against an own-box leave-one-out of 9.9e-4 -- a 3%
 difference in the units that decide anything.
 
+READ THE GATED BAND AND THE COMMON-WINDOW INDEX (2026-07-27, from G6c). Two ways
+this card misread the 64x rung, both fixed here, both additive so older cards stay
+comparable:
+  - `band` is the whole k OVERLAP, out to the big box's Nyquist (k=12.6 for
+    cgh64), while D-v2-9's bar is written on k <= k_gate = 2.51. Over the full
+    overlap the cdev8 -> cgh64 correction reads as a REGRESSION (4.97e-3
+    transported vs 4.32e-3 uncorrected); on the gate band it is a 7x improvement
+    (1.56e-2 -> 2.23e-3). The excess is high-k ringing a low-k T-bar has no
+    business correcting. `gate_band` is now reported and is what to gate on.
+  - the low-k index was fit from each box's OWN k_f, so a bigger box fit a wider
+    window; the apparent index drift (cdev8 1.44 / cdev 1.54 / cgh64 1.63) is
+    mostly that. On the common window they are 1.44 / 1.53 / 1.55, and the 64x
+    delta falls 0.20 -> 0.12, inside the 0.15 MATCH criterion.
+Also: the own-box leave-one-out these are measured against is itself an N-seed
+estimate (cgh64 ran 6 seeds), so a transport ratio at or below ~1 means the
+comparison is floor-limited -- a BOUND, not a demonstration that calibrating on a
+foreign box beats calibrating locally.
+
 Usage:
   pixi run python scripts/v2_g6b_calib_transport.py --small cdev8 --big cdev
 """
@@ -80,6 +98,12 @@ def lowk_index(k, R, kmax=LOW_K, kmin=None):
 
     R is the (negative) coherent suppression; fit log|R| vs log k. kmin defaults
     to the curve's own fundamental so each config is fit over its real reach.
+
+    That default makes two configs' indices NOT directly comparable: a bigger box
+    reaches lower k, so it fits over a wider window, and any departure from a pure
+    power law then shows up as an index difference with no box dependence behind
+    it. Pass kmin=<the overlap floor> for the apples-to-apples comparison; the
+    own-window fit is what licenses extrapolating each curve below its own reach.
     """
     kmin = kmin if kmin is not None else k.min()
     m = (k >= kmin) & (k <= kmax) & (R < 0)
@@ -89,7 +113,7 @@ def lowk_index(k, R, kmax=LOW_K, kmin=None):
     return dict(index=float(p[0]), amp=float(np.exp(p[1])), n_bins=int(m.sum()))
 
 
-def compare(small, big):
+def compare(small, big, k_gate=None):
     ks, kb = small["k"], big["k"]
     lo, hi = max(ks.min(), kb.min()), min(ks.max(), kb.max())
     band = (kb >= lo) & (kb <= hi)
@@ -128,7 +152,7 @@ def compare(small, big):
             max_diff_in_sigma=float(np.nanmax((np.abs(diff) / comb)[m])),
         )
 
-    return dict(
+    out = dict(
         k=kc,
         R_small=Rs,
         R_big=Rb,
@@ -137,9 +161,21 @@ def compare(small, big):
         diff=diff,
         comb_err=comb,
         overlap=(float(lo), float(hi)),
+        # `band` is the WHOLE k overlap, out to the big box's Nyquist -- kept
+        # under this name (and first) so every previously recorded card stays
+        # comparable. It is NOT the band D-v2-9's bar is written on; see
+        # `gate_band` below, which is.
         band=stats(np.ones_like(kc, dtype=bool)),
         low_k=dict(k_max=LOW_K, **stats(low)),
     )
+    if k_gate is not None:
+        # D-v2-9's bar (absolute |dP/P| <= 3e-2) is written on k <= k_gate. The
+        # overlap runs ~5x past that edge, where the transfer is the high-k
+        # ringing plateau rather than the coherent low-k suppression a T-bar
+        # exists to remove -- so the full-overlap statistic can read as a
+        # regression while the gated one improves. Report both; gate on this one.
+        out["gate_band"] = dict(k_max=float(k_gate), **stats(kc <= k_gate))
+    return out
 
 
 def make_figure(small, big, cmp_, idx_s, idx_b, out_png, labels):
@@ -198,9 +234,15 @@ def main():
     )
     small = pivot_curve(aggs["small"])
     big = pivot_curve(aggs["big"])
-    cmp_ = compare(small, big)
+    k_gate = aggs["big"].get("k_gate")
+    cmp_ = compare(small, big, k_gate=k_gate)
+    # own-window (each box from its own k_f) and common-window (both from the
+    # overlap floor) fits. Only the second is a like-for-like shape comparison.
     idx_s = lowk_index(small["k"], small["mean"])
     idx_b = lowk_index(big["k"], big["mean"])
+    k_common = cmp_["overlap"][0]
+    idx_s_com = lowk_index(small["k"], small["mean"], kmin=k_common)
+    idx_b_com = lowk_index(big["k"], big["mean"], kmin=k_common)
 
     print(f"=== G6b calibration transport: {args.small} -> {args.big} ===")
     print(f"small box: {args.small}  arm {small['arm']}  P={small['P']}  N={small['n']}  "
@@ -221,41 +263,75 @@ def main():
     print("  (the units D-v2-9's bar is written in; compare against the big box's "
           "OWN\n   leave-one-out residual, which is the best any calibration can do "
           "at this box)")
-    print(f"  in-band : uncorrected {bd['median_uncorrected']:.3e} -> transported "
-          f"{bd['median_abs_resid']:.3e} median  (max {bd['max_abs_resid']:.3e})")
+    gb = cmp_.get("gate_band")
+    if gb is not None:
+        print(f"  GATE BAND k<={gb['k_max']:.2f} (D-v2-9's bar, 3.0e-02): uncorrected "
+              f"{gb['median_uncorrected']:.3e} -> transported\n"
+              f"           {gb['median_abs_resid']:.3e} median  "
+              f"(max {gb['max_abs_resid']:.3e})")
     print(f"  k<={LOW_K}: uncorrected {lo['median_uncorrected']:.3e} -> transported "
           f"{lo['median_abs_resid']:.3e} median  (max {lo['max_abs_resid']:.3e})")
     if loo is not None:
         print(f"           {args.big} own-box leave-one-out {loo:.3e} median "
               f"-> transport costs x{lo['median_abs_resid'] / loo:.2f}")
+        print(f"           NB that reference is an N={big['n']} leave-one-out, so it "
+              f"carries its own\n           sampling floor; a ratio at or below ~1 is a "
+              f"BOUND, not a measured margin.")
+    print(f"  full overlap (to k={cmp_['overlap'][1]:.1f}, PAST the gate band -- "
+          f"cross-check only):\n"
+          f"           uncorrected {bd['median_uncorrected']:.3e} -> transported "
+          f"{bd['median_abs_resid']:.3e} median  (max {bd['max_abs_resid']:.3e})")
 
     print("\n--- cross-check: the same agreement in fractional and sigma_calib units ---")
     print("  (fractional divides by a curve that varies by an order of magnitude "
           "across\n   the band, so it overstates disagreement where the transfer is "
           "small)")
-    print(f"  in-band : {bd['median_frac']:.1%} median, {bd['max_frac']:.1%} max  |  "
-          f"{bd['median_diff_in_sigma']:.1f} sigma_calib median")
+    if gb is not None:
+        print(f"  gate k<={gb['k_max']:.2f}: {gb['median_frac']:.1%} median, "
+              f"{gb['max_frac']:.1%} max  |  {gb['median_diff_in_sigma']:.1f} "
+              "sigma_calib median")
     print(f"  k<={LOW_K}: {lo['median_frac']:.1%} median, {lo['max_frac']:.1%} max  |  "
           f"{lo['median_diff_in_sigma']:.1f} sigma_calib median")
-    if idx_s and idx_b:
+    print(f"  full overlap : {bd['median_frac']:.1%} median, {bd['max_frac']:.1%} max  |  "
+          f"{bd['median_diff_in_sigma']:.1f} sigma_calib median")
+    if idx_s_com and idx_b_com:
         print("\n--- low-k power-law index (governs extrapolation below the small k_f) ---")
-        print(f"  {args.big:6s}: R ~ k^{idx_b['index']:.2f}   {args.small:6s}: R ~ k^{idx_s['index']:.2f}")
-        print(f"  {'MATCH' if abs(idx_s['index'] - idx_b['index']) < 0.15 else 'DIFFER'} "
-              f"(delta index {abs(idx_s['index'] - idx_b['index']):.2f})")
+        print(f"  COMMON window k in [{k_common:.3f}, {LOW_K}] -- the like-for-like "
+              "comparison:")
+        print(f"    {args.big:6s}: R ~ k^{idx_b_com['index']:.2f} ({idx_b_com['n_bins']} bins)"
+              f"   {args.small:6s}: R ~ k^{idx_s_com['index']:.2f} ({idx_s_com['n_bins']} bins)")
+        d_com = abs(idx_s_com["index"] - idx_b_com["index"])
+        print(f"    {'MATCH' if d_com < 0.15 else 'DIFFER'} (delta index {d_com:.2f})")
+    if idx_s and idx_b:
+        d_own = abs(idx_s["index"] - idx_b["index"])
+        print("  own-window (each box from its own k_f; sets each curve's own "
+              "extrapolation,\n  but the windows differ so the delta is NOT a pure "
+              "box effect):")
+        print(f"    {args.big:6s}: R ~ k^{idx_b['index']:.2f} ({idx_b['n_bins']} bins)"
+              f"   {args.small:6s}: R ~ k^{idx_s['index']:.2f} ({idx_s['n_bins']} bins)"
+              f"   delta {d_own:.2f}")
 
     print("\nVerdict is JC's: transport is established if the ABSOLUTE residual left by "
           "the\nsmall box's T-bar is comparable to the big box's own leave-one-out "
-          "residual over\nk <= 0.5 AND the low-k indices match. No threshold is "
-          "hard-coded here.")
+          "residual over\nk <= 0.5 AND the low-k indices match on the COMMON window. "
+          "No threshold is\nhard-coded here.")
 
     out_prefix = args.out_prefix or f"g6b_transport_{args.small}_{args.big}"
     out = dict(
         small=args.small, big=args.big,
         n_small=small["n"], n_big=big["n"],
         overlap=cmp_["overlap"],
+        # `band` (= full overlap) and the own-window indices keep their original
+        # names and meanings so cards recorded before 2026-07-27 stay comparable.
         band=cmp_["band"], low_k=cmp_["low_k"],
+        gate_band=cmp_.get("gate_band"),
         index_small=idx_s, index_big=idx_b,
+        index_small_common=idx_s_com, index_big_common=idx_b_com,
+        index_common_kmin=float(k_common),
         note="Box transport at FIXED cell/coarse-mesh. Resolution axis untested. "
+        "Read gate_band (D-v2-9's bar) and the common-window indices; `band` is the "
+        "full overlap and runs past the gate edge. The own-box leave-one-out this is "
+        "compared against carries its own N-seed sampling floor. "
         "Verdict (transport established?) is JC's gate call.",
     )
     out_json = os.path.join(args.dir, f"{out_prefix}.json")
