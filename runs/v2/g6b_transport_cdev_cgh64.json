@@ -1,0 +1,64 @@
+{
+ "small": "cdev",
+ "big": "cgh64",
+ "n_small": 16,
+ "n_big": 6,
+ "overlap": [
+  0.04908738521234052,
+  12.566370614359172
+ ],
+ "band": {
+  "median_abs_resid": 0.001028779327050618,
+  "max_abs_resid": 0.0029916961833581297,
+  "median_uncorrected": 0.004309129578528988,
+  "max_uncorrected": 0.018835533659834796,
+  "median_frac": 0.22920860514022573,
+  "max_frac": 248.43042072340725,
+  "median_diff_in_sigma": 0.8092905501555806,
+  "max_diff_in_sigma": 6.604701205120678
+ },
+ "low_k": {
+  "k_max": 0.5,
+  "median_abs_resid": 0.00016409768907067745,
+  "max_abs_resid": 0.0005125597681207945,
+  "median_uncorrected": 0.003743071786969069,
+  "max_uncorrected": 0.008420938811726472,
+  "median_frac": 0.06634754115616362,
+  "max_frac": 0.3210397681974724,
+  "median_diff_in_sigma": 1.4238779227970526,
+  "max_diff_in_sigma": 6.604701205120678
+ },
+ "gate_band": {
+  "k_max": 2.5132741228718345,
+  "median_abs_resid": 0.0004208265143559979,
+  "max_abs_resid": 0.0009769334834946776,
+  "median_uncorrected": 0.015536010635674002,
+  "max_uncorrected": 0.018835533659834796,
+  "median_frac": 0.032993116587320764,
+  "max_frac": 0.3210397681974724,
+  "median_diff_in_sigma": 0.6175825627926212,
+  "max_diff_in_sigma": 6.604701205120678
+ },
+ "index_small": {
+  "index": 1.5424187029726955,
+  "amp": 0.028016340560979375,
+  "n_bins": 10
+ },
+ "index_big": {
+  "index": 1.6337000276384246,
+  "amp": 0.029512902735927084,
+  "n_bins": 20
+ },
+ "index_small_common": {
+  "index": 1.5424187029726955,
+  "amp": 0.028016340560979375,
+  "n_bins": 10
+ },
+ "index_big_common": {
+  "index": 1.6229929086805936,
+  "amp": 0.029106792773010273,
+  "n_bins": 19
+ },
+ "index_common_kmin": 0.04908738521234052,
+ "note": "Box transport at FIXED cell/coarse-mesh. Resolution axis untested. Read gate_band (D-v2-9's bar) and the common-window indices; `band` is the full overlap and runs past the gate edge. The own-box leave-one-out this is compared against carries its own N-seed sampling floor. Verdict (transport established?) is JC's gate call."
+}

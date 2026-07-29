@@ -192,5 +192,7 @@ NOT licensed, and deliberately so:
     removes it.
   - **cgh64 ran 6 seeds against 16 at the other two rungs**, so its own
     leave-one-out is the least well determined number on this page.
-  - **D-v2-10's "cannot currently claim a transfer correction" clause is answered
-    but not amended.** That is an ADR edit and JC's call.
+Ratified as **D-v2-11** (JC, 2026-07-29), which supersedes D-v2-10's "cannot
+currently claim a transfer correction" clause and carries the NOT-licensed list
+above into the decision log verbatim. The ADR is the decision; this page stays
+the measurement record behind it.

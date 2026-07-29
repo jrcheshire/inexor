@@ -1,0 +1,64 @@
+{
+ "small": "cdev8",
+ "big": "cdev",
+ "n_small": 16,
+ "n_big": 16,
+ "overlap": [
+  0.09817477042468103,
+  12.566370614359172
+ ],
+ "band": {
+  "median_abs_resid": 0.003253118054573764,
+  "max_abs_resid": 0.00688470162695173,
+  "median_uncorrected": 0.005434620518067722,
+  "max_uncorrected": 0.019125201023688983,
+  "median_frac": 0.7640432914810534,
+  "max_frac": 4.04708829905747,
+  "median_diff_in_sigma": 0.9928006569817797,
+  "max_diff_in_sigma": 6.035470727287299
+ },
+ "low_k": {
+  "k_max": 0.5,
+  "median_abs_resid": 0.0010173711346622635,
+  "max_abs_resid": 0.0013379879160393474,
+  "median_uncorrected": 0.004449791008537922,
+  "max_uncorrected": 0.00873012433785391,
+  "median_frac": 0.22863346451781866,
+  "max_frac": 0.37026999874160277,
+  "median_diff_in_sigma": 3.5313699710400126,
+  "max_diff_in_sigma": 6.035470727287299
+ },
+ "gate_band": {
+  "k_max": 2.5132741228718345,
+  "median_abs_resid": 0.0018893498481988187,
+  "max_abs_resid": 0.0029328877178053103,
+  "median_uncorrected": 0.01602084305465985,
+  "max_uncorrected": 0.019125201023688983,
+  "median_frac": 0.13165945213661803,
+  "max_frac": 0.37026999874160277,
+  "median_diff_in_sigma": 1.4516238633989946,
+  "max_diff_in_sigma": 6.035470727287299
+ },
+ "index_small": {
+  "index": 1.4352778622940454,
+  "amp": 0.029812060825982287,
+  "n_bins": 5
+ },
+ "index_big": {
+  "index": 1.5424187029726955,
+  "amp": 0.028016340560979375,
+  "n_bins": 10
+ },
+ "index_small_common": {
+  "index": 1.4352778622940454,
+  "amp": 0.029812060825982287,
+  "n_bins": 5
+ },
+ "index_big_common": {
+  "index": 1.5278487508798375,
+  "amp": 0.027537362541259203,
+  "n_bins": 9
+ },
+ "index_common_kmin": 0.09817477042468103,
+ "note": "Box transport at FIXED cell/coarse-mesh. Resolution axis untested. Read gate_band (D-v2-9's bar) and the common-window indices; `band` is the full overlap and runs past the gate edge. The own-box leave-one-out this is compared against carries its own N-seed sampling floor. Verdict (transport established?) is JC's gate call."
+}

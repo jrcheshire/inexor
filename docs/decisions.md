@@ -376,7 +376,10 @@ decision here is locked until explicitly re-litigated with JC.
 ## D-v2-10 — G5 verdict: PASS (A2's spine ratified); perf evaluation moves to the config-table homes
 - **Status:** accepted (JC, 2026-07-16, seed V2a close). Resolves the verdict
   D-v2-9 left open; retires the G5 kill-line branch (A1 fallback / 4096^3 to
-  A4-only) unexercised.
+  A4-only) unexercised. **One clause superseded by D-v2-11** (2026-07-29): the
+  low-k bullet's "a measured-transfer correction cannot currently be claimed to
+  remove it" is answered, and the assessment it defers is now done. The rest of
+  this entry, including the verdict, stands as written.
 - **Decision:** the two-level split (gauss + TSC + matching) passes the D-v2-9
   bar — 2.61e-2 vs 3e-2 in-band at the V2a probe config (tile 128 / buf 32,
   P = 192, C-dev) — and is ratified as A2's spine. The clause-3 shape diagnostic
@@ -429,3 +432,86 @@ decision here is locked until explicitly re-litigated with JC.
 - **Record:** `runs/v2/g5_kernel_findings.md` (mechanism),
   `runs/v2/g5b_abs_transfer.md` (bar), `runs/v2/cost_of_memory.md` (triples),
   `runs/v2/g5_results_cdev.json` (job 39 data incl. the tile scan).
+
+## D-v2-11 — the low-k split error IS a correctable transfer, and it calibrates off-box
+- **Status:** accepted (JC, 2026-07-29, G6 close). Supersedes ONE clause of
+  D-v2-10: "a measured-transfer correction cannot currently be claimed to
+  remove it". D-v2-10 is otherwise untouched and its verdict stands. This is
+  the assessment D-v2-10 deliberately deferred until after G5c.
+- **Context:** D-v2-10 accepted the low-k floor with eyes open and left two
+  questions for a separate assessment. (a) Is the split's low-k error a
+  coherent, removable WINDOW, or is it decorrelation? (b) Can the transfer
+  T-bar be calibrated ONCE on a small box and applied at a production box?
+  (b) is the compute question, and it decides whether the memory saving is
+  real: the monolithic reference is the only memory-expensive object in the
+  scheme, and it is needed only during calibration. If T-bar drifts with
+  volume, calibration inherits the production box's cost and the saving is
+  notional.
+  Measured on a fixed-cell box ladder (cdev8 / cdev / cgh64 = 1x / 8x / 64x
+  volume at fine cell 0.25, with coarse mesh and gate band held), so comparing
+  their ensemble-mean transfers is pure box transport at fixed resolution:
+  deneb job 188 (cdev, 16 seeds), deneb job 192 (cdev8, 16 seeds plus the 8x
+  transport leg), Vista job 866415 (cgh64, 6 seeds plus both remaining legs).
+  Every config's degenerate limits passed ~8 orders under tolerance (a
+  full-period tile-origin shift reproducing its unshifted twin, a translated
+  monolithic run reproducing the untranslated one), so the ratio machinery is
+  not manufacturing the signal it is being used to measure.
+- **Decision:**
+  1. **The low-k split error is ratified as a CORRECTABLE TRANSFER, not an
+     irreducible architectural floor.** It is a near-pure window: max(1 - r)
+     at k <= 0.5 is 3e-5, i.e. phase-perfect. A leave-one-out transfer at
+     C-dev cuts k <= 0.5 from 8.92e-3 to 9.90e-4 (factor 9.0) and the gate
+     band from 1.97e-2 to 4.25e-3 (factor 4.6).
+  2. **T-bar may be calibrated OFF-BOX, on a small ensemble.** On D-v2-9's
+     gate band the three transport legs leave 1.889e-3 (1x -> 8x), 4.208e-4
+     (8x -> 64x) and 2.227e-3 (1x -> 64x) against the 3e-2 bar: 1/16, 1/71
+     and 1/13 of it. The low-k power-law indices match on a common window
+     (deltas 0.093 / 0.081 / 0.117 against the script's 0.15 MATCH criterion),
+     which is what licenses extrapolating T-bar below a small box's
+     fundamental. Production therefore calibrates once, stores T-bar, and
+     applies it per mock: no ensemble and no monolithic reference at the
+     production box.
+  3. **Re-calibration triggers.** Tile size and tile origin are measured
+     stable and are NOT triggers: the low-k transfer is P-independent (cgh64
+     evolved |dP/P| = 1.896e-2 for T128 = T256 = T512 alike, job 861849), and
+     origin randomization costs rms 2.6e-5 in band against a 2.4e-3
+     seed-to-seed scatter. Fine cell, cosmology and redshift are UNMEASURED
+     and are treated as triggers until measured, with redshift bounded by
+     calibrating at the output z.
+  4. **The correction is reported, not gated.** D-v2-9's bar continues to be
+     read on the UNCORRECTED split and clause 3 (the split-to-discretization
+     ratio vs k) is unchanged. Whether a corrected P(k) ever becomes the
+     gated quantity is a V4 call, not decided here.
+- **Consequences:**
+  - D-v2-10's low-k bullet stands except for the superseded sentence. Its 1/P
+    shrinkage is the band-EDGE plateau, a different feature from the low-k
+    end, which no tile size reaches: only a transfer touches it.
+  - **A single-box floor survives the correction.** The per-realization
+    scatter (sigma/|mean| at k <= 0.5 of 0.20 / 0.18 / 0.16 across the three
+    rungs) is physical, not sampling noise: the ratio is taken between two
+    runs sharing initial conditions, so cosmic variance cancels and the
+    measured scatter sits 100-500x BELOW the sqrt(2/N_modes) floor. The
+    ensemble MEAN is therefore cheap to pin (determined to ~3% at cdev), but
+    a perfect T-bar still leaves ~1e-3 at k <= 0.5 on any single box and no
+    number of calibration seeds removes it. That is the accuracy a corrected
+    production mock inherits.
+  - **Three statistics answer three different questions**, and reading any one
+    alone gives the wrong answer: the absolute residual against the bar (the
+    gate question, answered above); sigma_calib, i.e. is a transport bias
+    RESOLVED at all (1.4 sigma at 8x, consistent with none; 4.7 sigma at 64x
+    from a 1x box, so the drift is real, just far too small to matter); and
+    the ratio to the big box's own leave-one-out, which is NOT a "cost",
+    because a per-realization prediction error and a mean-to-mean bias are
+    different estimands.
+  - **Not licensed, deliberately.** The RESOLUTION axis is untested (all of
+    this holds the fine cell at 0.25). Cosmology and redshift are unmeasured
+    as triggers. Correctability was measured within ONE kernel and split
+    configuration (gauss + TSC + matching). cgh64 ran 6 seeds against 16 at
+    the other two rungs, so its own leave-one-out is the least well
+    determined number in the record.
+  - **Record:** `runs/v2/g6_split_stability.md` (every number, the degenerate
+    limits, and two card-reading traps that each inverted a verdict before
+    being fixed). Verdict cards `runs/v2/g6b_transport_cdev8_cdev.json`,
+    `g6b_transport_cdev_cgh64.json`, `g6b_transport_cdev8_cgh64.json`
+    (tracked). Probes `scripts/v2_g6_split_stability.py`,
+    `scripts/v2_g6b_calib_transport.py`.

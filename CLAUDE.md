@@ -56,8 +56,8 @@ explicit `--mem` (see the umbrella albireo memory).
   the load-bearing novel pieces.
 - `docs/roadmap.md` — master plan M0-M4; M0 is a HARD go/no-go gate; each
   milestone gets a fresh detailed plan at its opening session.
-- `docs/decisions.md` — ADR log (D-001..D-009). Locked until re-litigated
-  with JC.
+- `docs/decisions.md` — ADR log (D-001..D-015, D-v2-8..D-v2-11; D-v2-1..7 live
+  in the plan-plan table). Locked until re-litigated with JC.
 - `paper/outline.md` — claims, money plots, verified citation list + the
   citation guard (refuted claims never to reintroduce).
 
