@@ -44,6 +44,11 @@
 
 cd ~/src/inexor || exit 1
 
+# pixi is NOT on a batch shell's PATH on deneb -- a login shell picks it up but
+# sbatch does not. Job 272 died on `pixi: command not found` twice in a row for
+# exactly this. v2_g6_deneb.sbatch:44 carries the same line.
+export PATH="$HOME/.pixi/bin:$PATH"
+export PYTHONUNBUFFERED=1
 export G5_CPU_THREADS=64
 export OMP_NUM_THREADS=64
 export JAX_PLATFORMS=cpu
@@ -51,7 +56,24 @@ export JAX_PLATFORMS=cpu
 echo "=== env ==="
 date
 hostname
-pixi run python -c "import jax; print('jax', jax.__version__); print(jax.devices())"
+git log --oneline -1
+free -g | head -2
+nproc
+
+# PREREQUISITE GUARD, despite the deliberate absence of `set -e` above. The
+# no-set -e rule is about independent physics LEGS; the env is a prerequisite,
+# not a leg. Job 272 let a broken env through and buried one cause under two
+# identical copies of the same error -- the same shape as Vista job 865844,
+# which buried it under eleven. A repeat now exits in seconds with the real
+# diagnostic instead of a log that has to be read backwards.
+if ! command -v pixi >/dev/null 2>&1; then
+    echo "FATAL: pixi not on PATH after adding ~/.pixi/bin -- aborting before any leg"
+    exit 1
+fi
+if ! pixi run python -c "import jax; print('jax', jax.__version__); print(jax.devices())"; then
+    echo "FATAL: the pixi env cannot import jax -- aborting before any leg"
+    exit 1
+fi
 
 echo
 echo "=== cdev: containment + force fidelity ==="
