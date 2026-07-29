@@ -161,7 +161,15 @@ def lagrangian_index(q, n_part, box_size):
 def containment(x_fin, qi, g, n_tile, b_fine):
     """R1: fraction of CORE particles that leave their padded box.
 
-    Counted over ALL tiles (cheap: pure arithmetic), so this is not one draw.
+    Counted over ALL tiles and ALL particles -- not a sampled subset, so this is
+    not one draw.
+
+    VECTORIZED, one pass over particles. Every particle already knows which tile
+    owns it (its Lagrangian block), so its own box origin follows from that block
+    and the whole question is a single mod-and-compare. The obvious loop-over-
+    tiles-masking-all-particles form is O(n_tiles x n_particles), which is merely
+    slow at cdev (4096 tiles x 16.7M particles per row) but impossible at cgh64
+    (32768 x 134M). Same arithmetic, same answer.
     """
     from v2_g5_core import padded_size
 
@@ -169,18 +177,12 @@ def containment(x_fin, qi, g, n_tile, b_fine):
     cell = box_size / n_fine
     p_side, b_real = padded_size(n_tile, b_fine, n_fine=n_fine)
     t_lag = n_tile * n_part // n_fine
-    n_side = n_fine // n_tile
     blk = qi // t_lag
-    n_out = 0
-    for ti in range(n_side):
-        for tj in range(n_side):
-            for tk in range(n_side):
-                sel = (blk[:, 0] == ti) & (blk[:, 1] == tj) & (blk[:, 2] == tk)
-                if not sel.any():
-                    continue
-                org = np.array([ti, tj, tk], np.float64) * n_tile * cell - b_real * cell
-                loc = np.mod(x_fin[sel] - org, box_size)
-                n_out += int((loc >= p_side * cell).any(axis=1).sum())
+    # Each particle's own tile origin, then its own tile-local coordinate. This
+    # mirrors tile_origin_extent + tile_local_coords exactly, per particle.
+    org = blk.astype(np.float64) * (n_tile * cell) - b_real * cell
+    loc = np.mod(x_fin - org, box_size)
+    n_out = int((loc >= p_side * cell).any(axis=1).sum())
     n_core = int(qi.shape[0])
     return dict(
         n_tile=int(n_tile),
