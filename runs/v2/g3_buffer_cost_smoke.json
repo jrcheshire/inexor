@@ -1,0 +1,121 @@
+{
+  "config": "smoke",
+  "seed": 0,
+  "nsteps": 20,
+  "geometry": {
+    "n_part": 32,
+    "L": 32.0,
+    "n_fine": 64,
+    "n_coarse": 16,
+    "fine_cell": 0.5,
+    "coarse_cell": 2.0,
+    "spacing": 1.0,
+    "k_nyq_fine": 6.283185307179586,
+    "k_nyq_coarse": 1.5707963267948966,
+    "k_gate": 1.2566370614359172
+  },
+  "identity_one_tile_is_box": {
+    "rel": 0.0,
+    "tol": 1e-10,
+    "p_side": 64,
+    "b_realized": 0,
+    "n_outside": 0,
+    "ok": true
+  },
+  "excursion_linf": {
+    "total": {
+      "p50": 3.3924136178658326,
+      "p99": 8.798757780036167,
+      "p999": 10.22131681008484,
+      "max": 11.255266977665231
+    },
+    "residual_y": {
+      "p50": 0.7727811661483099,
+      "p99": 5.696574431488,
+      "p999": 7.812538108258921,
+      "max": 10.390241092253298
+    }
+  },
+  "blocks": [
+    2,
+    4,
+    8,
+    16
+  ],
+  "containment": [
+    {
+      "n_tile": 32,
+      "b_requested": 0,
+      "b_realized": 0,
+      "padded_P": 32,
+      "n_out_core": 12644,
+      "frac_out": 0.3858642578125,
+      "vol_ratio": 1.0
+    },
+    {
+      "n_tile": 32,
+      "b_requested": 8,
+      "b_realized": 8,
+      "padded_P": 48,
+      "n_out_core": 1779,
+      "frac_out": 0.054290771484375,
+      "vol_ratio": 3.375
+    },
+    {
+      "n_tile": 32,
+      "b_requested": 16,
+      "b_realized": 16,
+      "padded_P": 64,
+      "n_out_core": 0,
+      "frac_out": 0.0,
+      "vol_ratio": 8.0
+    }
+  ],
+  "force_fidelity": [
+    {
+      "n_tile": 32,
+      "b_requested": 0,
+      "b_realized": 0,
+      "b_lag": 0,
+      "padded_P": 32,
+      "n_tiles_sampled": 2,
+      "rel_median": 0.7475736140770423,
+      "rel_max": 0.7589312185615711,
+      "rel_all": [
+        0.7362160095925134,
+        0.7589312185615711
+      ],
+      "vol_ratio": 1.0
+    },
+    {
+      "n_tile": 32,
+      "b_requested": 8,
+      "b_realized": 8,
+      "b_lag": 4,
+      "padded_P": 48,
+      "n_tiles_sampled": 2,
+      "rel_median": 0.30206650862044815,
+      "rel_max": 0.31507692338598614,
+      "rel_all": [
+        0.31507692338598614,
+        0.2890560938549102
+      ],
+      "vol_ratio": 3.375
+    },
+    {
+      "n_tile": 32,
+      "b_requested": 16,
+      "b_realized": 16,
+      "b_lag": 8,
+      "padded_P": 64,
+      "n_tiles_sampled": 2,
+      "rel_median": 2.029979738607353e-15,
+      "rel_max": 2.766727680957529e-15,
+      "rel_all": [
+        2.766727680957529e-15,
+        1.293231796257177e-15
+      ],
+      "vol_ratio": 8.0
+    }
+  ]
+}
