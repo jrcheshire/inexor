@@ -164,6 +164,39 @@ BullFrog steps from `a = 0.1` on a 0.25 Mpc/h mesh do not drive the divergence
 the concern assumed. The dynamical floor is therefore BELOW the window-based
 Floor B, not above it, and Floor B's 8.5e-4 stands as the binding number.
 
+## F -- W's positive response, and the replacement for the phase-scramble test
+
+The plan's second `W` validation ("scramble long-mode phases, confirm `W`
+returns the injected size") cannot be run for any `W` that is genuinely zero
+under a deterministic window. A phase ROTATION is still mode-diagonal and
+cancels exactly as a window does; a full phase SCRAMBLE decorrelates the arms,
+so the cross-bispectrum of an effectively independent field with the reference
+vanishes in expectation. Neither exercises `W`.
+
+Replacement, agreed at the checkpoint: inject a known quadratic long-short
+coupling, `delta_t = delta_m (1 + g delta_L/rms(delta_L))` with `delta_L` the
+long shell -- a long mode modulating local small-scale amplitude, which is
+exactly the term an independent tile cannot reproduce because it does not
+contain the long mode.
+
+| g | `W`[sq2] | `W`[sq3] | `W`[sq4] | `W`[sq6] | `W`[equi] |
+|---|---|---|---|---|---|
+| 0.01 | 6.55e-03 | 1.06e-02 | 1.01e-02 | 7.45e-03 | 6.41e-03 |
+| 0.02 | 1.31e-02 | 2.11e-02 | 2.03e-02 | 1.49e-02 | 1.28e-02 |
+| 0.04 | 2.62e-02 | 4.23e-02 | 4.06e-02 | 2.98e-02 | 2.56e-02 |
+| 0.08 | 5.24e-02 | 8.45e-02 | 8.12e-02 | 5.96e-02 | 5.13e-02 |
+
+`dW/dg` = 0.66 / 1.06 / 1.01 / 0.75 / 0.64, and at `g = 0.08` `W` sits
+**518-853x its own window floor** (9.9e-05).
+
+**Read the two outputs differently.** `W/g` is constant to printed precision,
+but that is EXACT BY CONSTRUCTION -- `delta_t - delta_m = g delta_m d_L` is
+exactly O(g) and `T - 1` is O(g), so `eps` and hence `W` are exactly linear in
+`g`. Constant `W/g` is therefore a plumbing check (it would catch an O(g^2)
+contamination or a botched transfer subtraction). The result that matters is
+`W/W_floor`: `W` distinguishes a coupling from a window by nearly three orders
+of magnitude, which is the only reason it is in the deliverable.
+
 ## Where the floors land
 
 | floor | `R_Q` |
@@ -179,7 +212,22 @@ Floor B, not above it, and Floor B's 8.5e-4 stands as the binding number.
 gate-eligible triangle, by the criterion `sigma_B <= bar/3`. Nothing here is
 close to making the 15% bar a bound.
 
-## Checkpoint questions for JC
+## Checkpoint OUTCOME (JC, 2026-07-31)
+
+1. **Gate on `R_Q`, require `rho` to agree.** `R_Q` stays the gate statistic per
+   the 2026-07-29 decision; `rho` is computed alongside and a divergence between
+   them is a WINDOW-CONTAMINATION flag, not a tiling failure. No conditioning
+   cut is needed on the gate path.
+2. **Pin the estimand at `cdev`, not `cdev8`.** At `cdev8` every leg is past
+   `k_nl` and there is no linear long mode; at `cdev` the `m = 1-3` long legs
+   (0.049-0.147 h/Mpc) are genuinely linear and the x-ladder at the Stage 5
+   geometry `T=64/b=16` gives five points below threshold and two above.
+3. **Reduce by MAX over gate-eligible triangles, with the `R` vs `x` curve
+   mandatory and ungated** (inheriting D-v2-9 clause 3; max-over-band has hidden
+   shape on this project twice).
+4. **`W` validated by coupling injection**, as in section F above.
+
+## Superseded checkpoint questions
 
 1. **The estimand.** `R_Q` was chosen to remove the P(k) contamination that
    `R_B` carries, and measurably does not: it responds as `1/T`, leaving ~1% of

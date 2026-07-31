@@ -414,6 +414,83 @@ def section_BC(cfg, nseed, tris, names, out):
     )
 
 
+def inject_coupling(delta, box_size, k_long_center, dk, g):
+    """delta_t = delta_m (1 + g * delta_L / rms(delta_L)), delta_L the long shell.
+
+    A long mode modulating local small-scale amplitude -- the physical term an
+    independent tile cannot reproduce, because the tile does not contain the
+    long mode at all. This is the injection W exists to detect, as distinct from
+    a window (which W must ignore) and a decorrelation (which W also ignores).
+    """
+    from inexor.diagnostics import _k_grid, _shell_mask
+
+    n = delta.shape[0]
+    _, _, k_mag = _k_grid(n, box_size)
+    dk_grid = np.fft.rfftn(delta)
+    msk = _shell_mask(k_mag, k_long_center - 0.5 * dk, k_long_center + 0.5 * dk)
+    d_long = np.fft.irfftn(np.where(msk, dk_grid, 0.0), s=(n, n, n), axes=(0, 1, 2))
+    d_long = d_long / np.sqrt((d_long**2).mean())
+    return delta * (1.0 + g * d_long)
+
+
+def section_F(cfg, seed, tris, names, out, g_ladder=(0.01, 0.02, 0.04, 0.08)):
+    """W's POSITIVE-response test: a known quadratic long-short coupling.
+
+    Replaces the plan's "scramble long-mode phases and confirm W returns the
+    injected size", which cannot work for any W that is genuinely zero under a
+    deterministic window. A phase ROTATION is still mode-diagonal, so it cancels
+    out of W exactly as a window does; a full phase SCRAMBLE decorrelates the
+    arms, and the cross-bispectrum of an independent field with the reference
+    vanishes in expectation. Neither exercises W.
+
+    W responds to new mode COUPLING, so the injection is a coupling. The known
+    answer is the SCALING, not an amplitude: W must be linear in g with zero
+    intercept, and must sit far above the window floor measured in section D. A
+    statistic that is flat in g, or comparable to its own null, has no
+    sensitivity and must not be reported as a discriminator.
+
+    READ THE TWO OUTPUTS DIFFERENTLY. The linearity is EXACT BY CONSTRUCTION:
+    delta_t - delta_m = g delta_m d_L is exactly O(g), and T - 1 is O(g) as
+    well, so eps and therefore W are exactly linear in g. A constant W/g is
+    consequently a PLUMBING check -- it would catch an O(g^2) contamination or a
+    botched transfer subtraction, and nothing more. The physics result is the
+    ratio W(g)/W_floor: that is what says W can tell a coupling from a window,
+    which is the only reason it is in the deliverable.
+    """
+    print("\n=== F: W positive response to an injected long-short coupling ===")
+    d_m, g_geo = evolved_field(cfg, seed)
+    ell = g_geo["L"]
+    kf = 2.0 * np.pi / ell
+    k_long = float(tris[0][0])
+    rows = []
+    for g in g_ladder:
+        d_t = inject_coupling(d_m, ell, k_long, kf, g)
+        st = stats(d_t, d_m, ell, tris)
+        rows.append((g, st))
+    w_floor = out.get("D", {}).get("W_floor", float("nan"))
+
+    print(f"  injecting at k_long = {k_long:.4f} h/Mpc; W window floor = {w_floor:.3e}")
+    print(f"  {'g':>7s} " + " ".join(f"{'W[' + nm + ']':>12s}" for nm in names))
+    for g, st in rows:
+        print(f"  {g:7.3f} " + " ".join(f"{st['W'][i]:12.4e}" for i in range(len(names))))
+    print(f"  {'W/g':>7s} " + " ".join(f"{'':>12s}" for _ in names))
+    for g, st in rows:
+        print(f"  {g:7.3f} " + " ".join(f"{st['W'][i] / g:12.4e}" for i in range(len(names))))
+
+    w0 = np.array([r[1]["W"] for r in rows])
+    gs = np.array([r[0] for r in rows])
+    lin = [float(np.polyfit(gs, w0[:, i], 1)[0]) for i in range(len(names))]
+    resid = [float(np.abs(w0[:, i] / gs - np.mean(w0[:, i] / gs)).max() / abs(np.mean(w0[:, i] / gs)))
+             for i in range(len(names))]
+    print(f"\n  {'tri':>6s} {'dW/dg':>12s} {'W/g spread':>12s} {'W(g=max)/floor':>15s}")
+    for i, nm in enumerate(names):
+        print(f"  {nm:>6s} {lin[i]:12.4e} {resid[i]:12.3f} "
+              f"{abs(w0[-1, i]) / w_floor:15.1f}")
+    out["F"] = dict(names=names, g=list(gs), W=[list(r) for r in w0],
+                    dWdg=lin, W_over_g_spread=resid, W_floor=w_floor,
+                    k_long=k_long)
+
+
 def section_E(cfg, nseed, tris, names, out, eps_ladder=(1e-10, 1e-8, 1e-6)):
     """Floor B', the DYNAMICAL resolving power -- the one that binds.
 
@@ -481,7 +558,7 @@ def main():
     ap.add_argument("--config", default="smoke", choices=("smoke", "cdev8", "cdev", "cgh64"))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--nseed", type=int, default=24)
-    ap.add_argument("--sections", default="DABC", help="subset of D, A, BC, E")
+    ap.add_argument("--sections", default="DABC", help="subset of D, A, BC, E, F")
     ap.add_argument("--neps-seed", type=int, default=8, help="seeds for section E (2 evolves each)")
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args()
@@ -501,6 +578,8 @@ def main():
         section_A(args.config, args.seed, d_m, g, tris, names, out)
     if "BC" in args.sections:
         section_BC(args.config, args.nseed, tris, names, out)
+    if "F" in args.sections:
+        section_F(args.config, args.seed, tris, names, out)
     if "E" in args.sections:
         section_E(args.config, args.neps_seed, tris, names, out)
 
