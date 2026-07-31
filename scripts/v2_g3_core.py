@@ -459,3 +459,170 @@ def cola_vs_direct_residual(x0, v0, q, psi1, psi2, table, force_fn, box_size, d_
         x_direct=np.asarray(xd, np.float64),
         u_final=np.asarray(uc, np.float64),
     )
+
+
+# ===========================================================================
+# Lagrangian tiles and the sCOLA tile evolution (G3 Stage 4)
+# ===========================================================================
+
+
+def lagrangian_index(q, n_part, box_size):
+    """Integer Lagrangian grid index of each particle, (n, 3) int64."""
+    spacing = float(box_size) / int(n_part)
+    return np.rint(np.asarray(q, np.float64) / spacing).astype(np.int64) % int(n_part)
+
+
+def lagrangian_tiles(qi, n_part, n_fine, n_tile, b_realized):
+    """Per-tile (tijk, member_idx, core_in_member), fixed ONCE in LAGRANGIAN space.
+
+    MEMBERSHIP IS LAGRANGIAN, NOT EULERIAN, and this is a correctness issue
+    rather than a convenience. v2_g5_core.tile_members:855 re-derives membership
+    from CURRENT positions, so a particle drifting across a wall is silently
+    reassigned to the neighbouring tile -- which is exactly the inter-tile
+    coupling sCOLA must not have. Here every particle belongs to the tile its
+    Lagrangian position put it in, for the whole run.
+
+    TWO UNIT SYSTEMS, NEVER TO BE CONFUSED. n_tile and b_realized are in FINE
+    CELLS (what padded_size takes). The Lagrangian block is
+    t_lag = n_tile * n_part // n_fine and the shell is
+    b_lag = ceil(b_realized * n_part / n_fine), both in PARTICLE cells. The
+    shell rounds UP where not exact: a wider buffer is safe, a narrower one
+    silently drops mass the tile needed.
+    """
+    t_lag = int(n_tile) * int(n_part) // int(n_fine)
+    b_lag = int(np.ceil(float(b_realized) * int(n_part) / int(n_fine)))
+    n_side = int(n_fine) // int(n_tile)
+    blk = qi // t_lag
+    out = []
+    for i in range(n_side):
+        for j in range(n_side):
+            for k in range(n_side):
+                tijk = (i, j, k)
+                core = np.ones(qi.shape[0], bool)
+                member = np.ones(qi.shape[0], bool)
+                for ax in range(3):
+                    core &= blk[:, ax] == tijk[ax]
+                    lo = tijk[ax] * t_lag - b_lag
+                    member &= ((qi[:, ax] - lo) % int(n_part)) < (t_lag + 2 * b_lag)
+                idx = np.where(member)[0]
+                out.append((tijk, idx, core[idx]))
+    return out, t_lag, b_lag
+
+
+def make_tile_force(tijk, n_tile, b_fine, n_fine, box_size, n_global, core_in_member=None):
+    """force_fn on ONE padded tile box, plus a per-step core-containment tally.
+
+    Routed through force_global on the padded box so the tile arm and the
+    monolithic arm share the identical kernel/paint/gather path; the comparison
+    is then a test of MISSING MASS AND PERIODIZATION, not of two harnesses. Three
+    conversions make that work: tile-local coordinates, box_size = P*cell, and
+    n_total rescaled to n_global*(P/n_fine)^3 so the mean stays GLOBAL (a tile's
+    own particle count rescales the force by mean_global/mean_tile, an O(1)
+    error that reads as catastrophic tiling failure).
+
+    n_out_core is a CONTRACT, not a diagnostic. In G5 a particle outside its
+    padded box was healthy brick overhang; in sCOLA a CORE particle outside its
+    own padded box is unambiguously a bug -- its density is missing from the
+    solve and tile_gather_vector hands it back zero force.
+    """
+    import jax.numpy as jnp
+
+    from v2_g5_core import force_global, padded_size, tile_local_coords, tile_origin_extent
+
+    cell = float(box_size) / int(n_fine)
+    p_side, b_real = padded_size(n_tile, b_fine, n_fine=n_fine)
+    origin, extent = tile_origin_extent(tijk, n_tile, b_real, cell)
+    n_total_arg = float(n_global) * (float(p_side) / float(n_fine)) ** 3
+    tally = []
+
+    def force(x_members):
+        u = tile_local_coords(jnp.asarray(x_members), origin, box_size)
+        if core_in_member is not None:
+            tally.append(int(np.asarray(jnp.any(u[core_in_member] >= extent, axis=1)).sum()))
+        g, _ = force_global(u, p_side, p_side * cell, n_total_arg, "mono", assign="cic")
+        return jnp.asarray(g)
+
+    return force, tally, dict(p_side=int(p_side), b_realized=int(b_real), extent=float(extent))
+
+
+def evolve_tile_scola(tijk, idx, core_in_member, q, psi1, psi2, coeffs, box_size,
+                      n_fine, n_tile, b_fine, n_global, zero_residual=False):
+    """One tile's sCOLA evolution. Returns (y_core, u_core, diag).
+
+    The tile carries its members' residual state only. y = u = 0 at a_init for
+    every particle (lpt_ics returns exactly x_LPT, v_LPT), so no restriction of
+    an initial condition is needed -- the residual starts identically zero and
+    the tile's job is entirely to grow it.
+
+    zero_residual=True forces the residual force to zero, leaving only the
+    analytic frame terms. Both arms then follow the same frame exactly, so any
+    difference is restriction + reassembly rather than physics -- the
+    residual_zero rung.
+    """
+    import jax.numpy as jnp
+
+    q_m = jnp.asarray(q[idx])
+    p1_m = jnp.asarray(psi1[idx])
+    p2_m = jnp.asarray(psi2[idx])
+    cim = jnp.asarray(core_in_member)
+
+    force, tally, geo = make_tile_force(
+        tijk, n_tile, b_fine, n_fine, box_size, n_global, core_in_member=cim
+    )
+    if zero_residual:
+        base = force
+
+        def force(x):  # noqa: F811 -- deliberate shadow, keeps the tally live
+            base(x)
+            return jnp.zeros_like(jnp.asarray(x))
+
+    y = jnp.zeros((len(idx), 3), dtype=jnp.float64)
+    u = jnp.zeros((len(idx), 3), dtype=jnp.float64)
+    for c in coeffs:
+        y, u = cola_step_bullfrog(y, u, q_m, p1_m, p2_m, c, force, box_size)
+    ci = np.asarray(core_in_member)
+    return (np.asarray(y)[ci], np.asarray(u)[ci],
+            dict(n_out_core=tally, n_members=int(len(idx)), n_core=int(ci.sum()), **geo))
+
+
+def evolve_scola(q, psi1, psi2, qi, coeffs, box_size, n_fine, n_part, n_tile, b_fine,
+                 d_final, zero_residual=False):
+    """Full tiled sCOLA run -> (x_final wrapped, u, diag). The A3 arm.
+
+    Reassembly asserts filled.min() == filled.max() == 1: every particle written
+    exactly once, by exactly one tile. A partition defect would otherwise show
+    up as a plausible-looking field rather than as an error.
+    """
+    from v2_g5_core import padded_size
+
+    _, b_real = padded_size(n_tile, b_fine, n_fine=n_fine)
+    tiles, t_lag, b_lag = lagrangian_tiles(qi, n_part, n_fine, n_tile, b_real)
+    n_global = int(n_part) ** 3
+    y_out = np.zeros((n_global, 3), np.float64)
+    u_out = np.zeros((n_global, 3), np.float64)
+    filled = np.zeros(n_global, np.int64)
+    n_out_total, per_tile = 0, []
+    for tijk, idx, cim in tiles:
+        yc, uc, d = evolve_tile_scola(
+            tijk, idx, cim, q, psi1, psi2, coeffs, box_size, n_fine, n_tile,
+            b_fine, n_global, zero_residual=zero_residual,
+        )
+        core_idx = idx[np.asarray(cim)]
+        y_out[core_idx] = yc
+        u_out[core_idx] = uc
+        filled[core_idx] += 1
+        n_out_total += int(sum(d["n_out_core"]))
+        per_tile.append(d)
+
+    if not (filled.min() == 1 and filled.max() == 1):
+        raise AssertionError(
+            f"partition broken: filled min {filled.min()} max {filled.max()} "
+            f"(sum {filled.sum()} vs {n_global}); every particle must be written "
+            "exactly once by exactly one tile"
+        )
+    x = np.mod(y_out + x_lpt(q, psi1, psi2, d_final), box_size)
+    return x, u_out, dict(
+        n_tiles=len(tiles), t_lag=t_lag, b_lag=b_lag, n_out_core_total=n_out_total,
+        p_side=per_tile[0]["p_side"], b_realized=per_tile[0]["b_realized"],
+        filled_ok=True,
+    )
