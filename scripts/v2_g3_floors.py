@@ -64,14 +64,21 @@ OUT_DIR = os.path.join(os.path.dirname(HERE), "runs", "v2")
 # legs fixed. Plus an equilateral control at the same k_short -- if tiling (or
 # any perturbation) hurts both equally the error is generic, not a squeezed
 # coupling failure, and the whole squeezed framing is wrong.
+# Defaults are the cdev8 exploration set. The GATE set is pinned at cdev, where
+# x = m * P / n_fine with P = 96 at the Stage 5 geometry T=64/b=16 puts x = 1 at
+# m = 5.33, so m = 1..7 straddles the threshold with five points below and two
+# above. Overridable so one script serves both configs and the deneb job states
+# its own set rather than inheriting a constant tuned for another box.
 LONG_MULTS = (2, 3, 4, 6)
 K_SHORT_MULT = 12
 
 
-def _triangles(kf):
-    squeezed = [(m * kf, K_SHORT_MULT * kf, K_SHORT_MULT * kf) for m in LONG_MULTS]
-    equilateral = [(K_SHORT_MULT * kf, K_SHORT_MULT * kf, K_SHORT_MULT * kf)]
-    return squeezed + equilateral, ["sq%d" % m for m in LONG_MULTS] + ["equi"]
+def _triangles(kf, long_mults=None, k_short_mult=None):
+    lm = LONG_MULTS if long_mults is None else tuple(long_mults)
+    ks = K_SHORT_MULT if k_short_mult is None else int(k_short_mult)
+    squeezed = [(m * kf, ks * kf, ks * kf) for m in lm]
+    equilateral = [(ks * kf, ks * kf, ks * kf)]
+    return squeezed + equilateral, ["sq%d" % m for m in lm] + ["equi"]
 
 
 # ===========================================================================
@@ -275,13 +282,16 @@ def translate(delta, shift):
 # ===========================================================================
 
 
-def section_D(cfg, seed, out):
+def section_D(cfg, seed, out, long_mults=None, k_short_mult=None):
     """Discriminators against KNOWN answers, before they judge anything."""
     print("\n=== D: discriminator validation (known-answer, field-level) ===")
     d_m, g = evolved_field(cfg, seed)
     ell = g["L"]
     kf = 2.0 * np.pi / ell
-    tris, names = _triangles(kf)
+    tris, names = _triangles(kf, long_mults, k_short_mult)
+    print(f"  k_f = {kf:.4f} h/Mpc; k_long = "
+          + ", ".join(f"{float(t[0]):.3f}" for t in tris[:-1])
+          + f"; k_short = {float(tris[0][1]):.3f} h/Mpc")
 
     d_t, tk_grid = apply_window(d_m, ell)
     s = stats(d_t, d_m, ell, tris)
@@ -561,6 +571,10 @@ def main():
     ap.add_argument("--sections", default="DABC", help="subset of D, A, BC, E, F")
     ap.add_argument("--neps-seed", type=int, default=8, help="seeds for section E (2 evolves each)")
     ap.add_argument("--out-suffix", default="")
+    ap.add_argument("--long-mults", type=int, nargs="+", default=None,
+                    help="k_long shell centres in units of k_f (default: the cdev8 set)")
+    ap.add_argument("--k-short-mult", type=int, default=None,
+                    help="k_short shell centre in units of k_f")
     args = ap.parse_args()
 
     import jax
@@ -571,7 +585,9 @@ def main():
     print("MONOLITHIC PAIRS ONLY -- no tiled arm exists in this script by design.")
     out = dict(config=args.config, seed=args.seed, sections=args.sections)
 
-    d_m, g, tris, names = section_D(args.config, args.seed, out)
+    d_m, g, tris, names = section_D(
+        args.config, args.seed, out, args.long_mults, args.k_short_mult
+    )
     out["geometry"] = {k: float(v) if isinstance(v, (int, float, np.generic)) else v
                        for k, v in g.items()}
     if "A" in args.sections:
