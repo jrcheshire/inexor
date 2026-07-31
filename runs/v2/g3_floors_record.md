@@ -212,6 +212,73 @@ of magnitude, which is the only reason it is in the deliverable.
 gate-eligible triangle, by the criterion `sigma_B <= bar/3`. Nothing here is
 close to making the 15% bar a bound.
 
+## The PIN run at cdev (deneb job 282, 2026-07-31, main @170c8f4)
+
+`cdev`: `n_part=256`, `n_fine=512`, `L=128` Mpc/h, same 0.25 Mpc/h cell. Gate
+set `m = 1..7` with `k_short = 24 k_f = 1.178 h/Mpc`, chosen to match cdev8's
+`k_short` in PHYSICAL units. 24 seeds, 1h42m wall (213.9 s/seed; the 55-70 min
+estimate was ~1.8x optimistic -- cdev8 -> cdev costs more than the 8x volume
+ratio). Card: `runs/v2/g3_floors_cdev_pin.json`.
+
+Every floor improves over cdev8:
+
+| tri | sigma_B(`R_Q`) | sigma_C | cancel | sigma_G/\|B\| | C/G | n_tri |
+|---|---|---|---|---|---|---|
+| sq1 | 4.86e-04 | 0.436 | 898 | 0.0461 | 9.5 | 50976 |
+| sq2 | 3.23e-04 | 0.379 | 1175 | 0.0410 | 9.3 | 98400 |
+| sq3 | 5.11e-04 | 0.408 | 797 | 0.0482 | 8.5 | 110208 |
+| sq4 | 3.85e-04 | 0.361 | 938 | 0.0387 | 9.3 | 181728 |
+| sq5 | 2.67e-04 | 0.378 | 1414 | 0.0354 | 10.7 | 242112 |
+| sq6 | 2.40e-04 | 0.381 | 1588 | 0.0363 | 10.5 | 259392 |
+| sq7 | 1.87e-04 | 0.378 | 2021 | 0.0346 | 10.9 | 299400 |
+
+`r(k_long)` mean 0.99999982. `R_Q` under the window 0.0449 (the 1/T response
+reconfirmed); `rho` flat to 1.97e-04; `W` floor 2.02e-04, and section F gives
+`W(g=0.08)/floor` = 73-148. Instrument floor: bit-repro 0, translation 6.7e-16,
+f32-state-vs-f64 7.7e-07.
+
+**Resolvability: MEASUREMENT on every gate triangle, by 100-270x.**
+`sigma_B(R_Q)` = 1.9e-04 to 5.1e-04 against `bar/3` = 5.0e-02.
+
+### Two problems the pin run exposed
+
+**1. The equilateral control is INERT at cdev, so its Floor B is NOT measured.**
+The injected window is `1 + 0.05 exp(-(k/k0)^2)` with `k0 = 6 k_f`, and the
+equilateral sits with all three legs at `k_short = 24 k_f`, where
+`T - 1 = 5.6e-09` and `T^3 - 1 = 1.7e-08`. So its `R_B` reads 0.000000 (residual
+8.0e-11) and its `sigma_B(R_Q)` reads 1.3e-10 with a cancellation factor of
+2.5e+09. Those are not a floor -- they are the scatter of a quantity that is
+identically zero by construction. At cdev8 the window did reach `k_short`
+(12 `k_f`, `T^3-1 = 2.8e-03`) so the control had a response there; the physical
+`k_short` match is what moved it out of the window's support.
+
+Consequence: the equilateral is a reported CONTROL, not a gate triangle, so this
+does not touch the gate. But reading the control at Stage 5 ("does tiling hurt
+equilateral as much as squeezed?") requires knowing its resolving power, and
+that number does not exist at cdev. Fix is a section-BC re-run with a window
+that has support at `k_short` -- a scale-flat 5% window gives every triangle a
+response (`R_B = 0.158`, `R_Q = -0.0476` for all of them) and costs another
+~1.4 h on deneb.
+
+**2. The Gaussian-sigma diagnostic does not discriminate, at EITHER config.**
+The plan expected measured/analytic to differ a lot for squeezed and AGREE for
+equilateral, the point being that agreement on squeezed would prove the
+estimator blind to squeezed physics. Measured:
+
+| config | squeezed C/G | equilateral C/G |
+|---|---|---|
+| cdev8 | 14.3 - 23.1 | 19.5 |
+| cdev | 8.5 - 10.9 | 9.1 |
+
+Nothing agrees, at either box. The cause is now clear and is not the box: the
+equilateral sits at `k_short`, which is 1.18 h/Mpc and therefore nonlinear
+REGARDLESS of `L` (`k_nl ~ 0.2-0.3`). Growing the box from 64 to 128 Mpc/h moved
+`C/G` from ~19 to ~9 but cannot make `k = 1.18` linear. For the diagnostic to
+behave as the plan predicted, the equilateral would have to sit at a LINEAR `k`
+(all legs at 2-3 `k_f`), which is a different triangle from the `k_short`-matched
+control and would serve a different purpose. Recorded rather than fixed: the
+diagnostic as specified cannot work with a `k_short`-matched equilateral.
+
 ## Checkpoint OUTCOME (JC, 2026-07-31)
 
 1. **Gate on `R_Q`, require `rho` to agree.** `R_Q` stays the gate statistic per
