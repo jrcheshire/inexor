@@ -130,6 +130,33 @@ A2 C2C-streamed (GH), A2 all-HBM, A1 monolithic. Decision rule at V4: stay on
 the Pareto front, B/p primary, but a point that buys 2x memory for >5x SU
 needs an explicit JC sign-off.
 
+### V4 candidate: f32 for the force MESH and FFT workspace (JC, 2026-07-31)
+
+**Not the state.** D-v2-8 ratified T9 at 9 B/p (int8 cell-relative positions +
+int16 velocity); f32 positions and velocities are 24 B/p, so the codec already
+beats f32 by 2.7x and there is nothing to win on the state side.
+
+**The mesh is a different term, and it is the one that dominates.** The measured
+cgh64 CPU working set is 125 GB at `n_fine = 1024`, against ~48 GB of device
+state at 360 B/p. An f64 `1024^3` mesh alone is 8.6 GB and the force needs
+several of those plus complex FFT workspace. Halving that term is worth roughly
+2x volume at fixed memory, or ~26% more cells per side -- squarely the v2 thesis
+(maximize volume x resolution per node, compute freely traded for memory).
+
+**Nothing measured to date bears on it.** `force_global` paints through
+`paint_f32(pos, n_mesh, box_size, fdtype=jnp.float64)` and returns f64
+regardless of the dtype of the positions handed in (confirmed: f32 positions
+in, f64 force out). G3 Stage 3's f32 rung therefore carried the STATE only, and
+its 1.1e-6 in `R_Q` licenses nothing about an f32 force solve.
+
+**What it would take.** Thread an `fdtype` through `density_f64` / `force_global`
+(the package paint already accepts one), then re-run
+`scripts/v2_g3_floors.py` unchanged and read the result against the MESH FLOOR
+rather than against zero -- the same discipline D-v2-8's codec ladder used. It
+is a change to the running version that D-v2-9's P(k) bar and G6's transfer
+calibration were both established at, so it needs its own gate and cannot ride
+on theirs.
+
 ## 4. What carries from v1
 
 | v1 asset | v2 role |
