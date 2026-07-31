@@ -215,6 +215,22 @@ def _degeneracy(p_side, n_fine, n_tile):
     )
 
 
+def _tile_picks(n_side, n_tiles):
+    """The sampled tile indices. Factored out so R2 and R3 sample the SAME tiles.
+
+    If the two statistics drew different tiles their ratio would mix a genuine
+    frame effect with tile-to-tile scatter, which at n_tiles = 4 is large (the
+    cdev T=32 rel_max ladder is non-monotone in b).
+    """
+    picks = []
+    step = max(1, n_side // n_tiles)
+    for i in range(0, n_side, step):
+        picks.append((i, (i * 2) % n_side, (i * 3) % n_side))
+        if len(picks) >= n_tiles:
+            break
+    return picks
+
+
 def force_fidelity(x_fin, qi, g_mono, g, n_tile, b_fine, n_tiles=R2_TILES):
     """R2: tile force vs monolithic force on CORE particles, over n_tiles tiles."""
     from v2_g5_core import padded_size
@@ -227,12 +243,7 @@ def force_fidelity(x_fin, qi, g_mono, g, n_tile, b_fine, n_tiles=R2_TILES):
     n_side = n_fine // n_tile
     blk = qi // t_lag
 
-    picks = []
-    step = max(1, n_side // n_tiles)
-    for i in range(0, n_side, step):
-        picks.append((i, (i * 2) % n_side, (i * 3) % n_side))
-        if len(picks) >= n_tiles:
-            break
+    picks = _tile_picks(n_side, n_tiles)
 
     rels = []
     for tijk in picks:
@@ -267,6 +278,158 @@ def force_fidelity(x_fin, qi, g_mono, g, n_tile, b_fine, n_tiles=R2_TILES):
 
 
 # ===========================================================================
+# R3: the same error measured in the COLA residual force
+# ===========================================================================
+
+
+def _core_and_members(qi, n_part, n_fine, n_tile, b_real, tijk):
+    """(core mask, member index) for one tile. Lagrangian, so FIELD-INDEPENDENT.
+
+    Both R3 arms must use the identical particle set: the tile geometry is the
+    thing held fixed, and the only difference between the arms is the
+    configuration the force is solved on.
+    """
+    t_lag = n_tile * n_part // n_fine
+    b_lag = int(np.ceil(b_real * n_part / n_fine))
+    blk = qi // t_lag
+    core = np.ones(qi.shape[0], bool)
+    member = np.ones(qi.shape[0], bool)
+    for j in range(3):
+        core &= blk[:, j] == tijk[j]
+        lo = tijk[j] * t_lag - b_lag
+        member &= ((qi[:, j] - lo) % n_part) < (t_lag + 2 * b_lag)
+    return core, np.where(member)[0], b_lag
+
+
+def force_fidelity_cola(x_fin, kick_lpt, bcoef, qi, g_mono, g, n_tile, b_fine,
+                        n_tiles=R2_TILES):
+    """R3: tile-vs-mono error in the NET COLA KICK, on core particles.
+
+    R2 compares the raw force, but the raw force is not what an sCOLA tile
+    integrates. cola_step_bullfrog (v2_g3_core.py:242) applies
+
+        u <- alpha u + bcoef g + c_k1 Psi1 + c_k2 Psi2
+
+    so the quantity the residual state actually receives is the WHOLE
+    right-hand side, and the question R2 cannot answer is whether the analytic
+    Psi terms cancel the part of g that a truncated tile gets wrong. Here
+    kick_lpt = c_k1 Psi1 + c_k2 Psi2 is passed in from the real BullFrog
+    coefficients rather than reconstructed, and the statistic is
+
+        rms(bcoef (g_tile - g_mono)) / rms(bcoef g_mono + kick_lpt).
+
+    Note what did NOT change: the numerator is still the raw force difference,
+    because Psi1 and Psi2 are sliced from the GLOBAL frame and are bit-identical
+    between the arms. Only the denominator changes. That is the whole content of
+    the test -- if the frame cancels most of g, the same absolute force error is
+    a LARGER fraction of the kick, not a smaller one, and sCOLA is in worse
+    shape than R2 suggested rather than better.
+
+    A first attempt defined the residual as g - force(x_LPT), solving the LPT
+    configuration on the same padded tile. That is a different quantity: the
+    Psi terms are displacement fields (the LINEAR force), not the force on the
+    LPT-displaced configuration, and the two agree only while the field is
+    linear. The vacuity guard below caught it at smoke (frame_cancel 0.9997).
+
+    VACUITY GUARD: frame_cancel = rms(kick)/rms(bcoef g), reported PER TILE.
+    Near 1 means the analytic terms cancel nothing, R3 carries no information
+    R2 did not, and NEITHER a better nor a worse rel may be read as a result.
+    """
+    n_fine, n_part, box_size = g["n_fine"], g["n_part"], g["L"]
+    n_global = n_part**3
+    p_side, b_real = padded_size_cached(n_tile, b_fine, n_fine)
+    n_side = n_fine // n_tile
+
+    rel_cola, rel_raw, frame_cancel = [], [], []
+    uniform_frac, rel_fluc = [], []
+    for tijk in _tile_picks(n_side, n_tiles):
+        core, idx, _ = _core_and_members(qi, n_part, n_fine, n_tile, b_real, tijk)
+        core_in_member = core[idx]
+        g_tile, _, _, _ = tile_force_mono(
+            x_fin[idx], tijk, n_tile, b_fine, n_fine, box_size, n_global
+        )
+        d_raw = g_tile[core_in_member] - g_mono[core]
+        kick_mono = bcoef * g_mono[core] + kick_lpt[core]
+
+        rms_kick = float(np.sqrt((kick_mono**2).sum(axis=1).mean()))
+        rms_g = float(np.sqrt((g_mono[core] ** 2).sum(axis=1).mean()))
+        rel_cola.append(float(np.sqrt(((bcoef * d_raw) ** 2).sum(axis=1).mean())) / rms_kick)
+        rel_raw.append(float(np.sqrt((d_raw**2).sum(axis=1).mean())) / rms_g)
+        frame_cancel.append(rms_kick / (abs(bcoef) * rms_g))
+
+        # The part of the error that a TRANSLATION-INVARIANT statistic can see.
+        # A force error uniform across the core moves the whole tile rigidly, and
+        # R_Q (a bispectrum ratio) cannot see a rigid translation. Reported as a
+        # decomposition, NOT as a replacement for rel_raw: the per-tile uniform
+        # terms differ between tiles, so they still move tiles relative to one
+        # another and land in the large-scale field that D-v2-9 gates separately.
+        d_bar = d_raw.mean(axis=0)
+        g_bar = g_mono[core].mean(axis=0)
+        rms_d = float(np.sqrt((d_raw**2).sum(axis=1).mean()))
+        uniform_frac.append(float(np.sqrt((d_bar**2).sum())) / rms_d if rms_d > 0 else 0.0)
+        rel_fluc.append(
+            float(np.sqrt(((d_raw - d_bar) ** 2).sum(axis=1).mean()))
+            / float(np.sqrt(((g_mono[core] - g_bar) ** 2).sum(axis=1).mean()))
+        )
+
+    return dict(
+        n_tile=int(n_tile),
+        b_requested=int(b_fine),
+        b_realized=int(b_real),
+        padded_P=int(p_side),
+        n_tiles_sampled=len(rel_cola),
+        rel_cola_median=float(np.median(rel_cola)),
+        rel_cola_max=float(np.max(rel_cola)),
+        rel_raw_median=float(np.median(rel_raw)),
+        rel_raw_max=float(np.max(rel_raw)),
+        frame_cancel_median=float(np.median(frame_cancel)),
+        uniform_frac_median=float(np.median(uniform_frac)),
+        rel_fluc_median=float(np.median(rel_fluc)),
+        rel_fluc_max=float(np.max(rel_fluc)),
+        rel_cola_all=[float(v) for v in rel_cola],
+        rel_raw_all=[float(v) for v in rel_raw],
+        rel_fluc_all=[float(v) for v in rel_fluc],
+        uniform_frac_all=[float(v) for v in uniform_frac],
+        vol_ratio=(p_side / n_tile) ** 3,
+        **_degeneracy(p_side, n_fine, n_tile),
+    )
+
+
+def padded_size_cached(n_tile, b_fine, n_fine):
+    from v2_g5_core import padded_size
+
+    return padded_size(n_tile, b_fine, n_fine=n_fine)
+
+
+def identity_cola_one_tile_is_box(x_fin, kick_lpt, bcoef, g_mono, n_fine, box_size,
+                                  n_global, tol=1e-10):
+    """R3's degenerate limit: at T = n_fine, b = 0 the tile IS the box, so the
+    kick error must be identically zero.
+
+    R2 has this guard already, but R3 divides by a DIFFERENT denominator that is
+    itself a computed quantity. A kick_lpt built at the wrong step's
+    coefficients, or with Psi in the wrong units, would leave the numerator
+    correct and silently rescale every row. This guard would not catch that on
+    its own -- it is the frame_cancel column that has to be read for it -- so
+    the denominator is also asserted finite and non-degenerate here.
+    """
+    g_tile, p_side, b_real, n_out = tile_force_mono(
+        x_fin, (0, 0, 0), n_fine, 0, n_fine, box_size, n_global
+    )
+    kick = bcoef * g_mono + kick_lpt
+    rms_kick = float(np.sqrt((kick**2).sum(axis=1).mean()))
+    rel = float(np.sqrt(((bcoef * (g_tile - g_mono)) ** 2).sum(axis=1).mean())) / rms_kick
+    ok = bool(
+        rel < tol and p_side == n_fine and b_real == 0 and n_out == 0
+        and np.isfinite(rms_kick) and rms_kick > 0.0
+    )
+    return dict(
+        rel=rel, tol=tol, p_side=int(p_side), b_realized=int(b_real), n_outside=n_out,
+        rms_kick=rms_kick, ok=ok
+    )
+
+
+# ===========================================================================
 # main
 # ===========================================================================
 
@@ -277,6 +440,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--nsteps", type=int, default=N_STEPS)
     ap.add_argument("--skip-r2", action="store_true", help="containment only (no force solves)")
+    ap.add_argument("--skip-r3", action="store_true", help="no COLA-residual force legs")
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args()
 
@@ -323,6 +487,14 @@ def main():
 
     g_mono = np.asarray(force_mono(jnp.asarray(x_fin, jnp.float64)), np.float64)
     qi = lagrangian_index(q, n_part, L)
+
+    # The analytic half of the COLA kick, at the LAST step -- the one whose force
+    # evaluation sits closest to x_fin, where g_mono is measured. Taken from
+    # bullfrog_cola_coeffs rather than rebuilt, so R3 cannot drift from the
+    # stepper it is meant to describe.
+    cola_c = g3.bullfrog_cola_coeffs(table)
+    _, _, bcoef_k, _, c_k1, c_k2, _ = (float(v) for v in cola_c[-1])
+    kick_lpt = c_k1 * psi1 + c_k2 * psi2
 
     # ---- degenerate limit FIRST -------------------------------------------
     ident = identity_one_tile_is_box(x_fin, g_mono, n_fine, L, n_global)
@@ -391,6 +563,51 @@ def main():
                     f"{rec['vol_ratio']:7.2f} {rec['rel_median']:9.4f} {rec['rel_max']:9.4f}{flag}"
                 )
 
+    r3, ident_cola = [], None
+    if not args.skip_r3:
+        ident_cola = identity_cola_one_tile_is_box(
+            x_fin, kick_lpt, bcoef_k, g_mono, n_fine, L, n_global
+        )
+        print("\n=== R3 degenerate limit: net kick, one tile == the whole box ===")
+        print(f"  rel = {ident_cola['rel']:.3e} (tol {ident_cola['tol']:.0e})   "
+              f"ok = {ident_cola['ok']}")
+        if not ident_cola["ok"]:
+            print("  REFUSING to report R3: the single-tile residual force does not")
+            print("  reproduce the monolithic residual force where they are the same solve.")
+            sys.exit(1)
+
+        gc_all = float(
+            np.sqrt(((bcoef_k * g_mono + kick_lpt) ** 2).sum(axis=1).mean())
+            / (abs(bcoef_k) * np.sqrt((g_mono**2).sum(axis=1).mean()))
+        )
+        print("\n=== R3 net COLA kick: tile vs monolithic on CORE particles ===")
+        print(f"  whole-box frame cancellation rms|kick| / rms|bcoef F| = {gc_all:.4f}")
+        print("  (near 1 => the frame cancels nothing here and R3 has no power over R2;")
+        print("   well BELOW 1 => the same force error is a LARGER fraction of the kick)")
+        print(f"  {'T':>5s} {'b':>4s} {'b Mpc/h':>8s} {'P':>5s} {'vol x':>7s} "
+              f"{'rel med':>9s} {'rel max':>9s} {'raw max':>9s} {'cancel':>7s} "
+              f"{'unif':>6s} {'fluc med':>9s}")
+        for t in cores:
+            for b in BUF_FINE:
+                try:
+                    padded_size(t, b, n_fine=n_fine)
+                except ValueError:
+                    continue
+                rec = force_fidelity_cola(x_fin, kick_lpt, bcoef_k, qi, g_mono, g, t, b)
+                r3.append(rec)
+                flag = (
+                    "  DEGENERATE (tile == box, 0 by construction)"
+                    if rec["degenerate"]
+                    else ("  near-deg" if rec["near_degenerate"] else "")
+                )
+                print(
+                    f"  {t:5d} {b:4d} {rec['b_realized'] * cell:8.1f} {rec['padded_P']:5d} "
+                    f"{rec['vol_ratio']:7.2f} {rec['rel_cola_median']:9.4f} "
+                    f"{rec['rel_cola_max']:9.4f} {rec['rel_raw_max']:9.4f} "
+                    f"{rec['frame_cancel_median']:7.4f} {rec['uniform_frac_median']:6.3f} "
+                    f"{rec['rel_fluc_median']:9.4f}{flag}"
+                )
+
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"g3_buffer_cost_{args.config}{args.out_suffix}.json")
     with open(path, "w") as f:
@@ -405,6 +622,8 @@ def main():
                 blocks=blocks,
                 containment=r1,
                 force_fidelity=r2,
+                identity_cola_one_tile_is_box=ident_cola,
+                cola_force_fidelity=r3,
             ),
             f,
             indent=2,
