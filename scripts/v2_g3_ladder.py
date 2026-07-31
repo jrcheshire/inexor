@@ -394,9 +394,26 @@ def rung_buffer_monotonicity(B, res, n_tile, tris, names, b_list=None):
             g["n_part"], n_tile, b, B["d_final"],
         )
         s = _stats_vs_mono(x_t, B, tris)
+        # r(k) ALONGSIDE R_Q, because the two can disagree about whether the
+        # buffer is helping. R_Q evaluated where the arms have decorrelated is
+        # not a bias measurement -- it is the difference of two fields with no
+        # phase relation, and its ordering in b is then noise. r is the clean
+        # monotone diagnostic; if r rises with b while max|R_Q| wanders, the
+        # non-monotonicity is a property of the STATISTIC, not of the physics.
+        import v2_g3_floors as fl
+        from inexor import painting
+
+        centers = sorted({float(k) for t in tris for k in t})
+        d_t = np.asarray(painting.density_contrast(
+            x_t, g["n_fine"], g["L"], g["n_part"] ** 3, paint="int"), np.float64)
+        d_m = np.asarray(painting.density_contrast(
+            B["x_mono"], g["n_fine"], g["L"], g["n_part"] ** 3, paint="int"), np.float64)
+        _, r_sh = fl.shell_transfer(d_t, d_m, g["L"], centers, 2.0 * np.pi / g["L"])
         rows.append(dict(b=int(b), b_realized=int(b_real), p_side=int(p_side),
                          p_frac=float(p_side) / float(g["n_fine"]),
                          max_abs_R_Q=float(np.nanmax(np.abs(s["R_Q"]))),
+                         r=[float(v) for v in r_sh],
+                         r_kshort=float(r_sh[-1]), r_klong=float(r_sh[0]),
                          R_Q=list(s["R_Q"])))
     res["buffer_monotonicity"] = dict(n_tile=int(n_tile), names=names, rows=rows)
     return res["buffer_monotonicity"]
@@ -493,13 +510,27 @@ def main():
 
         print("\n  === buffer_monotonicity (report rung; diagnoses the bracket) ===")
         bm = rung_buffer_monotonicity(B, res, n_tile, tris, names, b_list=args.b_scan)
-        print(f"  {'b':>5s} {'b_real':>7s} {'P':>5s} {'P/n_fine':>9s} {'max|R_Q|':>11s}")
+        print(f"  {'b':>5s} {'b_real':>7s} {'P':>5s} {'P/n_fine':>9s} {'max|R_Q|':>11s} "
+              f"{'r(k_long)':>10s} {'r(k_short)':>11s}")
         for r in bm["rows"]:
             print(f"  {r['b']:5d} {r['b_realized']:7d} {r['p_side']:5d} "
-                  f"{r['p_frac']:9.3f} {r['max_abs_R_Q']:11.4e}")
+                  f"{r['p_frac']:9.3f} {r['max_abs_R_Q']:11.4e} "
+                  f"{r['r_klong']:10.6f} {r['r_kshort']:11.6f}")
         vals = [r["max_abs_R_Q"] for r in bm["rows"]]
         mono = all(vals[i] >= vals[i + 1] for i in range(len(vals) - 1))
-        print(f"  monotone decreasing in b: {'YES' if mono else 'NO'}")
+        rl = [r["r_klong"] for r in bm["rows"]]
+        rs = [r["r_kshort"] for r in bm["rows"]]
+        mono_rl = all(rl[i] <= rl[i + 1] for i in range(len(rl) - 1))
+        mono_rs = all(rs[i] <= rs[i + 1] for i in range(len(rs) - 1))
+        print(f"  max|R_Q| monotone decreasing in b: {'YES' if mono else 'NO'}")
+        print(f"  r(k_long)  monotone increasing in b: {'YES' if mono_rl else 'NO'}")
+        print(f"  r(k_short) monotone increasing in b: {'YES' if mono_rs else 'NO'}")
+        if (mono_rl or mono_rs) and not mono:
+            print("  => the buffer DOES help monotonically (r), while max|R_Q| wanders.")
+            print("     R_Q evaluated where r ~ 0 is not a bias measurement, so its")
+            print("     ordering in b is noise. Read r before reading R_Q.")
+        res["bracket_summary"]["r_klong_monotone"] = bool(mono_rl)
+        res["bracket_summary"]["r_kshort_monotone"] = bool(mono_rs)
         if not mono:
             print("  NOT monotone -> read P/n_fine first: a tile covering most of the")
             print("  box is not a tile, and the buffer was never the controlling variable.")
