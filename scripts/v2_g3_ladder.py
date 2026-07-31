@@ -329,6 +329,33 @@ def bracket_controls(B, res, n_tile, b_fine, tris, names):
     )
     s_piv = _stats_vs_mono(x_piv, B, tris)
 
+    # r(k) PER SHELL, for every arm. rho divides by the measured transfer, so it
+    # is only interpretable where the arms are still correlated -- and a tiled
+    # arm CAN decorrelate outright at small scales. Without this column an
+    # exploding rho looks like a bug in rho rather than what it is: the
+    # conditioning cut doing its job. Stage 3 predicted exactly this and the
+    # first cdev8 ladder run hit it (T_prod ~ 1.2e-5 at k_short = 2.36 h/Mpc).
+    import v2_g3_floors as fl
+    from inexor import painting
+
+    gg = B["g"]
+    centers = sorted({float(k) for t in tris for k in t})
+    kf_ = 2.0 * np.pi / gg["L"]
+
+    def _d(x):
+        return np.asarray(
+            painting.density_contrast(x, gg["n_fine"], gg["L"], gg["n_part"] ** 3, paint="int"),
+            np.float64,
+        )
+
+    d_mono = _d(B["x_mono"])
+    rk = {}
+    for arm_name, xa in (("pivot", x_piv), ("kill_control", x_kill), ("span_check", x_2lpt)):
+        t_sh, r_sh = fl.shell_transfer(_d(xa), d_mono, gg["L"], centers, kf_)
+        rk[arm_name] = dict(centers=[float(c) for c in centers],
+                            T=[float(v) for v in t_sh], r=[float(v) for v in r_sh])
+    out["shell_r"] = rk
+
     out["kill_control"] = {k: list(s_kill[k]) for k in ("R_B", "R_Q", "rho", "W")}
     out["span_check"] = {k: list(s_2lpt[k]) for k in ("R_B", "R_Q", "rho", "W")}
     out["pivot"] = {k: list(s_piv[k]) for k in ("R_B", "R_Q", "rho", "W")}
@@ -448,6 +475,14 @@ def main():
         mp = float(np.nanmax(np.abs(br["pivot"]["R_Q"])))
         mk = float(np.nanmax(np.abs(br["kill_control"]["R_Q"])))
         m2 = float(np.nanmax(np.abs(br["span_check"]["R_Q"])))
+        print(f"\n  {'k':>8s} " + " ".join(f"{'r[' + a[:4] + ']':>11s}"
+              for a in ("pivot", "kill", "span")))
+        rr = br["shell_r"]
+        for i, c in enumerate(rr["pivot"]["centers"]):
+            print(f"  {c:8.4f} " + " ".join(f"{rr[a]['r'][i]:11.6f}"
+                  for a in ("pivot", "kill_control", "span_check")))
+        print("  (rho is only interpretable where r is not near 0; a decorrelated")
+        print("   arm makes the measured transfer tiny and rho explodes by construction)")
         print(f"\n  max|R_Q|: pivot {mp:.4f}   kill(b=0) {mk:.4f}   span(2LPT) {m2:.4f}")
         print(f"  gate has POWER      (kill > bar=0.15):  {'YES' if mk > 0.15 else 'NO'}")
         print(f"  gate has RANGE      (2LPT > bar=0.15):  {'YES' if m2 > 0.15 else 'NO'}")
