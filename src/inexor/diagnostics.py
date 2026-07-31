@@ -233,8 +233,13 @@ def _band_fields(delta, theta, want_i=True):
     return jnp.fft.irfftn(delta_k * theta, s=(n, n, n), axes=axes)
 
 
-def _triple_sums(fields, tri_idx):
-    """sum_x F_a F_b F_c for each triangle, via lax.scan.
+def _triple_sums(f_a, f_b, f_c, tri_idx):
+    """sum_x A_a B_b C_c for each triangle, via lax.scan.
+
+    Three separate stacks so the estimator does CROSS-bispectra: leg j of every
+    triangle is drawn from stack j. Pass the same stack three times for the auto
+    case. This is what the W discriminator needs -- W puts a residual field on
+    the long leg and the reference field on the two short legs.
 
     A scan rather than a vmap on purpose: vmap would materialize one real
     (N, N, N) temporary PER TRIANGLE, so the peak would scale with the triangle
@@ -244,7 +249,7 @@ def _triple_sums(fields, tri_idx):
     import jax.numpy as jnp
 
     def body(carry, t):
-        return carry, jnp.sum(fields[t[0]] * fields[t[1]] * fields[t[2]])
+        return carry, jnp.sum(f_a[t[0]] * f_b[t[1]] * f_c[t[2]])
 
     _, out = jax.lax.scan(body, None, tri_idx)
     return out
@@ -260,17 +265,30 @@ def bispectrum_core(delta, theta, tri_idx, alpha, n_mesh, j_fields=None):
     """
     import jax.numpy as jnp
 
-    i_fields = _band_fields(delta, theta)
-    if i_fields.dtype != jnp.float64:
+    legs = delta if isinstance(delta, (tuple, list)) else (delta, delta, delta)
+    if len(legs) != 3:
+        raise ValueError(f"delta must be one field or exactly 3 (one per leg); got {len(legs)}")
+    # Distinct arrays only: the auto case must not pay 3x the band-field memory,
+    # which is the resident cost of the whole estimator.
+    uniq, stacks = [], []
+    for f in legs:
+        for k, seen in enumerate(uniq):
+            if f is seen:
+                stacks.append(stacks[k])
+                break
+        else:
+            uniq.append(f)
+            stacks.append(_band_fields(f, theta))
+    if stacks[0].dtype != jnp.float64:
         raise TypeError(
-            f"band fields are {i_fields.dtype}, not float64 -- enable x64 in the CALLER "
+            f"band fields are {stacks[0].dtype}, not float64 -- enable x64 in the CALLER "
             "(jax.config.update('jax_enable_x64', True)). Library code does not toggle "
             "it, and an f32 bispectrum does not fail, it just moves every tolerance."
         )
     if j_fields is None:
         j_fields = _band_fields(None, theta, want_i=False)
-    s = _triple_sums(i_fields, tri_idx)
-    norm = _triple_sums(j_fields, tri_idx)
+    s = _triple_sums(stacks[0], stacks[1], stacks[2], tri_idx)
+    norm = _triple_sums(j_fields, j_fields, j_fields, tri_idx)
     n_tri = float(n_mesh) ** 6 * norm
     # Non-closing bin triples have no mode-triplets at all. mbody documents
     # n_tri = 0 for these but still divides, which in f32 round-off returns a
@@ -298,7 +316,9 @@ def bispectrum(delta, box_size, triangles, dk=None, j_fields=None):
     triangle count cancels between the data and the J normalization), so a
     correct field returns B with no free constant. mbody fields.py:174 port.
 
-    delta : real (N, N, N) field.
+    delta : real (N, N, N) field, or a 3-tuple of them for a CROSS-bispectrum
+        (leg j is drawn from field j, in the triangle's own leg order). The
+        auto case shares one band-field stack rather than building three.
     triangles : sequence of (k1, k2, k3) shell centers in h/Mpc. Fully general;
         a triple whose bins cannot close returns n_tri = 0 and B = NaN.
     dk : None (k_fundamental), a scalar, or a 3-sequence for a PER-LEG width.
@@ -316,8 +336,12 @@ def bispectrum(delta, box_size, triangles, dk=None, j_fields=None):
     enters at all.
     """
     centers, widths, tri_idx = _shell_spec(triangles, box_size, dk)
-    delta = np.asarray(delta, dtype=np.float64)
-    n = delta.shape[0]
+    if isinstance(delta, (tuple, list)):
+        delta = tuple(np.asarray(f, dtype=np.float64) for f in delta)
+        n = delta[0].shape[0]
+    else:
+        delta = np.asarray(delta, dtype=np.float64)
+        n = delta.shape[0]
     theta = _theta_stack(n, box_size, centers, widths)
     alpha = box_size**6 / float(n) ** 9
     b, n_tri = bispectrum_core(delta, theta, tri_idx, alpha, n, j_fields=j_fields)
