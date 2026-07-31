@@ -3,7 +3,7 @@
 #SBATCH --output=%x-%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=48G
 #SBATCH --time=04:00:00
 #
@@ -39,6 +39,12 @@
 # it would cost another 48 evolves (~1.6 h) to re-confirm a negative.
 
 set -euo pipefail
+
+# -c 64 = the whole node as Slurm counts it (CPUTot=64), matching the house
+# pattern in v2_g3_buffer_cost_deneb.sbatch:37. XLA-CPU spins a MACHINE-sized
+# spin-waiting thread pool per process, so at -c 32 the cgroup strangles a pool
+# that was sized for 64 and the job spends its wall in contention.
+export OMP_NUM_THREADS=64
 
 # deneb batch shells have no pixi on PATH (job 272 died on this in under a
 # second); the prerequisite guard below fails loudly rather than mid-run.
