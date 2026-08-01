@@ -51,6 +51,15 @@ OUT_DIR = os.path.join(os.path.dirname(HERE), "runs", "v2")
 # -space analogue, set well above roundoff and far below anything physical.
 ALGEBRAIC_TOL = 1e-12
 
+# CONDITIONING CUT (JC, 2026-07-31). R_Q is only interpretable where the two arms
+# still share phases: the ratio of two DECORRELATED fields' bispectra tends to a
+# bounded value, so R_Q saturates and can then DECREASE with increasing
+# brokenness. Measured at cdev8/T=64: r(k_short) = 0.014 at b=0 rising to 0.668
+# at b=64, over which max|R_Q| went 0.251 / 0.421 / 0.398 / 0.300 / 0.110 -- non
+# monotone, with the break at the most decorrelated row. Below this cut an R_Q is
+# reported but NOT gated.
+R_CONDITION_CUT = 0.5
+
 
 class RungFailure(AssertionError):
     pass
@@ -492,6 +501,8 @@ def main():
         mp = float(np.nanmax(np.abs(br["pivot"]["R_Q"])))
         mk = float(np.nanmax(np.abs(br["kill_control"]["R_Q"])))
         m2 = float(np.nanmax(np.abs(br["span_check"]["R_Q"])))
+        rr_ = br["shell_r"]
+        r_short = {a: rr_[a]["r"][-1] for a in ("pivot", "kill_control", "span_check")}
         print(f"\n  {'k':>8s} " + " ".join(f"{'r[' + a[:4] + ']':>11s}"
               for a in ("pivot", "kill", "span")))
         rr = br["shell_r"]
@@ -501,12 +512,29 @@ def main():
         print("  (rho is only interpretable where r is not near 0; a decorrelated")
         print("   arm makes the measured transfer tiny and rho explodes by construction)")
         print(f"\n  max|R_Q|: pivot {mp:.4f}   kill(b=0) {mk:.4f}   span(2LPT) {m2:.4f}")
-        print(f"  gate has POWER      (kill > bar=0.15):  {'YES' if mk > 0.15 else 'NO'}")
-        print(f"  gate has RANGE      (2LPT > bar=0.15):  {'YES' if m2 > 0.15 else 'NO'}")
-        print(f"  kill exceeds pivot  (|R_kill| > |R_piv|): {'YES' if mk > mp else 'NO'}")
-        res["bracket_summary"] = dict(max_pivot=mp, max_kill=mk, max_2lpt=m2,
-                                      power=bool(mk > 0.15), rng=bool(m2 > 0.15),
-                                      kill_gt_pivot=bool(mk > mp))
+        # THE BRACKETS ARE ON r, NOT R_Q (JC, 2026-07-31). R_Q is not monotone
+        # in brokenness, so |R(b=0)| > |R(pivot)| is unsatisfiable BY
+        # CONSTRUCTION once both arms decorrelate -- it is not an unmet
+        # threshold but a criterion this statistic cannot meet. r IS monotone in
+        # brokenness (measured 0.014 -> 0.668 across the same b-scan), so it is
+        # what the kill control and the span check are built on.
+        print(f"\n  conditioning cut: R_Q gated only where r(k_short) >= {R_CONDITION_CUT}")
+        print(f"    r(k_short): pivot {r_short['pivot']:.4f}  kill {r_short['kill_control']:.4f}"
+              f"  2LPT {r_short['span_check']:.4f}")
+        cond = r_short["pivot"] >= R_CONDITION_CUT
+        print(f"    pivot INTERPRETABLE at k_short: {'YES' if cond else 'NO -- reported, not gated'}")
+        print(f"  kill_control (r): kill LESS correlated than pivot: "
+              f"{'YES' if r_short['kill_control'] < r_short['pivot'] else 'NO'}")
+        print(f"  span_check   (r): 2LPT LESS correlated than pivot:  "
+              f"{'YES' if r_short['span_check'] < r_short['pivot'] else 'NO'}")
+        print(f"  [legacy R_Q view] kill {mk:.4f} vs pivot {mp:.4f} vs 2LPT {m2:.4f}")
+        res["bracket_summary"] = dict(
+            max_pivot=mp, max_kill=mk, max_2lpt=m2,
+            r_short=r_short, r_condition_cut=R_CONDITION_CUT,
+            pivot_interpretable=bool(cond),
+            kill_less_correlated=bool(r_short["kill_control"] < r_short["pivot"]),
+            span_less_correlated=bool(r_short["span_check"] < r_short["pivot"]),
+            legacy_kill_gt_pivot=bool(mk > mp))
 
         print("\n  === buffer_monotonicity (report rung; diagnoses the bracket) ===")
         bm = rung_buffer_monotonicity(B, res, n_tile, tris, names, b_list=args.b_scan)
