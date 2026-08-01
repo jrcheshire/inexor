@@ -150,6 +150,21 @@ def plot(card, path):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
+    from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
+
+    def _decades(ax, axis="x"):
+        """Label decades only, as plain numbers.
+
+        matplotlib's default log formatter labels minor ticks too, which on
+        these ranges overprints into an unreadable smear ("2x10^3 4x10^6 ...").
+        Decade-only major ticks with plain numbers, minor ticks unlabelled.
+        """
+        a = ax.xaxis if axis == "x" else ax.yaxis
+        a.set_major_locator(LogLocator(base=10.0))
+        a.set_minor_locator(LogLocator(base=10.0, subs=tuple(np.arange(2, 10) * 0.1)))
+        a.set_minor_formatter(NullFormatter())
+        a.set_major_formatter(FuncFormatter(
+            lambda v, _: ("%g" % v) if 1e-3 <= v < 1e4 else ("%.0e" % v)))
 
     rows = card["rows"]
     vols = np.array([r["vol_ratio"] for r in rows])
@@ -167,6 +182,7 @@ def plot(card, path):
     ax1.set_xlabel(r"$k$  [$h\,\mathrm{Mpc}^{-1}$]")
     ax1.set_ylabel(r"$r(k)$   tiled vs monolithic")
     ax1.set_ylim(-0.05, 1.03)
+    _decades(ax1, "x")
     ax1.grid(alpha=0.18, lw=0.6)
     ax1.set_axisbelow(True)
     for sp in ("top", "right"):
@@ -178,6 +194,8 @@ def plot(card, path):
                     zorder=3)
     ax2.set_xscale("log")
     ax2.set_yscale("log")
+    _decades(ax2, "x")
+    _decades(ax2, "y")
     ax2.set_xlabel(r"cost  [monolithic evolves, $=(P/T)^3$]")
     ax2.set_ylabel(r"$k$ at $r=0.5$   [$h\,\mathrm{Mpc}^{-1}$]")
     ax2.grid(alpha=0.18, lw=0.6)
@@ -188,11 +206,17 @@ def plot(card, path):
     handles = [Line2D([], [], marker=m, ls="", color="0.35", markersize=7,
                       label=f"$T$ = {t} cells ({t * card['geometry']['L'] / card['geometry']['n_fine']:.0f} Mpc/$h$)")
                for t, m in marks.items()]
-    ax2.legend(handles=handles, frameon=False, fontsize=8, loc="lower right")
+    # Upper-left: usable-k rises with cost, so points run lower-left to
+    # upper-right and the top-left corner is the one region the data cannot
+    # occupy (cheap AND trustworthy to high k).
+    ax2.legend(handles=handles, frameon=False, fontsize=8, loc="upper left")
 
     sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
     cb = fig.colorbar(sm, ax=(ax1, ax2), fraction=0.028, pad=0.015)
     cb.set_label("cost  [monolithic evolves]", fontsize=9)
+    cb.ax.yaxis.set_major_locator(LogLocator(base=10.0, subs=(1.0, 2.0, 3.0, 5.0)))
+    cb.ax.yaxis.set_minor_formatter(NullFormatter())
+    cb.ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: "%g" % v))
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fig.savefig(path, dpi=160, bbox_inches="tight")
