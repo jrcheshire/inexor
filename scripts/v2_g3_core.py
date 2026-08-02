@@ -488,24 +488,74 @@ def lagrangian_tiles(qi, n_part, n_fine, n_tile, b_realized):
     b_lag = ceil(b_realized * n_part / n_fine), both in PARTICLE cells. The
     shell rounds UP where not exact: a wider buffer is safe, a narrower one
     silently drops mass the tile needed.
+
+    COST. The obvious form loops over tiles and masks the whole particle array
+    once per tile, which is O(n_tiles x n_particles). That is merely slow at cdev
+    (4096 tiles x 16.8M) and ruinous at cgh64 (32768 tiles x 134M = 4.4e12
+    element-ops of single-threaded numpy, ~10 h before any physics runs). Same
+    trap as the containment loop v2_g3_buffer_cost.py hit at cea3942.
+
+    Instead, invert the question: which tiles can a given particle belong to?
+    Membership is SEPARABLE per axis and, per axis, is the periodic half-open
+    window t*t_lag in (q + b_lag - w, q + b_lag] with w = t_lag + 2*b_lag. A
+    window of width w holds at most w//t_lag + 1 multiples of t_lag, so that many
+    candidate tile indices per axis suffice -- 2 for every geometry in GRID,
+    against n_side (up to 32). Cost becomes O(n_off^3 x n_particles), a 4096x
+    reduction at cgh64's T=32.
+
+    The per-candidate validity test is the ORIGINAL predicate applied verbatim,
+    so this is a reordering of the same comparisons rather than a new membership
+    rule; equality with the loop form is exhaustively asserted by
+    tests/test_lagrangian_tiles.py.
     """
     t_lag = int(n_tile) * int(n_part) // int(n_fine)
     b_lag = int(np.ceil(float(b_realized) * int(n_part) / int(n_fine)))
     n_side = int(n_fine) // int(n_tile)
+    n_part = int(n_part)
+    n_pcl = qi.shape[0]
+    w = t_lag + 2 * b_lag
     blk = qi // t_lag
+
+    # Clamped at n_side: there, every tile is already a candidate and each
+    # distinct index appears exactly once among (top - d) mod n_side, so the
+    # candidate set stays duplicate-free. Above n_side it would not.
+    n_off = min(w // t_lag + 1, n_side)
+
+    cand, ok = [], []
+    for ax in range(3):
+        q_ax = qi[:, ax]
+        top = (q_ax + b_lag) // t_lag
+        c = np.stack([(top - d) % n_side for d in range(n_off)])
+        cand.append(c)
+        ok.append(np.stack([((q_ax - (c[d] * t_lag - b_lag)) % n_part) < w
+                            for d in range(n_off)]))
+
+    # One int64 key per (particle, tile) pair, ordered so that a plain sort
+    # groups by tile and leaves particle indices ascending WITHIN a tile --
+    # matching np.where's ascending order in the loop form. n_tiles * n_pcl is
+    # 4.4e12 at cgh64's T=32, comfortably inside int64.
+    keys = []
+    for d0 in range(n_off):
+        for d1 in range(n_off):
+            for d2 in range(n_off):
+                m = ok[0][d0] & ok[1][d1] & ok[2][d2]
+                if not m.any():
+                    continue
+                p = np.flatnonzero(m)
+                tid = ((cand[0][d0][p] * n_side + cand[1][d1][p]) * n_side
+                       + cand[2][d2][p])
+                keys.append(tid * n_pcl + p)
+    key = np.sort(np.concatenate(keys)) if keys else np.empty(0, np.int64)
+
+    n_tiles = n_side ** 3
+    blk_flat = (blk[:, 0] * n_side + blk[:, 1]) * n_side + blk[:, 2]
+    edges = np.searchsorted(key, np.arange(n_tiles + 1, dtype=np.int64) * n_pcl)
+
     out = []
-    for i in range(n_side):
-        for j in range(n_side):
-            for k in range(n_side):
-                tijk = (i, j, k)
-                core = np.ones(qi.shape[0], bool)
-                member = np.ones(qi.shape[0], bool)
-                for ax in range(3):
-                    core &= blk[:, ax] == tijk[ax]
-                    lo = tijk[ax] * t_lag - b_lag
-                    member &= ((qi[:, ax] - lo) % int(n_part)) < (t_lag + 2 * b_lag)
-                idx = np.where(member)[0]
-                out.append((tijk, idx, core[idx]))
+    for t in range(n_tiles):
+        idx = (key[edges[t]:edges[t + 1]] % n_pcl).astype(np.int64)
+        tijk = (t // (n_side * n_side), (t // n_side) % n_side, t % n_side)
+        out.append((tijk, idx, blk_flat[idx] == t))
     return out, t_lag, b_lag
 
 
