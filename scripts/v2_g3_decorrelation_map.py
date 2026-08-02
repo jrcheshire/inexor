@@ -78,7 +78,27 @@ def k_at_r(k, r, level):
     return float(k0 + (level - r0) * (k1 - k0) / (r1 - r0))
 
 
-def measure(cfg, seed):
+def parse_grid(spec):
+    """Parse "T:b,T:b,..." into a GRID subset, preserving GRID's order.
+
+    An ensemble over seeds only needs the cost-matched rows the ranking turns
+    on; running all of GRID per seed costs 4.4 h at cdev where the subset costs
+    46 min. Every pair must be in GRID, so a subset run stays comparable to the
+    full-grid cards rather than silently measuring a new geometry.
+    """
+    if not spec:
+        return list(GRID)
+    want = []
+    for tok in spec.split(","):
+        t, _, b = tok.strip().partition(":")
+        pair = (int(t), int(b))
+        if pair not in GRID:
+            raise SystemExit(f"--grid: {pair} is not in GRID {GRID}")
+        want.append(pair)
+    return [g for g in GRID if g in want]
+
+
+def measure(cfg, seed, grid=GRID):
     import jax
 
     jax.config.update("jax_enable_x64", True)
@@ -101,7 +121,7 @@ def measure(cfg, seed):
     d_mono = dens(B["x_mono"])
     rows = []
     t0 = time.perf_counter()
-    for n_tile, b_fine in GRID:
+    for n_tile, b_fine in grid:
         try:
             p_side, b_real = padded_size(n_tile, b_fine, n_fine=n_fine)
         except ValueError:
@@ -168,7 +188,14 @@ def plot(card, path):
 
     rows = card["rows"]
     vols = np.array([r["vol_ratio"] for r in rows])
-    norm = matplotlib.colors.LogNorm(vmin=vols.min(), vmax=vols.max())
+    # A cost-matched subset (--grid) has ONE vol_ratio, and LogNorm with
+    # vmin == vmax maps everything to nan. Widen by a decade either side so the
+    # colour still reads as "this cost" without the ramp claiming a spread the
+    # subset does not have.
+    lo, hi = float(vols.min()), float(vols.max())
+    if not hi > lo:
+        lo, hi = lo / 2.0, hi * 2.0
+    norm = matplotlib.colors.LogNorm(vmin=lo, vmax=hi)
     cmap = matplotlib.colormaps["viridis"]
     marks = {32: "o", 64: "s", 128: "^"}
 
@@ -225,11 +252,14 @@ def plot(card, path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--config", default="cdev8", choices=("smoke", "cdev8", "cdev"))
+    ap.add_argument("--config", default="cdev8", choices=("smoke", "cdev8", "cdev", "cgh64"))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--plot-only", action="store_true")
     ap.add_argument("--out-suffix", default="")
+    ap.add_argument("--grid", default="", metavar="T:b,T:b,...",
+                    help="GRID subset, e.g. 32:8,64:16,128:32 (default: all of GRID)")
     args = ap.parse_args()
+    grid = parse_grid(args.grid)
 
     path = os.path.join(OUT_DIR, f"g3_decorrelation_{args.config}{args.out_suffix}.json")
     if args.plot_only:
@@ -239,7 +269,7 @@ def main():
         g = geometry(args.config)
         print(f"  L={g['L']} n_part={g['n_part']} n_fine={g['n_fine']}  "
               f"k_f={2 * np.pi / g['L']:.4f} h/Mpc")
-        card = measure(args.config, args.seed)
+        card = measure(args.config, args.seed, grid)
         os.makedirs(OUT_DIR, exist_ok=True)
         with open(path, "w") as f:
             json.dump(card, f, indent=2, default=float)
