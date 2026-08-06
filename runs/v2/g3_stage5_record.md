@@ -192,28 +192,18 @@ that triangle's own `|R_Q|`, which diverges at a zero crossing, so the printed
 | b=64, 0.589 | -0.161 to +0.153 | +0.293 to +0.823 | 0.80 |
 | b=64, 0.884 | -0.198 to +0.231 | +1.970 to +3.269 | 3.23 |
 
-**The arm that looks best under `R_Q` is the one `rho` says is worst.** At
-b=64 the three `R_Q` values (0.106, 0.161, 0.231) sit at or just above the 15%
-bar and would read as a near-pass; over the same triangles `rho` runs 0.29 ->
-0.82 -> 3.27, i.e. a squeezed bispectrum wrong by a factor of 2 to 4. Reading
-`R_Q` alone would have graded the 8x-buffer arm as nearly passing.
+**`R_Q` and `rho` diverge because `rho` diverges, and section 8 identifies the
+cause: in this regime `rho` measures `1/r^2` and nothing else.** The first
+reading of this card said the divergence showed a squeezed bispectrum wrong by
+a factor of 2 to 4 at b=64. **That reading was wrong and is retracted.** The
+large `rho` values are a restatement of the decorrelation already reported in
+the eligibility map, not an independent measurement of tiling error. See
+section 8.
 
-The mechanism is the known one, now visible on the REAL tiling rather than in
-principle: at `k_short` >= 0.589 in that arm `R_Q` scatters around zero with
-MIXED SIGNS and compressed magnitude while `rho` is uniformly large and
-positive. That is `R_Q` saturating, exactly the behaviour that made the plan's
-`kill_control` criterion unsatisfiable, and it is why the brackets were moved
-onto `r`.
-
-**Neither statistic is obviously trustworthy at `r` just above the cut.** At
-b=64 / `k_short` = 0.884 the arms share `r` = 0.517, so `rho` divides by a
-transfer measured between fields that have lost half their phase coherence.
-The honest reading is that the divergence itself is evidence that **the
-ratified `r >= 0.5` cut, which was set on the correlation, is too permissive
-for the seam statistic**. Where the two agree best (b=32, `k_short` = 0.295,
-triangle sq1) they agree to 0.016 absolute; agreement degrades with `k_short`
-rather than tracking `r` cleanly (b=64 at `r` = 0.921 still shows 0.12-0.22
-absolute disagreement).
+What survives from this section: no cell yields a verdict under the ratified
+precondition, and the raw disagreement between the two statistics is large in
+absolute terms. WHY it is large is section 8's subject, and the answer changes
+which statistic is at fault.
 
 ### 3. Buffer vs tile size, paired
 
@@ -269,14 +259,13 @@ On `r`, never on `R_Q`:
 
 ### 6. Pre-registered predictions, graded
 
-- **`R_Q < 0`: FAILS in the deep legs.** All `R_Q` are negative at
-  `k_short` = 0.295 in all four arms, as predicted. At `k_short` = 0.589 and
-  0.884 (b=64 only) the signs are mixed and the positive values (+0.153,
-  +0.231) are the same size as the negative ones. By the pre-registration that
-  is **a bug signature, not a result**, and it is owed an explanation before any
-  ensemble. The competing reading is that it is `R_Q` saturating near a zero
-  crossing, which section 2 independently supports; those two readings are not
-  distinguished by this card.
+- **`R_Q < 0`: the prediction FAILS, but the code is sound.** Positive `R_Q` of
+  squeezed size does appear (+0.153, +0.231). Section 8 shows it is the
+  documented `1/T` response of `Q` operating on the real tiling, concentrated
+  exactly on the triangles the mechanism predicts. **The pre-registration was
+  wrong, not the estimator** -- it assumed `Q`'s power normalization cancels,
+  which contradicts the project's own Stage-4 finding. Retire the prediction;
+  do not chase a bug.
 - **Monotone in `b`: FAILS at one seed.** At `k_short` = 0.295, `R_Q` runs
   0.547 (b=4) -> 0.700 (b=8) -> 0.106 (b=16). The b=4/b=8 inversion is 28% and
   within plausible seed scatter; unresolved.
@@ -326,6 +315,98 @@ The real floor is section E, the dynamical null that perturbs the INITIAL
 density and evolves both arms, and **361 did not run it**. The equilateral
 control still has no measured floor at cdev.
 
+### 8. The bug signature is not a bug, and `rho` is measuring the wrong thing
+
+Resolved 2026-08-06 from the pilot card alone, no new compute. All three gate
+statistics are algebraically determined by two measured quantities, so the
+decomposition is exact rather than inferred:
+
+```
+T(k)   = <d_t d_m*> / <|d_m|^2>  =  r(k) * sqrt(P_t/P_m)   [CROSS transfer]
+R_B    = B_t/B_m - 1                      T_prod = T(k1)T(k2)T(k3)
+rho    = (1 + R_B)/T_prod - 1
+R_Q    = (1 + R_B) * D - 1,  where  D := qdenom(P_m)/qdenom(P_t)
+```
+
+`D` is not stored but is recovered exactly as `(1+R_Q)/(1+R_B)`. The
+`rho`-`R_B`-`T_prod` identity was checked on every triangle of every cell and
+holds to < 1e-9, so the card is internally consistent.
+
+**Finding A: the positive `R_Q` is the documented `1/T` response, not a
+defect.** `Q` normalizes by each arm's OWN power, so `R_Q` carries the power
+deficit through `D` with the opposite sign to the bispectrum deficit. Wherever
+`D * (1 + R_B) > 1`, `R_Q` goes positive. `D` is a per-triangle constant,
+essentially independent of `k_short` (b=16 triangle sq1: 5.99 / 5.71 / 5.90 /
+5.92 across the four legs) and strongly dependent on `x = k_long / k_P`:
+
+| x | 0.5 | 1.0 | 1.5 | 2.0 | 2.5 | 3.0 | 3.5 |
+|---|---|---|---|---|---|---|---|
+| D (b=64) | 2.50-2.82 | 1.22-1.32 | 1.14-1.22 | 1.02-1.10 | 1.13-1.22 | 1.13-1.23 | 1.15-1.20 |
+
+At `x <= 1` the long mode is at or below the padded tile's own fundamental, so
+the tiled arm structurally cannot represent it and loses a factor 2.5 to 6 of
+power there. That deficit lands in `Q`'s DENOMINATOR and inflates `Q_t`.
+**Of the 19 positive `R_Q` values in the card, 17 sit at `x <= 1`**, and the
+two that do not are +0.013 (x = 2.5) and +0.043 (x = 3.5) -- an order of
+magnitude below the sizeable positives (+0.10 to +0.38) and consistent with
+noise about zero. So every positive `R_Q` of SQUEEZED SIZE is at `x <= 1`,
+which is the mechanism's own prediction and not a pattern a coding error would
+produce.
+
+The estimator is independently validated on this exact path: job 361's section
+D reproduces the closed-form `R_Q` = 1/1.05 - 1 = -1/21 to ~2e-16 under a
+scale-flat window. The `R_Q` code is analytically correct.
+
+**So the PRE-REGISTRATION was wrong, not the code.** It reasoned that the tile
+cannot feel the long mode's nonlinear response and concluded `R_Q < 0`. That
+step is only valid if `Q`'s power normalization cancels between the arms, and
+the project had ALREADY MEASURED that it does not (`R_Q` responds as `1/T`,
+Stage 4 / `g3_ladder_record.md`). The prediction contradicted an established
+result of this gate at the moment it was written. The physical intuition
+survives on the RAW ratio: **`R_B` < 0 on 90 of 92 estimand triangles**,
+spanning -0.87 to +0.07, which is the pre-registered "tile cannot feel the long mode"
+statement measured on a quantity whose normalization does not fight it.
+
+**Finding B, and this is the more consequential one: in the decorrelated regime
+`rho` measures `1/r^2` and nothing else.** Because `T = r * sqrt(P_t/P_m)`, when
+the tiled arm retains its power but loses phase coherence, `T -> r`, so
+`T_prod -> r(k_long) * r(k_short)^2 ~ r_short^2` and
+`rho ~ (1 + R_B)/r_short^2 - 1`. Measured against that prediction:
+
+| arm | `k_short` | `r` | `1/r^2 - 1` | median `rho` |
+|---|---|---|---|---|
+| T=128 b=64 | 0.295 | 0.921 | 0.18 | 0.05 |
+| T=128 b=64 | 0.589 | 0.762 | 0.72 | 0.66 |
+| T=128 b=64 | 0.884 | 0.517 | 2.74 | 2.67 |
+| T=128 b=64 | 1.178 | 0.276 | 12.13 | 10.93 |
+| T=128 b=16 | 0.884 | 0.080 | 155.07 | 142.40 |
+| T=128 b=32 | 0.884 | 0.113 | 76.69 | 83.58 |
+| T=128 b=32 | 1.178 | -0.005 | (diverges) | 35980 |
+
+Sixteen for sixteen, agreeing to 10-20% wherever `r` > 0 and diverging to 1e4
+where `r` crosses zero. **`rho`'s "signal" is a restatement of the eligibility
+map.** It carries essentially no independent information about the tiling error
+in this regime, and its apparent verdict that the b=64 arm is wrong by a factor
+of 2 to 4 is an artifact of dividing by a decorrelation-damped transfer. This
+is the `1/P`-diverging-where-the-signal-is-damped failure mode, in a statistic
+built specifically to be window-invariant.
+
+**Finding C: the root cause is shared, and it is the transfer's definition.**
+`T` is a CROSS spectrum, so it conflates two physically different things: the
+tiled arm LOSING POWER (`sqrt(P_t/P_m)` < 1) and the tiled arm DECORRELATING
+(`r` < 1). Every gate statistic inherits the confusion. `rho` divides by it and
+diverges; `R_B` is multiplied by it and is biased low; `R_Q` is contaminated by
+its power part through `D` and flips sign. The `r >= 0.5` conditioning cut does
+not repair this, because at `r` = 0.5 the `1/r^2` inflation is already a factor
+of 4.
+
+**What this does NOT establish.** That an auto-spectrum ratio
+`sqrt(P_t/P_m)` would separate the two cleanly is a hypothesis, not a
+measurement -- it is the obvious candidate but it has not been tried, and
+whether the resulting statistic still responds to a genuine seam error is
+exactly the thing the brackets exist to test. One seed throughout. Whether the
+gate statistic should change is a checkpoint decision and is NOT taken here.
+
 ## Not licensed / owed
 
 - Nothing here is a cgh64 statement. Stage 5 is the MECHANISM ensemble and
@@ -342,15 +423,20 @@ control still has no measured floor at cdev.
 ### Opened by the pilot (2026-08-06)
 
 - **The gate is eligible but unreadable at cdev.** Six cells pass the `r >= 0.5`
-  conditioning cut and all six fail the `rho`-agreement precondition. Whether
-  that is a `rho` problem, an `R_Q` problem, or a signal that the `r` cut is too
-  permissive for the seam statistic is UNDECIDED and is a checkpoint call. The
-  8-seed ensemble buys error bars on a statistic its own precondition currently
-  refuses, so its value is contingent on that call.
-- **The positive `R_Q` values at `k_short` >= 0.589 are owed an explanation**
-  before any ensemble: the pre-registration calls a positive `R_Q` of squeezed
-  size a bug signature, and the competing saturation reading is not
-  distinguished by this card.
+  conditioning cut and all six fail the `rho`-agreement precondition. Section 8
+  shows the precondition is failing mostly because **`rho` diverges as `1/r^2`**,
+  so it is not an independent check on `R_Q` in this regime and the six
+  refusals should not be read as six tiling failures. Whether the gate statistic
+  changes is a CHECKPOINT CALL, deliberately not taken here.
+- **RESOLVED 2026-08-06: the positive `R_Q` is not a bug** (section 8). It is
+  the documented `1/T` response of `Q`, concentrated at `x <= 1` where the tiled
+  arm cannot represent the long mode. The pre-registered `R_Q < 0` prediction is
+  retired as unsound; the physical intuition behind it survives on `R_B`.
+- **Candidate for the checkpoint, untested:** replace the cross transfer with an
+  auto-spectrum ratio `sqrt(P_t/P_m)`, which does not carry `r` and so would not
+  diverge on decorrelation. Whether such a statistic still RESPONDS to a genuine
+  seam error is unmeasured and is exactly what the brackets exist to decide.
+  Costs one readout on the existing card plus a bracket check, not a new run.
 - **The equilateral control still has no floor at cdev.** Section BC cannot
   produce one under any window; it needs section E (the dynamical IC-perturbation
   null), which has not been run at cdev.
