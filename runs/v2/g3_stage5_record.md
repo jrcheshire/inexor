@@ -465,12 +465,21 @@ grid of section 2. One seed, no error bar, and the bar was ratified against
 `R_Q`, so whether it transfers to a different statistic is itself a checkpoint
 question.
 
-**Housekeeping hazard, pre-existing.** Both runs peaked at ~58 GB host RSS
-(360: 57.83, 362: 57.97) against a `--mem=54G` request on a 61 GB node. Deneb
-is evidently not enforcing `--mem`, so both jobs survived on luck rather than
-on the resource spec. The request should be raised to ~60 G before this profile
-is run again, and no conclusion should be drawn from the fact that it has not
-failed yet.
+**Housekeeping hazard, pre-existing, and DO NOT "fix" it by raising `--mem`.**
+Both runs peaked at ~58 GB host RSS (360: 57.83, 362: 57.97) against a
+`--mem=54G` request. The first reading of this was that the request should go
+up to ~60 G; that is wrong and would produce a doomed job. Deneb's Slurm
+config is `RealMemory=56000` MB (`CfgTRES=cpu=64,mem=56000M`), so **56000M is
+the largest satisfiable request** and anything above it pends forever. 54G =
+55296M already sits just under that cap.
+
+What is actually happening: the node has 61 GB physical against 56 GB declared
+to Slurm, and there is no cgroup memory enforcement, so a job silently
+overruns both its request and `RealMemory` and survives on the ~5 GB Slurm does
+not know about. The correct posture is to leave `--mem=54G` and know the
+profile has ~0 GB of headroom, not to request memory that cannot be granted.
+Co-scheduling is already prevented by `-c 64` taking every core, which is the
+placement mechanism the sbatch header documents.
 
 ### 10. The bracket scan, pre-registered before the cdev run (2026-08-06)
 
