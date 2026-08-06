@@ -93,6 +93,16 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--arms", default=None, help="T:b pairs in FINE cells, comma separated")
     ap.add_argument("--nbins", type=int, default=12)
+    ap.add_argument("--force", choices=("mono", "hybrid"), default="mono",
+                    help="mono = the failing arm (full kernel per tile); "
+                         "hybrid = global long-range + tiled short-range (rung H1)")
+    ap.add_argument("--alpha", type=float, default=1.0,
+                    help="split scale in COARSE cells, r_s = alpha * coarse_cell")
+    ap.add_argument("--family", default="gauss")
+    ap.add_argument("--assign-long", default="tsc")
+    ap.add_argument("--no-match", action="store_true",
+                    help="drop the coarse->fine window match (mandatory for gauss)")
+    ap.add_argument("--identity-tol", type=float, default=1e-12)
     args = ap.parse_args()
 
     import jax
@@ -103,21 +113,65 @@ def main():
     import v2_g3_core as g3
     import v2_g3_ladder as lad
     from v2_g3_stage5 import DEFAULT_ARMS
-    from v2_g5_core import force_global, padded_size
+    from v2_g5_core import force_global, force_short_tiled, padded_size
 
     B = lad.build(args.config, args.seed)
     g = B["g"]
     ell, n_fine, n_part = g["L"], g["n_fine"], g["n_part"]
+    n_coarse, d_c, d_f = g["n_coarse"], g["coarse_cell"], g["fine_cell"]
     kf = 2.0 * np.pi / ell
+    n_tot = n_part**3
     q, psi1, psi2, qi = B["q"], B["psi1"], B["psi2"], B["qi"]
+    r_s = args.alpha * d_c
+    match = None if args.no_match else (d_c, d_f)
 
     # Evaluate every arm at the SAME configuration, the background's own final
     # positions. Any difference is then the force operator alone -- no evolution,
     # no divergence of trajectories, nothing to attribute except the solve.
     x_eval = np.mod(np.asarray(g3.x_lpt(q, psi1, psi2, B["d_final"]), np.float64), ell)
-    g_mono, _ = force_global(jnp.asarray(x_eval), n_fine, ell, n_part**3, "mono", assign="cic")
+    g_mono, _ = force_global(jnp.asarray(x_eval), n_fine, ell, n_tot, "mono", assign="cic")
     g_mono = np.asarray(g_mono, np.float64)
     f_mono = lagrangian_field(g_mono, qi, n_part)
+
+    if args.force == "hybrid":
+        # RUNG H0, and it REFUSES THE RUN on failure. A check that did not run
+        # reads exactly like one that passed, and every H1 number is meaningless
+        # if long + short does not reassemble the monolithic force.
+        #
+        # Both halves are evaluated on the FINE mesh here, which is the only
+        # configuration in which the identity is exact: the coarse long solve
+        # used by H1 carries the two-level scheme's own representation error,
+        # which is a measured floor (D-v2-9), not a wiring bug.
+        gl_f, _ = force_global(jnp.asarray(x_eval), n_fine, ell, n_tot, "long",
+                               family=args.family, r_s=r_s, n_ref=n_fine, assign="cic")
+        gs_f, _ = force_global(jnp.asarray(x_eval), n_fine, ell, n_tot, "short",
+                               family=args.family, r_s=r_s, n_ref=n_fine, assign="cic")
+        rec = np.asarray(gl_f, np.float64) + np.asarray(gs_f, np.float64)
+        scale = np.abs(g_mono).max()
+        dev_kernel = float(np.abs(rec - g_mono).max() / scale)
+
+        gs_t, _ = force_short_tiled(x_eval, n_fine, ell, n_tot, n_fine, 0,
+                                    family=args.family, r_s=r_s)
+        rec_t = np.asarray(gl_f, np.float64) + np.asarray(gs_t, np.float64)
+        dev_tiled = float(np.abs(rec_t - g_mono).max() / scale)
+
+        print(f"\n  H0 wiring identity (fine mesh, r_s = {r_s:.4f} = "
+              f"{args.alpha} coarse cells)")
+        print(f"     long + short          vs mono : {dev_kernel:.3e}")
+        print(f"     long + short_tiled(1) vs mono : {dev_tiled:.3e}   "
+              f"(one tile = box, b = 0)")
+        if not (dev_kernel < args.identity_tol and dev_tiled < args.identity_tol):
+            raise SystemExit(
+                f"  H0 FAILED against tol {args.identity_tol:.0e} -- the halves do not "
+                "reassemble the monolithic force, so no H1 number would mean anything.")
+        print(f"     both under {args.identity_tol:.0e}: PASS\n")
+
+        # the long-range half of every hybrid arm: one global COARSE solve,
+        # independent of the tiling, which is the whole point
+        g_long, _ = force_global(jnp.asarray(x_eval), n_coarse, ell, n_tot, "long",
+                                 family=args.family, r_s=r_s, n_ref=n_fine,
+                                 match=match, assign=args.assign_long)
+        g_long = np.asarray(g_long, np.float64)
 
     arms = ([tuple(int(v) for v in a.split(":")) for a in args.arms.split(",")]
             if args.arms else list(DEFAULT_ARMS[args.config]))
@@ -129,17 +183,26 @@ def main():
     rows = []
     for n_tile, b_fine in arms:
         p_side, b_real = padded_size(n_tile, b_fine, n_fine=n_fine)
-        tiles, _, _ = g3.lagrangian_tiles(qi, n_part, n_fine, n_tile, b_real)
-        g_tile = np.zeros_like(g_mono)
-        filled = np.zeros(len(g_mono), np.int64)
-        for tijk, idx, cim in tiles:
-            force, _, _ = g3.make_tile_force(
-                tijk, n_tile, b_fine, n_fine, ell, n_part**3, core_in_member=None)
-            gt = np.asarray(force(jnp.asarray(x_eval[idx])), np.float64)
-            core = idx[np.asarray(cim)]
-            g_tile[core] = gt[np.asarray(cim)]
-            filled[core] += 1
-        assert filled.min() == 1 and filled.max() == 1, "tile partition broken"
+        if args.force == "hybrid":
+            # short range from the tiles, long range from the shared global
+            # coarse solve above. This is force_two_level's composition
+            # (v2_g5_two_level_force), i.e. the RATIFIED two-level force, with
+            # nothing new invented for this probe.
+            gs, _ = force_short_tiled(x_eval, n_fine, ell, n_tot, n_tile, b_fine,
+                                      family=args.family, r_s=r_s)
+            g_tile = np.asarray(gs, np.float64) + g_long
+        else:
+            tiles, _, _ = g3.lagrangian_tiles(qi, n_part, n_fine, n_tile, b_real)
+            g_tile = np.zeros_like(g_mono)
+            filled = np.zeros(len(g_mono), np.int64)
+            for tijk, idx, cim in tiles:
+                force, _, _ = g3.make_tile_force(
+                    tijk, n_tile, b_fine, n_fine, ell, n_tot, core_in_member=None)
+                gt = np.asarray(force(jnp.asarray(x_eval[idx])), np.float64)
+                core = idx[np.asarray(cim)]
+                g_tile[core] = gt[np.asarray(cim)]
+                filled[core] += 1
+            assert filled.min() == 1 and filled.max() == 1, "tile partition broken"
 
         f_tile = lagrangian_field(g_tile, qi, n_part)
         amp, r, _ = shell_transfer_vec(f_tile, f_mono, ell, n_bins=args.nbins)
@@ -163,10 +226,12 @@ def main():
     print("  and tracks 1 above it. Flat loss, or a knee elsewhere, refutes it.")
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    out = os.path.join(OUT_DIR, f"g3_tile_force_scale_{args.config}.json")
+    tag = "" if args.force == "mono" else f"_{args.force}"
+    out = os.path.join(OUT_DIR, f"g3_tile_force_scale_{args.config}{tag}.json")
     with open(out, "w") as fh:
-        json.dump(dict(config=args.config, seed=args.seed, L=ell, n_fine=n_fine,
-                       n_part=n_part, kf=kf, rows=rows), fh, indent=1)
+        json.dump(dict(config=args.config, seed=args.seed, force=args.force,
+                       alpha=args.alpha, family=args.family, L=ell, n_fine=n_fine,
+                       n_coarse=n_coarse, n_part=n_part, kf=kf, rows=rows), fh, indent=1)
     print(f"\n  wrote {out}")
 
 

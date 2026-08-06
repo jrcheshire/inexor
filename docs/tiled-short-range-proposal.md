@@ -127,6 +127,51 @@ production box, read with `rho_auto` (D-v2-12 clause 3), against D-v2-7's 15%
 bar. Note the comparison should be ENSEMBLE-based per D-v2-12 clause 4, not
 realization-matched.
 
+## Results: H0 and H1 PASS (2026-08-06)
+
+Run with `scripts/v2_g3_tile_force_scale.py --force hybrid`, which composes the
+long-range coarse solve and `force_short_tiled` exactly as
+`v2_g5_two_level_force.force_two_level` does. `alpha` = 1.0 so
+`r_s` = one coarse cell; gauss family; TSC + matching on the coarse solve.
+
+**H0 -- wiring identity: PASS at 4.8e-16**, both forms, against a 1e-12 bound.
+`long + short` reproduces `mono` on the fine mesh, and so does
+`long + short_tiled` with one tile covering the box. The probe REFUSES to
+continue if either fails.
+
+**H1 -- the decisive test: PASS.** Amplitude ratio at cdev8, at the box
+fundamental (k = 1 k_f), before and after:
+
+| arm | P | `k_P` [k_f] | mono | hybrid |
+|---|---|---|---|---|
+| T=64 b=16 | 96 | 2.67 | 0.096 | 0.998 |
+| T=64 b=32 | 128 | 2.00 | 0.332 | 0.998 |
+| T=64 b=64 | 192 | 1.33 | 0.647 | 0.998 |
+| T=32 b=32 | 96 | 2.67 | 0.087 | 0.998 |
+
+The knee at `k_P` is gone. The hybrid is flat at 0.998 -> 0.987 across k = 1 to
+10 k_f in every arm, and the correlation with the monolithic force is 1.000 to
+three decimals at every shell -- against a mono arm whose correlation ran
+0.654, 0.977, 0.970 and **-0.246** at the fundamental. The worst arm recovers
+by a factor 11.5.
+
+**The residual 0.2-1.3% is arm-independent and rises with k**, which is the
+signature of the shared coarse long-range solve's own representation error, not
+of tiling. It is three orders below the 15% bar.
+
+**The arm knob was verified to apply**, since four arms agreeing to three
+decimals is exactly what a silently-ignored parameter looks like. Measured
+directly on `g_short`: the arms differ from the b=64 reference by 7.1e-3,
+4.1e-3 and 5.8e-3 relative, monotone in buffer, i.e. real periodization error
+that is simply too small to move the shell average. At smoke, where the buffers
+are only 2-4 `r_s`, the arms do visibly differ (0.976 / 0.985 / 0.982).
+
+**Early read on H2, not a substitute for running it.** At cdev8 the buffers are
+4, 8 and 16 `r_s` and the 4-`r_s` arm already sits within 0.7% of the 16-`r_s`
+one. That is consistent with the requirement being set by `r_s` rather than by
+the box, which is the H2 prediction, but H2 still owes the actual scan and the
+2.0/P law still applies.
+
 ## What could still sink it, stated up front
 
 - **The 2.0/P tiling error is a power law, so buffer cost does not vanish.**
