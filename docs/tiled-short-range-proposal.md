@@ -196,6 +196,53 @@ one. That is consistent with the requirement being set by `r_s` rather than by
 the box, which is the H2 prediction, but H2 still owes the actual scan and the
 2.0/P law still applies.
 
+## Results at the PRODUCTION box (deneb 363, 364, 2026-08-06)
+
+**The gating reproduction check passed first.** The sbatch pre-registered that
+the tiled arm must land on the tracked card's `shell_A` at the box fundamental
+or nothing else in the run could be read. Predicted 0.441 and 0.424; measured
+0.441 and 0.424. The harness is measuring what Stage 5 measured.
+
+**H3 at cdev**, T=128, both buffers, k = 1..12 k_f:
+
+| | k=1 | k=4 | k=8 | k=12 | r at k=12 | max\|rho_auto\| | wall |
+|---|---|---|---|---|---|---|---|
+| tiled, b=16 | 0.441 | 0.920 | 0.884 | 0.918 | 0.368 | 0.679 | 234 s |
+| tiled, b=32 | 0.424 | 1.222 | 1.050 | 1.017 | 0.393 | 0.673 | 434 s |
+| hybrid, b=16 | 1.000 | 0.999 | 0.996 | 0.994 | 1.000 | **0.0051** | 452 s |
+| hybrid, b=32 | 1.000 | 0.999 | 0.996 | 0.994 | 1.000 | **0.0051** | 571 s |
+
+All four predictions hold at the production box. The hybrid sits at 0.0051
+against the 0.15 bar, a **29x margin**, where the failing arm is 4.5x OVER it.
+Correlation is 1.000 at every shell out to 0.589 h/Mpc against the failing
+arm's decay to 0.368.
+
+**THE BUFFER SIZING ANSWER, which is what G3 owed A2.** The two hybrid arms are
+identical to three decimals in amplitude and identical in `rho_auto`, so **4
+`r_s` of buffer is already ample and 8 buys nothing**. The cheap arm runs 22.6
+s/step against the monolithic 9.9 s/step recorded in `cost_of_memory.md`, i.e.
+**2.3x monolithic compute** -- inside A3's 3.2x premise, and cheaper than the
+3.23x the ratified two-level config was measured at.
+
+**H2's box-independence prediction was HALF right, and the half that failed
+does not matter.** Predicted: the same rel(b) row by row at cdev8 and cdev
+within a few percent. Measured:
+
+| b/`r_s` | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|
+| cdev8 | 4.09e-2 | 4.55e-3 | 3.05e-3 | 1.49e-3 |
+| cdev (8x volume) | 3.97e-2 | 5.45e-3 | 4.10e-3 | 2.75e-3 |
+| ratio | 0.97 | 1.20 | 1.34 | 1.85 |
+
+The STEEP part of the curve -- the part that sets how much buffer you need --
+agrees to 3%, and the knee sits at 4 `r_s` in both boxes. So **the buffer
+REQUIREMENT is box-independent**, which is the cost case. What differs is the
+residual FLOOR once buffer is ample, 1.85x higher at 8x the volume. That is a
+real box dependence and it is recorded as one, but it lives in a quantity
+already ~50x under the bar, and H3 shows it does not propagate: the 4 and 8
+`r_s` arms give the SAME `rho_auto` to four decimals. Extrapolating the trend
+to 64x volume lands near 5e-3, still far under.
+
 ## H5: can tile independence be recovered? Partly, and it is not free
 
 The lockstep hybrid solves the coarse long-range force from the true evolved
