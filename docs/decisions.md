@@ -515,3 +515,91 @@ decision here is locked until explicitly re-litigated with JC.
     `g6b_transport_cdev_cgh64.json`, `g6b_transport_cdev8_cgh64.json`
     (tracked). Probes `scripts/v2_g6_split_stability.py`,
     `scripts/v2_g6b_calib_transport.py`.
+
+## D-v2-12 — G3 verdict: A3 fails the squeezed-B bar, and the realization-matched estimand is retired
+- **Status:** PROPOSED (2026-08-06), awaiting JC ratification. Fires the
+  pre-registered V2 kill line in `docs/plan-plan-v2.md` ("G3 squeezed-B > 15%
+  at sane buffers -> A3 dies (A2 unaffected); publish the negative (P-C)
+  regardless"). Does not touch D-v2-10 or D-v2-11: A2's spine stands.
+- **Context:** G3 asked whether sCOLA-style sequential independent tiles
+  reproduce the monolithic squeezed bispectrum inside D-v2-7's 15% bar.
+  Measured at cdev (L=128, n_fine=512), seed 0, deneb jobs 360/362, arms
+  T=128 at b = 4/8/16 Mpc/h plus T=64/b=8, costing 1.95x / 3.38x / 8.00x /
+  8.00x monolithic evolves.
+  **Two of the three ratified G3 statistics were found broken during the
+  readout and this verdict does not rest on either** (see clause 3). The
+  numbers below are `rho_auto`, built afterwards and validated against an
+  exact translation null, and the auto amplitude ratio, which involves no
+  ratio between realizations at all.
+- **Decision:**
+  1. **A3 FAILS the 15% bar at cdev, by 2.7-6.1x.** At the well-conditioned
+     cells (`k_short` = 6 k_f, where `r` = 0.70-0.92 and nothing is
+     degenerate), max |`rho_auto`| over the estimand triangles is 0.656 /
+     0.720 / 0.398 / 0.924 for b = 4 / 8 / 16 Mpc/h and T=64/b=8. The best
+     arm is 2.7x the bar and costs 8x monolithic. **At A3's own budgeted
+     compute cost of 3.2x** (plan-plan Sec. 5, the premise of the whole
+     route) the nearest arm is b = 8 Mpc/h at 3.38x, which reads 0.720 --
+     **4.8x the bar.**
+  2. **The failure is realization-INDEPENDENT and mechanistically
+     understood.** The auto amplitude ratio `A(k) = sqrt(P_t/P_m)` involves
+     no cross-realization comparison. At the box fundamental it is 0.441 /
+     0.424 / 0.633 / 0.394 across the four arms, i.e. **the tiled field
+     carries 15-40% of the monolithic LONG-MODE POWER**. The squeezed
+     bispectrum is by construction the coupling of small-scale power to that
+     long mode, so no estimand and no amount of ensemble averaging repairs a
+     systematic deficit of this size. Dividing the deficit out explicitly is
+     what `rho_auto` does, and 40-92% error survives it.
+  3. **`R_Q` and `rho` are WITHDRAWN as G3 statistics.** `R_Q` normalizes by
+     each arm's OWN power, so the power deficit enters `Q`'s denominator with
+     the opposite sign to the bispectrum deficit and `R_Q` flips positive on
+     the very triangles the tile handles worst (17 of 19 positives at
+     `x <= 1`); on the smoke it also fails to rank the kill control at EVERY
+     `k_short`. `rho` divides by the CROSS transfer `T = r * A`, hence by the
+     correlation, and was measured to track `1/r^2 - 1` across sixteen cells
+     within 10-20%, reaching 3.6e4 where `r` crosses zero. Any further G3
+     reading uses `rho_auto`.
+  4. **The realization-matched estimand is retired as the default for
+     tiled-vs-monolithic comparison** (JC, 2026-08-06: it was adopted for
+     interpretability, not statistical necessity). In the decorrelated
+     regime -- which is the tiling's normal operating regime -- a shared-IC
+     ratio compares two different small-scale realizations and stops being
+     the quantity of interest. Future comparisons use ensemble/statistical
+     agreement. This clause does NOT weaken clause 1, which clause 2 makes
+     independent of the framing.
+- **Consequences:**
+  - **A3 dies as a squeezed-B mock route. A2 is unaffected** and D-v2-10 /
+    D-v2-11 stand untouched. The negative is publishable (P-C) and is
+    strengthened, not weakened, by the mechanism in clause 2.
+  - **THE ANOMALY THAT SHOULD BE CHASED IF ANYTHING IS.** Pure 2LPT -- the
+    span-check bracket, the background the tiles are built on top of --
+    has `A(k_f)` = 0.980, i.e. essentially correct long-mode power. The tiled
+    arm has 0.394. **The tiling is destroying large-scale power its own LPT
+    background already had right**, which is the opposite of what sCOLA is
+    supposed to do. Stage 4's `buffer_to_box` degenerate rung passes at
+    1e-13, so this is not a gross implementation bug, but whether it is
+    intrinsic to finite-buffer sCOLA or specific to this implementation's
+    background handling is **NOT established**, and it is the one question
+    that could reverse clause 1.
+  - **The buffer the literature specifies was never tested, deliberately.**
+    Leclercq (2003.04925) gives buffer >= 25 Mpc/h; every arm here is at or
+    below 16. At cdev geometry b = 25 Mpc/h costs 16.8x and b = 32 costs
+    27.0x, against A3's 3.2x budget -- so the buffer that might rescue the
+    physics removes the reason to want A3 at all. That is what makes "at sane
+    buffers" in the kill line satisfied. It is a cost argument, not a physics
+    one, and clause 1 should be read that way.
+  - **Cancelled as verdict inputs:** the cgh64 bispectrum ensemble (~84 Vista
+    node-hours) and Stage 7 A3 capacity work. cgh64 is worse on the
+    controlling variable (`k(r=0.5)` = 0.330 at 8 Mpc/h vs cdev's 0.472), so
+    it would refine a number already several times over the bar in the
+    direction of failing harder.
+  - **Not licensed.** ONE SEED at ONE box. The margin is 2.7-6.1x against a
+    12-22% seed scatter on related quantities, so the VERDICT is safe at one
+    seed, but no individual number here is an ensemble statement. Nothing
+    here bears on tiled mocks for P(k)-only use, on non-squeezed statistics,
+    or on any resolution other than the 0.25 Mpc/h fine cell.
+  - **Record:** `runs/v2/g3_stage5_record.md` secs. 1-10 (sec. 8 the
+    diagnosis, sec. 9 the `rho_auto` measurement, sec. 10 the bracket-scan
+    pre-registration). Cards `g3_stage5_cdev.json`,
+    `g3_floors_cdev_flatw.json`. Probes `scripts/v2_g3_stage5.py`,
+    `v2_g3_stage5_readout.py`, `v2_g3_card_repro.py`,
+    `tests/test_auto_transfer.py`.
