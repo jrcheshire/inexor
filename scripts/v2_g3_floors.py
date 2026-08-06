@@ -260,14 +260,34 @@ def evolved_field(cfg, seed, fdtype=None, ic_rel_eps=0.0, ic_pert_seed=90001):
     return np.asarray(d, np.float64), g
 
 
-def apply_window(delta, box_size, amp=0.05, k0_mult=6.0):
-    """delta_t(k) = T(k) delta_m(k) with T = 1 + amp exp(-(k/k0)^2). KNOWN answer."""
+def apply_window(delta, box_size, amp=0.05, k0_mult=6.0, window="gauss"):
+    """delta_t(k) = T(k) delta_m(k) with a KNOWN transfer.
+
+    window="gauss" (default, and the shape every existing card was measured
+    with): T = 1 + amp exp(-(k/k0)^2), support concentrated at low k.
+
+    window="flat": T = 1 + amp at every k. This exists because the Gaussian
+    window is INERT at the gate's small-scale leg -- with k0 = 6 k_f and
+    k_short = 24 k_f at cdev, T - 1 = 5.6e-9 there, so the equilateral control
+    (all three legs at k_short) was perturbed by nothing and its "floor B" of
+    1.3e-10 is the scatter of a quantity that is identically zero rather than a
+    resolving power. Reading the equilateral control at Stage 5 needs a window
+    with support where that triangle lives, which is what this is.
+
+    Keeping the default unchanged is deliberate: g3_floors_cdev_pin.json and the
+    cdev8 cards are frozen references and must stay comparable.
+    """
     from inexor.diagnostics import _k_grid
 
     n = delta.shape[0]
     _, _, k_mag = _k_grid(n, box_size)
-    k0 = k0_mult * 2.0 * np.pi / box_size
-    tk = 1.0 + amp * np.exp(-((k_mag / k0) ** 2))
+    if window == "gauss":
+        k0 = k0_mult * 2.0 * np.pi / box_size
+        tk = 1.0 + amp * np.exp(-((k_mag / k0) ** 2))
+    elif window == "flat":
+        tk = np.full_like(k_mag, 1.0 + amp)
+    else:
+        raise ValueError(f"unknown window {window!r}; use 'gauss' or 'flat'")
     return np.fft.irfftn(tk * np.fft.rfftn(delta), s=(n, n, n), axes=(0, 1, 2)), tk
 
 
@@ -282,7 +302,7 @@ def translate(delta, shift):
 # ===========================================================================
 
 
-def section_D(cfg, seed, out, long_mults=None, k_short_mult=None):
+def section_D(cfg, seed, out, long_mults=None, k_short_mult=None, window="gauss"):
     """Discriminators against KNOWN answers, before they judge anything."""
     print("\n=== D: discriminator validation (known-answer, field-level) ===")
     d_m, g = evolved_field(cfg, seed)
@@ -293,7 +313,7 @@ def section_D(cfg, seed, out, long_mults=None, k_short_mult=None):
           + ", ".join(f"{float(t[0]):.3f}" for t in tris[:-1])
           + f"; k_short = {float(tris[0][1]):.3f} h/Mpc")
 
-    d_t, tk_grid = apply_window(d_m, ell)
+    d_t, tk_grid = apply_window(d_m, ell, window=window)
     s = stats(d_t, d_m, ell, tris)
 
     # exact expected R_B: the window at the shell centres
@@ -367,7 +387,7 @@ def section_A(cfg, seed, d_m, g, tris, names, out):
                                 max_W=float(np.abs(v["W"]).max())) for k, v in rows.items()}
 
 
-def section_BC(cfg, nseed, tris, names, out):
+def section_BC(cfg, nseed, tris, names, out, window="gauss"):
     """Floors B and C, and the cancellation factor."""
     print(f"\n=== B/C: resolving power and cosmic variance ({nseed} seeds) ===")
     rq, rb, bm, wv, rlong = [], [], [], [], []
@@ -375,7 +395,7 @@ def section_BC(cfg, nseed, tris, names, out):
     for s in range(nseed):
         d_m, g = evolved_field(cfg, 1000 + s)
         ell = g["L"]
-        d_t, _ = apply_window(d_m, ell)
+        d_t, _ = apply_window(d_m, ell, window=window)
         st = stats(d_t, d_m, ell, tris)
         rq.append(st["R_Q"])
         rb.append(st["R_B"])
@@ -571,6 +591,9 @@ def main():
     ap.add_argument("--sections", default="DABC", help="subset of D, A, BC, E, F")
     ap.add_argument("--neps-seed", type=int, default=8, help="seeds for section E (2 evolves each)")
     ap.add_argument("--out-suffix", default="")
+    ap.add_argument("--window", default="gauss", choices=("gauss", "flat"),
+                    help="injected transfer for sections D/BC; flat gives the equilateral "
+                         "control a response the k0=6k_f gaussian cannot reach")
     ap.add_argument("--long-mults", type=int, nargs="+", default=None,
                     help="k_long shell centres in units of k_f (default: the cdev8 set)")
     ap.add_argument("--k-short-mult", type=int, default=None,
@@ -583,17 +606,18 @@ def main():
 
     print(f"=== G3 Stage 3 floors: {args.config} ===")
     print("MONOLITHIC PAIRS ONLY -- no tiled arm exists in this script by design.")
-    out = dict(config=args.config, seed=args.seed, sections=args.sections)
+    out = dict(config=args.config, seed=args.seed, sections=args.sections,
+               window=args.window)
 
     d_m, g, tris, names = section_D(
-        args.config, args.seed, out, args.long_mults, args.k_short_mult
+        args.config, args.seed, out, args.long_mults, args.k_short_mult, window=args.window
     )
     out["geometry"] = {k: float(v) if isinstance(v, (int, float, np.generic)) else v
                        for k, v in g.items()}
     if "A" in args.sections:
         section_A(args.config, args.seed, d_m, g, tris, names, out)
     if "BC" in args.sections:
-        section_BC(args.config, args.nseed, tris, names, out)
+        section_BC(args.config, args.nseed, tris, names, out, window=args.window)
     if "F" in args.sections:
         section_F(args.config, args.seed, tris, names, out)
     if "E" in args.sections:
