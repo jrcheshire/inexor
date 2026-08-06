@@ -55,6 +55,8 @@ def main():
     ap.add_argument("--nbins", type=int, default=10)
     ap.add_argument("--skip-tiled", action="store_true",
                     help="skip the failing arm (it is slow and already characterised)")
+    ap.add_argument("--skip-bg", action="store_true",
+                    help="skip the frozen-background arm (the tile-independence test)")
     args = ap.parse_args()
 
     import jax
@@ -86,14 +88,38 @@ def main():
         return np.asarray(
             painting.density_contrast(x, n_fine, ell, n_tot, paint="int"), np.float64)
 
-    def force_two_level(pos):
-        pn = np.asarray(pos, np.float64)
-        gl, _ = force_global(jnp.asarray(pn), n_coarse, ell, n_tot, "long",
-                             family=args.family, r_s=r_s, n_ref=n_fine,
-                             match=(d_c, d_f), assign=args.assign_long)
-        gs, _ = force_short_tiled(pn, n_fine, ell, n_tot, args.tile, args.buf,
-                                  family=args.family, r_s=r_s)
-        return jnp.asarray(np.asarray(gl, np.float64) + np.asarray(gs, np.float64))
+    def make_force(frozen_background):
+        """The two-level force. frozen_background sources the long-range field
+        from the ANALYTIC LPT positions instead of the true evolved ones.
+
+        That is the whole architecture question. x_LPT(D) is known for every
+        particle at every step without evolving anything, so if this arm agrees
+        with the true-position one, all 20 coarse force fields can be computed
+        UP FRONT and every tile can then run its full schedule independently --
+        no lockstep, no per-step synchronisation. The gather point stays the
+        particle's TRUE position: only the SOURCE of the field is approximated.
+        """
+        state = {"k": 0}
+
+        def f(pos):
+            pn = np.asarray(pos, np.float64)
+            if frozen_background:
+                d_mid = float(B["coeffs"][state["k"]][6])
+                state["k"] += 1
+                src = np.mod(np.asarray(
+                    g3.x_lpt(B["q"], B["psi1"], B["psi2"], d_mid), np.float64), ell)
+                gather = pn
+            else:
+                src, gather = pn, None
+            gl, _ = force_global(jnp.asarray(src), n_coarse, ell, n_tot, "long",
+                                 family=args.family, r_s=r_s, n_ref=n_fine,
+                                 match=(d_c, d_f), assign=args.assign_long,
+                                 pos_gather=gather)
+            gs, _ = force_short_tiled(pn, n_fine, ell, n_tot, args.tile, args.buf,
+                                      family=args.family, r_s=r_s)
+            return jnp.asarray(np.asarray(gl, np.float64) + np.asarray(gs, np.float64))
+
+        return f, state
 
     d_mono = dens(B["x_mono"])
     arms = {}
@@ -104,14 +130,25 @@ def main():
                                     ell, n_fine, n_part, args.tile, args.buf,
                                     B["d_final"])
         arms["tiled"] = (dens(x_t), time.perf_counter() - t0)
-        print(f"  tiled  (failing scheme) evolved in {arms['tiled'][1]:.0f}s")
+        print(f"  tiled  (failing scheme)  evolved in {arms['tiled'][1]:.0f}s")
 
-    t0 = time.perf_counter()
     zero = np.zeros_like(B["q"])
-    x_h, _, _ = g3.evolve_cola(zero, zero, B["q"], B["psi1"], B["psi2"], B["coeffs"],
-                               force_two_level, ell, B["d_final"])
-    arms["hybrid"] = (dens(np.asarray(x_h, np.float64)), time.perf_counter() - t0)
-    print(f"  hybrid (proposal)       evolved in {arms['hybrid'][1]:.0f}s\n")
+    for name, frozen in (("hybrid", False), ("hybrid_bg", True)):
+        if frozen and args.skip_bg:
+            continue
+        fn, state = make_force(frozen)
+        t0 = time.perf_counter()
+        x_h, _, _ = g3.evolve_cola(zero, zero, B["q"], B["psi1"], B["psi2"],
+                                   B["coeffs"], fn, ell, B["d_final"])
+        arms[name] = (dens(np.asarray(x_h, np.float64)), time.perf_counter() - t0)
+        if frozen and state["k"] != len(B["coeffs"]):
+            raise SystemExit(
+                f"frozen-background arm stepped the schedule {state['k']} times for "
+                f"{len(B['coeffs'])} coefficients -- the background was NOT advancing "
+                "with the integrator, so this arm measured something else entirely.")
+        tag = "(proposal, lockstep)" if not frozen else "(frozen background)"
+        print(f"  {name:8s} {tag:22s} evolved in {arms[name][1]:.0f}s")
+    print()
 
     centers = [float(m * kf) for m in range(1, args.nbins + 1)]
     print("  AUTO amplitude ratio sqrt(P_arm/P_mono) -- realization-independent")

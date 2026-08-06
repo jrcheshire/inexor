@@ -592,6 +592,7 @@ def force_global(
     match=None,
     clip=None,
     assign="cic",
+    pos_gather=None,
 ):
     """One global mesh solve of the chosen split kernel -> ((n,3) f64, max_match).
 
@@ -600,6 +601,15 @@ def force_global(
 
     Sequential per-component solves: never materialize three force meshes at
     once (forces.py's Sec. 9 rule -- the memory budget depends on it).
+
+    pos_gather splits the SOURCE of the field from the point it is READ AT.
+    Default None means gather at `pos`, which is the only behaviour any existing
+    caller sees. It exists for the frozen-background test: the long-range field
+    can be built once per step from the analytic LPT positions -- known for
+    every particle at every time without evolving anything -- while each tile
+    still reads its own particles' force at their TRUE positions. That is what
+    would let tiles run independently again, since a field that depends on no
+    evolved state can be precomputed for the whole schedule up front.
     """
     import jax.numpy as jnp
 
@@ -628,10 +638,11 @@ def force_global(
         raise ValueError(f"assign must be 'cic' or 'tsc', got {assign!r}")
     dk = jnp.fft.rfftn(delta)
     g = [jnp.fft.irfftn(dk * jnp.asarray(k), s=(n_mesh,) * 3) for k in kers]
+    rd = pos if pos_gather is None else jnp.asarray(pos_gather)
     if assign == "cic":
-        out = cic_read_vector(g[0], g[1], g[2], pos, n_mesh, box_size)
+        out = cic_read_vector(g[0], g[1], g[2], rd, n_mesh, box_size)
     else:
-        out = tsc_read_vector(g[0], g[1], g[2], pos, n_mesh, box_size)
+        out = tsc_read_vector(g[0], g[1], g[2], rd, n_mesh, box_size)
     return np.asarray(out, dtype=np.float64), max_applied
 
 
