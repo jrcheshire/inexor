@@ -397,11 +397,19 @@ def measure(cfg, seed, args):
             raise SystemExit("no arm can host a b=0 kill control (every tile < 32 fine "
                              "cells); pass --skip-brackets or add a larger tile")
         n_tile, b_fine = args.arms[idx]
-        tris, names = fl._triangles(kf, long_mults, args.bracket_k_short or k_shorts[0])
-        print(f"  brackets at {arm_tag(n_tile, b_fine)} "
-              f"(k_short mult {args.bracket_k_short or k_shorts[0]}) ...", flush=True)
+        bk = args.bracket_k_short or k_shorts[0]
+        tris, names = fl._triangles(kf, long_mults, bk)
+        # The brackets have only ever been read at k_shorts[0], which is the
+        # most-correlated leg and the one regime where every candidate statistic
+        # discriminates. The scan reads them at EVERY k_short off the same three
+        # evolved fields, so it costs estimator time only and shows where each
+        # statistic stops being able to rank a broken tiling.
+        scan_ks = [] if args.skip_bracket_scan else list(k_shorts)
+        tri_sets = {str(ks): fl._triangles(kf, long_mults, ks) for ks in scan_ks}
+        print(f"  brackets at {arm_tag(n_tile, b_fine)} (k_short mult {bk}; "
+              f"scan {scan_ks or 'off'}) ...", flush=True)
         res = {}
-        lad.bracket_controls(B, res, n_tile, b_fine, tris, names)
+        lad.bracket_controls(B, res, n_tile, b_fine, tris, names, tri_sets=tri_sets)
         out["brackets"] = res["brackets"]
 
     out["peak_host_rss_bytes"] = int(_host_rss_bytes())
@@ -472,6 +480,8 @@ def main():
                     help="index into --arms (default: largest tile that can host b=0)")
     ap.add_argument("--bracket-k-short", type=int, default=None)
     ap.add_argument("--skip-brackets", action="store_true")
+    ap.add_argument("--skip-bracket-scan", action="store_true",
+                    help="brackets at k_shorts[0] only, the pre-2026-08-06 behaviour")
     ap.add_argument("--skip-response", action="store_true")
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args()

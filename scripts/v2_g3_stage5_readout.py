@@ -194,6 +194,57 @@ def section_response(cards):
                       + "  ".join(f"k={k:.2f}: {v:+.4f}" for k, v in zip(ks, m)))
 
 
+def section_bracket_scan(cards):
+    """Does each statistic still RANK the controls as the small-scale leg deepens?
+
+    The brackets were historically read at k_shorts[0] only, the most-correlated
+    leg, where every candidate discriminates. This asks the question that
+    actually decides gateability: where does each statistic stop being able to
+    tell a maximally broken tiling (b=0) from the configuration under test?
+    """
+    print("\n=== 5b. BRACKET SCAN: discrimination vs the small-scale leg ===")
+    scan = cards[0].get("brackets", {}).get("by_k_short")
+    if not scan:
+        print("    absent -- card produced before the bracket scan existed")
+        print("    (scripts/v2_g3_ladder.py, 2026-08-06). Re-run to populate.")
+        return
+    br = cards[0]["brackets"]
+    kf = 2.0 * np.pi / cards[0]["geometry"]["L"]
+    cen = np.array(br["shell_r"]["pivot"]["centers"])
+    rr = np.array(br["shell_r"]["pivot"]["r"])
+    stats_ = ("R_Q", "rho", "rho_auto", "R_B")
+
+    for label in sorted(scan, key=int):
+        blk = scan[label]
+        ks = int(label)
+        names = blk["names"]
+        est = [i for i, n in enumerate(names)
+               if n.startswith("sq") and ks >= 2 * int(n[2:])]
+        k_s = ks * kf
+        r_at = float(rr[int(np.argmin(np.abs(cen - k_s)))])
+        print(f"\n    k_short = {k_s:.3f} h/Mpc ({ks} k_f), pivot r = {r_at:.3f}, "
+              f"{len(est)} estimand triangles")
+        if not est:
+            print("      no squeezed triangle at this k_short -- nothing to rank")
+            continue
+        print(f"      {'stat':10s} {'span':>9s} {'pivot':>9s} {'kill':>9s}   "
+              f"{'kill/pivot':>10s}  ranks?")
+        for st in stats_:
+            try:
+                v = {a: float(np.nanmax(np.abs(np.array(blk[a][st])[est])))
+                     for a in ("span_check", "pivot", "kill_control")}
+            except (KeyError, TypeError):
+                continue
+            ratio = v["kill_control"] / v["pivot"] if v["pivot"] else np.nan
+            ok = v["kill_control"] > v["pivot"]
+            print(f"      {st:10s} {v['span_check']:9.4f} {v['pivot']:9.4f} "
+                  f"{v['kill_control']:9.4f}   {ratio:10.3f}  {'yes' if ok else 'NO'}")
+    print("\n    'ranks?' = kill_control (b=0, maximally broken) reads WORSE than the")
+    print("    pivot. A statistic that stops ranking has SATURATED, and a saturated")
+    print("    statistic cannot grade a tiling however well-behaved its magnitude is.")
+    print("    One seed: a ratio near 1.0 is unresolved, not a demonstrated failure.")
+
+
 def section_brackets(cards):
     print("\n=== 5. BRACKETS (on r, never on R_Q) ===")
     c = cards[0]
@@ -228,6 +279,7 @@ def main():
     section_paired(cards, args.level)
     section_response(cards)
     section_brackets(cards)
+    section_bracket_scan(cards)
     print("\n=== CAVEATS ===")
     print("  - Wall times are MACHINE-dependent (7.4x on Vista vs 4.0x on deneb for the")
     print("    same box and configs). Compare wall only within a host.")

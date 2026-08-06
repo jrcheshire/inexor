@@ -472,6 +472,53 @@ on the resource spec. The request should be raised to ~60 G before this profile
 is run again, and no conclusion should be drawn from the fact that it has not
 failed yet.
 
+### 10. The bracket scan, pre-registered before the cdev run (2026-08-06)
+
+Section 9 left one question open: the brackets had only ever been read at
+`k_shorts[0]`, the most-correlated leg, so they showed `rho_auto` HAS
+discriminating power but not that it KEEPS it where `rho` fails.
+`bracket_controls` now takes an optional `tri_sets` and reads all four
+`k_short` off the SAME three evolved control fields, so the scan costs
+estimator time only (+3 s on the smoke). The pre-existing single-set outputs
+are bit-identical, verified by diffing a smoke card against a baseline taken
+before the change: worst absolute deviation 0.000e+00 on every bracket
+quantity, with `shell_r`'s centre list widening 7 -> 8 by design.
+
+**Smoke preview** (T=32/b=8, tiny box, NOT a cdev statement), `kill/pivot`
+ratio; > 1 means the maximally broken tiling reads worse, as it must:
+
+| `k_short` (k_f) | pivot `r` | `R_Q` | `rho` | `rho_auto` | `R_B` |
+|---|---|---|---|---|---|
+| 4 | 0.597 | 0.947 NO | 3.555 | 1.050 | 1.056 |
+| 6 | 0.404 | 0.904 NO | 9.244 | 1.027 | 1.049 |
+| 8 | 0.066 | 0.945 NO | 406.4 | 1.047 | 1.053 |
+
+**Predictions for cdev, fixed before the run:**
+
+1. **`R_Q` fails to rank at every `k_short`.** On the smoke it already fails at
+   the SHALLOWEST leg (0.947), which is stronger than expected -- the
+   saturation is not confined to the decorrelated regime. If cdev reproduces
+   this, `R_Q`'s problem is worse than "cannot be read where the arms
+   decorrelate" and the ratified gate statistic is in question on its own terms.
+2. **`rho` ranks, and the ordering is worthless.** Its `kill/pivot` grows
+   3.6 -> 9.2 -> 406 as `r` falls, and its kill magnitude reaches 6.6e4 against
+   a 0.15 bar. It gets the ORDER right for the wrong reason: the kill control
+   decorrelates more, so its `1/r^2` inflation is larger, and brokenness
+   correlates with decorrelation. A correct ranking does not rescue a statistic
+   whose magnitude is five orders off the bar. **Do not read this row as
+   `rho` winning.**
+3. **`rho_auto` ranks with a modest, roughly constant margin** (1.03-1.05 on
+   the smoke), tracking `R_B` closely -- which is expected, since `A -> 1` under
+   pure decorrelation and `rho_auto -> R_B` by construction.
+
+**The risk this run is designed to expose.** `rho_auto` is bounded, but bounded
+is not the same as discriminating: as decorrelation completes, `B_t` becomes
+independent of `B_m`, `R_B -> -1` for every arm, and the margin over 1.0 can
+collapse. A 3-5% margin at one seed is NOT resolved. **If `kill/pivot` -> 1.0
+at the deep legs, the honest conclusion is that `rho_auto` fixes the divergence
+but does NOT extend the gate's reach, and the `r` conditioning cut is still
+required.** That is a real possible outcome and it is not a failed run.
+
 ## Not licensed / owed
 
 - Nothing here is a cgh64 statement. Stage 5 is the MECHANISM ensemble and

@@ -296,8 +296,26 @@ def _stats_vs_mono(x_arm, B, tris, dk=None):
     return fl.stats(dens(x_arm), dens(B["x_mono"]), ell, tris, dk=dk)
 
 
-def bracket_controls(B, res, n_tile, b_fine, tris, names):
-    """kill_control and span_check -- the gate's power and its dynamic range."""
+def bracket_controls(B, res, n_tile, b_fine, tris, names, tri_sets=None):
+    """kill_control and span_check -- the gate's power and its dynamic range.
+
+    tri_sets: optional {label: (tris, names)} evaluated on the SAME three
+    evolved control fields, so a scan over the small-scale leg costs estimator
+    time only -- the three evolves are the expensive part and they do not depend
+    on which triangles are read off them.
+
+    WHY THE SCAN EXISTS. The brackets have only ever been run at k_shorts[0],
+    which at cdev is 6 k_f where r is 0.7-0.92 and EVERY candidate statistic
+    discriminates. That establishes a statistic has power; it says nothing about
+    whether it KEEPS it at the deep legs, which is precisely where rho was
+    measured to fail (runs/v2/g3_stage5_record.md sec. 8-9). A statistic that is
+    merely BOUNDED under decorrelation rather than divergent can still saturate,
+    and a saturated statistic cannot rank a broken tiling against a good one.
+
+    The default single-set path is unchanged and its outputs are bit-identical:
+    the densities are painted once and reused, and the int paint is
+    deterministic.
+    """
     import v2_g3_core as g3
 
     g = B["g"]
@@ -348,7 +366,13 @@ def bracket_controls(B, res, n_tile, b_fine, tris, names):
     from inexor import painting
 
     gg = B["g"]
-    centers = sorted({float(k) for t in tris for k in t})
+    # the union over every triangle set, so A = T/r is available on every leg the
+    # scan reads -- shells are computed independently, so the values at the
+    # original centers are unchanged by widening the set
+    all_tris = list(tris)
+    for _ts, _ns in (tri_sets or {}).values():
+        all_tris.extend(_ts)
+    centers = sorted({float(k) for t in all_tris for k in t})
     kf_ = 2.0 * np.pi / gg["L"]
 
     def _d(x):
@@ -357,17 +381,29 @@ def bracket_controls(B, res, n_tile, b_fine, tris, names):
             np.float64,
         )
 
+    KEEP = ("R_B", "R_Q", "rho", "rho_auto", "W", "T_prod", "A_prod")
     d_mono = _d(B["x_mono"])
-    rk = {}
+    rk, scan = {}, {}
     for arm_name, xa in (("pivot", x_piv), ("kill_control", x_kill), ("span_check", x_2lpt)):
-        t_sh, r_sh, _ = fl.shell_transfer(_d(xa), d_mono, gg["L"], centers, kf_)
+        d_arm = _d(xa)
+        t_sh, r_sh, a_sh = fl.shell_transfer(d_arm, d_mono, gg["L"], centers, kf_)
         rk[arm_name] = dict(centers=[float(c) for c in centers],
-                            T=[float(v) for v in t_sh], r=[float(v) for v in r_sh])
+                            T=[float(v) for v in t_sh], r=[float(v) for v in r_sh],
+                            A=[float(v) for v in a_sh])
+        # the scan: same evolved field, different small-scale leg
+        for label, (ts, ns) in (tri_sets or {}).items():
+            s = fl.stats(d_arm, d_mono, gg["L"], ts)
+            scan.setdefault(label, {"names": list(ns)})[arm_name] = {
+                k: [float(v) for v in s[k]] for k in KEEP
+            }
+        del d_arm
     out["shell_r"] = rk
+    if scan:
+        out["by_k_short"] = scan
 
-    out["kill_control"] = {k: list(s_kill[k]) for k in ("R_B", "R_Q", "rho", "W")}
-    out["span_check"] = {k: list(s_2lpt[k]) for k in ("R_B", "R_Q", "rho", "W")}
-    out["pivot"] = {k: list(s_piv[k]) for k in ("R_B", "R_Q", "rho", "W")}
+    out["kill_control"] = {k: list(s_kill[k]) for k in KEEP}
+    out["span_check"] = {k: list(s_2lpt[k]) for k in KEEP}
+    out["pivot"] = {k: list(s_piv[k]) for k in KEEP}
     out["names"] = names
     res["brackets"] = out
     return out
