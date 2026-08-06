@@ -109,6 +109,43 @@ def section_verdict(cards, level):
     print("       speak there, not that the tiling agreed.")
 
 
+def section_auto(cards, level):
+    """rho_auto next to rho: REPORTED, NOT GATED.
+
+    The ratified precondition is rho. This section exists so the checkpoint that
+    decides whether to keep it can read both on the same triangles, and so the
+    1/r^2 signature is visible rather than argued.
+    """
+    print(f"\n=== 2b. AUTO-TRANSFER rho_auto vs rho (r >= {level}) -- REPORTED, NOT GATED ===")
+    if not any("max_abs_rho_auto" in c for card in cards
+               for r in card["rows"] for c in r["cells"].values()):
+        print("    absent from these cards -- produced before the auto transfer existed")
+        print("    (scripts/v2_g3_stage5.py, 2026-08-06). Re-run to populate.")
+        return
+    ks = cards[0]["gate"]["k_short_mults"]
+    kf = 2.0 * np.pi / cards[0]["geometry"]["L"]
+    print("    arm             k_short     r     rho_auto        rho    1/r^2-1")
+    for arm in [r["arm"] for r in cards[0]["rows"]]:
+        for k in ks:
+            va, vr, rr = [], [], []
+            for c in cards:
+                row = next((r for r in c["rows"] if r["arm"] == arm), None)
+                cell = row["cells"][str(k)] if row else None
+                if cell and "max_abs_rho_auto" in cell:
+                    va.append(cell["max_abs_rho_auto"])
+                    vr.append(cell["max_abs_rho"])
+                    rr.append(cell["r_k_short"])
+            if not va:
+                continue
+            r_m = float(np.mean(rr))
+            pred = 1.0 / r_m**2 - 1.0 if r_m > 0 else float("inf")
+            print(f"    {arm:16s} {k * kf:6.3f} {r_m:6.3f} {np.mean(va):10.4f} "
+                  f"{np.mean(vr):10.4f} {pred:10.4f}")
+    print("    The last column is what rho reduces to when the tiled arm keeps its")
+    print("    power and only loses phase coherence. Where rho tracks it, rho is")
+    print("    reporting the eligibility map, not the tiling error.")
+
+
 def section_paired(cards, level):
     """The buffer-vs-tile null, ranked WITHIN each seed."""
     print("\n=== 3. PAIRED: same absolute buffer, different tile size ===")
@@ -187,6 +224,7 @@ def main():
           f"seeds {[c['seed'] for c in cards]} ===")
     section_eligibility(cards, args.level)
     section_verdict(cards, args.level)
+    section_auto(cards, args.level)
     section_paired(cards, args.level)
     section_response(cards)
     section_brackets(cards)

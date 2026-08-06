@@ -360,7 +360,7 @@ def bracket_controls(B, res, n_tile, b_fine, tris, names):
     d_mono = _d(B["x_mono"])
     rk = {}
     for arm_name, xa in (("pivot", x_piv), ("kill_control", x_kill), ("span_check", x_2lpt)):
-        t_sh, r_sh = fl.shell_transfer(_d(xa), d_mono, gg["L"], centers, kf_)
+        t_sh, r_sh, _ = fl.shell_transfer(_d(xa), d_mono, gg["L"], centers, kf_)
         rk[arm_name] = dict(centers=[float(c) for c in centers],
                             T=[float(v) for v in t_sh], r=[float(v) for v in r_sh])
     out["shell_r"] = rk
@@ -417,7 +417,7 @@ def rung_buffer_monotonicity(B, res, n_tile, tris, names, b_list=None):
             x_t, g["n_fine"], g["L"], g["n_part"] ** 3, paint="int"), np.float64)
         d_m = np.asarray(painting.density_contrast(
             B["x_mono"], g["n_fine"], g["L"], g["n_part"] ** 3, paint="int"), np.float64)
-        _, r_sh = fl.shell_transfer(d_t, d_m, g["L"], centers, 2.0 * np.pi / g["L"])
+        _, r_sh, _ = fl.shell_transfer(d_t, d_m, g["L"], centers, 2.0 * np.pi / g["L"])
         rows.append(dict(b=int(b), b_realized=int(b_real), p_side=int(p_side),
                          p_frac=float(p_side) / float(g["n_fine"]),
                          max_abs_R_Q=float(np.nanmax(np.abs(s["R_Q"]))),

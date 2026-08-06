@@ -277,7 +277,7 @@ def measure(cfg, seed, args):
 
         k_curve, r_curve, _ = cross_r(d_t, d_mono, ell)
         k_usable = {str(lv): k_at_r(k_curve, r_curve, lv) for lv in R_REPORT}
-        t_shell, r_shell = fl.shell_transfer(d_t, d_mono, ell, all_centers, kf)
+        t_shell, r_shell, a_shell = fl.shell_transfer(d_t, d_mono, ell, all_centers, kf)
         r_at = dict(zip(all_centers, (float(v) for v in r_shell)))
 
         cells = {}
@@ -300,7 +300,9 @@ def measure(cfg, seed, args):
                 estimand_names=[names[i] for i in sq],
                 R_Q=[float(v) for v in s["R_Q"]], R_B=[float(v) for v in s["R_B"]],
                 rho=[float(v) for v in s["rho"]], W=[float(v) for v in s["W"]],
+                rho_auto=[float(v) for v in s["rho_auto"]],
                 T_prod=[float(v) for v in s["T_prod"]],
+                A_prod=[float(v) for v in s["A_prod"]],
                 n_tri=[float(v) for v in s["n_tri"]],
             )
             # THE ESTIMAND: max |R_Q| over gate-eligible SQUEEZED triangles. The
@@ -322,6 +324,18 @@ def measure(cfg, seed, args):
                 scale = np.maximum(np.abs([s["R_Q"][i] for i in sq]), 1e-12)
                 cell["max_rho_deviation"] = float(np.nanmax(diff / scale))
                 cell["rho_agrees"] = bool(cell["max_rho_deviation"] <= args.rho_tol)
+                # rho_auto: REPORTED, NOT GATED. The ratified precondition is
+                # rho, and swapping the gate statistic is a checkpoint decision,
+                # not something a producer may do silently. Emitted alongside so
+                # the checkpoint can be argued on measured behaviour -- the pilot
+                # showed rho tracks 1/r^2 rather than the tiling error, and the
+                # auto transfer carries no r (runs/v2/g3_stage5_record.md sec. 8).
+                ra = np.abs([s["rho_auto"][i] for i in sq])
+                cell["max_abs_rho_auto"] = float(np.nanmax(ra))
+                d_a = np.abs(np.array([s["R_Q"][i] - s["rho_auto"][i] for i in sq]))
+                cell["max_rho_auto_deviation"] = float(np.nanmax(d_a / scale))
+                cell["rho_auto_agrees"] = bool(
+                    cell["max_rho_auto_deviation"] <= args.rho_tol)
             else:
                 cell["verdict"] = "NOT GRADEABLE"
                 cell["why"] = ("decorrelated" if r_ks < R_GATE
@@ -348,7 +362,13 @@ def measure(cfg, seed, args):
             wall=float(wall), k=[float(v) for v in k_curve],
             r=[float(v) for v in r_curve], k_usable=k_usable,
             shell_centers=all_centers, shell_T=[float(v) for v in t_shell],
-            shell_r=[float(v) for v in r_shell], cells=cells, response=resp,
+            shell_r=[float(v) for v in r_shell],
+            # shell_A closes the gap that blocked the pilot's own re-analysis:
+            # with T and r alone, any statistic built on the AUTO transfer needs
+            # a fresh run. With A on the card, (1 + R_B)/A_prod - 1 is
+            # recoverable per triangle from the card, no evolve required.
+            shell_A=[float(v) for v in a_shell],
+            cells=cells, response=resp,
         ))
         print(f"  {tag:16s} b={b_real * fine_cell:5.1f} Mpc/h P={p_side:4d} "
               f"vol={vol_ratio:6.2f}x tiles={diag['n_tiles']:5d} "

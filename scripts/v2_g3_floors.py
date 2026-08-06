@@ -87,11 +87,31 @@ def _triangles(kf, long_mults=None, k_short_mult=None):
 
 
 def shell_transfer(delta_t, delta_m, box_size, centers, dk):
-    """Per-shell transfer T(k) = P_tm / P_mm, and the correlation r(k).
+    """Per-shell CROSS transfer T(k), correlation r(k), and AUTO transfer A(k).
 
-    T is what a deterministic window would be; r is the decorrelation check the
-    cancellation factor's interpretation depends on (r ~ 1 at k_long means the
-    arms genuinely share long modes).
+        T(k) = P_tm / P_mm          A(k) = sqrt(P_tt / P_mm)
+        r(k) = P_tm / sqrt(P_tt P_mm)
+
+    T is what a deterministic window would be, and r is the decorrelation check.
+
+    A EXISTS BECAUSE T CONFLATES TWO DIFFERENT THINGS. Identically,
+
+        T(k) = r(k) * A(k)
+
+    (the test suite asserts this to 1e-13), so the cross transfer folds an
+    AMPLITUDE change -- the tiled arm losing power -- together with a PHASE
+    change -- the tiled arm decorrelating. Any statistic that divides by T
+    therefore divides by r, and blows up as 1/r wherever the arms decorrelate
+    even when no power has been lost at all. That is what happened to `rho` on
+    the Stage 5 pilot: it tracked 1/r^2 - 1 across sixteen cells within 10-20%
+    and reached 3.6e4 where r crossed zero, so it measured the decorrelation
+    already in the eligibility map rather than the tiling error it was built
+    for (runs/v2/g3_stage5_record.md sec. 8).
+
+    A carries no r. It is still exactly the window under a deterministic window
+    (P_t = T^2 P_m there, so A = T), so window-invariance is preserved, but
+    under pure decorrelation at fixed power A -> 1 and the statistic built on it
+    degrades to the raw ratio instead of diverging.
     """
     from inexor.diagnostics import _k_grid, _shell_mask
 
@@ -101,6 +121,7 @@ def shell_transfer(delta_t, delta_m, box_size, centers, dk):
     _, _, k_mag = _k_grid(n, box_size)
     t_out = np.empty(len(centers))
     r_out = np.empty(len(centers))
+    a_out = np.empty(len(centers))
     for i, c in enumerate(centers):
         msk = _shell_mask(k_mag, c - 0.5 * dk, c + 0.5 * dk)
         p_tm = float(np.real(tk[msk] * np.conj(mk[msk])).sum())
@@ -108,7 +129,8 @@ def shell_transfer(delta_t, delta_m, box_size, centers, dk):
         p_tt = float((np.abs(tk[msk]) ** 2).sum())
         t_out[i] = p_tm / p_mm if p_mm > 0 else np.nan
         r_out[i] = p_tm / np.sqrt(p_tt * p_mm) if p_tt * p_mm > 0 else np.nan
-    return t_out, r_out
+        a_out[i] = np.sqrt(p_tt / p_mm) if p_mm > 0 else np.nan
+    return t_out, r_out, a_out
 
 
 def residual_field(delta_t, delta_m, box_size, centers, dk):
@@ -124,7 +146,7 @@ def residual_field(delta_t, delta_m, box_size, centers, dk):
     tk = np.fft.rfftn(delta_t)
     mk = np.fft.rfftn(delta_m)
     _, _, k_mag = _k_grid(n, box_size)
-    t_shell, _ = shell_transfer(delta_t, delta_m, box_size, centers, dk)
+    t_shell, _, _ = shell_transfer(delta_t, delta_m, box_size, centers, dk)
     ek = tk - mk
     for c, t in zip(centers, t_shell):
         msk = _shell_mask(k_mag, c - 0.5 * dk, c + 0.5 * dk)
@@ -163,15 +185,25 @@ def stats(delta_t, delta_m, box_size, tris, dk=None):
     # measured per-shell transfer out explicitly, so it is the estimand that is
     # window-invariant by construction. Reported here so the checkpoint can
     # choose between them on measured window-response rather than on intent.
-    t_shell, _ = shell_transfer(delta_t, delta_m, box_size, centers, w)
+    t_shell, _, a_shell = shell_transfer(delta_t, delta_m, box_size, centers, w)
     ts = dict(zip(centers, t_shell))
     t_prod = np.array([ts[float(t[0])] * ts[float(t[1])] * ts[float(t[2])] for t in tris])
+
+    # rho_auto: the same window division, through the AUTO transfer A = sqrt(P_t/P_m).
+    # Identical to rho under a deterministic window (A = T there, exactly), but A
+    # carries no r, so where the arms decorrelate at fixed power A -> 1 and this
+    # degrades to R_B instead of diverging as 1/r^2. See shell_transfer's docstring
+    # and runs/v2/g3_stage5_record.md sec. 8 for the measurement that motivated it.
+    a_s = dict(zip(centers, a_shell))
+    a_prod = np.array([a_s[float(t[0])] * a_s[float(t[1])] * a_s[float(t[2])] for t in tris])
 
     return dict(
         R_B=b_t / b_m - 1.0,
         R_Q=q_t / q_m - 1.0,
         rho=(b_t / b_m) / t_prod - 1.0,
+        rho_auto=(b_t / b_m) / a_prod - 1.0,
         T_prod=t_prod,
+        A_prod=a_prod,
         W=b_emm / b_m,
         B_m=b_m,
         B_t=b_t,
@@ -401,7 +433,7 @@ def section_BC(cfg, nseed, tris, names, out, window="gauss"):
         rb.append(st["R_B"])
         bm.append(st["B_m"])
         wv.append(st["W"])
-        _, r = shell_transfer(d_t, d_m, ell, st["centers"], 2.0 * np.pi / ell)
+        _, r, _ = shell_transfer(d_t, d_m, ell, st["centers"], 2.0 * np.pi / ell)
         rlong.append(r[0])
         if s == 0:
             g0, p_m0, ntri0, cen0 = g, st["P_m"], st["n_tri"], st["centers"]
