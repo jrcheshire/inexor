@@ -570,16 +570,41 @@ decision here is locked until explicitly re-litigated with JC.
   - **A3 dies as a squeezed-B mock route. A2 is unaffected** and D-v2-10 /
     D-v2-11 stand untouched. The negative is publishable (P-C) and is
     strengthened, not weakened, by the mechanism in clause 2.
-  - **THE ANOMALY THAT SHOULD BE CHASED IF ANYTHING IS.** Pure 2LPT -- the
-    span-check bracket, the background the tiles are built on top of --
-    has `A(k_f)` = 0.980, i.e. essentially correct long-mode power. The tiled
-    arm has 0.394. **The tiling is destroying large-scale power its own LPT
-    background already had right**, which is the opposite of what sCOLA is
-    supposed to do. Stage 4's `buffer_to_box` degenerate rung passes at
-    1e-13, so this is not a gross implementation bug, but whether it is
-    intrinsic to finite-buffer sCOLA or specific to this implementation's
-    background handling is **NOT established**, and it is the one question
-    that could reverse clause 1.
+  - **THE ANOMALY IS RESOLVED, and it is not a bug** (2026-08-06, probe
+    `scripts/v2_g3_tile_force_scale.py`). Pure 2LPT -- the background the
+    tiles sit on -- has `A(k_f)` = 0.980 while the tiled arm has 0.394, which
+    looked like the tiling destroying large-scale power its own background
+    had right. The cause is structural. A tile's force comes from
+    `force_global` on a PERIODIC PADDED BOX, which supports no mode longer
+    than that box, while the analytic frame terms in `cola_step_bullfrog`
+    (`c_k1*psi1 + c_k2*psi2`) keep their GLOBAL long-wavelength content. COLA
+    works because those two very nearly cancel at large scales; here the force
+    side of the cancellation is simply absent, so the residual grows a
+    spurious large-scale piece that fights the background displacement.
+    Measured directly on the force, one evaluation per arm and no evolution:
+    the tile force loses amplitude specifically BELOW the padded tile's own
+    fundamental `k_P = 2*pi/(P*cell)` and recovers above it, with the knee
+    tracking `k_P` as it moves (smoke, `k_P` = 2.00 vs 1.33 k_f). The
+    production-box density shows the same signature across all four arms at
+    three different `k_P`, from data already on disk: amplitude below `k_P` of
+    0.441 / 0.424 / 0.633 / 0.394 rising to 0.920 / 0.903 / 0.929 / 0.839 at
+    the first shell above it, for `k_P` = 3.20 / 2.67 / 2.00 / 4.00 k_f.
+  - **Consequence of that resolution: the controlling variable is the PADDED
+    TILE SIZE relative to the box, not the buffer as such.** Getting
+    box-scale modes right requires the padded tile to approach the box, i.e.
+    not to tile. This is why the buffer ladder never converges toward 1 and
+    why the literature's larger buffer would not fix it either -- more buffer
+    moves `k_P` down slowly and at cubic cost.
+  - **The structural fix is identified but UNTESTED, and it is the one thing
+    worth trying before A3 is closed for good.** The missing piece is exactly
+    the long-range force, and this project already has validated machinery
+    that supplies it: the two-level split ratified in D-v2-10/D-v2-11, a
+    global coarse solve plus a local fine solve. A tiled arm that took its
+    long-wavelength force from the global coarse mesh instead of from the
+    tile's own periodization would have no reason to show this deficit. That
+    is a HYPOTHESIS with a clear mechanism, not a measured result; it is not
+    the configuration tested here, and clause 1 stands for the configuration
+    that was.
   - **The buffer the literature specifies was never tested, deliberately.**
     Leclercq (2003.04925) gives buffer >= 25 Mpc/h; every arm here is at or
     below 16. At cdev geometry b = 25 Mpc/h costs 16.8x and b = 32 costs

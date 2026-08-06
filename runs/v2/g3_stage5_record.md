@@ -528,6 +528,58 @@ at the deep legs, the honest conclusion is that `rho_auto` fixes the divergence
 but does NOT extend the gate's reach, and the `r` conditioning cut is still
 required.** That is a real possible outcome and it is not a failed run.
 
+### 11. Why the tiling loses large-scale power (2026-08-06, resolved)
+
+Section 9's anomaly -- the tiled arm at `A(k_f)` = 0.394 against pure 2LPT's
+0.980 -- is explained, and it is structural rather than a defect.
+
+**Mechanism, read off the integrator.** `cola_step_bullfrog` updates the
+residual velocity as `u <- alpha*u + bcoef*g + c_k1*psi1 + c_k2*psi2`. COLA
+works because at large scales the true force `g` very nearly cancels the
+analytic frame terms, leaving the residual small there so the background
+carries the long modes untouched. A tile's `g` comes from `force_global` on a
+PERIODIC PADDED BOX, which supports no mode longer than itself, while `psi1`
+and `psi2` are the GLOBAL LPT displacements and keep their long-wavelength
+content. The cancellation therefore fails at large scales and the residual
+grows a spurious piece that fights the background.
+
+**Measured, one force evaluation per arm, no evolution**
+(`scripts/v2_g3_tile_force_scale.py`). The prediction fixed before the run was
+that the tile force loses amplitude specifically below the padded tile's own
+fundamental `k_P` and tracks the monolithic force above it, with a flat loss
+or a knee elsewhere refuting it. Smoke, `sqrt(P_tile/P_mono)` on the
+Lagrangian grid:
+
+| arm | `k_P` [k_f] | k=1 | k=2 | k=3 | k=4 |
+|---|---|---|---|---|---|
+| T=16 b=8 | 2.00 | 0.186 | 0.364 | 0.571 | 0.537 |
+| T=16 b=16 | 1.33 | 0.468 | 0.882 | 0.871 | 0.847 |
+| T=32 b=8 | 1.33 | 0.542 | 0.934 | 0.776 | 0.857 |
+
+The knee moves with `k_P` and not with the buffer: the two arms sharing
+`k_P` = 1.33 recover together at k=2, while the `k_P` = 2.00 arm is still at
+0.364 there.
+
+**Confirmed at the production box for free**, from `shell_A` already on the
+tracked card, across four arms at three different `k_P`:
+
+| arm | `k_P` [k_f] | below `k_P` | first shell above |
+|---|---|---|---|
+| T=128 b=16 | 3.20 | 0.441, 0.691, 0.702 | 0.920 |
+| T=128 b=32 | 2.67 | 0.424, 0.736 | 0.903 |
+| T=128 b=64 | 2.00 | 0.633 | 0.929 |
+| T=64 b=32 | 4.00 | 0.394, 0.573, 0.676 | 0.839 |
+
+**What this changes.** The controlling variable is the PADDED TILE SIZE
+relative to the box, not the buffer as such, so no affordable buffer converges
+the long modes and the literature's larger buffer would not either. The
+missing ingredient is precisely a long-range force, which the two-level split
+ratified in D-v2-10/D-v2-11 already supplies. A tiled arm drawing its
+long-wavelength force from the global coarse mesh rather than from its own
+periodization has no reason to show this deficit. **That is a mechanism-backed
+hypothesis, not a measurement**, and it is the one experiment worth running
+before A3 is closed permanently.
+
 ## Not licensed / owed
 
 - Nothing here is a cgh64 statement. Stage 5 is the MECHANISM ensemble and
