@@ -443,6 +443,145 @@ def local_bispectrum_binned(delta_shape_n, box_size, cosmo, triangles, f_NL, z=0
     return 2.0 * f_NL * np.asarray(ratio, dtype=np.float64)
 
 
+def _subvolume_blocks(delta, n_sub, offset_cells):
+    """Split a periodic mesh into n_sub^3 equal cubes, origin shifted by offset_cells.
+
+    Returns (n_sub^3, s, s, s) with s = N // n_sub, block index raveled C-order.
+    The shift is a np.roll, so the split stays a partition of the periodic box:
+    every cell belongs to exactly one block and no cell is dropped.
+    """
+    n = delta.shape[0]
+    s = n // n_sub
+    off = int(offset_cells) % n
+    d = np.roll(delta, (-off, -off, -off), axis=(0, 1, 2))
+    d = d.reshape(n_sub, s, n_sub, s, n_sub, s)
+    return np.ascontiguousarray(d.transpose(0, 2, 4, 1, 3, 5)).reshape(n_sub**3, s, s, s)
+
+
+def _straddle_fraction(n_mesh, n_sub, offset_cells, tiles_per_side):
+    """Fraction of sub-volumes that cross at least one tile wall.
+
+    A sub-volume lying wholly inside one tile can only see the long-wavelength
+    modulation that tile already carries in its own frame; it is blind to the
+    seam BY CONSTRUCTION. A lattice of such sub-volumes measures both arms in a
+    correlated way and cannot detect the defect, which is the reason this
+    function exists rather than a comment.
+
+    NOTE the obvious guard -- "make n_sub coprime to tiles_per_side" -- is not
+    available here: an equal-cube split needs n_sub | N, N is a power of two, and
+    so is tiles_per_side, so every admissible pair shares a factor. The offset is
+    what breaks the alignment, and this is the measurement of whether it did.
+    """
+    s = n_mesh // n_sub
+    tile_cells = n_mesh // tiles_per_side
+    off = int(offset_cells) % n_mesh
+    nested = 0
+    for b in range(n_sub):
+        lo = off + b * s
+        # interior wall positions inside (lo, lo + s), in the unrolled frame
+        walls = [w for w in range(0, 2 * n_mesh, tile_cells) if lo < w < lo + s]
+        nested += 0 if walls else 1
+    return 1.0 - (nested / float(n_sub)) ** 3
+
+
+def subvolume_response(delta, box_size, n_sub, k_centers, dk=None, offset_frac=0.5,
+                       tiles_per_side=None):
+    """Position-dependent P(k): the response of small-scale power to the local
+    long-wavelength density (the integrated bispectrum, Chiang et al. 2014).
+
+    Splits the box into n_sub^3 equal sub-cubes, measures each one's mean
+    overdensity `delta_bar` and its own band power `P_sub(k)`, then regresses
+    the fractional power fluctuation on `delta_bar`:
+
+        P_sub(k) / <P_sub(k)> - 1 = slope(k) * delta_bar + noise
+
+    `slope` is dlnP/ddelta_bar, the squeezed-limit coupling in amplitude form.
+
+    WHY THIS EXISTS ALONGSIDE bispectrum(). The reduced-bispectrum ratio cannot
+    separate amplitude-wrong from phase-wrong: two fields that have decorrelated
+    give a ratio that saturates at a bounded value and is not monotone in how
+    broken they are. This statistic is built on band POWER inside a sub-volume,
+    so it is insensitive to the small-scale phases and keeps its meaning where
+    the ratio loses it. It is a different estimator, not a reformulation.
+
+    n_sub must divide the mesh (equal cubes, no trimming). The sub-volume's own
+    fundamental is 2 pi n_sub / L, and requesting a center below it raises --
+    an empty band would otherwise return NaN and read as a failed arm.
+
+    offset_frac shifts the sub-volume lattice by that fraction of a sub-volume
+    (default half), which is what stops it from aligning with a tile lattice.
+    Pass tiles_per_side to have that checked rather than assumed: the returned
+    `straddle_frac` is the fraction of sub-volumes crossing a tile wall, and a
+    fully nested lattice (0.0) raises.
+
+    Returns a dict: delta_bar (n_blocks,), p_sub (n_blocks, n_k), p_mean (n_k,),
+    slope (n_k,), slope_err (n_k,), n_modes (n_k,), plus n_sub, n_blocks,
+    sub_box, k_f_sub, offset_cells and straddle_frac.
+    """
+    delta = np.asarray(delta, dtype=np.float64)
+    n = delta.shape[0]
+    if n % n_sub:
+        raise ValueError(f"n_sub={n_sub} must divide the mesh N={n} (equal cubes, no trimming)")
+    s = n // n_sub
+    sub_box = box_size / n_sub
+    kf_sub = 2.0 * np.pi / sub_box
+    centers = np.atleast_1d(np.asarray(k_centers, dtype=np.float64))
+    w = kf_sub if dk is None else float(np.asarray(dk, dtype=np.float64).ravel()[0])
+    low = centers[centers - 0.5 * w < 0.5 * kf_sub]
+    if low.size:
+        raise ValueError(
+            f"k_centers {low.tolist()} reach below the sub-volume fundamental "
+            f"{kf_sub:.4f} h/Mpc (n_sub={n_sub}, sub-box {sub_box:.2f} Mpc/h). That band has "
+            "no modes inside a sub-volume; use a smaller n_sub or a larger center."
+        )
+
+    offset_cells = int(round(offset_frac * s))
+    straddle = None
+    if tiles_per_side is not None:
+        straddle = _straddle_fraction(n, n_sub, offset_cells, int(tiles_per_side))
+        if straddle == 0.0:
+            raise ValueError(
+                f"every sub-volume lies inside one tile (n_sub={n_sub}, "
+                f"tiles_per_side={tiles_per_side}, offset {offset_cells} cells): the lattice "
+                "is blind to the seams by construction and cannot discriminate the arms."
+            )
+
+    blocks = _subvolume_blocks(delta, n_sub, offset_cells)
+    delta_bar = blocks.mean(axis=(1, 2, 3))
+
+    _, _, k_mag = _k_grid(s, sub_box)
+    masks = [_shell_mask(k_mag, float(c) - 0.5 * w, float(c) + 0.5 * w) for c in centers]
+    n_modes = np.array([float(m.sum()) for m in masks])
+    if (n_modes == 0).any():
+        raise ValueError(f"empty sub-volume band(s) at centers {centers[n_modes == 0].tolist()}")
+
+    dk_blocks = np.fft.rfftn(blocks, axes=(1, 2, 3))
+    pm = np.abs(dk_blocks) ** 2 * (sub_box**3 / s**6)
+    del dk_blocks
+    p_sub = np.stack([pm[:, m].sum(axis=1) / cnt for m, cnt in zip(masks, n_modes)], axis=1)
+    del pm
+
+    p_mean = p_sub.mean(axis=0)
+    # Ordinary least squares through the sub-volume scatter. delta_bar averages
+    # to ~0 over the full box by construction, but it is centered explicitly so
+    # the slope does not depend on that holding exactly.
+    x = delta_bar - delta_bar.mean()
+    sxx = float((x**2).sum())
+    y = p_sub / p_mean[None, :] - 1.0
+    y = y - y.mean(axis=0)[None, :]
+    slope = (x[:, None] * y).sum(axis=0) / sxx
+    resid = y - x[:, None] * slope[None, :]
+    dof = max(len(x) - 2, 1)
+    slope_err = np.sqrt((resid**2).sum(axis=0) / dof / sxx)
+
+    return dict(
+        delta_bar=delta_bar, p_sub=p_sub, p_mean=p_mean, slope=slope, slope_err=slope_err,
+        n_modes=n_modes, k_centers=centers, n_sub=int(n_sub), n_blocks=int(n_sub**3),
+        sub_box=float(sub_box), k_f_sub=float(kf_sub), offset_cells=int(offset_cells),
+        straddle_frac=straddle,
+    )
+
+
 def min_image_rms(x_a, x_b, box_size):
     """RMS per-component displacement between two position sets, minimum-image."""
     d = np.asarray(x_a, dtype=np.float64) - np.asarray(x_b, dtype=np.float64)
