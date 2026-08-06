@@ -407,6 +407,71 @@ whether the resulting statistic still responds to a genuine seam error is
 exactly the thing the brackets exist to test. One seed throughout. Whether the
 gate statistic should change is a checkpoint decision and is NOT taken here.
 
+### 9. The auto-transfer re-run (deneb 362, 2026-08-06)
+
+Job 362 re-ran the pilot at `main @ abd4661`, same config and seed as 360,
+5224 s. It exists to measure `rho_auto` on real evolved fields, which fixtures
+and the smoke box cannot do.
+
+**The refactor is exactly neutral.** `v2_g3_card_repro.py` compared 112 arrays
+across the four arms on `R_Q`, `R_B`, `rho`, `W`, `T_prod`, `n_tri` and the
+shell arrays: **worst relative deviation 0.000e+00** against a 1e-12 bound.
+Bitwise, not merely within tolerance, a day apart on the same host. The four
+`k(r=0.5)` anchors also reproduce (0.4517 / 0.4722 / 0.9000 / 0.5172), and
+eligibility is unchanged at 6 of 16 cells. The 362 card therefore SUPERSEDES
+360 at the canonical path -- identical numbers plus `rho_auto`, `A_prod` and
+`shell_A` -- and every number in sections 1-8 above stands unaltered.
+
+**`rho_auto` does not inherit the decorrelation.** Across the b=64 arm's
+`k_short` scan, where `r` falls from 0.921 to 0.517:
+
+| `k_short` | `r` | `rho` | `1/r^2 - 1` | `rho_auto` |
+|---|---|---|---|---|
+| 0.295 | 0.921 | 0.289 | 0.179 | 0.398 |
+| 0.589 | 0.762 | 0.823 | 0.721 | 0.250 |
+| 0.884 | 0.517 | 3.270 | 2.742 | 0.225 |
+
+`rho` climbs by 11x tracking `1/r^2 - 1`; `rho_auto` is flat, and slightly
+DECREASING. Section 8's diagnosis is confirmed on evolved fields rather than
+on fixtures, and the replacement behaves as designed.
+
+**`rho_auto` discriminates the brackets.** Computed from the stored `shell_T`
+and `shell_r` via the identity `A = T/r`, so no extra run was needed. Max over
+the three estimand triangles at `k_short` = 6 k_f:
+
+| control | `R_Q` | `rho` | `rho_auto` | `R_B` |
+|---|---|---|---|---|
+| span_check (2LPT) | 0.4233 | 0.4880 | 0.4982 | 0.7310 |
+| pivot | 0.8975 | 0.8620 | 0.9237 | 0.9612 |
+| kill_control (b=0) | 1.4017 | 1.6831 | 1.1858 | 1.0245 |
+
+The ratified criterion -- a maximally broken tiling must read WORSE than the
+configuration under test -- passes for `rho_auto` (1.186 > 0.924), and it
+passes PER TRIANGLE rather than only on the max: kill > pivot > span_check
+holds on sq1, sq2 and sq3 individually. That is the form Stage 4 demanded and
+the form `R_Q` could not express.
+
+**What this does NOT establish, and it is the obvious next question.** The
+brackets run at `k_short` = 6 k_f only (`k_shorts[0]`), which is exactly the
+regime where `r` is 0.7-0.92 and `rho` is still healthy -- all four statistics
+pass there. So this measures that `rho_auto` HAS discriminating power, not that
+it RETAINS it at the deep legs where `rho` fails. Brackets at `k_short` = 18
+k_f would settle it and need a new run (`--bracket-k-short 18`).
+
+**Also unresolved: `rho_auto` puts every cdev arm far outside the 15% bar**
+(0.22 to 0.92 at `k_short` = 6 k_f, i.e. 22% to 92%). If it became the gate
+statistic the verdict would be a clear fail rather than the unreadable cell
+grid of section 2. One seed, no error bar, and the bar was ratified against
+`R_Q`, so whether it transfers to a different statistic is itself a checkpoint
+question.
+
+**Housekeeping hazard, pre-existing.** Both runs peaked at ~58 GB host RSS
+(360: 57.83, 362: 57.97) against a `--mem=54G` request on a 61 GB node. Deneb
+is evidently not enforcing `--mem`, so both jobs survived on luck rather than
+on the resource spec. The request should be raised to ~60 G before this profile
+is run again, and no conclusion should be drawn from the fact that it has not
+failed yet.
+
 ## Not licensed / owed
 
 - Nothing here is a cgh64 statement. Stage 5 is the MECHANISM ensemble and
