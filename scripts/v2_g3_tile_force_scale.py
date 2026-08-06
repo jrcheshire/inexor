@@ -123,8 +123,8 @@ def main():
             if args.arms else list(DEFAULT_ARMS[args.config]))
     print(f"\n  config {args.config}  L={ell}  n_fine={n_fine}  n_part={n_part}  "
           f"seed {args.seed}")
-    print(f"  evaluating the force at the background's final positions "
-          f"(no evolution)\n")
+    print("  evaluating the force at the background's final positions "
+          "(no evolution)\n")
 
     rows = []
     for n_tile, b_fine in arms:
