@@ -517,7 +517,7 @@ decision here is locked until explicitly re-litigated with JC.
     `scripts/v2_g6b_calib_transport.py`.
 
 ## D-v2-12 — G3 verdict: A3 fails the squeezed-B bar; A2's buffer is sized at 4 r_s
-- **Status:** PROPOSED (2026-08-06), awaiting JC ratification. Discharges BOTH
+- **Status:** accepted (JC, 2026-08-06, G3 close). Discharges BOTH
   halves of the V2 exit criterion ("squeezed-B error number -> A3 verdict + A2
   buffer sizing"): clauses 1-4 kill A3, clause 5 sizes A2's buffer. Fires the
   pre-registered V2 kill line in `docs/plan-plan-v2.md` ("G3 squeezed-B > 15%
