@@ -516,11 +516,14 @@ decision here is locked until explicitly re-litigated with JC.
     (tracked). Probes `scripts/v2_g6_split_stability.py`,
     `scripts/v2_g6b_calib_transport.py`.
 
-## D-v2-12 — G3 verdict: A3 fails the squeezed-B bar, and the realization-matched estimand is retired
-- **Status:** PROPOSED (2026-08-06), awaiting JC ratification. Fires the
+## D-v2-12 — G3 verdict: A3 fails the squeezed-B bar; A2's buffer is sized at 4 r_s
+- **Status:** PROPOSED (2026-08-06), awaiting JC ratification. Discharges BOTH
+  halves of the V2 exit criterion ("squeezed-B error number -> A3 verdict + A2
+  buffer sizing"): clauses 1-4 kill A3, clause 5 sizes A2's buffer. Fires the
   pre-registered V2 kill line in `docs/plan-plan-v2.md` ("G3 squeezed-B > 15%
   at sane buffers -> A3 dies (A2 unaffected); publish the negative (P-C)
-  regardless"). Does not touch D-v2-10 or D-v2-11: A2's spine stands.
+  regardless"). Does not touch D-v2-10 or D-v2-11: A2's spine stands, and
+  clause 5 is a measurement ON that spine, not a change to it.
 - **Context:** G3 asked whether sCOLA-style sequential independent tiles
   reproduce the monolithic squeezed bispectrum inside D-v2-7's 15% bar.
   Measured at cdev (L=128, n_fine=512), seed 0, deneb jobs 360/362, arms
@@ -566,6 +569,31 @@ decision here is locked until explicitly re-litigated with JC.
      the quantity of interest. Future comparisons use ensemble/statistical
      agreement. This clause does NOT weaken clause 1, which clause 2 makes
      independent of the framing.
+  5. **A2's BUFFER IS SIZED AT 4 r_s, and G3's second deliverable is
+     discharged.** The V2 exit criterion reads "squeezed-B error number ->
+     A3 verdict + A2 buffer sizing"; clauses 1-4 answer the first half and
+     this answers the second. Measured at cdev, seed 0, deneb job 364, on the
+     synchronous two-level force (global coarse long range + `force_short_tiled`
+     on fine tiles, i.e. `force_two_level`, the D-v2-10 spine) with the fine
+     level TILED at T=128:
+     - `max|rho_auto|` = **0.0051 against the 0.15 bar, a 29x margin**, at
+       both b = 4 `r_s` and b = 8 `r_s`. The two are identical to four
+       decimals, so **4 `r_s` is ample and 8 buys nothing.**
+     - Auto amplitude 1.000 -> 0.994 over k = 1..12 k_f and **r = 1.000 at
+       every shell**, against the failing arm's 0.441 and 0.368.
+     - Cost 22.6 s/step against the monolithic 9.9 s/step recorded in
+       `runs/v2/cost_of_memory.md` = **2.3x**, inside A3's 3.2x premise and
+       below the 3.23x the ratified two-level config was measured at.
+     **Why the realization-matched reading is admissible HERE** even though
+     clause 4 retires it as the default: it fails in the DECORRELATED regime,
+     and these arms are correlated at r = 1.000 at every shell. There is no
+     decorrelation for the shared-IC ratio to misreport. The same margin read
+     on `R_B` is 0.0102, i.e. 15x under the bar, so the conclusion does not
+     hinge on the choice of statistic either.
+     **Scope:** one seed at cdev. The margin is 29x against a 12-22% seed
+     scatter on related quantities, so the VERDICT is safe at one seed; no
+     individual digit here is an ensemble statement, and this is not a cgh64
+     number.
 - **Consequences:**
   - **A3 dies as a squeezed-B mock route. A2 is unaffected** and D-v2-10 /
     D-v2-11 stand untouched. The negative is publishable (P-C) and is
