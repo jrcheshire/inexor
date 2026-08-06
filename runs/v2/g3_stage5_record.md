@@ -136,18 +136,195 @@ with it. If they disagree, it may not.
 
 ## Results
 
-*(to be filled in from the pilot and the 8-seed ensemble; nothing at cdev has
-been run yet)*
+**Pilot only: deneb job 360, seed 0, 2026-08-05, `main @ 490a414`, card
+`g3_stage5_cdev.json`. ONE SEED, so nothing below carries an error bar and no
+ranking between arms is licensed** (the decorrelation ensemble measured 12-22%
+absolute seed scatter on the neighbouring quantity). The 8-seed ensemble was
+held pending this map, as designed.
+
+**HEADLINE: the pilot landed outside all three pre-registered outcomes.** The
+eligibility half reads as outcome 1 (a cheap buffer IS gradeable at some
+`k_short`), but no gradeable cell yields a verdict, because **every one of the
+six eligible cells fails the ratified `rho`-agreement precondition**. The
+correct statement is therefore neither "A3 is alive at a quotable price" nor
+"nothing is gradeable": the gate is ELIGIBLE but UNREADABLE at cdev.
 
 ### 1. Eligibility map
 
+`r` at the small-scale leg, threshold 0.5 (`*` = gradeable):
+
+| arm | b [Mpc/h] | cost | 0.295 | 0.589 | 0.884 | 1.178 |
+|---|---|---|---|---|---|---|
+| T=128 b=16 | 4 | 1.95x | 0.700\* | 0.368 | 0.080 | -0.038 |
+| T=128 b=32 | 8 | 3.38x | 0.708\* | 0.393 | 0.113 | -0.005 |
+| T=128 b=64 | 16 | 8.00x | 0.921\* | 0.762\* | 0.517\* | 0.276 |
+| T=64 b=32 | 8 | 8.00x | 0.774\* | 0.430 | 0.119 | -0.011 |
+
+Six of sixteen cells are eligible. **The pinned gate leg (`k_short` = 1.178
+h/Mpc) is gradeable NOWHERE, including at the 8x buffer** (`r` = 0.276). Stage
+5's founding premise was inferred from the correlation cards; it is now measured
+directly on the seam configuration, and it holds.
+
+The `k(r=0.5)` anchors reproduce the tracked Vista cards (0.452 / 0.472 / 0.900
+/ 0.517 h/Mpc) within the 1% cross-arch tolerance, so the cross-machine
+comparison is sound.
+
 ### 2. Max |R_Q| over gate-eligible triangles
+
+| arm | 0.295 | 0.589 | 0.884 | 1.178 |
+|---|---|---|---|---|
+| T=128 b=16 | 0.547 `!rho` | -- | -- | -- |
+| T=128 b=32 | 0.700 `!rho` | -- | -- | -- |
+| T=128 b=64 | 0.106 `!rho` | 0.161 `!rho` | 0.231 `!rho` | -- |
+| T=64 b=32 | 0.898 `!rho` | -- | -- | -- |
+
+`--` is NOT GRADEABLE and never a pass. `!rho` = the cell fails the
+per-triangle `rho`-agreement requirement, so its `R_Q` is not a verdict.
+
+**The `rho` failures are genuine curve-level disagreement, not the
+normalization.** `max_rho_deviation` divides each triangle's `|R_Q - rho|` by
+that triangle's own `|R_Q|`, which diverges at a zero crossing, so the printed
+122 and 229 are inflated. The ABSOLUTE differences are not:
+
+| arm, `k_short` | `R_Q` range | `rho` range | max abs diff |
+|---|---|---|---|
+| b=32, 0.295 | -0.375 to -0.700 | +0.057 to -0.369 | 0.43 |
+| b=64, 0.589 | -0.161 to +0.153 | +0.293 to +0.823 | 0.80 |
+| b=64, 0.884 | -0.198 to +0.231 | +1.970 to +3.269 | 3.23 |
+
+**The arm that looks best under `R_Q` is the one `rho` says is worst.** At
+b=64 the three `R_Q` values (0.106, 0.161, 0.231) sit at or just above the 15%
+bar and would read as a near-pass; over the same triangles `rho` runs 0.29 ->
+0.82 -> 3.27, i.e. a squeezed bispectrum wrong by a factor of 2 to 4. Reading
+`R_Q` alone would have graded the 8x-buffer arm as nearly passing.
+
+The mechanism is the known one, now visible on the REAL tiling rather than in
+principle: at `k_short` >= 0.589 in that arm `R_Q` scatters around zero with
+MIXED SIGNS and compressed magnitude while `rho` is uniformly large and
+positive. That is `R_Q` saturating, exactly the behaviour that made the plan's
+`kill_control` criterion unsatisfiable, and it is why the brackets were moved
+onto `r`.
+
+**Neither statistic is obviously trustworthy at `r` just above the cut.** At
+b=64 / `k_short` = 0.884 the arms share `r` = 0.517, so `rho` divides by a
+transfer measured between fields that have lost half their phase coherence.
+The honest reading is that the divergence itself is evidence that **the
+ratified `r >= 0.5` cut, which was set on the correlation, is too permissive
+for the seam statistic**. Where the two agree best (b=32, `k_short` = 0.295,
+triangle sq1) they agree to 0.016 absolute; agreement degrades with `k_short`
+rather than tracking `r` cleanly (b=64 at `r` = 0.921 still shows 0.12-0.22
+absolute disagreement).
 
 ### 3. Buffer vs tile size, paired
 
+Not computable: the paired section needs >= 2 seed cards and the pilot is one.
+
+The pre-registered arm-D question ("does absolute buffer set the physics for
+the SEAM statistic, as it does for the correlation?") **cannot be answered from
+this card**. Arms B and D share an 8 Mpc/h buffer and give `R_Q` = 0.700 vs
+0.898, a 28% disagreement, and `rho` = 0.369 vs 0.862, a factor 2.3 -- but BOTH
+cells are `!rho`, so those are refused numbers and quoting them as a comparison
+would be reading a statistic the gate has already rejected. On `r`, where the
+numbers are admissible, arm D reaches `k(r=0.5)` = 0.517 against arm B's 0.472,
+a 9.5% difference at 2.4x the cost. One seed, no error bar. **Stage 6 may not
+use the transfer rule to pick a geometry on this evidence.**
+
 ### 4. Position-dependent P(k)
 
+REPORTED, NOT GATED (no bar ratified). Tiled/mono response ratio minus 1, at
+`n_sub` = 4 (straddle fraction 1.000, so every sub-volume crosses a tile wall
+as intended):
+
+| arm | k=0.29 | k=0.59 | k=0.88 | k=1.18 |
+|---|---|---|---|---|
+| T=128 b=16 | -0.171 | +0.316 | +0.186 | +0.304 |
+| T=128 b=32 | -0.207 | -0.038 | -0.031 | -0.003 |
+| T=128 b=64 | -0.018 | +0.044 | +0.075 | +0.084 |
+| T=64 b=32 | -0.086 | +0.046 | +0.047 | +0.167 |
+
+The statistic remains finite and small at `k` = 1.18 where `R_Q` is refused
+outright, which is the property it was built for: it is an amplitude statistic
+and does not see the decorrelated phases. Whether it is a usable substitute
+gate is a checkpoint decision, not something this card settles.
+
 ### 5. Brackets
+
+On `r`, never on `R_Q`:
+
+| k | pivot | kill (b=0) | 2LPT |
+|---|---|---|---|
+| 0.049 | 0.9985 | 0.9980 | 1.0000 |
+| 0.098 | 0.9642 | **0.9649** | 0.9997 |
+| 0.147 | 0.9238 | 0.8723 | 0.9992 |
+| 0.196 | 0.8932 | 0.8418 | 0.9981 |
+| 0.245 | 0.7818 | 0.5858 | 0.9943 |
+| 0.295 | 0.7737 | 0.5584 | 0.9904 |
+| 0.344 | 0.6981 | 0.4597 | 0.9813 |
+
+- 2LPT more correlated than the pivot at every shell: **True**.
+- Kill control less correlated than the pivot at every shell: **False**, and by
+  7e-4 at a single shell (k = 0.098), against a quantity whose seed scatter is
+  percent-level. **Treat as unresolved at one seed, not as a bracket failure.**
+  It is the one result here that a second seed would settle cheaply.
+
+### 6. Pre-registered predictions, graded
+
+- **`R_Q < 0`: FAILS in the deep legs.** All `R_Q` are negative at
+  `k_short` = 0.295 in all four arms, as predicted. At `k_short` = 0.589 and
+  0.884 (b=64 only) the signs are mixed and the positive values (+0.153,
+  +0.231) are the same size as the negative ones. By the pre-registration that
+  is **a bug signature, not a result**, and it is owed an explanation before any
+  ensemble. The competing reading is that it is `R_Q` saturating near a zero
+  crossing, which section 2 independently supports; those two readings are not
+  distinguished by this card.
+- **Monotone in `b`: FAILS at one seed.** At `k_short` = 0.295, `R_Q` runs
+  0.547 (b=4) -> 0.700 (b=8) -> 0.106 (b=16). The b=4/b=8 inversion is 28% and
+  within plausible seed scatter; unresolved.
+- **A step at `x` ~ 1**: not assessed here.
+- **Equilateral hurt less than squeezed**: not assessable, see the floors note
+  below.
+- **Position-dependent response smaller than `R_Q` where phases decorrelate:
+  HOLDS where it can be checked.** At b=32 it is 0.003-0.031 at the two deep
+  legs where `R_Q` is refused entirely.
+
+### 7. The companion floors run (deneb 361) does NOT deliver the equilateral floor
+
+Job 361 ran `v2_g3_floors.py --window flat`, 24 seeds, sections D + BC.
+
+**Section D is a clean and genuinely new identity pass.** The flat window is a
+scale-independent 5% transfer, and the estimator reproduces its closed form
+exactly at every triangle INCLUDING the equilateral, which the gaussian window
+could never reach (it had `T - 1` = 5.6e-9 there): `R_B` = 0.157625000000001
+against an expected 1.05^3 = 0.157625 (agreement ~2e-16); `R_Q` =
+-0.047619047619048 against the predicted 1/1.05 - 1 = -1/21 exactly, confirming
+the documented 1/T response of `Q` under a uniform window; `rho` flat to
+5.6e-16, confirming its window-invariance at the equilateral for the first
+time; `W` floor 3.7e-16.
+
+**Section BC's "MEASUREMENT" verdicts must NOT be quoted as resolving power.**
+It reports `sigma_B(R_Q)` = 1.8e-16 to 3.1e-16 on all eight triangles with a
+cancellation factor of 1.2e15 to 2.3e15, and marks all eight `resolvable:
+true` against `bar/3` = 0.05. Those sigmas are floating-point noise. A
+scale-flat multiplicative window makes `R_Q` EXACTLY seed-independent by
+construction -- the realization cancels identically in the ratio -- so the
+seed-to-seed scatter is machine epsilon and the cancellation factor is
+approximately 1/eps.
+
+This is the same defect class as the gaussian-window failure it was meant to
+repair, in a different disguise: under `gauss` the control was the scatter of
+an identically-zero quantity (1.3e-10, cancellation 2.5e9); under `flat` it is
+the scatter of an exactly-constant one (2e-16, cancellation 1.8e15). The
+`--window flat` flag DID fix the response (section D above), which is what it
+was named for, but the response and the floor are different quantities and only
+the first was repaired.
+
+**The codebase already predicted this.** `section_E`'s docstring states that
+BC's window-arm construction "is nearly noiseless by design ... the
+resolvability verdict it produces is optimistic to the point of being wrong. A
+reference that CANNOT exhibit the behaviour under test reads as agreement."
+The real floor is section E, the dynamical null that perturbs the INITIAL
+density and evolves both arms, and **361 did not run it**. The equilateral
+control still has no measured floor at cdev.
 
 ## Not licensed / owed
 
@@ -161,3 +338,25 @@ been run yet)*
   fine cell.
 - The position-dependent response is REPORTED, NOT GATED. No bar for it has been
   ratified, and proposing one is a checkpoint decision.
+
+### Opened by the pilot (2026-08-06)
+
+- **The gate is eligible but unreadable at cdev.** Six cells pass the `r >= 0.5`
+  conditioning cut and all six fail the `rho`-agreement precondition. Whether
+  that is a `rho` problem, an `R_Q` problem, or a signal that the `r` cut is too
+  permissive for the seam statistic is UNDECIDED and is a checkpoint call. The
+  8-seed ensemble buys error bars on a statistic its own precondition currently
+  refuses, so its value is contingent on that call.
+- **The positive `R_Q` values at `k_short` >= 0.589 are owed an explanation**
+  before any ensemble: the pre-registration calls a positive `R_Q` of squeezed
+  size a bug signature, and the competing saturation reading is not
+  distinguished by this card.
+- **The equilateral control still has no floor at cdev.** Section BC cannot
+  produce one under any window; it needs section E (the dynamical IC-perturbation
+  null), which has not been run at cdev.
+- **The `max_rho_deviation` criterion normalizes per triangle by `|R_Q|`** and
+  therefore diverges at a zero crossing. The verdicts here survive an absolute
+  reading, so no conclusion changes, but the criterion should be restated in
+  absolute terms (or against the bar) before it gates anything.
+- **The kill-control bracket reads False on a 7e-4 inversion at one shell**, at
+  one seed. Unresolved, and cheap to settle.
