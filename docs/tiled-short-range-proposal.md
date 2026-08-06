@@ -172,6 +172,55 @@ one. That is consistent with the requirement being set by `r_s` rather than by
 the box, which is the H2 prediction, but H2 still owes the actual scan and the
 2.0/P law still applies.
 
+## H5: can tile independence be recovered? Partly, and it is not free
+
+The lockstep hybrid solves the coarse long-range force from the true evolved
+positions each step, which forces a per-step synchronisation across all tiles.
+The frozen-background arm instead sources that field from `x_LPT(D_mid)` --
+known for every particle at every step without evolving anything -- while still
+gathering each particle's force at its TRUE position. If it agreed, all coarse
+force fields could be precomputed up front and every tile could run its whole
+schedule independently.
+
+cdev8, T=64, b=16 fine (4 r_s), one seed, `alpha` = 1.0:
+
+| | k=1 | k=4 | k=7 | k=10 | r at k=10 | max\|rho_auto\| |
+|---|---|---|---|---|---|---|
+| tiled (failing) | 0.432 | 0.880 | 0.798 | 0.791 | 0.128 | 0.625 |
+| hybrid lockstep | 1.000 | 0.996 | 0.992 | 0.989 | 1.000 | 0.0023 |
+| hybrid frozen bg | 0.995 | 0.959 | 0.920 | 0.896 | 0.989 | 0.107 |
+
+**It works where it was supposed to and costs where it was not obvious.** The
+large-scale deficit is gone (0.995 at the fundamental against the failing arm's
+0.432) and the correlation stays above 0.989 at every shell. But small-scale
+power drifts down to 0.896 by 10 k_f, and `rho_auto` lands at 0.107 against the
+0.15 bar -- a 1.4x margin where lockstep has 65x. **That is not a pass**: one
+seed, no error bar, and the ratified reading is an ensemble at the production
+box.
+
+**Why a LONG-range approximation shows up at SMALL scales.** Two compounding
+reasons, the second of which is a knob.
+
+1. A slightly wrong long-range force perturbs every trajectory, and 20 steps of
+   nonlinear dynamics amplify that perturbation preferentially at small scales.
+   This is the same amplification `v2_g3_floors.section_E` exists to measure.
+2. At `alpha` = 1.0 the split scale is one coarse cell = 1.0 Mpc/h, so the
+   "long" kernel still carries force down to k ~ 1 h/Mpc -- well inside the
+   regime where 2LPT is a poor description. The frozen background is therefore
+   being asked to supply force on scales it does not model well.
+
+**Two knobs, both untested, both cheap.** Reason 2 predicts that a LARGER
+`alpha` confines the long kernel to larger scales, where 2LPT is accurate, and
+should improve the frozen arm -- at the cost of a longer-reach short kernel and
+so a bigger buffer. That is a direct trade between tile independence and buffer
+cost, and it is the interesting one. Separately, re-syncing the background
+every N steps interpolates continuously between frozen (N = 20, fully
+independent) and lockstep (N = 1). Neither is measured here.
+
+**Architecturally**, the honest statement today is: full tile independence is
+achievable and gets the large scales right, but at `alpha` = 1.0 it spends most
+of the accuracy margin to do it. A synchronous pipeline keeps the margin.
+
 ## What could still sink it, stated up front
 
 - **The 2.0/P tiling error is a power law, so buffer cost does not vanish.**
