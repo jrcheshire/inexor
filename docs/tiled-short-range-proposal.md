@@ -1,8 +1,32 @@
 # Proposal: give the tiles a global long-range force
 
-**Status:** proposal, nothing built. Written 2026-08-06 after D-v2-12's
-mechanism finding. Supersedes nothing; D-v2-12 clause 1 stands for the
-configuration it tested.
+**Status: SHELVED 2026-08-06 (JC), after H0-H3 and H5 were measured.** Read
+this line before the ladder below: rungs H0, H1, H2 (cdev8 leg), H3 and H5 ran
+and are reported here; H2's production leg and H4 were not pursued and the
+frozen-background knobs named in H5 are untested.
+
+**Why shelved, not failed.** H0-H3 PASSED and the numbers are good. But the
+arm they validate is the SYNCHRONOUS TWO-LEVEL scheme already ratified in
+D-v2-10 -- the design study calls synchronous two-level and independent tiles
+"different products" (Sec. f/g) -- so this work did not repair A3, it measured
+A2 with a tiled fine mesh. Reviving A3 as a product means making the
+frozen-background arm good enough, and that is a NEW product decision belonging
+to the V4 architecture freeze with every number on the table, not a
+continuation of G3. A3's own kill line already fired (D-v2-12).
+
+**What to pick up from, if it is ever revived:** H5 measured a fully
+independent-tile arm at `max|rho_auto|` = 0.107 against the 0.15 bar (one seed,
+cdev8), and names the knob that should move it -- a larger `alpha`, which
+confines the frozen long-range kernel to the scales 2LPT actually models, at
+the cost of a longer-reach short kernel and a bigger buffer. Start there rather
+than from scratch.
+
+**The result worth carrying forward regardless** is the buffer sizing, which is
+what G3 owed A2 as well as A3 (`docs/plan-plan-v2.md` V2 exit: "squeezed-B
+error number -> A3 verdict + A2 buffer sizing"). See H3.
+
+Written 2026-08-06 after D-v2-12's mechanism finding. Supersedes nothing;
+D-v2-12 clause 1 stands for the configuration it tested.
 
 ## The claim to be tested
 
