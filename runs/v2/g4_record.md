@@ -530,8 +530,29 @@ Identical 31.3 GiB device peak on both confirms the two runs did the same
 work in the same way, so the wall difference is the machine and not a
 different execution path.
 
-**Scope, stated so it is not over-read:** one op (paint), one shape, staged
-arm only. A full step also gathers forces and runs FFTs, and the FFT rates
+### 5.7b The arms INVERT on real work: staged is 2.78x faster (same job)
+
+Comparing the two host arms on the SAME real paint point, on the GH200:
+
+| arm | wall | particles/s | device peak |
+|---|---|---|---|
+| staged | **13.29 s** | 6.46e8 | 31.33 GiB |
+| coherent | **36.94 s** | 2.33e8 | 16.00 GiB |
+
+**On the ladder `coherent` was 14-20% FASTER; on real work `staged` is 2.78x
+faster.** The ranking inverts, on the same machine, between a streaming
+reduction and a paint. This is the sec. 5.7 lesson in its sharpest form: a
+bandwidth-bound microbenchmark does not predict the ordering of real work,
+let alone its ratio. It was missed on first reading because 5.7 compared
+`staged` ACROSS MACHINES and never compared the ARMS on the same machine --
+the data had been on the card since job 894036.
+
+**Not a pure loss, and worth keeping as a knob:** `coherent` uses HALF the
+device memory (16.00 vs 31.33 GiB). So the XLA-managed path trades 2.78x wall
+for 2x device headroom on real work. If device residency ever binds -- a
+larger mesh, a bigger tile -- that trade may be worth taking deliberately.
+
+**Scope, stated so it is not over-read:** one op (paint), one shape. A full step also gathers forces and runs FFTs, and the FFT rates
 in sec. 5.6 differ between the parts by more than 1.80x (481/562 vs 307/333
 GB/s). So 1.80x is the paint number, not a step number, and a step-level
 figure needs the tiled two-level force -- which this probe does not
@@ -567,12 +588,13 @@ G5 characterised only at C-dev and on the cdev8/cdev/cgh64 box ladder. The
 step-level number for C-hero remains unmeasured; what is now measured is that
 the memory is not the obstacle.
 
-## 6. Verdict -- DRAFT, NOT RATIFIED
+## 6. Verdict -- FOUR CLAUSES RATIFIED (JC, 2026-08-06), ONE REVISED
 
-Proposed clauses for JC to accept, amend or reject. Nothing here is in force
-and none of it is in `decisions.md` yet. Evidence is sec. 5.1-5.8.
+JC ratified clauses 1, 2, 4 and 5 on 2026-08-06. Clause 3 was challenged and
+is REVISED below on new evidence; it needs re-confirmation before this goes
+into `decisions.md` as an ADR. Evidence is sec. 5.1-5.8.
 
-**Clause 1 -- V3 PASSES, but the seed's question was not answerable as
+**Clause 1 [RATIFIED] -- V3 PASSES, but the seed's question was not answerable as
 posed.** V3's exit was "the A2-on-GH claim gets its measured footing
 (coherent vs staged vs infeasible)". That trichotomy assumed ATS access to
 pageable LPDDR is expressible; it is not -- this jax/CUDA stack exposes only
@@ -582,7 +604,7 @@ page-locked host memory at 359-367 GB/s with 4.00 GiB device residency, and
 C-gh's paint runs on one GH200.** Proposed: that satisfies the exit, with the
 criterion amended to name the regime measured rather than the one asked for.
 
-**Clause 2 -- the GH200 host ceiling is ~116 GB and is a HARD CLIFF, and it
+**Clause 2 [RATIFIED -- "that's the ceiling for Hopper, which is fine"] -- the GH200 host ceiling is ~116 GB and is a HARD CLIFF, and it
 binds config selection.** Full rate at 116.0 GB, ~100x collapse at 120.3 GB
 (sec. 5.5), mechanism confirmed two ways. There is no graceful region, so a
 C-gh operating point must be specified CLEAR of it, not near it -- the same
@@ -590,22 +612,38 @@ failure mode as D-v2-10's 0.87-of-bar margin, which turned out to be a
 gate-config artifact. C-gh's T9 state is 77.3 GB, ~1.5x under. Proposed:
 record ~116 GB as a config-table constraint on the C-gh home.
 
-**Clause 3 -- `staged` is the production path; `coherent`'s advantage does
-not generalize.** XLA-managed transfer beats explicit staging by 14-20% on
-C2C and loses by 4% on PCIe (sec. 5.4). Proposed: specify `staged` as the
-single production path on portability grounds, and record `coherent` as a
-Grace-Hopper-only optimization to revisit if a config-table home is ever
-C2C-only. The alternative -- a per-home choice -- buys <=20% for two code
-paths, which does not look worth it.
+**Clause 3 [REVISED -- needs re-confirmation] -- `staged` is the production
+path, and the reason is not the one first given.** The draft argued
+portability: give up `coherent`'s measured 14-20% on C2C to avoid two code
+paths. **JC challenged this correctly** -- production runs go to Vista and
+ultimately Horizon, both C2C-class, with S3 h100 a fallback, so trading away
+a Grace-Hopper win to suit the fallback optimizes for the wrong machine.
 
-**Clause 4 -- the word "coherent" must not enter the ADR.** The seed and the
+**Re-examining the card dissolved the trade-off entirely.** On the REAL C-gh
+paint, on the GH200 itself, `staged` is **2.78x FASTER** than `coherent`
+(13.29 s vs 36.94 s, sec. 5.7b). The ladder's 14-20% advantage INVERTS on
+real work. So `staged` wins on the production machine class on the workload
+that matters, and no portability argument is needed or should be made.
+
+Proposed: specify `staged` as the production path on MEASURED PERFORMANCE at
+the config-table home, per D-v2-10's binding that Pareto decisions come from
+config-table-home measurements. Record `coherent` not as a rejected
+alternative but as a **memory-vs-wall knob**: it uses half the device memory
+(16.00 vs 31.33 GiB) for 2.78x the wall, which may be worth taking
+deliberately if device residency ever binds.
+
+Note for whoever writes the ADR: the draft's portability reasoning was wrong
+and the 14-20% figure it conceded was never real for this workload. Do not
+carry either into the record.
+
+**Clause 4 [RATIFIED] -- the word "coherent" must not enter the ADR.** The seed and the
 design study both use it to mean ATS on pageable LPDDR. Nothing measured here
 tests that, and an ADR inheriting the word would assert a capability we have
 no evidence for. Proposed: say "host-resident streaming via `pinned_host`",
 and note ATS as untested and not expressible through jax memory kinds on
 jax 0.10.2.
 
-**Clause 5 -- C-hero is viable on memory grounds, and the bandwidth ratio
+**Clause 5 [RATIFIED] -- C-hero is viable on memory grounds, and the bandwidth ratio
 must not be used to size it.** One H100 streams 4096^3's full 618.5 GB T9
 state at full rate (sec. 5.8) and costs 1.80x the GH200's wall on a real
 paint (sec. 5.7), against a 6.71-6.87x FABRIC ratio that does not propagate.
