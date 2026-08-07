@@ -1,0 +1,354 @@
+{
+ "ladder": [
+  64.0,
+  88.0,
+  104.0,
+  128.0
+ ],
+ "chunk_gib": 2.0,
+ "reps": 5,
+ "hbm_bytes": 103079215104,
+ "ceilings_gbs": {
+  "hbm": 3400.0,
+  "lpddr": 486.0,
+  "c2c_read": 375.0,
+  "c2c_write": 297.0
+ },
+ "configs": [
+  {
+   "arm": "hbm",
+   "working_set_gib": 64.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": null,
+   "jax_version": "0.10.2",
+   "n_chunks": 32,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 68719476736,
+   "alloc_s": 0.4218127930071205,
+   "peak_after_alloc": 70866960896,
+   "peak_after_warmup": 70866960896,
+   "completed": true,
+   "wall_median_s": 0.018352363957092166,
+   "wall_min_s": 0.018335405038669705,
+   "wall_all_s": [
+    0.018453290918841958,
+    0.018362123984843493,
+    0.018351499922573566,
+    0.018335405038669705,
+    0.018352363957092166
+   ],
+   "gbytes_per_s": 3744.4482300299933,
+   "peak_total": 70866960896,
+   "hbm_peak_over_working_set": 1.0312500074505806,
+   "hbm_peak_over_chunk": 33.00000023841858,
+   "exceeds_hbm": false,
+   "capacity_witness": false
+  },
+  {
+   "arm": "staged",
+   "working_set_gib": 64.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 32,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 68719476736,
+   "alloc_s": 2.7891367620322853,
+   "peak_after_alloc": 4294967808,
+   "peak_after_warmup": 4294967808,
+   "completed": true,
+   "wall_median_s": 0.18756547290831804,
+   "wall_min_s": 0.18743126490153372,
+   "wall_all_s": [
+    0.18781836703419685,
+    0.18765513505786657,
+    0.18754742410965264,
+    0.18756547290831804,
+    0.18743126490153372
+   ],
+   "gbytes_per_s": 366.3759415337068,
+   "peak_total": 4294967808,
+   "hbm_peak_over_working_set": 0.0625000074505806,
+   "hbm_peak_over_chunk": 2.000000238418579,
+   "exceeds_hbm": false,
+   "capacity_witness": false
+  },
+  {
+   "arm": "coherent",
+   "working_set_gib": 64.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 32,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 68719476736,
+   "alloc_s": 2.780354417162016,
+   "peak_after_alloc": 4294967808,
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of host memory while trying to allocate 128.5KiB. Please set the environment variable XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB to allocate larger host memory than the default 64 GB. [executable_name='jit_add'] [tf-allocator-allocation-error='']",
+   "oom": true,
+   "peak_total": 4294967808
+  },
+  {
+   "arm": "hbm",
+   "working_set_gib": 88.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": null,
+   "jax_version": "0.10.2",
+   "n_chunks": 44,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 94489280512,
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 2.00GiB. [tf-allocator-allocation-error=''] [executable_name='jit_multiply']",
+   "oom": true,
+   "peak_total": 73014444544
+  },
+  {
+   "arm": "staged",
+   "working_set_gib": 88.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 44,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 94489280512,
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of host memory while trying to allocate 2.00GiB. Please set the environment variable XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB to allocate larger host memory than the default 64 GB. [tf-allocator-allocation-error='']",
+   "oom": true,
+   "peak_total": 4294967808
+  },
+  {
+   "arm": "coherent",
+   "working_set_gib": 88.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 44,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 94489280512,
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of host memory while trying to allocate 2.00GiB. Please set the environment variable XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB to allocate larger host memory than the default 64 GB. [tf-allocator-allocation-error='']",
+   "oom": true,
+   "peak_total": 4294967808
+  },
+  {
+   "arm": "hbm",
+   "working_set_gib": 104.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": null,
+   "jax_version": "0.10.2",
+   "n_chunks": 52,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 111669149696,
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 2.00GiB. [tf-allocator-allocation-error=''] [executable_name='jit_multiply']",
+   "oom": true,
+   "peak_total": 73014444544
+  },
+  {
+   "arm": "staged",
+   "working_set_gib": 104.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 52,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 111669149696,
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of host memory while trying to allocate 2.00GiB. Please set the environment variable XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB to allocate larger host memory than the default 64 GB. [tf-allocator-allocation-error='']",
+   "oom": true,
+   "peak_total": 4294967808
+  },
+  {
+   "arm": "coherent",
+   "working_set_gib": 104.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 52,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 111669149696,
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of host memory while trying to allocate 2.00GiB. Please set the environment variable XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB to allocate larger host memory than the default 64 GB. [tf-allocator-allocation-error='']",
+   "oom": true,
+   "peak_total": 4294967808
+  },
+  {
+   "arm": "hbm",
+   "working_set_gib": 128.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": null,
+   "jax_version": "0.10.2",
+   "n_chunks": 64,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 137438953472,
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 2.00GiB. [tf-allocator-allocation-error=''] [executable_name='jit_multiply']",
+   "oom": true,
+   "peak_total": 73014444544
+  },
+  {
+   "arm": "staged",
+   "working_set_gib": 128.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 64,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 137438953472,
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of host memory while trying to allocate 2.00GiB. Please set the environment variable XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB to allocate larger host memory than the default 64 GB. [tf-allocator-allocation-error='']",
+   "oom": true,
+   "peak_total": 4294967808
+  },
+  {
+   "arm": "coherent",
+   "working_set_gib": 128.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 64,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 137438953472,
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of host memory while trying to allocate 2.00GiB. Please set the environment variable XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB to allocate larger host memory than the default 64 GB. [tf-allocator-allocation-error='']",
+   "oom": true,
+   "peak_total": 4294967808
+  },
+  {
+   "arm": "hbm",
+   "real": true,
+   "n_side": 2048,
+   "n_mesh": 1024,
+   "n_particles": 8589934592,
+   "n_chunks": 49,
+   "chunk_gib": 2.0,
+   "positions_bytes": 103079215104,
+   "t9_state_bytes": 77309411328,
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": null,
+   "jax_version": "0.10.2",
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 2.00GiB. [tf-allocator-allocation-error='']",
+   "oom": true,
+   "peak_total": 75161927680
+  },
+  {
+   "arm": "staged",
+   "real": true,
+   "n_side": 2048,
+   "n_mesh": 1024,
+   "n_particles": 8589934592,
+   "n_chunks": 49,
+   "chunk_gib": 2.0,
+   "positions_bytes": 103079215104,
+   "t9_state_bytes": 77309411328,
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of host memory while trying to allocate 2.00GiB. Please set the environment variable XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB to allocate larger host memory than the default 64 GB. [tf-allocator-allocation-error='']",
+   "oom": true,
+   "peak_total": 0
+  },
+  {
+   "arm": "coherent",
+   "real": true,
+   "n_side": 2048,
+   "n_mesh": 1024,
+   "n_particles": 8589934592,
+   "n_chunks": 49,
+   "chunk_gib": 2.0,
+   "positions_bytes": 103079215104,
+   "t9_state_bytes": 77309411328,
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "completed": false,
+   "error": "RESOURCE_EXHAUSTED: Out of host memory while trying to allocate 2.00GiB. Please set the environment variable XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB to allocate larger host memory than the default 64 GB. [tf-allocator-allocation-error='']",
+   "oom": true,
+   "peak_total": 0
+  }
+ ]
+}

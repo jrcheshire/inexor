@@ -243,6 +243,24 @@ def run_single(args):
         except Exception:
             return None
 
+    # --- the caps, recorded BEFORE anything is allocated ---
+    # Job 894010 was invalidated by exactly this: both ceilings it "measured"
+    # were software defaults, not the GH200. The host arms hit
+    # XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB (default 64 GB) on a node with 192 GB
+    # free, and the device arm died at a 68 GiB peak against 95.6 GiB of HBM.
+    # An env var that is SET is not a cap that APPLIED, so the limits are read
+    # back off the device and the run is refused if they cannot cover the
+    # ladder (umbrella reference-knob-must-prove-it-applied).
+    stats = {}
+    try:
+        stats = dev.memory_stats() or {}
+    except Exception:
+        pass
+    rec["device_bytes_limit"] = stats.get("bytes_limit")
+    rec["env_host_limit_gb"] = os.environ.get("XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB")
+    rec["env_mem_fraction"] = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION")
+    rec["env_preallocate"] = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE")
+
     try:
         import jax.numpy as jnp
 
@@ -541,6 +559,55 @@ def main():
         if r.get("unsupported"):
             note = "UNSUPPORTED  " + str(r.get("error", ""))[:60]
         print(f"{r['arm']:9s} {gib:>8s} {gbs_s} {pk_s} {ratio_s} {over:>5s}  {note}")
+
+    # --- precondition: did the caps clear the ladder? ---
+    # This runs BEFORE the witnesses because a ladder run under a cap below
+    # its own top measures the cap, not the machine (job 894010). A capacity
+    # claim read off such a run is void, so say so here rather than let the
+    # witness section imply otherwise.
+    top_bytes = max(ladder) * 1024**3
+    dev_lim = next((r.get("device_bytes_limit") for r in recs if r.get("device_bytes_limit")), None)
+    host_lim_gb = next((r.get("env_host_limit_gb") for r in recs if r.get("env_host_limit_gb")), None)
+    host_lim = float(host_lim_gb) * 1e9 if host_lim_gb else 64 * 1e9  # 64 GB is the XLA default
+    print("\n--- preconditions (a cap below the ladder top voids the capacity witness) ---")
+    print(
+        f"device bytes_limit: {dev_lim / 1024**3:.1f} GiB"
+        if dev_lim
+        else "device bytes_limit: UNKNOWN"
+    )
+    print(
+        f"host limit: {host_lim / 1024**3:.1f} GiB "
+        f"({'XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=' + host_lim_gb if host_lim_gb else 'XLA DEFAULT 64 GB -- NOT SET'})"
+    )
+    voided = []
+    # The two caps are checked against DIFFERENT references, on purpose. The
+    # host arms must be free to run the whole ladder, so their cap is read
+    # against the ladder top. The hbm arm is DESIGNED to die above the cliff,
+    # so its cap is read against physical HBM instead -- the requirement is
+    # that the cliff it finds is the CARD's, not a fraction of it. Comparing
+    # the device cap to the ladder top would void every possible run.
+    if dev_lim and dev_lim < 0.9 * HBM_BYTES:
+        voided.append(
+            f"device cap {dev_lim / 1024**3:.1f} GiB is only "
+            f"{dev_lim / HBM_BYTES:.2f} of HBM -- the hbm arm's OOM point is a "
+            f"software fraction, not the card's cliff"
+        )
+    if host_lim < top_bytes:
+        voided.append(
+            f"host cap {host_lim / 1024**3:.1f} GiB < ladder top {max(ladder):g} GiB -- "
+            f"the host arms cannot reach the rungs that carry the capacity witness"
+        )
+    if voided:
+        print("*** CAPACITY WITNESS VOID ***")
+        for v in voided:
+            print("    " + v)
+        print(
+            "    An OOM under these caps says nothing about the GH200. Raise\n"
+            "    XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB (and the device fraction),\n"
+            "    confirm the readback above moved, and re-run."
+        )
+    else:
+        print("caps clear the ladder top: capacity witness is readable")
 
     # the verdict is JC's; this only reports whether the witnesses fired
     coh_over = [

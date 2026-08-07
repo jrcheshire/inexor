@@ -185,9 +185,72 @@ none of them bears on the capacity witness**, which is the primary one:
    above a published ceiling is exactly the kind of number that turns out to
    be a harness artifact. The ladder is what tests it.
 
-### 5.2 Legs 2-3 (the ladder across the cliff, and the C-gh paint point)
+### 5.2 Legs 2-3 -- **VOID. The ladder measured JAX's defaults, not the GH200.**
 
-*(in flight)*
+Job 894010 ran to completion and every rung above 64 GiB OOM'd. **None of
+those OOMs is a statement about the hardware**, and no capacity claim may be
+read off this card.
+
+| arm | set GiB | GB/s | peak GiB | status |
+|---|---|---|---|---|
+| hbm | 64 | 3744.4 | 66.00 | ok |
+| staged | 64 | 366.4 | 4.00 | ok |
+| coherent | 64 | - | 4.00 | OOM (host, needed 128.5 **KiB** more) |
+| hbm | 88 / 104 / 128 | - | 68.00 | OOM (device) |
+| staged | 88 / 104 / 128 | - | 4.00 | OOM (host) |
+| coherent | 88 / 104 / 128 | - | 4.00 | OOM (host) |
+| all | REAL (C-gh) | - | - | OOM |
+
+**Both ceilings are software defaults.** The error text named one of them
+outright:
+
+- **Host arms: `XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB`, default 64 GB**, on a node
+  with 192 GB free. This fits every observation exactly: `staged` at the
+  64 GiB rung just squeezed in, and `coherent` at the SAME rung failed
+  needing a further **128.5 KiB** for a compile-time allocation -- it had
+  consumed the entire default budget. The 88/104/128 rungs never had a
+  chance.
+- **Device arm: OOM at a 68.00 GiB peak against 95.6 GiB of HBM**, i.e. ~0.71
+  of the card, consistent with a default memory fraction rather than the
+  card's capacity. Not independently confirmed on this run, which is itself
+  the defect -- `bytes_limit` was never recorded.
+
+**What this cost, and the lesson.** The primary witness -- capacity -- was
+never exercised against the hardware at all; the ladder answered a question
+about environment-variable defaults. Sec. 3's preconditions guarded the wrong
+direction: they said an `hbm` arm that COMPLETED 128 GiB would invalidate the
+ladder, but said nothing about one that FAILS EARLY, which voids it just as
+completely. A benchmark that OOMs is not self-evidently measuring memory
+(umbrella reference-benchmark-measures-the-harness,
+reference-knob-must-prove-it-applied).
+
+**Fixed, in the code rather than in a checklist:** every worker now records
+`device_bytes_limit` read back off the device plus the three env knobs, and
+the summary prints a preconditions block that declares the capacity witness
+**VOID** when the host cap is below the ladder top or the device cap is below
+0.9 of physical HBM. The two caps are deliberately checked against different
+references, because the `hbm` arm is *designed* to die above the cliff and
+comparing its cap to the ladder top would void every possible run. The job
+now exports `XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=160` and
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` -- but setting them is a claim, and the
+readback is the evidence.
+
+**What survives from 894010, and it is not nothing:**
+- The instrument's ceiling parity holds at the rungs that ran (hbm 3744 GB/s
+  at 64 GiB; staged 366 GB/s, flat against leg 1's 353-359).
+- **Streaming is confirmed at scale for `staged`**: peak pinned at 4.00 GiB
+  (2.0 chunks) at a 64 GiB working set, i.e. 16x the set with no growth in
+  residency. That is the behaviour the whole architecture needs, and it is
+  the one real result of the run.
+- The `coherent` arm's failure mode is now understood and is not a property
+  of the arm.
+
+**Not yet measured, and still the whole point:** whether ANY arm holds a
+working set larger than HBM. Every rung that would have tested it was capped.
+
+### 5.3 Re-run
+
+*(pending -- corrected job not yet submitted)*
 
 ## 6. Verdict
 

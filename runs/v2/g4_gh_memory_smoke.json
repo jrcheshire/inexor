@@ -1,0 +1,215 @@
+{
+ "ladder": [
+  4.0,
+  8.0
+ ],
+ "chunk_gib": 2.0,
+ "reps": 3,
+ "hbm_bytes": 103079215104,
+ "ceilings_gbs": {
+  "hbm": 3400.0,
+  "lpddr": 486.0,
+  "c2c_read": 375.0,
+  "c2c_write": 297.0
+ },
+ "configs": [
+  {
+   "arm": "hbm",
+   "working_set_gib": 4.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": null,
+   "jax_version": "0.10.2",
+   "n_chunks": 2,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 4294967296,
+   "alloc_s": 2.4352648200001568,
+   "peak_after_alloc": 6442451456,
+   "peak_after_warmup": 6442451456,
+   "completed": true,
+   "wall_median_s": 0.0014295270666480064,
+   "wall_min_s": 0.0014161828439682722,
+   "wall_all_s": [
+    0.001490230904892087,
+    0.0014295270666480064,
+    0.0014161828439682722
+   ],
+   "gbytes_per_s": 3004.4672788679372,
+   "peak_total": 6442451456,
+   "hbm_peak_over_working_set": 1.5000001192092896,
+   "hbm_peak_over_chunk": 3.000000238418579,
+   "exceeds_hbm": false,
+   "capacity_witness": false
+  },
+  {
+   "arm": "staged",
+   "working_set_gib": 4.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 2,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 4294967296,
+   "alloc_s": 0.29637150513008237,
+   "peak_after_alloc": 4294967808,
+   "peak_after_warmup": 4294967808,
+   "completed": true,
+   "wall_median_s": 0.012173907132819295,
+   "wall_min_s": 0.012142227031290531,
+   "wall_all_s": [
+    0.012275314889848232,
+    0.012173907132819295,
+    0.012142227031290531
+   ],
+   "gbytes_per_s": 352.8010563199811,
+   "peak_total": 4294967808,
+   "hbm_peak_over_working_set": 1.0000001192092896,
+   "hbm_peak_over_chunk": 2.000000238418579,
+   "exceeds_hbm": false,
+   "capacity_witness": false
+  },
+  {
+   "arm": "coherent",
+   "working_set_gib": 4.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 2,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 4294967296,
+   "alloc_s": 0.2991374400444329,
+   "peak_after_alloc": 4294967808,
+   "peak_after_warmup": 4294967808,
+   "completed": true,
+   "wall_median_s": 0.010540220886468887,
+   "wall_min_s": 0.010527421021834016,
+   "wall_all_s": [
+    0.010631708893924952,
+    0.010540220886468887,
+    0.010527421021834016
+   ],
+   "gbytes_per_s": 407.4836136986186,
+   "peak_total": 4294967808,
+   "hbm_peak_over_working_set": 1.0000001192092896,
+   "hbm_peak_over_chunk": 2.000000238418579,
+   "exceeds_hbm": false,
+   "capacity_witness": false
+  },
+  {
+   "arm": "hbm",
+   "working_set_gib": 8.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": null,
+   "jax_version": "0.10.2",
+   "n_chunks": 4,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 8589934592,
+   "alloc_s": 0.16156320297159255,
+   "peak_after_alloc": 10737418752,
+   "peak_after_warmup": 10737418752,
+   "completed": true,
+   "wall_median_s": 0.002557008061558008,
+   "wall_min_s": 0.0025395038537681103,
+   "wall_all_s": [
+    0.002616463927552104,
+    0.002557008061558008,
+    0.0025395038537681103
+   ],
+   "gbytes_per_s": 3359.3693821857073,
+   "peak_total": 10737418752,
+   "hbm_peak_over_working_set": 1.2500000596046448,
+   "hbm_peak_over_chunk": 5.000000238418579,
+   "exceeds_hbm": false,
+   "capacity_witness": false
+  },
+  {
+   "arm": "staged",
+   "working_set_gib": 8.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 4,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 8589934592,
+   "alloc_s": 0.47283320710994303,
+   "peak_after_alloc": 4294967808,
+   "peak_after_warmup": 4294967808,
+   "completed": true,
+   "wall_median_s": 0.023946376983076334,
+   "wall_min_s": 0.023919017054140568,
+   "wall_all_s": [
+    0.024024585029110312,
+    0.023946376983076334,
+    0.023919017054140568
+   ],
+   "gbytes_per_s": 358.715416451966,
+   "peak_total": 4294967808,
+   "hbm_peak_over_working_set": 0.5000000596046448,
+   "hbm_peak_over_chunk": 2.000000238418579,
+   "exceeds_hbm": false,
+   "capacity_witness": false
+  },
+  {
+   "arm": "coherent",
+   "working_set_gib": 8.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GH200 120GB",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 4,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 8589934592,
+   "alloc_s": 0.4578805328346789,
+   "peak_after_alloc": 4294967808,
+   "peak_after_warmup": 4294967808,
+   "completed": true,
+   "wall_median_s": 0.020785372937098145,
+   "wall_min_s": 0.020763004897162318,
+   "wall_all_s": [
+    0.02085865312255919,
+    0.020785372937098145,
+    0.020763004897162318
+   ],
+   "gbytes_per_s": 413.2682448371429,
+   "peak_total": 4294967808,
+   "hbm_peak_over_working_set": 0.5000000596046448,
+   "hbm_peak_over_chunk": 2.000000238418579,
+   "exceeds_hbm": false,
+   "capacity_witness": false
+  }
+ ]
+}

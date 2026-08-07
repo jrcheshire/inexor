@@ -84,6 +84,17 @@ export PATH="$HOME/.pixi/bin:$PATH"
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+# BOTH of these are load-bearing, and job 894010 was VOIDED for want of them.
+# Its ladder measured JAX's defaults rather than the GH200: the host arms hit
+# XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB's default of 64 GB on a node with 192 GB
+# free (staged just fit at the 64 GiB rung; coherent failed the same rung
+# needing 128.5 KiB MORE), and the device arm OOM'd at a 68 GiB peak against
+# 95.6 GiB of HBM, ~0.75 of the card. Neither ceiling was hardware.
+# The probe now reads bytes_limit back off the device and VOIDS the capacity
+# witness if the caps do not clear the ladder top -- setting these is a claim,
+# the readback is the evidence.
+export XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=160
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export JAX_COMPILATION_CACHE_DIR=$SCRATCH/inexor-xla-cache
 
 echo "=== provenance ==="
