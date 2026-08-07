@@ -970,6 +970,7 @@ def force_short_tiled(
     peak=None,
     profile=0,
     pad_fill="cycle",
+    cap_mult=1.0,
 ):
     """(1-S(k))*ik/k^2 on fine tiles, host-accumulated -> (g (n,3) f64, diag).
 
@@ -1007,6 +1008,18 @@ def force_short_tiled(
     n_brick = choose_brick(n_tile, b_real, n_fine)
     order, starts, nb = brick_buckets(pos_np, n_fine, n_brick, cell)
     cap, pad_frac = tile_capacity(order, starts, nb, tiles, n_tile, b_real, n_brick)
+    if float(cap_mult) != 1.0:
+        # THE cap ISOLATION KNOB. The V4 pricing record names `cap` as the cost
+        # variable but could not isolate it: n_brick co-varied 32 -> 64 in every
+        # fixed-box step, so `cap` and the brick decomposition moved together.
+        # Inflating cap directly holds members, bricks, tiles, geometry and the
+        # kernel ALL fixed and changes only the number of padded rows, which is
+        # the clean instrument the record says is owed. It is an instrument and
+        # never an operating point: it buys nothing and costs padding.
+        if float(cap_mult) < 1.0:
+            raise ValueError(f"cap_mult must be >= 1.0 (it may not drop members), got {cap_mult}")
+        cap = int(np.ceil(cap * float(cap_mult) / 1024.0) * 1024)
+        pad_frac = float(1.0 - (1.0 - pad_frac) / float(cap_mult))
 
     kers = split_kernels(
         (P,) * 3, cell, "short", family, r_s=r_s, r_in=r_in, r_out=r_out, n_ref=n_fine
@@ -1099,6 +1112,7 @@ def force_short_tiled(
         cap=int(cap),
         pad_frac=float(pad_frac),
         pad_fill=str(pad_fill),
+        cap_mult=float(cap_mult),
         fft_work_ratio=float(len(tiles) * P**3 / float(n_fine) ** 3),
         # Superset overhang: brick-union members outside the padded mesh,
         # correctly excluded. Since choose_brick gained the `c | b_fine`

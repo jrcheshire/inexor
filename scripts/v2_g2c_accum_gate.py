@@ -78,6 +78,10 @@ CONFIGS = {
 A_INIT, A_FINAL, SPACING = 0.1, 1.0, "log"
 SEED = 0
 CODEC_ARMS = ("t6lin", "t6cdf", "t9", "t12")
+# arm -> bucket side in PARTICLE cells (see make_roundtrip). The velocity codec
+# is int16 max-range in every one of these, identical to `t9`, so the arms
+# differ ONLY in the position quantum and the comparison is like-for-like.
+T9_BUCKET_ARMS = {"t9c1": 1, "t9c2": 2, "t9c4": 4}
 C_CLIP = 6.0  # residual clip range in sigma (linear tier); G2b convention
 
 
@@ -176,6 +180,29 @@ def make_roundtrip(arm, L, n_fine, n_coarse):
             return x, v, diag
         if arm in ("t6lin", "t6cdf", "t9"):
             xq = _rt_pos_lattice(x, L, n_fine * 256)
+        elif arm in T9_BUCKET_ARMS:
+            # V4 (2026-08-07): the IMPLEMENTABLE T9 position tiers.
+            #
+            # The ratified t9 arm above quantizes at fine_cell/256, which an
+            # int8 can only carry if its implicit bucket is ONE FINE CELL. This
+            # script's own docstring (line 35) flags exactly that as deferred:
+            # "The 3 B/p position claim assumes CUBE's sorted-by-cell layout;
+            # this gate measures REPRESENTATION error only (storage layout is a
+            # build decision)." V4 is where that decision is taken, and the
+            # arithmetic does not work: at C-gh the fine mesh is 4096^3 = 6.9e10
+            # cells against 8.6e9 particles, so a per-cell index costs ~69 GB --
+            # more than the 77 GB of state it indexes. CUBE gets away with it by
+            # running one particle per cell; our fine mesh is 2x the particle
+            # grid per side, so its layout does not transfer.
+            #
+            # An affordable index needs a COARSER bucket, which coarsens the
+            # quantum. c = bucket side in PARTICLE cells; levels across the box
+            # = n_part * 256 / c = n_fine * 128 / c (n_fine = 2 n_part):
+            #   t9c1  bucket 0.5 Mpc/h  quantum fine/128  index 17.2 GB
+            #   t9c2  bucket 1.0 Mpc/h  quantum fine/64   index  2.15 GB
+            #   t9c4  bucket 2.0 Mpc/h  quantum fine/32   index  0.27 GB
+            # against the gated fine/256. This arm set measures what that costs.
+            xq = _rt_pos_lattice(x, L, (n_fine * 128) // T9_BUCKET_ARMS[arm])
         elif arm == "t12":
             xq = _rt_pos_lattice(x, L, 2**16)
         else:
@@ -469,6 +496,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--config", default="cdev", choices=sorted(CONFIGS))
     ap.add_argument("--ks", default="10,20,40", help="K sweep (accumulation axis)")
+    ap.add_argument(
+        "--arms",
+        default=",".join(CODEC_ARMS),
+        help="codec arms to run (default: the ratified set; V4 adds t9c1,t9c2,t9c4)",
+    )
     ap.add_argument("--single", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--arm", default="ref", help=argparse.SUPPRESS)
     ap.add_argument("--k", type=int, default=10, help=argparse.SUPPRESS)
@@ -508,7 +540,11 @@ def main():
     runs = {}
     legs = [("ref", k, None) for k in sorted(set(ks + [2 * k for k in ks]))]
     legs += [("ref", k_head, n_fine // 2)]  # mesh-floor arm
-    legs += [(arm, k, None) for arm in CODEC_ARMS for k in ks]
+    arms = tuple(a.strip() for a in args.arms.split(",") if a.strip())
+    unknown = [a for a in arms if a not in CODEC_ARMS and a not in T9_BUCKET_ARMS]
+    if unknown:
+        raise ValueError(f"unknown arm(s) {unknown}; known: {CODEC_ARMS + tuple(T9_BUCKET_ARMS)}")
+    legs += [(arm, k, None) for arm in arms for k in ks]
     for arm, k, mesh in legs:
         m = mesh or n_fine
         print(f"[worker] arm={arm} K={k} mesh={m} ...", flush=True)
@@ -559,7 +595,7 @@ def main():
         )
 
     print("\n--- codec arms vs ref (same K; gate band) ---")
-    for arm in CODEC_ARMS:
+    for arm in arms:
         for k in ks:
             sp = state_path(args.config, arm, k, n_fine)
             if not os.path.exists(sp) or not os.path.exists(ref_path(k)):

@@ -260,6 +260,8 @@ def force_leg(args):
             args.buf,
             peak=peak,
             profile=args.profile,
+            pad_fill=args.pad_fill,
+            cap_mult=args.cap_mult,
             **kw,
         )
         # force_short_tiled's diag carries its own `family`/`n_tile` keys, which
@@ -835,8 +837,19 @@ def main():
         ("--nsteps", int, N_STEPS),
         ("--tile-shift", int, 0),
         ("--profile", int, 0),
+        # cap ISOLATION (V4e): inflate the padded capacity with members, bricks,
+        # tiles and kernel ALL held fixed. The only clean instrument for the
+        # cost law the V4 pricing record could not isolate.
+        ("--cap-mult", float, 1.0),
     ):
         ap.add_argument(f, type=t, default=d, help=argparse.SUPPRESS)
+    # Padding fill A/B (V4e): "zero" reproduces the pre-eba91ab contention in
+    # which every padded row scatter-added onto one mesh address; "cycle" is the
+    # shipped default. Forces are bitwise identical either way, so the arm
+    # difference is purely the cost of same-address atomic contention.
+    ap.add_argument(
+        "--pad-fill", default="cycle", choices=["cycle", "zero"], help=argparse.SUPPRESS
+    )
     ap.add_argument("--fdtype", default="f64", choices=["f32", "f64"], help=argparse.SUPPRESS)
     ap.add_argument("--match", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
