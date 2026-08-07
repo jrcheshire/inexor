@@ -567,6 +567,58 @@ G5 characterised only at C-dev and on the cdev8/cdev/cgh64 box ladder. The
 step-level number for C-hero remains unmeasured; what is now measured is that
 the memory is not the obstacle.
 
-## 6. Verdict
+## 6. Verdict -- DRAFT, NOT RATIFIED
 
-*(empty -- V3 exit is JC's call, on the record in sec. 5)*
+Proposed clauses for JC to accept, amend or reject. Nothing here is in force
+and none of it is in `decisions.md` yet. Evidence is sec. 5.1-5.8.
+
+**Clause 1 -- V3 PASSES, but the seed's question was not answerable as
+posed.** V3's exit was "the A2-on-GH claim gets its measured footing
+(coherent vs staged vs infeasible)". That trichotomy assumed ATS access to
+pageable LPDDR is expressible; it is not -- this jax/CUDA stack exposes only
+`['device', 'pinned_host']` (sec. 1). The measured answer is a fourth
+regime the seed did not anticipate: **state larger than HBM streams out of
+page-locked host memory at 359-367 GB/s with 4.00 GiB device residency, and
+C-gh's paint runs on one GH200.** Proposed: that satisfies the exit, with the
+criterion amended to name the regime measured rather than the one asked for.
+
+**Clause 2 -- the GH200 host ceiling is ~116 GB and is a HARD CLIFF, and it
+binds config selection.** Full rate at 116.0 GB, ~100x collapse at 120.3 GB
+(sec. 5.5), mechanism confirmed two ways. There is no graceful region, so a
+C-gh operating point must be specified CLEAR of it, not near it -- the same
+failure mode as D-v2-10's 0.87-of-bar margin, which turned out to be a
+gate-config artifact. C-gh's T9 state is 77.3 GB, ~1.5x under. Proposed:
+record ~116 GB as a config-table constraint on the C-gh home.
+
+**Clause 3 -- `staged` is the production path; `coherent`'s advantage does
+not generalize.** XLA-managed transfer beats explicit staging by 14-20% on
+C2C and loses by 4% on PCIe (sec. 5.4). Proposed: specify `staged` as the
+single production path on portability grounds, and record `coherent` as a
+Grace-Hopper-only optimization to revisit if a config-table home is ever
+C2C-only. The alternative -- a per-home choice -- buys <=20% for two code
+paths, which does not look worth it.
+
+**Clause 4 -- the word "coherent" must not enter the ADR.** The seed and the
+design study both use it to mean ATS on pageable LPDDR. Nothing measured here
+tests that, and an ADR inheriting the word would assert a capability we have
+no evidence for. Proposed: say "host-resident streaming via `pinned_host`",
+and note ATS as untested and not expressible through jax memory kinds on
+jax 0.10.2.
+
+**Clause 5 -- C-hero is viable on memory grounds, and the bandwidth ratio
+must not be used to size it.** One H100 streams 4096^3's full 618.5 GB T9
+state at full rate (sec. 5.8) and costs 1.80x the GH200's wall on a real
+paint (sec. 5.7), against a 6.71-6.87x FABRIC ratio that does not propagate.
+Proposed: record 1.80x as the transferable figure, record the 6.9x explicitly
+as NOT a wall ratio, and note that the step-level number is unmeasured
+because the tiled two-level force has never run above cgh64 (512^3).
+
+**Explicitly NOT proposed, and left for V4:**
+- Any node-ladder decision between C-hero and gb. gb's fp64 is not a
+  differentiator (sec. 5.7 correction) and its per-card HBM is ~2x the
+  GH200's, so the question is whether to write multi-GPU sharding rather than
+  a hardware risk -- an engineering-effort call V4 should take with the
+  step-level cost in hand.
+- Any operating (T, b) for C-gh. D-v2-10 already reserves that for V4.
+- Any claim about the two-level force at C-gh or C-hero scale. It has been
+  measured only to cgh64, which is C-gh at 1/64 volume.

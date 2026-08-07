@@ -161,6 +161,67 @@ Readings (ratified as D-v2-10, JC 2026-07-16):
   (JC, verbatim in the 07-15 worklog): these sims are memory-expensive, not
   time-expensive; subverting that is the point of v2.
 
+## V3 -- G4 memory path (Vista GH200 job 894036/894118, Stampede3 h100 job 3380722/3380888)
+
+Full record + reading rules: `runs/v2/g4_record.md`. Jobs 894005 (smoke) and
+894010 (VOID -- it measured JAX's env defaults, not the hardware) are
+provenance, not data.
+
+**The headline for this record: streaming DECOUPLES device residency from
+state size.** Device peak is set by the chunk and the mesh, not by N, so the
+B/p column stops scaling with the particle count -- which is the entire point
+of v2 and the first time it has been demonstrated above the config table's
+dev rung.
+
+Memory-path bandwidth, one estimator, matched rungs (2 GiB chunks):
+
+| working set | GH200 staged | GH200 coherent | S3 H100 staged | S3 H100 coherent |
+|---|---|---|---|---|
+| 64 GiB | 367.0 | 418.0 | 53.4 | 51.2 |
+| 88 GiB | 360.0 | 418.5 | 53.4 | 51.2 |
+| 104 GiB | 359.1 | 429.2 | 53.5 | 51.2 |
+| 128 GiB | **2.4** | **1.6** | 53.4 | 51.2 |
+| 256 / 448 / 576 GiB | n/a (over LPDDR) | n/a | 53.8 / 53.8 / 53.8 | 51.3 / 51.2 / 51.2 |
+
+Device residency (the B/p story), constant in working set on BOTH machines:
+
+| arm | device peak | note |
+|---|---|---|
+| staged / coherent, any rung to 576 GiB | **4.00 GiB (2.0 chunks)** | independent of N |
+| hbm control | tracks the set | OOMs past the cap, as designed |
+| C-gh paint, 2048^3, either machine | 31.3 GiB = **3.91 B/p** | vs G5 tiled 24.7, mono 377 |
+
+Capacity ceilings, measured:
+
+| machine | HBM (detected) | host ceiling for streaming | mechanism |
+|---|---|---|---|
+| Vista GH200 | 95.6 GiB | **~116 GB (108 GiB), HARD CLIFF** | physical LPDDR; ~100x drop in one 4 GB step |
+| S3 h100 | 93.6 GiB | >= 618.5 GB, no cliff seen | 1006.9 GiB host; 618.5 GB = 61% of it |
+
+Real-workload triple (C-gh paint, 2048^3 into 1024^3, staged):
+
+| machine | wall | particles/s | device peak | fabric |
+|---|---|---|---|---|
+| Vista GH200 | 13.29 s | 6.46e8 | 31.3 GiB | C2C |
+| S3 h100 | 23.90 s | 3.59e8 | 31.3 GiB | PCIe |
+
+Readings (verdict is JC's, sec. 6 of the G4 record):
+- **Host-resident state larger than HBM streams**, at 359-367 GB/s (C2C) or
+  53-54 GB/s (PCIe), with 4.00 GiB device residency at every rung to 576 GiB.
+- **The fabric ratio is 6.71-6.87x but real work is 1.80x.** Paint is compute-
+  and latency-bound; on the GH200 it runs 46x below that machine's own ladder
+  rate. Do NOT size a config from the bandwidth ratio.
+- **The GH200's host ceiling is a hard cliff at physical LPDDR**, not a
+  roll-off, so an operating point must sit clear of it. C-gh's T9 state is
+  77.3 GB, ~1.5x under.
+- **C-hero's full 4096^3 T9 state (618.5 GB) streams at full rate** on one
+  H100 with 1 TB host -- flat across a 9x span of working set.
+- `coherent` (XLA-managed) beats `staged` (explicit) by 14-20% on C2C and
+  loses by 4% on PCIe, so it is a Grace-Hopper statement, not a general one.
+- SU rates for the Pareto arithmetic: Vista gh 1 SU/GPU-hr (1 GPU/node, so
+  the GPU is the charging unit); S3 h100 4 SU/node-hr across 4 GPUs, so a
+  single-GPU job there idles 75% of the billed hardware.
+
 ## Older anchors (v1 record, for scale)
 
 - XLA-native forward evolution peaked ~126-138 B/p (v1 R6, m2-results).
