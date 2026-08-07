@@ -74,10 +74,32 @@ the verdict needs them to agree:
    straddles the cliff at 64/88/104/128 GiB. An arm that COMPLETES a 128 GiB
    working set cannot have held it all in 96 GB of HBM. This is the witness
    that is hardest to fake.
-2. **HBM residency.** `peak_bytes_in_use / working_set`. ~1.0 means the set
+2. **HBM residency.** ~~`peak_bytes_in_use / working_set`. ~1.0 means the set
    was copied wholesale; `chunk/set` (0.031 at 64 GiB, 0.016 at 128 GiB with
-   2 GiB chunks) means it streamed. Anything in between is partial buffering
+   2 GiB chunks) means it streamed.~~ Anything in between is partial buffering
    and must be reported as such, not rounded to a story.
+
+   **CORRECTED 2026-08-06, after leg 1 of 894010 and BEFORE any ladder rung
+   existed. The struck-through rule is wrong and would have misread a healthy
+   arm.** The ratio's DENOMINATOR moves with the rung, so a perfectly
+   streaming arm at a small working set still reads ~1.0: leg 1's `staged`
+   arm held a constant 4.00 GiB (two 2 GiB chunks, double-buffered) at both
+   the 4 and 8 GiB rungs, giving pk/set = 1.0000 and 0.5000 for identical
+   behaviour. Same defect class as G3's withdrawn `rho`, which divided by the
+   cross transfer and so measured 1/r^2 -- a statistic whose denominator
+   carries the thing being tested cannot see the thing being tested.
+
+   **The statistic is ABSOLUTE peak, equivalently `peak_bytes_in_use / chunk`
+   (recorded as `hbm_peak_over_chunk`).** Read it as:
+   - **constant in working-set size** -> streaming. The count is how deep the
+     buffering is (leg 1: 2.0 chunks for both `staged` and `coherent`).
+   - **growing with working-set size** -> wholesale copy. This is what the
+     pre-fix `staged` arm did: 4.0 GiB at a 4 GiB set, 8.0 GiB at an 8 GiB
+     set.
+   The ratio is still reported, but it is descriptive, not diagnostic.
+   NB this correction makes the witness MORE discriminating, and it is forced
+   by arithmetic visible without any verdict-bearing rung -- the ladder above
+   the cliff had not run when it was written.
 3. **Bandwidth against the E2 ceilings** (HBM 3400, LPDDR 486, C2C r/w
    375/297 GB/s). A rate materially above C2C did not cross C2C per byte; a
    rate at HBM speed means the data was resident and the arm is lying.
@@ -131,7 +153,41 @@ not gates.
 
 ## 5. Results
 
-*(empty -- job 894010 in flight)*
+### 5.1 Leg 1 (gate, below the cliff) -- 894010, `runs/v2/g4_gh_memory_smoke.json`
+
+GATE PASS: the `coherent` arm compiled and ran at both rungs, so the
+expensive legs were allowed to proceed. `host_kind_used = pinned_host` on
+both host arms, as sec. 1 requires be stated.
+
+| arm | set GiB | GB/s | peak GiB | peak/chunk | peak/set |
+|---|---|---|---|---|---|
+| hbm | 4.0 | 3004.5 | 6.00 | 3.0 | 1.5000 |
+| staged | 4.0 | 352.8 | 4.00 | 2.0 | 1.0000 |
+| coherent | 4.0 | 407.5 | 4.00 | 2.0 | 1.0000 |
+| hbm | 8.0 | 3359.4 | 10.00 | 5.0 | 1.2500 |
+| staged | 8.0 | 358.7 | 4.00 | 2.0 | 0.5000 |
+| coherent | 8.0 | 413.3 | 4.00 | 2.0 | 0.5000 |
+
+Three readings, all provisional -- **every rung here is BELOW the cliff, so
+none of them bears on the capacity witness**, which is the primary one:
+
+1. **Both fixes took.** `staged` and `coherent` hold a constant 4.00 GiB
+   (2.0 chunks) independent of working-set size = streaming, double-buffered.
+   The pre-fix arm scaled its peak with the set. This is what licenses
+   expecting the ladder to survive above the cliff at all.
+2. **The instrument still reproduces the HBM ceiling** (3004-3359 GB/s vs
+   E2's 3400), so nothing about the rewrite disturbed the control.
+3. **`coherent` is ~15% FASTER than `staged`** (407.5 vs 352.8; 413.3 vs
+   358.7), and sits ABOVE E2's 375 GB/s C2C-read ceiling while `staged` sits
+   just below it. That is pre-registered outcome P3-b (XLA overlapping
+   transfer with compute in a way the explicit loop does not). **Not to be
+   quoted as a result yet**: two rungs, both below the cliff, and a rate
+   above a published ceiling is exactly the kind of number that turns out to
+   be a harness artifact. The ladder is what tests it.
+
+### 5.2 Legs 2-3 (the ladder across the cliff, and the C-gh paint point)
+
+*(in flight)*
 
 ## 6. Verdict
 
