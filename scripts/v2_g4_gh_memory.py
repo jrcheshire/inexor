@@ -45,9 +45,13 @@ Orchestration: one (arm, size) per fresh subprocess -- `peak_bytes_in_use` is
 a running max that never resets, so two arms in one process report the same
 number (umbrella reference-jax-peak-memory-no-reset).
 
+Also runs on Stampede3 h100 nodes, where the same ladder measures a
+PCIe-attached host instead of a C2C-attached one -- the comparison that
+decides C-hero vs gb at V4. HBM is DETECTED per node, not assumed.
+
 Run (Vista gh node, gpu env):
     pixi run -e gpu python scripts/v2_g4_gh_memory.py
-Reachability smoke (short, gh-dev):
+Gate leg / reachability (small ladder under the cliff, used as leg 1):
     pixi run -e gpu python scripts/v2_g4_gh_memory.py --smoke
 """
 
@@ -70,7 +74,31 @@ ARMS = ("hbm", "staged", "coherent")
 # Fusco+ 2408.11556). Reference points for reading a rate, NOT gates.
 CEILING_GBS = {"hbm": 3400.0, "lpddr": 486.0, "c2c_read": 375.0, "c2c_write": 297.0}
 
-HBM_BYTES = 96 * 1024**3  # GH200 HBM3; the cliff the ladder must cross
+# The cliff the ladder must cross. DETECTED, not assumed: this probe now runs
+# on GH200 (96 GB HBM3) and on Stampede3 H100 nodes, and a hardcoded 96 GiB
+# would silently answer `exceeds_hbm` and the device-cap precondition against
+# the WRONG card -- i.e. the capacity witness would be measured against a
+# reference that is not the hardware. Overridable with --hbm-gib.
+HBM_BYTES_FALLBACK = 96 * 1024**3
+
+
+def physical_hbm_bytes(override_gib=None):
+    """Physical HBM of device 0, from nvidia-smi; fallback is GH200's 96 GiB."""
+    if override_gib:
+        return int(override_gib * 1024**3)
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip().splitlines()
+        if out:
+            return int(float(out[0].strip()) * 1024**2)  # MiB -> bytes
+    except Exception:
+        pass
+    return HBM_BYTES_FALLBACK
+
+
+HBM_BYTES = physical_hbm_bytes()
 
 # Working-set ladder in GiB. Straddles HBM deliberately: 64/88 below, 104/128
 # above, so the hbm arm's OOM brackets the cliff instead of merely reporting it.
@@ -505,6 +533,8 @@ def main():
     ap.add_argument("--arms", default=",".join(ARMS))
     ap.add_argument("--smoke", action="store_true", help="tiny ladder: reachability only")
     ap.add_argument("--out-suffix", default="", help="suffix for the card, e.g. _smoke")
+    ap.add_argument("--hbm-gib", type=float, default=None,
+                    help="override detected physical HBM (GiB); default reads nvidia-smi")
     ap.add_argument("--real", action="store_true", help="C-gh paint point")
     ap.add_argument("--n-side", type=int, default=2048, help="C-gh particle side")
     ap.add_argument("--n-mesh", type=int, default=1024)
@@ -517,6 +547,8 @@ def main():
         run_real(args) if args.real else run_single(args)
         return
 
+    global HBM_BYTES
+    HBM_BYTES = physical_hbm_bytes(args.hbm_gib)
     arms = [a for a in args.arms.split(",") if a]
     if args.smoke:
         # under HBM on purpose: the smoke asks "is the path expressible and
@@ -528,7 +560,7 @@ def main():
 
     recs = []
     print("=== G4: GH200 memory-path reality check ===")
-    print(f"HBM cliff at {HBM_BYTES / 1024**3:.0f} GiB; ladder {ladder} GiB; arms {arms}")
+    print(f"HBM cliff at {HBM_BYTES / 1024**3:.1f} GiB (detected); ladder {ladder} GiB; arms {arms}")
     for gib in ladder:
         for arm in arms:
             print(f"[worker] {arm:9s} {gib:6.1f} GiB ...", flush=True)
