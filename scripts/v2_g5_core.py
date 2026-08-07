@@ -55,6 +55,8 @@ Global arms reuse painting.paint_f32(fdtype=f64) + cic_read_vector, so F0
 tests the KERNEL alone. Only tile arms need probe-local CIC.
 """
 
+import time
+
 import numpy as np
 
 # Coarse:fine mesh ratio (PMFAST pattern; the config table's `coarse = fine/4`).
@@ -941,6 +943,7 @@ def force_short_tiled(
     r_in=None,
     r_out=None,
     peak=None,
+    profile=0,
 ):
     """(1-S(k))*ik/k^2 on fine tiles, host-accumulated -> (g (n,3) f64, diag).
 
@@ -1003,7 +1006,16 @@ def force_short_tiled(
     n_overhang_total = 0
     peak_first = None
 
+    # Phase timers. Free (perf_counter only, no extra syncs and no jit
+    # splitting, so fusion is untouched and the totals still add to the wall
+    # the un-instrumented code would have taken). The brackets are chosen so
+    # each one ends at a point that ALREADY synchronised: `np.asarray(out)`
+    # forces the D2H copy, so `t_device` really is device compute + transfer
+    # and not just the async dispatch.
+    t_member, t_stage, t_device, t_scatter = [], [], [], []
+
     for ti, t in enumerate(tiles):
+        _t0 = time.perf_counter()
         idx = tile_members(order, starts, nb, t, n_tile, b_real, n_brick)
         m = len(idx)
         if m > cap:
@@ -1013,16 +1025,26 @@ def force_short_tiled(
         live_np = np.zeros((cap,), dtype=bool)
         live_np[:m] = True
         origin, _ = tile_origin_extent(t, n_tile, b_real, cell)
+        _t1 = time.perf_counter()
         u = jnp.mod(jnp.asarray(pos_np[idx_pad]) - jnp.asarray(origin), float(box_size))
+        _t2 = time.perf_counter()
         out, owned, n_out = one_tile_jit(u, jnp.asarray(live_np))
         out = np.asarray(out)
         owned = np.asarray(owned)
         n_overhang_total += int(n_out)
+        _t3 = time.perf_counter()
         sel = owned[:m]
         g_out[idx[sel]] = out[:m][sel]
         owner_count[idx[sel]] += 1
         if ti == 0 and peak is not None:
             peak_first = peak()
+        _t4 = time.perf_counter()
+        t_member.append(_t1 - _t0)
+        t_stage.append(_t2 - _t1)
+        t_device.append(_t3 - _t2)
+        # NB tile 0's scatter bracket also contains the `peak()` call, which
+        # synchronises. Read t_scatter from the median, not the mean.
+        t_scatter.append(_t4 - _t3)
         del out, owned
 
     diag = dict(
@@ -1054,5 +1076,44 @@ def force_short_tiled(
         ),
         peak_after_first_tile=peak_first,
         peak_total=(peak() if peak is not None else None),
+        # WHERE THE TILE WALL GOES. `member` = host bucket lookup + index/mask
+        # build; `stage` = the numpy fancy-index gather pos_np[idx_pad] plus
+        # H2D; `device` = the jitted paint/FFT/gather plus D2H; `scatter` = the
+        # host write-back. Tile 0 carries the XLA compile, so the STEADY-STATE
+        # per-tile cost is the median over tiles 1.. and the compile is read as
+        # t_device[0] minus that median. A cost extrapolated across boxes must
+        # use the steady-state number: tile count scales with volume, compile
+        # does not.
+        anatomy=_phase_anatomy(
+            dict(member=t_member, stage=t_stage, device=t_device, scatter=t_scatter),
+            keep_per_tile=bool(profile),
+        ),
     )
     return g_out, diag
+
+
+def _phase_anatomy(phases, keep_per_tile=False):
+    """Summary stats per phase: total, steady-state median, and tile-0 cost."""
+    out = {}
+    for name, vals in phases.items():
+        if not vals:
+            out[name] = None
+            continue
+        tail = vals[1:] if len(vals) > 1 else vals
+        rec = dict(
+            total_s=float(np.sum(vals)),
+            first_s=float(vals[0]),
+            median_s=float(np.median(tail)),
+            max_s=float(np.max(tail)),
+        )
+        if keep_per_tile:
+            rec["per_tile_s"] = [float(v) for v in vals]
+        out[name] = rec
+    dev = phases.get("device") or []
+    if len(dev) > 1:
+        # The one number the C-gh extrapolation actually needs.
+        out["compile_s_est"] = float(dev[0] - np.median(dev[1:]))
+        out["steady_per_tile_s"] = float(
+            sum(np.median(v[1:]) for v in phases.values() if len(v) > 1)
+        )
+    return out

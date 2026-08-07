@@ -252,7 +252,15 @@ def force_leg(args):
     if args.tile:
         pk = peak()
         g_out, diag = force_short_tiled(
-            x_np, g["n_fine"], L, n_total, args.tile, args.buf, peak=peak, **kw
+            x_np,
+            g["n_fine"],
+            L,
+            n_total,
+            args.tile,
+            args.buf,
+            peak=peak,
+            profile=args.profile,
+            **kw,
         )
         # force_short_tiled's diag carries its own `family`/`n_tile` keys, which
         # collide with the explicit ones below -> namespace it.
@@ -826,6 +834,7 @@ def main():
         ("--a", float, A_PIVOT),
         ("--nsteps", int, N_STEPS),
         ("--tile-shift", int, 0),
+        ("--profile", int, 0),
     ):
         ap.add_argument(f, type=t, default=d, help=argparse.SUPPRESS)
     ap.add_argument("--fdtype", default="f64", choices=["f32", "f64"], help=argparse.SUPPRESS)

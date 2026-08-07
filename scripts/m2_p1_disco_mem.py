@@ -63,13 +63,14 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 RUNS = os.path.join(REPO, "runs", "m2")
 GIB = 1024.0**3
 
 
-def _single(n_mesh, K, f64):
+def _single(n_mesh, K, f64, forward_only=False, pm_ratio=1):
     # x64 BEFORE any jax import. Default OFF: f32 is the fair comparison, and
     # disco-mocks' own tasks set JAX_ENABLE_X64=1 in their env, so this must
     # override rather than inherit.
@@ -143,7 +144,11 @@ def _single(n_mesh, K, f64):
             time_var=a_steps,
             stepper="bullfrog",
             method="pm",
-            res_pm=n_mesh,
+            # res_pm/n_mesh is the mesh:particle ratio, and it MUST match the
+            # arm it is compared against or the memory comparison is meaningless
+            # (our config table runs n_fine = 2 x n_part per side, so pm_ratio=2
+            # is the matched setting; pm_ratio=1 reproduces the v1 rows).
+            res_pm=int(pm_ratio) * n_mesh,
             worder=2,
             antialias=0,
             grad_kernel_order=0,  # DISCO-DJ defaults to 4 (FD) -- M1 lesson
@@ -161,20 +166,41 @@ def _single(n_mesh, K, f64):
         X, _P = evolve(pos, vel)
         return jax.numpy.sum(X.reshape(-1, 3) ** 2)  # trivial; isolates the adjoint
 
-    jax.block_until_ready(loss(x0j, v0j))
-    peak_fwd = peak()
+    if forward_only:
+        # Capacity-ladder mode: the adjoint is not the comparison (v2 is a
+        # forward engine), and running it would cap the ladder ~3x lower on
+        # memory than the forward can actually reach.
+        t0 = time.perf_counter()
+        X, _P = evolve(x0j, v0j)
+        jax.block_until_ready(X)
+        wall_fwd = time.perf_counter() - t0
+        peak_fwd = peak()
+        peak_adj = None
+        # Same guard shape as the adjoint's: a forward that silently returned
+        # the inputs (or NaNs) would give a flatteringly small peak AND be
+        # meaningless. A real evolve moves every particle a finite distance.
+        Xn = np.asarray(X).reshape(-1, 3)
+        moved = float(np.linalg.norm(Xn - x0))
+        finite = bool(np.all(np.isfinite(Xn)))
+        gnorm, ran = moved, bool(finite and moved > 0.0)
+    else:
+        t0 = time.perf_counter()
+        jax.block_until_ready(loss(x0j, v0j))
+        wall_fwd = time.perf_counter() - t0
+        peak_fwd = peak()
 
-    g = jax.grad(loss, argnums=(0, 1))(x0j, v0j)
-    jax.block_until_ready(g)
-    peak_adj = peak()
+        g = jax.grad(loss, argnums=(0, 1))(x0j, v0j)
+        jax.block_until_ready(g)
+        peak_adj = peak()
 
     # Guard against measuring a no-op. If the adjoint silently returned zeros
     # (a broken trace, convert_to_numpy severing the graph, ...) the peak would
     # be flatteringly small AND meaningless -- and it would look like a great
     # result for DISCO-DJ. A real gradient is finite and nonzero.
-    gx = np.asarray(g[0])
-    gnorm = float(np.linalg.norm(gx))
-    finite = bool(np.all(np.isfinite(gx)))
+        gx = np.asarray(g[0])
+        gnorm = float(np.linalg.norm(gx))
+        finite = bool(np.all(np.isfinite(gx)))
+        ran = bool(finite and gnorm > 0.0)
 
     return {
         "code": "discodj",
@@ -182,19 +208,25 @@ def _single(n_mesh, K, f64):
         "n_particles": n_part,
         "K": K,
         "f64": f64,
+        "forward_only": bool(forward_only),
+        "pm_ratio": int(pm_ratio),
+        "res_pm": int(pm_ratio) * n_mesh,
         "platform": dev.platform,
         "device": str(dev),
         "bytes_limit": limit(),
         "peak_after_ic": peak_ic,
         "peak_forward": peak_fwd,
         "peak_adjoint": peak_adj,
+        "peak_forward_per_particle": (peak_fwd / n_part) if peak_fwd else None,
+        "peak_adjoint_per_particle": (peak_adj / n_part) if peak_adj else None,
+        "wall_forward_s": wall_fwd,
         "grad_norm": gnorm,
         "grad_finite": finite,
-        "adjoint_ran": bool(finite and gnorm > 0.0),
+        "adjoint_ran": ran,
     }
 
 
-def _spawn(n_mesh, K, f64):
+def _spawn(n_mesh, K, f64, forward_only=False, pm_ratio=1):
     cmd = [
         sys.executable,
         os.path.abspath(__file__),
@@ -203,9 +235,13 @@ def _spawn(n_mesh, K, f64):
         str(n_mesh),
         "--steps",
         str(K),
+        "--pm-ratio",
+        str(pm_ratio),
     ]
     if f64:
         cmd.append("--f64")
+    if forward_only:
+        cmd.append("--forward-only")
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
         err = (p.stderr or "").strip().splitlines()
@@ -236,16 +272,45 @@ def main():
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--f64", action="store_true", help="secondary row: f64 state")
     ap.add_argument("--single", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument(
+        "--forward-only",
+        action="store_true",
+        help="capacity-ladder mode: skip the adjoint so the ladder finds the FORWARD ceiling",
+    )
+    ap.add_argument(
+        "--pm-ratio",
+        type=int,
+        default=1,
+        help="res_pm / n_mesh; 2 matches our config table's n_fine = 2 x n_part",
+    )
+    ap.add_argument("--tag", default=None, help="output suffix (default: f32/f64)")
     args = ap.parse_args()
 
     if args.single:
-        print(json.dumps(_single(int(args.n), args.steps, args.f64)))
+        print(
+            json.dumps(
+                _single(int(args.n), args.steps, args.f64, args.forward_only, args.pm_ratio)
+            )
+        )
         return
 
     recs = []
     for n in [int(x) for x in args.n.split(",") if x.strip()]:
-        print(f"[p1_disco] n_mesh={n} K={args.steps} f64={args.f64} ...", flush=True)
-        recs.append(_spawn(n, args.steps, args.f64))
+        print(
+            f"[p1_disco] n_mesh={n} K={args.steps} f64={args.f64} "
+            f"pm_ratio={args.pm_ratio} forward_only={args.forward_only} ...",
+            flush=True,
+        )
+        rec = _spawn(n, args.steps, args.f64, args.forward_only, args.pm_ratio)
+        recs.append(rec)
+        if rec.get("error"):
+            # The ceiling IS the measurement: stop climbing once a rung dies,
+            # and say whether it died of memory or of something else.
+            print(
+                f"  rung n_mesh={n} FAILED (oom={rec.get('oom')}): {rec.get('error')}",
+                flush=True,
+            )
+            break
 
     print("\n===== DISCO-DJ adjoint peak (the control for inexor's transient) =====")
     lim = next((r.get("bytes_limit") for r in recs if r.get("bytes_limit")), None)
@@ -291,7 +356,7 @@ def main():
         print("  (x, p, xi, pi x3 x4B); a peak below that means the adjoint did not run.")
 
     os.makedirs(RUNS, exist_ok=True)
-    tag = "f64" if args.f64 else "f32"
+    tag = args.tag or ("f64" if args.f64 else "f32")
     path = os.path.join(RUNS, f"p1_disco_mem_{tag}.json")
     with open(path, "w") as f:
         json.dump({"configs": recs}, f, indent=1)
