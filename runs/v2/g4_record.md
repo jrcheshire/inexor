@@ -345,6 +345,83 @@ should not be quoted against the E2 ceilings.
 - **P3 -> outcome (b)**, with the caveat in item 5.
 - **P4 HELD** exactly.
 
+## 5.4 Stampede3 h100 -- the C-hero fabric, MATCHED (job 3380722)
+
+Same script, same rungs, same 2 GiB chunk, same caps, one GPU pinned. The
+two cards are within 2% on HBM (S3 93.6 GiB detected vs GH200 95.6 GiB), so
+the cliff sits in the same place on both and any ladder difference is the
+memory FABRIC, not capacity. Node: 4x H100 (95830 MiB each), 96 cores,
+**1006.9 GiB host** -- confirming the config table's C-hero row from the
+machine rather than from the table. Memory kinds `['device', 'pinned_host']`,
+identical to the GH200; `unpinned_host` exists on neither.
+
+| arm | GiB | Vista GH200 | S3 H100 | ratio |
+|---|---|---|---|---|
+| hbm | 64 | 3742.8 | 2287.7 | 1.64x |
+| hbm | 88/104/128 | OOM | OOM | -- |
+| staged | 64 | 367.0 | 53.4 | **6.87x** |
+| staged | 88 | 360.0 | 53.4 | **6.74x** |
+| staged | 104 | 359.1 | 53.5 | **6.71x** |
+| staged | 128 | 2.4 | 53.4 | 0.04x |
+| coherent | 64 | 418.0 | 51.2 | 8.16x |
+| coherent | 88 | 418.5 | 51.2 | 8.17x |
+| coherent | 104 | 429.2 | 51.2 | 8.38x |
+| coherent | 128 | 1.6 | 51.2 | 0.03x |
+
+**1. The PCIe prediction is CONFIRMED and quantified: 6.71-6.87x** on the
+staged arm, against a predicted "~6-7x". S3 sits at 51-53 GB/s, squarely in
+the PCIe 5 x16 range; the GH200's 359-429 GB/s is C2C. Device peak is 4.00
+GiB on both machines at every rung, so both stream identically -- the
+mechanism transfers, only the rate does not.
+
+**2. The 128 GiB collapse is GH200-SPECIFIC, and this is independent
+evidence for the LPDDR-capacity hypothesis.** S3 runs 128 GiB at 53.4 GB/s,
+perfectly flat, no collapse at all. Same rung, same code, same chunk -- on a
+node with 1007 GiB of host memory, where 128 GiB is 13% of host rather than
+118% of the GH200's 116 GB LPDDR. So the collapse is not structural to the
+ladder or to that working-set size; it is that machine running out of the
+memory the set has to live in. Job 894118's bracket still locates the knee,
+but the mechanism now has a cross-machine control it did not have before.
+
+**3. The coherent advantage does NOT transfer.** On the GH200 `coherent`
+beat `staged` by 14-20%; on S3 it is 4% SLOWER (51.2 vs 53.4) at every rung.
+XLA overlapping transfer with compute buys something on a C2C link with
+headroom and nothing on a saturated PCIe one. Anything V4 concludes about
+`coherent` is a Grace-Hopper statement, not a general one.
+
+### fp64 on H100 (leg 1) -- the baseline the gb run will be read against
+
+| op | f32 | f64 | statistic |
+|---|---|---|---|
+| gemm n=4096 | 315.7 TFLOP/s | 60.6 TFLOP/s | ratio **0.192** |
+| gemm n=8192 | 407.4 TFLOP/s | 63.7 TFLOP/s | ratio **0.156** |
+| fft3d n=256 | 0.0005 s | 0.0009 s | wall **1.72x** |
+| fft3d n=512 | 0.0034 s | 0.0065 s | wall **1.92x** |
+
+H100 f64 GEMM at 60.6-63.7 TFLOP/s is ~90-95% of the part's fp64 peak, so
+fp64 here is genuinely full-rate and is the right control.
+
+**METRIC CORRECTION, and it must be applied to the gb card too.** The
+script's printed `f64:f32` ratio for `fft3d` reads 1.04-1.16, which invites
+reading f64 as FASTER. It is not: `complex128` moves exactly 2.00x the bytes
+of `complex64`, so a GB/s ratio carries the dtype in its numerator and cannot
+be an fp64-health statistic. The clean read is WALL: 2.00x = pure bandwidth
+scaling with no fp64 penalty, >2.00x = a real penalty. H100 lands at
+1.72-1.92x, i.e. slightly better than bandwidth scaling and no penalty. The
+GEMM ratio needs no correction (same FLOP count both dtypes).
+**The script was deliberately NOT changed**: job 894167 is queued against the
+committed tree and mutating it under a pending job would mean the gb run
+executes something other than what its control ran. Both walls are in the
+JSON, so the correction is applied at readout instead.
+
+**What this does NOT say.** The 6.9x is a BANDWIDTH-BOUND figure. The one
+real-workload point we have -- the C-gh paint on the GH200 -- ran at 7.8 GB/s
+staged, 46x BELOW that machine's own ladder rate, because paint is not
+bandwidth-bound. So the fabric gap is an upper bound on the end-to-end
+penalty for real work, and possibly a very loose one. Sizing C-hero from
+6.9x would be reading a bandwidth ratio as a wall ratio. The measurement that
+would settle it is the paint point on S3, which this job did not run.
+
 ## 6. Verdict
 
 *(empty -- V3 exit is JC's call, on the record in sec. 5)*
