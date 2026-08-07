@@ -476,6 +476,46 @@ correction), never the printed fft GB/s ratio.
 GH200 node from the dump: 1 device, 72 cores, 212.7 GiB host -- consistent
 with the LPDDR knee at 116 GB found in sec. 5.5.
 
+## 5.7 The fabric gap does NOT propagate to real work: 1.80x, not 6.9x (job 3380888 leg 1)
+
+The same C-gh paint point (2048^3 into a 1024^3 mesh), staged arm, run on
+both machines:
+
+| | Vista GH200 | S3 H100 | ratio |
+|---|---|---|---|
+| wall | 13.29 s | 23.90 s | **1.80x** |
+| positions rate | 7.75 GB/s | 4.31 GB/s | 1.80x |
+| particles/s | 6.46e8 | 3.59e8 | 1.80x |
+| device peak | 31.3 GiB | 31.3 GiB | 1.00 |
+
+**The ladder said 6.71-6.87x. Real work says 1.80x.** Paint is compute- and
+latency-bound, not bandwidth-bound -- on the GH200 it runs 46x below that
+machine's own ladder rate -- so most of the fabric gap never reaches the
+wall. Sec. 5.4 warned that sizing C-hero from the bandwidth ratio would be
+reading a bandwidth ratio as a wall ratio; doing so would have overstated
+the penalty by 3.8x.
+
+**This is the number the C-hero-vs-gb call should turn on**, and it moves the
+argument substantially toward C-hero:
+
+- C-hero costs **1.80x the wall per unit of paint** and buys **~8.7x the
+  usable state capacity** (1007 GiB host vs the GH200's measured ~116 GB
+  LPDDR ceiling from sec. 5.5), on the single-GPU code that exists today.
+- gb would need multi-GPU sharding that inexor does not have (`evolve` is an
+  eager single-device orchestrator), and its fp64 health is still unmeasured
+  (job 894167 pending).
+
+Identical 31.3 GiB device peak on both confirms the two runs did the same
+work in the same way, so the wall difference is the machine and not a
+different execution path.
+
+**Scope, stated so it is not over-read:** one op (paint), one shape, staged
+arm only. A full step also gathers forces and runs FFTs, and the FFT rates
+in sec. 5.6 differ between the parts by more than 1.80x (481/562 vs 307/333
+GB/s). So 1.80x is the paint number, not a step number, and a step-level
+figure needs the tiled two-level force -- which this probe does not
+implement.
+
 ## 6. Verdict
 
 *(empty -- V3 exit is JC's call, on the record in sec. 5)*
