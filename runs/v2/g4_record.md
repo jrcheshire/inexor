@@ -1,9 +1,10 @@
 # G4 -- the GH200 memory-path reality check (v2 seed V3)
 
-**Status: PRE-REGISTRATION. Written 2026-08-06 while job 894010 was running,
-before any ladder number existed.** Sections 1-4 are the reading rules and
-predictions; section 5 is empty until the card lands. Nothing here
-self-ratifies: the V3 exit is JC's call.
+**Status: CLOSED 2026-08-06 as D-v2-13.** Sections 1-4 are the
+PRE-REGISTRATION, written while job 894010 was running and before any ladder
+number existed -- they are unchanged except for one reading rule corrected
+mid-flight (sec. 3, witness 2) with the original struck through rather than
+replaced. Section 5 is the results. Section 6 is the ratified verdict.
 
 Provenance: `main @7a5ad00`. Probe `scripts/v2_g4_gh_memory.py`, job
 `scripts/v2_g4_gh_vista.sbatch` (Vista `gh`, 8 h). Prior run: job 894005
@@ -588,11 +589,16 @@ G5 characterised only at C-dev and on the cdev8/cdev/cgh64 box ladder. The
 step-level number for C-hero remains unmeasured; what is now measured is that
 the memory is not the obstacle.
 
-## 6. Verdict -- FOUR CLAUSES RATIFIED (JC, 2026-08-06), ONE REVISED
+## 6. Verdict -- ALL FIVE CLAUSES ACCEPTED (JC, 2026-08-06) = D-v2-13
 
-JC ratified clauses 1, 2, 4 and 5 on 2026-08-06. Clause 3 was challenged and
-is REVISED below on new evidence; it needs re-confirmation before this goes
-into `decisions.md` as an ADR. Evidence is sec. 5.1-5.8.
+**Ratified and now in `docs/decisions.md` as D-v2-13**, with a row in
+`docs/plan-plan-v2.md`'s decision table. Clauses 1, 2, 4 and 5 were ratified
+as drafted; clause 3 was challenged, revised on re-examined evidence, and
+re-ratified. The ADR is the citable form; this section is kept as the
+drafting record, including how clause 3's first basis was wrong.
+Evidence is sec. 5.1-5.8.
+
+**V3 is CLOSED. Next gate is V4 (architecture freeze).**
 
 **Clause 1 [RATIFIED] -- V3 PASSES, but the seed's question was not answerable as
 posed.** V3's exit was "the A2-on-GH claim gets its measured footing
@@ -612,7 +618,7 @@ failure mode as D-v2-10's 0.87-of-bar margin, which turned out to be a
 gate-config artifact. C-gh's T9 state is 77.3 GB, ~1.5x under. Proposed:
 record ~116 GB as a config-table constraint on the C-gh home.
 
-**Clause 3 [REVISED -- needs re-confirmation] -- `staged` is the production
+**Clause 3 [REVISED, then RE-RATIFIED] -- `staged` is the production
 path, and the reason is not the one first given.** The draft argued
 portability: give up `coherent`'s measured 14-20% on C2C to avoid two code
 paths. **JC challenged this correctly** -- production runs go to Vista and

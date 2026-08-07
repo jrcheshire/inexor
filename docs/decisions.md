@@ -656,3 +656,92 @@ decision here is locked until explicitly re-litigated with JC.
     `g3_floors_cdev_flatw.json`. Probes `scripts/v2_g3_stage5.py`,
     `v2_g3_stage5_readout.py`, `v2_g3_card_repro.py`,
     `tests/test_auto_transfer.py`.
+
+## D-v2-13 — V3 verdict: host-resident state streams; the GH200 ceiling is ~116 GB; `staged` is the production path
+
+- **Status:** accepted (JC, 2026-08-06, V3/G4 close). Clauses 1, 2, 4, 5
+  ratified as drafted; clause 3 was challenged, revised on re-examined
+  evidence, and re-ratified. Discharges both halves of the V3 exit criterion
+  ("the A2-on-GH claim gets its measured footing" + "cost-of-memory gains the
+  GH points"). Does not touch D-v2-8 through D-v2-12: the state tier, the
+  fidelity bar, A2's spine, the transfer correction and G3's verdict all
+  stand. Next gate is V4 (architecture freeze).
+- **Context:** C-gh is 2048^3 particles, and at the D-v2-8 T9 tier that is
+  77.3 GB of state alone — 81% of the GH200's 96 GB HBM before a mesh
+  exists. So C-gh is real only if host-resident state is reachable at useful
+  bandwidth. Measured on Vista `gh` (jobs 894036, 894118, 894166) and, for
+  the fabric comparison, Stampede3 `h100` (jobs 3380722, 3380888), with one
+  estimator and matched rungs. Full record `runs/v2/g4_record.md`;
+  triples in `runs/v2/cost_of_memory.md` §V3.
+- **Decision:**
+  1. **V3 PASSES, with the exit criterion amended to name the regime
+     actually measured.** The seed asked "coherent (ATS) vs staged vs
+     infeasible". That trichotomy is **not expressible on this stack**: jax
+     0.10.2 + CUDA aarch64 exposes only `['device', 'pinned_host']`, so
+     pageable LPDDR is not addressable through JAX memory kinds at all. The
+     measured answer is a fourth regime — **state larger than HBM streams out
+     of page-locked host memory at 359-367 GB/s with 4.00 GiB of device
+     residency, independent of working-set size**, and C-gh's paint runs on
+     one GH200 (2048^3, 13.29 s, 6.46e8 particles/s).
+  2. **The GH200 host ceiling is ~116 GB (108 GiB) and is a HARD CLIFF that
+     binds config selection.** Full rate at 116.0 GB, ~100x collapse at
+     120.3 GB — no graceful region. The mechanism is physical LPDDR capacity,
+     established two ways: a bracket that straddles it to within 4.3 GB, and
+     an S3 h100 node running the identical 128 GiB rung at full rate on a
+     1007 GiB host. A C-gh operating point must therefore be specified CLEAR
+     of the ceiling, not near it — the same failure mode as D-v2-10's
+     0.87-of-bar margin. C-gh's T9 state is 77.3 GB, ~1.5x under.
+  3. **`staged` (explicit `device_put` per chunk) is the production path, on
+     measured performance at the config-table home per D-v2-10.** On the REAL
+     C-gh paint on the GH200, `staged` is **2.78x faster** than the
+     XLA-managed arm (13.29 s vs 36.94 s). **The ladder's ordering INVERTS**:
+     on a bandwidth-bound streaming reduction the XLA-managed arm is 14-20%
+     faster, and that advantage neither transfers nor survives sign on real
+     work. The XLA-managed path is recorded not as a rejected alternative but
+     as a **memory-vs-wall knob** — it uses half the device memory (16.00 vs
+     31.33 GiB) for 2.78x the wall, worth taking deliberately if device
+     residency ever binds. **The first draft of this clause argued
+     portability and conceded the 14-20%; both were wrong** (JC: production
+     goes to Vista and ultimately Horizon, both C2C-class, with S3 h100 a
+     fallback, so a portability trade optimizes for the wrong machine). Do
+     not reintroduce either argument.
+  4. **The word "coherent" must not be used for this capability.** The seed
+     and the design study use it to mean ATS access to pageable memory.
+     Nothing here tests that. Say "host-resident streaming via `pinned_host`";
+     record ATS as untested and not expressible through jax memory kinds on
+     jax 0.10.2.
+  5. **C-hero is viable on memory grounds, and the fabric ratio must not be
+     used to size it.** One S3 h100 streams 4096^3's full T9 state — 618.5 GB
+     = 576 GiB — at full rate, flat across a 9x span of working set, on a
+     1007 GiB host. It costs **1.80x** the GH200's wall on the real C-gh
+     paint. The C2C-vs-PCIe FABRIC ratio is 6.71-6.87x and **does not
+     propagate**: paint is compute- and latency-bound, running 46x below its
+     own machine's ladder rate. **1.80x is the transferable figure; 6.9x is
+     not a wall ratio.**
+- **Consequences and limits:**
+  - **The step-level number is unmeasured at every config-table home.** The
+    tiled two-level force has only ever run at `cgh64` (512^3 particles =
+    C-gh at 1/64 volume). C-gh is 64x that and C-hero 512x, with tile counts
+    going 512 -> 32,768 -> 262,144. Nothing here licenses a wall/step claim
+    at C-gh or C-hero, and V4's node ladder needs one.
+  - **No monolithic reference exists at hero scale**, so a hero-scale run can
+    measure COST only; accuracy has to come from D-v2-11's off-box transport.
+    That is a scoping decision V4 must take explicitly.
+  - **Not licensed:** anything about multi-GPU (inexor has none — `evolve` is
+    an eager single-device orchestrator), any operating (T, b) for C-gh
+    (reserved to V4 by D-v2-10), and any claim that the GB200 route is
+    hardware-risky. GB200 fp64 is **not** a differentiator — it is
+    essentially Hopper GPU-for-GPU with ~2x the per-card HBM (JC, from run
+    history); the earlier "gb is slower for fp64" note came from a single
+    uncontrolled workload row and is retracted.
+  - **Provenance note:** job 894010 is VOID and is recorded as provenance,
+    not data — it measured JAX's environment defaults
+    (`XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB` = 64 GB, and a 0.75 device fraction)
+    rather than the hardware. The probe now reads both caps back off the
+    device and declares the capacity witness void if they do not clear the
+    ladder.
+  - **Record:** `runs/v2/g4_record.md` (§1-4 pre-registration written before
+    any rung existed; §5.1-5.8 results; §6 the ratified clauses).
+    `runs/v2/cost_of_memory.md` §V3. Probes `scripts/v2_g4_gh_memory.py`,
+    `scripts/v2_g4b_fp64_capability.py`. Cards `g4_gh_memory{,_smoke,_bracket,
+    _s3,_s3real,_s3hero}.json`, `g4b_capability{_gh,_s3}.json`.
