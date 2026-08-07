@@ -502,8 +502,29 @@ argument substantially toward C-hero:
   usable state capacity** (1007 GiB host vs the GH200's measured ~116 GB
   LPDDR ceiling from sec. 5.5), on the single-GPU code that exists today.
 - gb would need multi-GPU sharding that inexor does not have (`evolve` is an
-  eager single-device orchestrator), and its fp64 health is still unmeasured
-  (job 894167 pending).
+  eager single-device orchestrator) to reach 4096^3, since 618.5 GB needs all
+  four cards' 768 GB aggregate.
+
+**fp64 is NOT a differentiator, and treating it as one was my error.**
+JC, 2026-08-06, from run history across projects including jobs run the same
+hour: **GB200 fp64 is basically the same as Hopper GPU-for-GPU; it just has
+more HBM (~192 GB/card).** I had been calling it "unmeasured" and carrying it
+as a live architecture risk on the strength of an umbrella-memory note
+("gb is SLOWER than gh for fp64", from a single ichnaea control row at 44 s
+vs 27 s). **That row contradicts the project's actual experience on gb and is
+not evidence about the hardware** -- it was never controlled for compile
+time, occupancy, per-card use of a 4-GPU node, or thread counts. The note has
+been retracted in umbrella memory rather than reinterpreted. Job 894167 will
+confirm directly against the two-part Hopper baseline, but nothing gates on
+it.
+
+**What that does to the trade.** With fp64 equal, gb's per-card 192 GB HBM is
+2x the GH200's, so C-gh's 72.0 GiB state would sit entirely in HBM with no
+streaming at all -- a simplification, not just a capacity win. The remaining
+question for 4096^3 is purely whether we would rather write multi-GPU
+sharding (gb, fast memory, no streaming) or accept 1.80x on paint with the
+code that exists (C-hero, 1 TB host). That is an engineering-effort call, not
+a hardware-risk one.
 
 Identical 31.3 GiB device peak on both confirms the two runs did the same
 work in the same way, so the wall difference is the machine and not a
