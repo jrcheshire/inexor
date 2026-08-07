@@ -250,6 +250,11 @@ working set larger than HBM. Every rung that would have tested it was capped.
 
 ### 5.3 Re-run -- job 894036, `main @2aa1152`. THE LADDER IS READABLE.
 
+Provenance: Vista `gh`, COMPLETED exit 0:0, elapsed **34m05s** against an 8 h
+request (generous by design; TACC bills actual use). Cards
+`runs/v2/g4_gh_memory.json` + `_smoke.json`, both committed. Total cost of
+G4 including the void run 894010 and the 894005 smoke: **7 SUs**.
+
 **Preconditions passed, by readback and not by assertion:** `device
 bytes_limit` **90.2 GiB** (0.95 of the card, from
 `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`), host limit **149.0 GiB** (from
