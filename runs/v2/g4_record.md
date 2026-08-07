@@ -248,9 +248,85 @@ readback is the evidence.
 **Not yet measured, and still the whole point:** whether ANY arm holds a
 working set larger than HBM. Every rung that would have tested it was capped.
 
-### 5.3 Re-run
+### 5.3 Re-run -- job 894036, `main @2aa1152`. THE LADDER IS READABLE.
 
-*(pending -- corrected job not yet submitted)*
+**Preconditions passed, by readback and not by assertion:** `device
+bytes_limit` **90.2 GiB** (0.95 of the card, from
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`), host limit **149.0 GiB** (from
+`XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=160`), ladder top 128 GiB. Summary printed
+`caps clear the ladder top: capacity witness is readable`. This also confirms
+894010's diagnosis after the fact: the default fraction is 0.75, i.e. 71.7
+GiB, against the 68 GiB peak that run actually died at.
+
+| arm | set GiB | GB/s | peak GiB | peak/chunk | > HBM | status |
+|---|---|---|---|---|---|---|
+| hbm | 64 | 3742.8 | 66.00 | 33.0 | no | ok |
+| staged | 64 | 367.0 | 4.00 | 2.0 | no | ok |
+| coherent | 64 | 418.0 | 4.00 | 2.0 | no | ok |
+| hbm | 88 | - | 88.00 | - | no | OOM |
+| staged | 88 | 360.0 | 4.00 | 2.0 | no | ok |
+| coherent | 88 | 418.5 | 4.00 | 2.0 | no | ok |
+| hbm | 104 | - | 88.00 | - | no | OOM |
+| staged | 104 | 359.1 | 4.00 | 2.0 | **yes** | ok |
+| coherent | 104 | 429.2 | 4.00 | 2.0 | **yes** | ok |
+| hbm | 128 | - | 88.00 | - | no | OOM |
+| staged | 128 | **2.4** | 4.00 | 2.0 | **yes** | ok |
+| coherent | 128 | **1.6** | 4.00 | 2.0 | **yes** | ok |
+| hbm | REAL C-gh | - | 90.00 | - | - | OOM |
+| staged | REAL C-gh | 7.8 | 31.33 | - | - | ok |
+| coherent | REAL C-gh | 2.8 | 16.00 | - | - | ok |
+
+**1. The capacity witness FIRES.** `staged` and `coherent` both completed the
+104 and 128 GiB rungs -- working sets larger than the 95.6 GiB of HBM -- with
+device peak pinned at **4.00 GiB (2.0 chunks) at every rung including 128
+GiB**. Constant peak across a 2x span of working set is the streaming
+signature under the corrected witness (sec. 3), and a set that exceeds HBM
+while only 4 GiB is resident cannot have been copied wholesale. Both host
+arms genuinely stream state larger than the card.
+
+**2. The rate is flat to 104 GiB and then COLLAPSES at 128.** staged
+367.0 / 360.0 / 359.1 GB/s at 64/88/104, then **2.4**; coherent 418.0 / 418.5
+/ 429.2, then **1.6**. This is a ~150-270x fall, and it is not a blip: it
+shows in all 5 reps, with wall times of 42-100 s against 0.26-0.31 s one rung
+below, and with large scatter (staged 128: 99.9/42.3/81.8/57.3/51.5 s) where
+every other rung is stable to the third digit. **Mechanism NOT established.**
+The leading candidate is host memory pressure -- 128 GiB is 137.4 GB of
+page-locked memory on a node with ~192 GB available, and pinned pages cannot
+be reclaimed -- and the scatter is consistent with contention rather than a
+clean bandwidth ceiling. It is deliberately not asserted here; it needs its
+own measurement.
+
+**3. C-gh's actual state sits in the flat regime, with margin.** T9 at
+2048^3 is 77.3 GB = **72.0 GiB**, comfortably below the 104 GiB rung that ran
+at full rate and well clear of the 128 GiB collapse. So the collapse, whatever
+it is, does not sit between C-gh and the hardware.
+
+**4. The C-gh paint point RAN.** 2048^3 particles painted from host-resident
+positions on one GH200: `staged` 7.8 GB/s, `coherent` 2.8 GB/s, while `hbm`
+OOM'd as designed (96.0 GiB of f32 positions against a 90.2 GiB cap). Per P4
+these rates must NOT be compared with the ladder's -- paint is not
+bandwidth-bound, and the ladder measures the memory path while this point
+measures whether C-gh runs at all. It does.
+
+**5. `coherent` beats `staged` by 14-20% at every rung that ran cleanly**
+(418.0/418.5/429.2 vs 367.0/360.0/359.1) -- pre-registered outcome P3-b, XLA
+overlapping transfer with compute in a way the explicit loop does not.
+**One thing unresolved and flagged rather than banked:** 429.2 GB/s is ABOVE
+the E2 card's 375 GB/s C2C-read figure. Either that figure is not the binding
+limit for this access pattern, or the arm is not doing what the label says.
+The reduction touches each byte once, so cache cannot explain it. Until that
+is closed, the 14-20% is a solid RELATIVE result and the absolute number
+should not be quoted against the E2 ceilings.
+
+**Against the pre-registration (sec. 4):**
+- **P1 partially WRONG.** Predicted `hbm` completes 64 and 88 and dies at
+  104/128; measured, it dies at **88** (peak 88.00 GiB, i.e. all chunks
+  allocated, then the reduction's temporaries hit the 90.2 GiB cap). The
+  usable device cliff is between 64 and 88 GiB, tighter than predicted.
+- **P2 HELD to 104 GiB, FAILED at 128** (item 2). The flatness that makes
+  >96 GB usable is real over 64-104 GiB.
+- **P3 -> outcome (b)**, with the caveat in item 5.
+- **P4 HELD** exactly.
 
 ## 6. Verdict
 
