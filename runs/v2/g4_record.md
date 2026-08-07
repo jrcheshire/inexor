@@ -422,6 +422,35 @@ penalty for real work, and possibly a very loose one. Sizing C-hero from
 6.9x would be reading a bandwidth ratio as a wall ratio. The measurement that
 would settle it is the paint point on S3, which this job did not run.
 
+## 5.5 The knee is LPDDR capacity -- CLOSED (job 894118)
+
+| rung | set | staged GB/s | coherent GB/s | vs 116 GB LPDDR |
+|---|---|---|---|---|
+| 104 GiB | 111.7 GB | 363.9 | 434.1 | fits |
+| **108 GiB** | **116.0 GB** | **358.9** | **443.9** | fits, AT the boundary |
+| **112 GiB** | **120.3 GB** | **2.9** | **7.3** | exceeds by 4.3 GB |
+| 116 GiB | 124.6 GB | 3.4 | 3.4 | exceeds |
+| 120 GiB | 128.8 GB | 2.6 | 3.7 | exceeds |
+| 128 GiB | 137.4 GB | 2.6 | 3.6 | exceeds |
+
+**The mechanism is established.** Full rate at 116.0 GB, a ~100x collapse at
+120.3 GB: the last rung that fits physical LPDDR runs at full speed and the
+first rung that exceeds it falls off a cliff. The config table's 116 GB sits
+inside a 4.3 GB bracket. Sec. 5.3 recorded this as "mechanism NOT
+established"; it is now, and by two independent routes -- this bracket, plus
+S3 h100 running the identical 128 GiB rung at full rate on a 1007 GiB host
+(sec. 5.4), which rules out anything structural to the code or the rung.
+
+**The usable number for V4: a Vista GH200 streams a host working set up to
+~116 GB (108 GiB), and falls off a cliff immediately past it.** This is a
+hard capacity edge, not a soft degradation -- there is no graceful region to
+operate in, so a production config must sit clear of it rather than near it.
+C-gh's T9 state is 72.0 GiB = 77.3 GB, which leaves ~1.5x headroom.
+
+Do not read the collapsed rungs' relative values (staged 2.9 vs coherent 7.3
+at 112 GiB): scatter in that regime is large and the ordering is not stable.
+The only content there is "collapsed".
+
 ## 6. Verdict
 
 *(empty -- V3 exit is JC's call, on the record in sec. 5)*
