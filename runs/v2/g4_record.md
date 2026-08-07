@@ -252,8 +252,20 @@ working set larger than HBM. Every rung that would have tested it was capped.
 
 Provenance: Vista `gh`, COMPLETED exit 0:0, elapsed **34m05s** against an 8 h
 request (generous by design; TACC bills actual use). Cards
-`runs/v2/g4_gh_memory.json` + `_smoke.json`, both committed. Total cost of
-G4 including the void run 894010 and the 894005 smoke: **7 SUs**.
+`runs/v2/g4_gh_memory.json` + `_smoke.json`, both committed.
+
+**Cost of G4, all three jobs:** 894005 (gh-dev) 0:00:28 + 894010 (gh) 0:11:20
++ 894036 (gh) 0:34:05 = **45m53s = 0.765 node-hours**, hence **~0.8 SU**, or
+~1.1 SU if each job takes the ~15-minute minimum charge. The node-hours are
+measured; the SU figure is derived from an assumed 1 SU/node-hour rate.
+
+**Correction:** this line first read "7 SUs", taken from the JPL-SPHEREx
+balance delta across the session. That is a PROJECT-WIDE balance shared by
+multiple users, so it attributes nothing to these jobs -- during the same
+window two `xphot-inject-corpus` jobs ran 1:50 each, and other people draw on
+the same allocation. `sacct` without `-a` shows only one's own jobs, which
+makes the contamination invisible if you look there to reconcile. Cost is
+attributed from the JOBS' OWN elapsed node-time, never from a shared balance.
 
 **Preconditions passed, by readback and not by assertion:** `device
 bytes_limit` **90.2 GiB** (0.95 of the card, from
