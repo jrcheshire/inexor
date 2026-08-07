@@ -537,6 +537,36 @@ GB/s). So 1.80x is the paint number, not a step number, and a step-level
 figure needs the tiled two-level force -- which this probe does not
 implement.
 
+## 5.8 C-hero's state size streams at full rate (job 3380888 leg 2)
+
+4096^3 at the ratified T9 tier is **618.5 GB = 576 GiB**. On the S3 h100
+node's 1006.9 GiB host:
+
+| rung | set | staged GB/s | coherent GB/s | device peak |
+|---|---|---|---|---|
+| 256 GiB | 274.9 GB | 53.8 | 51.3 | 4.00 GiB |
+| 448 GiB | 481.0 GB | 53.8 | 51.2 | 4.00 GiB |
+| **576 GiB** | **618.5 GB** | **53.8** | **51.2** | **4.00 GiB** |
+
+**Flat across a 9x span** (53.4 at 64 GiB in sec. 5.4 -> 53.8 at 576 GiB),
+with device residency pinned at 4.00 GiB at every rung. No cliff: 618.5 GB is
+61% of this node's host memory, where the GH200's collapse came at ~104% of
+its LPDDR (sec. 5.5). So the streaming route holds at hero scale on this
+hardware, with margin rather than at the edge.
+
+**Combined with sec. 5.7, the C-hero case is now measured on both halves:**
+it holds 4096^3's entire state (618.5 GB, streaming, 4 GiB resident) and
+costs 1.80x the GH200's wall on a real paint. Neither half was known this
+morning.
+
+**What this does NOT establish, and the gap is the same one as sec. 5.7's.**
+This is STATE STREAMING, not a force evaluation. At res_pm = N a 4096^3 mesh
+is 274.9 GB of int32 and cannot sit in 93.6 GiB of HBM, so a real hero step
+needs the tiled two-level scheme -- which this probe does not implement and
+G5 characterised only at C-dev and on the cdev8/cdev/cgh64 box ladder. The
+step-level number for C-hero remains unmeasured; what is now measured is that
+the memory is not the obstacle.
+
 ## 6. Verdict
 
 *(empty -- V3 exit is JC's call, on the record in sec. 5)*
