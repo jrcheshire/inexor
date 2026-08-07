@@ -97,10 +97,18 @@ def _sharding(dev, kind):
 def _host_kind(dev):
     """Which host memory kind this stack exposes.
 
-    `unpinned_host` is the one that can sit in plain Grace LPDDR; `pinned_host`
-    is the documented offload target. Prefer unpinned for the coherent arm --
-    if only pinned exists, the arm is measuring pinned memory and the record
-    must say so rather than claiming LPDDR.
+    `unpinned_host` is the one that can sit in plain pageable Grace LPDDR;
+    `pinned_host` is the documented offload target (page-locked staging).
+
+    MEASURED 2026-08-06 on Vista (job 894005, jax 0.10.2, GH200 120GB):
+    this CUDA stack exposes ONLY ['device', 'pinned_host'] -- there is no
+    `unpinned_host`, though CPU JAX on the laptop reports all three. So the
+    `coherent` arm falls back to pinned_host here, and what it then tests is
+    IMPLICIT vs EXPLICIT staging out of page-locked host memory, NOT ATS/
+    coherent access to ordinary LPDDR. The seed's "coherent vs staged"
+    dichotomy is not expressible through memory kinds on this jax. Callers
+    must read `host_kind_used` before calling anything "coherent"; the
+    summary prints the caveat when it fires.
     """
     for kind in ("unpinned_host", "pinned_host"):
         if _mem_of_kind(dev, kind) is not None:
@@ -111,6 +119,28 @@ def _host_kind(dev):
 # ===========================================================================
 # worker: one arm at one working-set size, in its own process
 # ===========================================================================
+
+
+def _make_jit_sum(dev, dtype):
+    """A sum whose INPUT stays in host memory and whose OUTPUT is on device.
+
+    This is the coherent arm, and it has to be spelled this way. MEASURED
+    (job 894005): calling jnp.sum directly on a pinned_host array raises
+        INVALID_ARGUMENT: E1200: CompileTimeHostOffloadOutputLocationMismatch
+    because the result of an op on host-resident data defaults to host memory
+    space while the caller wants it on device. Declaring out_shardings on the
+    device memory space resolves the mismatch and hands XLA the whole
+    transfer decision -- which is precisely the thing under test: if this
+    compiles and runs, XLA moved the bytes without us staging them, and the
+    residency + capacity witnesses say whether it streamed or copied.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    return jax.jit(
+        lambda c: jnp.sum(c, dtype=dtype),
+        out_shardings=_sharding(dev, "device"),
+    )
 
 
 def _alloc_chunks(dev, kind, n_chunks, chunk_elems):
@@ -136,12 +166,23 @@ def _alloc_chunks(dev, kind, n_chunks, chunk_elems):
     return chunks
 
 
-def _stream_reduce(chunks, arm, dev):
+def _stream_reduce(chunks, arm, dev, jit_sum=None):
     """Sum every chunk. Bytes touched == working-set bytes, exactly.
 
-    hbm/coherent hand the chunk straight to jnp; staged copies it to HBM
-    first and drops the copy. Identical arithmetic in all three arms, so a
-    wall difference is a memory-path difference and nothing else.
+    Identical arithmetic in all three arms, so a wall difference is a memory-
+    path difference and nothing else. What differs is WHO moves the bytes:
+      hbm      : nothing to move, the chunk is already in HBM.
+      staged   : we device_put each chunk, use it, and drop it. MEASURED
+                 (job 894005): without forcing completion per chunk, XLA's
+                 async dispatch keeps every staged copy alive and device peak
+                 equals the WHOLE working set (pk/set read exactly 1.000 at
+                 both smoke sizes). That is not a slow streamer, it is not a
+                 streamer at all -- above the HBM cliff it would OOM for a
+                 reason unrelated to the memory path and the ladder would
+                 discriminate nothing. So block per chunk, then drop.
+      coherent : XLA moves them. The chunk stays in host memory and a jitted
+                 sum with its OUTPUT declared on device does the transfer
+                 internally (see _make_jit_sum).
     """
     import jax
     import jax.numpy as jnp
@@ -151,8 +192,11 @@ def _stream_reduce(chunks, arm, dev):
     for c in chunks:
         if arm == "staged":
             on_dev = jax.device_put(c, dev_sh)
-            total = total + jnp.sum(on_dev, dtype=total.dtype)
-            del on_dev
+            part = jax.block_until_ready(jnp.sum(on_dev, dtype=total.dtype))
+            del on_dev  # the block above is what makes this release effective
+            total = total + part
+        elif arm == "coherent":
+            total = total + jit_sum(c)
         else:
             total = total + jnp.sum(c, dtype=total.dtype)
     return jax.block_until_ready(total)
@@ -200,18 +244,21 @@ def run_single(args):
             return None
 
     try:
+        import jax.numpy as jnp
+
         t0 = time.perf_counter()
         chunks = _alloc_chunks(dev, kind, n_chunks, chunk_elems)
         rec["alloc_s"] = time.perf_counter() - t0
         rec["peak_after_alloc"] = peak()
 
-        _stream_reduce(chunks, args.arm, dev)  # warmup + compile
+        jit_sum = _make_jit_sum(dev, jnp.float32) if args.arm == "coherent" else None
+        _stream_reduce(chunks, args.arm, dev, jit_sum)  # warmup + compile
         rec["peak_after_warmup"] = peak()
 
         walls = []
         for _ in range(args.reps):
             t0 = time.perf_counter()
-            _stream_reduce(chunks, args.arm, dev)
+            _stream_reduce(chunks, args.arm, dev, jit_sum)
             walls.append(time.perf_counter() - t0)
 
         wall = float(np.median(walls))
@@ -312,12 +359,26 @@ def run_real(args):
         rec["peak_after_alloc"] = peak()
 
         mesh = jnp.zeros((n_mesh**3,), jnp.int32)
+        # same three spellings as the ladder: we stage, or XLA does. The
+        # coherent arm must declare its output on device or it hits the E1200
+        # host-offload location mismatch (job 894005).
+        jit_paint = jax.jit(
+            lambda p: paint_int(p, n_mesh, L, 12).reshape(-1),
+            out_shardings=_sharding(dev, "device"),
+        )
 
         def one_pass():
             acc = mesh
             for c in chunks:
-                pos = jax.device_put(c, dev_sh) if args.arm == "staged" else c
-                acc = acc + paint_int(pos, n_mesh, L, 12).reshape(-1)
+                if args.arm == "staged":
+                    pos = jax.device_put(c, dev_sh)
+                    part = jax.block_until_ready(paint_int(pos, n_mesh, L, 12).reshape(-1))
+                    del pos  # block first, or every staged chunk stays resident
+                elif args.arm == "coherent":
+                    part = jit_paint(c)
+                else:
+                    part = paint_int(c, n_mesh, L, 12).reshape(-1)
+                acc = acc + part
             return jax.block_until_ready(acc)
 
         one_pass()  # warmup + compile
@@ -425,6 +486,7 @@ def main():
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--arms", default=",".join(ARMS))
     ap.add_argument("--smoke", action="store_true", help="tiny ladder: reachability only")
+    ap.add_argument("--out-suffix", default="", help="suffix for the card, e.g. _smoke")
     ap.add_argument("--real", action="store_true", help="C-gh paint point")
     ap.add_argument("--n-side", type=int, default=2048, help="C-gh particle side")
     ap.add_argument("--n-mesh", type=int, default=1024)
@@ -502,7 +564,7 @@ def main():
     print("\nNothing here self-ratifies: G4's exit is JC's call on the regime.")
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    path = os.path.join(OUT_DIR, "g4_gh_memory.json")
+    path = os.path.join(OUT_DIR, f"g4_gh_memory{args.out_suffix}.json")
     with open(path, "w") as fh:
         json.dump(
             dict(
