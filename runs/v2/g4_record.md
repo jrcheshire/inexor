@@ -451,6 +451,31 @@ Do not read the collapsed rungs' relative values (staged 2.9 vs coherent 7.3
 at 112 GiB): scatter in that regime is large and the ordering is not stable.
 The only content there is "collapsed".
 
+## 5.6 The Hopper fp64 baseline, reproduced on two parts (job 894166 + 3380722 leg 1)
+
+| | GH200 (894166) | S3 H100 (3380722) |
+|---|---|---|
+| gemm n=4096 f64 | 59.8 TFLOP/s | 60.6 TFLOP/s |
+| gemm n=8192 f64 | 64.6 TFLOP/s | 63.7 TFLOP/s |
+| **gemm f64:f32** | **0.193 / 0.157** | **0.192 / 0.156** |
+| fft3d f64 | 481.2 / 562.4 GB/s | 307.7 / 332.7 GB/s |
+| fft3d WALL f64/f32 | 1.61 / 1.79 | 1.72 / 1.92 |
+
+Same Hopper die in two packagings, on two machines, with two independent pixi
+installs of the same jax 0.10.2. Absolute f64 GEMM agrees to ~1.5% and the
+f64:f32 ratio to 0.001. **This is the control the gb card gets read against,
+and it is a reproduced baseline rather than a single point** -- which matters,
+because a one-machine baseline could not distinguish "GB200 fp64 is throttled"
+from "our harness measures fp64 badly".
+
+FFT absolute rates differ (HBM3e vs HBM3) while the wall ratios stay under
+2.00 on both, i.e. neither part penalises fp64 beyond its byte count. Read
+the gb card the same way: GEMM ratio directly, FFT by WALL (sec. 5.4's metric
+correction), never the printed fft GB/s ratio.
+
+GH200 node from the dump: 1 device, 72 cores, 212.7 GiB host -- consistent
+with the LPDDR knee at 116 GB found in sec. 5.5.
+
 ## 6. Verdict
 
 *(empty -- V3 exit is JC's call, on the record in sec. 5)*
