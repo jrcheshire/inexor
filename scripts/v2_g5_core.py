@@ -745,7 +745,7 @@ def _tile_cic_pieces(u, live, shape, cell):
 
 
 def _tile_corner(base, frac, wlo, corner, shape, ok):
-    """One CIC corner: flat index (wrapped mod P) + weight, both no-op'd on ~ok.
+    """One CIC corner: flat index (wrapped mod P) + weight, no-op'd on ~ok.
 
     Out-of-box and padding slots are sent to a VALID index with ZERO weight, so
     mode="promise_in_bounds" is honestly safe. painting.py's contract holds only
@@ -754,6 +754,17 @@ def _tile_corner(base, frac, wlo, corner, shape, ok):
     cells wrong from a lowering that "worked"). mode="drop" is REJECTED: it
     would silently swallow a genuinely misrouted live particle, the exact bug
     class this gate must be able to see.
+
+    WHICH LINE MAKES THE INDEX SAFE (corrected 2026-08-07). It is the `% nx`
+    below, not a `where` on `ok`. `base` comes from floor(u/cell) with
+    u = mod(pos - origin, L) in [0, L), so base is bounded by n_fine and cannot
+    overflow int32, and jnp's `%` with a positive modulus is non-negative. So
+    `flat` is in range for EVERY row, live or not, and the index is returned
+    unmasked. The earlier `where(ok, flat, 0)` was redundant for safety and
+    expensive for a reason nobody costed: it funnelled every padded row -- 33%
+    of all rows at the C-gh candidate geometry -- onto flat index 0, so each of
+    the 8 unrolled scatter-adds became ~2e6 f64 atomics contending for a single
+    address. Only the WEIGHT zeroing is load-bearing, and it is kept.
     """
     import jax.numpy as jnp
 
@@ -766,7 +777,7 @@ def _tile_corner(base, frac, wlo, corner, shape, ok):
     iy = (base[:, 1] + dy) % ny
     iz = (base[:, 2] + dz) % nz
     flat = (ix * ny + iy) * nz + iz
-    return jnp.where(ok, flat, 0), jnp.where(ok, wx * wy * wz, 0.0)
+    return flat, jnp.where(ok, wx * wy * wz, 0.0)
 
 
 def tile_paint_f64(u, live, shape, cell, mean):
@@ -808,19 +819,33 @@ def tile_paint_f64(u, live, shape, cell, mean):
 
 
 def choose_brick(n_tile, b_fine, n_fine):
-    """Largest brick size dividing BOTH n_tile and n_fine, with brick <= b_fine.
+    """Largest brick dividing n_tile, n_fine AND b_fine, with brick <= b_fine.
 
     Bricks are the host-side bucket grid. Bucketing on TILES and gathering the
     27 neighbours would give a 27x superset of which only ~3.4x is live -- an
     8x wasted paint. Bucketing on bricks makes the union of a tile's bricks a
     TIGHT superset of tile+buffer. b_fine = 0 -> brick = n_tile (the tile is
     its own bucket).
+
+    THE b_fine CONDITION (added 2026-08-07). Without `c | b_fine` the brick
+    union OVERSHOOTS the padded box: brick_span pads by ceil(b/c) bricks, so
+    the union side is n_tile + 2*c*ceil(b/c) > n_tile + 2*b = P whenever c does
+    not divide b, and every member in the excess is gathered, staged, painted
+    with zero weight and thrown away. Measured in the V4a card: overhang is
+    exactly 0 at all five legs where c | b holds, and 3,044,340,012 at the one
+    leg where it does not (T128/b96 -> c = 64, union side 384 vs P = 320),
+    whose `cap` of 10,168,320 is inflated ~1.7x by this alone. With the
+    condition enforced the union is EXACTLY the padded box, which promotes
+    n_out == 0 from a diagnostic to a contract (see tile_paint_f64; the
+    _tile_cic_pieces docstring still calls it a diagnostic and is now wrong).
+    No operating geometry moves: (T,b) = (64,16), (128,32) and (256,32) all
+    already satisfy it.
     """
     if int(b_fine) <= 0:
         return int(n_tile)
     best = 1
     for c in range(1, int(b_fine) + 1):
-        if int(n_tile) % c == 0 and int(n_fine) % c == 0:
+        if int(n_tile) % c == 0 and int(n_fine) % c == 0 and int(b_fine) % c == 0:
             best = c
     return best
 
@@ -944,6 +969,7 @@ def force_short_tiled(
     r_out=None,
     peak=None,
     profile=0,
+    pad_fill="cycle",
 ):
     """(1-S(k))*ik/k^2 on fine tiles, host-accumulated -> (g (n,3) f64, diag).
 
@@ -1020,8 +1046,20 @@ def force_short_tiled(
         m = len(idx)
         if m > cap:
             raise RuntimeError(f"tile {t}: {m} members > cap {cap} (host capacity is wrong)")
-        idx_pad = np.zeros((cap,), dtype=np.int64)
-        idx_pad[:m] = idx
+        # Padding fill. The pad rows are masked to zero WEIGHT either way, so
+        # both arms give bitwise-identical forces; what differs is which mesh
+        # addresses their (zero-weight) scatter-adds contend for. "zero" points
+        # every pad row at particle 0, so all cap-m of them hit the same 8
+        # cells -- the pre-2026-08-07 behaviour, kept only so the cost of that
+        # contention can be measured as an A/B. "cycle" reuses live indices, so
+        # the pad rows scatter where the live ones already do.
+        if pad_fill == "cycle" and m > 0:
+            idx_pad = np.resize(idx, cap)
+        elif pad_fill in ("zero", "cycle"):
+            idx_pad = np.zeros((cap,), dtype=np.int64)
+            idx_pad[:m] = idx
+        else:
+            raise ValueError(f"pad_fill must be 'cycle' or 'zero', got {pad_fill!r}")
         live_np = np.zeros((cap,), dtype=bool)
         live_np[:m] = True
         origin, _ = tile_origin_extent(t, n_tile, b_real, cell)
@@ -1060,10 +1098,18 @@ def force_short_tiled(
         n_brick=int(n_brick),
         cap=int(cap),
         pad_frac=float(pad_frac),
+        pad_fill=str(pad_fill),
         fft_work_ratio=float(len(tiles) * P**3 / float(n_fine) ** 3),
         # Superset overhang: brick-union members outside the padded mesh,
-        # correctly excluded. An efficiency diagnostic, NOT an error -- an
-        # earlier `n_dropped == 0` contract fired on this healthy behaviour.
+        # correctly excluded. Since choose_brick gained the `c | b_fine`
+        # condition (2026-08-07) the brick union is EXACTLY the padded box, so
+        # this should now be 0 at every geometry and a non-zero value means the
+        # brick decomposition is wrong, not merely wasteful. Left as a reported
+        # number rather than a raise until the promotion gate covers it; the
+        # pre-fix V4a card has 3,044,340,012 here at T128/b96 and 0 elsewhere.
+        # (Distinct from the old `n_dropped == 0` contract, which fired on
+        # healthy overhang and was correctly removed -- that was about live
+        # particles being silently discarded, which never happens here.)
         n_overhang_total=int(n_overhang_total),
         # THE REAL CONTRACT: every particle owned by exactly one tile.
         n_owned_total=int((owner_count > 0).sum()),
