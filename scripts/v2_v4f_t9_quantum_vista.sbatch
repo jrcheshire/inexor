@@ -71,6 +71,18 @@
 set -e
 cd ~/src/inexor
 
+# REQUIRED: Vista's batch environment does not carry pixi on PATH. Job 896092
+# omitted this line and died at the first pixi call with rc 127. (The sibling
+# probe job failed the same way and, having no `set -e`, reported COMPLETED in
+# 6 seconds having run nothing -- this script's `set -e` at least failed
+# honestly.) The explicit check below turns a PATH problem into a one-line
+# diagnosis instead of a 127.
+export PATH="$HOME/.pixi/bin:$PATH"
+command -v pixi >/dev/null 2>&1 || {
+  echo "FATAL: pixi not on PATH (looked in \$HOME/.pixi/bin)"
+  exit 1
+}
+
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=160
 export JAX_COMPILATION_CACHE_DIR=$SCRATCH/inexor-xla-cache
@@ -81,6 +93,7 @@ git log --oneline -1
 hostname
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 free -g | head -2
+pixi run -e gpu python -c "import jax; print('jax', jax.__version__, jax.devices())"
 
 echo
 echo "=== V4f: T9 position-quantum ladder at C-dev (GH200, no cdev8 fallback) ==="

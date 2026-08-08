@@ -96,6 +96,23 @@
 
 cd ~/src/inexor || exit 1
 
+# REQUIRED: Vista's batch environment does not carry pixi on PATH. Job 896055
+# omitted this line and every leg died with "pixi: command not found" -- and
+# because this script deliberately has no `set -e` (see above), it then exited
+# 0 and Slurm reported COMPLETED in 6 seconds having run no science at all.
+# The precondition block below exists so that cannot happen twice: a missing
+# toolchain now aborts LOUDLY, while a leg that OOMs still leaves the rest
+# running, which is the behaviour `set -e` was dropped to get.
+export PATH="$HOME/.pixi/bin:$PATH"
+command -v pixi >/dev/null 2>&1 || {
+  echo "FATAL: pixi not on PATH (looked in \$HOME/.pixi/bin)"
+  exit 1
+}
+pixi run -e gpu python -c "import jax; print('jax', jax.__version__, jax.devices())" || {
+  echo "FATAL: the gpu env cannot import jax or see a device"
+  exit 1
+}
+
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 # NOT the 64 GB default: that default silently voided job 894010 (D-v2-13
 # provenance note), and legs 5-7 are precisely the ones that would hit it.
@@ -112,40 +129,70 @@ echo "XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=$XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB"
 COMMON="--single --kind force --family gauss --which mono --alpha 1.0 --fdtype f64 --a 1.0 --profile 1"
 GEOM="--config cgh64 --tile 256 --buf 32"
 
-echo
-echo "=== leg 1: padding A/B -- zero fill (the pre-eba91ab contention) ==="
-pixi run -e gpu python scripts/v2_g5_two_level_force.py $COMMON $GEOM \
+# Per-leg status, so the end of the log states what actually ran. Without this
+# a silent no-op reads identically to a clean sweep (job 896055).
+LEG_NAMES=()
+LEG_RCS=()
+run_leg() {
+  local name="$1"
+  shift
+  echo
+  echo "=== $name ==="
+  "$@"
+  local rc=$?
+  LEG_NAMES+=("$name")
+  LEG_RCS+=("$rc")
+  [ "$rc" -ne 0 ] && echo "--- leg exited rc=$rc (expected for the top OOM rungs) ---"
+  return 0
+}
+
+run_leg "leg 1: padding A/B -- zero fill (the pre-eba91ab contention)" \
+  pixi run -e gpu python scripts/v2_g5_two_level_force.py $COMMON $GEOM \
   --tag v4d_padfill_zero --pad-fill zero
 
-echo
-echo "=== leg 2: padding A/B -- cycle fill (the shipped default) ==="
-pixi run -e gpu python scripts/v2_g5_two_level_force.py $COMMON $GEOM \
+run_leg "leg 2: padding A/B -- cycle fill (the shipped default)" \
+  pixi run -e gpu python scripts/v2_g5_two_level_force.py $COMMON $GEOM \
   --tag v4d_padfill_cycle --pad-fill cycle
 
-echo
-echo "=== leg 3: cap isolation -- cap x1.5, nothing else moves ==="
-pixi run -e gpu python scripts/v2_g5_two_level_force.py $COMMON $GEOM \
+run_leg "leg 3: cap isolation -- cap x1.5, nothing else moves" \
+  pixi run -e gpu python scripts/v2_g5_two_level_force.py $COMMON $GEOM \
   --tag v4d_capmult_1p5 --pad-fill cycle --cap-mult 1.5
 
-echo
-echo "=== leg 4: cap isolation -- cap x2.0, nothing else moves ==="
-pixi run -e gpu python scripts/v2_g5_two_level_force.py $COMMON $GEOM \
+run_leg "leg 4: cap isolation -- cap x2.0, nothing else moves" \
+  pixi run -e gpu python scripts/v2_g5_two_level_force.py $COMMON $GEOM \
   --tag v4d_capmult_2p0 --pad-fill cycle --cap-mult 2.0
 
-echo
-echo "=== leg 5: stream run-length sweep (tile-shaped gather vs sequential) ==="
-pixi run -e gpu python scripts/v2_v4e_stream_runlength.py \
+run_leg "leg 5: stream run-length sweep (tile-shaped gather vs sequential)" \
+  pixi run -e gpu python scripts/v2_v4e_stream_runlength.py \
   --src-gib 16 --stage-mib 64 --tag v4e_gh
 
-echo
-echo "=== leg 6: IC memory anatomy, host AND device, cheapest rung first ==="
-pixi run -e gpu python scripts/v2_v4d_ic_memory.py \
+run_leg "leg 6: IC memory anatomy, host AND device, cheapest rung first" \
+  pixi run -e gpu python scripts/v2_v4d_ic_memory.py \
   --mode ic --rungs 256,512,1024 --tag v4d_gh
 
-echo
-echo "=== leg 7: largest monolithic rfftn that fits on this card ==="
-pixi run -e gpu python scripts/v2_v4d_ic_memory.py \
+run_leg "leg 7: largest monolithic rfftn that fits on this card" \
+  pixi run -e gpu python scripts/v2_v4d_ic_memory.py \
   --mode fft --rungs 512,1024,1536,2048 --tag v4d_gh
+
+echo
+echo "=== LEG SUMMARY ==="
+n_ok=0
+for i in "${!LEG_NAMES[@]}"; do
+  printf '  rc=%-3s %s\n' "${LEG_RCS[$i]}" "${LEG_NAMES[$i]}"
+  [ "${LEG_RCS[$i]}" -eq 0 ] && n_ok=$((n_ok + 1))
+done
+echo "  ${n_ok}/${#LEG_NAMES[@]} legs exited clean"
+
+echo
+echo "=== CARDS WRITTEN ==="
+ls -la runs/v2/v4d_ic_memory_v4d_gh_*.json runs/v2/v4e_stream_runlength_v4e_gh.json 2>&1
+ls -la runs/v2/g5_results_*v4d_*.json 2>&1 | head
+
+if [ "$n_ok" -eq 0 ]; then
+  echo
+  echo "FATAL: every leg failed -- this run produced NOTHING. Do not read it as a result."
+  exit 1
+fi
 
 echo
 echo "=== DONE ==="
