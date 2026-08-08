@@ -210,6 +210,14 @@ def main():
         "per bucket a floor of 1 is 12.5%% of payload on its own, which dominates "
         "any low slack setting; 0 trades that for arena traffic",
     )
+    ap.add_argument(
+        "--layout",
+        default="per-bucket",
+        choices=("per-bucket", "brick-packed"),
+        help="per-bucket = D-v2-14 cl.3 as ratified (spare per bucket, arena for "
+        "overflow); brick-packed = spare pooled per brick, buckets packed tight, "
+        "no per-bucket slot-boundary array",
+    )
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args()
@@ -227,7 +235,13 @@ def main():
 
     from inexor.codec import T9Layout
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table, float_step_bullfrog
-    from inexor.layout import BrickLayout, _capacity_extra, bucket_order_key, choose_brick
+    from inexor.layout import (
+        BrickLayout,
+        BrickPackedLayout,
+        _capacity_extra,
+        bucket_order_key,
+        choose_brick,
+    )
 
     sys.path.insert(0, HERE)
 
@@ -246,15 +260,26 @@ def main():
     a_steps = a_grid(A_INIT, A_FINAL, args.steps, SPACING)
     coeffs = bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo))
 
-    lay = BrickLayout.build(
-        x,
-        t9,
-        bricks_per_side,
-        slack_frac=args.slack,
-        arena_frac=args.arena_frac,
-        alloc_margin=args.alloc_margin,
-        min_spare=args.min_spare,
-    )
+    packed = args.layout == "brick-packed"
+    if packed:
+        lay = BrickPackedLayout.build(
+            x,
+            t9,
+            bricks_per_side,
+            brick_slack=args.slack,
+            arena_frac=args.arena_frac,
+            alloc_margin=args.alloc_margin,
+        )
+    else:
+        lay = BrickLayout.build(
+            x,
+            t9,
+            bricks_per_side,
+            slack_frac=args.slack,
+            arena_frac=args.arena_frac,
+            alloc_margin=args.alloc_margin,
+            min_spare=args.min_spare,
+        )
     counts0 = lay.occupancy.astype(np.int64).copy()
     # capacity each ladder target would have frozen at build time
     cap_by_target = {}
@@ -295,7 +320,11 @@ def main():
         rep = None
         if args.repack_every and (k + 1) % args.repack_every == 0:
             t2 = time.perf_counter()
-            rep = lay.repack(slack_frac=args.slack, chunk=1 << 16, min_spare=args.min_spare)
+            rep = (
+                lay.repack(brick_slack=args.slack, chunk=1 << 16)
+                if packed
+                else lay.repack(slack_frac=args.slack, chunk=1 << 16, min_spare=args.min_spare)
+            )
             rep["wall_s"] = time.perf_counter() - t2
             lay.check()
 
@@ -310,7 +339,7 @@ def main():
             max_fill_frac=stats["max_fill_frac"],
             n_full_buckets=stats["n_full_buckets"],
             occupancy=occupancy_summary(counts, n),
-            slack_ladder=slack_ladder_demand(counts, cap_by_target, n=n),
+            slack_ladder=(None if packed else slack_ladder_demand(counts, cap_by_target, n=n)),
         )
         per_step.append(rec)
         # flush=True is not cosmetic. A buffered long run that dies leaves an
@@ -324,6 +353,7 @@ def main():
             + (
                 f"  REPACK {rep['wall_s'] * 1000:.0f}ms scratch "
                 f"{rep['scratch_bytes'] / 1e6:.2f}MB slots {rep['slots_used'] / n:.3f}xN"
+                + (f" fill {rep['max_brick_fill']:.1%}" if "max_brick_fill" in rep else "")
                 if rep
                 else ""
             ),
@@ -335,6 +365,8 @@ def main():
     # the headline: what each slack target would have cost, and whether it held
     worst = {}
     for s in SLACK_LADDER:
+        if per_step[0]["slack_ladder"] is None:
+            continue
         arena = max(r["slack_ladder"][f"{s:g}"]["arena_frac_of_n"] for r in per_step)
         cap = cap_by_target[s]
         slack_bpp = float((cap - counts0).sum()) * 9.0 / n

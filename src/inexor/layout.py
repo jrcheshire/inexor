@@ -700,3 +700,337 @@ def _refuse_uint16_overflow(counts, what):
             "clustering -- how close a real run gets is part of what M-v2-1's cgh64 "
             "measurement is for."
         )
+
+
+# ============================================================================
+# Brick-packed layout: spare at BRICK granularity (the M-v2-1 alternative)
+# ============================================================================
+#
+# WHY. `BrickLayout` gives every bucket its own spare slots, and a bucket cannot
+# be given a FRACTION of a slot -- so any nonzero slack costs one whole slot per
+# occupied bucket, 12.5% of payload at the ratified ~8 particles per bucket.
+# Measured, that floor is what makes the sweep bottom out at 12.38 B/p against
+# a 10.15 budget, and it is granularity rather than a tunable: the `min_spare`
+# rule that looked like the cause is INERT, since ceil() already returns >= 1.
+#
+# Here the spare belongs to the BRICK (~512 buckets, ~4096 particles at C-gh)
+# and buckets are packed TIGHT inside it. One shared slot amortizes to 1/4096
+# rather than 1/8. A bucket that grows takes room from the brick's pool by
+# shifting its neighbours along -- at most a brick's worth of entries inside a
+# 37 KB block, which is the same local move `repack` already performs.
+#
+# TWO TERMS FALL, NOT ONE.
+#
+#   granularity   12.5% -> ~0.02%, because the spare unit is 512x larger
+#   bucket_start  GONE. `BrickLayout` carries an int64 slot boundary per
+#                 bucket: 8 B per bucket is 8.6 GB at C-gh, a full 1.00 B/p
+#                 that the record's all-in figures never counted. Here bucket
+#                 boundaries are a prefix sum of `occupancy` WITHIN a brick, so
+#                 the index we already pay 0.25 B/p for does both jobs.
+#
+# AND THE FLUCTUATION IS SMALLER, which is the physical reason to expect this to
+# work at all. Bucket occupancy grew 76x over a run (8 -> 5943 at cdev8) because
+# a 1 Mpc/h cell can sit inside a halo. A brick averages over 512x the volume, so
+# its count cannot concentrate the same way -- and it is the brick's total, not
+# any bucket's, that has to fit its allocation now.
+#
+# Both arrays that make this work are still O(1) per brick rather than per
+# bucket, so the index cost does not come back somewhere else.
+
+
+@dataclass
+class BrickPackedLayout:
+    """Buckets packed tight inside bricks; spare slots pooled per brick."""
+
+    t9: object
+    bricks_per_side: int
+    brick_start: np.ndarray  # int64 (n_bricks+1,) fixed slot runs
+    occupancy: np.ndarray  # uint16 (n_buckets,) THE index; also bucket bounds
+    slot_to_particle: np.ndarray  # int64 (n_slots,) -1 where free
+    particle_to_slot: np.ndarray  # int64 (n,)   transient bookkeeping
+    key: np.ndarray  # int32 (n,)   transient: current bucket ordinal
+    n_particles: int
+    arena_base: int = 0
+    # Explicit bucket id per arena resident, because an arena particle is by
+    # definition NOT inside its bucket's derived span -- the one place the
+    # occupancy-as-boundaries trick does not reach. 4 B each, for a population
+    # measured at ~0.01% of N, so it does not disturb the tier.
+    arena_bucket: np.ndarray = None
+
+    @classmethod
+    def build(cls, x, t9, bricks_per_side, brick_slack=0.10, alloc_margin=0.10,
+              arena_frac=0.01):
+        nbk = t9.n_buckets_side
+        if nbk % int(bricks_per_side):
+            raise ValueError(
+                f"bricks_per_side {bricks_per_side} must divide the bucket grid {nbk}"
+            )
+        key, _, _ = bucket_order_key(x, t9, int(bricks_per_side))
+        per3 = (nbk // int(bricks_per_side)) ** 3
+        n_bricks = int(bricks_per_side) ** 3
+        brick = key // per3
+
+        brick_counts = np.bincount(brick, minlength=n_bricks).astype(np.int64)
+        occupancy = np.bincount(key, minlength=n_bricks * per3).astype(np.int64)
+        _refuse_uint16_overflow(occupancy, "initial")
+
+        spare = np.ceil(brick_counts * float(brick_slack)).astype(np.int64)
+        spare = np.where(brick_counts > 0, np.maximum(spare, 1), spare)
+        brick_start = np.zeros(n_bricks + 1, dtype=np.int64)
+        np.cumsum(brick_counts + spare, out=brick_start[1:])
+
+        order = np.argsort(key, kind="stable")
+        rank = _within_run_index(brick_counts)  # position inside the brick's run
+        slots = brick_start[brick[order]] + rank
+        n_alloc = int(np.ceil(int(brick_start[-1]) * (1.0 + float(alloc_margin))))
+        n_arena = int(np.ceil(len(key) * float(arena_frac)))
+        slot_to_particle = np.full(n_alloc + n_arena, -1, dtype=np.int64)
+        slot_to_particle[slots] = order
+        particle_to_slot = np.empty(len(key), dtype=np.int64)
+        particle_to_slot[order] = slots
+        return cls(
+            t9=t9,
+            bricks_per_side=int(bricks_per_side),
+            brick_start=brick_start,
+            occupancy=occupancy.astype(np.uint16),
+            slot_to_particle=slot_to_particle,
+            particle_to_slot=particle_to_slot,
+            key=key.astype(np.int32),
+            n_particles=len(key),
+            arena_base=n_alloc,
+            arena_bucket=np.full(n_arena, -1, dtype=np.int64),
+        )
+
+    @property
+    def buckets_per_brick(self):
+        return (self.t9.n_buckets_side // self.bricks_per_side) ** 3
+
+    @property
+    def n_bricks(self):
+        return self.bricks_per_side**3
+
+    @property
+    def n_buckets(self):
+        return len(self.occupancy)
+
+    @property
+    def n_slots(self):
+        return int(self.brick_start[-1])
+
+    def brick_slot_range(self, brick_flat):
+        return int(self.brick_start[brick_flat]), int(self.brick_start[brick_flat + 1])
+
+    def bucket_slot_starts(self, brick_flat):
+        """Bucket boundaries inside ONE brick, derived rather than stored.
+
+        This is the array `BrickLayout` keeps globally at 8 B per bucket. Here it
+        is a prefix sum over the brick's own occupancy slice -- O(512) at C-gh,
+        computed where it is needed and never resident.
+        """
+        p3 = self.buckets_per_brick
+        occ = self.occupancy[brick_flat * p3 : (brick_flat + 1) * p3].astype(np.int64)
+        out = np.zeros(p3 + 1, dtype=np.int64)
+        np.cumsum(occ, out=out[1:])
+        return int(self.brick_start[brick_flat]) + out
+
+    def brick_members(self, brick_flat):
+        lo, hi = self.brick_slot_range(brick_flat)
+        run = self.slot_to_particle[lo:hi]
+        return run[run >= 0]
+
+    def migrate(self, x_new):
+        """Rebuild every brick whose contents changed.
+
+        A brick is the unit of work: within one, buckets are packed tight, so a
+        particle changing bucket moves its neighbours' boundaries and the run has
+        to be rewritten. Bricks nobody entered or left or moved inside are never
+        touched.
+        """
+        key_new, _, _ = bucket_order_key(x_new, self.t9, self.bricks_per_side)
+        key_new = key_new.astype(np.int32)
+        changed = np.nonzero(key_new != self.key)[0]
+        p3 = self.buckets_per_brick
+        stats = dict(
+            bucket_migrant_frac=float(len(changed)) / max(self.n_particles, 1),
+            # aliases so a caller can record either layout with one code path
+            migrant_frac=float(len(changed)) / max(self.n_particles, 1),
+            arena_used=0,
+            n_full_buckets=0,
+            n_overflow=0,
+            overflow_frac=0.0,
+        )
+        if len(changed) == 0:
+            stats["brick_migrant_frac"] = 0.0
+            stats["max_brick_fill"] = float(
+                np.max(np.bincount(self.key // p3, minlength=self.n_bricks) / np.maximum(
+                    np.diff(self.brick_start), 1))
+            )
+            stats["max_fill_frac"] = stats["max_brick_fill"]
+            return stats
+
+        old_brick, new_brick = self.key // p3, key_new // p3
+        stats["brick_migrant_frac"] = float(np.sum(old_brick != new_brick)) / self.n_particles
+        affected = np.unique(np.concatenate([old_brick[changed], new_brick[changed]]))
+
+        claim = np.nonzero(np.isin(new_brick, affected))[0]
+        claim = claim[np.argsort(key_new[claim], kind="stable")]
+        cb = new_brick[claim]
+
+        counts = np.bincount(cb, minlength=self.n_bricks)[affected]
+        cap = np.diff(self.brick_start)[affected]
+        over = counts - cap
+        fits = np.minimum(counts, cap)
+        stats["n_overflow"] = int(np.maximum(over, 0).sum())
+        stats["overflow_frac"] = stats["n_overflow"] / self.n_particles
+        stats["n_overflow_bricks"] = int(np.sum(over > 0))
+
+        # clear the affected runs, then write them back packed
+        lens = cap
+        self.slot_to_particle[
+            np.repeat(self.brick_start[affected], lens) + _within_run_index(lens)
+        ] = -1
+        # drop any stale arena residents belonging to affected bricks
+        if self.arena_bucket is not None and len(self.arena_bucket):
+            stale = np.isin(self.arena_bucket // p3, affected)
+            if np.any(stale):
+                idx = np.nonzero(stale)[0]
+                self.slot_to_particle[self.arena_base + idx] = -1
+                self.arena_bucket[idx] = -1
+
+        keep = _prefix_mask(counts, fits)
+        placed = claim[keep]
+        slots = self.brick_start[cb[keep]] + _within_run_index(fits)
+        self.slot_to_particle[slots] = placed
+        self.particle_to_slot[placed] = slots
+        spill, spill_b = claim[~keep], key_new[claim[~keep]]
+        if len(spill):
+            free = np.nonzero(self.arena_bucket < 0)[0]
+            if len(free) < len(spill):
+                raise ValueError(
+                    f"{len(spill)} particles overflow their brick's capacity and the arena "
+                    f"of {len(self.arena_bucket)} slots has only {len(free)} free. The layout "
+                    "does not clamp or drop (D-007). Raise brick_slack or arena_frac."
+                )
+            a = free[: len(spill)]
+            self.arena_bucket[a] = spill_b
+            self.slot_to_particle[self.arena_base + a] = spill
+            self.particle_to_slot[spill] = self.arena_base + a
+        stats["arena_used"] = int(np.sum(self.arena_bucket >= 0))
+        # `occupancy` must count what is IN the brick runs, because it is what
+        # the derived bucket boundaries are built from -- an arena resident is
+        # NOT in its bucket's span, so counting it would shift every later
+        # bucket in that brick.
+        occ = np.bincount(key_new, minlength=self.n_bricks * p3)
+        if len(spill):
+            np.subtract.at(occ, spill_b, 1)
+        self.occupancy = occ.astype(np.uint16)
+        self.key = key_new
+        fill = np.bincount(new_brick, minlength=self.n_bricks) / np.maximum(
+            np.diff(self.brick_start), 1
+        )
+        stats["max_brick_fill"] = float(fill.max())
+        stats["max_fill_frac"] = stats["max_brick_fill"]
+        return stats
+
+    def repack(self, brick_slack=0.10, chunk=1 << 20):
+        """Redistribute BRICK capacity in place, same monotone trick as
+        `BrickLayout.repack`.
+
+        Needed for the same reason: capacity frozen at build time cannot track
+        structure formation. Measured, the problem recurs at brick level -- a
+        brick hosting a halo outgrew even 50% spare by step 6 at cdev8 -- so
+        "bricks average over 512x the volume and therefore cannot concentrate"
+        was too optimistic, and this is what corrects it.
+
+        It is CHEAPER here than per-bucket, because only brick boundaries move:
+        n_bricks is 512x smaller than n_buckets, and the particles inside a
+        brick keep their relative order, so the rearrangement is a block shift.
+        """
+        counts = np.bincount(self.key // self.buckets_per_brick, minlength=self.n_bricks)
+        counts = counts.astype(np.int64)
+        spare = np.ceil(counts * float(brick_slack)).astype(np.int64)
+        spare = np.where(counts > 0, np.maximum(spare, 1), spare)
+        new_start = np.zeros(self.n_bricks + 1, dtype=np.int64)
+        np.cumsum(counts + spare, out=new_start[1:])
+        n_alloc = len(self.slot_to_particle)
+        if int(new_start[-1]) > n_alloc:
+            raise ValueError(
+                f"repack needs {int(new_start[-1])} slots against {n_alloc} allocated"
+            )
+
+        live = np.nonzero(self.slot_to_particle >= 0)[0]
+        parts = self.slot_to_particle[live]
+        # ARENA RESIDENTS ARE OUT OF ORDER. The main runs are already in
+        # (brick, bucket) order, so slot order is key order -- but an arena
+        # particle sits past every brick run, so it arrives LAST regardless of
+        # which bucket it belongs to. Placing by slot order would scatter it
+        # into the wrong bucket's span, which is exactly what `check` caught at
+        # the first step that overflowed. Re-order by key; stable, so particles
+        # sharing a bucket keep their relative order.
+        if np.any(self.slot_to_particle[self.arena_base :] >= 0):
+            parts = parts[np.argsort(self.key[parts], kind="stable")]
+        n_live = len(parts)
+        scratch_peak = 0
+        # compact forward, from the ordered particle list
+        for i in range(0, n_live, chunk):
+            j = min(i + chunk, n_live)
+            buf = parts[i:j]
+            scratch_peak = max(scratch_peak, buf.nbytes)
+            self.slot_to_particle[i:j] = buf
+        self.slot_to_particle[n_live:] = -1
+        # expand backward into the new brick runs
+        final = np.repeat(new_start[:-1], counts) + _within_run_index(counts)
+        for i in range(n_live, 0, -chunk):
+            lo = max(i - chunk, 0)
+            buf = self.slot_to_particle[lo:i].copy()
+            scratch_peak = max(scratch_peak, buf.nbytes)
+            self.slot_to_particle[lo:i] = -1
+            self.slot_to_particle[final[lo:i]] = buf
+        self.brick_start = new_start
+        self.particle_to_slot[parts] = final
+        if self.arena_bucket is not None:
+            self.arena_bucket[:] = -1  # everyone is back in a brick run
+        self.occupancy = np.bincount(
+            self.key, minlength=self.n_bricks * self.buckets_per_brick
+        ).astype(np.uint16)
+        return dict(
+            scratch_bytes=int(scratch_peak),
+            slots_used=int(new_start[-1]),
+            slots_allocated=int(n_alloc),
+            max_brick_fill=float(np.max(counts / np.maximum(counts + spare, 1))),
+        )
+
+    def check(self):
+        live = self.slot_to_particle >= 0
+        if int(np.sum(live)) != self.n_particles:
+            raise AssertionError(f"lost particles: {int(np.sum(live))} vs {self.n_particles}")
+        p = self.slot_to_particle[live]
+        if len(np.unique(p)) != len(p):
+            raise AssertionError("a particle occupies two slots")
+        if not np.array_equal(self.particle_to_slot[p], np.nonzero(live)[0]):
+            raise AssertionError("particle_to_slot disagrees with slot_to_particle")
+        # every particle must sit inside its OWN bucket's derived span
+        p3 = self.buckets_per_brick
+        for b in (0, self.n_bricks // 2, self.n_bricks - 1):
+            starts = self.bucket_slot_starts(b)
+            lo, _ = self.brick_slot_range(b)
+            run = self.slot_to_particle[lo : starts[-1]]
+            if np.any(run < 0):
+                raise AssertionError(f"brick {b} has a hole inside its packed prefix")
+            want = np.repeat(np.arange(b * p3, (b + 1) * p3), np.diff(starts))
+            if not np.array_equal(self.key[run], want.astype(np.int32)):
+                raise AssertionError(f"brick {b}: a particle is outside its bucket's span")
+        return True
+
+    def bytes_per_particle(self, payload=9.0):
+        n = max(self.n_particles, 1)
+        return dict(
+            payload=payload,
+            bucket_index=self.occupancy.nbytes / n,
+            brick_start=self.brick_start.nbytes / n,
+            slack=(self.n_slots - self.n_particles) * payload / n,
+            total=payload
+            + self.occupancy.nbytes / n
+            + self.brick_start.nbytes / n
+            + (self.n_slots - self.n_particles) * payload / n,
+        )
