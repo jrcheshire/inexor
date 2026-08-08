@@ -63,10 +63,6 @@ A_INIT, A_FINAL, SPACING = 0.1, 1.0, "log"
 SEED = 0
 ALPHA = 1.0  # r_s / coarse_cell, the ratified kernel (gauss + TSC + matching)
 
-# The slack targets priced. 0.10 is D-v2-14 clause 2's estimate; the rest
-# bracket it. These are TARGETS -- the realized fraction is larger, because a
-# whole spare slot is the smallest unit a bucket can be given.
-SLACK_LADDER = (0.05, 0.10, 0.15, 0.25, 0.50, 1.00)
 
 
 def geometry(cfg):
@@ -137,26 +133,6 @@ def make_force(g, tile, buf, family="gauss", assign="tsc", match=True):
 # ---------------------------------------------------------------------------
 
 
-def slack_ladder_demand(counts_now, capacity_by_target, payload=9.0, n=None):
-    """Arena demand left by each slack target, exactly.
-
-    The layout freezes capacity at build time and never resizes, so a bucket
-    overflowing at step k needs `count_k - capacity_0` arena slots. Summing that
-    over buckets is the arena the run would have needed -- no simulation of the
-    ladder required, and no approximation.
-    """
-    out = {}
-    for target, cap in capacity_by_target.items():
-        over = np.maximum(counts_now - cap, 0)
-        out[f"{target:g}"] = dict(
-            arena_slots=int(over.sum()),
-            arena_frac_of_n=float(over.sum()) / max(n, 1),
-            n_overflowing_buckets=int((over > 0).sum()),
-            worst_overflow=int(over.max()) if len(over) else 0,
-        )
-    return out
-
-
 def occupancy_summary(counts, n):
     live = counts[counts > 0]
     return dict(
@@ -202,22 +178,6 @@ def main():
         "so a sweep needs one margin held fixed across every point -- otherwise "
         "the points differ in two variables at once",
     )
-    ap.add_argument(
-        "--min-spare",
-        type=int,
-        default=1,
-        help="spare slots guaranteed to every OCCUPIED bucket. At ~8 particles "
-        "per bucket a floor of 1 is 12.5%% of payload on its own, which dominates "
-        "any low slack setting; 0 trades that for arena traffic",
-    )
-    ap.add_argument(
-        "--layout",
-        default="per-bucket",
-        choices=("per-bucket", "brick-packed"),
-        help="per-bucket = D-v2-14 cl.3 as ratified (spare per bucket, arena for "
-        "overflow); brick-packed = spare pooled per brick, buckets packed tight, "
-        "no per-bucket slot-boundary array",
-    )
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args()
@@ -235,13 +195,7 @@ def main():
 
     from inexor.codec import T9Layout
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table, float_step_bullfrog
-    from inexor.layout import (
-        BrickLayout,
-        BrickPackedLayout,
-        _capacity_extra,
-        bucket_order_key,
-        choose_brick,
-    )
+    from inexor.layout import BrickPackedLayout, bucket_order_key, choose_brick
 
     sys.path.insert(0, HERE)
 
@@ -260,33 +214,15 @@ def main():
     a_steps = a_grid(A_INIT, A_FINAL, args.steps, SPACING)
     coeffs = bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo))
 
-    packed = args.layout == "brick-packed"
-    if packed:
-        lay = BrickPackedLayout.build(
-            x,
-            t9,
-            bricks_per_side,
-            brick_slack=args.slack,
-            arena_frac=args.arena_frac,
-            alloc_margin=args.alloc_margin,
-        )
-    else:
-        lay = BrickLayout.build(
-            x,
-            t9,
-            bricks_per_side,
-            slack_frac=args.slack,
-            arena_frac=args.arena_frac,
-            alloc_margin=args.alloc_margin,
-            min_spare=args.min_spare,
-        )
+    lay = BrickPackedLayout.build(
+        x,
+        t9,
+        bricks_per_side,
+        brick_slack=args.slack,
+        arena_frac=args.arena_frac,
+        alloc_margin=args.alloc_margin,
+    )
     counts0 = lay.occupancy.astype(np.int64).copy()
-    # capacity each ladder target would have frozen at build time
-    cap_by_target = {}
-    for s in SLACK_LADDER:
-        extra = _capacity_extra(counts0, s, args.min_spare)
-        cap_by_target[s] = counts0 + extra
-
     n = g["n_total"]
     bpp0 = lay.bytes_per_particle()
     print(f"    initial: {occupancy_summary(counts0, n)}")
@@ -320,11 +256,7 @@ def main():
         rep = None
         if args.repack_every and (k + 1) % args.repack_every == 0:
             t2 = time.perf_counter()
-            rep = (
-                lay.repack(brick_slack=args.slack, chunk=1 << 16)
-                if packed
-                else lay.repack(slack_frac=args.slack, chunk=1 << 16, min_spare=args.min_spare)
-            )
+            rep = lay.repack(brick_slack=args.slack, chunk=1 << 16)
             rep["wall_s"] = time.perf_counter() - t2
             lay.check()
 
@@ -339,7 +271,6 @@ def main():
             max_fill_frac=stats["max_fill_frac"],
             n_full_buckets=stats["n_full_buckets"],
             occupancy=occupancy_summary(counts, n),
-            slack_ladder=(None if packed else slack_ladder_demand(counts, cap_by_target, n=n)),
         )
         per_step.append(rec)
         # flush=True is not cosmetic. A buffered long run that dies leaves an
@@ -362,32 +293,29 @@ def main():
 
     wall = time.perf_counter() - t_run
 
-    # the headline: what each slack target would have cost, and whether it held
-    worst = {}
-    for s in SLACK_LADDER:
-        if per_step[0]["slack_ladder"] is None:
-            continue
-        arena = max(r["slack_ladder"][f"{s:g}"]["arena_frac_of_n"] for r in per_step)
-        cap = cap_by_target[s]
-        slack_bpp = float((cap - counts0).sum()) * 9.0 / n
-        worst[f"{s:g}"] = dict(
-            slack_bpp=slack_bpp,
-            peak_arena_frac_of_n=arena,
-            arena_bpp=arena * 9.0,
-            all_in_bpp=9.0 + bpp0["bucket_index"] + bpp0["brick_csr"] + slack_bpp + arena * 9.0,
-        )
-
-    print("\n--- slack ladder: what each target costs and what it leaves ---")
-    print(f"    {'target':>8} {'slack B/p':>10} {'peak arena':>11} {'arena B/p':>10} {'all-in':>8}")
-    for s, w in worst.items():
-        print(
-            f"    {s:>8} {w['slack_bpp']:>10.3f} {w['peak_arena_frac_of_n']:>10.3%} "
-            f"{w['arena_bpp']:>10.3f} {w['all_in_bpp']:>8.3f}"
-        )
-    print(
-        "\n    D-v2-14 clause 2 has slack+arena at 0.90 B/p and all-in at 10.15. "
-        "Any move is JC's call, not this script's."
+    # the headline, priced the way D-v2-14 clause 2 is written. Peak arena, not
+    # mean: the region has to be sized for the worst step of the run.
+    reps = [r["repack"] for r in per_step if r.get("repack")]
+    main = max(r["slots_used"] for r in reps) / n if reps else lay.n_slots / n
+    peak_arena = max(r["arena_used_frac"] for r in per_step)
+    terms = dict(
+        payload=9.0,
+        bucket_index=bpp0["bucket_index"],
+        brick_start=bpp0["brick_start"],
+        slack=(main - 1.0) * 9.0,
+        arena=peak_arena * 9.0,
     )
+    terms["total"] = sum(terms.values())
+
+    print("\n--- all-in, in the units D-v2-14 clause 2 is written in ---")
+    for k in ("payload", "bucket_index", "brick_start", "slack", "arena"):
+        print(f"    {k:<14} {terms[k]:8.3f}")
+    print(f"    {'TOTAL':<14} {terms['total']:8.3f} B/p   "
+          f"vs the ratified 10.150 ({terms['total'] / 10.15 - 1:+.1%})")
+    print(f"    peak arena {peak_arena:.3%} of particles;  "
+          f"main {main:.3f} x N;  repack "
+          f"{1000 * sum(r['wall_s'] for r in reps) / max(len(reps), 1):.0f} ms/step")
+    print("\n    Any move to a ratified figure is JC's call, not this script's.")
 
     card = dict(
         config=args.config,
@@ -405,7 +333,7 @@ def main():
         live_arena_frac=args.arena_frac,
         initial_occupancy=occupancy_summary(counts0, n),
         initial_bpp=bpp0,
-        slack_ladder_worst=worst,
+        all_in_terms=terms,
         per_step=per_step,
         wall_s=wall,
         ratified_estimate=dict(slack_and_arena_bpp=0.90, all_in_bpp=10.15, source="D-v2-14 cl.2"),

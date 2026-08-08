@@ -36,6 +36,7 @@ https://claude.ai/code/artifact/370ba948-b9ea-4e42-9c15-92dce10fdf55).
 | D-v2-16 | **Force architecture freeze** (JC, 2026-08-08, V4 freeze; full ADR in `decisions.md`). **The force is never materialized globally** — ownership is a partition so the kick applies tile-locally, deleting the 2 x 206 GB of host arrays that kept C-gh unrunnable. **`paint_tsc_int` is a required deliverable**: `paint_tsc_f64` uses order-dependent f64 `.at[].add` and `--assign-long` defaults to tsc, so the coarse arm ratified in D-v2-10 violates D-006 today. The long-range force is staged as a per-tile coarse sub-block (resident is 12.9 GB at C-gh but 103 GB at C-hero against 96 GB HBM). Geometry T=256/b=32, **PROVISIONAL until measured at C-gh** — the criterion is frozen, the number is not. `cap` is the cost variable with nothing co-varying. The streaming constraint is the HOST GATHER, not the transfer, and the 18x is contingent on an ffi-level pinned gather jax cannot express. **Promotion out of `scripts/v2_g5_core.py` is gated on bitwise parity against the retained probe at three geometries.** |
 | D-v2-17 | **Gating scope** (JC, 2026-08-08, V4 freeze; full ADR in `decisions.md`). D-v2-9's bar continues to be read on the **UNCORRECTED** split: gating the corrected quantity would let a calibration absorb an architecture error, and the transfer's own ~1e-3 irreducible residual would move inside the gate rather than beside it. **C-hero is a capacity demonstration only** — no monolithic reference can exist at hero scale, so hero runs measure cost, memory and completion, and accuracy is inherited via D-v2-11's off-box transport with that caveat attached to any data product. |
 | D-v2-18 | **Build roadmap** (JC, 2026-08-08, V4 freeze; full ADR in `decisions.md`). Seven rungs M-v2-1..7, codec first because the layout is defined in terms of it and the IC stage emits it. Table + mandatory crosswalk in Sec. 5. |
+| D-v2-19 | **State layout: spare pooled per brick, and the re-sort is affordable** (JC, 2026-08-08; full ADR in `decisions.md`). Supersedes D-v2-14 clause 3, whose two load-bearing assertions measured false. Per-bucket spare costs a whole slot per occupied bucket -- **12.5% of payload whatever the setting** -- and a stored slot boundary per bucket is **1.00 B/p at C-gh that clause 2 never counted**. Pooling spare per brick and DERIVING boundaries from the occupancy index fixes both. A repack **is not a sort** (bucket order is fixed; it is a monotone rearrangement, O(chunk) scratch, 27 ms/step), so the "second 77 GB scatter target" objection does not apply -- and it is required, because frozen capacity fails at every granularity. A 1-2% arena catches the rare collapsing brick; peak use 0.57% against the per-bucket design's 22%. **All-in 10.204 B/p against clause 2's 10.15; 87.7 GB at C-gh, 1.32x under the cliff.** Measured at 1/4096 of C-gh's volume, one seed. |
 
 ## 1. Thesis
 
@@ -134,9 +135,15 @@ entries.
 | C-hero | 4096^3 | 618.5 GB | 17.2 GB | ~697 GB | ~1 TB | ~1.4x under |
 | C-vol | 4096^3 | 618.5 GB | 34.4 GB | ~715 GB | ~1 TB | ~1.4x under |
 
-**The 0.90 B/p slack term is an ESTIMATE** from a hand argument about migration
-rates -- 7.7 GB of C-gh's 87.2. Measuring it at `cgh64` is an exit condition of
-M-v2-1, and a materially larger number moves this table and amends D-v2-14.
+**Measured 2026-08-08 (D-v2-19), and the table above is the POOLED design.**
+The 0.90 slack estimate is very nearly right for spare pooled per brick (0.901)
+and unreachable for the per-bucket scheme it was written about, where whole-slot
+granularity forces >= 1.125. Two terms the original table omitted: a stored slot
+boundary per bucket (1.00 B/p, now derived instead at 0.002) and the arena
+(0.051 at a measured 0.57% peak). All-in **10.204 B/p**, 87.7 GB at C-gh,
+**1.32x under the ~116 GB cliff**. Measured at cdev8 -- 1/4096 of C-gh's volume,
+one seed -- so the capacity run still owes the uint16-ceiling and streaming
+questions.
 
 ## 3. The compute<->memory tradeoff map (D-v2-4)
 

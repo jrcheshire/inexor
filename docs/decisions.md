@@ -761,6 +761,10 @@ ratifying it did not measure it.
 
 - **Status:** accepted (JC, 2026-08-08, V4 freeze; drafted 2026-08-07). Amends
   D-v2-8's state-tier clause; does not touch its requirements chain.
+  **Clause 3 SUPERSEDED by D-v2-19 (JC, 2026-08-08)** -- both of its
+  load-bearing assertions measured false. Clauses 1, 2, 4 and 5 stand; clause
+  2's slack figure is re-derived there. Left byte-frozen otherwise, per the
+  D-v2-10 -> D-v2-11 precedent.
 - **Context:** D-v2-8 ratified T9 = 9 B/p on G2c's `t9` arm. That gate says in
   its own docstring (`v2_g2c_accum_gate.py:35`) that it "measures
   REPRESENTATION error only (storage layout is a build decision)". V4 takes
@@ -928,3 +932,65 @@ ratifying it did not measure it.
   **Not scheduled, deliberately:** PP-in-tiles (own gate, never a default);
   reviving A3 via the frozen-background arm (shelved); an absolute RSD bar,
   which D-v2-8 clause 5 still needs before anything leans on it.
+
+## D-v2-19 -- State layout: spare pooled per brick, and the re-sort is affordable
+
+- **Status:** accepted (JC, 2026-08-08). Supersedes D-v2-14 clause 3 and
+  re-derives its clause 2 slack figure. D-v2-14's other clauses stand: the
+  1.0 Mpc/h bucket, the `fine_cell/64` quantum, the opt-in int32 id tier, and
+  the requirement that the paint be order-independent are all untouched.
+- **Context:** clause 3 ratified per-bucket capacity with eject-and-reinsert,
+  and ruled out periodic re-sorting because "a second 77 GB scatter target is
+  over the ceiling". Building it measured both halves false, and measured a
+  term the accounting had missed. Records: `runs/v2/m1_layout_record.md`,
+  `runs/v2/m1_brick_packed_record.md`; probe `scripts/v2_m1_migration.py`;
+  cdev8 under the ratified two-level force, whose ICs and force were checked
+  bitwise against the G5 driver before anything was concluded from them.
+- **Decision:**
+  1. **Spare is pooled per BRICK; buckets are packed tight inside it.** A
+     bucket cannot be given a fraction of a slot, so per-bucket spare costs one
+     whole slot per occupied bucket -- **12.5% of payload at ~8 particles per
+     bucket, whatever the setting**, since `ceil()` already returns >= 1. (The
+     `min_spare` floor that appeared to cause this is INERT; the cause is
+     granularity.) Pooled over a brick's ~4096 particles, 10% means 10%:
+     measured slots hold at exactly 1.100x N.
+  2. **Bucket slot boundaries are DERIVED, not stored** -- a prefix sum of
+     `occupancy` within a brick. The stored int64 boundary per bucket was
+     8.6 GB at C-gh, **a full 1.00 B/p that D-v2-14 clause 2's table never
+     counted**. 1.00 -> 0.002 B/p.
+  3. **Capacity is redistributed by a periodic in-place repack.** Frozen
+     capacity fails at EVERY granularity -- per-bucket it ran away to 62% of
+     particles in the arena and climbing; per-brick a collapsing halo outgrew
+     even 50% spare by step 6. But a repack **is not a sort**: `migrate` keeps
+     every particle in the right bucket and bucket order is a fixed spatial
+     ordering, so restoring the layout is a MONOTONE rearrangement -- two
+     in-place passes with **O(chunk) scratch, measured at 0.13-0.52 MB
+     independent of N**. Clause 3's "second 77 GB scatter target" does not
+     apply. Cost 27 ms/step against a 4 s force step.
+  4. **A small arena is still required, and may never clamp (D-007).** With
+     repack every step a fixed brick fraction still overflows, by MORE as the
+     fraction rises (37 particles at 10%, 248 at 15%, 461 at 20%) because more
+     spare reaches heavier clustering before failing. 461 of 2.1e6 is 0.02%: a
+     rare-event problem, absorbed by a 1-2% arena for ~0.05 B/p. **Peak use
+     measured 0.57%**, against 22% for the per-bucket design. An arena particle
+     still BELONGS to its brick and `brick_members` returns it -- omitting it
+     deleted it from the force with nothing raising, measured at 98.4% loss on
+     a stress fixture and 0.57% at the operating point.
+  5. **The all-in figure, re-derived:** payload 9.000 + index 0.250 + brick
+     boundaries 0.002 + slack 0.901 + arena 0.051 = **10.204 B/p**, against
+     clause 2's 10.15 (+0.5%). At C-gh **87.7 GB against the ~116 GB cliff,
+     1.32x under** -- the headroom clause 2 claimed. The per-bucket layout's
+     best measured setting is ~13.4 B/p, 1.09x under, once its boundary array
+     is counted. Layout overhead 6.0% of the force.
+- **What this does NOT establish.** One config at **1/4096 of C-gh's volume**,
+  one seed, CPU, state resident. The uint16 per-bucket index has **11.0x
+  headroom** at cdev8's peak bucket population of 5943 and larger volumes hold
+  rarer, denser peaks -- whether C-gh stays under 65535 is unmeasured and is a
+  named deliverable of the capacity run. Whether the 6.0% overhead survives a
+  streaming state is untested. `repack` sorts by key when the arena is
+  non-empty, O(N log N), which wants a merge at C-gh since only the few arena
+  residents are out of order.
+- **Consequence for D-v2-14 clause 2:** its capacity column is re-derived at
+  10.204 B/p. The 0.90 slack estimate it labelled as an estimate turns out to
+  be very nearly right FOR THE POOLED DESIGN (0.901) and unreachable for the
+  per-bucket one it was written about, where granularity forces >= 1.125.
