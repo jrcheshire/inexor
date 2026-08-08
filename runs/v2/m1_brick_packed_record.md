@@ -90,3 +90,111 @@ the rare collapsing brick. Remove any one and it fails.
   the few arena residents are out of order.
 - The 6.0% is dominated by `migrate` (0.23 s) rather than `repack` (0.027 s),
   and neither is optimized.
+
+---
+
+# cgh64: the exit gate, as a matched CPU/GPU pair
+
+Jobs **897358** (`gg`, CPU force, 2h23m) and **897377** (`gh`, GPU force,
+1h43m), both COMPLETED 0:0, commit `32b22f2`, 512^3 particles in L=256 --
+**64x the volume the layout was designed on, at C-gh's own cell and spacing**.
+~4.1 node-hours, against my 1-2 estimate.
+
+## The pair agrees EXACTLY, and that is a stronger check than it looks
+
+| | gg (CPU force) | gh (GPU force) |
+|---|---|---|
+| all-in B/p | 10.292 | 10.292 |
+| main | 1.100x N | 1.100x N |
+| peak arena | 1.548% | 1.548% |
+| peak bucket population | 13774 | 13774 |
+| p99.9 occupancy | 706 | 706 |
+| peak migrants | 69.6% | 69.6% |
+
+**I predicted "close but not bitwise" and was wrong.** Quantization filters
+roundoff completely: backend differences are ~1e-15 relative, the position
+quantum is 3.9e-3 Mpc/h, so a particle would have to sit within ~1e-13 of a
+bucket boundary to be assigned differently -- a ~1e-9 event across 1.3e8
+particles. The layout statistics are therefore backend-invariant BY
+CONSTRUCTION, which is a useful property in its own right.
+
+## Memory: the design holds at 64x volume
+
+**10.292 B/p, +1.4% on D-v2-14 clause 2's 10.15.** Across the 1x/8x/64x ladder
+the figure moves 10.204 -> 10.234 -> 10.292, and `main` is **1.100x N at every
+rung** -- the pooled spare is exactly the requested 10% at all three volumes,
+which is the property per-bucket allocation could not deliver at any setting.
+
+At C-gh that projects to ~88-90 GB against the ~116 GB cliff.
+
+## Overhead: the finding this run was for, and my prediction was wrong
+
+| | force s/step | layout s/step | overhead |
+|---|---|---|---|
+| gg (CPU force) | 146.75 | 19.01 | **13.0%** |
+| gh (GPU force) | 21.48 | 18.36 | **85.5%** |
+
+Force speedup CPU -> GPU: **6.83x**. The layout costs the SAME on both (19.01 vs
+18.36 s) -- it is host-side numpy and does not care about the backend, which is
+exactly why the CPU-relative figure is the wrong one to quote.
+
+**On the backend production will use, the layout is 85.5% of the force cost.**
+I pre-registered 25-40% and was wrong by ~2x. The reasoning was right in
+direction and wrong in size: I expected the force to gain far more from the GPU
+than 6.83x, forgetting that V4 already measured ~74% of per-tile cost as HOST
+plumbing, so the device speedup is capped by work that never left the CPU.
+
+This is an M-v2-2/M-v2-3 item, not a layout defect: `migrate` dominates
+(~18 s of the ~20 s), and its cost is an `argsort` plus `isin` over 1.34e8
+particles that a counting sort should largely remove.
+
+## The uint16 index: the distribution is invariant, only the extreme grows
+
+| config | p99 | p99.9 | peak |
+|---|---|---|---|
+| cdev8 (128^3) | 121 | 704 | 5943 |
+| cdev (256^3) | 123 | 688 | 7581 |
+| cgh64 (512^3) | 122 | 706 | 13774 |
+
+**p99 and p99.9 are flat to ~2% across 64x volume.** The occupancy distribution
+is not changing; the peak grows only because more samples are drawn from the
+same distribution. My earlier "the growth ratio is accelerating, headroom is
+1.4x" was fitting a trend to the single noisiest statistic in the dataset -- the
+max is one bucket, and its two ratio estimates (1.276x, 1.817x) differ by 2.5x
+for that reason.
+
+Extrapolating the last rung gives ~45000 at C-gh against 65535, but that rests
+on the weakest number available and should not be read to two figures. What is
+solid: **99.9% of buckets are under ~710**, and realistically ONE bucket in the
+box approaches the ceiling.
+
+Two ways to handle it, JC's call, neither implemented:
+- **uint32 index everywhere**: +0.25 B/p, all-in ~10.54, ~91 GB at C-gh,
+  1.28x under the cliff. Simple, costs a quarter byte per particle forever.
+- **Let the arena catch it**: a bucket over 65535 spills its excess exactly as
+  a full brick does, capping the stored count. Given p99.9 ~ 706 this is ~one
+  bucket, so the cost rounds to zero and the machinery already exists.
+
+## What this does NOT establish
+
+- **Streaming is untested and this run could not test it.** cgh64's whole T9
+  state is ~1.2 GB and fits in memory. Streaming is real only at C-gh proper
+  (77 GB), which is M-v2-6.
+- **One seed, one cosmology, one schedule.**
+- **The GPU backend was INFERRED, not demonstrated.** The log records
+  `jax 0.10.2` and no device line; the 6.83x speedup is strong circumstantial
+  evidence, since both nodes carry the same 72-core Grace CPU, but a benchmark
+  should demonstrate its knob is live. Both sbatch scripts now print
+  `jax.devices()` and the gh one ASSERTS a non-CPU backend.
+
+## Defects in my own instruments, this run
+
+5. **The gh job reported `CARDS WRITTEN: (none)` while the card was written
+   fine.** `--out-suffix _cgh64` duplicates the config name the probe already
+   inserts, so the file is `m1_migration_cgh64_cgh64_gh.json` and the listing
+   pattern missed it. A false negative in a check whose whole job is to prove
+   the run produced something. Pattern widened.
+6. **The device was not recorded** (above).
+
+Running total for the layout work: six defects of mine, and the consistent
+property is that **none of them would have raised on its own.**

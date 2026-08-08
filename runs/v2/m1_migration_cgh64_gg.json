@@ -1,0 +1,618 @@
+{
+ "config": "cgh64",
+ "geometry": {
+  "n_part": 512,
+  "L": 256.0,
+  "n_fine": 1024,
+  "n_coarse": 256,
+  "fine_cell": 0.25,
+  "coarse_cell": 1.0,
+  "spacing": 0.5,
+  "n_total": 134217728
+ },
+ "tile": 256,
+ "buf": 32,
+ "n_brick": 32,
+ "bricks_per_side": 32,
+ "bucket_cells": 2,
+ "bucket_size": 1.0,
+ "quantum": 0.00390625,
+ "steps": 20,
+ "seed": 0,
+ "live_slack": 0.1,
+ "live_arena_frac": 0.02,
+ "initial_occupancy": {
+  "mean": 8.0,
+  "mean_occupied": 8.0,
+  "max": 82,
+  "p50": 8.0,
+  "p99": 20.0,
+  "p999": 28.0,
+  "n_empty": 0,
+  "n_buckets": 16777216,
+  "uint16_headroom": 799.2073170731708
+ },
+ "initial_bpp": {
+  "payload": 9.0,
+  "bucket_index": 0.25,
+  "brick_start": 0.0019531846046447754,
+  "slack": 0.9009888768196106,
+  "total": 10.152942061424255
+ },
+ "all_in_terms": {
+  "payload": 9.0,
+  "bucket_index": 0.25,
+  "brick_start": 0.0019531846046447754,
+  "slack": 0.900997057557106,
+  "arena": 0.13931353390216827,
+  "total": 10.292263776063919
+ },
+ "per_step": [
+  {
+   "step": 0,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654237,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 1.7850388269871473
+   },
+   "a": 0.11220184543019636,
+   "wall_force_s": 139.64052833244205,
+   "wall_migrate_s": 14.861142685636878,
+   "migrant_frac": 0.1970955729484558,
+   "arena_used_frac": 0.0,
+   "max_fill_frac": 0.9780626078383041,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.0,
+    "max": 114,
+    "p50": 8.0,
+    "p99": 22.0,
+    "p999": 32.0,
+    "n_empty": 0,
+    "n_buckets": 16777216,
+    "uint16_headroom": 574.8684210526316
+   }
+  },
+  {
+   "step": 1,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654281,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 1.8473922032862902
+   },
+   "a": 0.12589254117941673,
+   "wall_force_s": 139.24506113678217,
+   "wall_migrate_s": 14.118963945657015,
+   "migrant_frac": 0.2208230346441269,
+   "arena_used_frac": 0.0,
+   "max_fill_frac": 0.9868237678956037,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.00000143051173,
+    "max": 147,
+    "p50": 7.0,
+    "p99": 24.0,
+    "p999": 37.0,
+    "n_empty": 3,
+    "n_buckets": 16777216,
+    "uint16_headroom": 445.81632653061223
+   }
+  },
+  {
+   "step": 2,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654218,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 1.724242903292179
+   },
+   "a": 0.14125375446227545,
+   "wall_force_s": 134.09958166070282,
+   "wall_migrate_s": 15.148366291075945,
+   "migrant_frac": 0.24661843478679657,
+   "arena_used_frac": 0.0,
+   "max_fill_frac": 0.996031746031746,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.000002384186502,
+    "max": 178,
+    "p50": 7.0,
+    "p99": 26.0,
+    "p999": 44.0,
+    "n_empty": 5,
+    "n_buckets": 16777216,
+    "uint16_headroom": 368.1741573033708
+   }
+  },
+  {
+   "step": 3,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654274,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.212964141741395
+   },
+   "a": 0.15848931924611134,
+   "wall_force_s": 140.03181563690305,
+   "wall_migrate_s": 14.913761479780078,
+   "migrant_frac": 0.27479512244462967,
+   "arena_used_frac": 1.691281795501709e-06,
+   "max_fill_frac": 1.0075738763347406,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.00003051769454,
+    "max": 301,
+    "p50": 7.0,
+    "p99": 29.0,
+    "p999": 53.0,
+    "n_empty": 64,
+    "n_buckets": 16777216,
+    "uint16_headroom": 217.72425249169436
+   }
+  },
+  {
+   "step": 4,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654229,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.203566489741206
+   },
+   "a": 0.1778279410038923,
+   "wall_force_s": 140.48722422495484,
+   "wall_migrate_s": 15.495191615074873,
+   "migrant_frac": 0.3052569404244423,
+   "arena_used_frac": 1.0907649993896484e-05,
+   "max_fill_frac": 1.0425674918785706,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.000179771648282,
+    "max": 607,
+    "p50": 6.0,
+    "p99": 33.0,
+    "p999": 66.0,
+    "n_empty": 377,
+    "n_buckets": 16777216,
+    "uint16_headroom": 107.9654036243822
+   }
+  },
+  {
+   "step": 5,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654139,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.2326734587550163
+   },
+   "a": 0.19952623149688797,
+   "wall_force_s": 142.44833038933575,
+   "wall_migrate_s": 15.58880389854312,
+   "migrant_frac": 0.33811555057764053,
+   "arena_used_frac": 6.804615259170532e-05,
+   "max_fill_frac": 1.0570423910920101,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.00078495097335,
+    "max": 1000,
+    "p50": 6.0,
+    "p99": 38.0,
+    "p999": 81.0,
+    "n_empty": 1646,
+    "n_buckets": 16777216,
+    "uint16_headroom": 65.535
+   }
+  },
+  {
+   "step": 6,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654252,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.268097909167409
+   },
+   "a": 0.223872113856834,
+   "wall_force_s": 143.28152990341187,
+   "wall_migrate_s": 15.661863161250949,
+   "migrant_frac": 0.37447621673345566,
+   "arena_used_frac": 0.0001690983772277832,
+   "max_fill_frac": 1.0683746325073498,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.002702672084572,
+    "max": 1220,
+    "p50": 6.0,
+    "p99": 43.0,
+    "p999": 101.0,
+    "n_empty": 5666,
+    "n_buckets": 16777216,
+    "uint16_headroom": 53.717213114754095
+   }
+  },
+  {
+   "step": 7,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654278,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.3014431949704885
+   },
+   "a": 0.251188643150958,
+   "wall_force_s": 142.82062125951052,
+   "wall_migrate_s": 15.9419178199023,
+   "migrant_frac": 0.41205520182847977,
+   "arena_used_frac": 0.0004286468029022217,
+   "max_fill_frac": 1.102060023005333,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.007715984380454,
+    "max": 1385,
+    "p50": 5.0,
+    "p99": 48.0,
+    "p999": 125.0,
+    "n_empty": 16166,
+    "n_buckets": 16777216,
+    "uint16_headroom": 47.31768953068592
+   }
+  },
+  {
+   "step": 8,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654314,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.3069782685488462
+   },
+   "a": 0.28183829312644537,
+   "wall_force_s": 146.4705829974264,
+   "wall_migrate_s": 16.10052951052785,
+   "migrant_frac": 0.45136117190122604,
+   "arena_used_frac": 0.0008954182267189026,
+   "max_fill_frac": 1.2027041644131964,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.018798551907842,
+    "max": 1683,
+    "p50": 5.0,
+    "p99": 54.0,
+    "p999": 153.0,
+    "n_empty": 39331,
+    "n_buckets": 16777216,
+    "uint16_headroom": 38.93939393939394
+   }
+  },
+  {
+   "step": 9,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654174,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.3572861310094595
+   },
+   "a": 0.31622776601683794,
+   "wall_force_s": 146.29769907332957,
+   "wall_migrate_s": 16.779306955635548,
+   "migrant_frac": 0.492104135453701,
+   "arena_used_frac": 0.0016945600509643555,
+   "max_fill_frac": 1.238953040800616,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.040438422779783,
+    "max": 2484,
+    "p50": 4.0,
+    "p99": 60.0,
+    "p999": 187.0,
+    "n_empty": 84379,
+    "n_buckets": 16777216,
+    "uint16_headroom": 26.382850241545892
+   }
+  },
+  {
+   "step": 10,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654212,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.3250552862882614
+   },
+   "a": 0.35481338923357547,
+   "wall_force_s": 147.5603994987905,
+   "wall_migrate_s": 16.750329798087478,
+   "migrant_frac": 0.5331319272518158,
+   "arena_used_frac": 0.0028667598962783813,
+   "max_fill_frac": 1.3221407435996397,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.078753469733474,
+    "max": 2836,
+    "p50": 4.0,
+    "p99": 67.0,
+    "p999": 226.0,
+    "n_empty": 163548,
+    "n_buckets": 16777216,
+    "uint16_headroom": 23.10825105782793
+   }
+  },
+  {
+   "step": 11,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654320,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.489660916849971
+   },
+   "a": 0.3981071705534973,
+   "wall_force_s": 147.29931349866092,
+   "wall_migrate_s": 16.97710544615984,
+   "migrant_frac": 0.5728287398815155,
+   "arena_used_frac": 0.004301123321056366,
+   "max_fill_frac": 1.3344793713163066,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.141254799566884,
+    "max": 4241,
+    "p50": 4.0,
+    "p99": 74.0,
+    "p999": 269.0,
+    "n_empty": 291093,
+    "n_buckets": 16777216,
+    "uint16_headroom": 15.452723414289082
+   }
+  },
+  {
+   "step": 12,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654288,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.46360931918025
+   },
+   "a": 0.44668359215096315,
+   "wall_force_s": 151.0780388917774,
+   "wall_migrate_s": 17.516309114173055,
+   "migrant_frac": 0.6096834242343903,
+   "arena_used_frac": 0.005988791584968567,
+   "max_fill_frac": 1.5374705135184177,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.230428424905298,
+    "max": 5220,
+    "p50": 3.0,
+    "p99": 80.0,
+    "p999": 319.0,
+    "n_empty": 469714,
+    "n_buckets": 16777216,
+    "uint16_headroom": 12.554597701149426
+   }
+  },
+  {
+   "step": 13,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654242,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.4953434355556965
+   },
+   "a": 0.5011872336272724,
+   "wall_force_s": 151.7119535151869,
+   "wall_migrate_s": 17.732557754963636,
+   "migrant_frac": 0.6419397667050362,
+   "arena_used_frac": 0.008197784423828125,
+   "max_fill_frac": 2.025094696969697,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.352999164561474,
+    "max": 5438,
+    "p50": 3.0,
+    "p99": 87.0,
+    "p999": 372.0,
+    "n_empty": 709008,
+    "n_buckets": 16777216,
+    "uint16_headroom": 12.051305627068775
+   }
+  },
+  {
+   "step": 14,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654231,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.5014103278517723
+   },
+   "a": 0.5623413251903491,
+   "wall_force_s": 152.70986786857247,
+   "wall_migrate_s": 17.901930974796414,
+   "migrant_frac": 0.6679930537939072,
+   "arena_used_frac": 0.010885462164878845,
+   "max_fill_frac": 2.020918276901259,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.51032910967338,
+    "max": 7048,
+    "p50": 3.0,
+    "p99": 94.0,
+    "p999": 426.0,
+    "n_empty": 1006060,
+    "n_buckets": 16777216,
+    "uint16_headroom": 9.298382519863791
+   }
+  },
+  {
+   "step": 15,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654287,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.4957638513296843
+   },
+   "a": 0.6309573444801934,
+   "wall_force_s": 153.17427495494485,
+   "wall_migrate_s": 18.211201632395387,
+   "migrant_frac": 0.6863640025258064,
+   "arena_used_frac": 0.013140611350536346,
+   "max_fill_frac": 2.0269537480063797,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.696990791543882,
+    "max": 6676,
+    "p50": 3.0,
+    "p99": 100.0,
+    "p999": 485.0,
+    "n_empty": 1344553,
+    "n_buckets": 16777216,
+    "uint16_headroom": 9.816506890353505
+   }
+  },
+  {
+   "step": 16,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654223,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.5069319494068623
+   },
+   "a": 0.707945784384138,
+   "wall_force_s": 152.16391645744443,
+   "wall_migrate_s": 18.46156138367951,
+   "migrant_frac": 0.6959537044167519,
+   "arena_used_frac": 0.014530874788761139,
+   "max_fill_frac": 2.5982465654374547,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.910979652055609,
+    "max": 9499,
+    "p50": 3.0,
+    "p99": 106.0,
+    "p999": 543.0,
+    "n_empty": 1715154,
+    "n_buckets": 16777216,
+    "uint16_headroom": 6.899147278660911
+   }
+  },
+  {
+   "step": 17,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654240,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.52504357136786
+   },
+   "a": 0.7943282347242815,
+   "wall_force_s": 155.15823309868574,
+   "wall_migrate_s": 18.425507072359324,
+   "migrant_frac": 0.6964944154024124,
+   "arena_used_frac": 0.015479281544685364,
+   "max_fill_frac": 2.888888888888889,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 9.14103641574862,
+    "max": 12013,
+    "p50": 2.0,
+    "p99": 112.0,
+    "p999": 598.0,
+    "n_empty": 2094228,
+    "n_buckets": 16777216,
+    "uint16_headroom": 5.455340048281029
+   }
+  },
+  {
+   "step": 18,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654370,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.6027456372976303
+   },
+   "a": 0.8912509381337457,
+   "wall_force_s": 154.93630613945425,
+   "wall_migrate_s": 18.54923700541258,
+   "migrant_frac": 0.6865367591381073,
+   "arena_used_frac": 0.014866329729557037,
+   "max_fill_frac": 2.6300358102059085,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 9.37752484628515,
+    "max": 13774,
+    "p50": 2.0,
+    "p99": 117.0,
+    "p999": 651.0,
+    "n_empty": 2464513,
+    "n_buckets": 16777216,
+    "uint16_headroom": 4.757877159866415
+   }
+  },
+  {
+   "step": 19,
+   "repack": {
+    "scratch_bytes": 524288,
+    "slots_used": 147654279,
+    "slots_allocated": 165104028,
+    "max_brick_fill": 0.9090909090909091,
+    "wall_s": 2.532986432313919
+   },
+   "a": 1.0,
+   "wall_force_s": 154.31652936339378,
+   "wall_migrate_s": 18.850604079663754,
+   "migrant_frac": 0.6668538376688957,
+   "arena_used_frac": 0.014317065477371216,
+   "max_fill_frac": 1.9916267942583732,
+   "n_full_buckets": 0,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 9.612932743283224,
+    "max": 13126,
+    "p50": 2.0,
+    "p99": 122.0,
+    "p999": 706.0,
+    "n_empty": 2815012,
+    "n_buckets": 16777216,
+    "uint16_headroom": 4.992762456193814
+   }
+  }
+ ],
+ "wall_s": 8498.352114280686,
+ "ratified_estimate": {
+  "slack_and_arena_bpp": 0.9,
+  "all_in_bpp": 10.15,
+  "source": "D-v2-14 cl.2"
+ }
+}

@@ -60,8 +60,10 @@ echo "branch: $(git branch --show-current)"
 # green Slurm row that ran nothing is worse than a failure. These two checks
 # exist so that cannot happen again.
 command -v pixi >/dev/null 2>&1 || { echo "FATAL: pixi not on PATH"; exit 1; }
-pixi run python -c "import jax, inexor.layout; print('jax', jax.__version__)" \
-  || { echo "FATAL: environment cannot import jax + inexor.layout"; exit 1; }
+pixi run python -c "
+import jax, inexor.layout
+print('jax', jax.__version__, 'devices:', jax.devices())
+" || { echo "FATAL: environment cannot import jax + inexor.layout"; exit 1; }
 free -g | head -2
 
 # ---- the legs --------------------------------------------------------------
@@ -87,6 +89,6 @@ for i in "${!NAMES[@]}"; do
   [ "${CODES[$i]}" -eq 0 ] && ok=$((ok+1))
 done
 echo ""; echo "=== CARDS WRITTEN ==="
-ls -la runs/v2/m1_migration_cgh64*.json 2>/dev/null || echo "  (none)"
+ls -la runs/v2/m1_migration_*cgh64*.json 2>/dev/null || echo "  (none)"
 echo ""; echo "=== $(date -Is)  legs ok: $ok of ${#NAMES[@]} ==="
 [ "$ok" -gt 0 ] || { echo "FATAL: zero legs succeeded"; exit 1; }
