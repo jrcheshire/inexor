@@ -392,10 +392,14 @@ class BrickLayout:
             claims = claims[np.argsort(key_new[claims], kind="stable")]
             b_of_claim = key_new[claims]
 
-            # clear the affected buckets, then refill their prefixes
-            for b in affected:  # small: only buckets that changed
-                lo = int(self.bucket_start[b])
-                self.slot_to_particle[lo : lo + int(self.occupancy[b])] = -1
+            # Clear the affected buckets, then refill their prefixes. Vectorized:
+            # under a real step most buckets exchange somebody, so `affected` is
+            # O(n_buckets) -- 1.68e7 at cgh64 -- and a python loop here would
+            # dominate everything. Cost is the affected capacity, not the box.
+            lens = self.capacity[affected]
+            self.slot_to_particle[
+                np.repeat(self.bucket_start[affected], lens) + _within_run_index(lens)
+            ] = -1
             self.occupancy[affected] = 0
             # arena entries belonging to affected buckets are re-placed too
             stale = np.isin(self.arena_slot_bucket, affected)
