@@ -19,12 +19,42 @@ THE TWO ARMS ARE THE REAL DESIGN FORK.
 The per-run arm is the design most likely to miss the measured rate, and it is
 also the one you get by accident if you write the obvious loop.
 
-PRE-REGISTERED READING (written before the first rung ran).
-  Predicted: `assemble` is roughly flat in run length above ~64 KB and lands
-  within ~3x of G4's 359 GB/s; `per_run` falls off sharply below ~1 MB runs.
-  FALSIFIED IF: `assemble` at 37 KB runs is below ~40 GB/s, i.e. under ~10% of
-  sequential. Then the brick-sorted redesign buys ~10x on `stage` rather than
-  the ~20x the arithmetic allows, and the C-gh cost model needs redoing.
+PRE-REGISTRATION, ROUND 1 (job 896159) AND WHY IT WAS VOID.
+  It read: "`assemble` is flat above ~64 KB and within ~3x of 359 GB/s;
+  FALSIFIED IF `assemble` at 37 KB is below ~40 GB/s." The run came back at
+  7.6 GB/s effective and would have read as a falsification of the whole
+  streaming redesign. It was not. The probe device_put from a plain np.empty --
+  PAGEABLE host memory -- so every transfer went through the driver's bounce
+  buffer and flat-lined at ~19.6 GB/s at EVERY run length, which is the tell.
+  D-v2-13 clause 3 ratified `pinned_host`; a pageable number cannot test it.
+  The falsifier was miscalibrated against the probe's own defect, not measured
+  against the design.
+
+PRE-REGISTERED READING, ROUND 2 (written before the fixed rung ran).
+  The two rates are now separated, because they depend on different things:
+    gather        scattered-run memcpy into a contiguous buffer. RUN-LENGTH
+                  DEPENDENT. Round 1 measured this validly: 12.5 GB/s at
+                  37 KB rising to 18.7 GB/s at 1 MB, single-threaded on
+                  Neoverse-V2. Expect that to reproduce.
+    h2d_pinned    one contiguous transfer out of pinned host. Should be
+                  RUN-LENGTH INDEPENDENT and should approach D-v2-13's
+                  359-367 GB/s. If it does not, THAT is the surprise.
+    ideal         gather + h2d_pinned in series, the design's ceiling.
+  Predicted: h2d_pinned lands within ~2x of 359 GB/s and is flat in run length;
+  `ideal` at 37 KB is therefore gather-dominated, ~11-12 GB/s, and the binding
+  constraint on the streaming redesign is the HOST MEMCPY, not the transfer.
+  FALSIFIED IF: h2d_pinned is also ~20 GB/s (then pinning is not the
+  explanation and something else caps this node's H2D), or if gather at 37 KB
+  comes back far from round 1's 12.5 GB/s (then round 1's valid half was not
+  valid either).
+
+  NOTE ON WHAT `ideal` IS. It is a ceiling, not a built thing: jax exposes no
+  way to memcpy into a pinned buffer in place, so this probe gathers into
+  pageable memory and then stages to pinned outside the timer. A production
+  implementation has to gather DIRECTLY into cudaHostAlloc-backed memory, which
+  is an ffi-level concern and a real build item. Reported so the build knows
+  what it is aiming at rather than discovering the gap later.
+
   This is NOT a gate. No bar is tested and nothing here is ratified.
 
 It also does double duty as the only cost input to `n_brick`, which
@@ -82,7 +112,20 @@ def run_leg(src_gib, stage_mib, run_bytes, arm, reps=3):
 
     stage = np.empty(stage_n, dtype=np.uint8)
 
-    gather_s, h2d_s = [], []
+    # PINNED, not pageable. Job 896159's version of this probe device_put from a
+    # plain np.empty, i.e. PAGEABLE host memory, so every transfer went through
+    # the driver's bounce buffer and flat-lined at ~19.6 GB/s regardless of run
+    # length. That is not the path D-v2-13 clause 3 ratified (`pinned_host` +
+    # explicit device_put per chunk, measured 359-367 GB/s), so the number could
+    # not test the streaming premise and the falsifier written against it was
+    # miscalibrated. Both rates are now reported separately.
+    pinned_sh = None
+    for m in dev.addressable_memories():
+        if m.kind == "pinned_host":
+            pinned_sh = jax.sharding.SingleDeviceSharding(dev, memory_kind="pinned_host")
+            break
+
+    gather_s, h2d_page_s, h2d_pin_s = [], [], []
     for _ in range(reps):
         if arm == "assemble":
             t0 = time.perf_counter()
@@ -93,38 +136,57 @@ def run_leg(src_gib, stage_mib, run_bytes, arm, reps=3):
             jax.block_until_ready(out)
             t2 = time.perf_counter()
             del out
+            gather_s.append(t1 - t0)
+            h2d_page_s.append(t2 - t1)
+            if pinned_sh is not None:
+                # Stage into pinned host ONCE, outside the timer, then time only
+                # the pinned H2D -- the exact `staged` step G4 measured.
+                pin = jax.device_put(stage, pinned_sh)
+                jax.block_until_ready(pin)
+                t3 = time.perf_counter()
+                out = jax.device_put(pin, dev_sh)
+                jax.block_until_ready(out)
+                t4 = time.perf_counter()
+                del out, pin
+                h2d_pin_s.append(t4 - t3)
         elif arm == "per_run":
             t0 = time.perf_counter()
-            t1 = t0  # no separate gather phase: each run transfers on its own
             parts = []
             for o in offs:
-                p = jax.device_put(src[o : o + run_n], dev_sh)
-                parts.append(p)
+                parts.append(jax.device_put(src[o : o + run_n], dev_sh))
             jax.block_until_ready(parts[-1])
             t2 = time.perf_counter()
             del parts
+            gather_s.append(0.0)
+            h2d_page_s.append(t2 - t0)
         else:
             raise ValueError(arm)
-        gather_s.append(t1 - t0)
-        h2d_s.append(t2 - t1)
 
     # min-of-N, not mean: we want the achievable rate, and the tail is noise
     # from other tenants on the node (umbrella reference-kill-the-noise).
     g = float(np.min(gather_s))
-    h = float(np.min(h2d_s))
-    tot = g + h
+    hp = float(np.min(h2d_page_s))
+    hq = float(np.min(h2d_pin_s)) if h2d_pin_s else None
     gb = stage_n / 1024.0**3
+    # The design's ceiling: scattered-run gather THEN a pinned H2D. It is a
+    # ceiling and not a measurement of a built thing, because jax exposes no way
+    # to memcpy into a pinned buffer in place -- a production implementation has
+    # to gather directly into pinned memory (cudaHostAlloc-backed), which is an
+    # ffi-level concern. Reported so the build knows what it is aiming at.
+    ideal = (g + hq) if (hq is not None) else None
     return dict(
         arm=arm,
         run_bytes=run_n,
         n_runs=int(n_runs),
         bytes=int(stage_n),
         gather_s=g,
-        h2d_s=h,
-        total_s=tot,
+        h2d_pageable_s=hp,
+        h2d_pinned_s=hq,
         gather_gbs=(None if g <= 0 else gb / g),
-        h2d_gbs=(None if h <= 0 else gb / h),
-        effective_gbs=(None if tot <= 0 else gb / tot),
+        h2d_pageable_gbs=(None if hp <= 0 else gb / hp),
+        h2d_pinned_gbs=(None if not hq else gb / hq),
+        ideal_gbs=(None if not ideal else gb / ideal),
+        pinned_available=bool(pinned_sh is not None),
         platform=dev.platform,
     )
 
@@ -169,7 +231,19 @@ def main():
 
     recs = []
     print(f"=== V4e run-length sweep (src {args.src_gib} GiB, stage {args.stage_mib} MiB) ===")
-    print(f"{'run':>10s} {'n_runs':>7s} {'arm':>9s} {'gather':>10s} {'H2D':>10s} {'eff':>10s}")
+    _probe = spawn(args, RUN_BYTES[-1], "assemble")
+    if _probe.get("platform") != "gpu":
+        print(
+            "  WARNING: not a GPU backend. There is no real H2D here, so H2Dpage is a\n"
+            "  plain memcpy and H2Dpin is an EXTRA copy on top of it -- the two invert\n"
+            "  relative to a GPU and none of the transfer columns are readable. This run\n"
+            "  tests the plumbing only.",
+            flush=True,
+        )
+    print(
+        f"{'run':>10s} {'n_runs':>7s} {'arm':>9s} {'gather':>9s} {'H2Dpage':>9s} "
+        f"{'H2Dpin':>9s} {'ideal':>9s}   (GB/s)"
+    )
     for rb in RUN_BYTES:
         for arm in ("assemble", "per_run"):
             r = spawn(args, rb, arm)
@@ -177,11 +251,13 @@ def main():
             if r.get("failed") or r.get("skipped"):
                 print(f"{rb:10d} {'':>7s} {arm:>9s}  {r.get('skipped') or 'FAILED'}", flush=True)
                 continue
-            gg = r["gather_gbs"]
+
+            def f(x):
+                return "       --" if not x else f"{x:9.1f}"
+
             print(
-                f"{rb:10d} {r['n_runs']:7d} {arm:>9s} "
-                f"{('--' if gg is None else f'{gg:8.1f}'):>10s} "
-                f"{r['h2d_gbs']:10.1f} {r['effective_gbs']:10.1f}   GB/s",
+                f"{rb:10d} {r['n_runs']:7d} {arm:>9s} {f(r['gather_gbs'])} "
+                f"{f(r['h2d_pageable_gbs'])} {f(r['h2d_pinned_gbs'])} {f(r['ideal_gbs'])}",
                 flush=True,
             )
 
