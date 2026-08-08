@@ -211,7 +211,8 @@ class BrickLayout:
     # ---------------------------------------------------------------- build
 
     @classmethod
-    def build(cls, x, t9, bricks_per_side, slack_frac=0.10, arena_frac=0.01, alloc_margin=0.02):
+    def build(cls, x, t9, bricks_per_side, slack_frac=0.10, arena_frac=0.01, alloc_margin=0.02,
+              min_spare=1):
         """Sort positions into the slot layout.
 
         slack_frac is D-v2-14 clause 2's 0.90 B/p estimate expressed as a
@@ -244,8 +245,7 @@ class BrickLayout:
 
         # per-bucket capacity: its own count plus slack, at least one spare slot
         # wherever anything lives, so a single arrival never needs the arena
-        extra = np.ceil(counts * float(slack_frac)).astype(np.int64)
-        extra = np.where(counts > 0, np.maximum(extra, 1), extra)
+        extra = _capacity_extra(counts, slack_frac, min_spare)
         capacity = counts + extra
         _refuse_uint16_overflow(capacity, "capacity")
 
@@ -453,7 +453,7 @@ class BrickLayout:
             n_full_buckets=int(np.sum(occ >= cap_all)),
         )
 
-    def repack(self, slack_frac=0.10, chunk=1 << 20):
+    def repack(self, slack_frac=0.10, chunk=1 << 20, min_spare=1):
         """Redistribute capacity across buckets IN PLACE, with bounded scratch.
 
         WHY THIS IS NOT A SORT, which is the whole point. `migrate` already keeps
@@ -509,8 +509,7 @@ class BrickLayout:
 
         counts = np.bincount(all_b, minlength=self.n_buckets).astype(np.int64)
         _refuse_uint16_overflow(counts, "repack")
-        extra = np.ceil(counts * float(slack_frac)).astype(np.int64)
-        extra = np.where(counts > 0, np.maximum(extra, 1), extra)
+        extra = _capacity_extra(counts, slack_frac, min_spare)
         new_cap = counts + extra
         new_start = np.zeros(self.n_buckets + 1, dtype=np.int64)
         np.cumsum(new_cap, out=new_start[1:])
@@ -664,6 +663,24 @@ def _within_run_index(counts):
     starts = np.zeros(len(counts) + 1, dtype=np.int64)
     np.cumsum(counts, out=starts[1:])
     return np.arange(int(starts[-1]), dtype=np.int64) - np.repeat(starts[:-1], counts)
+
+
+def _capacity_extra(counts, slack_frac, min_spare=1):
+    """Spare slots per bucket: ceil(slack * count), floored at `min_spare` for
+    occupied buckets.
+
+    min_spare IS A REAL MEMORY TERM, not a safety detail. At the ratified ~8
+    particles per bucket a floor of 1 costs 12.5% of payload on its own, which
+    at the low end of a slack sweep DOMINATES the slack setting -- ceil(0.02*8),
+    ceil(0.05*8) and ceil(0.10*8) are all 1, so those settings are pinned by
+    this floor rather than by their own value. Setting it to 0 trades main-store
+    slack for arena traffic: a bucket sitting exactly at capacity sends every
+    arrival to the arena.
+    """
+    extra = np.ceil(np.asarray(counts) * float(slack_frac)).astype(np.int64)
+    if min_spare:
+        extra = np.where(counts > 0, np.maximum(extra, int(min_spare)), extra)
+    return extra
 
 
 def _prefix_mask(counts, fits):

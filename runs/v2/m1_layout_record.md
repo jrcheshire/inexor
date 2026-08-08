@@ -178,9 +178,50 @@ D-v2-14 clause 2's 10.15** -- about 29% over. At C-gh that is ~112 GB against
 the ~116 GB cliff: 1.03x under, where the ratified figure claimed 1.33x. So the
 repack removes the failure mode and does NOT by itself restore the budget.
 
-Not yet done: a slack sweep at fixed every-step cadence to minimize
-(main + arena) all-in. 0.20 was chosen to make the mechanism visible, not
-because it is optimal, and the two terms trade against each other.
+### 6a. The slack sweep, and where the floor actually comes from
+
+Five settings, every-step repack, uniform 10% allocation margin, cdev8, real
+force. All-in = (main + PEAK arena) x 9 + index, since the arena must be sized
+for the worst step:
+
+| slack | main xN | peak arena | all-in B/p | peak inside the run |
+|---|---|---|---|---|
+| **0.02** | 1.127 | 22.0% | **12.38** | yes, step 17 |
+| 0.05 | 1.142 | 21.4% | 12.46 | yes |
+| 0.10 | 1.177 | 20.3% | 12.67 | yes |
+| 0.20 | 1.260 | 18.1% | 13.22 | yes |
+| 0.35 | 1.419 | 15.1% | 14.38 | yes |
+
+**No interior minimum.** Monotonic, cheapest at the bottom. **12.38 B/p against
+the ratified 10.15, +22%** -- ~106 GB at C-gh against the ~116 GB cliff, 1.09x
+margin where D-v2-14 clause 2 claimed 1.33x.
+
+**The arena TURNS OVER rather than plateauing.** Every setting peaks at step 17
+and ends ~1.5% below its peak (slack 0.02: 3.7 -> 22.0 -> 20.6%, per-step
+increments +1.65, +1.20, +0.51, +0.37, -0.64, -0.82). So the allocation is
+bounded by a measured peak, not an extrapolation, and a = 1 is where production
+runs end anyway. My earlier "plateaued" was read off two steps and was
+imprecise; a quarter-mean test then called it "still climbing" because the early
+ramp dominates the average. Both were wrong about the shape; the series is a
+rise and turnover.
+
+**The 12.5% floor is granularity, and the `min_spare` rule that appeared to
+cause it is INERT.** `np.ceil` of any positive value is already >= 1, so
+`max(ceil(s*count), 1)` has always equalled `ceil(s*count)` -- verified
+elementwise, and a run at `min_spare=0` reproduced `min_spare=1` to every digit
+(main 1.127, arena 22.0%, 12.38 B/p). I had claimed that rule was the largest
+remaining term and worth ~1.1 B/p. It is worth nothing. The real cause is that a
+bucket cannot be given a FRACTION of a slot: any nonzero slack costs one whole
+slot per occupied bucket, which at ~8 particles per bucket is 12.5% of payload.
+
+**The lever that follows, untested:** allocate spare at BRICK granularity rather
+than per bucket. A brick is ~512 buckets / ~4096 particles, so one shared spare
+slot amortizes to 1/4096 instead of 1/8. A bucket needing room takes it from the
+brick's pool by shifting its neighbours along -- a move of at most 4096 entries
+inside a 37 KB block, the same local operation the repack already performs. That
+would remove the granularity floor and make slack a genuine tunable, which is
+where the remaining ~2 B/p would have to come from. Not built: it changes how
+the layout allocates, and that is a design call.
 
 ## 7. What the cgh64 run must report
 

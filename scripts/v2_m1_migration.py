@@ -193,6 +193,23 @@ def main():
         help="redistribute capacity in place every N steps (0 = never, the "
         "frozen-capacity policy D-v2-14 clause 3 ratifies)",
     )
+    ap.add_argument(
+        "--alloc-margin",
+        type=float,
+        default=0.10,
+        help="slot-array headroom above the BUILD requirement. The steady state "
+        "under clustering sits a little above it by a setting-dependent amount, "
+        "so a sweep needs one margin held fixed across every point -- otherwise "
+        "the points differ in two variables at once",
+    )
+    ap.add_argument(
+        "--min-spare",
+        type=int,
+        default=1,
+        help="spare slots guaranteed to every OCCUPIED bucket. At ~8 particles "
+        "per bucket a floor of 1 is 12.5%% of payload on its own, which dominates "
+        "any low slack setting; 0 trades that for arena traffic",
+    )
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args()
@@ -210,7 +227,7 @@ def main():
 
     from inexor.codec import T9Layout
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table, float_step_bullfrog
-    from inexor.layout import BrickLayout, bucket_order_key, choose_brick
+    from inexor.layout import BrickLayout, _capacity_extra, bucket_order_key, choose_brick
 
     sys.path.insert(0, HERE)
 
@@ -230,14 +247,19 @@ def main():
     coeffs = bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo))
 
     lay = BrickLayout.build(
-        x, t9, bricks_per_side, slack_frac=args.slack, arena_frac=args.arena_frac
+        x,
+        t9,
+        bricks_per_side,
+        slack_frac=args.slack,
+        arena_frac=args.arena_frac,
+        alloc_margin=args.alloc_margin,
+        min_spare=args.min_spare,
     )
     counts0 = lay.occupancy.astype(np.int64).copy()
     # capacity each ladder target would have frozen at build time
     cap_by_target = {}
     for s in SLACK_LADDER:
-        extra = np.ceil(counts0 * s).astype(np.int64)
-        extra = np.where(counts0 > 0, np.maximum(extra, 1), extra)
+        extra = _capacity_extra(counts0, s, args.min_spare)
         cap_by_target[s] = counts0 + extra
 
     n = g["n_total"]
@@ -273,7 +295,7 @@ def main():
         rep = None
         if args.repack_every and (k + 1) % args.repack_every == 0:
             t2 = time.perf_counter()
-            rep = lay.repack(slack_frac=args.slack, chunk=1 << 16)
+            rep = lay.repack(slack_frac=args.slack, chunk=1 << 16, min_spare=args.min_spare)
             rep["wall_s"] = time.perf_counter() - t2
             lay.check()
 
