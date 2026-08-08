@@ -1,4 +1,12 @@
-# inexor roadmap (master plan)
+# inexor roadmap (v1 master plan -- HISTORICAL RECORD)
+
+> **[2026-08-08] This file is the v1 record and is no longer forward-looking.**
+> v1 was halted 2026-07-14 when M2's premise measured false (read
+> `retrospective.md`); M3 and M4 are cancelled. The M0-M2 record below stands as
+> written and the gates D-010..D-015 are still in force. **The live plan is
+> `plan-plan-v2.md`**, whose Sec. 5 carries the ratified build ladder
+> M-v2-1..M-v2-7 (D-v2-18). The "Current status / Next" line immediately below
+> is preserved as it read at the halt; it is not current.
 
 Convention: this is the master plan; **each milestone gets its own detailed
 plan drawn up in plan mode at the session that opens it** (sfbfs/xphot

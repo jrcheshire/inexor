@@ -74,7 +74,11 @@ upstream reports, JC's call:**
    guard -> lossless int32 conversion, order-independent, bit-stable. NB the
    guard binds at production frac_bits=12 x 1e4-particle cells (4.1e7 >
    2^24): production options = fewer frac_bits / CAS loop / jax.ffi kernel /
-   upstream fix -- an M-v2-1 decision.
+   upstream fix -- **an M-v2-2 decision** (re-aimed 2026-08-08 per D-v2-18's
+   mandatory crosswalk; under the old numbering this said M-v2-1, which is now
+   the codec). NB it is a PERFORMANCE decision, not a correctness or adjoint
+   one: `painting.py`'s XLA `.at[].add()` path works today, and the atomic bug
+   binds only if the PRIMAL paint becomes a custom kernel.
 4. lax round_p (jnp.rint) has no Triton lowering; boolean mask algebra in
    one rint reformulation ALSO mis-lowered silently before the all-zeros
    finding superseded it (unconfirmed whether real; the shipped kernel is

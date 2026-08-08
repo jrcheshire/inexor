@@ -748,18 +748,19 @@ decision here is locked until explicitly re-litigated with JC.
 
 ---
 
-# V4 architecture freeze -- DRAFTS, NOT YET RATIFIED
+# V4 architecture freeze -- RATIFIED 2026-08-08
 
-D-v2-14 through D-v2-18 below are **PROPOSED** and await JC. They are drafted
-from `runs/v2/v4_architecture_record.md` (jobs 896159, 896160, 896408) and
-`runs/v2/v4_pricing_record.md`. Every clause either cites a measured number or
-labels itself an estimate. Nothing here is in force until the status line says
-accepted.
+D-v2-14 through D-v2-18 below were ACCEPTED by JC on 2026-08-08, unamended.
+They rest on `runs/v2/v4_architecture_record.md` (jobs 896159, 896160, 896408)
+and `runs/v2/v4_pricing_record.md`. Every clause either cites a measured number
+or labels itself an estimate; the estimates stay labelled after ratification,
+and D-v2-14 clause 2's slack term is an M-v2-1 exit condition precisely because
+ratifying it did not measure it.
 
 ## D-v2-14 -- State architecture: T9 at the implementable quantum, on a brick-sorted layout
 
-- **Status:** PROPOSED (drafted 2026-08-07). Amends D-v2-8's state-tier clause;
-  does not touch its requirements chain.
+- **Status:** accepted (JC, 2026-08-08, V4 freeze; drafted 2026-08-07). Amends
+  D-v2-8's state-tier clause; does not touch its requirements chain.
 - **Context:** D-v2-8 ratified T9 = 9 B/p on G2c's `t9` arm. That gate says in
   its own docstring (`v2_g2c_accum_gate.py:35`) that it "measures
   REPRESENTATION error only (storage layout is a build decision)". V4 takes
@@ -805,7 +806,7 @@ accepted.
 
 ## D-v2-15 -- IC architecture: disk staging, a 1D transfer table, and an out-of-core FFT
 
-- **Status:** PROPOSED (drafted 2026-08-07).
+- **Status:** accepted (JC, 2026-08-08, V4 freeze; drafted 2026-08-07).
 - **Context:** the only IC memory number on record (76 B/p, v1 R6) is device
   only. Nothing had ever measured the host side, and IC generation was
   sidestepped by every gate loading from an offline npz.
@@ -839,8 +840,8 @@ accepted.
 
 ## D-v2-16 -- Force architecture freeze
 
-- **Status:** PROPOSED (drafted 2026-08-07). Discharges D-v2-10's reservation
-  of the operating (T, b) to V4.
+- **Status:** accepted (JC, 2026-08-08, V4 freeze; drafted 2026-08-07).
+  Discharges D-v2-10's reservation of the operating (T, b) to V4.
 - **Decision:**
   1. **The force is never materialized globally.** Its only consumer is the
      integrator's elementwise kick and ownership is a partition, so the kick
@@ -885,8 +886,8 @@ accepted.
 
 ## D-v2-17 -- Gating scope: the uncorrected split stays gated; C-hero is capacity-only
 
-- **Status:** PROPOSED (drafted 2026-08-07). Discharges D-v2-11 clause 4 and
-  D-v2-13's hero-scoping item.
+- **Status:** accepted (JC, 2026-08-08, V4 freeze; drafted 2026-08-07).
+  Discharges D-v2-11 clause 4 and D-v2-13's hero-scoping item.
 - **Decision:**
   1. **D-v2-9's bar continues to be read on the UNCORRECTED split.**
      D-v2-11's transfer stays reported and is applied in production, but
@@ -901,8 +902,8 @@ accepted.
 
 ## D-v2-18 -- Build roadmap
 
-- **Status:** PROPOSED (drafted 2026-08-07). Replaces the M-v2-1..4
-  placeholders in `docs/plan-plan-v2.md` §5.
+- **Status:** accepted (JC, 2026-08-08, V4 freeze; drafted 2026-08-07). Replaces
+  the M-v2-1..4 placeholders in `docs/plan-plan-v2.md` §5, applied 2026-08-08.
 - **Decision:** the codec moves first, because the layout is defined in terms
   of it and the IC stage emits it.
 

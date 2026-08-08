@@ -31,6 +31,11 @@ https://claude.ai/code/artifact/370ba948-b9ea-4e42-9c15-92dce10fdf55).
 | D-v2-11 | **The low-k split error IS a correctable transfer, and it calibrates OFF-BOX** (JC, 2026-07-29, G6 close; full ADR in `decisions.md`). Supersedes D-v2-10's "a measured-transfer correction cannot currently be claimed"; the G5 verdict is untouched. Near-pure window (max(1-r) = 3e-5 at k <= 0.5, phase-perfect), so a leave-one-out transfer removes a factor 9.0 at k <= 0.5 within C-dev. On a fixed-cell 1x/8x/64x box ladder the transported residual on the gate band is 1/16, 1/71 and 1/13 of the 3e-2 bar, so **T-bar is calibrated once on a small ensemble and applied per mock: no monolithic reference and no ensemble at the production box**, which is what makes the memory saving real rather than notional. Tile size and origin are measured non-triggers; **fine cell, cosmology and redshift are UNMEASURED and treated as triggers**. The correction is reported, not gated: D-v2-9's bar is still read on the UNCORRECTED split. Residual floor: ~12-20% per-realization scatter is physical (shared-IC ratio cancels cosmic variance), leaving ~1e-3 at k <= 0.5 on any single box regardless of calibration seeds. |
 | D-v2-12 | **G3 verdict: A3 dies; A2's buffer is sized at 4 r_s** (JC, 2026-08-06, G3 close; full ADR in `decisions.md`). Fires the pre-registered V2 kill line. A3 (sCOLA-style sequential independent tiles) misses D-v2-7's 15% bar by 2.7-6.1x at cdev, and the failure is realization-INDEPENDENT: each tile solves the FULL kernel on its own periodic padded box, so it carries only 15-40% of the monolithic long-mode POWER and the amplitude knee tracks the padded-tile fundamental across four arms. A2 unaffected; D-v2-10/D-v2-11 untouched; the negative is publishable (P-C). **Two of the three ratified G3 statistics were withdrawn** -- R_Q carries the power deficit into Q's denominator with the opposite sign and flips positive at x <= 1, and rho divides by the CROSS transfer T = r*A and so tracks 1/r^2 - 1 (measured 16/16 cells within 10-20%, reaching 3.6e4 where r crosses zero). Readings now use rho_auto, built on the AUTO transfer. The realization-matched estimand is retired as the default for tiled-vs-monolithic comparison. **Clause 5 discharges G3's other deliverable**: on the two-level spine with the fine level TILED, max|rho_auto| = 0.0051 vs the 0.15 bar (29x) at BOTH 4 and 8 r_s, identical to four decimals, so **4 r_s is ample and 8 buys nothing**, at 2.3x monolithic compute. |
 | D-v2-13 | **V3 verdict: host-resident state streams; the GH200 ceiling is ~116 GB; `staged` is the production path** (JC, 2026-08-06, V3/G4 close; full ADR in `decisions.md`). Discharges both halves of V3's exit. **The seed's coherent/staged/infeasible trichotomy is not expressible** -- jax 0.10.2 + CUDA aarch64 exposes only `['device','pinned_host']`, so ATS on pageable LPDDR is untested and the word "coherent" must not enter the record. Measured instead: state larger than HBM streams at 359-367 GB/s with **4.00 GiB device residency independent of working-set size** (C-gh paint 3.91 B/p vs G5's tiled 24.7 / mono 377), and C-gh's 2048^3 paint runs on one GH200. **The host ceiling is ~116 GB and is a HARD CLIFF** (full rate at 116.0 GB, ~100x collapse at 120.3 GB; physical LPDDR, confirmed by a 4.3 GB bracket and by an S3 h100 running the same rung flat on a 1007 GiB host), so a C-gh operating point must sit CLEAR of it -- C-gh's T9 state is 77.3 GB, ~1.5x under. **`staged` beats the XLA-managed arm 2.78x on the REAL paint while LOSING 14-20% on the ladder** -- the ordering inverts, so the microbenchmark predicts neither ratio nor sign; the XLA-managed path is kept as a memory-vs-wall knob (half the device memory for 2.78x the wall). **C-hero is viable on memory**: one h100 streams 4096^3's full 618.5 GB T9 state flat across a 9x span, at **1.80x** the GH200's wall on real work -- and the 6.71-6.87x FABRIC ratio does NOT propagate. Step-level cost is unmeasured everywhere: the two-level force has only run at cgh64 = C-gh at 1/64 volume. |
+| D-v2-14 | **State architecture: T9 at the implementable quantum, on a brick-sorted layout** (JC, 2026-08-08, V4 freeze; full ADR in `decisions.md`). The gated `t9` arm quantized at `fine_cell/256`, which an int8 carries only if its bucket is ONE FINE CELL — a per-cell index costs ~69 GB at C-gh against the 77 GB of state it indexes, so the ratified tier was gated at a resolution no affordable layout can deliver. **Bucket becomes 1.0 Mpc/h, quantum `fine_cell/64`**, 15x margin on D-v2-9's bar with a 2.15 GB index; chosen on margin, NOT on a measured ordering (the ladder is non-monotonic and all four arms pass). **All-in is 10.15 B/p, not 9.** Layout is brick-sorted with per-bucket capacity and eject-and-reinsert exchange; overflow escalates slack -> arena -> refusal and **may never clamp**. Admissible only because the paint is order-independent, which makes D-v2-16 clause 2 a precondition. IDs are an opt-in int32 tier, refused above n_side 1290. |
+| D-v2-15 | **IC architecture: disk staging, a 1D transfer table, an out-of-core FFT** (JC, 2026-08-08, V4 freeze; full ADR in `decisions.md`). The IC host term is real at **~90 B/p and FLAT in N** (~773 GB at 2048^3 against a 116 GB ceiling) — never measured before, and the shape prediction was wrong. The fix is cheap and both halves are already in the tree (1D log-k table + `linear_power(backend="table")`). Disk stages the IC stage ONLY; evolve does not spill. **A 2048^3 `rfftn` does not fit a GH200** (ceiling between 1024^3 and 1536^3, workspace 7x the field), so the out-of-core layer is REQUIRED at C-gh and cannot defer to C-hero. Reproducibility is defined against a decomposition, not across one: the canonical noise unit is one XY plane keyed by `fold_in`. |
+| D-v2-16 | **Force architecture freeze** (JC, 2026-08-08, V4 freeze; full ADR in `decisions.md`). **The force is never materialized globally** — ownership is a partition so the kick applies tile-locally, deleting the 2 x 206 GB of host arrays that kept C-gh unrunnable. **`paint_tsc_int` is a required deliverable**: `paint_tsc_f64` uses order-dependent f64 `.at[].add` and `--assign-long` defaults to tsc, so the coarse arm ratified in D-v2-10 violates D-006 today. The long-range force is staged as a per-tile coarse sub-block (resident is 12.9 GB at C-gh but 103 GB at C-hero against 96 GB HBM). Geometry T=256/b=32, **PROVISIONAL until measured at C-gh** — the criterion is frozen, the number is not. `cap` is the cost variable with nothing co-varying. The streaming constraint is the HOST GATHER, not the transfer, and the 18x is contingent on an ffi-level pinned gather jax cannot express. **Promotion out of `scripts/v2_g5_core.py` is gated on bitwise parity against the retained probe at three geometries.** |
+| D-v2-17 | **Gating scope** (JC, 2026-08-08, V4 freeze; full ADR in `decisions.md`). D-v2-9's bar continues to be read on the **UNCORRECTED** split: gating the corrected quantity would let a calibration absorb an architecture error, and the transfer's own ~1e-3 irreducible residual would move inside the gate rather than beside it. **C-hero is a capacity demonstration only** — no monolithic reference can exist at hero scale, so hero runs measure cost, memory and completion, and accuracy is inherited via D-v2-11's off-box transport with that caveat attached to any data product. |
+| D-v2-18 | **Build roadmap** (JC, 2026-08-08, V4 freeze; full ADR in `decisions.md`). Seven rungs M-v2-1..7, codec first because the layout is defined in terms of it and the IC stage emits it. Table + mandatory crosswalk in Sec. 5. |
 
 ## 1. Thesis
 
@@ -116,6 +121,23 @@ C-vol trades mass floor for volume at the bar's edge (spacing 0.63, cell
 slider explicit, not as a commitment. Gate week runs on C-dev; C-gh is V3's
 target; C-hero/C-vol are V4 capacity checks.
 
+**Capacity column, re-derived at V4 (D-v2-14 clause 2).** The ratified state
+tier costs **10.15 B/p all-in, not 9**: T9 payload 9.00 (int8 x3 positions +
+int16 x3 velocities), bucket index 0.25, brick CSR 0.004, slack and arena 0.90.
+The bucket is 1.0 Mpc/h (two particle cells), so the index is (L/1.0)^3 uint16
+entries.
+
+| config | N_p | T9 payload | bucket index | all-in state | host | headroom |
+|---|---|---|---|---|---|---|
+| C-dev | 256^3 | 0.15 GB | 0.004 GB | 0.17 GB | — | not binding |
+| C-gh | 2048^3 | 77.3 GB | 2.15 GB | **87.2 GB** | ~116 GB LPDDR (a HARD cliff, D-v2-13) | **1.33x under**, not the 1.50x the 9 B/p figure implied |
+| C-hero | 4096^3 | 618.5 GB | 17.2 GB | ~697 GB | ~1 TB | ~1.4x under |
+| C-vol | 4096^3 | 618.5 GB | 34.4 GB | ~715 GB | ~1 TB | ~1.4x under |
+
+**The 0.90 B/p slack term is an ESTIMATE** from a hand argument about migration
+rates -- 7.7 GB of C-gh's 87.2. Measuring it at `cgh64` is an exit condition of
+M-v2-1, and a materially larger number moves this table and amends D-v2-14.
+
 ## 3. The compute<->memory tradeoff map (D-v2-4)
 
 Instrument, not afterthought. Every gate run reports the triple
@@ -183,8 +205,10 @@ on tails). Outputs land in `runs/v2/` (gitignored).
 ## 5. Seeds
 
 Sequence: V0 -> V1 -> V2 -> V3 -> V4 (freeze) -> V5+ (build) -> VD (deferred).
-V1-V3 are the "gate week" -- **V1, V2a, V2b and V3 are all CLOSED as of 2026-08-06 (D-v2-8..D-v2-13); V4 is next**: every premise priced before the architecture
-freezes. Each seed's prompt is meant to be pasted at that session's start
+V1-V3 are the "gate week" -- **all CLOSED: V1/V2a/V2b/V3 as of 2026-08-06
+(D-v2-8..D-v2-13), and V4 as of 2026-08-08 (D-v2-14..18). The build ladder
+M-v2-1..7 is open at Sec. 5; M-v2-1 is in flight**: every premise priced before
+the architecture froze. Each seed's prompt is meant to be pasted at that session's start
 (plan mode; floors before gates; state compute placement up front).
 
 ### V0 -- requirements pin + tradeoff frame  [with JC; no compute]
@@ -329,6 +353,16 @@ estimator is a PORT from mbody (`fields.py:174` + `ic.py:151`), not a build.**
 
 ### V4 -- architecture freeze + v2 roadmap  [with JC]
 
+**STATUS (2026-08-08): CLOSED. D-v2-14..18 ratified unamended; the exit is
+discharged** -- ADRs written, the roadmap section below replaced with the
+seven-rung ladder, the capacity table re-derived at 10.15 B/p, and the
+crosswalk applied. Record `runs/v2/v4_architecture_record.md` (jobs 896159,
+896160, 896408) and `runs/v2/v4_pricing_record.md` (895315/895316/895439).
+The seed's own framing survived contact with one exception worth keeping: A3
+did NOT pass, so there is no companion product, and the freeze had to reopen
+the ratified state tier because G2c had measured representation error while
+explicitly deferring storage layout.
+
 - **Goal:** with G1/G2c/G5/G3/G4 numbers on the table: pick the architecture
   (expected: A2 Mock Factory shape -- state tier per G2c, framework per G1,
   mesh split per G5, node ladder per G4; A3 as a companion product if G3
@@ -351,22 +385,34 @@ estimator is a PORT from mbody (`fields.py:174` + `ic.py:151`), not a build.**
   only, no code.
   ```
 
-### V5+ -- build milestones  [instantiated at V4]
+### V5+ -- build milestones  [instantiated at V4; ratified as D-v2-18, 2026-08-08]
 
-Placeholders; V4 writes their real seeds with gate-informed numbers:
+The ladder below REPLACES the four placeholders this section used to carry.
+**The codec moves first**, because the layout is defined in terms of it and the
+IC stage emits it. Each rung opens with its own detailed plan session.
 
-- **M-v2-1 engine core:** two-level PM forward on the chosen framework,
-  V0-config correctness vs the v1 parity arms (mbody/DISCO where configs
-  overlap), deterministic paint, per-step-jit/donation discipline.
-- **M-v2-2 tiles + ICs:** tile streaming, buffer machinery, counter-based
-  on-demand tile ICs (tiling-invariant by keying on absolute q-cell/mode --
-  verify identity vs monolithic at f64 first; the sCOLA master-field
-  precedent slices, it does not regenerate: this part is new).
-- **M-v2-3 codec + capacity:** the G2c-winning codec live; capacity ladder
-  runs (deneb -> GH -> S3 hero) with the cost-of-memory table finalized.
-- **M-v2-4 output stage:** on-the-fly P(k)/bispectrum + halo-proxy or
-  field-level-bias emission per D-v2-8; snapshot packing tier (pack9-class);
-  v28-style mock hand-off format (disco-mocks compatibility check).
+| id | scope | exit gate |
+|---|---|---|
+| M-v2-1 | codec + layout: T9 pack/unpack, brick-sorted state, per-bucket capacity, incremental exchange, opt-in ID tier | exact round-trip; wrap-never-clamp asserted; **measured** migrant distribution and slack at cgh64 (D-v2-14 clause 2) |
+| M-v2-2 | harden and promote the two-level force; `paint_tsc_int`; the ffi pinned gather | bitwise parity vs the probe at 3 geometries; runtime invariants become tests; regression tests for the three measured bugs |
+| M-v2-3 | engine core on T9 state | correctness vs the v1 parity arms where configs overlap |
+| M-v2-4 | f32 force mesh | thread `fdtype`, re-run `v2_g3_floors.py` unchanged, read against the MESH FLOOR not zero; own gate, cannot ride on D-v2-9's or G6's |
+| M-v2-5 | streamed ICs + out-of-core FFT | tile-IC identity vs monolithic at f64; the transfer table's error < 1e-4 |
+| M-v2-6 | capacity | **a complete 2048^3 mock on one Vista gh node** |
+| M-v2-7 | output stage | HMF within 5%, halo b1 within 2% at k <= 0.25; squeezed B <= 15%; disco-mocks read-back |
+
+**Crosswalk from the old numbering** (the charter's IDs are referenced
+elsewhere and must not read as silently renumbered): old M-v2-1 engine core ->
+new M-v2-3; old M-v2-2 tiles+ICs -> new M-v2-5; old M-v2-3 codec+capacity ->
+split across new M-v2-1 and M-v2-6; old M-v2-4 output -> new M-v2-7. Applied
+2026-08-08 in `runs/v2/cost_of_memory.md`, whose Pallas `atomic_add` deferral
+pointed at "M-v2-1" and now points at M-v2-2. NB the gitignored
+`g5_results_*.json` cards carry an `M-v2-2` in their `host_bucketing` note under
+the OLD meaning, which is new M-v2-1; they are frozen records, left as written.
+
+**Not scheduled, deliberately:** PP-in-tiles (own gate, never a default);
+reviving A3 via the frozen-background arm (shelved, D-v2-12); an absolute RSD
+bar, which D-v2-8 clause 5 still needs before anything leans on it.
 
 ### VD -- differentiable slow mode  [deferred; opens only when named]
 

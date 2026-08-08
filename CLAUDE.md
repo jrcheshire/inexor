@@ -12,16 +12,22 @@ mbody owns MLX/Apple-Silicon).
 
 ## Current milestone
 
-**v2 OPENED** (2026-07-14). Master strategy + session seeds:
-`docs/plan-plan-v2.md` — START THERE. Near-term sequence: seed V0
-(requirements pin + tradeoff frame, with JC) -> V1/V2/V3 (the gate week:
-G1 kernel floor, G2c accumulated codec gate, G5 two-level force split,
-G3 tile seams incl. squeezed bispectrum at the 15% bar, G4 GH200 coherent
-path) -> V4 (architecture freeze + build roadmap). Design-space study:
-`docs/design-study-2026-07-14.html` (artifact:
+**Building M-v2-1 (codec + layout).** The gate week (V1, V2a, V2b, V3) and the
+V4 architecture freeze are CLOSED: D-v2-14..18 ratified 2026-08-08 and the
+build ladder is D-v2-18's seven rungs, M-v2-1 through M-v2-7. Master strategy +
+session seeds: `docs/plan-plan-v2.md` — START THERE; the freeze's measurements
+are `runs/v2/v4_architecture_record.md` and `runs/v2/v4_pricing_record.md`.
+Design-space study: `docs/design-study-2026-07-14.html` (artifact:
 https://claude.ai/code/artifact/370ba948-b9ea-4e42-9c15-92dce10fdf55).
-New probes: `scripts/v2_g2_residual_range.py`, `scripts/v2_g2b_codec_ladder.py`
-(results quoted in the plan-plan; outputs `runs/v2/`, gitignored).
+
+**The probes in `scripts/v2_*.py` are the ratified oracles** — D-v2-10,
+D-v2-11 and D-v2-12 are measurements OF `scripts/v2_g5_core.py`, and D-v2-16
+clause 7 gates promotion on bitwise parity against it kept unmodified. They
+import `inexor.{config,cosmology,ic,lpt}`, `integrate.{a_grid,bullfrog_table,
+bullfrog_float_coeffs,float_step_bullfrog}`, `forces.make_force_fn`, and some
+PRIVATE painting/diagnostics symbols (`_cic_pieces`, `_corner_flat_weight`,
+`_CORNERS`, `_k_grid`, `_bin_edges`, `_shell_mask`). Those names carry a
+stability contract in practice: changing them silently moves an oracle.
 
 v1 record (closed): M0 PASSED — GO (D-010..D-012, `runs/m0/`); M1 forward PM
 DONE 2026-07-13 (mbody parity at its floor; DISCO-DJ gap attributed to 3
@@ -56,7 +62,7 @@ explicit `--mem` (see the umbrella albireo memory).
   the load-bearing novel pieces.
 - `docs/roadmap.md` — master plan M0-M4; M0 is a HARD go/no-go gate; each
   milestone gets a fresh detailed plan at its opening session.
-- `docs/decisions.md` — ADR log (D-001..D-015, D-v2-8..D-v2-12; D-v2-1..7 live
+- `docs/decisions.md` — ADR log (D-001..D-015, D-v2-8..D-v2-18; D-v2-1..7 live
   in the plan-plan table). Locked until re-litigated with JC.
 - `paper/outline.md` — claims, money plots, verified citation list + the
   citation guard (refuted claims never to reintroduce).
