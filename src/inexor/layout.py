@@ -834,9 +834,48 @@ class BrickPackedLayout:
         return int(self.brick_start[brick_flat]) + out
 
     def brick_members(self, brick_flat):
+        """Live particles belonging to a brick, INCLUDING its arena residents.
+
+        The run alone is not the brick's membership. An arena particle still
+        belongs to this brick -- it is only stored elsewhere because the brick
+        was momentarily full -- and omitting it would silently drop it from the
+        force. At the measured peak that is 0.57% of particles vanishing from
+        gravity with nothing raising, which is why this is not an optimization
+        detail.
+        """
         lo, hi = self.brick_slot_range(brick_flat)
         run = self.slot_to_particle[lo:hi]
-        return run[run >= 0]
+        out = run[run >= 0]
+        if self.arena_bucket is not None and len(self.arena_bucket):
+            # free arena slots carry -1, and -1 // p3 is -1, so they never match
+            sel = np.nonzero(self.arena_bucket // self.buckets_per_brick == brick_flat)[0]
+            if len(sel):
+                out = np.concatenate([out, self.slot_to_particle[self.arena_base + sel]])
+        return out
+
+    def tile_members(self, tijk, n_tile, b_fine, n_brick, n_fine):
+        """Live particle indices covering tile+buffer, as the brick union.
+
+        Same union and same wrap guard as `BrickLayout.tile_members` and as the
+        ratified probe's; only the per-brick storage differs.
+        """
+        nb = int(n_fine) // int(n_brick)
+        if nb != self.bricks_per_side:
+            raise ValueError(
+                f"brick grid {nb} from (n_fine={n_fine}, n_brick={n_brick}) disagrees with "
+                f"the layout's {self.bricks_per_side}"
+            )
+        pad, span = brick_span(n_tile, b_fine, n_brick, nb)
+        lo = np.asarray(tijk, dtype=np.int64) * (int(n_tile) // int(n_brick)) - pad
+        out = []
+        for i in range(span):
+            bi = (lo[0] + i) % nb
+            for j in range(span):
+                bj = (lo[1] + j) % nb
+                for k in range(span):
+                    bk = (lo[2] + k) % nb
+                    out.append(self.brick_members((bi * nb + bj) * nb + bk))
+        return np.concatenate(out) if out else np.empty(0, dtype=np.int64)
 
     def migrate(self, x_new):
         """Rebuild every brick whose contents changed.

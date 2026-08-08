@@ -22,11 +22,17 @@ Plus the invariants both layouts share: particles are conserved, overflow raises
 rather than clamping (D-007), and `check()` fails when the layout is broken.
 """
 
+import os
+import sys
+
 import numpy as np
 import pytest
 
-from inexor.codec import T9Layout
-from inexor.layout import BrickPackedLayout
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "scripts"))
+
+from inexor.codec import T9Layout  # noqa: E402
+from inexor.layout import BrickPackedLayout  # noqa: E402
 
 L_BOX = 128.0
 N_PART = 32
@@ -183,3 +189,77 @@ def test_check_catches_corruption(corrupt, match):
         lay.n_particles -= 1
     with pytest.raises(AssertionError, match=match):
         lay.check()
+
+
+# --------------------------------------------------- membership for the force
+
+
+# A dedicated geometry: the module fixture's 2 bricks per side makes tile+buffer
+# wrap the brick grid, which brick_span correctly refuses. 64 particles per side
+# gives an 8-brick grid where a 32-cell tile with a 16-cell buffer fits.
+TM_N_PART, TM_N_FINE, TM_BRICKS = 64, 128, 8
+TM_TILE, TM_BUF = 32, 16
+
+
+def _tm_setup(seed=11):
+    import jax
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    import jax.numpy as jnp
+
+    from inexor.codec import T9Layout, roundtrip_positions
+    from inexor.layout import choose_brick
+
+    t9 = T9Layout(box_size=L_BOX, n_part=TM_N_PART, bucket_cells=2)
+    rng = np.random.default_rng(seed)
+    g = (np.arange(TM_N_PART) + 0.5) * (L_BOX / TM_N_PART)
+    q = np.stack(np.meshgrid(g, g, g, indexing="ij"), axis=-1).reshape(-1, 3)
+    x = np.mod(q + rng.normal(scale=0.35 * L_BOX / TM_N_PART, size=q.shape), L_BOX)
+    xq = np.asarray(roundtrip_positions(jnp.asarray(x), t9))
+    n_brick = choose_brick(TM_TILE, TM_BUF, TM_N_FINE)
+    jax.config.update("jax_enable_x64", prev)
+    return t9, x, xq, n_brick
+
+
+def test_tile_membership_matches_the_ratified_probe():
+    """The force consumes this. `scripts/v2_g5_core.py` is the oracle
+    (D-v2-16 cl.7), and membership must agree EXACTLY on matched inputs -- the
+    probe fed the same quantized positions the layout stores."""
+    from v2_g5_core import brick_buckets as probe_brick_buckets
+    from v2_g5_core import tile_members as probe_tile_members
+
+    t9, x, xq, n_brick = _tm_setup()
+    assert TM_N_FINE // n_brick == TM_BRICKS
+    lay = BrickPackedLayout.build(x, t9, TM_BRICKS, brick_slack=0.10)
+
+    order, starts, nb = probe_brick_buckets(xq, TM_N_FINE, n_brick, L_BOX / TM_N_FINE)
+    for tijk in ((0, 0, 0), (1, 2, 3), (nb - 1, 0, nb - 1)):
+        t = np.asarray(tijk)
+        mine = lay.tile_members(t, TM_TILE, TM_BUF, n_brick, TM_N_FINE)
+        theirs = probe_tile_members(order, starts, nb, t, TM_TILE, TM_BUF, n_brick)
+        assert np.array_equal(np.sort(mine), np.sort(theirs)), f"tile {tijk}"
+        assert len(np.unique(mine)) == len(mine), "a particle appears twice in one tile"
+
+
+def test_arena_residents_are_not_dropped_from_membership():
+    """The silent-mass-loss guard. An arena particle still BELONGS to its brick;
+    omitting it would delete it from the force with nothing raising. Forced by
+    collapsing the box so the arena is populated, then checking the union over
+    ALL bricks accounts for every particle exactly once."""
+    t9, x, _, n_brick = _tm_setup(seed=12)
+    lay = BrickPackedLayout.build(x, t9, TM_BRICKS, brick_slack=0.0, arena_frac=1.0)
+    rng = np.random.default_rng(13)
+    clump = np.mod(
+        rng.normal(loc=L_BOX * 0.5, scale=L_BOX * 0.02, size=(TM_N_PART**3, 3)), L_BOX
+    )
+    st = lay.migrate(clump)
+    lay.check()
+    assert st["arena_used"] > 0, "fixture did not populate the arena"
+
+    seen = np.concatenate([lay.brick_members(b) for b in range(lay.n_bricks)])
+    assert len(seen) == lay.n_particles, (
+        f"brick union holds {len(seen)} of {lay.n_particles} particles -- "
+        f"{lay.n_particles - len(seen)} would vanish from the force"
+    )
+    assert len(np.unique(seen)) == lay.n_particles, "a particle is in two bricks"
