@@ -186,6 +186,13 @@ def main():
     # run completes and the ladder below reports the demand instead of the
     # script dying at the first bucket that outgrows its frozen capacity.
     ap.add_argument("--arena-frac", type=float, default=1.0)
+    ap.add_argument(
+        "--repack-every",
+        type=int,
+        default=0,
+        help="redistribute capacity in place every N steps (0 = never, the "
+        "frozen-capacity policy D-v2-14 clause 3 ratifies)",
+    )
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args()
@@ -263,8 +270,16 @@ def main():
         counts = np.bincount(key_now, minlength=lay.n_buckets).astype(np.int64)
         assert int(counts.sum()) == n, "counts lost particles"
 
+        rep = None
+        if args.repack_every and (k + 1) % args.repack_every == 0:
+            t2 = time.perf_counter()
+            rep = lay.repack(slack_frac=args.slack, chunk=1 << 16)
+            rep["wall_s"] = time.perf_counter() - t2
+            lay.check()
+
         rec = dict(
             step=k,
+            repack=rep,
             a=float(a_steps[k + 1]),
             wall_force_s=t_force,
             wall_migrate_s=t_mig,
@@ -283,7 +298,13 @@ def main():
         print(
             f"  step {k:3d} a={rec['a']:.4f}  migrants {rec['migrant_frac']:7.3%}  "
             f"arena {rec['arena_used_frac']:7.3%}  max_occ {rec['occupancy']['max']:5d}  "
-            f"force {t_force:7.2f}s  migrate {t_mig:6.2f}s",
+            f"force {t_force:7.2f}s  migrate {t_mig:6.2f}s"
+            + (
+                f"  REPACK {rep['wall_s'] * 1000:.0f}ms scratch "
+                f"{rep['scratch_bytes'] / 1e6:.2f}MB slots {rep['slots_used'] / n:.3f}xN"
+                if rep
+                else ""
+            ),
             flush=True,
         )
 

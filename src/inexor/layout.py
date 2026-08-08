@@ -211,12 +211,21 @@ class BrickLayout:
     # ---------------------------------------------------------------- build
 
     @classmethod
-    def build(cls, x, t9, bricks_per_side, slack_frac=0.10, arena_frac=0.01):
+    def build(cls, x, t9, bricks_per_side, slack_frac=0.10, arena_frac=0.01, alloc_margin=0.02):
         """Sort positions into the slot layout.
 
         slack_frac is D-v2-14 clause 2's 0.90 B/p estimate expressed as a
         fraction of payload; it is a knob here precisely because it is not yet
         measured. arena_frac sizes the shared overflow region.
+
+        alloc_margin gives the slot array a little room ABOVE what the initial
+        capacities need, so a later `repack` at the same slack fits. Without it
+        the allocation sits exactly on the steady-state requirement and a
+        repack under real clustering missed by 194 slots in 2.6e6 -- 0.007%,
+        harmless in size and fatal in effect. The total requirement is very
+        nearly invariant under clustering (bucket occupancies always sum to N),
+        which is why a margin this small is enough; it is NOT a slack fraction
+        and should not be grown to absorb one.
         """
         t9_n_buckets_side = t9.n_buckets_side
         if t9_n_buckets_side % int(bricks_per_side):
@@ -243,9 +252,12 @@ class BrickLayout:
         bucket_start = np.zeros(n_buckets + 1, dtype=np.int64)
         np.cumsum(capacity, out=bucket_start[1:])
         n_slots = int(bucket_start[-1])
+        # headroom lives past the last bucket's run, so it costs nothing until a
+        # repack redistributes into it
+        n_alloc = n_slots + int(np.ceil(n_slots * float(alloc_margin)))
 
         order = np.argsort(key, kind="stable")
-        slot_to_particle = np.full(n_slots, -1, dtype=np.int64)
+        slot_to_particle = np.full(n_alloc, -1, dtype=np.int64)
         particle_to_slot = np.empty(len(key), dtype=np.int64)
         # each bucket fills from the bottom of its run
         run_pos = np.repeat(bucket_start[:-1], counts) + _within_run_index(counts)
@@ -263,7 +275,7 @@ class BrickLayout:
             ),
             particle_to_slot=particle_to_slot,
             arena_slot_bucket=np.full(n_arena, -1, dtype=np.int64),
-            arena_base=n_slots,
+            arena_base=n_alloc,
             n_particles=len(key),
         )
 
@@ -439,6 +451,117 @@ class BrickLayout:
             max_occupancy=int(occ.max()),
             max_fill_frac=float(np.max(occ / np.maximum(cap_all, 1))),
             n_full_buckets=int(np.sum(occ >= cap_all)),
+        )
+
+    def repack(self, slack_frac=0.10, chunk=1 << 20):
+        """Redistribute capacity across buckets IN PLACE, with bounded scratch.
+
+        WHY THIS IS NOT A SORT, which is the whole point. `migrate` already keeps
+        every particle in the bucket it belongs to; what degrades over a run is
+        only the CAPACITY distribution, because capacity was frozen at build
+        time while structure grew. Bucket ORDER is a fixed spatial ordering and
+        never changes. So restoring the layout is a monotone rearrangement of
+        blocks whose order is already correct -- not the general permutation
+        that a re-sort would be.
+
+        Monotone rearrangements need no second copy. Two passes, each provably
+        safe in place:
+
+          compact  every particle's compacted index is <= its current slot,
+                   because capacity >= occupancy in every bucket. Walking
+                   ASCENDING, a write at dst[i] can only land at or below
+                   src[i] < src[j] for every j > i still unread.
+          expand   every particle's new slot is >= its compacted index, because
+                   new capacity >= new count. Walking DESCENDING, a write at
+                   dst[i] lands at or above src[i] > src[j] for every j < i.
+
+        Done chunk-at-a-time so the temporary is O(chunk), not O(N) -- numpy's
+        fancy-index assignment materializes its source, so `a[dst] = a[src]`
+        over the whole array would allocate exactly the full-size second buffer
+        this is meant to avoid.
+
+        Returns stats including the scratch high-water mark, which is the number
+        D-v2-14 clause 3's "a second 77 GB scatter target is over the ceiling"
+        should be read against.
+        """
+        # ALLOCATED, not used. `n_slots` is bucket_start[-1], which a repack
+        # rewrites to the new (smaller) used size -- reading allocation off it
+        # made each repack believe it had less room than the one before, and
+        # the second one failed by 0.2%. `arena_base` is the physical boundary
+        # of the main region and does not move.
+        n_slots = int(self.arena_base)
+        occ = self.occupancy.astype(np.int64)
+
+        # particles in bucket order: the main array is already ordered, and
+        # arena residents are folded back into their own buckets
+        live_slots = np.nonzero(self.slot_to_particle[:n_slots] >= 0)[0]
+        main_p = self.slot_to_particle[live_slots]
+        main_b = np.repeat(np.arange(self.n_buckets, dtype=np.int64), occ)
+        a_used = np.nonzero(self.arena_slot_bucket >= 0)[0]
+        if len(a_used):
+            a_b = self.arena_slot_bucket[a_used]
+            a_p = self.slot_to_particle[self.arena_base + a_used]
+            order = np.argsort(np.concatenate([main_b, a_b]), kind="stable")
+            all_p = np.concatenate([main_p, a_p])[order]
+            all_b = np.concatenate([main_b, a_b])[order]
+        else:
+            all_p, all_b = main_p, main_b
+
+        counts = np.bincount(all_b, minlength=self.n_buckets).astype(np.int64)
+        _refuse_uint16_overflow(counts, "repack")
+        extra = np.ceil(counts * float(slack_frac)).astype(np.int64)
+        extra = np.where(counts > 0, np.maximum(extra, 1), extra)
+        new_cap = counts + extra
+        new_start = np.zeros(self.n_buckets + 1, dtype=np.int64)
+        np.cumsum(new_cap, out=new_start[1:])
+        if int(new_start[-1]) > n_slots:
+            raise ValueError(
+                f"repack needs {int(new_start[-1])} slots against {n_slots} allocated. The "
+                "slot array is fixed at build size on purpose; growing it is the second "
+                "full-size buffer D-v2-14 clause 3 rules out. Lower slack_frac or build "
+                "with more headroom."
+            )
+
+        src = live_slots if not len(a_used) else None
+        scratch_peak = 0
+
+        # -- pass 1: compact to the front, ascending -------------------------
+        if src is None:
+            # arena residents were interleaved, so sources are not sorted;
+            # gather them via the (already bucket-ordered) particle list
+            src = np.concatenate(
+                [live_slots, self.arena_base + a_used]
+            )[np.argsort(np.concatenate([main_b, self.arena_slot_bucket[a_used]]), kind="stable")]
+        n_live = len(all_p)
+        dst = np.arange(n_live, dtype=np.int64)
+        for i in range(0, n_live, chunk):
+            j = min(i + chunk, n_live)
+            buf = self.slot_to_particle[src[i:j]]
+            scratch_peak = max(scratch_peak, buf.nbytes)
+            self.slot_to_particle[dst[i:j]] = buf
+        self.slot_to_particle[n_live:] = -1
+
+        # -- pass 2: expand into the new capacities, descending ---------------
+        final = np.repeat(new_start[:-1], counts) + _within_run_index(counts)
+        for i in range(n_live, 0, -chunk):
+            lo = max(i - chunk, 0)
+            buf = self.slot_to_particle[lo:i].copy()
+            scratch_peak = max(scratch_peak, buf.nbytes)
+            self.slot_to_particle[lo:i] = -1
+            self.slot_to_particle[final[lo:i]] = buf
+
+        self.bucket_start = new_start
+        self.occupancy = counts.astype(np.uint16)
+        self.particle_to_slot[all_p] = final
+        self.arena_slot_bucket[:] = -1
+        self.arena_base = n_slots
+        return dict(
+            n_live=int(n_live),
+            scratch_bytes=int(scratch_peak),
+            scratch_frac_of_state=float(scratch_peak) / max(n_live * 9.0, 1),
+            slots_used=int(new_start[-1]),
+            slots_allocated=int(n_slots),
+            max_occupancy=int(counts.max()),
         )
 
     def _bucket_of_slot(self, slots):
