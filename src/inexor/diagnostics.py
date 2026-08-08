@@ -589,34 +589,9 @@ def min_image_rms(x_a, x_b, box_size):
     return float(np.sqrt(np.mean(d**2)))
 
 
-def reversibility_check(state_a, state_b):
-    """Exact integer equality of two (x, w) states -- the tier-0 primitive.
-
-    Returns (ok, n_diff). EXACT equality, never a tolerance (house rule).
-    """
-    xa, wa = state_a
-    xb, wb = state_b
-    xa, wa = np.asarray(xa), np.asarray(wa)
-    xb, wb = np.asarray(xb), np.asarray(wb)
-    n_diff = int(np.count_nonzero(xa != xb) + np.count_nonzero(wa != wb))
-    return n_diff == 0, n_diff
-
-
-def overflow_report(max_w_per_step, warn_abs=None):
-    """D-007 monitor: per-step max|w| trace -> headroom summary + loud warning.
-
-    max_w_per_step: sequence of per-step max|w| (ints). Prints a WARNING line
-    for every step above warn_abs (default 0.9 * 32767) -- monitor, NEVER
-    clamp. Returns dict(max_w=..., n_warn=..., headroom_bits=...).
-    """
-    if warn_abs is None:
-        warn_abs = int(0.9 * 32767)
-    mw = np.asarray(max_w_per_step, dtype=np.int64)
-    hot = np.nonzero(mw > warn_abs)[0]
-    for k in hot:
-        print(
-            f"WARNING: |w| = {mw[k]} > {warn_abs} at step {k} -- int16 wrap imminent "
-            "(wrong physics, never wrong gradients; D-007)"
-        )
-    head = float(np.log2(32767.0 / max(int(mw.max()), 1)))
-    return dict(max_w=int(mw.max()), n_warn=int(len(hot)), headroom_bits=head)
+# `reversibility_check` and `overflow_report` lived here and were removed with
+# the v1 retirement (2026-08-08). Both spoke the v1 state vocabulary: exact
+# integer equality of an (x, w) pair after a forward+reverse replay, and the
+# D-007 headroom monitor on the w-frame ladder's int16 velocity. v2 has no
+# reverse replay and no ladder. The wrap-never-clamp invariant itself is NOT
+# retired -- it moves into the T9 codec's own refusals at M-v2-1.

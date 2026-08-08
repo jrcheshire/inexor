@@ -1,5 +1,10 @@
 """diagnostics.py: estimator binning (hand-computed small grid), spectrum
-recovery, r(k) identities, reversibility primitive, overflow monitor."""
+recovery, r(k) identities, minimum-image displacement.
+
+The reversibility-primitive and overflow-monitor tests went with the v1
+retirement (2026-08-08): both asserted properties of an (x, w) integer state
+under a forward+reverse replay, which v2 does not have.
+"""
 
 import numpy as np
 import pytest
@@ -8,9 +13,7 @@ from inexor.diagnostics import (
     cic_window,
     cross_r,
     min_image_rms,
-    overflow_report,
     pk_estimator,
-    reversibility_check,
 )
 
 
@@ -67,21 +70,3 @@ def test_min_image_rms():
     assert min_image_rms(xa, xb, L) == pytest.approx(np.sqrt(4.0 / 3.0))
 
 
-def test_reversibility_check_exactness():
-    x = np.arange(12, dtype=np.uint16).reshape(4, 3)
-    w = (np.arange(12, dtype=np.int16) - 6).reshape(4, 3)
-    ok, nd = reversibility_check((x, w), (x.copy(), w.copy()))
-    assert ok and nd == 0
-    w2 = w.copy()
-    w2[0, 0] += 1
-    ok, nd = reversibility_check((x, w), (x, w2))
-    assert not ok and nd == 1
-
-
-def test_overflow_report(capsys):
-    rep = overflow_report([100, 20000, 30000])
-    out = capsys.readouterr().out
-    assert rep["n_warn"] == 1 and rep["max_w"] == 30000
-    assert "WARNING" in out and "D-007" in out
-    quiet = overflow_report([100, 200])
-    assert quiet["n_warn"] == 0 and quiet["headroom_bits"] > 7
