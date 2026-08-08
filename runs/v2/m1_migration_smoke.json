@@ -1,0 +1,1269 @@
+{
+ "config": "smoke",
+ "geometry": {
+  "n_part": 32,
+  "L": 32.0,
+  "n_fine": 64,
+  "n_coarse": 16,
+  "fine_cell": 0.5,
+  "coarse_cell": 2.0,
+  "spacing": 1.0,
+  "n_total": 32768
+ },
+ "tile": 16,
+ "buf": 4,
+ "n_brick": 4,
+ "bricks_per_side": 16,
+ "bucket_cells": 2,
+ "bucket_size": 2.0,
+ "quantum": 0.0078125,
+ "steps": 20,
+ "seed": 0,
+ "live_slack": 0.1,
+ "live_arena_frac": 1.0,
+ "initial_occupancy": {
+  "mean": 8.0,
+  "mean_occupied": 8.0,
+  "max": 30,
+  "p50": 8.0,
+  "p99": 18.0,
+  "p999": 22.905000000000655,
+  "n_empty": 0,
+  "n_buckets": 4096,
+  "uint16_headroom": 2184.5
+ },
+ "initial_bpp": {
+  "payload": 9.0,
+  "bucket_index": 0.25,
+  "brick_csr": 2.0,
+  "slack": 1.341705322265625,
+  "arena": 9.0,
+  "total": 21.591705322265625
+ },
+ "slack_ladder_worst": {
+  "0.05": {
+   "slack_bpp": 1.12884521484375,
+   "peak_arena_frac_of_n": 0.478240966796875,
+   "arena_bpp": 4.304168701171875,
+   "all_in_bpp": 16.683013916015625
+  },
+  "0.1": {
+   "slack_bpp": 1.341705322265625,
+   "peak_arena_frac_of_n": 0.47186279296875,
+   "arena_bpp": 4.24676513671875,
+   "all_in_bpp": 16.838470458984375
+  },
+  "0.15": {
+   "slack_bpp": 1.97369384765625,
+   "peak_arena_frac_of_n": 0.46160888671875,
+   "arena_bpp": 4.15447998046875,
+   "all_in_bpp": 17.378173828125
+  },
+  "0.25": {
+   "slack_bpp": 2.579315185546875,
+   "peak_arena_frac_of_n": 0.448760986328125,
+   "arena_bpp": 4.038848876953125,
+   "all_in_bpp": 17.8681640625
+  },
+  "0.5": {
+   "slack_bpp": 4.71533203125,
+   "peak_arena_frac_of_n": 0.41558837890625,
+   "arena_bpp": 3.74029541015625,
+   "all_in_bpp": 19.70562744140625
+  },
+  "1": {
+   "slack_bpp": 9.0,
+   "peak_arena_frac_of_n": 0.363677978515625,
+   "arena_bpp": 3.273101806640625,
+   "all_in_bpp": 23.523101806640625
+  }
+ },
+ "per_step": [
+  {
+   "step": 0,
+   "a": 0.11220184543019636,
+   "wall_force_s": 0.5426641250960529,
+   "wall_migrate_s": 0.002130333101376891,
+   "migrant_frac": 0.013214111328125,
+   "arena_used_frac": 0.0023193359375,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 175,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.0,
+    "max": 34,
+    "p50": 8.0,
+    "p99": 18.050000000000182,
+    "p999": 23.0,
+    "n_empty": 0,
+    "n_buckets": 4096,
+    "uint16_headroom": 1927.5
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 122,
+     "arena_frac_of_n": 0.00372314453125,
+     "n_overflowing_buckets": 78,
+     "worst_overflow": 4
+    },
+    "0.1": {
+     "arena_slots": 76,
+     "arena_frac_of_n": 0.0023193359375,
+     "n_overflowing_buckets": 55,
+     "worst_overflow": 4
+    },
+    "0.15": {
+     "arena_slots": 46,
+     "arena_frac_of_n": 0.00140380859375,
+     "n_overflowing_buckets": 35,
+     "worst_overflow": 3
+    },
+    "0.25": {
+     "arena_slots": 17,
+     "arena_frac_of_n": 0.000518798828125,
+     "n_overflowing_buckets": 13,
+     "worst_overflow": 2
+    },
+    "0.5": {
+     "arena_slots": 0,
+     "arena_frac_of_n": 0.0,
+     "n_overflowing_buckets": 0,
+     "worst_overflow": 0
+    },
+    "1": {
+     "arena_slots": 0,
+     "arena_frac_of_n": 0.0,
+     "n_overflowing_buckets": 0,
+     "worst_overflow": 0
+    }
+   }
+  },
+  {
+   "step": 1,
+   "a": 0.12589254117941673,
+   "wall_force_s": 0.22168133407831192,
+   "wall_migrate_s": 0.00626329192891717,
+   "migrant_frac": 0.026519775390625,
+   "arena_used_frac": 0.01165771484375,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 378,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.0,
+    "max": 36,
+    "p50": 8.0,
+    "p99": 20.0,
+    "p999": 24.905000000000655,
+    "n_empty": 0,
+    "n_buckets": 4096,
+    "uint16_headroom": 1820.4166666666667
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 494,
+     "arena_frac_of_n": 0.01507568359375,
+     "n_overflowing_buckets": 215,
+     "worst_overflow": 8
+    },
+    "0.1": {
+     "arena_slots": 382,
+     "arena_frac_of_n": 0.01165771484375,
+     "n_overflowing_buckets": 175,
+     "worst_overflow": 7
+    },
+    "0.15": {
+     "arena_slots": 268,
+     "arena_frac_of_n": 0.0081787109375,
+     "n_overflowing_buckets": 131,
+     "worst_overflow": 7
+    },
+    "0.25": {
+     "arena_slots": 157,
+     "arena_frac_of_n": 0.004791259765625,
+     "n_overflowing_buckets": 90,
+     "worst_overflow": 5
+    },
+    "0.5": {
+     "arena_slots": 24,
+     "arena_frac_of_n": 0.000732421875,
+     "n_overflowing_buckets": 17,
+     "worst_overflow": 3
+    },
+    "1": {
+     "arena_slots": 1,
+     "arena_frac_of_n": 3.0517578125e-05,
+     "n_overflowing_buckets": 1,
+     "worst_overflow": 1
+    }
+   }
+  },
+  {
+   "step": 2,
+   "a": 0.14125375446227545,
+   "wall_force_s": 0.2143110001925379,
+   "wall_migrate_s": 0.010735874995589256,
+   "migrant_frac": 0.036468505859375,
+   "arena_used_frac": 0.023284912109375,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 579,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.0,
+    "max": 38,
+    "p50": 8.0,
+    "p99": 21.0,
+    "p999": 26.905000000000655,
+    "n_empty": 0,
+    "n_buckets": 4096,
+    "uint16_headroom": 1724.6052631578948
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 919,
+     "arena_frac_of_n": 0.028045654296875,
+     "n_overflowing_buckets": 341,
+     "worst_overflow": 12
+    },
+    "0.1": {
+     "arena_slots": 763,
+     "arena_frac_of_n": 0.023284912109375,
+     "n_overflowing_buckets": 298,
+     "worst_overflow": 12
+    },
+    "0.15": {
+     "arena_slots": 562,
+     "arena_frac_of_n": 0.01715087890625,
+     "n_overflowing_buckets": 228,
+     "worst_overflow": 11
+    },
+    "0.25": {
+     "arena_slots": 372,
+     "arena_frac_of_n": 0.0113525390625,
+     "n_overflowing_buckets": 160,
+     "worst_overflow": 10
+    },
+    "0.5": {
+     "arena_slots": 93,
+     "arena_frac_of_n": 0.002838134765625,
+     "n_overflowing_buckets": 42,
+     "worst_overflow": 8
+    },
+    "1": {
+     "arena_slots": 11,
+     "arena_frac_of_n": 0.000335693359375,
+     "n_overflowing_buckets": 5,
+     "worst_overflow": 4
+    }
+   }
+  },
+  {
+   "step": 3,
+   "a": 0.15848931924611134,
+   "wall_force_s": 0.2151700840331614,
+   "wall_migrate_s": 0.01732033398002386,
+   "migrant_frac": 0.052093505859375,
+   "arena_used_frac": 0.038482666015625,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 785,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.0,
+    "max": 38,
+    "p50": 8.0,
+    "p99": 22.050000000000182,
+    "p999": 30.0,
+    "n_empty": 0,
+    "n_buckets": 4096,
+    "uint16_headroom": 1724.6052631578948
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 1457,
+     "arena_frac_of_n": 0.044464111328125,
+     "n_overflowing_buckets": 495,
+     "worst_overflow": 18
+    },
+    "0.1": {
+     "arena_slots": 1261,
+     "arena_frac_of_n": 0.038482666015625,
+     "n_overflowing_buckets": 447,
+     "worst_overflow": 17
+    },
+    "0.15": {
+     "arena_slots": 954,
+     "arena_frac_of_n": 0.02911376953125,
+     "n_overflowing_buckets": 346,
+     "worst_overflow": 16
+    },
+    "0.25": {
+     "arena_slots": 683,
+     "arena_frac_of_n": 0.020843505859375,
+     "n_overflowing_buckets": 262,
+     "worst_overflow": 14
+    },
+    "0.5": {
+     "arena_slots": 227,
+     "arena_frac_of_n": 0.006927490234375,
+     "n_overflowing_buckets": 77,
+     "worst_overflow": 12
+    },
+    "1": {
+     "arena_slots": 28,
+     "arena_frac_of_n": 0.0008544921875,
+     "n_overflowing_buckets": 13,
+     "worst_overflow": 8
+    }
+   }
+  },
+  {
+   "step": 4,
+   "a": 0.1778279410038923,
+   "wall_force_s": 0.25830087484791875,
+   "wall_migrate_s": 0.025333833182230592,
+   "migrant_frac": 0.063995361328125,
+   "arena_used_frac": 0.05584716796875,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 935,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.0,
+    "max": 45,
+    "p50": 7.0,
+    "p99": 25.0,
+    "p999": 36.0,
+    "n_empty": 0,
+    "n_buckets": 4096,
+    "uint16_headroom": 1456.3333333333333
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 2063,
+     "arena_frac_of_n": 0.062957763671875,
+     "n_overflowing_buckets": 607,
+     "worst_overflow": 23
+    },
+    "0.1": {
+     "arena_slots": 1830,
+     "arena_frac_of_n": 0.05584716796875,
+     "n_overflowing_buckets": 547,
+     "worst_overflow": 22
+    },
+    "0.15": {
+     "arena_slots": 1466,
+     "arena_frac_of_n": 0.04473876953125,
+     "n_overflowing_buckets": 438,
+     "worst_overflow": 21
+    },
+    "0.25": {
+     "arena_slots": 1126,
+     "arena_frac_of_n": 0.03436279296875,
+     "n_overflowing_buckets": 348,
+     "worst_overflow": 20
+    },
+    "0.5": {
+     "arena_slots": 461,
+     "arena_frac_of_n": 0.014068603515625,
+     "n_overflowing_buckets": 139,
+     "worst_overflow": 16
+    },
+    "1": {
+     "arena_slots": 84,
+     "arena_frac_of_n": 0.0025634765625,
+     "n_overflowing_buckets": 31,
+     "worst_overflow": 10
+    }
+   }
+  },
+  {
+   "step": 5,
+   "a": 0.19952623149688797,
+   "wall_force_s": 0.2374132911209017,
+   "wall_migrate_s": 0.03523862501606345,
+   "migrant_frac": 0.07464599609375,
+   "arena_used_frac": 0.07745361328125,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 1049,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.0,
+    "max": 54,
+    "p50": 7.0,
+    "p99": 27.0,
+    "p999": 40.905000000000655,
+    "n_empty": 0,
+    "n_buckets": 4096,
+    "uint16_headroom": 1213.611111111111
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 2797,
+     "arena_frac_of_n": 0.085357666015625,
+     "n_overflowing_buckets": 710,
+     "worst_overflow": 32
+    },
+    "0.1": {
+     "arena_slots": 2538,
+     "arena_frac_of_n": 0.07745361328125,
+     "n_overflowing_buckets": 661,
+     "worst_overflow": 31
+    },
+    "0.15": {
+     "arena_slots": 2097,
+     "arena_frac_of_n": 0.063995361328125,
+     "n_overflowing_buckets": 529,
+     "worst_overflow": 30
+    },
+    "0.25": {
+     "arena_slots": 1681,
+     "arena_frac_of_n": 0.051300048828125,
+     "n_overflowing_buckets": 424,
+     "worst_overflow": 28
+    },
+    "0.5": {
+     "arena_slots": 845,
+     "arena_frac_of_n": 0.025787353515625,
+     "n_overflowing_buckets": 202,
+     "worst_overflow": 24
+    },
+    "1": {
+     "arena_slots": 212,
+     "arena_frac_of_n": 0.0064697265625,
+     "n_overflowing_buckets": 47,
+     "worst_overflow": 16
+    }
+   }
+  },
+  {
+   "step": 6,
+   "a": 0.223872113856834,
+   "wall_force_s": 0.22420033300295472,
+   "wall_migrate_s": 0.04695287509821355,
+   "migrant_frac": 0.091949462890625,
+   "arena_used_frac": 0.10345458984375,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 1151,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.0,
+    "max": 67,
+    "p50": 7.0,
+    "p99": 31.050000000000182,
+    "p999": 52.715000000001965,
+    "n_empty": 0,
+    "n_buckets": 4096,
+    "uint16_headroom": 978.1343283582089
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 3690,
+     "arena_frac_of_n": 0.11260986328125,
+     "n_overflowing_buckets": 803,
+     "worst_overflow": 47
+    },
+    "0.1": {
+     "arena_slots": 3390,
+     "arena_frac_of_n": 0.10345458984375,
+     "n_overflowing_buckets": 754,
+     "worst_overflow": 46
+    },
+    "0.15": {
+     "arena_slots": 2914,
+     "arena_frac_of_n": 0.08892822265625,
+     "n_overflowing_buckets": 639,
+     "worst_overflow": 45
+    },
+    "0.25": {
+     "arena_slots": 2404,
+     "arena_frac_of_n": 0.0733642578125,
+     "n_overflowing_buckets": 499,
+     "worst_overflow": 43
+    },
+    "0.5": {
+     "arena_slots": 1399,
+     "arena_frac_of_n": 0.042694091796875,
+     "n_overflowing_buckets": 268,
+     "worst_overflow": 39
+    },
+    "1": {
+     "arena_slots": 492,
+     "arena_frac_of_n": 0.0150146484375,
+     "n_overflowing_buckets": 75,
+     "worst_overflow": 30
+    }
+   }
+  },
+  {
+   "step": 7,
+   "a": 0.251188643150958,
+   "wall_force_s": 0.22822179179638624,
+   "wall_migrate_s": 0.06055187503807247,
+   "migrant_frac": 0.1070556640625,
+   "arena_used_frac": 0.12908935546875,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 1166,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.0,
+    "max": 78,
+    "p50": 6.0,
+    "p99": 37.0,
+    "p999": 67.52500000000327,
+    "n_empty": 0,
+    "n_buckets": 4096,
+    "uint16_headroom": 840.1923076923077
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 4534,
+     "arena_frac_of_n": 0.13836669921875,
+     "n_overflowing_buckets": 807,
+     "worst_overflow": 59
+    },
+    "0.1": {
+     "arena_slots": 4230,
+     "arena_frac_of_n": 0.12908935546875,
+     "n_overflowing_buckets": 761,
+     "worst_overflow": 58
+    },
+    "0.15": {
+     "arena_slots": 3740,
+     "arena_frac_of_n": 0.1141357421875,
+     "n_overflowing_buckets": 642,
+     "worst_overflow": 57
+    },
+    "0.25": {
+     "arena_slots": 3230,
+     "arena_frac_of_n": 0.09857177734375,
+     "n_overflowing_buckets": 538,
+     "worst_overflow": 55
+    },
+    "0.5": {
+     "arena_slots": 2111,
+     "arena_frac_of_n": 0.064422607421875,
+     "n_overflowing_buckets": 306,
+     "worst_overflow": 51
+    },
+    "1": {
+     "arena_slots": 983,
+     "arena_frac_of_n": 0.029998779296875,
+     "n_overflowing_buckets": 113,
+     "worst_overflow": 42
+    }
+   }
+  },
+  {
+   "step": 8,
+   "a": 0.28183829312644537,
+   "wall_force_s": 0.22780829202383757,
+   "wall_migrate_s": 0.07348104193806648,
+   "migrant_frac": 0.11517333984375,
+   "arena_used_frac": 0.157135009765625,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 1170,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.0,
+    "max": 96,
+    "p50": 6.0,
+    "p99": 41.0,
+    "p999": 77.81000000000131,
+    "n_empty": 0,
+    "n_buckets": 4096,
+    "uint16_headroom": 682.65625
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 5453,
+     "arena_frac_of_n": 0.166412353515625,
+     "n_overflowing_buckets": 848,
+     "worst_overflow": 76
+    },
+    "0.1": {
+     "arena_slots": 5149,
+     "arena_frac_of_n": 0.157135009765625,
+     "n_overflowing_buckets": 816,
+     "worst_overflow": 75
+    },
+    "0.15": {
+     "arena_slots": 4626,
+     "arena_frac_of_n": 0.14117431640625,
+     "n_overflowing_buckets": 713,
+     "worst_overflow": 74
+    },
+    "0.25": {
+     "arena_slots": 4056,
+     "arena_frac_of_n": 0.123779296875,
+     "n_overflowing_buckets": 594,
+     "worst_overflow": 72
+    },
+    "0.5": {
+     "arena_slots": 2822,
+     "arena_frac_of_n": 0.08612060546875,
+     "n_overflowing_buckets": 351,
+     "worst_overflow": 67
+    },
+    "1": {
+     "arena_slots": 1494,
+     "arena_frac_of_n": 0.04559326171875,
+     "n_overflowing_buckets": 147,
+     "worst_overflow": 58
+    }
+   }
+  },
+  {
+   "step": 9,
+   "a": 0.31622776601683794,
+   "wall_force_s": 0.25658029201440513,
+   "wall_migrate_s": 0.0848281248472631,
+   "migrant_frac": 0.129058837890625,
+   "arena_used_frac": 0.184967041015625,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 1125,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.007820136852395,
+    "max": 162,
+    "p50": 6.0,
+    "p99": 45.0,
+    "p999": 89.72700000000168,
+    "n_empty": 4,
+    "n_buckets": 4096,
+    "uint16_headroom": 404.537037037037
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 6380,
+     "arena_frac_of_n": 0.1947021484375,
+     "n_overflowing_buckets": 868,
+     "worst_overflow": 142
+    },
+    "0.1": {
+     "arena_slots": 6061,
+     "arena_frac_of_n": 0.184967041015625,
+     "n_overflowing_buckets": 839,
+     "worst_overflow": 141
+    },
+    "0.15": {
+     "arena_slots": 5528,
+     "arena_frac_of_n": 0.168701171875,
+     "n_overflowing_buckets": 738,
+     "worst_overflow": 140
+    },
+    "0.25": {
+     "arena_slots": 4940,
+     "arena_frac_of_n": 0.1507568359375,
+     "n_overflowing_buckets": 635,
+     "worst_overflow": 138
+    },
+    "0.5": {
+     "arena_slots": 3591,
+     "arena_frac_of_n": 0.109588623046875,
+     "n_overflowing_buckets": 395,
+     "worst_overflow": 133
+    },
+    "1": {
+     "arena_slots": 2047,
+     "arena_frac_of_n": 0.062469482421875,
+     "n_overflowing_buckets": 178,
+     "worst_overflow": 124
+    }
+   }
+  },
+  {
+   "step": 10,
+   "a": 0.35481338923357547,
+   "wall_force_s": 0.22604337497614324,
+   "wall_migrate_s": 0.10335841705091298,
+   "migrant_frac": 0.149627685546875,
+   "arena_used_frac": 0.21630859375,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 1084,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.009777560498655,
+    "max": 229,
+    "p50": 5.0,
+    "p99": 48.09999999999991,
+    "p999": 108.91000000000031,
+    "n_empty": 5,
+    "n_buckets": 4096,
+    "uint16_headroom": 286.17903930131007
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 7401,
+     "arena_frac_of_n": 0.225860595703125,
+     "n_overflowing_buckets": 850,
+     "worst_overflow": 209
+    },
+    "0.1": {
+     "arena_slots": 7088,
+     "arena_frac_of_n": 0.21630859375,
+     "n_overflowing_buckets": 819,
+     "worst_overflow": 208
+    },
+    "0.15": {
+     "arena_slots": 6574,
+     "arena_frac_of_n": 0.20062255859375,
+     "n_overflowing_buckets": 728,
+     "worst_overflow": 207
+    },
+    "0.25": {
+     "arena_slots": 6002,
+     "arena_frac_of_n": 0.18316650390625,
+     "n_overflowing_buckets": 644,
+     "worst_overflow": 205
+    },
+    "0.5": {
+     "arena_slots": 4610,
+     "arena_frac_of_n": 0.14068603515625,
+     "n_overflowing_buckets": 457,
+     "worst_overflow": 200
+    },
+    "1": {
+     "arena_slots": 2847,
+     "arena_frac_of_n": 0.086883544921875,
+     "n_overflowing_buckets": 225,
+     "worst_overflow": 191
+    }
+   }
+  },
+  {
+   "step": 11,
+   "a": 0.3981071705534973,
+   "wall_force_s": 0.22716741682961583,
+   "wall_migrate_s": 0.11645904183387756,
+   "migrant_frac": 0.1624755859375,
+   "arena_used_frac": 0.2481689453125,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 1054,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.01761683386347,
+    "max": 289,
+    "p50": 5.0,
+    "p99": 50.13999999999987,
+    "p999": 113.31200000000536,
+    "n_empty": 9,
+    "n_buckets": 4096,
+    "uint16_headroom": 226.76470588235293
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 8438,
+     "arena_frac_of_n": 0.25750732421875,
+     "n_overflowing_buckets": 827,
+     "worst_overflow": 269
+    },
+    "0.1": {
+     "arena_slots": 8132,
+     "arena_frac_of_n": 0.2481689453125,
+     "n_overflowing_buckets": 798,
+     "worst_overflow": 268
+    },
+    "0.15": {
+     "arena_slots": 7640,
+     "arena_frac_of_n": 0.233154296875,
+     "n_overflowing_buckets": 723,
+     "worst_overflow": 267
+    },
+    "0.25": {
+     "arena_slots": 7075,
+     "arena_frac_of_n": 0.215911865234375,
+     "n_overflowing_buckets": 662,
+     "worst_overflow": 265
+    },
+    "0.5": {
+     "arena_slots": 5648,
+     "arena_frac_of_n": 0.17236328125,
+     "n_overflowing_buckets": 463,
+     "worst_overflow": 260
+    },
+    "1": {
+     "arena_slots": 3807,
+     "arena_frac_of_n": 0.116180419921875,
+     "n_overflowing_buckets": 257,
+     "worst_overflow": 251
+    }
+   }
+  },
+  {
+   "step": 12,
+   "a": 0.44668359215096315,
+   "wall_force_s": 0.2255778748076409,
+   "wall_migrate_s": 0.13416091701947153,
+   "migrant_frac": 0.1851806640625,
+   "arena_used_frac": 0.281768798828125,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 978,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.049127978383689,
+    "max": 307,
+    "p50": 5.0,
+    "p99": 55.0,
+    "p999": 190.5300000000061,
+    "n_empty": 25,
+    "n_buckets": 4096,
+    "uint16_headroom": 213.46905537459284
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 9539,
+     "arena_frac_of_n": 0.291107177734375,
+     "n_overflowing_buckets": 811,
+     "worst_overflow": 284
+    },
+    "0.1": {
+     "arena_slots": 9233,
+     "arena_frac_of_n": 0.281768798828125,
+     "n_overflowing_buckets": 788,
+     "worst_overflow": 283
+    },
+    "0.15": {
+     "arena_slots": 8756,
+     "arena_frac_of_n": 0.2672119140625,
+     "n_overflowing_buckets": 723,
+     "worst_overflow": 282
+    },
+    "0.25": {
+     "arena_slots": 8172,
+     "arena_frac_of_n": 0.2493896484375,
+     "n_overflowing_buckets": 647,
+     "worst_overflow": 280
+    },
+    "0.5": {
+     "arena_slots": 6749,
+     "arena_frac_of_n": 0.205963134765625,
+     "n_overflowing_buckets": 474,
+     "worst_overflow": 275
+    },
+    "1": {
+     "arena_slots": 4838,
+     "arena_frac_of_n": 0.14764404296875,
+     "n_overflowing_buckets": 270,
+     "worst_overflow": 265
+    }
+   }
+  },
+  {
+   "step": 13,
+   "a": 0.5011872336272724,
+   "wall_force_s": 0.260366166010499,
+   "wall_migrate_s": 0.14978237496688962,
+   "migrant_frac": 0.197479248046875,
+   "arena_used_frac": 0.3125,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 942,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.09886307464162,
+    "max": 478,
+    "p50": 4.0,
+    "p99": 60.55000000000018,
+    "p999": 188.11000000001604,
+    "n_empty": 50,
+    "n_buckets": 4096,
+    "uint16_headroom": 137.10251046025104
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 10539,
+     "arena_frac_of_n": 0.321624755859375,
+     "n_overflowing_buckets": 772,
+     "worst_overflow": 459
+    },
+    "0.1": {
+     "arena_slots": 10240,
+     "arena_frac_of_n": 0.3125,
+     "n_overflowing_buckets": 752,
+     "worst_overflow": 458
+    },
+    "0.15": {
+     "arena_slots": 9787,
+     "arena_frac_of_n": 0.298675537109375,
+     "n_overflowing_buckets": 706,
+     "worst_overflow": 457
+    },
+    "0.25": {
+     "arena_slots": 9209,
+     "arena_frac_of_n": 0.281036376953125,
+     "n_overflowing_buckets": 649,
+     "worst_overflow": 455
+    },
+    "0.5": {
+     "arena_slots": 7763,
+     "arena_frac_of_n": 0.236907958984375,
+     "n_overflowing_buckets": 482,
+     "worst_overflow": 451
+    },
+    "1": {
+     "arena_slots": 5816,
+     "arena_frac_of_n": 0.177490234375,
+     "n_overflowing_buckets": 282,
+     "worst_overflow": 442
+    }
+   }
+  },
+  {
+   "step": 14,
+   "a": 0.5623413251903491,
+   "wall_force_s": 0.22867725021205842,
+   "wall_migrate_s": 0.1664404161274433,
+   "migrant_frac": 0.204986572265625,
+   "arena_used_frac": 0.343658447265625,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 905,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.157331341797361,
+    "max": 672,
+    "p50": 4.0,
+    "p99": 65.68000000000029,
+    "p999": 218.1040000000212,
+    "n_empty": 79,
+    "n_buckets": 4096,
+    "uint16_headroom": 97.52232142857143
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 11549,
+     "arena_frac_of_n": 0.352447509765625,
+     "n_overflowing_buckets": 754,
+     "worst_overflow": 653
+    },
+    "0.1": {
+     "arena_slots": 11261,
+     "arena_frac_of_n": 0.343658447265625,
+     "n_overflowing_buckets": 736,
+     "worst_overflow": 652
+    },
+    "0.15": {
+     "arena_slots": 10809,
+     "arena_frac_of_n": 0.329864501953125,
+     "n_overflowing_buckets": 679,
+     "worst_overflow": 651
+    },
+    "0.25": {
+     "arena_slots": 10250,
+     "arena_frac_of_n": 0.31280517578125,
+     "n_overflowing_buckets": 629,
+     "worst_overflow": 649
+    },
+    "0.5": {
+     "arena_slots": 8865,
+     "arena_frac_of_n": 0.270538330078125,
+     "n_overflowing_buckets": 473,
+     "worst_overflow": 645
+    },
+    "1": {
+     "arena_slots": 6894,
+     "arena_frac_of_n": 0.21038818359375,
+     "n_overflowing_buckets": 297,
+     "worst_overflow": 636
+    }
+   }
+  },
+  {
+   "step": 15,
+   "a": 0.6309573444801934,
+   "wall_force_s": 0.23030116618610919,
+   "wall_migrate_s": 0.1776766248513013,
+   "migrant_frac": 0.21502685546875,
+   "arena_used_frac": 0.3731689453125,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 840,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.23316582914573,
+    "max": 788,
+    "p50": 4.0,
+    "p99": 77.0,
+    "p999": 221.32300000004034,
+    "n_empty": 116,
+    "n_buckets": 4096,
+    "uint16_headroom": 83.16624365482234
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 12494,
+     "arena_frac_of_n": 0.38128662109375,
+     "n_overflowing_buckets": 713,
+     "worst_overflow": 769
+    },
+    "0.1": {
+     "arena_slots": 12228,
+     "arena_frac_of_n": 0.3731689453125,
+     "n_overflowing_buckets": 692,
+     "worst_overflow": 768
+    },
+    "0.15": {
+     "arena_slots": 11797,
+     "arena_frac_of_n": 0.360015869140625,
+     "n_overflowing_buckets": 628,
+     "worst_overflow": 767
+    },
+    "0.25": {
+     "arena_slots": 11272,
+     "arena_frac_of_n": 0.343994140625,
+     "n_overflowing_buckets": 592,
+     "worst_overflow": 765
+    },
+    "0.5": {
+     "arena_slots": 9959,
+     "arena_frac_of_n": 0.303924560546875,
+     "n_overflowing_buckets": 469,
+     "worst_overflow": 761
+    },
+    "1": {
+     "arena_slots": 8003,
+     "arena_frac_of_n": 0.244232177734375,
+     "n_overflowing_buckets": 297,
+     "worst_overflow": 752
+    }
+   }
+  },
+  {
+   "step": 16,
+   "a": 0.707945784384138,
+   "wall_force_s": 0.258610500022769,
+   "wall_migrate_s": 0.19096712488681078,
+   "migrant_frac": 0.22802734375,
+   "arena_used_frac": 0.400848388671875,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 801,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.357051772507013,
+    "max": 785,
+    "p50": 4.0,
+    "p99": 75.60000000000036,
+    "p999": 248.3600000000065,
+    "n_empty": 175,
+    "n_buckets": 4096,
+    "uint16_headroom": 83.48407643312102
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 13392,
+     "arena_frac_of_n": 0.40869140625,
+     "n_overflowing_buckets": 681,
+     "worst_overflow": 766
+    },
+    "0.1": {
+     "arena_slots": 13135,
+     "arena_frac_of_n": 0.400848388671875,
+     "n_overflowing_buckets": 662,
+     "worst_overflow": 765
+    },
+    "0.15": {
+     "arena_slots": 12738,
+     "arena_frac_of_n": 0.38873291015625,
+     "n_overflowing_buckets": 624,
+     "worst_overflow": 764
+    },
+    "0.25": {
+     "arena_slots": 12233,
+     "arena_frac_of_n": 0.373321533203125,
+     "n_overflowing_buckets": 587,
+     "worst_overflow": 762
+    },
+    "0.5": {
+     "arena_slots": 10950,
+     "arena_frac_of_n": 0.33416748046875,
+     "n_overflowing_buckets": 454,
+     "worst_overflow": 758
+    },
+    "1": {
+     "arena_slots": 9041,
+     "arena_frac_of_n": 0.275909423828125,
+     "n_overflowing_buckets": 311,
+     "worst_overflow": 749
+    }
+   }
+  },
+  {
+   "step": 17,
+   "a": 0.7943282347242815,
+   "wall_force_s": 0.23606558283790946,
+   "wall_migrate_s": 0.20424762507900596,
+   "migrant_frac": 0.235137939453125,
+   "arena_used_frac": 0.427642822265625,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 754,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.432321152856408,
+    "max": 791,
+    "p50": 3.0,
+    "p99": 83.15000000000009,
+    "p999": 338.9000000000142,
+    "n_empty": 210,
+    "n_buckets": 4096,
+    "uint16_headroom": 82.85082174462705
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 14257,
+     "arena_frac_of_n": 0.435089111328125,
+     "n_overflowing_buckets": 672,
+     "worst_overflow": 780
+    },
+    "0.1": {
+     "arena_slots": 14013,
+     "arena_frac_of_n": 0.427642822265625,
+     "n_overflowing_buckets": 656,
+     "worst_overflow": 780
+    },
+    "0.15": {
+     "arena_slots": 13628,
+     "arena_frac_of_n": 0.4158935546875,
+     "n_overflowing_buckets": 611,
+     "worst_overflow": 779
+    },
+    "0.25": {
+     "arena_slots": 13139,
+     "arena_frac_of_n": 0.400970458984375,
+     "n_overflowing_buckets": 563,
+     "worst_overflow": 778
+    },
+    "0.5": {
+     "arena_slots": 11909,
+     "arena_frac_of_n": 0.363433837890625,
+     "n_overflowing_buckets": 452,
+     "worst_overflow": 776
+    },
+    "1": {
+     "arena_slots": 10060,
+     "arena_frac_of_n": 0.3070068359375,
+     "n_overflowing_buckets": 308,
+     "worst_overflow": 771
+    }
+   }
+  },
+  {
+   "step": 18,
+   "a": 0.8912509381337457,
+   "wall_force_s": 0.23112516687251627,
+   "wall_migrate_s": 0.21941145812161267,
+   "migrant_frac": 0.245697021484375,
+   "arena_used_frac": 0.451416015625,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 716,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.52445369406868,
+    "max": 904,
+    "p50": 3.0,
+    "p99": 84.57000000000016,
+    "p999": 492.86700000001883,
+    "n_empty": 252,
+    "n_buckets": 4096,
+    "uint16_headroom": 72.49446902654867
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 15013,
+     "arena_frac_of_n": 0.458160400390625,
+     "n_overflowing_buckets": 627,
+     "worst_overflow": 893
+    },
+    "0.1": {
+     "arena_slots": 14792,
+     "arena_frac_of_n": 0.451416015625,
+     "n_overflowing_buckets": 614,
+     "worst_overflow": 893
+    },
+    "0.15": {
+     "arena_slots": 14433,
+     "arena_frac_of_n": 0.440460205078125,
+     "n_overflowing_buckets": 577,
+     "worst_overflow": 892
+    },
+    "0.25": {
+     "arena_slots": 13970,
+     "arena_frac_of_n": 0.42633056640625,
+     "n_overflowing_buckets": 539,
+     "worst_overflow": 891
+    },
+    "0.5": {
+     "arena_slots": 12826,
+     "arena_frac_of_n": 0.39141845703125,
+     "n_overflowing_buckets": 435,
+     "worst_overflow": 889
+    },
+    "1": {
+     "arena_slots": 11088,
+     "arena_frac_of_n": 0.33837890625,
+     "n_overflowing_buckets": 312,
+     "worst_overflow": 884
+    }
+   }
+  },
+  {
+   "step": 19,
+   "a": 1.0,
+   "wall_force_s": 0.2285138329025358,
+   "wall_migrate_s": 0.22577074985019863,
+   "migrant_frac": 0.224365234375,
+   "arena_used_frac": 0.47186279296875,
+   "max_fill_frac": 1.0,
+   "n_full_buckets": 696,
+   "occupancy": {
+    "mean": 8.0,
+    "mean_occupied": 8.632244467860906,
+    "max": 1129,
+    "p50": 3.0,
+    "p99": 89.05000000000018,
+    "p999": 548.8350000000332,
+    "n_empty": 300,
+    "n_buckets": 4096,
+    "uint16_headroom": 58.04694419840567
+   },
+   "slack_ladder": {
+    "0.05": {
+     "arena_slots": 15671,
+     "arena_frac_of_n": 0.478240966796875,
+     "n_overflowing_buckets": 599,
+     "worst_overflow": 1118
+    },
+    "0.1": {
+     "arena_slots": 15462,
+     "arena_frac_of_n": 0.47186279296875,
+     "n_overflowing_buckets": 587,
+     "worst_overflow": 1118
+    },
+    "0.15": {
+     "arena_slots": 15126,
+     "arena_frac_of_n": 0.46160888671875,
+     "n_overflowing_buckets": 548,
+     "worst_overflow": 1117
+    },
+    "0.25": {
+     "arena_slots": 14705,
+     "arena_frac_of_n": 0.448760986328125,
+     "n_overflowing_buckets": 514,
+     "worst_overflow": 1116
+    },
+    "0.5": {
+     "arena_slots": 13618,
+     "arena_frac_of_n": 0.41558837890625,
+     "n_overflowing_buckets": 424,
+     "worst_overflow": 1114
+    },
+    "1": {
+     "arena_slots": 11917,
+     "arena_frac_of_n": 0.363677978515625,
+     "n_overflowing_buckets": 305,
+     "worst_overflow": 1109
+    }
+   }
+  }
+ ],
+ "wall_s": 7.086291749961674,
+ "ratified_estimate": {
+  "slack_and_arena_bpp": 0.9,
+  "all_in_bpp": 10.15,
+  "source": "D-v2-14 cl.2"
+ }
+}
