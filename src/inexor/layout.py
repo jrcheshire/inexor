@@ -421,9 +421,12 @@ class BrickLayout:
             self.particle_to_slot[placed] = slots
             self.occupancy[affected] = fits.astype(np.uint16)
 
-            # the remainder escalates to the arena, then to a refusal
-            for p, b in zip(claims[~keep], b_of_claim[~keep]):
-                self._to_arena(int(p), int(b))
+            # The remainder escalates to the arena, then to a refusal. In BULK:
+            # placing them one at a time meant one `nonzero` scan of the whole
+            # arena per particle, which measured 91 s a step at cdev8 against
+            # 3.97 s for the force it was bookkeeping for -- an instrument 23x
+            # the cost of the physics. One scan per step, not per migrant.
+            self._to_arena_bulk(claims[~keep], b_of_claim[~keep])
 
         occ = self.occupancy.astype(np.int64)
         cap_all = self.capacity
@@ -447,23 +450,28 @@ class BrickLayout:
             out[in_arena] = self.arena_slot_bucket[slots[in_arena] - self.arena_base]
         return out
 
-    def _to_arena(self, p, b):
-        """slack -> arena -> loud refusal. Never clamps, never drops."""
+    def _to_arena_bulk(self, particles, buckets):
+        """slack -> arena -> loud refusal. Never clamps, never drops.
+
+        One scan of the arena free list per call, then a single scatter.
+        """
+        if len(particles) == 0:
+            return
         free = np.nonzero(self.arena_slot_bucket < 0)[0]
-        if len(free) == 0:
+        if len(free) < len(particles):
             raise ValueError(
-                f"bucket {b} overflowed its capacity and the arena of "
-                f"{len(self.arena_slot_bucket)} slots is exhausted. The layout does not clamp "
-                "or drop (D-007): a dropped particle deletes mass, and the particles that "
-                "overflow are the clustered ones a halo-grade mock exists to resolve. "
-                "Raise slack_frac or arena_frac -- and record the measured value, because "
-                "D-v2-14 clause 2's 0.90 B/p slack is an estimate, not a measurement."
+                f"{len(particles)} particles overflowed their buckets' capacity and the arena "
+                f"of {len(self.arena_slot_bucket)} slots has only {len(free)} free. The layout "
+                "does not clamp or drop (D-007): a dropped particle deletes mass, and the "
+                "particles that overflow are the clustered ones a halo-grade mock exists to "
+                "resolve. Raise slack_frac or arena_frac -- and record the measured value, "
+                "because D-v2-14 clause 2's 0.90 B/p slack is an estimate, not a measurement."
             )
-        a = int(free[0])
-        self.arena_slot_bucket[a] = b
+        a = free[: len(particles)]
+        self.arena_slot_bucket[a] = buckets
         s = self.arena_base + a
-        self.slot_to_particle[s] = p
-        self.particle_to_slot[p] = s
+        self.slot_to_particle[s] = particles
+        self.particle_to_slot[particles] = s
 
     # ------------------------------------------------------------ checking
 

@@ -364,7 +364,7 @@ def test_overflow_refuses_loudly_rather_than_dropping():
     n = N_PART**3
     lay = BrickLayout.build(_lattice_positions(seed=14), t9, BRICKS_PER_SIDE,
                             slack_frac=0.0, arena_frac=0.0)
-    with pytest.raises(ValueError, match="arena of 0 slots is exhausted"):
+    with pytest.raises(ValueError, match="arena of 0 slots has only 0 free"):
         lay.migrate(_clustered_positions(seed=15, n=n))
 
 
