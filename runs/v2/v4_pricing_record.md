@@ -10,6 +10,30 @@ Organised for lookup. §1 is the competitor comparison, §2 the cost law, §3 th
 C-gh estimate that falls out of it, §4 the gb node readout, §5 what this does
 NOT license, §6 corrections and defects.
 
+> **SUPERSEDED IN TWO PLACES (2026-08-07, `runs/v2/v4_architecture_record.md`).**
+> Read §2 with both of these in hand:
+>
+> 1. **The "paint/gather-dominated" reading of the device phase is wrong.**
+>    §2 finding (4) says the device phase is "far above its FFT floor, i.e.
+>    paint/gather-dominated -- which is what G1's Pallas work targets." More
+>    than half of that excess was zero-weight atomic contention: the tile
+>    padding indexed particle 0 and `_tile_corner` sent every masked row to
+>    flat index 0, so ~2e6 dead rows per tile contended on ONE address. Fixed
+>    in `eba91ab`; measured 47.15 -> 21.26 ms, **2.218x**, at identical `cap`
+>    and geometry (job 896159 legs 1-2). The custom-kernel lane is
+>    correspondingly less urgent.
+> 2. **The top rung of §2's `cap` table is inflated by a defect.** `cgh64`
+>    T128/b96's `cap` of 10,168,320 is ~1.7x too large because `choose_brick`
+>    was missing the `c | b_realized` condition, so the brick union overshot
+>    the padded box (union side 384 against P = 320) and that leg alone carries
+>    3,044,340,012 overhang against 0 at every other leg. Fixed in `eba91ab`.
+>    No operating geometry moves. **Do not fit a cost law through that point.**
+>
+> §2's central claim survives both and is now ISOLATED rather than
+> correlational: `stage` is linear in `cap` and device goes as ~`cap^0.5`, with
+> members, bricks, tiles and kernel all held fixed (job 896159 legs 3-4). The
+> fixed-`n_brick` pair §2 records as owed is discharged by that instrument.
+
 ## Provenance
 
 | job | machine | elapsed | what | commit |

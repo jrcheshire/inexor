@@ -745,3 +745,185 @@ decision here is locked until explicitly re-litigated with JC.
     `runs/v2/cost_of_memory.md` §V3. Probes `scripts/v2_g4_gh_memory.py`,
     `scripts/v2_g4b_fp64_capability.py`. Cards `g4_gh_memory{,_smoke,_bracket,
     _s3,_s3real,_s3hero}.json`, `g4b_capability{_gh,_s3}.json`.
+
+---
+
+# V4 architecture freeze -- DRAFTS, NOT YET RATIFIED
+
+D-v2-14 through D-v2-18 below are **PROPOSED** and await JC. They are drafted
+from `runs/v2/v4_architecture_record.md` (jobs 896159, 896160, 896408) and
+`runs/v2/v4_pricing_record.md`. Every clause either cites a measured number or
+labels itself an estimate. Nothing here is in force until the status line says
+accepted.
+
+## D-v2-14 -- State architecture: T9 at the implementable quantum, on a brick-sorted layout
+
+- **Status:** PROPOSED (drafted 2026-08-07). Amends D-v2-8's state-tier clause;
+  does not touch its requirements chain.
+- **Context:** D-v2-8 ratified T9 = 9 B/p on G2c's `t9` arm. That gate says in
+  its own docstring (`v2_g2c_accum_gate.py:35`) that it "measures
+  REPRESENTATION error only (storage layout is a build decision)". V4 takes
+  that decision, and the arithmetic does not work as assumed: the gated arm
+  quantizes at `fine_cell/256`, which an int8 carries only if its bucket is one
+  fine cell, and at C-gh a per-fine-cell index costs ~69 GB against the 77 GB
+  of state it indexes. CUBE's sorted-by-cell layout works because CUBE runs one
+  particle per cell; our fine mesh is 2x the particle grid per side.
+- **Decision:**
+  1. **The position bucket is 1.0 Mpc/h (two particle cells), quantum
+     `fine_cell/64`.** Measured at cdev, K=40, job 896160: max |dP/P| 4.123e-4
+     and worst-case dP2/P0 2.035e-3, against D-v2-9's absolute 3e-2 -- a 15x
+     margin, and ~2.5 orders under both the step and mesh floors. The `t9`
+     control reproduced its ratified 1.3e-4 exactly.
+     **Chosen on margin plus a 2.15 GB index, NOT on a measured ordering:** the
+     ladder is non-monotonic at these levels (`t9c1` beats `t9` on dP/P,
+     `t9c4` beats `t9c2` on dP2/P0), so all four arms passing is what is
+     established, not that c=2 is the best of them. One seed, one config.
+  2. **The all-in state cost is 10.15 B/p, not 9.** Payload 9.00, bucket index
+     0.25, brick CSR 0.004, slack and arena 0.90. At C-gh that is 87.2 GB,
+     1.33x under the ~116 GB cliff rather than 1.50x. D-v2-8's capacity column
+     is re-derived with this figure, which is what D-v2-8 said V4 would do.
+     **The 0.90 slack term is an ESTIMATE**, from a hand argument about
+     migration rates; it is 7.7 GB of the 87.2 and its measurement is an exit
+     condition of the codec milestone.
+  3. **The canonical layout is brick-sorted**, so a tile's members are
+     contiguous spans. `cap` and the slack absorbing inter-brick migration are
+     the same buffer, and capacity is per-bucket rather than a global max over
+     tiles. A full re-sort is not affordable (a second 77 GB scatter target is
+     over the ceiling); the operation is eject-and-reinsert. Bucket overflow
+     escalates slack -> arena -> loud refusal and **may never clamp** (D-007).
+  4. **The layout is admissible only because the paint is order-independent**
+     (D-006). Brick-sorting reorders particles every step, so any
+     order-dependent accumulation on the primal path silently becomes
+     irreproducible. This makes clause 2 of D-v2-16 a precondition, not a
+     nicety.
+  5. **Particle IDs are an opt-in tier**, int32 at +4 B/p, available where it
+     fits (n_side <= 1290) and refused above. Production C-gh carries none.
+     Expressed as a seventh column on a struct-of-arrays state so physics
+     kernels never see it and only layout kernels vary.
+- **Record:** `runs/v2/v4_architecture_record.md` section 4; job 896160;
+  arms `t9c1`/`t9c2`/`t9c4` in `scripts/v2_g2c_accum_gate.py`.
+
+## D-v2-15 -- IC architecture: disk staging, a 1D transfer table, and an out-of-core FFT
+
+- **Status:** PROPOSED (drafted 2026-08-07).
+- **Context:** the only IC memory number on record (76 B/p, v1 R6) is device
+  only. Nothing had ever measured the host side, and IC generation was
+  sidestepped by every gate loading from an offline npz.
+- **Decision:**
+  1. **The IC host term is real, ~90 B/p, and FLAT in N** (126.5 / 95.4 / 89.6
+     at n = 256 / 512 / 1024, job 896159). It extrapolates to **~773 GB at
+     2048^3 against a 116 GB ceiling** and is the binding IC constraint. My
+     pre-registration predicted growth with N and was wrong about the shape;
+     a fixed number of half-grid arrays gives constant B/p.
+  2. **The colour and transfer evaluation moves to a 1D log-spaced |k| table
+     with interpolation.** P(k) is a function of |k| only. Both halves already
+     exist in the tree (`cosmology.py:207` uses a 4000-point log grid;
+     `linear_power(backend="table")` already log-log interpolates). This
+     removes essentially all of clause 1's term.
+  3. **Disk is an explicit staging tier for the IC stage only.** The generator
+     emits T9-encoded slabs; `evolve` streams them back into `pinned_host`
+     chunks. The evolve loop does NOT spill: state fits host at C-gh
+     (87.2/116 GB) and C-hero (~697/1007 GiB).
+  4. **An out-of-core FFT is REQUIRED at C-gh and cannot defer to C-hero.**
+     The largest monolithic `jnp.fft.rfftn` on a GH200 is between 1024^3 and
+     1536^3 (job 896159 leg 7: 1024^3 peaks at 28.04 GB for a 4.00 GB field,
+     1536^3 OOMs on a 27.04 GiB allocation). **The workspace ratio is 7x the
+     field** and is the number the slab design must budget against.
+  5. **Reproducibility is defined against a decomposition, not across one.**
+     `jax.random.normal`'s stream is shape-dependent, so a slab-decomposed
+     white-noise field is not bit-identical to a monolithic one. The canonical
+     noise unit is one XY plane keyed by `fold_in`, which makes the field
+     invariant to slab thickness. It is NOT resolution-independent; fixed-phase
+     cross-resolution comparison still requires equal N.
+- **Record:** `runs/v2/v4_architecture_record.md` sections 5 and 6.
+
+## D-v2-16 -- Force architecture freeze
+
+- **Status:** PROPOSED (drafted 2026-08-07). Discharges D-v2-10's reservation
+  of the operating (T, b) to V4.
+- **Decision:**
+  1. **The force is never materialized globally.** Its only consumer is the
+     integrator's elementwise kick and ownership is a partition, so the kick
+     applies tile-locally on device and velocities are written back through the
+     layout. This deletes both O(N) f64 host arrays -- the 2 x 206 GB that have
+     kept C-gh unrunnable. A global `sink="accumulate"` path is retained for
+     tests only, with a size refusal.
+  2. **`paint_tsc_int` is a required deliverable.** `paint_tsc_f64` accumulates
+     through order-dependent f64 `.at[].add`, and `--assign-long` defaults to
+     `tsc`, so **the coarse arm ratified in D-v2-10 violates D-006 today**. No
+     existing document names this. It is also a precondition for D-v2-14
+     clause 3.
+  3. **The long-range force is staged as a per-tile coarse sub-block**, not
+     held resident. Resident is 12.9 GB at C-gh but 103 GB at C-hero against
+     96 GB of HBM. Sub-block staging makes the whole force path O(tile) in
+     device memory and removes the C-hero cliff by construction. (Derived, not
+     measured.)
+  4. **Geometry: T=256, b=32 for C-gh**, chosen on `cap` per
+     `v4_pricing_record.md` section 7 and now supported by a second,
+     independent argument -- gather saturates near 18 GB/s only at >= 256 KB
+     runs, which would need b ~ 64, costing 1.7x padded volume for 1.5x gather.
+     Roughly a wash. **This remains PROVISIONAL until measured at C-gh**; the
+     criterion is frozen, the number is not.
+  5. **`cap` is confirmed as the cost variable, with nothing co-varying**
+     (job 896159 legs 3-4): `stage` is linear in `cap` (1.487 at x1.5, 1.973 at
+     x2.0) and device goes as ~`cap^0.5`. The fixed-`n_brick` isolation owed by
+     `v4_pricing_record.md` is discharged by a cleaner instrument and is struck
+     from the owed list.
+  6. **The streaming constraint is the HOST GATHER, not the transfer.** Pinned
+     H2D is 176-221 GB/s and flat in run length; the scattered-run gather at a
+     37 KB brick span is 12.2 GB/s (job 896408). Worth 6.9x on `stage` at f64
+     and 18x at T9 -- **contingent on gathering directly into
+     `cudaHostAlloc`-backed memory, which jax cannot express and which is
+     therefore an ffi-level build item.**
+  7. **Promotion out of `scripts/v2_g5_core.py` is gated on bitwise parity**
+     against the retained probe at three geometries, with the probe kept
+     unmodified as the reference oracle. D-v2-10, D-v2-11 and D-v2-12 are all
+     measurements OF that code; if the promoted engine is not numerically
+     identical, three ratified records quietly stop describing the shipped
+     artifact.
+- **Record:** `runs/v2/v4_architecture_record.md` sections 1, 2, 3.
+
+## D-v2-17 -- Gating scope: the uncorrected split stays gated; C-hero is capacity-only
+
+- **Status:** PROPOSED (drafted 2026-08-07). Discharges D-v2-11 clause 4 and
+  D-v2-13's hero-scoping item.
+- **Decision:**
+  1. **D-v2-9's bar continues to be read on the UNCORRECTED split.**
+     D-v2-11's transfer stays reported and is applied in production, but
+     gating the corrected quantity would let a calibration absorb an
+     architecture error, and the transfer's own irreducible residual (~1e-3 at
+     low k on any single box) would move inside the gate rather than beside it.
+  2. **C-hero is a capacity demonstration only.** No monolithic reference can
+     exist at hero scale, so hero runs measure cost, memory and completion;
+     accuracy is inherited via D-v2-11's off-box transport, which is what that
+     transport was ratified for. Any hero data product ships with that caveat
+     attached.
+
+## D-v2-18 -- Build roadmap
+
+- **Status:** PROPOSED (drafted 2026-08-07). Replaces the M-v2-1..4
+  placeholders in `docs/plan-plan-v2.md` §5.
+- **Decision:** the codec moves first, because the layout is defined in terms
+  of it and the IC stage emits it.
+
+  | id | scope | exit gate |
+  |---|---|---|
+  | M-v2-1 | codec + layout: T9 pack/unpack, brick-sorted state, per-bucket capacity, incremental exchange, opt-in ID tier | exact round-trip; wrap-never-clamp asserted; **measured** migrant distribution and slack at cgh64 (D-v2-14 clause 2) |
+  | M-v2-2 | harden and promote the two-level force; `paint_tsc_int`; the ffi pinned gather | bitwise parity vs the probe at 3 geometries; runtime invariants become tests; regression tests for the three measured bugs |
+  | M-v2-3 | engine core on T9 state | correctness vs the v1 parity arms where configs overlap |
+  | M-v2-4 | f32 force mesh | thread `fdtype`, re-run `v2_g3_floors.py` unchanged, read against the MESH FLOOR not zero; own gate, cannot ride on D-v2-9's or G6's |
+  | M-v2-5 | streamed ICs + out-of-core FFT | tile-IC identity vs monolithic at f64; the transfer table's error < 1e-4 |
+  | M-v2-6 | capacity | **a complete 2048^3 mock on one Vista gh node** |
+  | M-v2-7 | output stage | HMF within 5%, halo b1 within 2% at k <= 0.25; squeezed B <= 15%; disco-mocks read-back |
+
+  **Crosswalk, mandatory.** The charter's IDs are referenced elsewhere and must
+  not be silently renumbered: old M-v2-1 engine core -> new M-v2-3; old M-v2-2
+  tiles+ICs -> new M-v2-5; old M-v2-3 codec+capacity -> split across new
+  M-v2-1 and M-v2-6; old M-v2-4 output -> new M-v2-7. In particular
+  `runs/v2/cost_of_memory.md:77` defers the Pallas `atomic_add` decision to
+  "M-v2-1", which under this ladder is the codec; that pointer must be re-aimed
+  at M-v2-2.
+
+  **Not scheduled, deliberately:** PP-in-tiles (own gate, never a default);
+  reviving A3 via the frozen-background arm (shelved); an absolute RSD bar,
+  which D-v2-8 clause 5 still needs before anything leans on it.
