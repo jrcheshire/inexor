@@ -143,7 +143,46 @@ and migrate timings side by side, so the ratio was legible at a glance. An
 instrument that reports its own cost next to the cost of what it measures
 catches this class for free; one that reports only its answer does not.
 
-## 6. What the cgh64 run must report
+## 6. The in-place repack: clause 3's objection does not hold, but the budget is still tight
+
+Clause 3 rejects periodic re-sorting because "a second 77 GB scatter target is
+over the ceiling". That is true of a sort, and **this is not a sort**: `migrate`
+already keeps every particle in the right bucket, bucket order is a fixed
+spatial ordering, and what degrades is only the CAPACITY distribution.
+Restoring it is a monotone rearrangement, doable in place in two passes
+(compact ascending, expand descending), chunked so the temporary is O(chunk).
+
+Measured at cdev8 under the REAL two-level force, 20 steps, slack 0.20:
+
+| repack cadence | overflow at a=1 | trend |
+|---|---|---|
+| never (clause 3 as ratified) | 61.5% | climbing |
+| every 2 steps | 32.8% | climbing |
+| **every step** | **16.5%** | **plateaued** (16.1% at step 14, 16.5% at step 19) |
+
+The qualitative change is the plateau: a bounded steady state instead of a
+runaway. Cost is **58 ms against a 4.13 s force step, 1.4%**. Working memory is
+**0.52 MB and flat** in clustering and in time -- set by the chunk size, not by
+N, which is the number the "second 77 GB" objection should be read against.
+Main allocation held at **1.258x N across the whole run**, no drift.
+
+**The residual 16.5% is not a repack failure and no cadence fixes it.** With 50%
+of particles changing bucket per step, a bucket of 8 with 20% slack (capacity
+10) overflows on its third arrival, within a single step. Cadence controls the
+runaway; per-bucket slack controls the single-step overflow. Two independent
+knobs, and the second one costs memory directly.
+
+**Where that leaves the budget.** Main 1.258x N plus an arena sized for the
+16.5% peak is ~1.43x N of 9-byte slots, so **~12.8-13.1 B/p all-in against
+D-v2-14 clause 2's 10.15** -- about 29% over. At C-gh that is ~112 GB against
+the ~116 GB cliff: 1.03x under, where the ratified figure claimed 1.33x. So the
+repack removes the failure mode and does NOT by itself restore the budget.
+
+Not yet done: a slack sweep at fixed every-step cadence to minimize
+(main + arena) all-in. 0.20 was chosen to make the mechanism visible, not
+because it is optimal, and the two terms trade against each other.
+
+## 7. What the cgh64 run must report
 
 - the arena fraction and peak occupancy at C-gh's own bucket and spacing, in a
   volume 64x cdev8's
