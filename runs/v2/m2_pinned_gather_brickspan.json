@@ -1,0 +1,51 @@
+{
+  "info": {
+    "platform": "gpu",
+    "device": "cuda:0",
+    "memory_kinds": [
+      "device",
+      "pinned_host"
+    ]
+  },
+  "args": {
+    "n_rows": 40000000,
+    "runs": 512,
+    "run_len": 4096,
+    "reps": 5,
+    "out": "runs/v2/m2_pinned_gather_brickspan.json"
+  },
+  "pinned_writable": {
+    "supported": true,
+    "writable_view": false
+  },
+  "paths": {
+    "f64_xyz": {
+      "bytes": 50331648,
+      "gather_s": 0.013067375402897596,
+      "gather_gbps": 3.851702920300225,
+      "h2d_pageable_s": 0.006363627966493368,
+      "h2d_pageable_gbps": 7.9092694081132615,
+      "host_to_pinned_s": 0.0036438023671507835,
+      "host_to_pinned_gbps": 13.812946732167605,
+      "pinned_to_device_s": 0.0038376920856535435,
+      "pinned_to_device_gbps": 13.115082418455343,
+      "ffi_would_save_s": 0.0036438023671507835,
+      "total_via_pinned_s": 0.020548869855701923,
+      "total_via_pageable_s": 0.019431003369390965
+    },
+    "t9_9byte": {
+      "bytes": 18874368,
+      "gather_s": 0.01113737327978015,
+      "gather_gbps": 1.6946875646402486,
+      "h2d_pageable_s": 0.002238295041024685,
+      "h2d_pageable_gbps": 8.432475457462198,
+      "host_to_pinned_s": 0.000971286091953516,
+      "host_to_pinned_gbps": 19.43234661379594,
+      "pinned_to_device_s": 0.0014657466672360897,
+      "pinned_to_device_gbps": 12.876964636454383,
+      "ffi_would_save_s": 0.000971286091953516,
+      "total_via_pinned_s": 0.013574406038969755,
+      "total_via_pageable_s": 0.013375668320804834
+    }
+  }
+}

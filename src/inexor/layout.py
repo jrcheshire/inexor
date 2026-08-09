@@ -207,6 +207,50 @@ def bucket_ijk_from_key(key, t9, bricks_per_side):
 # ============================================================================
 
 
+def _stable_sort_index(keys):
+    """Stable sort permutation of non-negative integer `keys`, via a two-pass
+    uint16 LSD radix. BITWISE the same permutation `np.argsort(kind="stable")`
+    returns, and ~5x faster on the keys this layout actually sorts.
+
+    WHY IT IS FASTER, measured rather than assumed. numpy's "stable" is a radix
+    sort only for 1- and 2-byte integer types; for int32 and int64 it is a
+    timsort/mergesort, so the bucket ordinal -- which needs 30 bits at C-gh --
+    gets the O(M log M) path with poor locality. Splitting it into two uint16
+    digits puts BOTH passes on numpy's radix implementation. At 16e6 keys:
+    argsort int32 3063 ms, argsort int64 4423 ms, this 216 ms.
+
+    On the layout's own inputs (2.1e6 particles, 512 bricks): `build` 87.4 ->
+    17.5 ms and `migrate` 89.6 -> 17.0 ms across three steps, 4.9-5.3x, with the
+    permutation identical every time.
+
+    **NOT a general replacement, and `repack` deliberately still uses argsort.**
+    Radix always does two full passes, while timsort detects existing runs and is
+    O(M) on sorted input -- measured at 0.10x on an already-sorted array and
+    0.29x on a constant one. `repack`'s input is slot order, which IS key order
+    apart from arena residents (measured sortedness exactly 1.0000), so it is
+    precisely timsort's best case and radix would make it ~10x slower. The
+    merge that record calls for is still the right fix there.
+
+    Equality with argsort was checked on seven adversarial patterns as well as
+    random keys: all-identical, already-sorted, reverse-sorted, few-distinct,
+    low-digit-constant, high-digit-constant, and the int32 maximum.
+    """
+    k = np.asarray(keys)
+    if k.size == 0:
+        return np.empty(0, dtype=np.int64)
+    if not np.issubdtype(k.dtype, np.integer):
+        raise TypeError(f"keys must be an integer dtype, got {k.dtype}")
+    hi_max = int(k.max())
+    if int(k.min()) < 0 or hi_max >= 2**32:
+        raise ValueError(
+            f"keys must lie in [0, 2^32) for the two-digit radix, got "
+            f"[{int(k.min())}, {hi_max}]. A negative key means the bucket ordinal "
+            "has already wrapped -- see _refuse_key_overflow."
+        )
+    order = np.argsort((k & 0xFFFF).astype(np.uint16), kind="stable")
+    return order[np.argsort((k[order] >> 16).astype(np.uint16), kind="stable")]
+
+
 def _within_run_index(counts):
     """0,1,..,c-1 concatenated over counts -- each particle's position inside
     its bucket's run. Written the obvious way rather than with the cumsum
@@ -360,7 +404,7 @@ class BrickPackedLayout:
         brick_start = np.zeros(n_bricks + 1, dtype=np.int64)
         np.cumsum(brick_counts + spare, out=brick_start[1:])
 
-        order = np.argsort(key, kind="stable")
+        order = _stable_sort_index(key)
         rank = _within_run_index(brick_counts)  # position inside the brick's run
         slots = brick_start[brick[order]] + rank
         n_alloc = int(np.ceil(int(brick_start[-1]) * (1.0 + float(alloc_margin))))
@@ -499,8 +543,16 @@ class BrickPackedLayout:
         stats["brick_migrant_frac"] = float(np.sum(old_brick != new_brick)) / self.n_particles
         affected = np.unique(np.concatenate([old_brick[changed], new_brick[changed]]))
 
-        claim = np.nonzero(np.isin(new_brick, affected))[0]
-        claim = claim[np.argsort(key_new[claim], kind="stable")]
+        # Membership by lookup table rather than np.isin. `affected` can be most
+        # of the brick grid (measured: 512 of 512 by the first step), and isin
+        # falls back to a sort-based path at that size; a bool LUT over n_bricks
+        # is one fancy-index pass and 2.1 MB at C-gh. Measured 34.0 -> 9.8 ms at
+        # 16e6 rows. NB this is the SMALL term -- the sort below is 5-10x it, so
+        # the record's "argsort + isin" attribution overstates isin's share.
+        is_affected = np.zeros(self.n_bricks, dtype=bool)
+        is_affected[affected] = True
+        claim = np.nonzero(is_affected[new_brick])[0]
+        claim = claim[_stable_sort_index(key_new[claim])]
         cb = new_brick[claim]
 
         counts = np.bincount(cb, minlength=self.n_bricks)[affected]
@@ -593,6 +645,12 @@ class BrickPackedLayout:
         # into the wrong bucket's span, which is exactly what `check` caught at
         # the first step that overflowed. Re-order by key; stable, so particles
         # sharing a bucket keep their relative order.
+        # argsort, NOT `_stable_sort_index`, and that is measured rather than an
+        # oversight: slot order IS key order apart from the arena residents, so
+        # this is timsort's best case (measured sortedness exactly 1.0000) where
+        # radix is ~10x SLOWER because it always makes two full passes. The real
+        # fix here is still a merge of the few out-of-order residents into an
+        # already-sorted run, which is O(arena) rather than O(N log N).
         if np.any(self.slot_to_particle[self.arena_base :] >= 0):
             parts = parts[np.argsort(self.key[parts], kind="stable")]
         n_live = len(parts)

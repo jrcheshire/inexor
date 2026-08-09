@@ -102,6 +102,25 @@ the rare collapsing brick. Remove any one and it fails.
   stays under 65535 is unmeasured and is the second thing cgh64 must report.
 - Layout overhead is 6.0% of the force ON CPU AT THIS SIZE. Whether it holds
   when the state streams rather than fits in memory is untested.
+- **`migrate`'s sort is FIXED, 2026-08-08 (M-v2-2): 1.67x end to end, layout
+  bitwise unchanged.** The cost was `np.argsort(kind="stable")`, which is a radix
+  sort in numpy only for 1- and 2-byte integer types -- the 30-bit bucket ordinal
+  gets timsort instead. Splitting the key into two uint16 digits puts both passes
+  on the radix implementation: **the sort alone goes 5.0x** (89.6 -> 17.0 ms at
+  2.1e6 rows; 3063 -> 216 ms at 16e6), and `migrate` end to end goes 1.67x,
+  so the sort was ~40% of it rather than nearly all of it. The permutation is
+  IDENTICAL to argsort's on random keys and on seven adversarial patterns, so no
+  trajectory bit moves -- verified end to end by rebuilding the layout from
+  scratch and comparing `slot_to_particle` elementwise.
+  **The speedup is FLAT in N**: 1.68 / 1.67 / 1.68 / 1.66x at 3.3e4 / 2.6e5 /
+  2.1e6 / 1.7e7 particles, a 512x range. I expected it to GROW as the O(M log M)
+  term took over and it does not, which is what licenses carrying it to C-gh
+  rather than re-measuring there. Measured on the M4 laptop; the transfer to a
+  Grace CPU is untested.
+  Also fixed: `np.isin(new_brick, affected)` -> a bool lookup table, 34.0 -> 9.8
+  ms at 16e6 rows. **That correction is small, and it corrects this record**: the
+  "argsort + `isin`" attribution above overstates `isin`, which was never more
+  than a few percent of the step.
 - `repack` sorts by key when the arena is non-empty, which is O(N log N). At
   cdev8 that is invisible; at C-gh it wants the merge it deserves, since only
   the few arena residents are out of order.

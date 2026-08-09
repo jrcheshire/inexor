@@ -168,6 +168,69 @@ def test_repack_redistributes_in_place_with_bounded_scratch():
     assert r["slots_used"] <= r["slots_allocated"]
 
 
+# -------------------------------------------------------------- the radix sort
+
+
+@pytest.mark.parametrize(
+    "name,make",
+    [
+        ("random", lambda r, m: r.integers(0, 2**30, m).astype(np.int32)),
+        ("all identical", lambda r, m: np.zeros(m, np.int32)),
+        ("already sorted", lambda r, m: np.sort(r.integers(0, 2**30, m).astype(np.int32))),
+        ("reverse sorted",
+         lambda r, m: np.sort(r.integers(0, 2**30, m).astype(np.int32))[::-1].copy()),
+        ("few distinct", lambda r, m: r.integers(0, 512, m).astype(np.int32)),
+        ("low digit zero", lambda r, m: (r.integers(0, 2**14, m) << 16).astype(np.int32)),
+        ("high digit zero", lambda r, m: r.integers(0, 2**16, m).astype(np.int32)),
+        ("int32 maximum", lambda r, m: np.full(m, 2**31 - 1, np.int32)),
+        ("int64 keys", lambda r, m: r.integers(0, 2**30, m).astype(np.int64)),
+    ],
+)
+def test_the_radix_sort_is_the_same_permutation_as_argsort(name, make):
+    """The whole licence for swapping the sort. It must return the IDENTICAL
+    permutation, not merely a correctly sorted one -- within-bucket order decides
+    which slot each particle occupies, which decides the paint accumulation
+    order, which decides the bits of a trajectory. Adversarial patterns included
+    because a radix sort's failure modes live at the digit boundaries."""
+    from inexor.layout import _stable_sort_index
+
+    keys = make(np.random.default_rng(30), 20_000)
+    assert np.array_equal(_stable_sort_index(keys), np.argsort(keys, kind="stable")), name
+
+
+def test_the_radix_sort_refuses_keys_it_cannot_represent():
+    """Two digits cover [0, 2^32). A negative key means the bucket ordinal has
+    already wrapped, which is the silent int32 failure `_refuse_key_overflow`
+    exists for -- so it must raise here rather than sort garbage into a
+    plausible-looking order."""
+    from inexor.layout import _stable_sort_index
+
+    with pytest.raises(ValueError, match=r"\[0, 2\^32\)"):
+        _stable_sort_index(np.array([-1, 0, 1], dtype=np.int64))
+    with pytest.raises(ValueError, match=r"\[0, 2\^32\)"):
+        _stable_sort_index(np.array([0, 2**32], dtype=np.int64))
+    assert _stable_sort_index(np.empty(0, dtype=np.int32)).size == 0
+
+
+def test_the_layout_is_unchanged_by_the_faster_sort():
+    """End to end: swapping the sort must move NOTHING observable. Same slots,
+    same occupancy, same particle-to-slot map -- otherwise it is a change in the
+    trajectory wearing a performance argument."""
+    lay, x, t9 = _build(seed=31, brick_slack=0.50)
+    rng = np.random.default_rng(32)
+    for _ in range(3):
+        x = np.mod(x + rng.normal(scale=0.3 * t9.spacing, size=x.shape), L_BOX)
+        lay.migrate(x)
+        lay.check()
+    # the reference: rebuild from scratch at the same positions, which exercises
+    # the build-side sort, and compare the derived layout exactly
+    ref = BrickPackedLayout.build(x, t9, BRICKS_PER_SIDE, brick_slack=0.50)
+    lay.repack(brick_slack=0.50)
+    assert np.array_equal(lay.occupancy, ref.occupancy)
+    assert np.array_equal(lay.slot_to_particle, ref.slot_to_particle)
+    assert np.array_equal(lay.particle_to_slot, ref.particle_to_slot)
+
+
 # ------------------------------------------------------- the index dtype ceiling
 
 
