@@ -757,19 +757,27 @@ def check_tile_paint_headroom(n_particles_total, frac_bits, max_cell_particles=1
 
 def tile_gather_vector(gx, gy, gz, u, live, shape, cell):
     """Read 3 tile fields with ONE shared CIC stencil (`cic_read_vector` twin,
-    origin-shifted). Zeroed on ~live. Returns ((n,3) f64, n_out)."""
+    origin-shifted). Zeroed on ~live. Returns ((n,3) field-dtype, n_out).
+
+    Dtype follows the field, per the narrowing rule in `painting.py`. This one
+    hardcoded an f64 accumulator until M-v2-4, so it returned f64 even from an
+    f32 tile mesh -- the only one of the four that did not even read the field's
+    dtype.
+    """
     nx, ny, nz = (int(s) for s in shape)
     base, frac, ok, n_out = _tile_cic_pieces(u, live, (nx, ny, nz), cell)
     fx, fy, fz = gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)
     n = u.shape[0]
-    ax = jnp.zeros((n,), dtype=jnp.float64)
-    ay = jnp.zeros((n,), dtype=jnp.float64)
-    az = jnp.zeros((n,), dtype=jnp.float64)
+    dt = gx.dtype
+    ax = jnp.zeros((n,), dtype=dt)
+    ay = jnp.zeros((n,), dtype=dt)
+    az = jnp.zeros((n,), dtype=dt)
     wlo = 1.0 - frac
     for dx in (0, 1):
         for dy in (0, 1):
             for dz in (0, 1):
                 flat, w = _tile_corner(base, frac, wlo, (dx, dy, dz), (nx, ny, nz), ok)
+                w = w.astype(dt)
                 ax = ax + w * fx[flat]
                 ay = ay + w * fy[flat]
                 az = az + w * fz[flat]
@@ -930,11 +938,18 @@ def gather_coarse_subblock(
 
     fx, fy, fz = (jnp.asarray(s).reshape(-1) for s in (sub_x, sub_y, sub_z))
     n = xp.shape[0]
-    ax = jnp.zeros((n,), dtype=fx.dtype)
-    ay = jnp.zeros((n,), dtype=fx.dtype)
-    az = jnp.zeros((n,), dtype=fx.dtype)
+    dt = fx.dtype
+    ax = jnp.zeros((n,), dtype=dt)
+    ay = jnp.zeros((n,), dtype=dt)
+    az = jnp.zeros((n,), dtype=dt)
     for dx, dy, dz in corners:
+        # the product is formed in f64 and narrowed ONCE, matching
+        # `_tsc_corner_flat_weight` exactly. Narrowing `w_axis` above instead
+        # breaks the bitwise contract on 113 of 186 elements at 1.19e-7 --
+        # measured, on the unmasked path, so it diverges everywhere and not
+        # only for padded rows (see the narrowing rule in painting.py)
         ww = w_axis[dx - first][:, 0] * w_axis[dy - first][:, 1] * w_axis[dz - first][:, 2]
+        ww = ww.astype(dt)
         flat = ((i[:, 0] + dx) * extent + (i[:, 1] + dy)) * extent + (i[:, 2] + dz)
         ax = ax + ww * fx[flat]
         ay = ay + ww * fy[flat]

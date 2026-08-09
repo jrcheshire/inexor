@@ -451,6 +451,86 @@ def test_counts_from_int_is_exact_where_we_claim_and_not_past_it():
         )
 
 
+# ============================================== S4: the gather seam, at f32
+
+
+def test_every_gather_follows_the_field_dtype():
+    import jax.numpy as jnp
+
+    n_coarse = N_FINE_T // forces.COARSE_RATIO
+    rng = np.random.default_rng(60)
+    g32 = [jnp.asarray(rng.normal(size=(n_coarse,) * 3), dtype=jnp.float32) for _ in range(3)]
+    pos = _positions(61, N_PART_T)
+    u, live, shape, cell = _tile_fixture(62)
+    t32 = [jnp.asarray(rng.normal(size=shape), dtype=jnp.float32) for _ in range(3)]
+    tiled, _ = forces.tile_gather_vector(*t32, u, live, shape, cell)
+    _, sub, owned, _, origin, nc, cell_c = _owned_subblock(63, fdtype=jnp.float32)
+    _assert_dtypes([
+        ("tsc_read_vector(f32)",
+         _name(painting.tsc_read_vector(*g32, pos, n_coarse, L_BOX)), "float32"),
+        ("cic_read_vector(f32)",
+         _name(painting.cic_read_vector(*g32, pos, n_coarse, L_BOX)), "float32"),
+        ("tile_gather_vector(f32)", _name(tiled), "float32"),
+        ("gather_coarse_subblock(f32)",
+         _name(forces.gather_coarse_subblock(*sub, owned, origin, cell_c, nc)), "float32"),
+    ])
+
+
+@pytest.mark.parametrize("assign", ["cic", "tsc"])
+def test_the_subblock_gather_stays_bitwise_the_global_gather_at_f32(assign):
+    """THE CONTRACT S4 was most likely to break (D-v2-16 clause 3).
+
+    Staging is a memory decision and must not move a number, at EITHER dtype.
+    The f64 half of this is `test_gathering_from_the_subblock_is_bitwise_the_
+    global_gather` in the parity suite; this is the f32 half, and it is the
+    reason the narrowing rule casts the three-factor PRODUCT rather than the
+    per-axis weights. Narrowing early was measured in situ against this exact
+    fixture: 113 of 186 elements differ at 1.19e-7, on the UNMASKED path, so it
+    diverges everywhere rather than only for padded rows.
+
+    Checked on tile 0, whose block straddles the periodic boundary, which is
+    where an index-shift or a rounding difference would hide.
+    """
+    import jax.numpy as jnp
+
+    g, sub, owned, _, origin, n_coarse, cell_c = _owned_subblock(64, fdtype=jnp.float32)
+    glob = np.asarray(
+        (painting.tsc_read_vector if assign == "tsc" else painting.cic_read_vector)(
+            *g, owned, n_coarse, L_BOX
+        )
+    )
+    mine = np.asarray(
+        forces.gather_coarse_subblock(*sub, owned, origin, cell_c, n_coarse, assign=assign)
+    )
+    assert mine.dtype == np.float32 and glob.dtype == np.float32
+    peak = float(np.max(np.abs(glob)))
+    assert peak > 1e-6, f"oracle peak {peak:.3e} -- the comparison is vacuous, not passing"
+    assert int(np.count_nonzero(glob)) > 0.9 * glob.size
+    n_diff = int(np.count_nonzero(mine != glob))
+    assert n_diff == 0, (
+        f"{n_diff}/{mine.size} elements differ at f32, max |delta| "
+        f"{float(np.max(np.abs(mine - glob))):.3e}. The staged gather is no longer bitwise "
+        "the global one -- check whether the corner weight is being narrowed before the "
+        "three-factor product rather than after it."
+    )
+
+
+def test_narrowing_the_weight_early_would_break_the_contract():
+    """Why the rule says AFTER the product, asserted rather than asserted-in-prose.
+
+    If f32(a)*f32(b)*f32(c) equalled f32(a*b*c) the ordering would not matter
+    and the rule would be cargo. It does not.
+    """
+    rng = np.random.default_rng(70)
+    a, b, c = (rng.random(4096) for _ in range(3))
+    early = (a.astype(np.float32) * b.astype(np.float32) * c.astype(np.float32))
+    late = (a * b * c).astype(np.float32)
+    assert not np.array_equal(early, late), (
+        "narrowing per-axis and narrowing the product agree on this sample, so the "
+        "ordering rule in painting.py has no teeth -- re-derive it before relying on it"
+    )
+
+
 # ====================================================== the two promotion traps
 
 
@@ -483,23 +563,33 @@ def test_narrowing_the_kernel_build_alone_does_not_narrow_the_kernel():
     )
 
 
-def test_a_gather_accumulator_is_defeated_by_an_f64_weight():
-    """TRAP 2, asserted on the real function.
+def test_a_gather_accumulator_would_be_defeated_by_an_f64_weight():
+    """TRAP 2, and the proof S4's cast is what defeats it.
 
-    `gather_coarse_subblock` sets its accumulators from the FIELD's dtype
-    (forces.py, `dtype=fx.dtype`), which reads like it already follows the mesh.
-    It does not: the corner weights are built from f64 positions, and
-    `f32_acc + f64_w * f32_field -> f64`. So handing it an f32 sub-block today
-    returns f64, and an f32 arm built without S4's weight cast would look like it
-    worked while gathering in double precision.
+    `gather_coarse_subblock` sets its accumulators from the FIELD's dtype, which
+    reads like it always followed the mesh. It did not: the corner weights come
+    from f64 positions, and `f32_acc + f64_w * f32_field -> f64`, so before S4
+    an f32 sub-block gathered in f64 and returned f64.
+
+    Both halves are asserted. The raw promotion is still live and is what the
+    cast exists for; the function is no longer subject to it.
     """
     import jax.numpy as jnp
 
     _, sub, owned, _, origin, n_coarse, cell_c = _owned_subblock(50, fdtype=jnp.float32)
     assert _name(sub[0]) == "float32", "staging is a slice and must not change dtype"
+
+    # the promotion itself, unchanged and still the reason for the cast
+    acc32 = jnp.zeros((4,), dtype=jnp.float32)
+    w64 = jnp.ones((4,), dtype=jnp.float64)
+    fld32 = jnp.ones((4,), dtype=jnp.float32)
+    assert _name(acc32 + w64 * fld32) == "float64", (
+        "f32_acc + f64_weight * f32_field no longer promotes; the weight cast in the four "
+        "gathers may be removable, but check every one before touching it"
+    )
+
     got = forces.gather_coarse_subblock(*sub, owned, origin, cell_c, n_coarse, assign="tsc")
-    assert _name(got) == "float64", (
-        "an f32 field gathered through f64 weights returns f64 -- this is the trap M-v2-4 "
-        "S4's weight cast exists for. When S4 lands, this expectation becomes float32 and "
-        "the assertion below is what proves the cast is doing the work."
+    assert _name(got) == "float32", (
+        "an f32 sub-block gathered back to f64 -- S4's `ww.astype(dt)` is missing or has "
+        "been removed, and an f32 arm built on this would silently gather in double"
     )
