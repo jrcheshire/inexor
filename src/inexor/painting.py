@@ -251,7 +251,7 @@ def check_tsc_paint_headroom(n_particles_total, frac_bits, max_cell_particles=1.
         )
 
 
-def paint_tsc_int(positions, n_mesh, box_size, frac_bits=12):
+def paint_tsc_int(positions, n_mesh, box_size, frac_bits=12, live=None):
     """Deterministic integer-accumulation TSC paint. Returns the raw int32 mesh.
 
     The D-v2-16 clause 2 deliverable. `paint_tsc_f64` accumulates through
@@ -269,14 +269,26 @@ def paint_tsc_int(positions, n_mesh, box_size, frac_bits=12):
     do not sum to exactly 2^frac_bits the way the exact weights sum to 1. That is
     the same trade `paint_int` makes across 8 corners and it is a mass error of
     order 27 * 2^-frac_bits per particle, not a determinism problem.
+
+    **`live` exists to keep the STREAMED paint on one XLA shape (M-v2-3).** The
+    engine accumulates this over chunks of bricks, and a chunk's row count varies,
+    so each chunk keys a new shape and recompiles -- measured at 2.91 s of a
+    13.21 s step across 8 chunks, the same trap that cost 24.1 s in the
+    long-range read. Padding needs a MASK rather than filler positions, because
+    an unmasked pad row would add real mass to the mesh; masked rows contribute a
+    quantized weight of exactly zero, so the accumulated mesh is bitwise what the
+    unpadded chunks give.
     """
     scale = np.float32(2.0**frac_bits)  # np scalar: no device array at trace-build time
     N = int(n_mesh)
     cell = float(box_size) / N
     base, w = _tsc_pieces(positions, cell)
     mesh = jnp.zeros((N**3,), dtype=jnp.int32)
+    m = None if live is None else jnp.asarray(live)
     for corner in _TSC_CORNERS:
         flat, ww = _tsc_corner_flat_weight(base, w, corner, N)
+        if m is not None:
+            ww = jnp.where(m, ww, 0.0)
         mesh = mesh.at[flat].add(
             rint_i(ww.astype(jnp.float32) * scale), mode="promise_in_bounds"
         )

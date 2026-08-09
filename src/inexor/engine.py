@@ -174,12 +174,23 @@ def coarse_delta_streamed(st, cfg):
     n = cfg.n_coarse
     mesh = np.zeros((n, n, n), dtype=np.int64)
     bricks = list(range(st.n_bricks))
-    for i in range(0, len(bricks), cfg.chunk_bricks):
-        _, x, _ = st.decode_bricks(bricks[i : i + cfg.chunk_bricks])
-        if not len(x):
+    groups = [bricks[i : i + cfg.chunk_bricks] for i in range(0, len(bricks), cfg.chunk_bricks)]
+    rows = [sum(st.brick_member_count(b) for b in gg) for gg in groups]
+    # ONE shape for every chunk. A varying row count recompiles per chunk, which
+    # profiled at 2.91 s of a 13.21 s step -- the same trap as the long-range
+    # read. Padding is masked, not filled: an unmasked pad row would add mass.
+    pad = int(max(rows)) if rows else 0
+    for gg, m in zip(groups, rows):
+        if m == 0:
             continue
+        _, x, _ = st.decode_bricks(gg)
+        xp = np.zeros((pad, 3), dtype=np.float64)
+        xp[:m] = x
+        lv = np.zeros(pad, dtype=bool)
+        lv[:m] = True
         mesh += np.asarray(
-            paint_tsc_int(jnp.asarray(x), n, cfg.box_size, cfg.frac_bits), dtype=np.int64
+            paint_tsc_int(jnp.asarray(xp), n, cfg.box_size, cfg.frac_bits, live=lv),
+            dtype=np.int64,
         )
     if int(np.abs(mesh).max()) >= 2**31:
         raise ValueError(

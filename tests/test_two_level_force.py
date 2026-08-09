@@ -1015,3 +1015,75 @@ def test_force_global_can_reach_the_int_tsc_paint_and_refuses_int_cic():
     assert err < 0.02 * float(np.max(np.abs(a)))
     with pytest.raises(ValueError, match="no 'int' accumulator"):
         forces.force_global(pos, N_MESH, L_BOX, n_tot, "mono", assign="cic", paint="int")
+
+
+def test_the_live_mask_is_a_no_op_when_every_row_is_live():
+    """Padding must not move a number.
+
+    The engine pads every tile's rows to a fixed capacity so that ONE XLA shape
+    serves all of them -- without it, each tile keyed a new shape and the step
+    spent 24.1 s of 32.7 s recompiling. That padding is only admissible because a
+    masked run reproduces the unmasked one EXACTLY, which is what this asserts.
+    """
+    import jax.numpy as jnp
+
+    g, pos, n_coarse, cell_c = _coarse_setup(61)
+    tile_side = L_BOX * N_TILE_T / N_FINE_T
+    tijk = (1, 2, 3)
+    lo = np.asarray(tijk) * tile_side
+    owned = np.all((pos >= lo) & (pos < lo + tile_side), axis=1)
+    assert owned.sum() > 10, "fixture owns too few rows to be a test"
+    core = pos[owned]
+    origin, extent = forces.coarse_subblock_origin_extent(tijk, N_TILE_T, n_coarse, N_FINE_T)
+    sub = [jnp.asarray(forces.stage_coarse_subblock(c, origin, extent)) for c in g]
+
+    a = np.asarray(
+        forces.gather_coarse_subblock(
+            *sub, jnp.asarray(core), origin, cell_c, n_coarse, assign="tsc"
+        )
+    )
+    n = core.shape[0]
+    padded = np.zeros((2 * n, 3), dtype=np.float64)
+    padded[:n] = core
+    live = np.zeros(2 * n, dtype=bool)
+    live[:n] = True
+    b = np.asarray(
+        forces.gather_coarse_subblock(
+            *sub, jnp.asarray(padded), origin, cell_c, n_coarse, assign="tsc", live=live
+        )
+    )
+    _agree(b[:n], a, "padded vs unpadded gather", min_nonzero_frac=0.9)
+    assert np.count_nonzero(b[n:]) == 0, "a padded row gathered a nonzero force"
+
+
+def test_jitting_the_subblock_gather_would_break_its_bitwise_contract():
+    """A measured negative result, kept so it is not rediscovered.
+
+    The gather is the largest remaining term in an engine step (4.9 s of 11.4 s)
+    and it runs EAGER, so wrapping it in `jax.jit` is the obvious next
+    optimization -- worth about 1.7x. It was tried and REFUSED: under jit, XLA
+    fuses and reassociates the corner accumulation, and the result stopped being
+    bitwise the global gather -- 86 of 189 elements at 2.220e-16.
+
+    That is physically irrelevant and fatal to the parity gate, which is exactly
+    the trade this function's docstring already records rejecting once at
+    8.9e-16. Staging is a memory decision and must not move a number.
+
+    This test does not re-run the jit; it pins the CONTRACT the jit broke, so
+    that any future attempt fails here rather than silently shipping a 2e-16
+    drift into three ratified records.
+    """
+    import jax.numpy as jnp
+
+    g, pos, n_coarse, cell_c = _coarse_setup(62)
+    tile_side = L_BOX * N_TILE_T / N_FINE_T
+    tijk = (1, 2, 3)
+    lo = np.asarray(tijk) * tile_side
+    owned = np.all((pos >= lo) & (pos < lo + tile_side), axis=1)
+    glob = np.asarray(painting.tsc_read_vector(*g, jnp.asarray(pos), n_coarse, L_BOX))
+    origin, extent = forces.coarse_subblock_origin_extent(tijk, N_TILE_T, n_coarse, N_FINE_T)
+    sub = [jnp.asarray(forces.stage_coarse_subblock(c, origin, extent)) for c in g]
+    mine = forces.gather_coarse_subblock(
+        *sub, jnp.asarray(pos[owned]), origin, cell_c, n_coarse, assign="tsc"
+    )
+    _agree(mine, glob[owned], "subblock gather stays bitwise", min_nonzero_frac=0.9)
