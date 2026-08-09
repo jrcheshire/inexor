@@ -832,6 +832,84 @@ class SlotState:
         if ids is not None:
             self.ids[self.arena_base + a] = ids
 
+    def repack(self, brick_slack=0.10):
+        """Redistribute BRICK capacity to match current occupancy.
+
+        **Required, not an optimization.** D-v2-19 clause 3 measured that frozen
+        capacity fails at every granularity -- per-brick, a collapsing halo
+        outgrew even 50% spare by step 6 -- so pooling, repack and a small arena
+        are all three needed and removing any one fails. Built without this, the
+        engine ran ten steps at `smoke` and then hit the D-007 refusal with the
+        arena full, which is the ladder doing its job and is exactly the failure
+        clause 3 predicts.
+
+        Arena residents are folded back into their brick's run here, so after a
+        repack slot order IS key order with no exceptions -- which is what
+        discharges the `argsort` D-v2-19's "what this does not establish" flags
+        in `BrickPackedLayout.repack`.
+
+        **The scratch is O(N), and the in-place form is owed.** D-v2-19 clause 3
+        establishes that this is a MONOTONE rearrangement -- bucket order is a
+        fixed spatial ordering, so restoring the layout is two in-place passes
+        with O(chunk) scratch, measured at 0.13-0.52 MB independent of N. This
+        implementation allocates instead, which is correct and is fine at the
+        development configurations, and is 91 GB of transient at C-gh. Writing
+        the in-place version is a named follow-up, not a design change.
+        """
+        p3 = self.buckets_per_brick
+        occ = self.occupancy.astype(np.int64)
+        # pull every arena resident back into its brick's count
+        arena_live = np.nonzero(self.arena_bucket >= 0)[0]
+        if len(arena_live):
+            occ = occ + np.bincount(self.arena_bucket[arena_live], minlength=self.n_buckets)
+        counts = occ.reshape(self.n_bricks, p3).sum(axis=1)
+        spare = np.ceil(counts * float(brick_slack)).astype(np.int64)
+        spare = np.where(counts > 0, np.maximum(spare, 1), spare)
+        new_start = np.zeros(self.n_bricks + 1, dtype=np.int64)
+        np.cumsum(counts + spare, out=new_start[1:])
+        n_alloc = int(new_start[-1])
+        if n_alloc + self.n_arena > self.off.shape[0]:
+            raise ValueError(
+                f"repack needs {n_alloc} slots plus a {self.n_arena}-slot arena against an "
+                f"allocation of {self.off.shape[0]}. Raise alloc_margin at build."
+            )
+        off = np.zeros_like(self.off)
+        w = np.zeros_like(self.w)
+        ids = None if self.ids is None else np.full_like(self.ids, -1)
+        new_occ = np.zeros(self.n_buckets, dtype=np.int64)
+        for b in range(self.n_bricks):
+            slots = self.brick_member_slots(b)
+            if not len(slots):
+                continue
+            dest = self._bucket_flat_of_slots(b, slots)
+            order = np.argsort(dest - b * p3, kind="stable")
+            lo = int(new_start[b])
+            m = len(order)
+            off[lo : lo + m] = self.off[slots[order]]
+            w[lo : lo + m] = self.w[slots[order]]
+            if ids is not None:
+                ids[lo : lo + m] = self.ids[slots[order]]
+            new_occ[b * p3 : (b + 1) * p3] = np.bincount(
+                dest[order] - b * p3, minlength=p3
+            )
+        self.off, self.w = off, w
+        if ids is not None:
+            self.ids = ids
+        self.brick_start = new_start
+        self.occupancy = _to_index(new_occ, self.index_dtype, "repacked")
+        self.arena_base = n_alloc
+        self.arena_bucket[:] = -1
+        return dict(slots_used=n_alloc, slots_per_particle=n_alloc / max(self.n_particles, 1))
+
+    def _bucket_flat_of_slots(self, brick_flat, slots):
+        """Flat bucket ordinal per slot, run rows then arena rows."""
+        m = self.brick_live_count(brick_flat)
+        out = self.bucket_flat_of_live_slots(brick_flat)
+        if len(slots) > m:
+            a = slots[m:] - self.arena_base
+            out = np.concatenate([out, self.arena_bucket[a]])
+        return out
+
     def bytes_per_particle(self, payload=9.0):
         """The all-in figure, with `scaffold` reported and EMPTY.
 

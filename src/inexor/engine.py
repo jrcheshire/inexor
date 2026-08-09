@@ -81,6 +81,8 @@ class EngineConfig:
         paint_long="int",
         frac_bits=12,
         chunk_bricks=64,
+        brick_slack=0.10,
+        repack_every=1,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -98,6 +100,11 @@ class EngineConfig:
         self.paint_long = str(paint_long)
         self.frac_bits = int(frac_bits)
         self.chunk_bricks = int(chunk_bricks)
+        # D-v2-19 clause 3: frozen capacity fails at EVERY granularity, so the
+        # repack is required rather than an optimization. Built without it, the
+        # engine hit the D-007 refusal with a full arena by step 10 at `smoke`.
+        self.brick_slack = float(brick_slack)
+        self.repack_every = int(repack_every)
 
     @property
     def n_total(self):
@@ -294,6 +301,7 @@ def step(st, cfg, coeff, c_drift, collect=None):
 
     stats = drift_and_migrate(st, c_drift, vel_scale_new=s_new)
     stats.update(cap=cap, n_tiles=len(cfg.tiles), vel_scale=s_new)
+    stats["repack"] = None
     if collect is not None:
         collect(stats)
     return stats
@@ -318,7 +326,10 @@ def run(st, cfg, coeffs, collect=None):
     drift_and_migrate(st, lead)  # onto the first midpoint
     out = []
     for k in range(len(fused)):
-        out.append(step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect))
+        stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect)
+        if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
+            stats["repack"] = st.repack(brick_slack=cfg.brick_slack)
+        out.append(stats)
     return out
 
 
