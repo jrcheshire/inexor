@@ -93,8 +93,10 @@ def ste_wrap_s(z, mod):
 # 77 GB of state it indexes. CUBE's sorted-by-cell layout works because CUBE
 # runs one particle per cell; our fine mesh is 2x the particle grid per side, so
 # it does not transfer. D-v2-14 therefore coarsens the bucket to 1.0 Mpc/h (two
-# particle cells, `bucket_cells = 2`), quantum fine_cell/64, index 2.15 GB --
-# measured at 15x margin on D-v2-9's 3e-2 bar.
+# particle cells, `bucket_cells = 2`), quantum fine_cell/64, index 4.29 GB --
+# measured at 15x margin on D-v2-9's 3e-2 bar. (The index was 2.15 GB at
+# ratification, when it was uint16; M-v2-1 widened it to uint32 rather than
+# establish that a bucket never holds 65535 particles -- see `layout.py`.)
 #
 # `bucket_cells` is chosen ON MARGIN, not on a measured ordering: the ladder is
 # non-monotonic at these levels (c=1 beats the finer control on dP/P, c=4 beats
@@ -102,7 +104,7 @@ def ste_wrap_s(z, mod):
 #
 # There is no per-particle bucket id in the payload. The bucket is implied by
 # WHERE the particle sits in a brick-sorted array plus a per-bucket count index
-# -- that index is the 0.25 B/p line of the 10.15 B/p all-in figure, and it is
+# -- that index is the 0.50 B/p line of the all-in figure (0.25 as ratified), and it is
 # `layout.py`'s job. This module owns the transform only.
 
 LEVELS_PER_BUCKET = 256  # one uint8 per axis; the definition of the tier
@@ -178,8 +180,8 @@ class T9Layout:
     def bucket_size(self):
         return self.bucket_cells * self.spacing
 
-    def index_bytes(self, dtype=np.uint16):
-        """Bytes the per-bucket count index costs (the 0.25 B/p line at C-gh)."""
+    def index_bytes(self, dtype=np.uint32):
+        """Bytes the per-bucket count index costs (the 0.50 B/p line at C-gh)."""
         return self.n_buckets * np.dtype(dtype).itemsize
 
 

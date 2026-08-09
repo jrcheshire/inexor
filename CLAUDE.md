@@ -12,9 +12,14 @@ mbody owns MLX/Apple-Silicon).
 
 ## Current milestone
 
-**Building M-v2-1 (codec + layout).** The gate week (V1, V2a, V2b, V3) and the
-V4 architecture freeze are CLOSED: D-v2-14..18 ratified 2026-08-08 and the
-build ladder is D-v2-18's seven rungs, M-v2-1 through M-v2-7. Master strategy +
+**M-v2-1 (codec + layout) BUILT; next rung is M-v2-2 (force promotion).** The
+gate week (V1, V2a, V2b, V3) and the V4 architecture freeze are CLOSED:
+D-v2-14..18 ratified 2026-08-08 and the build ladder is D-v2-18's seven rungs,
+M-v2-1 through M-v2-7. Two ADRs landed on top of the freeze the same day:
+**D-v2-19** (spare pools per brick; the re-sort is a monotone rearrangement,
+not a sort) and **D-v2-20** (the per-bucket index is uint32, 0.50 B/p, all-in
+~10.54 — the uint16 ceiling is removed rather than measured, and the cgh64 tail
+re-run is no longer owed). Master strategy +
 session seeds: `docs/plan-plan-v2.md` — START THERE; the freeze's measurements
 are `runs/v2/v4_architecture_record.md` and `runs/v2/v4_pricing_record.md`.
 Design-space study: `docs/design-study-2026-07-14.html` (artifact:
@@ -62,8 +67,10 @@ explicit `--mem` (see the umbrella albireo memory).
   the load-bearing novel pieces.
 - `docs/roadmap.md` — master plan M0-M4; M0 is a HARD go/no-go gate; each
   milestone gets a fresh detailed plan at its opening session.
-- `docs/decisions.md` — ADR log (D-001..D-015, D-v2-8..D-v2-19; D-v2-1..7 live
-  in the plan-plan table). Locked until re-litigated with JC.
+- `docs/decisions.md` — ADR log (D-001..D-015, D-v2-8..D-v2-20; D-v2-1..7 live
+  in the plan-plan table). Locked until re-litigated with JC. Note two ADRs
+  supersede parts of D-v2-14: D-v2-19 (clause 3, layout) and D-v2-20 (clause
+  2's index term) — read those before quoting a B/p figure.
 - `paper/outline.md` — claims, money plots, verified citation list + the
   citation guard (refuted claims never to reintroduce).
 

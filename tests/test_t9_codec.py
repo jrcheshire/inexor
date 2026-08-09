@@ -242,14 +242,22 @@ def test_layout_refuses_a_non_power_of_two_lattice():
 def test_layout_derives_the_ratified_c_gh_numbers():
     """The arithmetic D-v2-14 is written in, checked end to end at the real
     config: 2048^3 particles in 1024 Mpc/h, bucket 1.0 Mpc/h, quantum
-    fine_cell/64 with a 0.25 Mpc/h fine cell, index 2.15 GB."""
+    fine_cell/64 with a 0.25 Mpc/h fine cell.
+
+    The index is the one number here that MOVED after ratification: 2.15 GB at
+    uint16, 4.29 GB now that it is uint32. Both are asserted -- the ratified
+    figure because D-v2-14 clause 2 is written in it, and the current default
+    because that is what a run costs."""
     lay = _layout(bucket_cells=2, n_part=2048, box=1024.0)
     fine_cell = lay.spacing / 2  # mesh ratio 2x (plan-plan Sec. 2)
     assert lay.spacing == pytest.approx(0.5)
     assert lay.bucket_size == pytest.approx(1.0)
     assert lay.quantum == pytest.approx(fine_cell / 64)
     assert lay.n_buckets_side == 1024
-    assert lay.index_bytes() / 1e9 == pytest.approx(2.15, abs=0.01)
+    assert lay.index_bytes(dtype=np.uint16) / 1e9 == pytest.approx(2.15, abs=0.01)
+    assert lay.index_bytes() / 1e9 == pytest.approx(4.29, abs=0.01)
+    # 0.50 B/p against the ratified 0.25, on 2048^3 particles
+    assert lay.index_bytes() / 2048**3 == pytest.approx(0.50, rel=0.01)
 
 
 # ------------------------------------------------------------- velocities

@@ -9,7 +9,18 @@ THE TWO GRIDS, and why there are two.
 
   bucket   1.0 Mpc/h, the position codec's quantization cell. At C-gh that is
            1024^3 buckets holding ~8 particles each. Its per-bucket occupancy
-           is the index the codec needs: uint16, 2.15 GB, 0.25 B/p.
+           is the index the codec needs: uint32, 4.29 GB, 0.50 B/p.
+
+           WHY uint32 AND NOT uint16, which would halve it. A uint16 ceiling of
+           65535 is reachable in principle -- a 1 Mpc/h cell can sit inside a
+           halo -- and nothing cheap establishes whether a production run gets
+           there. Measured peaks are 5943 / 7581 / 13774 across 1x / 8x / 64x of
+           volume, which is rising, but three points do not support an
+           extrapolation to C-gh: a power-law fit through the tail overpredicted
+           cgh64's own peak by 10x (M-v2-1, `runs/v2/m1_brick_packed_record.md`).
+           So the ceiling is removed rather than measured. It costs 0.25 B/p out
+           of a 1.32x margin under the GH200 host cliff, leaving 1.28x, and it
+           makes the index independent of a bound nobody has established.
 
   brick    8 Mpc/h = 32 fine cells at C-gh, so 128^3 bricks of ~4096 particles.
            This is the FORCE's bucketing -- the union of a tile's bricks is a
@@ -66,7 +77,7 @@ import numpy as np
 
 from .codec import LEVELS_PER_BUCKET
 
-UINT16_MAX = 65535
+DEFAULT_INDEX_DTYPE = np.uint32
 
 
 # ============================================================================
@@ -214,15 +225,60 @@ def _prefix_mask(counts, fits):
     return within < np.repeat(fits, counts)
 
 
-def _refuse_uint16_overflow(counts, what):
-    hot = int(np.max(counts)) if len(counts) else 0
-    if hot > UINT16_MAX:
+def _to_index(counts, dtype, what):
+    """Narrow bucket counts to the stored index dtype, REFUSING overflow.
+
+    EVERY write to `occupancy` goes through here, which is the point. numpy
+    narrows modularly, so a bare `.astype(uint16)` turns a bucket of 65,536 into
+    an occupancy of 0 and one of 70,000 into 4,464 -- and because occupancy IS
+    the bucket-boundary prefix sum, that does not merely misreport one bucket, it
+    shifts the derived span of every LATER bucket in that brick. `check()`
+    samples three bricks, so it would very likely pass.
+
+    Until 2026-08-08 only `build` was guarded; `migrate` and `repack` narrowed
+    bare, so the guarded path was the one where overflow is least likely and the
+    two that run every step were silent. That is the defect this replaces, and
+    it is why the refusal lives at the cast rather than beside it.
+    """
+    counts = np.asarray(counts)
+    hot = int(counts.max()) if counts.size else 0
+    limit = int(np.iinfo(dtype).max)
+    if hot > limit:
         raise ValueError(
-            f"{what} bucket count {hot} exceeds uint16 ({UINT16_MAX}). The per-bucket index "
-            "is uint16 because that is what makes it 0.25 B/p; a wider index costs 0.5 B/p "
-            "and moves D-v2-14 clause 2's all-in figure. This fires only under extreme "
-            "clustering -- how close a real run gets is part of what M-v2-1's cgh64 "
-            "measurement is for."
+            f"{what} bucket count {hot} exceeds the {np.dtype(dtype).name} index ceiling "
+            f"({limit}). The index does not wrap and does not clamp (D-007): occupancy "
+            "doubles as the derived bucket boundaries, so a modular narrowing would "
+            "silently relocate every later bucket in the brick. Widen index_dtype."
+        )
+    return counts.astype(dtype)
+
+
+def _refuse_key_overflow(n_buckets):
+    """`key` is int32, so the bucket grid must fit it. C-hero does not.
+
+    The same silent-wrap class as `_to_index`, one config-table rung away: at
+    C-hero (4096^3 particles, bucket_cells 2) the grid is 2048^3 = 8.59e9 buckets
+    against an int32 max of 2.15e9, and a bare narrowing sends the high buckets
+    to NEGATIVE ordinals.
+
+    It is refused rather than widened, because widening is the wrong fix. `key`
+    is a per-particle cache -- 34.4 GB at C-gh as int32, 68.7 as int64, against
+    ~91 GB of state on a ~116 GB host -- so it cannot be resident at production
+    scale in EITHER width, and neither can `particle_to_slot` (68.7 GB) or
+    `slot_to_particle` (75.6 GB). All three are scaffolding for a probe that
+    keeps positions in their original order and uses the layout as an index into
+    them; the streamed engine stores state IN slot order, where a particle's
+    bucket is implied by where it sits and none of the three exists. Making that
+    ceiling loud is the fix available today; removing it is M-v2-3/M-v2-6's job.
+    """
+    if int(n_buckets) > np.iinfo(np.int32).max:
+        raise ValueError(
+            f"bucket grid {int(n_buckets)} exceeds int32 ({np.iinfo(np.int32).max}), which is "
+            "what `key` is stored in -- the high buckets would narrow to negative ordinals "
+            "silently. This bites at C-hero. Note the fix is NOT a wider key: at this scale "
+            "the per-particle bookkeeping arrays (key, particle_to_slot, slot_to_particle) "
+            "are ~21 B/p against ~10.5 B/p of state and cannot be resident at all, so the "
+            "layout has to stop materializing them first."
         )
 
 
@@ -251,7 +307,7 @@ def _refuse_uint16_overflow(counts, what):
 #                 bucket: 8 B per bucket is 8.6 GB at C-gh, a full 1.00 B/p
 #                 that the record's all-in figures never counted. Here bucket
 #                 boundaries are a prefix sum of `occupancy` WITHIN a brick, so
-#                 the index we already pay 0.25 B/p for does both jobs.
+#                 the index we already pay 0.50 B/p for does both jobs.
 #
 # AND THE FLUCTUATION IS SMALLER, which is the physical reason to expect this to
 # work at all. Bucket occupancy grew 76x over a run (8 -> 5943 at cdev8) because
@@ -270,7 +326,7 @@ class BrickPackedLayout:
     t9: object
     bricks_per_side: int
     brick_start: np.ndarray  # int64 (n_bricks+1,) fixed slot runs
-    occupancy: np.ndarray  # uint16 (n_buckets,) THE index; also bucket bounds
+    occupancy: np.ndarray  # uint32 (n_buckets,) THE index; also bucket bounds
     slot_to_particle: np.ndarray  # int64 (n_slots,) -1 where free
     particle_to_slot: np.ndarray  # int64 (n,)   transient bookkeeping
     key: np.ndarray  # int32 (n,)   transient: current bucket ordinal
@@ -284,20 +340,20 @@ class BrickPackedLayout:
 
     @classmethod
     def build(cls, x, t9, bricks_per_side, brick_slack=0.10, alloc_margin=0.10,
-              arena_frac=0.01):
+              arena_frac=0.01, index_dtype=DEFAULT_INDEX_DTYPE):
         nbk = t9.n_buckets_side
         if nbk % int(bricks_per_side):
             raise ValueError(
                 f"bricks_per_side {bricks_per_side} must divide the bucket grid {nbk}"
             )
-        key, _, _ = bucket_order_key(x, t9, int(bricks_per_side))
         per3 = (nbk // int(bricks_per_side)) ** 3
         n_bricks = int(bricks_per_side) ** 3
+        _refuse_key_overflow(n_bricks * per3)
+        key, _, _ = bucket_order_key(x, t9, int(bricks_per_side))
         brick = key // per3
 
         brick_counts = np.bincount(brick, minlength=n_bricks).astype(np.int64)
         occupancy = np.bincount(key, minlength=n_bricks * per3).astype(np.int64)
-        _refuse_uint16_overflow(occupancy, "initial")
 
         spare = np.ceil(brick_counts * float(brick_slack)).astype(np.int64)
         spare = np.where(brick_counts > 0, np.maximum(spare, 1), spare)
@@ -317,7 +373,7 @@ class BrickPackedLayout:
             t9=t9,
             bricks_per_side=int(bricks_per_side),
             brick_start=brick_start,
-            occupancy=occupancy.astype(np.uint16),
+            occupancy=_to_index(occupancy, index_dtype, "initial"),
             slot_to_particle=slot_to_particle,
             particle_to_slot=particle_to_slot,
             key=key.astype(np.int32),
@@ -325,6 +381,12 @@ class BrickPackedLayout:
             arena_base=n_alloc,
             arena_bucket=np.full(n_arena, -1, dtype=np.int64),
         )
+
+    @property
+    def index_dtype(self):
+        """The stored index dtype, read off the array rather than kept as a
+        separate field so the two cannot disagree about what is in force."""
+        return self.occupancy.dtype
 
     @property
     def buckets_per_brick(self):
@@ -488,7 +550,7 @@ class BrickPackedLayout:
         occ = np.bincount(key_new, minlength=self.n_bricks * p3)
         if len(spill):
             np.subtract.at(occ, spill_b, 1)
-        self.occupancy = occ.astype(np.uint16)
+        self.occupancy = _to_index(occ, self.index_dtype, "migrated")
         self.key = key_new
         fill = np.bincount(new_brick, minlength=self.n_bricks) / np.maximum(
             np.diff(self.brick_start), 1
@@ -554,9 +616,11 @@ class BrickPackedLayout:
         self.particle_to_slot[parts] = final
         if self.arena_bucket is not None:
             self.arena_bucket[:] = -1  # everyone is back in a brick run
-        self.occupancy = np.bincount(
-            self.key, minlength=self.n_bricks * self.buckets_per_brick
-        ).astype(np.uint16)
+        self.occupancy = _to_index(
+            np.bincount(self.key, minlength=self.n_bricks * self.buckets_per_brick),
+            self.index_dtype,
+            "repacked",
+        )
         return dict(
             scratch_bytes=int(scratch_peak),
             slots_used=int(new_start[-1]),
@@ -587,7 +651,22 @@ class BrickPackedLayout:
         return True
 
     def bytes_per_particle(self, payload=9.0):
+        """The terms D-v2-14 clause 2's all-in figure is written in.
+
+        `scaffold` is reported BESIDE the total and deliberately not inside it.
+        It is what this object carries that a production engine must not: `key`,
+        `particle_to_slot` and `slot_to_particle` exist because the probe keeps
+        positions in their original order and treats the layout as an index into
+        them, whereas the streamed engine stores state IN slot order, where a
+        particle's bucket is implied by where it sits. It is reported because
+        ~21 B/p of uncounted arrays sitting next to a 10.5 B/p budget should be
+        visible rather than inferred -- the same reason the superseded record's
+        missing 1.00 B/p `bucket_start` term mattered.
+        """
         n = max(self.n_particles, 1)
+        scaffold = (
+            self.key.nbytes + self.particle_to_slot.nbytes + self.slot_to_particle.nbytes
+        ) / n
         return dict(
             payload=payload,
             bucket_index=self.occupancy.nbytes / n,
@@ -597,4 +676,5 @@ class BrickPackedLayout:
             + self.occupancy.nbytes / n
             + self.brick_start.nbytes / n
             + (self.n_slots - self.n_particles) * payload / n,
+            scaffold=scaffold,
         )

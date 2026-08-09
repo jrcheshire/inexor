@@ -20,8 +20,11 @@ WHAT IT REPORTS, per step:
   - migrant fraction at BUCKET level (the exchange the layout performs) and at
     BRICK level (the coarser exchange the streaming path sees)
   - the bucket occupancy distribution: mean, max, and upper percentiles, plus
-    how close the max comes to the uint16 ceiling that the 0.25 B/p index
-    depends on
+    how close the max comes to the index dtype's ceiling. NB that headroom is
+    now REPORTING rather than a decision input: the index was widened to uint32
+    (0.50 B/p) precisely so that no measurement here has to establish a bound on
+    the far tail. The tail columns stay because the distribution is worth
+    knowing, not because a dtype waits on them.
   - for a LADDER of slack targets, the arena demand that target leaves --
     computed exactly against a capacity frozen at build time, which is the
     policy the layout implements (build once, never resize)
@@ -133,14 +136,21 @@ def make_force(g, tile, buf, family="gauss", assign="tsc", match=True):
 # ---------------------------------------------------------------------------
 
 
-# Bucket counts above each threshold. The uint16 index ceiling is 65535, and
-# whether that is reachable at C-gh is a question about the FAR TAIL, which
-# percentiles cannot answer -- p99.9 is ~700 while the peak is ~14000, so the
-# interesting region is entirely above the last percentile reported. If the
-# occupancy distribution is volume-invariant (p99 and p99.9 are flat to ~2%
-# across 64x volume, so it is), then N(>x) PER UNIT VOLUME is a fixed function
-# and can be extrapolated -- and, crucially, the extrapolation can be CHECKED by
-# predicting a bigger box's peak from a smaller box's tail before it is trusted.
+# Bucket counts above each threshold, kept as a description of the occupancy
+# distribution.
+#
+# THESE NUMBERS NO LONGER DECIDE ANYTHING, and the history is worth carrying.
+# They were added to settle whether a uint16 index (ceiling 65535) survives at
+# C-gh -- a question about the FAR TAIL, which percentiles cannot answer, since
+# p99.9 is ~700 while the peak is ~14000. The plan was to exploit the measured
+# volume-invariance of the distribution (p99 and p99.9 flat to ~2% across 64x)
+# to extrapolate N(>x) per unit volume, with the extrapolation CHECKED against a
+# bigger box's peak before being trusted. It was checked, and it failed: the fit
+# predicted cgh64's peak at ~135700 against 13774 measured, 10x wrong, because
+# it is dominated by well-populated low thresholds while the real tail falls far
+# faster. The response was to widen the index to uint32 rather than buy a better
+# extrapolation -- 0.25 B/p out of a 1.32x margin, against a bound that three
+# points were never going to establish.
 TAIL_THRESHOLDS = (100, 300, 1000, 3000, 10000, 30000, 65535)
 
 
@@ -148,8 +158,13 @@ def tail_counts(counts):
     return {str(t): int((counts > t).sum()) for t in TAIL_THRESHOLDS}
 
 
-def occupancy_summary(counts, n):
+def occupancy_summary(counts, n, index_dtype=np.uint32):
+    """Occupancy distribution. `uint16_headroom` is kept unchanged rather than
+    renamed so cards written before the widening stay directly comparable (the
+    `v2_g6b_calib_transport.py` precedent: fix additively, never in place);
+    `index_headroom` is the one that tracks the dtype actually in force."""
     live = counts[counts > 0]
+    hot = max(int(counts.max()), 1)
     return dict(
         tail=tail_counts(counts),
         mean=float(counts.mean()),
@@ -160,7 +175,9 @@ def occupancy_summary(counts, n):
         p999=float(np.percentile(live, 99.9)) if len(live) else 0.0,
         n_empty=int((counts == 0).sum()),
         n_buckets=int(len(counts)),
-        uint16_headroom=float(65535.0 / max(int(counts.max()), 1)),
+        uint16_headroom=float(65535.0 / hot),
+        index_dtype=np.dtype(index_dtype).name,
+        index_headroom=float(int(np.iinfo(index_dtype).max) / hot),
     )
 
 
@@ -171,6 +188,13 @@ def main():
     ap.add_argument("--tile", type=int, default=None, help="fine cells per tile side")
     ap.add_argument("--buf", type=int, default=32, help="buffer in fine cells")
     ap.add_argument("--bucket-cells", type=int, default=2, help="D-v2-14 ratifies 2")
+    ap.add_argument(
+        "--index-dtype",
+        default="uint32",
+        choices=("uint16", "uint32"),
+        help="the per-bucket occupancy index; uint32 is the default and uint16 reproduces "
+        "the cost D-v2-14 clause 2 was ratified with",
+    )
     ap.add_argument("--slack", type=float, default=0.10, help="the live layout's target")
     # 1.0 by default, i.e. the arena can hold every particle. That is NOT an
     # operating point -- it is what makes this a measurement rather than a
@@ -237,11 +261,12 @@ def main():
         brick_slack=args.slack,
         arena_frac=args.arena_frac,
         alloc_margin=args.alloc_margin,
+        index_dtype=np.dtype(args.index_dtype).type,
     )
     counts0 = lay.occupancy.astype(np.int64).copy()
     n = g["n_total"]
     bpp0 = lay.bytes_per_particle()
-    print(f"    initial: {occupancy_summary(counts0, n)}")
+    print(f"    initial: {occupancy_summary(counts0, n, lay.index_dtype)}")
     print(f"    initial B/p at slack {args.slack:g}: {bpp0}")
 
     xj = jnp.asarray(x, jnp.float64)
@@ -286,7 +311,7 @@ def main():
             arena_used_frac=stats["arena_used"] / n,
             max_fill_frac=stats["max_fill_frac"],
             n_full_buckets=stats["n_full_buckets"],
-            occupancy=occupancy_summary(counts, n),
+            occupancy=occupancy_summary(counts, n, lay.index_dtype),
         )
         per_step.append(rec)
         # flush=True is not cosmetic. A buffered long run that dies leaves an
@@ -331,6 +356,8 @@ def main():
     print(f"    peak arena {peak_arena:.3%} of particles;  "
           f"main {main:.3f} x N;  repack "
           f"{1000 * sum(r['wall_s'] for r in reps) / max(len(reps), 1):.0f} ms/step")
+    print(f"    (probe scaffolding, NOT in the total and not shipped: "
+          f"{bpp0['scaffold']:.1f} B/p of key + slot maps -- see bytes_per_particle)")
     print("\n    Any move to a ratified figure is JC's call, not this script's.")
 
     card = dict(
@@ -347,7 +374,7 @@ def main():
         seed=args.seed,
         live_slack=args.slack,
         live_arena_frac=args.arena_frac,
-        initial_occupancy=occupancy_summary(counts0, n),
+        initial_occupancy=occupancy_summary(counts0, n, lay.index_dtype),
         initial_bpp=bpp0,
         all_in_terms=terms,
         per_step=per_step,

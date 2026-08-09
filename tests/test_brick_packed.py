@@ -87,7 +87,7 @@ def test_no_per_bucket_boundary_array_exists():
     assert lay.brick_start.size == lay.n_bricks + 1
     b = lay.bytes_per_particle()
     assert b["brick_start"] < 0.01, "brick boundaries should be negligible per particle"
-    assert b["bucket_index"] == pytest.approx(0.25, rel=0.01)
+    assert b["bucket_index"] == pytest.approx(0.50, rel=0.01)
 
 
 def test_spare_is_the_requested_fraction_with_no_granularity_floor():
@@ -166,6 +166,126 @@ def test_repack_redistributes_in_place_with_bounded_scratch():
     payload = lay.n_particles * 9.0
     assert r["scratch_bytes"] < 0.2 * payload, "scratch should be set by the chunk, not by N"
     assert r["slots_used"] <= r["slots_allocated"]
+
+
+# ------------------------------------------------------- the index dtype ceiling
+
+
+def test_index_defaults_to_uint32_and_costs_half_a_byte():
+    """D-v2-14 clause 2 priced this index at uint16 / 0.25 B/p. It is uint32 now:
+    the ceiling is removed rather than measured, because nothing cheap bounds the
+    occupancy of a 1 Mpc/h cell that can sit inside a halo, and the one attempt to
+    extrapolate the tail overpredicted a measured peak by 10x."""
+    lay, _, _ = _build()
+    assert lay.index_dtype == np.uint32
+    assert lay.bytes_per_particle()["bucket_index"] == pytest.approx(0.50, rel=0.01)
+
+
+def test_uint16_index_is_still_reachable_and_reproduces_the_ratified_cost():
+    """The narrower index stays available, so the ratified 0.25 B/p figure is
+    still constructible and the widening is a default rather than a deletion."""
+    lay, _, _ = _build(index_dtype=np.uint16)
+    assert lay.index_dtype == np.uint16
+    assert lay.bytes_per_particle()["bucket_index"] == pytest.approx(0.25, rel=0.01)
+    lay.check()
+
+
+def test_a_bare_narrowing_would_have_wrapped_silently():
+    """Why the guard exists at all, pinned as a fact about numpy rather than a
+    claim in a docstring. This is the behaviour `_to_index` replaces: an
+    occupancy of 65536 stored as 0, which does not merely misreport one bucket --
+    occupancy IS the bucket-boundary prefix sum, so it relocates the derived span
+    of every later bucket in that brick."""
+    counts = np.array([70000, 65536, 65535], dtype=np.int64)
+    assert list(counts.astype(np.uint16)) == [4464, 0, 65535]
+
+
+def test_build_refuses_an_index_overflow():
+    """Path 1 of 3. Overflow at build was the only guarded path before
+    2026-08-08.
+
+    uint8 rather than uint16 because the fixture holds 32,768 particles, so no
+    bucket in it can reach 65,535 however hard it clumps -- the ceiling under
+    test has to sit below N or the test cannot fail."""
+    t9 = _t9()
+    bad = np.uint8
+    rng = np.random.default_rng(20)
+    # every particle inside one bucket: occupancy = N, past any narrow ceiling
+    clump = np.mod(rng.normal(loc=L_BOX * 0.5, scale=t9.quantum, size=(N_PART**3, 3)), L_BOX)
+    with pytest.raises(ValueError, match="initial bucket count .* exceeds"):
+        BrickPackedLayout.build(clump, t9, BRICKS_PER_SIDE, index_dtype=bad)
+
+
+def test_migrate_refuses_an_index_overflow():
+    """Path 2 of 3, and it runs every step. Before 2026-08-08 this narrowed bare,
+    so the step-path write was silent while the setup-path write raised."""
+    t9 = _t9()
+    lay = BrickPackedLayout.build(
+        _lattice(21), t9, BRICKS_PER_SIDE, brick_slack=1.0, arena_frac=1.0,
+        index_dtype=np.uint8,
+    )
+    rng = np.random.default_rng(22)
+    clump = np.mod(rng.normal(loc=L_BOX * 0.5, scale=t9.quantum, size=(N_PART**3, 3)), L_BOX)
+    with pytest.raises(ValueError, match="migrated bucket count .* exceeds"):
+        lay.migrate(clump)
+
+
+def test_repack_refuses_an_index_overflow_migrate_cannot_see():
+    """Path 3 of 3, and the two paths do NOT see the same number -- which is why
+    guarding `migrate` alone would not have covered this.
+
+    `migrate` counts what is in the brick RUNS, subtracting whatever spilled to
+    the arena. `repack` pulls every arena resident back into a run and counts all
+    of them. So a bucket can sit under the ceiling in `migrate` and over it in
+    `repack`, and this fixture is built to land exactly there: 512 small bricks
+    means the hot brick's capacity is ~64, so `migrate` records 64 while the
+    bucket really holds every particle in the box.
+    """
+    t9 = _t9()
+    many_bricks = 8  # 512 bricks of ~64 particles, so brick capacity is the limit
+    lay = BrickPackedLayout.build(
+        _lattice(23), t9, many_bricks, brick_slack=0.0, arena_frac=1.0,
+        index_dtype=np.uint8,
+    )
+    rng = np.random.default_rng(24)
+    clump = np.mod(rng.normal(loc=L_BOX * 0.5, scale=t9.quantum, size=(N_PART**3, 3)), L_BOX)
+    st = lay.migrate(clump)  # survives: the run holds only what the brick can
+    assert st["arena_used"] > 0, "fixture did not park the excess in the arena"
+    assert int(lay.occupancy.max()) <= np.iinfo(np.uint8).max
+    with pytest.raises(ValueError, match="repacked bucket count .* exceeds"):
+        lay.repack(brick_slack=0.10, chunk=1 << 12)
+
+
+def test_build_refuses_a_bucket_grid_past_the_int32_key():
+    """The same silent-wrap class as the index, in `key`, one config-table rung
+    away: C-hero's 2048^3 = 8.59e9 buckets against an int32 max of 2.15e9 would
+    narrow the high buckets to NEGATIVE ordinals. C-gh's 1024^3 fits, so the
+    refusal must not fire there -- both directions asserted, since a guard that
+    cannot pass is as useless as one that cannot fail."""
+    from inexor.layout import _refuse_key_overflow
+
+    _refuse_key_overflow(1024**3)  # C-gh: fits, must not raise
+    with pytest.raises(ValueError, match="exceeds int32"):
+        _refuse_key_overflow(2048**3)  # C-hero
+
+    hero = T9Layout(box_size=L_BOX, n_part=4096, bucket_cells=2)
+    with pytest.raises(ValueError, match="exceeds int32"):
+        # x is never touched: the refusal precedes the sort key it would feed
+        BrickPackedLayout.build(np.zeros((1, 3)), hero, 128)
+
+
+def test_scaffolding_is_reported_beside_the_total_not_inside_it():
+    """~21 B/p of probe bookkeeping sits next to a ~10.5 B/p budget. It is not
+    shipped -- the streamed engine stores state in slot order, where a particle's
+    bucket is implied by where it sits -- but an uncounted term of twice the
+    budget should be visible, which is the lesson of the 1.00 B/p `bucket_start`
+    array the superseded record never counted."""
+    lay, _, _ = _build()
+    b = lay.bytes_per_particle()
+    assert b["scaffold"] > 2 * b["total"], "scaffolding should dwarf the state it indexes"
+    assert b["total"] == pytest.approx(
+        b["payload"] + b["bucket_index"] + b["brick_start"] + b["slack"]
+    ), "scaffold must not be inside the total"
 
 
 @pytest.mark.parametrize(

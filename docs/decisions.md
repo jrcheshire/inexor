@@ -763,7 +763,9 @@ ratifying it did not measure it.
   D-v2-8's state-tier clause; does not touch its requirements chain.
   **Clause 3 SUPERSEDED by D-v2-19 (JC, 2026-08-08)** -- both of its
   load-bearing assertions measured false. Clauses 1, 2, 4 and 5 stand; clause
-  2's slack figure is re-derived there. Left byte-frozen otherwise, per the
+  2's slack figure is re-derived there. **Clause 2's INDEX term (uint16,
+  0.25 B/p) superseded by D-v2-20 (JC, 2026-08-08)**: the index is uint32 at
+  0.50 B/p and the all-in figure is ~10.54. Left byte-frozen otherwise, per the
   D-v2-10 -> D-v2-11 precedent.
 - **Context:** D-v2-8 ratified T9 = 9 B/p on G2c's `t9` arm. That gate says in
   its own docstring (`v2_g2c_accum_gate.py:35`) that it "measures
@@ -939,6 +941,10 @@ ratifying it did not measure it.
   re-derives its clause 2 slack figure. D-v2-14's other clauses stand: the
   1.0 Mpc/h bucket, the `fine_cell/64` quantum, the opt-in int32 id tier, and
   the requirement that the paint be order-independent are all untouched.
+  **Clause 5's index term (0.250) and the uint16 deliverable in "what this does
+  not establish" are SUPERSEDED by D-v2-20 (JC, 2026-08-08)**: the index is
+  uint32 at 0.500 and the all-in figure is ~10.54, 1.28x under the cliff. Every
+  other term of clause 5 stands.
 - **Context:** clause 3 ratified per-bucket capacity with eject-and-reinsert,
   and ruled out periodic re-sorting because "a second 77 GB scatter target is
   over the ceiling". Building it measured both halves false, and measured a
@@ -994,3 +1000,70 @@ ratifying it did not measure it.
   10.204 B/p. The 0.90 slack estimate it labelled as an estimate turns out to
   be very nearly right FOR THE POOLED DESIGN (0.901) and unreachable for the
   per-bucket one it was written about, where granularity forces >= 1.125.
+
+## D-v2-20 -- The per-bucket index is uint32: the ceiling is removed, not measured
+
+- **Status:** accepted (JC, 2026-08-08). Supersedes the **index dtype and its
+  0.25 B/p cost** in D-v2-14 clause 2 and D-v2-19 clause 5, and **discharges
+  the uint16 deliverable** D-v2-19's "what this does not establish" assigned to
+  the capacity run. Every other term of both clauses stands. Ratified on JC's
+  "moving the ratified number is OK", in the session that built it.
+- **Context:** D-v2-19 left open whether a uint16 index (ceiling 65535) survives
+  at C-gh, and named a cgh64 re-run with tail counting (~1.7 node-hours) as the
+  way to settle it. It cannot be settled that way at acceptable cost. Bucket
+  occupancy is volume-INVARIANT in its body (p99 121/123/122, p99.9 704/688/706
+  across 64x) while only the peak grows (5943/7581/13774), so the question is
+  entirely about the far tail -- and the one attempt to extrapolate that tail
+  **failed its own validation by 10x**, predicting cgh64's peak at ~135700
+  against 13774 measured, because the fit is dominated by well-populated low
+  thresholds while the real tail falls far faster. Three points were never going
+  to establish a bound two rungs away.
+- **Decision:**
+  1. **The per-bucket occupancy index is uint32, 0.50 B/p** (4.29 GB at C-gh
+     against uint16's 2.15). The ceiling stops being a proposition anything has
+     to establish.
+  2. **The all-in figure is ~10.54 B/p**, from D-v2-19 clause 5's 10.204 at
+     cdev8 and 10.292 at cgh64. At C-gh that is ~91 GB against the ~116 GB
+     cliff, **1.28x under** rather than 1.32x. This is what a run costs; the
+     0.25 buys removal of an unbounded risk out of a margin that has it.
+  3. **uint16 remains constructible**, via `BrickPackedLayout.build(
+     index_dtype=)` and the probe's `--index-dtype`, so the ratified 0.25 B/p
+     figure stays reproducible rather than deleted.
+  4. **Every write to the index is guarded, and the guard lives at the cast.**
+     `_to_index` is the single narrowing path for `build`, `migrate` and
+     `repack`. This fixes a defect as much as it implements a decision: before
+     it, only `build` was guarded, and `migrate` and `repack` -- the two that
+     run every step -- narrowed bare. numpy narrows modularly, so an occupancy
+     of 65536 stored as 0 would not merely misreport one bucket; occupancy IS
+     the derived bucket-boundary prefix sum, so it relocates the span of every
+     later bucket in that brick, and `check()` samples three bricks.
+     **`migrate` and `repack` do not see the same number** -- `migrate` counts
+     the brick runs net of arena spills, `repack` pulls the arena back in and
+     counts everything -- so a bucket can pass one and fail the other, and
+     guarding `migrate` alone would not have covered it.
+- **The int32 `key` ceiling is REFUSED, deliberately not widened.** The same
+  silent-wrap class sits in `key` (the brick-major bucket ordinal) one config
+  rung away: C-hero's 2048^3 = 8.59e9 buckets against int32's 2.15e9 would
+  narrow the high buckets to negative ordinals. Widening is the wrong fix,
+  because `key` cannot be resident at production scale in EITHER width: 34.4 GB
+  at C-gh as int32, 68.7 as int64, against ~91 GB of state on a ~116 GB host --
+  and the same is true of `particle_to_slot` (68.7 GB) and `slot_to_particle`
+  (75.6 GB). All three are scaffolding for a probe that keeps positions in their
+  original order and indexes into them; the streamed engine stores state IN slot
+  order, where a particle's bucket is implied by where it sits and none of the
+  three exists. A build-time refusal makes the ceiling loud today; removing it
+  belongs to M-v2-3/M-v2-6.
+- **~21 B/p of scaffolding is now REPORTED, beside the all-in total and not
+  inside it.** Those three arrays are twice the state budget and appeared in no
+  accounting -- the same shape as the 1.00 B/p `bucket_start` term D-v2-19
+  clause 2 found uncounted. Believed correct to exclude, for the reason above;
+  reported so the exclusion is visible rather than inferred.
+- **What this does NOT establish.** Nothing about the occupancy distribution:
+  the peak at C-gh is still unmeasured and this decision is precisely a
+  statement that it need not be measured. uint32's own ceiling (4.29e9) is not
+  argued to be unreachable from data either -- it is 3.1e5 times the largest
+  peak observed, on a quantity whose body does not grow with volume at all.
+- **Record:** `src/inexor/layout.py` (`_to_index`, `_refuse_key_overflow`),
+  `tests/test_brick_packed.py` (one test per write path), probe
+  `scripts/v2_m1_migration.py --index-dtype`; tail measurements in
+  `runs/v2/m1_brick_packed_record.md`.

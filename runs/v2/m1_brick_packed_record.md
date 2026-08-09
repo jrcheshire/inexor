@@ -1,5 +1,22 @@
 # Brick-packed layout: the budget comes back
 
+> **RESOLVED AFTER THE FACT, 2026-08-08 (D-v2-20).** The open uint16-vs-arena
+> question this record leaves below is CLOSED, and by neither of the two routes
+> it lists: the index is **uint32, 0.50 B/p, all-in ~10.54, 1.28x under the
+> cliff**. The cgh64 tail re-run this record calls for was NOT performed and is
+> no longer owed -- the ceiling was removed rather than measured, because the
+> only extrapolation available failed its own validation by 10x and three points
+> were never going to bound a peak two rungs away. Every occupancy number below
+> stands as measured; only the decision they were gathering evidence for has
+> moved. The `uint16` figures in the tables are therefore historical, and
+> reproducible via `--index-dtype uint16`.
+>
+> Two things surfaced while implementing it, both recorded in D-v2-20: only
+> `build` guarded the narrowing, so `migrate` and `repack` would have wrapped
+> SILENTLY; and the same class of ceiling sits in the int32 `key`, where it is
+> refused rather than widened because `key` cannot be resident at C-gh in either
+> width.
+
 **Measurement record, not a verdict.** D-v2-14 clause 3 is ratified and nothing
 here amends it. Branch `jc/v2-brick-packed`, cdev8, real two-level force, 20
 steps a = 0.1 -> 1.0, seed 0. cgh64 NOT run.
@@ -168,12 +185,20 @@ on the weakest number available and should not be read to two figures. What is
 solid: **99.9% of buckets are under ~710**, and realistically ONE bucket in the
 box approaches the ceiling.
 
-Two ways to handle it, JC's call, neither implemented:
-- **uint32 index everywhere**: +0.25 B/p, all-in ~10.54, ~91 GB at C-gh,
-  1.28x under the cliff. Simple, costs a quarter byte per particle forever.
-- **Let the arena catch it**: a bucket over 65535 spills its excess exactly as
-  a full brick does, capping the stored count. Given p99.9 ~ 706 this is ~one
-  bucket, so the cost rounds to zero and the machinery already exists.
+Two ways to handle it, JC's call, neither implemented **at the time this was
+written -- SETTLED 2026-08-08 as the first, see the banner at the top**:
+- **uint32 index everywhere** (**ADOPTED, D-v2-20**): +0.25 B/p, all-in ~10.54,
+  ~91 GB at C-gh, 1.28x under the cliff. Simple, costs a quarter byte per
+  particle forever.
+- **Let the arena catch it** (**not taken**): a bucket over 65535 spills its
+  excess exactly as a full brick does, capping the stored count. Given p99.9
+  ~ 706 this is ~one bucket, so the cost rounds to zero and the machinery
+  already exists. Rejected on inspection rather than measurement: it is not the
+  free reuse it looks like, because `repack` pulls every arena resident back
+  into a brick run and asserts as much, so a genuinely overflowing bucket needs
+  permanent-resident semantics and a cap-aware mask in BOTH `migrate` and
+  `repack` -- the two functions that produced four of this milestone's six
+  instrument defects -- to save 0.25 B/p out of a 1.32x margin.
 
 ## What this does NOT establish
 
