@@ -755,10 +755,28 @@ def tile_gather_vector(gx, gy, gz, u, live, shape, cell):
 # ===========================================================================
 #
 # The long-range force lives on the global COARSE mesh, and holding it resident
-# is affordable at C-gh (12.9 GB) and not at C-hero (103 GB against 96 GB of
-# HBM). Staging only the sub-block a tile can reach makes the whole force path
-# O(tile) in device memory and removes that cliff by construction, which is why
-# D-v2-16 calls it structural rather than an optimization.
+# is affordable at C-gh and not at C-hero. Staging only the sub-block a tile can
+# reach makes the whole force path O(tile) in device memory and removes that
+# cliff by construction, which is why D-v2-16 calls it structural rather than an
+# optimization.
+#
+# THE FIGURES CARRY A DTYPE, and this comment used to drop it (corrected
+# M-v2-4, 2026-08-09). Three coarse force meshes are:
+#
+#            C-gh (1024^3)   C-hero (2048^3)
+#     f32       12.9 GB          103 GB
+#     f64       25.8 GB          206 GB
+#
+# `v4_architecture_record.md` item 6 derived the f32 row and said so; D-v2-16
+# clause 3 and this comment then restated it without the qualifier. The engine
+# has been running the f64 row -- `split_kernels` built at np.float64 and the
+# streamed decode returns f64 -- so the resident cost has been 2x the ratified
+# figure since the freeze. The CONCLUSION is untouched, and in fact stronger at
+# f64: staging removes the cliff either way. M-v2-4 makes the artifact match the
+# f32 row, and its gate replaces "derived, not measured" with a measured ladder.
+#
+# NB 103 GB also appears in `g4_record.md` as C-gh's f32 POSITIONS (2048^3 x 3
+# x 4 B). Same arithmetic, different object. Do not unify them.
 #
 # WHY THE SUB-BLOCK IS SMALL. Only a tile's OWNED rows -- its core, not its
 # buffer -- need the long force, because ownership is a partition and the kick is

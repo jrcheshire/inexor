@@ -865,6 +865,25 @@ ratifying it did not measure it.
      96 GB of HBM. Sub-block staging makes the whole force path O(tile) in
      device memory and removes the C-hero cliff by construction. (Derived, not
      measured.)
+
+     > **Correction, M-v2-4, 2026-08-09 (figures only; the decision stands).**
+     > Clause 3's two numbers are **f32**: 3 x 1024^3 x 4 B and 3 x 2048^3 x 4 B.
+     > `v4_architecture_record.md` item 6 derived them and labelled the dtype;
+     > this clause dropped the qualifier when it condensed, and so did the
+     > matching comment in `forces.py`. **The shipped engine has been running
+     > f64** -- `split_kernels` built its kernels at `np.float64` and the
+     > streamed coarse decode returns f64 -- so the resident cost has been
+     > **25.8 GB at C-gh and 206 GB at C-hero**, 2x this clause, from the freeze
+     > until M-v2-4. Nothing in the decision changes: staging removes the cliff
+     > at either dtype, more emphatically at f64, and clause 3's *reason* for
+     > being structural rather than an optimization is unaffected. What changes
+     > is that the C-gh figure was not the one the engine was paying. M-v2-4
+     > makes the artifact match the f32 row and replaces "derived, not measured"
+     > with a measured ladder over n_coarse = 128..2048.
+     >
+     > NB `g4_record.md` also carries a 103 GB, for C-gh's f32 POSITIONS
+     > (2048^3 x 3 x 4 B). Same arithmetic, different object; not the same
+     > number twice.
   4. **Geometry: T=256, b=32 for C-gh**, chosen on `cap` per
      `v4_pricing_record.md` section 7 and now supported by a second,
      independent argument -- gather saturates near 18 GB/s only at >= 256 KB
