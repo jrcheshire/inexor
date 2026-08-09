@@ -186,6 +186,7 @@ def test_cic_match_factor_is_bitwise_the_probe_including_the_clip():
 # ------------------------------------------------------------------- the paint
 
 
+@pytest.mark.detflag
 def test_paint_tsc_f64_is_bitwise_the_probe():
     import jax.numpy as jnp
 
@@ -222,6 +223,7 @@ def test_tsc_weights_are_a_partition_of_unity():
     assert np.max(np.abs(total - 1.0)) < 1e-15, f"max |sum w - 1| = {np.max(np.abs(total - 1.0)):e}"
 
 
+@pytest.mark.detflag
 def test_density_f64_is_bitwise_the_probe():
     import jax.numpy as jnp
 
@@ -236,6 +238,7 @@ def test_density_f64_is_bitwise_the_probe():
 # ------------------------------------------------------------- the global arm
 
 
+@pytest.mark.detflag
 @pytest.mark.parametrize("which", ["mono", "long", "short"])
 @pytest.mark.parametrize("assign", ["cic", "tsc"])
 def test_force_global_is_bitwise_the_probe(which, assign):
@@ -252,6 +255,7 @@ def test_force_global_is_bitwise_the_probe(which, assign):
     assert mine_max == theirs_max
 
 
+@pytest.mark.detflag
 def test_force_global_matching_arm_is_bitwise_the_probe():
     """The matched coarse arm is the one D-v2-10 ratified, so it is the one that
     most needs pinning -- and it is the only path where `cic_match_factor` runs
@@ -380,6 +384,7 @@ def _tile_fixture(seed, n_tile=N_TILE_T, b_fine=B_FINE_T, n_fine=N_FINE_T):
     return u, live, (P,) * 3, cell
 
 
+@pytest.mark.detflag
 def test_tile_paint_f64_is_bitwise_the_probe():
     u, live, shape, cell = _tile_fixture(10)
     mean = N_PART_T**3 / float(N_FINE_T) ** 3
@@ -445,6 +450,7 @@ def _probe_membership(pos, n_fine, n_tile, b_fine):
     return member_fn, cap
 
 
+@pytest.mark.detflag
 @pytest.mark.parametrize("pad_fill", ["cycle", "zero"])
 def test_force_short_tiled_is_bitwise_the_probe(pad_fill):
     """The operating path, at the geometry the gates run. Both padding fills,
@@ -467,6 +473,7 @@ def test_force_short_tiled_is_bitwise_the_probe(pad_fill):
     assert diag["n_overhang_total"] == pdiag["n_overhang_total"] == 0
 
 
+@pytest.mark.detflag
 def test_the_two_padding_fills_agree_bitwise():
     """Stated as its own assertion because it is the premise of the A/B: the
     fills differ only in which mesh addresses the zero-weight scatter-adds
@@ -515,6 +522,7 @@ def test_the_accumulate_sink_refuses_a_production_sized_box():
         )
 
 
+@pytest.mark.detflag
 def test_the_tile_local_sink_sees_every_particle_exactly_once():
     """The production path. Ownership is a partition, so a tile-local sink must
     receive each particle exactly once across all tiles and reconstruct exactly
@@ -587,6 +595,41 @@ def test_regression_padding_rows_do_not_funnel_onto_flat_index_zero():
         "the masked row's index was rewritten -- that is the 2.2x contention bug"
     )
     assert float(w[0]) > 0.0 and float(w[1]) == 0.0, "masking must be on the WEIGHT"
+
+
+@pytest.mark.detflag
+def test_force_short_tiled_is_bitwise_the_probe_under_heavy_clustering():
+    """Gate geometry 3: the one that exercises `pad_fill` and `_tile_corner`
+    under real contention.
+
+    A clustered field makes `cap` (a max over tiles) far exceed the typical
+    member count, so most rows in most tiles are PADDING -- which is the regime
+    where the flat-index-0 funnel cost 2.218x, and the only one where the two
+    pad_fill arms do meaningfully different work. A uniform fixture has pad_frac
+    near zero and cannot see any of it.
+    """
+    n_tile, b_fine = N_TILE_T, B_FINE_T
+    rng = np.random.default_rng(40)
+    pos = np.mod(rng.normal(loc=L_BOX * 0.5, scale=L_BOX * 0.06, size=(N_PART_T**3, 3)), L_BOX)
+    member_fn, cap = _probe_membership(pos, N_FINE_T, n_tile, b_fine)
+    counts = [len(member_fn(t)) for t in
+              [(i, j, k) for i in range(N_FINE_T // n_tile)
+               for j in range(N_FINE_T // n_tile) for k in range(N_FINE_T // n_tile)]]
+    pad_frac = 1.0 - float(np.mean(counts)) / cap
+    assert pad_frac > 0.75, f"fixture is not padding-dominated (pad_frac {pad_frac:.2f})"
+
+    args = (pos, N_FINE_T, L_BOX, N_PART_T**3, n_tile, b_fine, member_fn, cap)
+    for pad_fill in ("cycle", "zero"):
+        mine, diag = forces.force_short_tiled(*args, r_s=R_S, pad_fill=pad_fill)
+        theirs, _ = probe.force_short_tiled(
+            pos, N_FINE_T, L_BOX, N_PART_T**3, n_tile, b_fine,
+            r_s=R_S, family="gauss", pad_fill=pad_fill,
+        )
+        _agree(mine, theirs, f"clustered/{pad_fill}")
+        assert diag["partition_ok"] and diag["n_overhang_total"] == 0
+        # a clustered field must produce a much larger force than a smooth one,
+        # or the fixture is not actually clustered
+        assert float(np.max(np.abs(mine))) > 1.0
 
 
 # ================================ coarse sub-block staging (D-v2-16 clause 3)
