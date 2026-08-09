@@ -261,11 +261,22 @@ def step(st, cfg, coeff, c_drift, collect=None):
             t, cfg.n_tile, cfg.n_coarse, cfg.n_fine, halo=COARSE_HALO
         )
         sub = [stage_coarse_subblock(g, o_cells, extent) for g in g_coarse]
+        # Padded to `cap` with a live mask, for the SAME reason the short arm is:
+        # a per-tile row count keys a new XLA shape, so every tile recompiles.
+        # Profiled before the fix at 2,107 compilations and 24.1 s of a 32.7 s
+        # step -- 74% of it, 18.5 s inside backend_compile_and_load. One shape
+        # serves every tile.
+        n_own = int(owned.sum())
+        xo = np.zeros((cap, 3), dtype=np.float64)
+        xo[:n_own] = x[owned]
+        lv = np.zeros(cap, dtype=bool)
+        lv[:n_own] = True
         g_long = np.asarray(
             gather_coarse_subblock(
-                *sub, jnp.asarray(x[owned]), o_cells, cfg.coarse_cell, cfg.n_coarse, assign="tsc"
+                *sub, jnp.asarray(xo), o_cells, cfg.coarse_cell, cfg.n_coarse,
+                assign="tsc", live=lv,
             )
-        )
+        )[:n_own]
 
         g_tot = g_short[owned] + g_long
         v_new = alpha_k * v[owned] + bcoef * g_tot

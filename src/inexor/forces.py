@@ -780,7 +780,8 @@ def stage_coarse_subblock(g_coarse, origin_cells, extent):
 
 
 def gather_coarse_subblock(
-    sub_x, sub_y, sub_z, positions, origin_cells, cell_coarse, n_coarse, assign="tsc"
+    sub_x, sub_y, sub_z, positions, origin_cells, cell_coarse, n_coarse, assign="tsc",
+    live=None,
 ):
     """Read the long force for one tile's rows out of a staged sub-block.
 
@@ -800,6 +801,16 @@ def gather_coarse_subblock(
     computes them, and only the integer index is shifted -- by
     `(base - origin) mod n_coarse`, which is exact. Values identical, weights
     identical, corner order identical, therefore bits identical.
+
+    **`live` exists because of a measured compile storm (M-v2-3).** Called once
+    per tile with each tile's own row count, this keys a NEW XLA shape per tile:
+    profiled at 2,107 compilations and 24.1 s of a 32.7 s engine step, 74% of it,
+    with 18.5 s inside `backend_compile_and_load`. That is exactly the trap
+    `make_tile_force_fn` documents for the short arm -- "a per-tile member count
+    would key a new shape and recompile per tile" -- and the fix is the same one:
+    the caller pads rows to a fixed capacity and passes the mask, so ONE compiled
+    program serves every tile. Padded rows read index 0 with zero weight, which
+    is the same no-op construction `_tile_corner` uses.
 
     The caller must pass only rows whose stencil fits the halo. Rows outside the
     tile's core would read wrapped values from the far side of the block,
@@ -825,15 +836,24 @@ def gather_coarse_subblock(
     # boundary back in range without touching any float
     i = jnp.mod(base - jnp.asarray(origin, dtype=jnp.int32), int(n_coarse))
 
-    lo_needed = int(np.asarray(i).min()) + first
-    hi_needed = int(np.asarray(i).max()) + first + len(w_axis) - 1
-    if lo_needed < 0 or hi_needed >= extent:
-        raise ValueError(
-            f"a row's {assign} stencil reaches outside the staged sub-block: needs "
-            f"[{lo_needed}, {hi_needed}] of [0, {extent - 1}]. Pass only the tile's OWNED "
-            "rows, or raise the halo -- reading past the block wraps to the far side of "
-            "the mesh and is silent."
-        )
+    i_np = np.asarray(i)
+    keep = np.ones(i_np.shape[0], dtype=bool) if live is None else np.asarray(live)
+    if keep.any():
+        lo_needed = int(i_np[keep].min()) + first
+        hi_needed = int(i_np[keep].max()) + first + len(w_axis) - 1
+        if lo_needed < 0 or hi_needed >= extent:
+            raise ValueError(
+                f"a row's {assign} stencil reaches outside the staged sub-block: needs "
+                f"[{lo_needed}, {hi_needed}] of [0, {extent - 1}]. Pass only the tile's OWNED "
+                "rows, or raise the halo -- reading past the block wraps to the far side of "
+                "the mesh and is silent."
+            )
+    if live is not None:
+        # padded rows read a valid address with zero weight, exactly as
+        # `_tile_corner` does; the index must stay in range for every row
+        m = jnp.asarray(keep)[:, None]
+        i = jnp.where(m, i, -first)
+        w_axis = tuple(jnp.where(m, w, 0.0) for w in w_axis)
 
     fx, fy, fz = (jnp.asarray(s).reshape(-1) for s in (sub_x, sub_y, sub_z))
     n = xp.shape[0]
