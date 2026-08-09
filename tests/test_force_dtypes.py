@@ -321,6 +321,136 @@ def test_split_kernels_refuses_a_dtype_it_cannot_serve():
         forces.split_kernels((8,) * 3, 1.0, "long", r_s=R_S, fdtype=np.float16)
 
 
+# ================================================ S3: the decode seam, at f32
+
+
+def test_the_decode_seam_narrows_the_field():
+    import jax.numpy as jnp
+
+    pos = _positions(3)
+    n_tot = N_PART**3
+    u, live, shape, cell = _tile_fixture(14)
+    mean_t = N_PART_T**3 / float(N_FINE_T) ** 3
+    mesh_int, _ = forces.tile_paint_int(u, live, shape, cell)
+    mesh32, _ = forces.tile_paint_f64(u, live, shape, cell, mean_t, fdtype=jnp.float32)
+    _assert_dtypes([
+        ("density_f64(f32)",
+         _name(forces.density_f64(pos, N_MESH, L_BOX, n_tot, fdtype=jnp.float32)), "float32"),
+        ("density_tsc(int, f32)",
+         _name(painting.density_tsc(pos, N_MESH, L_BOX, n_tot, paint="int",
+                                    fdtype=jnp.float32)), "float32"),
+        ("density_tsc(f64 paint, f32)",
+         _name(painting.density_tsc(pos, N_MESH, L_BOX, n_tot, paint="f64",
+                                    fdtype=jnp.float32)), "float32"),
+        ("tile_delta_from_int(f32)",
+         _name(forces.tile_delta_from_int(mesh_int, mean_t, fdtype=jnp.float32)), "float32"),
+        ("tile_paint_f64(f32)", _name(mesh32), "float32"),
+    ])
+
+
+def _hot_mesh(frac_bits=12, mean=8.0):
+    """A coarse mesh at the table's exact mean of 8.0 with one genuinely hot cell.
+
+    The hot cell is ODD on purpose. `< 2^24` is sufficient for an exact int->f32
+    decode, not necessary: what matters is significand WIDTH, and the first
+    fixture I wrote here (`5000 * 2^12 = 625 * 2^15`, 2.05e7) decoded exactly
+    despite being well past 2^24. A census that counts cells above 2^24 and
+    calls them lost therefore OVERSTATES the loss.
+    """
+    m = np.full((4, 4, 4), int(mean * 2**frac_bits), dtype=np.int32)
+    m[0, 0, 0] = 2**24 + 12345           # odd: needs all 25 bits
+    m[1, 1, 1] = int(300 * 2**frac_bits)  # 512x under the bound
+    assert int(m[0, 0, 0]) % 2 == 1 and int(m.max()) > 2**24 > int(m[1, 1, 1])
+    return m, frac_bits, mean
+
+
+def test_without_the_minus_one_the_decode_order_cannot_matter():
+    """`tile_delta_from_int` gains NOTHING from decoding in f64, and that is a
+    theorem rather than a measurement.
+
+    Its field is counts/mean with no `- 1` (ik(0) = 0 kills DC, so the short
+    force cannot see the offset). `mean` is exactly 8.0 at every config in the
+    table and `2**-frac_bits` is a power of two, so every step between the int32
+    mesh and the returned field is an exact rescaling that cannot move the
+    significand. Both orders round the same integer to 24 bits at the same
+    point.
+
+    Asserted so the f64 decode there is understood as free-and-harmless rather
+    than as load-bearing -- someone pricing the transient later needs to know it
+    buys nothing on this arm.
+    """
+    import jax.numpy as jnp
+
+    m, frac_bits, mean = _hot_mesh()
+    mi = jnp.asarray(m)
+    ours = np.asarray(forces.tile_delta_from_int(mi, mean, frac_bits, fdtype=jnp.float32))
+    direct = np.asarray(painting.counts_from_int(mi, frac_bits, fdtype=jnp.float32) / mean)
+    assert np.array_equal(ours, direct), (
+        "the two decode orders differ on a field with no mean subtraction, which they "
+        "cannot do while mean and the frac_bits scale are both powers of two -- check "
+        "whether a config broke mean == 8.0"
+    )
+
+
+def test_with_the_minus_one_the_f64_decode_helps_only_the_cells_that_matter_least():
+    """THE DECODE FORK, measured rather than argued.
+
+    The cancellation in `counts/mean - 1.0` is the one place the decode order
+    can matter. It matters far less than the plausible argument suggests, and
+    the honest version is worth pinning because the wrong version is what gets
+    re-derived:
+
+      - a NEAR-MEAN cell has a raw sum around 2^15, exact in both orders, so
+        there is no cancellation to protect. The Sterbenz argument for the f64
+        decode is true and irrelevant.
+      - only a cell needing more than 24 significand bits differs, i.e. >= 512x
+        the mean, where delta >> 1 and the absolute error is 6e-8 RELATIVE.
+
+    So the f64 decode is kept for costing nothing, not for rescuing the low-k
+    power. If a gate ever reads a decode margin, it must read it in relative
+    terms on the cells concerned.
+    """
+    m, frac_bits, mean = _hot_mesh()
+    exact = m.astype(np.float64) * 2.0**-frac_bits / mean - 1.0
+
+    f64_then_narrow = (exact).astype(np.float32)
+    direct_f32 = (m.astype(np.float32) * np.float32(2.0**-frac_bits)
+                  / np.float32(mean) - np.float32(1.0))
+
+    err_a = np.abs(f64_then_narrow.astype(np.float64) - exact)
+    err_b = np.abs(direct_f32.astype(np.float64) - exact)
+
+    # the near-mean and moderately-hot cells are exact BOTH ways
+    ordinary = np.ones(m.shape, dtype=bool)
+    ordinary[0, 0, 0] = False
+    assert np.all(err_a[ordinary] == 0.0) and np.all(err_b[ordinary] == 0.0), (
+        "a cell under the significand bound lost precision; the fork is not where "
+        "this test says it is"
+    )
+    # only the hot cell moves, the f64 order is exact there, and the direct one
+    # is off by a relatively negligible amount
+    assert err_a[0, 0, 0] == 0.0
+    assert err_b[0, 0, 0] > 0.0, "the hot cell did not lose anything; fixture is vacuous"
+    rel = float(err_b[0, 0, 0] / abs(exact[0, 0, 0]))
+    assert rel < 1e-6, f"relative error at the hot cell is {rel:.2e}, larger than expected"
+
+
+def test_counts_from_int_is_exact_where_we_claim_and_not_past_it():
+    """The bound the decode design rests on, asserted on the library rather than
+    quoted from its docstring."""
+    import jax.numpy as jnp
+
+    lo = np.asarray([[[2**24 - 1]]], dtype=np.int32)
+    hi = np.asarray([[[2**24 + 1]]], dtype=np.int32)
+    for m, exact in ((lo, True), (hi, False)):
+        got = float(np.asarray(painting.counts_from_int(jnp.asarray(m), 0,
+                                                        fdtype=jnp.float32))[0, 0, 0])
+        assert (got == float(m[0, 0, 0])) is exact, (
+            f"int32 {int(m[0, 0, 0])} -> f32 decoded to {got!r}; expected "
+            f"{'exact' if exact else 'inexact'}"
+        )
+
+
 # ====================================================== the two promotion traps
 
 

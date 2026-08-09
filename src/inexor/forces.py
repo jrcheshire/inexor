@@ -80,6 +80,7 @@ from .painting import (
     counts_from_int,
     density_contrast,
     density_tsc,
+    field_dtype,
     paint_f32,
     tsc_read_vector,
 )
@@ -351,17 +352,25 @@ def split_kernels(shape, cell, which, r_s=None, fdtype=np.float64):
 # ===========================================================================
 
 
-def density_f64(positions, n_mesh, box_size, n_particles_total):
-    """delta on an n_mesh^3 grid in f64, via the PACKAGE CIC stencil.
+def density_f64(positions, n_mesh, box_size, n_particles_total, fdtype=jnp.float64):
+    """delta on an n_mesh^3 grid via the PACKAGE CIC stencil.
 
     `paint_f32` takes an fdtype even though `density_contrast` never passes one,
     so the f64 mesh costs no new paint code and the global arm differs from
     `make_force_fn` ONLY in the kernel. That is what makes the F0 floor a test
     of the kernel rather than of the harness.
+
+    `fdtype` (M-v2-4) is the RETURNED field's dtype. **The paint stays pinned at
+    f64** -- the `fdtype=jnp.float64` below is not a candidate for threading.
+    This is the differentiable twin's accumulator, and narrowing it makes the
+    scatter-add f32, which is non-associative under CUDA atomics (M0 R3) and so
+    is a D-006 violation dressed as a memory saving. Narrow the field, never the
+    accumulator.
     """
+    fdtype = field_dtype(fdtype)
     counts = paint_f32(positions, n_mesh, box_size, fdtype=jnp.float64)
     mean = float(n_particles_total) / float(n_mesh) ** 3
-    return counts / mean - 1.0
+    return (counts / mean - 1.0).astype(fdtype)
 
 
 def force_global(
@@ -640,7 +649,7 @@ def _tile_corner(base, frac, wlo, corner, shape, ok):
     return flat, jnp.where(ok, wx * wy * wz, 0.0)
 
 
-def tile_paint_f64(u, live, shape, cell, mean):
+def tile_paint_f64(u, live, shape, cell, mean, fdtype=jnp.float64):
     """CIC paint of tile-local coords into ONE padded tile mesh -> (mesh, n_out).
 
     Paints counts/mean, with NO -1. Two separate facts, both measured (module
@@ -656,7 +665,13 @@ def tile_paint_f64(u, live, shape, cell, mean):
     docstring described a `flat = where(ok, flat, 0)` line until 2026-08-08 --
     `eba91ab` had removed it eight months of reading earlier, and the stale text
     was still recommending the construction that cost 2.2x.)
+
+    `fdtype` (M-v2-4) is the RETURNED mesh's dtype. The accumulator stays f64
+    and the division by `mean` happens before the narrowing: narrowing first
+    would round twice, and the tile-identity residual this arm is tested to
+    (1e-13) is tight enough to see that.
     """
+    fdtype = field_dtype(fdtype)
     nx, ny, nz = (int(s) for s in shape)
     base, frac, ok, n_out = _tile_cic_pieces(u, live, (nx, ny, nz), cell)
     mesh = jnp.zeros((nx * ny * nz,), dtype=jnp.float64)
@@ -666,7 +681,7 @@ def tile_paint_f64(u, live, shape, cell, mean):
             for dz in (0, 1):
                 flat, w = _tile_corner(base, frac, wlo, (dx, dy, dz), (nx, ny, nz), ok)
                 mesh = mesh.at[flat].add(w.astype(jnp.float64), mode="promise_in_bounds")
-    return mesh.reshape(nx, ny, nz) / float(mean), n_out
+    return (mesh.reshape(nx, ny, nz) / float(mean)).astype(fdtype), n_out
 
 
 def tile_paint_int(u, live, shape, cell, frac_bits=TILE_FRAC_BITS):
@@ -715,8 +730,19 @@ def tile_paint_int(u, live, shape, cell, frac_bits=TILE_FRAC_BITS):
 def tile_delta_from_int(mesh_int, mean, frac_bits=TILE_FRAC_BITS, fdtype=jnp.float64):
     """Decode `tile_paint_int`'s raw mesh to the same quantity `tile_paint_f64`
     returns: counts/mean, with NO -1 (see `tile_paint_f64` for why the -1 is
-    unnecessary and why `mean` must be the GLOBAL config scalar)."""
-    return counts_from_int(mesh_int, frac_bits, fdtype=fdtype) / float(mean)
+    unnecessary and why `mean` must be the GLOBAL config scalar).
+
+    **`fdtype` CHANGED MEANING at M-v2-4**: it used to be the decode dtype,
+    handed straight to `counts_from_int`; it is now the dtype of the returned
+    FIELD, with the decode and the division pinned at f64. Same default, same
+    result at that default, different behaviour at f32 -- which is exactly the
+    shape of change that goes unnoticed. Flagged loudly because M-v2-3 lost half
+    a day to the mirror image of it: `evolve_float`'s `paint` default had
+    decayed, and every call site omitted the argument, so nothing showed it.
+    See `density_tsc` for why the decode is pinned.
+    """
+    fdtype = field_dtype(fdtype)
+    return (counts_from_int(mesh_int, frac_bits, fdtype=jnp.float64) / float(mean)).astype(fdtype)
 
 
 def check_tile_paint_headroom(n_particles_total, frac_bits, max_cell_particles=1.0e4):
