@@ -304,17 +304,46 @@ def cic_match_factor(shape, cell_solve, cell_target, clip=None, order_solve=2, o
     return ratio, max_applied
 
 
-def split_kernels(shape, cell, which, r_s=None):
+def split_kernels(shape, cell, which, r_s=None, fdtype=np.float64):
     """The (Kx, Ky, Kz) half-grid kernels of the ratified gaussian split.
 
     The probe's `family` argument is gone: D-v2-10 froze the gaussian family and
     the windowed ones measured ~10x worse in the coarse arm, so they stay in
     `scripts/v2_g5_core.py` as the research record rather than shipping as a
     live branch nothing selects. A caller wanting them wants the probe.
+
+    `fdtype` (M-v2-4) narrows the REAL PREFACTOR and nothing else. Three things
+    make that the right seam rather than an arbitrary one:
+
+      - **The build stays f64, always.** `k2_true`, `k2_safe` and S are the
+        precision island. `fac / k2_safe` is where the split's accuracy lives,
+        and a pre-rounded denominator would cost accuracy for no memory: these
+        are transients, and what this milestone is buying is the RESIDENT
+        kernel.
+      - **Narrowing the prefactor is not the obvious spelling, and the obvious
+        one does not work.** `(fac / k2_safe) * ik` with a narrowed `ik` is
+        `f64 * complex64`, which numpy promotes back to complex128 -- an f32 arm
+        that is not one. `tests/test_force_dtypes.py` pins that trap.
+      - It costs one extra rounding. The prefactor form differs from narrowing
+        the finished product by at most 2 f32 ulp -- measured 1.0 to 1.5 ulp
+        (max rel 1.18e-7 to 1.79e-7) over four geometries from (8,12,16) to
+        64^3, both splits, so `rtol=2**-22` holds and `2**-23` does not. The
+        alternative materializes a full complex128 half-grid per component
+        before narrowing -- 8.6 GB each at C-gh against a kept set of 12.9 GB
+        for all three -- so the 2 ulp is bought deliberately.
+
+    At the f64 default both casts are `copy=False` no-ops on arrays that already
+    carry the dtype, so the expression reduces to what it was before M-v2-4 and
+    the result stays BITWISE the probe (D-v2-16 clause 7).
     """
+    fdtype = np.dtype(fdtype)
+    if fdtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+        raise ValueError(f"fdtype must be float32 or float64, got {fdtype.name}")
     ikx, iky, ikz, k2_true, k2_safe = kernel_grids(shape, cell, np.float64)
     fac = split_factor(k2_true, 0.0 if r_s is None else r_s, which)
-    return tuple((fac / k2_safe) * ik for ik in (ikx, iky, ikz))
+    pref = (fac / k2_safe).astype(fdtype, copy=False)
+    cdtype = np.complex128 if fdtype == np.dtype(np.float64) else np.complex64
+    return tuple(pref * ik.astype(cdtype, copy=False) for ik in (ikx, iky, ikz))
 
 
 # ===========================================================================

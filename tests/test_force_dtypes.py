@@ -273,6 +273,54 @@ def test_the_engine_coarse_arm_defaults_to_f64():
     _assert_dtypes([("engine.coarse_delta_streamed", _name(delta), "float64")])
 
 
+# ============================================== S2: the kernel seam, at f32
+
+
+def test_split_kernels_narrows_the_kernel_and_keeps_the_build_in_f64():
+    """The knob applies AND the precision island survives it."""
+    shape, cell = (8, 12, 16), L_BOX / 16
+    kx, ky, kz = forces.split_kernels(shape, cell, "long", r_s=R_S, fdtype=np.float32)
+    _assert_dtypes([
+        ("split_kernels(f32)/Kx", _name(kx), "complex64"),
+        ("split_kernels(f32)/Ky", _name(ky), "complex64"),
+        ("split_kernels(f32)/Kz", _name(kz), "complex64"),
+    ])
+    # the build is f64 whatever the output dtype: k2_true must keep a genuine
+    # DC zero or S(0) != 1 and the split breaks at DC, silently
+    assert _name(forces.kernel_grids(shape, cell, np.float32)[3]) == "float64"
+
+
+def test_the_f32_kernel_is_the_f64_one_to_two_ulp_and_is_not_equal_to_it():
+    """Both halves matter.
+
+    Equal would mean the narrowing did not happen (the promotion trap). Further
+    than 2 ulp would mean it narrowed something it should not have -- the build
+    rather than the prefactor.
+    """
+    shape, cell = (32,) * 3, L_BOX / 32
+    for which in ("long", "short"):
+        k64 = forces.split_kernels(shape, cell, which, r_s=R_S)
+        k32 = forces.split_kernels(shape, cell, which, r_s=R_S, fdtype=np.float32)
+        for a32, a64, axis in zip(k32, k64, "xyz"):
+            what = f"split_kernels/{which}/K{axis}"
+            assert _name(a32) == "complex64", what
+            assert not np.array_equal(a32, a64.astype(np.complex64)), (
+                f"{what}: the f32 arm is bitwise the narrowed f64 one, so the prefactor "
+                "cast did nothing -- check for a promotion back to complex128"
+            )
+            assert np.allclose(a32, a64, rtol=2.0**-22, atol=0.0), (
+                f"{what}: further than 2 f32 ulp from the f64 kernel. The prefactor is the "
+                "ONLY thing that may narrow; k2_true/k2_safe/S stay f64."
+            )
+
+
+def test_split_kernels_refuses_a_dtype_it_cannot_serve():
+    """Loud, like the other setup-time refusals. A silently-ignored dtype is the
+    failure mode the whole ledger exists to prevent."""
+    with pytest.raises(ValueError, match="fdtype must be float32 or float64"):
+        forces.split_kernels((8,) * 3, 1.0, "long", r_s=R_S, fdtype=np.float16)
+
+
 # ====================================================== the two promotion traps
 
 
