@@ -115,6 +115,93 @@ def density_contrast(positions, n_mesh, box_size, n_particles_total, paint="int"
     return counts / mean - 1.0
 
 
+# ===========================================================================
+# TSC: the coarse arm's assignment (promoted from scripts/v2_g5_core.py)
+# ===========================================================================
+#
+# Triangular Shaped Cloud: a 3-point stencil per axis centred on the NEAREST
+# cell, where CIC uses 2 points anchored at floor. Its window is sinc^3 rather
+# than sinc^2, so it suppresses the high-k power a coarse mesh would otherwise
+# alias down into the band -- which is why the long arm uses it and why
+# `--assign-long` defaults to `tsc`.
+#
+# NOTE the f64 paint below is ORDER-DEPENDENT and therefore violates D-006 on
+# the primal path: it accumulates through `.at[].add` on an f64 mesh, and f64
+# atomics do not commute. `paint_tsc_int` is the required deliverable
+# (D-v2-16 clause 2) and this stays as the differentiable/reference twin, in
+# exactly the relationship paint_f32 has to paint_int.
+
+_TSC_OFFSETS = (-1, 0, 1)
+_TSC_CORNERS = [(dx, dy, dz) for dx in _TSC_OFFSETS for dy in _TSC_OFFSETS for dz in _TSC_OFFSETS]
+
+
+def _tsc_pieces(positions, cell):
+    """TSC base cell (stop_gradient) and the 3 per-axis weights (-1, 0, +1).
+
+    The weights are the standard quadratic B-spline pieces about the nearest
+    cell centre and sum to 1 identically for any offset d in [-1/2, 1/2]:
+    0.5(0.5-d)^2 + (0.75-d^2) + 0.5(0.5+d)^2 == 1.
+    """
+    s = positions / float(cell)
+    base = jnp.round(s)
+    d = s - base
+    base = jax.lax.stop_gradient(base).astype(jnp.int32)
+    w_m = 0.5 * (0.5 - d) ** 2
+    w_0 = 0.75 - d**2
+    w_p = 0.5 * (0.5 + d) ** 2
+    return base, (w_m, w_0, w_p)
+
+
+def _tsc_corner_flat_weight(base, w, corner, n_mesh):
+    dx, dy, dz = corner
+    ix = (base[:, 0] + dx) % n_mesh
+    iy = (base[:, 1] + dy) % n_mesh
+    iz = (base[:, 2] + dz) % n_mesh
+    ww = w[dx + 1][:, 0] * w[dy + 1][:, 1] * w[dz + 1][:, 2]
+    return (ix * n_mesh + iy) * n_mesh + iz, ww
+
+
+def paint_tsc_f64(positions, n_mesh, box_size, n_particles_total):
+    """Global periodic TSC paint -> delta (n_mesh^3) f64.
+
+    The order-dependent twin; see the section note. Bitwise-transcribed from
+    `v2_g5_core.paint_tsc_f64`, whose output D-v2-10's coarse arm is measured
+    against.
+    """
+    N = int(n_mesh)
+    cell = float(box_size) / N
+    base, w = _tsc_pieces(positions, cell)
+    mesh = jnp.zeros((N**3,), dtype=jnp.float64)
+    for corner in _TSC_CORNERS:
+        flat, ww = _tsc_corner_flat_weight(base, w, corner, N)
+        mesh = mesh.at[flat].add(ww, mode="promise_in_bounds")
+    mean = float(n_particles_total) / float(N) ** 3
+    return mesh.reshape(N, N, N) / mean - 1.0
+
+
+def tsc_read_vector(gx, gy, gz, positions, n_mesh, box_size):
+    """Read 3 mesh fields with ONE shared TSC stencil.
+
+    The GATHER has no determinism problem at all -- it is a read followed by a
+    per-particle sum in a fixed unrolled order, with no atomics -- so unlike the
+    paint it needs no integer twin.
+    """
+    N = int(n_mesh)
+    cell = float(box_size) / N
+    base, w = _tsc_pieces(positions, cell)
+    fx, fy, fz = gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)
+    n = positions.shape[0]
+    ax = jnp.zeros((n,), dtype=gx.dtype)
+    ay = jnp.zeros((n,), dtype=gx.dtype)
+    az = jnp.zeros((n,), dtype=gx.dtype)
+    for corner in _TSC_CORNERS:
+        flat, ww = _tsc_corner_flat_weight(base, w, corner, N)
+        ax = ax + ww * fx[flat]
+        ay = ay + ww * fy[flat]
+        az = az + ww * fz[flat]
+    return jnp.stack([ax, ay, az], axis=1)
+
+
 def cic_read_vector(gx, gy, gz, positions, n_mesh, box_size):
     """Read 3 mesh fields with ONE shared CIC stencil (mbody painting.py:105;
     ~40% reverse-mode memory saving measured there)."""
