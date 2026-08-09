@@ -383,6 +383,25 @@ def force_global(
     a path the engine never takes. Recorded so the asymmetry reads as a decision
     rather than an oversight.
     """
+    delta, kers, max_applied = _global_delta_and_kernels(
+        positions, n_mesh, box_size, n_particles_total, which,
+        r_s=r_s, match=match, clip=clip, assign=assign, paint=paint, frac_bits=frac_bits,
+    )
+    dk = jnp.fft.rfftn(delta)
+    g = [jnp.fft.irfftn(dk * jnp.asarray(k), s=(n_mesh,) * 3) for k in kers]
+    rd = positions if pos_gather is None else jnp.asarray(pos_gather)
+    if assign == "cic":
+        out = cic_read_vector(g[0], g[1], g[2], rd, n_mesh, box_size)
+    else:
+        out = tsc_read_vector(g[0], g[1], g[2], rd, n_mesh, box_size)
+    return np.asarray(out, dtype=np.float64), max_applied
+
+
+def _global_delta_and_kernels(
+    positions, n_mesh, box_size, n_particles_total, which,
+    r_s=None, match=None, clip=None, assign="cic", paint="f64", frac_bits=TILE_FRAC_BITS,
+):
+    """The paint-and-kernel half of `force_global`, split out verbatim."""
     cell = box_size / n_mesh
     kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s)
     max_applied = 1.0
@@ -404,14 +423,44 @@ def force_global(
         )
     else:
         raise ValueError(f"assign must be 'cic' or 'tsc', got {assign!r}")
+    return delta, kers, max_applied
+
+
+def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None):
+    """The three long-range force meshes from an ALREADY-PAINTED delta.
+
+    `force_global` paints from every position AND gathers at every position,
+    returning an `(n, 3)` array -- both halves O(N), and the engine needs
+    neither. It streams the paint brick by brick (integer accumulation, so the
+    chunked sum is bitwise the monolithic one) and reads the force per tile out
+    of a staged sub-block, so what it wants from the global arm is exactly this:
+    solve, and stop.
+
+    Bitwise identical to the corresponding part of `force_global` by
+    construction -- it is the same expression, called from both.
+    """
+    cell = box_size / n_mesh
+    kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s)
+    if match is not None:
+        mf, _ = cic_match_factor((n_mesh,) * 3, match[0], match[1], clip=clip)
+        kers = tuple(k * mf for k in kers)
     dk = jnp.fft.rfftn(delta)
-    g = [jnp.fft.irfftn(dk * jnp.asarray(k), s=(n_mesh,) * 3) for k in kers]
-    rd = positions if pos_gather is None else jnp.asarray(pos_gather)
-    if assign == "cic":
-        out = cic_read_vector(g[0], g[1], g[2], rd, n_mesh, box_size)
-    else:
-        out = tsc_read_vector(g[0], g[1], g[2], rd, n_mesh, box_size)
-    return np.asarray(out, dtype=np.float64), max_applied
+    # sequential per-component solves: never three force meshes at once
+    return [jnp.fft.irfftn(dk * jnp.asarray(k), s=(n_mesh,) * 3) for k in kers]
+
+
+def tile_capacity(member_counts):
+    """The per-tile row capacity: a MAX over tiles, so one jitted program serves
+    every tile (a per-tile member count would key a new shape and recompile).
+
+    The package had no source for this -- `force_short_tiled` requires `cap` as a
+    required argument and only `scripts/v2_g5_core.tile_capacity` computed one,
+    so nothing in the package could drive the tiled force end to end.
+    """
+    counts = np.asarray(list(member_counts), dtype=np.int64)
+    if not len(counts):
+        raise ValueError("no tiles: cap is a max over tiles and there are none")
+    return int(counts.max())
 
 
 # ===========================================================================

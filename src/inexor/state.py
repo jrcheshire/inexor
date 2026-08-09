@@ -393,6 +393,18 @@ class SlotState:
             self.occupancy[brick_flat * p3 : (brick_flat + 1) * p3].astype(np.int64).sum()
         )
 
+    def brick_member_count(self, brick_flat):
+        """Live rows PLUS arena residents -- the brick's true membership.
+
+        `brick_live_count` is the run length alone, and using it where membership
+        is meant undercounts by the arena population. That is the same class as
+        the failure D-v2-19 clause 4 records: an arena particle still belongs to
+        its brick, and forgetting it cost 98.4% of the force there on a stress
+        fixture with nothing raising. Here it under-sized the tile capacity and
+        the force refused to run, which is the good version of the same mistake.
+        """
+        return self.brick_live_count(brick_flat) + len(self.arena_slots_of_brick(brick_flat))
+
     def bucket_slot_starts(self, brick_flat):
         """Bucket boundaries inside ONE brick, DERIVED rather than stored.
 
@@ -590,6 +602,58 @@ class SlotState:
         return out
 
     # ------------------------------------------------------------ the cost
+
+    def tile_bricks(self, tijk, n_tile, b_fine, n_brick, n_fine):
+        """The brick ordinals covering tile+buffer. Same union and same wrap
+        guard as `BrickPackedLayout.tile_members`; only the return differs, which
+        is the point -- the engine wants SPANS, not particle indices."""
+        from .layout import brick_span
+
+        nb = int(n_fine) // int(n_brick)
+        if nb != self.bricks_per_side:
+            raise ValueError(
+                f"brick grid {nb} from (n_fine={n_fine}, n_brick={n_brick}) disagrees with "
+                f"the layout's {self.bricks_per_side}"
+            )
+        pad, span = brick_span(n_tile, b_fine, n_brick, nb)
+        lo = np.asarray(tijk, dtype=np.int64) * (int(n_tile) // int(n_brick)) - pad
+        out = []
+        for i in range(span):
+            bi = (lo[0] + i) % nb
+            for j in range(span):
+                bj = (lo[1] + j) % nb
+                for k in range(span):
+                    bk = (lo[2] + k) % nb
+                    out.append((bi * nb + bj) * nb + bk)
+        return out
+
+    def decode_bricks(self, bricks):
+        """(slots, x, v) over a list of bricks, concatenated.
+
+        O(tile) floats. The tile is the largest float working set on the engine
+        path, by design: a global (n,3) f64 array is 206 GB at C-gh and deleting
+        both of them is D-v2-16 clause 1.
+        """
+        s, xs, vs = [], [], []
+        for b in bricks:
+            sl, x, v = self.decode_brick(b)
+            if len(sl):
+                s.append(sl)
+                xs.append(x)
+                vs.append(v)
+        if not s:
+            return (
+                np.empty(0, np.int64),
+                np.empty((0, 3), np.float64),
+                np.empty((0, 3), np.float64),
+            )
+        return np.concatenate(s), np.concatenate(xs), np.concatenate(vs)
+
+    def write_velocities(self, slots, w):
+        """Write int16 velocity codes back to given slots. The kick's only
+        write, and it is a scatter into contiguous spans rather than a global
+        array."""
+        self.w[slots] = w
 
     # ------------------------------------------------- drift and re-home
 
