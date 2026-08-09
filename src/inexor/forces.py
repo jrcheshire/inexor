@@ -69,6 +69,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from .painting import (
+    _CORNERS as _CIC_CORNERS,
+)
+from .painting import (
+    _TSC_CORNERS,
     cic_read_vector,
     density_contrast,
     paint_f32,
@@ -569,6 +573,134 @@ def tile_gather_vector(gx, gy, gz, u, live, shape, cell):
                 ay = ay + w * fy[flat]
                 az = az + w * fz[flat]
     return jnp.stack([ax, ay, az], axis=1), n_out
+
+
+# ===========================================================================
+# per-tile coarse sub-block staging (D-v2-16 clause 3)
+# ===========================================================================
+#
+# The long-range force lives on the global COARSE mesh, and holding it resident
+# is affordable at C-gh (12.9 GB) and not at C-hero (103 GB against 96 GB of
+# HBM). Staging only the sub-block a tile can reach makes the whole force path
+# O(tile) in device memory and removes that cliff by construction, which is why
+# D-v2-16 calls it structural rather than an optimization.
+#
+# WHY THE SUB-BLOCK IS SMALL. Only a tile's OWNED rows -- its core, not its
+# buffer -- need the long force, because ownership is a partition and the kick is
+# tile-local. So the block spans the core's coarse cells plus a halo for the
+# assignment stencil: (T/COARSE_RATIO + 2*halo)^3 rather than anything that grows
+# with the box. At C-gh's T=256 that is (64 + 4)^3 cells against the global
+# 1024^3, a factor of 3,500.
+#
+# halo=2 rather than 1: TSC reads the NEAREST cell +-1, and its base comes from
+# round() rather than floor(), so a particle at the core's edge can reach one
+# cell further out than a CIC-style bound would suggest. The extra layer costs
+# (68/66)^3 = 1.09x of a block that is already negligible, and the alternative is
+# an off-by-one that only fires on the tiles touching a box face.
+
+COARSE_HALO = 2
+
+
+def coarse_subblock_origin_extent(tijk, n_tile, n_coarse, n_fine, halo=COARSE_HALO):
+    """(origin in coarse CELLS (3,) int, extent in cells) for one tile's core.
+
+    The origin may be negative and the block may run past the mesh; both are
+    handled by wrapping at extraction, exactly as `tile_origin_extent` leans on
+    `mod` rather than special-casing the boundary.
+    """
+    ratio = int(n_fine) // int(n_coarse)
+    if int(n_tile) % ratio:
+        raise ValueError(
+            f"tile {n_tile} fine cells is not a whole number of coarse cells "
+            f"(ratio {ratio}); the sub-block would not align with the core"
+        )
+    t = np.asarray(tijk, dtype=np.int64)
+    per_tile = int(n_tile) // ratio
+    return t * per_tile - int(halo), per_tile + 2 * int(halo)
+
+
+def stage_coarse_subblock(g_coarse, origin_cells, extent):
+    """Extract the (extent,)*3 periodic sub-block at `origin_cells`.
+
+    Host-side numpy with `mode="wrap"` per axis, so a block straddling the
+    periodic boundary needs no special case and no copy of the whole mesh.
+    """
+    g = np.asarray(g_coarse)
+    out = g
+    for axis, o in enumerate(np.asarray(origin_cells, dtype=np.int64)):
+        idx = (np.arange(int(extent), dtype=np.int64) + int(o)) % g.shape[axis]
+        out = np.take(out, idx, axis=axis)
+    return out
+
+
+def gather_coarse_subblock(
+    sub_x, sub_y, sub_z, positions, origin_cells, cell_coarse, n_coarse, assign="tsc"
+):
+    """Read the long force for one tile's rows out of a staged sub-block.
+
+    BITWISE identical to gathering from the global coarse mesh. That is a
+    contract, not an aspiration: staging is a memory decision and must not move a
+    number.
+
+    **The obvious implementation does not achieve it, and measured 8.9e-16.**
+    Shifting the COORDINATE into block-local space (u = mod(pos - origin, L), the
+    way the tile short arm does) changes the last bits of `pos/cell` and
+    therefore of the fractional offset, so the weights differ by roundoff even
+    though the cell values are a verbatim slice. Roundoff would be harmless
+    physically and fatal to the parity gate, which is the whole reason this path
+    exists at C-hero.
+
+    So the weights come from the GLOBAL coordinate, exactly as the global gather
+    computes them, and only the integer index is shifted -- by
+    `(base - origin) mod n_coarse`, which is exact. Values identical, weights
+    identical, corner order identical, therefore bits identical.
+
+    The caller must pass only rows whose stencil fits the halo. Rows outside the
+    tile's core would read wrapped values from the far side of the block,
+    silently and plausibly, so they are refused rather than trusted.
+    """
+    extent = int(np.asarray(sub_x).shape[0])
+    origin = np.asarray(origin_cells, dtype=np.int64)
+    xp = jnp.asarray(positions) / float(cell_coarse)
+    if assign == "tsc":
+        base_f = jnp.round(xp)
+        d = xp - base_f
+        w_axis = (0.5 * (0.5 - d) ** 2, 0.75 - d**2, 0.5 * (0.5 + d) ** 2)
+        corners, first = _TSC_CORNERS, -1
+    elif assign == "cic":
+        base_f = jnp.floor(xp)
+        frac = xp - base_f
+        w_axis = (1.0 - frac, frac)
+        corners, first = _CIC_CORNERS, 0
+    else:
+        raise ValueError(f"assign must be 'cic' or 'tsc', got {assign!r}")
+    base = jax.lax.stop_gradient(base_f).astype(jnp.int32)
+    # exact integer re-basing; `% n_coarse` puts a block straddling the periodic
+    # boundary back in range without touching any float
+    i = jnp.mod(base - jnp.asarray(origin, dtype=jnp.int32), int(n_coarse))
+
+    lo_needed = int(np.asarray(i).min()) + first
+    hi_needed = int(np.asarray(i).max()) + first + len(w_axis) - 1
+    if lo_needed < 0 or hi_needed >= extent:
+        raise ValueError(
+            f"a row's {assign} stencil reaches outside the staged sub-block: needs "
+            f"[{lo_needed}, {hi_needed}] of [0, {extent - 1}]. Pass only the tile's OWNED "
+            "rows, or raise the halo -- reading past the block wraps to the far side of "
+            "the mesh and is silent."
+        )
+
+    fx, fy, fz = (jnp.asarray(s).reshape(-1) for s in (sub_x, sub_y, sub_z))
+    n = xp.shape[0]
+    ax = jnp.zeros((n,), dtype=fx.dtype)
+    ay = jnp.zeros((n,), dtype=fx.dtype)
+    az = jnp.zeros((n,), dtype=fx.dtype)
+    for dx, dy, dz in corners:
+        ww = w_axis[dx - first][:, 0] * w_axis[dy - first][:, 1] * w_axis[dz - first][:, 2]
+        flat = ((i[:, 0] + dx) * extent + (i[:, 1] + dy)) * extent + (i[:, 2] + dz)
+        ax = ax + ww * fx[flat]
+        ay = ay + ww * fy[flat]
+        az = az + ww * fz[flat]
+    return jnp.stack([ax, ay, az], axis=1)
 
 
 # ===========================================================================

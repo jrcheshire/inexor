@@ -589,6 +589,120 @@ def test_regression_padding_rows_do_not_funnel_onto_flat_index_zero():
     assert float(w[0]) > 0.0 and float(w[1]) == 0.0, "masking must be on the WEIGHT"
 
 
+# ================================ coarse sub-block staging (D-v2-16 clause 3)
+
+
+def _coarse_setup(seed=30):
+    """A global coarse force plus the geometry to slice it by tile."""
+    import jax.numpy as jnp
+
+    n_coarse = N_FINE_T // forces.COARSE_RATIO  # 16
+    rng = np.random.default_rng(seed)
+    g = [jnp.asarray(rng.normal(size=(n_coarse,) * 3)) for _ in range(3)]
+    pos = _positions(seed + 1, N_PART_T)
+    return g, pos, n_coarse, L_BOX / n_coarse
+
+
+def test_the_staged_subblock_is_a_verbatim_periodic_slice():
+    """The premise everything else rests on. If the slice is not exactly the
+    cells the global mesh holds at those (wrapped) indices, the gather cannot be
+    bitwise and the whole staging idea is a change in physics."""
+    g, _, n_coarse, _ = _coarse_setup()
+    origin, extent = forces.coarse_subblock_origin_extent(
+        (0, 0, 0), N_TILE_T, n_coarse, N_FINE_T
+    )
+    assert np.any(np.asarray(origin) < 0), "tile 0's block should straddle the low boundary"
+    sub = forces.stage_coarse_subblock(g[0], origin, extent)
+    gg = np.asarray(g[0])
+    for i in range(extent):
+        for j in range(extent):
+            for k in range(extent):
+                want = gg[(origin[0] + i) % n_coarse,
+                          (origin[1] + j) % n_coarse,
+                          (origin[2] + k) % n_coarse]
+                assert sub[i, j, k] == want
+
+
+def test_the_subblock_is_far_smaller_than_the_global_mesh():
+    """The reason it exists. Asserted as a ratio so a later halo change that
+    quietly ate the saving shows up here."""
+    n_coarse = 1024  # C-gh
+    _, extent = forces.coarse_subblock_origin_extent((0, 0, 0), 256, n_coarse, 4096)
+    assert extent == 64 + 2 * forces.COARSE_HALO
+    assert (n_coarse / extent) ** 3 > 1000
+
+
+@pytest.mark.parametrize("assign", ["cic", "tsc"])
+def test_gathering_from_the_subblock_is_bitwise_the_global_gather(assign):
+    """The contract: staging is a memory decision and must not move a number.
+
+    Checked on OWNED rows of several tiles, including tile 0 whose block
+    straddles the periodic boundary -- the case where an index-shift bug would
+    hide.
+    """
+    import jax.numpy as jnp
+
+    g, pos, n_coarse, cell_c = _coarse_setup()
+    n_side = N_FINE_T // N_TILE_T
+    glob = np.asarray(
+        (painting.tsc_read_vector if assign == "tsc" else painting.cic_read_vector)(
+            *g, jnp.asarray(pos), n_coarse, L_BOX
+        )
+    )
+    tile_side = L_BOX * N_TILE_T / N_FINE_T
+    checked = 0
+    for tijk in ((0, 0, 0), (1, 2, 3), (n_side - 1, n_side - 1, n_side - 1)):
+        lo = np.asarray(tijk) * tile_side
+        owned = np.all((pos >= lo) & (pos < lo + tile_side), axis=1)
+        if not owned.any():
+            continue
+        checked += int(owned.sum())
+        origin, extent = forces.coarse_subblock_origin_extent(
+            tijk, N_TILE_T, n_coarse, N_FINE_T
+        )
+        sub = [jnp.asarray(forces.stage_coarse_subblock(c, origin, extent)) for c in g]
+        mine = forces.gather_coarse_subblock(
+            *sub, jnp.asarray(pos[owned]), origin, cell_c, n_coarse, assign=assign
+        )
+        _agree(mine, glob[owned], f"coarse subblock/{assign}/{tijk}", min_nonzero_frac=0.9)
+    assert checked > 100, f"only {checked} owned rows exercised; the fixture is too thin"
+
+
+def test_the_subblock_gather_refuses_rows_it_cannot_serve():
+    """A row outside the tile's core reads wrapped values from the far side of
+    the block, silently and plausibly. That is the exact shape of bug the halo
+    exists to prevent, so it raises instead."""
+    import jax.numpy as jnp
+
+    g, pos, n_coarse, cell_c = _coarse_setup()
+    origin, extent = forces.coarse_subblock_origin_extent(
+        (0, 0, 0), N_TILE_T, n_coarse, N_FINE_T
+    )
+    sub = [jnp.asarray(forces.stage_coarse_subblock(c, origin, extent)) for c in g]
+    with pytest.raises(ValueError, match="reaches outside the staged sub-block"):
+        forces.gather_coarse_subblock(*sub, jnp.asarray(pos), origin, cell_c, n_coarse)
+
+
+def test_the_halo_is_wide_enough_for_tsc_rounding():
+    """halo=2 is not decoration. TSC's base comes from round(), not floor(), so a
+    core-edge particle reaches one cell further than a CIC bound suggests --
+    checked by driving rows to both extremes of the core and confirming the
+    stencil still fits."""
+    import jax.numpy as jnp
+
+    g, _, n_coarse, cell_c = _coarse_setup()
+    tile_side = L_BOX * N_TILE_T / N_FINE_T
+    edge = np.array([[1e-12, 1e-12, 1e-12], [tile_side - 1e-12] * 3])
+    origin, extent = forces.coarse_subblock_origin_extent(
+        (0, 0, 0), N_TILE_T, n_coarse, N_FINE_T
+    )
+    sub = [jnp.asarray(forces.stage_coarse_subblock(c, origin, extent)) for c in g]
+    out = forces.gather_coarse_subblock(
+        *sub, jnp.asarray(edge), origin, cell_c, n_coarse, assign="tsc"
+    )
+    assert np.all(np.isfinite(np.asarray(out)))
+
+
 # ============================================= paint_tsc_int (D-v2-16 clause 2)
 
 
