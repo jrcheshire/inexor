@@ -264,6 +264,10 @@ class SlotState:
     arena_bucket: np.ndarray  # int64 (n_arena,) -1 where free
     n_particles: int
     ids: np.ndarray = None  # int32 (n_alloc + n_arena,) or None
+    # brick -> arena rows, rebuilt on demand. NOT state: a pure function of
+    # `arena_bucket`, cached because computing it per call is an O(n_arena) scan
+    # and the callers are per-brick. See `arena_slots_of_brick`.
+    _arena_by_brick: dict = None
 
     # -------------------------------------------------------------- building
 
@@ -440,6 +444,24 @@ class SlotState:
             self.bucket_flat_of_live_slots(brick_flat), self.t9, self.bricks_per_side
         )
 
+    def _invalidate_arena_index(self):
+        self._arena_by_brick = None
+
+    def _build_arena_index(self):
+        """Group the occupied arena rows by brick, ONCE."""
+        idx = {}
+        if self.n_arena:
+            live = np.nonzero(self.arena_bucket >= 0)[0]
+            if len(live):
+                b = self.arena_bucket[live] // self.buckets_per_brick
+                order = np.argsort(b, kind="stable")
+                live, b = live[order], b[order]
+                edges = np.nonzero(np.diff(b))[0] + 1
+                for part in np.split(np.arange(len(b)), edges):
+                    idx[int(b[part[0]])] = self.arena_base + live[part]
+        self._arena_by_brick = idx
+        return idx
+
     def arena_slots_of_brick(self, brick_flat):
         """Arena rows belonging to this brick.
 
@@ -447,12 +469,22 @@ class SlotState:
         elsewhere because the brick was momentarily full -- and omitting it
         deletes it from the force with nothing raising. D-v2-19 clause 4 measured
         that at 98.4% loss on a stress fixture and 0.57% at the operating point.
+
+        **Grouped once rather than scanned per brick.** The obvious form is
+        `nonzero(arena_bucket // p3 == brick_flat)`, which is an O(n_arena) scan
+        for ONE brick's answer, and the callers ask per brick: profiled at 10,240
+        calls and 1.15 s of an 11.4 s step. That is the same shape as M-v2-1's
+        third instrument defect, where `_to_arena` scanned the whole arena per
+        particle and cost 91.00 s against a 3.97 s force. The grouping is a pure
+        function of `arena_bucket`, so it is a cache and not state, and every
+        write to `arena_bucket` invalidates it.
         """
         if self.n_arena == 0:
             return np.empty(0, dtype=np.int64)
-        # free arena rows carry -1, and -1 // p3 is -1, so they never match
-        sel = np.nonzero(self.arena_bucket // self.buckets_per_brick == brick_flat)[0]
-        return self.arena_base + sel
+        idx = self._arena_by_brick
+        if idx is None:
+            idx = self._build_arena_index()
+        return idx.get(int(brick_flat), np.empty(0, dtype=np.int64))
 
     def brick_member_slots(self, brick_flat):
         """Every slot holding one of this brick's particles: its live run, then
@@ -695,6 +727,7 @@ class SlotState:
             a_free = self.arena_slots_of_brick(b)
             if len(a_free):
                 self.arena_bucket[a_free - self.arena_base] = -1
+                self._invalidate_arena_index()
             # Drift in the INTEGER domain. The wrap is exactly modular there
             # (D-007), where `float_step_bullfrog`'s jnp.mod(x, L) is only
             # nearly so, and adding the displacement to the lattice index cannot
@@ -827,6 +860,7 @@ class SlotState:
             )
         a = free[: len(dest)]
         self.arena_bucket[a] = dest
+        self._invalidate_arena_index()
         self.off[self.arena_base + a] = off
         self.w[self.arena_base + a] = w
         if ids is not None:
@@ -899,6 +933,7 @@ class SlotState:
         self.occupancy = _to_index(new_occ, self.index_dtype, "repacked")
         self.arena_base = n_alloc
         self.arena_bucket[:] = -1
+        self._invalidate_arena_index()
         return dict(slots_used=n_alloc, slots_per_particle=n_alloc / max(self.n_particles, 1))
 
     def _bucket_flat_of_slots(self, brick_flat, slots):
