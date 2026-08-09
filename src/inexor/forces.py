@@ -64,6 +64,7 @@ the research record.
 
 from functools import lru_cache
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -370,3 +371,377 @@ def force_global(
     else:
         out = tsc_read_vector(g[0], g[1], g[2], rd, n_mesh, box_size)
     return np.asarray(out, dtype=np.float64), max_applied
+
+
+# ===========================================================================
+# tile geometry (origin-shifted; no global wrap)
+# ===========================================================================
+
+# FFT-friendly padded sizes (products of small primes). P = T + 2*b_fine is
+# rounded UP to one of these: T=128, b_fine=18 -> P=164 = 4*41 has a large prime
+# factor and is pathologically slow. The realized buffer is what gets reported.
+#
+# **Entries <= 512 are FROZEN.** They fix every already-measured tile selection
+# (D-v2-10, D-v2-11, D-v2-12), and the >512 block was appended 2026-07-17 for the
+# cgh64 ladder's tile512 arms, which want P = 576/640/768/1024. The list stops at
+# 1024 = the largest fine mesh in the config table, and the degeneracy guard
+# forbids P > n_fine anyway. Nothing may be inserted below 512: verified
+# exhaustively at append time that every `want` in [1, 512] selects the same P.
+FFT_FRIENDLY = (
+    32, 36, 40, 48, 50, 54, 60, 64, 72, 80, 90, 96, 100, 108, 120, 128,
+    144, 150, 160, 162, 180, 192, 200, 216, 240, 250, 256, 288, 300, 320,
+    360, 384, 400, 432, 480, 500, 512,
+    540, 576, 600, 640, 648, 720, 750, 768, 800, 810, 864, 900, 960, 972,
+    1000, 1024,
+)  # fmt: skip
+
+
+def padded_size(n_tile, b_fine, n_fine=None):
+    """FFT-friendly P >= n_tile + 2*b_fine, and the realized buffer.
+
+    Returns (P, b_realized). The buffer GROWS to the rounded size -- the extra is
+    real buffer, not padding -- so beta_realized >= beta_requested and is what
+    gets reported.
+
+    `n_fine` enables the degeneracy guard: a padded tile at least as large as the
+    global mesh is not a tile at all. It does more FFT work than the monolithic
+    solve it replaces, and (with the brick wrap) it is where the double-count bug
+    lives.
+    """
+    want = int(n_tile) + 2 * int(b_fine)
+    if n_fine is not None and want > int(n_fine):
+        raise ValueError(
+            f"padded tile {want} > fine mesh {n_fine}: the tile+buffer exceeds the box, "
+            "which is degenerate (more FFT work than monolithic). Reduce beta or n_tile."
+        )
+    for p in FFT_FRIENDLY:
+        if p >= want:
+            if n_fine is not None and p > int(n_fine):
+                raise ValueError(
+                    f"FFT-friendly padded size {p} > fine mesh {n_fine} "
+                    f"(wanted {want}); reduce beta or n_tile."
+                )
+            return int(p), (int(p) - int(n_tile)) // 2
+    raise ValueError(f"no FFT-friendly padded size >= {want}; extend FFT_FRIENDLY")
+
+
+def tile_origin_extent(tijk, n_tile, b_fine, cell):
+    """(origin (3,) f64, extent f64) of a tile+buffer box in GLOBAL coords.
+
+    origin = (t*n_tile - b_fine) * cell, and may be NEGATIVE -- deliberately, and
+    it is fine: mod(x - origin, L) handles the periodic wrap exactly, so a tile
+    whose buffer crosses the box boundary needs no special case.
+    """
+    t = np.asarray(tijk, dtype=np.int64)
+    origin = (t * int(n_tile) - int(b_fine)) * float(cell)
+    extent = (int(n_tile) + 2 * int(b_fine)) * float(cell)
+    return origin, extent
+
+
+def tile_local_coords(positions, origin, box_size):
+    """u = mod(pos - origin, L): the tile-local coordinate AND the membership
+    test, from ONE expression.
+
+    A particle is in tile+buffer iff all(u < extent). Exact including buffers that
+    wrap the periodic boundary -- no min-image, no branches. `painting._cic_pieces`'
+    `% n_mesh` is WRONG here: it would fold a particle from the far side of the
+    box into the tile.
+    """
+    return jnp.mod(positions - jnp.asarray(origin), float(box_size))
+
+
+def _tile_cic_pieces(u, live, shape, cell):
+    """Base cell, fractional offset, validity mask, and the out-of-box count.
+
+    THE MODULO QUESTION, settled by measurement (2026-07-15). The padded tile box
+    IS periodic -- that is exactly what its rfftn assumes -- so the tile paint
+    wraps modulo P, the PADDED BOX's own period. What would be wrong is
+    `painting.py`'s `% n_mesh`, the GLOBAL box's period, which folds far-side
+    particles in. Those are different moduli, and an earlier version conflated
+    "not the global modulo" with "no modulo": it required base < P-1, silently
+    discarding the LAST CELL LAYER of every padded box. That produced a 4.6e-1
+    error on the one-tile-equals-whole-box identity and a fake buffer-error
+    plateau that looked exactly like kernel ringing. The identity check caught it.
+
+    `ok` selects particles inside the padded box (u in [0, extent)) and the corner
+    indices wrap modulo P. `n_out` counts LIVE particles outside it.
+
+    **n_out is a CONTRACT, not a diagnostic** -- corrected 2026-08-08, when
+    promotion found this docstring and `tile_paint_f64`'s asserting opposite
+    things. It was a diagnostic when the brick union was merely a superset of
+    tile+buffer, and healthy overhang was expected. Since `choose_brick` gained
+    the `c | b_fine` condition (2026-08-07) the union is EXACTLY the padded box,
+    so any nonzero value means the brick decomposition is wrong rather than
+    wasteful. It stays a returned number rather than a raise because a caller may
+    hand-pick a brick that violates the condition; `layout.assert_brick_divides_
+    buffer` is the check that forbids that, and the gates assert n_out == 0.
+    """
+    nx, ny, nz = (int(s) for s in shape)
+    extent = jnp.asarray([nx, ny, nz], dtype=jnp.float64) * float(cell)
+    xp = u / float(cell)
+    base_f = jnp.floor(xp)
+    frac = xp - base_f
+    base = jax.lax.stop_gradient(base_f).astype(jnp.int32)
+    in_box = jnp.all((u >= 0.0) & (u < extent), axis=1)
+    ok = live & in_box
+    n_out = jnp.sum(live & (~in_box))
+    return base, frac, ok, n_out
+
+
+def _tile_corner(base, frac, wlo, corner, shape, ok):
+    """One CIC corner: flat index (wrapped mod P) + weight, no-op'd on ~ok.
+
+    Out-of-box and padding slots get a VALID index with ZERO weight, so
+    mode="promise_in_bounds" is honestly safe. Out-of-range indices under that
+    mode are undefined behaviour on GPU -- silent corruption, not an exception
+    (G1 job 33: 63% of cells wrong from a lowering that "worked"). mode="drop" is
+    REJECTED: it would silently swallow a genuinely misrouted live particle,
+    exactly the bug class the gates must be able to see.
+
+    WHICH LINE MAKES THE INDEX SAFE. It is the `% nx` below, NOT a `where` on
+    `ok`. `base` comes from floor(u/cell) with u = mod(pos - origin, L) in [0, L),
+    so base is bounded by n_fine and cannot overflow int32, and jnp's `%` with a
+    positive modulus is non-negative. `flat` is therefore in range for EVERY row,
+    live or not, and is returned unmasked. The earlier `where(ok, flat, 0)` was
+    redundant for safety and expensive for a reason nobody costed: it funnelled
+    every padded row -- 33% of all rows at the C-gh candidate geometry -- onto
+    flat index 0, so each of the 8 unrolled scatter-adds became ~2e6 f64 atomics
+    contending for ONE address. Removing it took the device phase 47.15 -> 21.26
+    ms, 2.218x. Only the WEIGHT zeroing is load-bearing, and it is kept.
+    """
+    nx, ny, nz = shape
+    dx, dy, dz = corner
+    wx = frac[:, 0] if dx else wlo[:, 0]
+    wy = frac[:, 1] if dy else wlo[:, 1]
+    wz = frac[:, 2] if dz else wlo[:, 2]
+    ix = (base[:, 0] + dx) % nx
+    iy = (base[:, 1] + dy) % ny
+    iz = (base[:, 2] + dz) % nz
+    flat = (ix * ny + iy) * nz + iz
+    return flat, jnp.where(ok, wx * wy * wz, 0.0)
+
+
+def tile_paint_f64(u, live, shape, cell, mean):
+    """CIC paint of tile-local coords into ONE padded tile mesh -> (mesh, n_out).
+
+    Paints counts/mean, with NO -1. Two separate facts, both measured (module
+    docstring):
+      - the -1 is unnecessary, because ik(0) = 0 kills the DC term exactly, so
+        the short force cannot see the offset (8.6e-16 for a shift of 1);
+      - `mean` is MANDATORY and must be the GLOBAL mean n_total/n_mesh^3 -- a
+        config scalar, not a reduction. A tile's own mean rescales the whole short
+        force by mean_global/mean_tile, an error of exactly |s-1| (O(1)), which
+        reads as a catastrophic tiling failure and sends you hunting buffers.
+
+    Index safety is `_tile_corner`'s `% P` plus the zero weight; see there. (This
+    docstring described a `flat = where(ok, flat, 0)` line until 2026-08-08 --
+    `eba91ab` had removed it eight months of reading earlier, and the stale text
+    was still recommending the construction that cost 2.2x.)
+    """
+    nx, ny, nz = (int(s) for s in shape)
+    base, frac, ok, n_out = _tile_cic_pieces(u, live, (nx, ny, nz), cell)
+    mesh = jnp.zeros((nx * ny * nz,), dtype=jnp.float64)
+    wlo = 1.0 - frac
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                flat, w = _tile_corner(base, frac, wlo, (dx, dy, dz), (nx, ny, nz), ok)
+                mesh = mesh.at[flat].add(w.astype(jnp.float64), mode="promise_in_bounds")
+    return mesh.reshape(nx, ny, nz) / float(mean), n_out
+
+
+def tile_gather_vector(gx, gy, gz, u, live, shape, cell):
+    """Read 3 tile fields with ONE shared CIC stencil (`cic_read_vector` twin,
+    origin-shifted). Zeroed on ~live. Returns ((n,3) f64, n_out)."""
+    nx, ny, nz = (int(s) for s in shape)
+    base, frac, ok, n_out = _tile_cic_pieces(u, live, (nx, ny, nz), cell)
+    fx, fy, fz = gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)
+    n = u.shape[0]
+    ax = jnp.zeros((n,), dtype=jnp.float64)
+    ay = jnp.zeros((n,), dtype=jnp.float64)
+    az = jnp.zeros((n,), dtype=jnp.float64)
+    wlo = 1.0 - frac
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                flat, w = _tile_corner(base, frac, wlo, (dx, dy, dz), (nx, ny, nz), ok)
+                ax = ax + w * fx[flat]
+                ay = ay + w * fy[flat]
+                az = az + w * fz[flat]
+    return jnp.stack([ax, ay, az], axis=1), n_out
+
+
+# ===========================================================================
+# the tiled short arm
+# ===========================================================================
+
+
+def make_tile_force_fn(n_fine, box_size, n_particles_total, n_tile, b_fine, r_s=None):
+    """Build the jitted per-tile short-force program -> (one_tile, geom).
+
+    ONE jitted program is reused for every tile, which is only possible because
+    `cap` is fixed: a per-tile member count would key a new shape and recompile
+    per tile. Tile 0 therefore carries the whole XLA compile and the steady-state
+    per-tile cost is the median over tiles 1.., which is the number any
+    cross-box extrapolation must use -- tile count scales with volume, compile
+    does not.
+
+    Each tile+buffer is FFT'd as a small PERIODIC box of P^3 fine cells. The tile
+    k-grid has fundamental 2pi/(P*d_f) but the SAME Nyquist pi/d_f as the global
+    mesh, so the two grids periodize the identical sharp-k-truncated continuum
+    kernel and differ ONLY by periodization.
+
+    Why the wrap should be harmless: for a core target every source within the
+    short kernel's range R ~ beta*r_s is present if b >= R, and images sit at
+    >= P - R >= T + R where the short force is erfc-suppressed far below the
+    truncation level. That was NOT taken on faith (risk R7) -- sharp-k truncation
+    at the fine Nyquist gives the real-space kernel oscillatory ~1/x ringing
+    tails, and had those dominated the image sums the periodization error would
+    decay as a POWER LAW in P rather than erfc, making `buffer ~ 5 r_s` and every
+    cost number in this engine wrong. G5's decay-law, seam-profile and
+    T-independence signatures discriminated the two; D-v2-10 is the verdict.
+
+    `one_tile(u, live) -> (g, owned, n_out)` where `owned` marks the rows this
+    tile is responsible for (core, not buffer), so ownership is a partition and
+    the kick can be applied tile-locally without any global force array.
+    """
+    cell = float(box_size) / int(n_fine)
+    mean = float(n_particles_total) / float(n_fine) ** 3
+    P, b_real = padded_size(n_tile, b_fine, n_fine=n_fine)
+    kers = [jnp.asarray(k) for k in split_kernels((P,) * 3, cell, "short", r_s=r_s)]
+    core_lo = b_real * cell
+    core_hi = (b_real + int(n_tile)) * cell
+
+    def one_tile(u, live):
+        delta, n_out_p = tile_paint_f64(u, live, (P,) * 3, cell, mean)
+        dk = jnp.fft.rfftn(delta)
+        g = [jnp.fft.irfftn(dk * k, s=(P,) * 3) for k in kers]
+        out, n_out_g = tile_gather_vector(g[0], g[1], g[2], u, live, (P,) * 3, cell)
+        owned = live & jnp.all((u >= core_lo) & (u < core_hi), axis=1)
+        return out, owned, n_out_p + n_out_g
+
+    geom = dict(P=int(P), b_realized=int(b_real), cell=cell, mean=mean,
+                core_lo=core_lo, core_hi=core_hi, n_side=int(n_fine) // int(n_tile))
+    return jax.jit(one_tile), geom
+
+
+# A global (n,3) f64 force array is 2 x 206 GB at C-gh -- the two arrays whose
+# deletion is what makes C-gh runnable at all (D-v2-16 cl.1). The accumulate sink
+# below materializes one, so it is capped: it exists to let tests compare against
+# the probe's host-accumulated output, not to run production.
+MAX_ACCUMULATE_BYTES = 2 * 1024**3
+
+
+def force_short_tiled(
+    positions,
+    n_fine,
+    box_size,
+    n_particles_total,
+    n_tile,
+    b_fine,
+    member_fn,
+    cap,
+    r_s=None,
+    pad_fill="cycle",
+    sink=None,
+    max_accumulate_bytes=MAX_ACCUMULATE_BYTES,
+):
+    """Drive the tiled short force over every tile -> (g or None, diag).
+
+    `member_fn(tijk) -> int64 indices` and `cap` are REQUIRED and come from the
+    caller. Membership is `layout.py`'s job and the force does not own a
+    bucketing; passing them in is also what lets the parity gate drive this with
+    the probe's own membership, so the comparison isolates the force computation
+    from the exchange.
+
+    `sink=None` accumulates into a global (n,3) host array and returns it. That
+    is the path D-v2-16 clause 1 keeps FOR TESTS ONLY, and it refuses above
+    `max_accumulate_bytes` -- at C-gh the array it would build is 206 GB, and the
+    deletion of two such arrays is the single change that makes C-gh runnable.
+    Production passes a callable `sink(idx, g_owned)` invoked per tile with only
+    that tile's owned rows, so nothing O(box) is ever materialized.
+    """
+    positions = np.asarray(positions)
+    one_tile, geom = make_tile_force_fn(
+        n_fine, box_size, n_particles_total, n_tile, b_fine, r_s=r_s
+    )
+    P, b_real, cell = geom["P"], geom["b_realized"], geom["cell"]
+    n_side = geom["n_side"]
+    tiles = [(i, j, k) for i in range(n_side) for j in range(n_side) for k in range(n_side)]
+    n = positions.shape[0]
+
+    accumulate = sink is None
+    if accumulate:
+        need = n * 3 * 8
+        if need > int(max_accumulate_bytes):
+            raise ValueError(
+                f"the global accumulate sink would allocate {need / 1024**3:.1f} GiB for "
+                f"{n} particles, over the {max_accumulate_bytes / 1024**3:.1f} GiB limit. "
+                "That array is what D-v2-16 clause 1 deletes (2 x 206 GB at C-gh); pass a "
+                "tile-local `sink(idx, g_owned)` instead of raising the limit."
+            )
+        g_out = np.zeros((n, 3), dtype=np.float64)
+    else:
+        g_out = None
+
+    owner_count = np.zeros((n,), dtype=np.int32)
+    n_overhang_total = 0
+    for t in tiles:
+        idx = np.asarray(member_fn(t))
+        m = len(idx)
+        if m > cap:
+            raise RuntimeError(f"tile {t}: {m} members > cap {cap} (host capacity is wrong)")
+        # Padding fill. Pad rows are masked to zero WEIGHT either way, so both
+        # arms give bitwise-identical forces; what differs is which mesh
+        # addresses their (zero-weight) scatter-adds contend for. "zero" points
+        # every pad row at particle 0, so all cap-m of them hit the same 8 cells
+        # -- the pre-2026-08-07 behaviour, retained ONLY so the cost of that
+        # contention stays measurable as an A/B (it was 2.218x on device).
+        if pad_fill == "cycle" and m > 0:
+            idx_pad = np.resize(idx, cap)
+        elif pad_fill in ("zero", "cycle"):
+            idx_pad = np.zeros((cap,), dtype=np.int64)
+            idx_pad[:m] = idx
+        else:
+            raise ValueError(f"pad_fill must be 'cycle' or 'zero', got {pad_fill!r}")
+        live_np = np.zeros((cap,), dtype=bool)
+        live_np[:m] = True
+        origin, _ = tile_origin_extent(t, n_tile, b_real, cell)
+        u = jnp.mod(jnp.asarray(positions[idx_pad]) - jnp.asarray(origin), float(box_size))
+        out, owned, n_out = one_tile(u, jnp.asarray(live_np))
+        out = np.asarray(out)
+        owned = np.asarray(owned)
+        n_overhang_total += int(n_out)
+        sel = owned[:m]
+        if accumulate:
+            g_out[idx[sel]] = out[:m][sel]
+        else:
+            sink(idx[sel], out[:m][sel])
+        owner_count[idx[sel]] += 1
+        del out, owned
+
+    diag = dict(
+        n_tiles=len(tiles),
+        n_tile=int(n_tile),
+        b_requested=int(b_fine),
+        b_realized=int(b_real),
+        padded_P=int(P),
+        cap=int(cap),
+        pad_fill=str(pad_fill),
+        fft_work_ratio=float(len(tiles) * P**3 / float(n_fine) ** 3),
+        # Superset overhang: brick-union members outside the padded mesh. Since
+        # choose_brick gained `c | b_fine` the union is EXACTLY the padded box, so
+        # this is a CONTRACT (must be 0) and a nonzero value means the brick
+        # decomposition is wrong, not merely wasteful. The pre-fix V4a card has
+        # 3,044,340,012 here at T128/b96 and 0 at every other leg.
+        n_overhang_total=int(n_overhang_total),
+        # THE REAL CONTRACT: every particle owned by exactly one tile.
+        n_owned_total=int((owner_count > 0).sum()),
+        min_owner_count=int(owner_count.min()),
+        max_owner_count=int(owner_count.max()),
+        partition_ok=bool(
+            owner_count.min() == 1 and owner_count.max() == 1
+            and int((owner_count > 0).sum()) == n
+        ),
+    )
+    return g_out, diag
