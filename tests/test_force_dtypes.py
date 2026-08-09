@@ -259,16 +259,23 @@ def test_the_gathers_and_subblock_staging_default_to_f64():
     ])
 
 
+def _engine_fixture(seed=40, **kw):
+    """The `smoke` rung, the smallest geometry whose decomposition is not
+    degenerate. Matches `tests/test_engine.py`."""
+    cfg = engine.EngineConfig(
+        box_size=L_BOX, n_part=32, n_fine=64, n_coarse=16, n_tile=16, b_fine=8, **kw
+    )
+    x = _positions(seed, 32)
+    v = np.random.default_rng(seed + 1).normal(scale=0.5, size=x.shape)
+    t9 = T9Layout(box_size=L_BOX, n_part=32, bucket_cells=2)
+    st = state.SlotState.build(x, v, t9, 64 // cfg.n_brick, arena_frac=0.05)
+    return cfg, st
+
+
 def test_the_engine_coarse_arm_defaults_to_f64():
     """The shipping path, end to end: the streamed integer accumulation decodes
     to f64 and the coarse solve stays there. This row is the one M-v2-4 moves."""
-    cfg = engine.EngineConfig(
-        box_size=L_BOX, n_part=32, n_fine=64, n_coarse=16, n_tile=16, b_fine=8
-    )
-    x = _positions(40, 32)
-    v = np.random.default_rng(41).normal(scale=0.5, size=x.shape)
-    t9 = T9Layout(box_size=L_BOX, n_part=32, bucket_cells=2)
-    st = state.SlotState.build(x, v, t9, 64 // cfg.n_brick, arena_frac=0.05)
+    cfg, st = _engine_fixture()
     delta = engine.coarse_delta_streamed(st, cfg)
     _assert_dtypes([("engine.coarse_delta_streamed", _name(delta), "float64")])
 
@@ -618,6 +625,124 @@ def test_coarse_force_meshes_refuses_a_dtype_it_was_not_given():
     # and the agreeing call is fine
     assert _name(forces.coarse_force_meshes(d32, N_MESH, L_BOX, "long", r_s=R_S,
                                             fdtype=np.float32)[0]) == "float32"
+
+
+# ================================= S6: the engine knobs, independent and live
+
+
+def test_the_two_engine_knobs_move_independently():
+    """Attributability. If one knob moved both meshes, leg 1's reading could not
+    be assigned to the coarse arm, which is the only arm the gate is about."""
+    cfg, st = _engine_fixture(coarse_dtype="float32", fine_dtype="float64")
+    assert (cfg.coarse_dtype, cfg.fine_dtype) == ("float32", "float64")
+    delta = engine.coarse_delta_streamed(st, cfg)
+    assert _name(delta) == "float32", "the coarse knob did not reach the streamed decode"
+    _, geom = forces.make_tile_force_fn(
+        cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine,
+        r_s=cfg.r_s, paint=cfg.paint_short, frac_bits=cfg.frac_bits,
+        fdtype=cfg.np_fine_dtype,
+    )
+    assert geom["fdtype"] == "float64", "the fine arm followed the coarse knob"
+
+
+def test_the_engine_reports_the_dtypes_it_actually_used():
+    """Read off the arrays, not echoed from the config.
+
+    A receipt that repeats what it was told cannot catch a knob that did not
+    apply -- and three knobs in this milestone turned out not to apply.
+    """
+    from inexor.config import Cosmology
+    from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
+
+    cfg, st = _engine_fixture(seed=44, coarse_dtype="float32", fine_dtype="float64")
+    cosmo = Cosmology()
+    a = a_grid(0.1, 1.0, 3, spacing="log")
+    coeffs = bullfrog_float_coeffs(bullfrog_table(a, cosmo))
+    out = engine.run(st, cfg, coeffs, census=True)
+    s = out[0]
+    assert s["coarse_dtype"] == "float32" and s["fine_dtype"] == "float64"
+    assert isinstance(s["coarse_peak_int"], int) and s["coarse_peak_int"] > 0
+    assert "coarse_cells_inexact_f32" in s and "coarse_exact_decode_ok" in s
+    # and the census is OFF by default, since it costs two extra mesh passes
+    plain = engine.step(st, cfg, (coeffs[0][1], coeffs[0][2]), 0.0)
+    assert "coarse_peak_int" in plain, "the free statistic should always be reported"
+    assert "coarse_cells_inexact_f32" not in plain, "the census is not opt-in any more"
+
+
+def test_the_census_counts_round_trips_not_a_magnitude_threshold():
+    """S3's finding, wired into the instrument.
+
+    `< 2^24` is sufficient for an exact int->f32 decode, not necessary, so a
+    census that thresholds on magnitude reports losses that did not happen.
+    `5000 * 2^12 = 625 * 2^15` is 2.05e7 and exact.
+    """
+    m = np.array([[[5000 * 2**12, 2**24 + 12345]]], dtype=np.int64)
+    above_threshold = int(np.count_nonzero(m > 2**24))
+    round_trip_fails = int(np.count_nonzero(m.astype(np.float32).astype(np.int64) != m))
+    assert above_threshold == 2, "fixture does not have two cells past 2^24"
+    assert round_trip_fails == 1, (
+        "the round-trip count agrees with the magnitude threshold here, so the census "
+        "design makes no difference and S3's finding should be re-checked"
+    )
+
+
+def test_the_slabbed_decode_is_bitwise_the_whole_array_form():
+    """The decode was slabbed to kill ~30 GB of transient at C-gh. Elementwise,
+    so it must not move a bit -- asserted directly rather than inferred from the
+    streamed-vs-monolithic paint test, which would also pass if BOTH forms
+    changed together."""
+    cfg, st = _engine_fixture(seed=46)
+    got = np.asarray(engine.coarse_delta_streamed(st, cfg))
+    # the pre-M-v2-4 expression, whole-array
+    import jax.numpy as jnp
+
+    from inexor.painting import counts_from_int, paint_tsc_int
+
+    n = cfg.n_coarse
+    mesh = np.zeros((n, n, n), dtype=np.int64)
+    _, x, _ = st.decode_bricks(list(range(st.n_bricks)))
+    mesh += np.asarray(
+        paint_tsc_int(jnp.asarray(x), n, cfg.box_size, cfg.frac_bits), dtype=np.int64
+    )
+    counts = counts_from_int(mesh.astype(np.int32), cfg.frac_bits, fdtype=jnp.float64)
+    want = np.asarray(counts) / (float(cfg.n_total) / float(n) ** 3) - 1.0
+    assert np.array_equal(got, want), (
+        f"{int(np.count_nonzero(got != want))} cells differ between the slabbed and "
+        "whole-array decodes; slabbing an elementwise expression must not move a bit"
+    )
+
+
+def test_an_f64_mesh_without_x64_is_refused():
+    """The one configuration that lies about itself.
+
+    Asking for f64 without x64 silently gives f32. In M-v2-4's own gate that is
+    the REFERENCE arm, where a silent degradation does not make the comparison
+    fail -- it makes it read zero, which is a pass.
+    """
+    import jax
+
+    cfg, _ = _engine_fixture(seed=48)
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", False)
+    try:
+        with pytest.raises(ValueError, match="ask for float64 while jax_enable_x64 is False"):
+            cfg.validate()
+        # and an explicitly-f32 config is fine without x64
+        cfg32, _ = _engine_fixture(seed=48, coarse_dtype="float32", fine_dtype="float32")
+        assert cfg32.validate() is True
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+def test_a_bad_engine_dtype_is_refused_at_construction():
+    """At construction, not at first use: a typo must not survive as far as a
+    cluster job."""
+    with pytest.raises(ValueError, match="coarse_dtype must be float32 or float64"):
+        engine.EngineConfig(box_size=L_BOX, n_part=32, n_fine=64, n_coarse=16,
+                            n_tile=16, b_fine=8, coarse_dtype="float16")
+    with pytest.raises(ValueError, match="fine_dtype must be float32 or float64"):
+        engine.EngineConfig(box_size=L_BOX, n_part=32, n_fine=64, n_coarse=16,
+                            n_tile=16, b_fine=8, fine_dtype=np.int32)
 
 
 # ====================================================== the two promotion traps
