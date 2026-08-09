@@ -156,6 +156,56 @@ class EngineConfig:
         so C-dev results transfer to configurations where cells do not."""
         return self.alpha * self.coarse_cell
 
+    def mesh_bytes(self):
+        """Per-step MESH anatomy in bytes, as a function of the two dtypes.
+
+        **Deliberately not folded into `bytes_per_particle`.** That reports a
+        per-particle budget and the mesh is not per-particle; a mesh term
+        divided by N would shrink as the box grows, which is the opposite of
+        what the coarse mesh does. The `scaffold=0.0` precedent there is the
+        same instinct -- a term that vanishes from a table is indistinguishable
+        from one that was never counted.
+
+        This exists because that is exactly what happened. D-v2-16 clause 3
+        quoted 12.9 GB at C-gh and 103 GB at C-hero; those are the f32 numbers
+        (`v4_architecture_record.md` item 6 says so), and the shipped code was
+        f64 throughout, so the engine paid 25.8 and 206 GB from the freeze until
+        M-v2-4. Nothing in the package could have shown that, because nothing
+        counted the mesh at all. `test_the_coarse_meshes_match_the_ratified_
+        budget` is the check that would have.
+
+        Terms are labelled `resident` (live simultaneously during the tile loop)
+        or `transient` (peak while a phase runs). The kernel BUILD stays f64 at
+        either dtype -- it is the precision island -- so it does not shrink, and
+        it is reported separately rather than hidden inside the kernel term.
+        """
+        cw = self.np_coarse_dtype.itemsize
+        fw = self.np_fine_dtype.itemsize
+        nc = self.n_coarse
+        cells = nc**3
+        half = nc * nc * (nc // 2 + 1)
+        from .forces import padded_size
+
+        p = padded_size(self.n_tile, self.b_fine, n_fine=self.n_fine)[0]
+        pcells = p**3
+        phalf = p * p * (p // 2 + 1)
+        slab = max(1, min(nc, 32))
+        return dict(
+            # --- coarse, transient
+            coarse_accumulator=cells * 8,          # int64 host, dtype-independent
+            coarse_decode_slab=slab * nc * nc * 8,  # one f64 slab (M-v2-4)
+            coarse_kernel_build_f64=3 * half * 8,   # k2_true/k2_safe/fac, the island
+            coarse_kernels=3 * half * 2 * cw,
+            coarse_fft_workspace=half * 2 * cw,
+            # --- coarse, resident through the tile loop
+            coarse_delta=cells * cw,
+            coarse_force_resident=3 * cells * cw,
+            # --- fine, resident through the tile loop
+            tile_kernels=3 * phalf * 2 * fw,
+            # --- fine, transient per tile
+            tile_workspace=pcells * (fw + 4 + 3 * fw) + phalf * 2 * fw,
+        )
+
     @property
     def n_brick(self):
         return choose_brick(self.n_tile, self._b_realized, self.n_fine)

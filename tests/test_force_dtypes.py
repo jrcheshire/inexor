@@ -745,6 +745,74 @@ def test_a_bad_engine_dtype_is_refused_at_construction():
                             n_tile=16, b_fine=8, fine_dtype=np.int32)
 
 
+# ============================================ S7: the mesh receipt
+
+# C-gh, from the config table in docs/plan-plan-v2.md. Constructing this
+# allocates nothing -- EngineConfig is plain attributes.
+C_GH = dict(box_size=1024.0, n_part=2048, n_fine=4096, n_coarse=1024, n_tile=256, b_fine=32)
+GB = 1024.0**3
+
+
+def test_the_coarse_meshes_match_the_ratified_budget():
+    """THE TEST THAT WOULD HAVE CAUGHT IT.
+
+    D-v2-16 clause 3 ratified 12.9 GB of resident coarse force at C-gh. That is
+    the f32 figure; the shipped code was f64 and paid 25.8 GB from the freeze
+    until M-v2-4, and nothing in the package could have shown it because nothing
+    counted the mesh at all.
+
+    Asserted in GB against the ADR's own numbers rather than against a formula,
+    so it fails if either the code or the ratified figure moves.
+    """
+    f32 = engine.EngineConfig(**C_GH, coarse_dtype="float32").mesh_bytes()
+    f64 = engine.EngineConfig(**C_GH, coarse_dtype="float64").mesh_bytes()
+    assert f32["coarse_force_resident"] / GB == pytest.approx(12.0, abs=0.05), (
+        f"{f32['coarse_force_resident'] / GB:.2f} GiB against D-v2-16 clause 3's 12.9 GB "
+        "(= 12.0 GiB); the f32 coarse residency no longer matches the ratified figure"
+    )
+    assert f64["coarse_force_resident"] == 2 * f32["coarse_force_resident"]
+
+
+def test_the_kernel_build_does_not_shrink_with_the_knob():
+    """The precision island, made visible in the accounting.
+
+    `split_kernels` builds at f64 whatever it returns, so someone pricing an f32
+    arm off the kernel term alone would over-predict the saving. Reported as its
+    own line for that reason.
+    """
+    f32 = engine.EngineConfig(**C_GH, coarse_dtype="float32").mesh_bytes()
+    f64 = engine.EngineConfig(**C_GH, coarse_dtype="float64").mesh_bytes()
+    assert f32["coarse_kernel_build_f64"] == f64["coarse_kernel_build_f64"]
+    assert f32["coarse_kernels"] * 2 == f64["coarse_kernels"]
+
+
+def test_the_coarse_knob_does_not_move_the_fine_terms_or_the_accumulator():
+    """Each knob moves its own terms and nothing else -- the accounting version
+    of the attributability the two knobs exist for."""
+    a = engine.EngineConfig(**C_GH, coarse_dtype="float32", fine_dtype="float64").mesh_bytes()
+    b = engine.EngineConfig(**C_GH, coarse_dtype="float64", fine_dtype="float64").mesh_bytes()
+    for k in ("tile_kernels", "tile_workspace", "coarse_accumulator", "coarse_decode_slab",
+              "coarse_kernel_build_f64"):
+        assert a[k] == b[k], f"{k} moved with the COARSE knob"
+    for k in ("coarse_delta", "coarse_force_resident", "coarse_kernels",
+              "coarse_fft_workspace"):
+        assert a[k] * 2 == b[k], f"{k} did not halve with the coarse knob"
+
+    c = engine.EngineConfig(**C_GH, coarse_dtype="float64", fine_dtype="float32").mesh_bytes()
+    assert c["tile_kernels"] * 2 == b["tile_kernels"]
+    assert c["coarse_force_resident"] == b["coarse_force_resident"]
+
+
+def test_the_slabbed_decode_transient_is_negligible_at_c_gh():
+    """The point of slabbing, stated as a number rather than a claim: the old
+    whole-array decode built an int32 copy plus two full f64 meshes on top of
+    the int64 accumulator."""
+    m = engine.EngineConfig(**C_GH, coarse_dtype="float32").mesh_bytes()
+    old_transient = m["coarse_accumulator"] + 4 * 1024**3 + 2 * 8 * 1024**3
+    assert m["coarse_decode_slab"] / GB < 0.5
+    assert old_transient / m["coarse_decode_slab"] > 50
+
+
 # ====================================================== the two promotion traps
 
 
