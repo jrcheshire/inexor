@@ -79,7 +79,16 @@ def counts_from_int(mesh_int, frac_bits=12, fdtype=jnp.float32):
     return mesh_int.astype(fdtype) * np.float32(2.0**-frac_bits)
 
 
-def check_int_paint_headroom(n_particles_total, frac_bits, max_cell_particles=1.0e4):
+# The STRICT CIC stencil bound, in the same sense as TSC_CELL_WEIGHT_BOUND below:
+# a cell receives from the 8 cells whose CIC stencils reach it, each with a
+# per-axis weight up to 1, so the bound is 8x the occupancy rather than the 1x
+# `check_int_paint_headroom` has always assumed. Derived at the M-v2-2 promotion.
+CIC_CELL_WEIGHT_BOUND = 8.0
+
+
+def check_int_paint_headroom(
+    n_particles_total, frac_bits, max_cell_particles=1.0e4, bound=1.0
+):
     """Setup-time refusal against int32 OVERFLOW in the paint accumulator.
 
     Architecture Sec. 5 budget: max cell mass ~1e4 particles x 2^frac_bits
@@ -87,14 +96,24 @@ def check_int_paint_headroom(n_particles_total, frac_bits, max_cell_particles=1.
     (cell sums < 2^24 for exact int32->f32 conversion) is a measured per-run
     diagnostic (max cell occupancy, R3 pattern), not a setup-time refusal --
     exceeding it degrades count precision, exceeding 2^31 corrupts it.
+
+    `bound` is the stencil's cell-weight bound. **The default is 1.0, which is
+    the optimistic factor this guard has always carried implicitly, and it is
+    kept as the default deliberately**: raising it to the strict
+    `CIC_CELL_WEIGHT_BOUND` would move an existing refusal boundary and start
+    rejecting configurations that every ratified v1 measurement ran under. New
+    call sites pass the strict bound; `tile_paint_int` does.
     """
-    worst_cell_sum = min(float(n_particles_total), max_cell_particles) * 2.0**frac_bits
+    worst_cell_sum = (
+        float(bound) * min(float(n_particles_total), max_cell_particles) * 2.0**frac_bits
+    )
     if worst_cell_sum >= 2.0**31:
         raise ValueError(
             f"int-paint headroom: worst-case cell sum ~{worst_cell_sum:.2e} >= 2^31 at "
             f"frac_bits={frac_bits} (assumed max cell occupancy "
-            f"{max_cell_particles:.1e} particles); lower frac_bits -- the int32 "
-            "accumulator would overflow (D-007-class corruption, not just imprecision)."
+            f"{max_cell_particles:.1e} particles, stencil bound {bound}); lower "
+            "frac_bits -- the int32 accumulator would overflow (D-007-class "
+            "corruption, not just imprecision)."
         )
 
 
@@ -202,7 +221,10 @@ def paint_tsc_f64(positions, n_mesh, box_size, n_particles_total):
 # receives from 8 cells with per-axis weights up to 1, so the strict CIC factor
 # is 8. It has never bitten because the default configuration carries ~52x
 # headroom, but it means this constant is not "the TSC version of a factor that
-# was 1" -- it is the first one that was derived at all.
+# was 1" -- it is the first one that was derived at all. That strict CIC factor
+# is now `CIC_CELL_WEIGHT_BOUND` above, passed explicitly by new call sites;
+# `check_int_paint_headroom`'s default stays 1.0 so no ratified configuration
+# changes its refusal status underneath us.
 TSC_CELL_WEIGHT_BOUND = 5.359375
 
 

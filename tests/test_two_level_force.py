@@ -838,3 +838,180 @@ def test_the_tsc_headroom_bound_is_not_below_a_measured_worst_case():
     assert hottest == pytest.approx(0.75**3 * n * 2**12, rel=1e-3), (
         "the fixture is not actually driving a cell to the single-cell maximum"
     )
+
+
+# ========================== tile_paint_int: the SHORT arm's D-006 twin (M-v2-3)
+#
+# D-v2-16 clause 2 named only the coarse `paint_tsc_int`. The short arm has the
+# same defect and no document said so: `tile_paint_f64` accumulates through
+# order-dependent f64 `.at[].add`, and D-v2-14 clause 4 admits the brick-sorted
+# layout ONLY because the paint is order-independent. The layout reorders every
+# step, so the arm carrying most of the force was the non-reproducible one.
+#
+# WHICH FIXTURE CAN SEE THIS, measured before the tests below were written.
+# Floating-point reassociation needs enough contributions per cell to bite:
+# summing 8 CIC weights into one cell is bitwise identical under permutation,
+# 64 is not (7.1e-15), 4096 is not (6.1e-12). The standard perturbed-lattice
+# `_positions` fixture puts ~8 corner writes in each occupied tile cell, so the
+# f64 tile paint is order-INVARIANT on it -- 0 of 32768 cells move under a
+# shuffle. A shuffle test built on that fixture passes for BOTH paints and
+# proves nothing.
+#
+# That is not true of the coarse arm, and the difference is the stencil: TSC's
+# 27 corners on a dense mesh already clear the threshold, which is why
+# `test_the_f64_tsc_paint_really_is_order_dependent_on_this_fixture` works on
+# the ordinary fixture and its short-arm counterpart below needs a CLUMP.
+
+
+def _clustered_tile_fixture(n=4096, seed=50):
+    """A tight clump inside one padded tile: ~2000 particles' worth in one cell.
+
+    This is the regime D-v2-19 measured as real (cdev8's peak bucket population
+    was 5943 by the end of a run), and it is the only regime in which the f64
+    short-arm paint's order dependence is visible at all. See the note above.
+    """
+    import jax.numpy as jnp
+
+    cell = L_BOX / N_FINE_T
+    _, b_real = forces.padded_size(N_TILE_T, B_FINE_T, n_fine=N_FINE_T)
+    P, _ = forces.padded_size(N_TILE_T, B_FINE_T, n_fine=N_FINE_T)
+    rng = np.random.default_rng(seed)
+    centre = np.full(3, (b_real + 4.0) * cell)
+    u = np.mod(centre + rng.normal(scale=0.25 * cell, size=(n, 3)), L_BOX)
+    live = jnp.asarray(np.ones((n,), dtype=bool))
+    return jnp.asarray(u), live, (P,) * 3, cell, rng.permutation(n)
+
+
+def test_tile_paint_int_is_order_independent():
+    """The whole point, and the precondition D-v2-14 clause 4 assumed."""
+    import jax.numpy as jnp
+
+    u, live, shape, cell, perm = _clustered_tile_fixture()
+    a, _ = forces.tile_paint_int(u, live, shape, cell)
+    b, _ = forces.tile_paint_int(jnp.asarray(np.asarray(u)[perm]), live, shape, cell)
+    assert np.array_equal(np.asarray(a), np.asarray(b)), (
+        "the integer tile paint is order-DEPENDENT, which defeats its only purpose"
+    )
+    assert int(np.asarray(a).max()) > 0, "degenerate fixture: nothing was painted"
+
+
+def test_the_f64_tile_paint_really_is_order_dependent_on_this_fixture():
+    """The control, and here it is doing more work than the coarse arm's.
+
+    Measured on this clump: permuting the particles moves 23 of the 27 occupied
+    cells at 1.5e-10. On the ordinary `_positions` fixture it moves NONE, which
+    is why the clump exists -- without it the test above would be comparing two
+    arrays that agree for a reason unrelated to integer arithmetic.
+    """
+    import jax.numpy as jnp
+
+    u, live, shape, cell, perm = _clustered_tile_fixture(seed=51)
+    mean = N_PART_T**3 / float(N_FINE_T) ** 3
+    a = np.asarray(forces.tile_paint_f64(u, live, shape, cell, mean)[0])
+    b = np.asarray(
+        forces.tile_paint_f64(jnp.asarray(np.asarray(u)[perm]), live, shape, cell, mean)[0]
+    )
+    n_diff = int(np.count_nonzero(a != b))
+    assert n_diff > 0, (
+        "the f64 tile paint is order-INVARIANT on this fixture, so the integer "
+        "test above proves nothing -- the clump is not dense enough"
+    )
+    assert float(np.max(np.abs(a - b))) < 1e-6, "the difference is larger than roundoff"
+
+
+@pytest.mark.detflag
+def test_a_uniform_fixture_cannot_discriminate_order_which_is_why_the_clump_exists():
+    """Pins the measurement the two tests above are built on.
+
+    If someone later 'simplifies' `_clustered_tile_fixture` to the ordinary
+    perturbed lattice, the order-independence test keeps passing and silently
+    stops testing anything. This fails first and says why.
+    """
+    import jax.numpy as jnp
+
+    u, live, shape, cell = _tile_fixture(52)
+    mean = N_PART_T**3 / float(N_FINE_T) ** 3
+    perm = np.random.default_rng(53).permutation(np.asarray(u).shape[0])
+    a = np.asarray(forces.tile_paint_f64(u, live, shape, cell, mean)[0])
+    b = np.asarray(
+        forces.tile_paint_f64(jnp.asarray(np.asarray(u)[perm]), live, shape, cell, mean)[0]
+    )
+    assert np.array_equal(a, b), (
+        "the uniform fixture HAS become order-sensitive -- if that is real, the "
+        "clustered fixture is no longer required and this note is stale"
+    )
+
+
+def test_tile_paint_int_matches_the_f64_twin_within_the_quantization_bound():
+    """Bounded agreement, not equality: 8 corners at 2^-frac_bits each."""
+    u, live, shape, cell, _ = _clustered_tile_fixture(seed=54)
+    mean = N_PART_T**3 / float(N_FINE_T) ** 3
+    exact = np.asarray(forces.tile_paint_f64(u, live, shape, cell, mean)[0])
+    mesh_i, _ = forces.tile_paint_int(u, live, shape, cell)
+    quant = np.asarray(forces.tile_delta_from_int(mesh_i, mean))
+    n_in = int(np.asarray(live).sum())
+    bound = 8 * 2.0**-12 * n_in / mean  # worst case per particle, summed
+    err = float(np.max(np.abs(quant - exact)))
+    assert err < bound, f"max |int - f64| = {err:.3e} exceeds {bound:.3e}"
+    assert err > 0.0, "the two paints agree exactly, so the int path is not quantizing"
+
+
+def test_tile_paint_int_conserves_mass_within_the_fixed_point_rounding():
+    """`tile_paint_conserves_mass_over_the_in_box_rows`' integer counterpart. The
+    8 corner weights sum to 1 exactly in f64; after per-corner rounding they sum
+    to 1 +- 8 * 2^-(frac_bits+1), so mass is conserved to that, not exactly."""
+    u, live, shape, cell, _ = _clustered_tile_fixture(seed=55)
+    mesh, n_out = forces.tile_paint_int(u, live, shape, cell)
+    n_in = int(np.asarray(live).sum()) - int(n_out)
+    total = float(np.asarray(mesh).sum()) / 2.0**12
+    assert total == pytest.approx(n_in, rel=8 * 2.0**-13)
+
+
+def test_tile_paint_headroom_uses_the_strict_cic_bound_and_refuses_an_overflow():
+    """CIC's strict factor is 8, not the 1 `check_int_paint_headroom` assumes by
+    default. Both directions: production passes, a real overflow raises."""
+    assert painting.CIC_CELL_WEIGHT_BOUND == 8.0
+    forces.check_tile_paint_headroom(N_PART_T**3, 12)
+    with pytest.raises(ValueError, match="int-paint headroom"):
+        forces.check_tile_paint_headroom(10**9, 16)
+    # and the strict bound must be STRICTER than the legacy default, or passing
+    # it through changes nothing and the call site is decorative
+    painting.check_int_paint_headroom(10**6, 15, bound=1.0)
+    with pytest.raises(ValueError, match="int-paint headroom"):
+        painting.check_int_paint_headroom(10**6, 15, bound=painting.CIC_CELL_WEIGHT_BOUND)
+
+
+def test_the_int_tile_arm_is_reachable_through_force_short_tiled():
+    """The knob is wired, the default is unchanged, and the two arms differ."""
+    pos = _positions(56, N_PART_T)
+    member_fn, cap = _probe_membership(pos, N_FINE_T, N_TILE_T, B_FINE_T)
+    args = (pos, N_FINE_T, L_BOX, N_PART_T**3, N_TILE_T, B_FINE_T, member_fn, cap)
+    g_f64, d_f64 = forces.force_short_tiled(*args, r_s=R_S)
+    g_int, d_int = forces.force_short_tiled(*args, r_s=R_S, paint="int")
+    assert d_f64["paint"] == "f64", "the default moved; the probe-parity tests now compare arms"
+    assert d_int["paint"] == "int"
+    err = float(np.max(np.abs(g_int - g_f64)))
+    peak = float(np.max(np.abs(g_f64)))
+    assert err > 0.0, "the int arm reproduced the f64 arm exactly, so it is not quantizing"
+    assert err < 0.02 * peak, f"int-vs-f64 short force differs by {err / peak:.1%} of peak"
+
+
+def test_force_global_can_reach_the_int_tsc_paint_and_refuses_int_cic():
+    """`force_global(assign='tsc')` called `paint_tsc_f64` directly, so the
+    D-006-compliant coarse paint existed and was unreachable from any force path.
+    The default stays f64 so D-v2-10/11/12's oracle comparisons are untouched."""
+    pos = _positions(57, N_PART_T)
+    n_tot = N_PART_T**3
+    a, _ = forces.force_global(pos, N_MESH, L_BOX, n_tot, "long", r_s=R_S, assign="tsc")
+    b, _ = forces.force_global(
+        pos, N_MESH, L_BOX, n_tot, "long", r_s=R_S, assign="tsc", paint="f64"
+    )
+    c, _ = forces.force_global(
+        pos, N_MESH, L_BOX, n_tot, "long", r_s=R_S, assign="tsc", paint="int"
+    )
+    assert np.array_equal(a, b), "the paint= default is not the f64 path any more"
+    err = float(np.max(np.abs(c - a)))
+    assert err > 0.0, "the int coarse arm reproduced f64 exactly, so it is not quantizing"
+    assert err < 0.02 * float(np.max(np.abs(a)))
+    with pytest.raises(ValueError, match="no 'int' accumulator"):
+        forces.force_global(pos, N_MESH, L_BOX, n_tot, "mono", assign="cic", paint="int")
