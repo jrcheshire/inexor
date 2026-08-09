@@ -186,9 +186,15 @@ def main():
                 jax.block_until_ready(jax.device_put(staged, sh))
 
             pinned = jax.device_put(staged, sh)
+            # A bare device is REJECTED as a destination when the source carries a
+            # memory kind ("Memory kind mismatch with xla::PjRtBuffers", job 397);
+            # the destination has to be a sharding that names `device` explicitly.
+            dev_sh = jax.sharding.SingleDeviceSharding(
+                jax.devices()[0], memory_kind="device"
+            )
 
             def pinned_to_device():
-                jax.block_until_ready(jax.device_put(pinned, jax.devices()[0]))
+                jax.block_until_ready(jax.device_put(pinned, dev_sh))
 
             t_pin = _time(to_pinned, reps=args.reps)
             t_p2d = _time(pinned_to_device, reps=args.reps)
