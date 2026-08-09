@@ -5,7 +5,7 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -A JPL-SPHEREx
-#SBATCH -t 12:00:00
+#SBATCH -t 03:00:00
 #
 # M-v2-3 exit gate, legs A and B (scripts/v2_m3_engine_gate.py).
 #
@@ -74,10 +74,10 @@ run_leg () {
 
 G=scripts/v2_m3_engine_gate.py
 
-run_leg cdev8-force  "$G" --config cdev8 --leg force --slack 0.15 --arena-frac 0.05
-run_leg cdev8-accum  "$G" --config cdev8 --leg accum --k 40 --slack 0.15 --arena-frac 0.05
+# Job 898169 read out 2026-08-09: cdev8-force PASS, cdev8-accum 4.666e-4,
+# cdev-accum 7.125e-4, and cgh64-force exit 1 on the gate's own O(N) comparison
+# array hitting D-v2-16 clause 1's 2 GiB refusal. Only that leg is re-run.
 run_leg cgh64-force  "$G" --config cgh64 --leg force --slack 0.15 --arena-frac 0.05
-run_leg cdev-accum   "$G" --config cdev  --leg accum --k 40 --slack 0.15 --arena-frac 0.05
 
 echo ""
 echo "=== LEG SUMMARY ==="

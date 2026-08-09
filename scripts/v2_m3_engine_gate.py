@@ -148,9 +148,26 @@ def leg_force_parity(cfg, g, slack=0.10, arena_frac=0.02):
     def member_fn(t):
         return probe.tile_members(order, starts, nb, t, g["tile"], b_real, n_brick)
 
+    # The 2 GiB refusal on the global accumulate sink is D-v2-16 clause 1's, and
+    # it fired here on the FIRST cgh64 attempt (job 898169: 3.0 GiB for 134 M
+    # particles). It was right to: this comparison materializes an O(N) force
+    # array, which is exactly the thing the clause deletes from the engine.
+    #
+    # Raised HERE and only here, because comparing two forces elementwise is
+    # inherently O(N) and 3.0 GiB is nothing against a 116 GB host. The engine
+    # itself never takes this path -- it drives a tile-local sink -- so the guard
+    # keeps its default and the exception is visible at the one call site that
+    # needs it.
+    #
+    # NOTE THE REACH THIS BUYS AND DOES NOT BUY. At C-gh proper (2048^3) the same
+    # array is 206 GB and this gate cannot run in this form at all; a hero-scale
+    # parity check would have to compare per tile and accumulate statistics
+    # rather than arrays. cgh64 is the largest configuration this instrument
+    # reaches.
     g_short_ref, diag = forces.force_short_tiled(
         x_q, g["n_fine"], g["L"], g["n_part"] ** 3, g["tile"], g["buf"],
         member_fn, cap_p, r_s=ec.r_s, paint="int",
+        max_accumulate_bytes=8 * 1024**3,
     )
 
     # --- the engine's short arm, from slot spans
