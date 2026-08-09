@@ -35,12 +35,12 @@ import _m1_common as M  # noqa: E402
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 ARMS = (
-    "inexor_float", "inexor_replumb", "inexor_replumb32", "inexor_int16",
+    "inexor_float", "inexor_replumb", "inexor_replumb32", "inexor_replumbI", "inexor_int16",
     "mbody_final", "mbody_own", "disco_final", "disco_own",
 )
 
 
-def run_inexor(tag, kernel_dtype="f64"):
+def run_inexor(tag, kernel_dtype="f64", paint="f32"):
     """Regenerate the never-quantized f64 arm. RE-PLUMBED at M-v2-3.
 
     This called `integrate.evolve_float` and `integrate.evolve`, both deleted at
@@ -88,7 +88,7 @@ def run_inexor(tag, kernel_dtype="f64"):
     # internally, and `make_force_fn` defaults to f32. Which one the stored
     # reference used is therefore a question to measure, not to assume.
     kd = jnp.float64 if kernel_dtype == "f64" else jnp.float32
-    force_fn = make_force_fn(box, fdtype=kd, paint="int")
+    force_fn = make_force_fn(box, fdtype=kd, paint=paint)
     for c in bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo)):
         x, v = float_step_bullfrog(x, v, tuple(np.asarray(c, np.float64)), force_fn, box.box_size)
 
@@ -100,7 +100,7 @@ def run_inexor(tag, kernel_dtype="f64"):
     # rather than a tautology.
     meta = M.make_meta("inexor", f"float64/kernel_{kernel_dtype}", cfg, REPO,
                        ic_file=f"ics_{tag}.npz")
-    sfx = "" if kernel_dtype == "f64" else "32"
+    sfx = ("" if kernel_dtype == "f64" else "32") + ("" if paint == "f32" else "I")
     p = M.save_state(
         os.path.join(M.RUNS, f"inexor_replumb{sfx}_{tag}.npz"),
         np.mod(np.asarray(x), box.box_size),
@@ -157,6 +157,12 @@ def main():
     ap_run = sub.add_parser("run", help="compute the inexor arms from injected ICs")
     ap_run.add_argument("--tag", required=True)
     ap_run.add_argument("--kernel-dtype", default="f64", choices=("f64", "f32"))
+    # `evolve_float`'s own default was paint="f32" and m1_parity never passed one,
+    # so the STORED v1 reference used the differentiable float CIC paint, not the
+    # deterministic integer one. Recovered from git (450f468^). Getting this
+    # wrong is what made the re-plumbed arm miss the stored reference by 5.3e-5
+    # cells -- a mass-assignment difference, not a drift in shared code.
+    ap_run.add_argument("--paint", default="f32", choices=("f32", "int"))
     ap_cmp = sub.add_parser("compare", help="compare two final-state npz files")
     ap_cmp.add_argument("--tag", required=True)
     ap_cmp.add_argument("--a", required=True, choices=ARMS)
@@ -165,7 +171,7 @@ def main():
     args = ap.parse_args()
 
     if args.cmd == "run":
-        run_inexor(args.tag, args.kernel_dtype)
+        run_inexor(args.tag, args.kernel_dtype, args.paint)
     else:
         compare(args.tag, args.a, args.b, fig=not args.no_fig)
 

@@ -62,15 +62,34 @@ only difference between the arms.
 |---|---|---|---|
 | `inexor_float` (STORED) | n64k10 | 4.196e-06 | 1.109e-06 |
 | `inexor_float` (STORED) | n128k40 | 1.628e-05 | 1.380e-06 |
-| `inexor_replumb` (today) | n64k10 | 5.335e-05 | 1.385e-05 |
-| `inexor_replumb` (today) | n128k40 | 3.178e-05 | 4.120e-06 |
+| `inexor_replumb` (today) | n64k10 | 4.196e-06 | 1.109e-06 |
+| `inexor_replumb` (today) | n128k40 | 1.628e-05 | 1.380e-06 |
 
-D-013's bars are rms <= 1e-4 cells and |dP/P| <= 1e-5.
+D-013's bars are rms <= 1e-4 cells and |dP/P| <= 1e-5; both arms clear both at
+both configurations, and the stored arm reproduces D-013's recorded 1.6e-5 /
+1.4e-6 **to the digit**.
 
-Control first: the stored arm reproduces D-013's recorded 1.6e-5 / 1.4e-6 at
-n128k40 **to the digit**, so the stored states, the estimator and the ratified
-numbers are intact. Today's re-plumbed driver passes both bars at n128k40 and
-misses |dP/P| by 1.4x at n64k10.
+**The re-plumbed driver reproduces the stored v1 reference EXACTLY** -- rms
+0.000e+00 cells, max |dP/P| 0.000e+00, with 1-r at 2-3e-16, the estimator's own
+self-comparison floor. So the shared force/paint stack has not moved since v1,
+and D-013 is re-runnable rather than only re-readable.
+
+**This took a wrong turn first, and the correction is the useful part.** The
+re-plumb initially used `paint="int"`, the deterministic integer paint, and
+missed the stored reference by 5.320e-05 cells with 1-r = 1.75e-08 -- small,
+systematic, and reported here as an unexplained drift in shared code. It is
+not. `evolve_float`'s signature (recovered from git at `450f468^`) is
+`(..., paint="f32", fdtype=jnp.float32)` and `m1_parity.py` never passed
+`paint`, so **the stored v1 reference used the differentiable FLOAT CIC paint**.
+The integer paint quantizes corner weights to 2^-12, which is a real
+mass-assignment difference of exactly that size and shape. Kernel dtype had been
+excluded by measurement and was never the variable.
+
+Two things worth keeping from the wrong turn: a decayed default is invisible in a
+call site that omits the argument, so reconstructing a deleted function means
+reading its SIGNATURE and not just its body; and "unexplained discrepancy in
+ratified shared code" was the expensive hypothesis to leave standing -- the
+deleted function was in git history the whole time and the check cost minutes.
 
 ## What this does NOT license
 
@@ -86,8 +105,8 @@ misses |dP/P| by 1.4x at n64k10.
 
 ## Defects in my own instruments
 
-Six, and the pattern is that four were caught by a guard or a paired test rather
-than by inspection.
+Seven, and the pattern is that five were caught by a guard, a paired test or a
+control rather than by inspection.
 
 1. **`check()` as first written was a gate that cannot fail.** Decode a slot,
    assert its position falls in the bucket the slot implies -- an identity, since
@@ -109,6 +128,12 @@ than by inspection.
    force: 1.004e-3.
 6. **The cgh64 leg hit D-v2-16 clause 1's own refusal** on the gate's O(N)
    comparison array. The guard was right; raised at that one call site.
+7. **The re-plumbed v1 arm used the wrong paint** (`int` where `evolve_float`
+   defaulted to `f32`), and I reported the resulting 5.3e-5 offset as an
+   unexplained drift in ratified shared code. It was my harness. Caught by
+   reading the deleted function's SIGNATURE out of git -- which the control had
+   already pointed at, since the stored arm reproduced D-013 to the digit and
+   therefore located the problem on today's side, not in the stored data.
 
 Two fixtures also could not reach the regime they claimed (a crossing test whose
 drift never cleared a bucket, and an overflow test converging on the box centre,
@@ -150,11 +175,6 @@ Reverted; the contract is pinned by
 
 ## Owed
 
-- **The re-plumbed v1 float driver does not reproduce the stored v1 reference**:
-  5.320e-05 cells, 1.277e-05 |dP/P|, with max 1-r = 1.75e-08, so a small
-  systematic offset and not decorrelation. Something in the shared force/paint
-  stack has moved since v1. Kernel dtype is excluded by measurement (f32 gives
-  5.321e-05 against f64's 5.320e-05). Cause not identified.
 - `SlotState.repack` allocates O(N); D-v2-19 clause 3 establishes the monotone
   in-place form at O(chunk). Correct at development configurations, 91 GB of
   transient at C-gh.

@@ -1136,7 +1136,10 @@ ratifying it did not measure it.
      attempt.
 - **What this does NOT establish.** Nothing at C-gh: the parity instrument
   compares an O(N) array (3.0 GiB at cgh64, 206 GB at C-gh), so **cgh64 is its
-  ceiling in this form**. One seed per configuration. No performance claim. And
-  the re-plumbed v1 float driver does not reproduce the stored v1 reference
-  (5.320e-05 cells, 1-r = 1.75e-08, kernel dtype excluded by measurement) --
-  small, systematic, cause unidentified, and it predates this milestone.
+  ceiling in this form**. One seed per configuration. No performance claim.
+  NB clause 6's part 3 was briefly recorded as an unexplained drift in shared
+  code: the re-plumbed v1 arm used `paint="int"` where the deleted
+  `evolve_float` defaulted to `"f32"`. Corrected the same session -- the arm
+  reproduces the stored v1 reference EXACTLY (0.000e+00 cells), so the shared
+  force/paint stack has not moved and D-013 is re-runnable, not only
+  re-readable.

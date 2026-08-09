@@ -37,10 +37,7 @@ is 0.25 Mpc/h at mesh:particle 2) and the v1 quantized arm's generator was
 deleted at the retirement. Replaced by the three-part gate D-v2-21 clause 6
 records.
 
-**Owed out of M-v2-3** (record's "Owed" section): the re-plumbed v1 float driver
-does not reproduce the stored v1 reference (5.32e-5 cells, 1-r 1.75e-8, kernel
-dtype excluded by measurement, cause unidentified, predates this milestone);
-`SlotState.repack` allocates O(N) where D-v2-19 clause 3 establishes a monotone
+**Owed out of M-v2-3** (record's "Owed" section): `SlotState.repack` allocates O(N) where D-v2-19 clause 3 establishes a monotone
 in-place form; and the parity instrument compares an O(N) array, so **cgh64 is
 its ceiling** — hero-scale parity needs a per-tile statistical form.
 
