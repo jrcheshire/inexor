@@ -66,7 +66,13 @@ from .layout import (
     bucket_order_key,
 )
 
-__all__ = ["SlotState", "decode_positions_host", "encode_positions_host"]
+__all__ = [
+    "SlotState",
+    "decode_positions_host",
+    "drift_and_migrate",
+    "encode_positions_host",
+    "reconcile_velocity_scale",
+]
 
 
 # ===========================================================================
@@ -100,6 +106,142 @@ def decode_positions_host(off, bucket_ijk, t9):
         off, dtype=np.int64
     )
     return i.astype(np.float64) * t9.quantum
+
+
+def _bucket_flat_brick_major(bucket_ijk, t9, bricks_per_side):
+    """Per-axis bucket -> brick-major flat ordinal. `layout.bucket_order_key`'s
+    tail, split out so the exchange can key on a bucket it already has rather
+    than re-deriving it from a position."""
+    per = t9.n_buckets_side // int(bricks_per_side)
+    b = np.asarray(bucket_ijk, dtype=np.int64)
+    brick = b // per
+    within = b - brick * per
+    bf = (brick[:, 0] * bricks_per_side + brick[:, 1]) * bricks_per_side + brick[:, 2]
+    wf = (within[:, 0] * per + within[:, 1]) * per + within[:, 2]
+    return bf * (per**3) + wf
+
+
+def _rescale_w(w, s_old, s_new):
+    """Re-express an int16 velocity code at a new scale.
+
+    Exact when the scales are equal, which is the common case within a step; the
+    general path decodes and re-rounds. It CANNOT overflow, and that is a
+    theorem rather than a margin: `s_new` is the max over tiles of each tile's
+    own `max|v|/32767`, and tile ownership is a partition, so `s_new` is exactly
+    the global `max|v|/32767` and `|rint(v/s_new)| <= 32767` for every particle.
+    """
+    if s_old == s_new:
+        return w
+    out = np.rint(np.asarray(w, dtype=np.float64) * (float(s_old) / float(s_new)))
+    return out.astype(np.int16)
+
+
+def _cat(dest, off, w, ids):
+    out = dict(
+        dest=np.concatenate(dest) if dest else np.empty(0, np.int64),
+        off=np.concatenate(off) if off else np.empty((0, 3), np.uint8),
+        w=np.concatenate(w) if w else np.empty((0, 3), np.int16),
+    )
+    # The id column rides with the payload or it is worse than useless: it would
+    # keep pointing at whoever USED to occupy the slot, so every id-based check
+    # silently compares the wrong particles. Found exactly that way.
+    out["ids"] = np.concatenate(ids) if ids and ids[0] is not None else None
+    return out
+
+
+def _cat_dicts(ds):
+    ds = [d for d in ds if len(d["dest"])]
+    if not ds:
+        return dict(
+            dest=np.empty(0, np.int64),
+            off=np.empty((0, 3), np.uint8),
+            w=np.empty((0, 3), np.int16),
+            ids=None,
+        )
+    has_ids = ds[0].get("ids") is not None
+    return dict(
+        dest=np.concatenate([d["dest"] for d in ds]),
+        off=np.concatenate([d["off"] for d in ds]),
+        w=np.concatenate([d["w"] for d in ds]),
+        ids=np.concatenate([d["ids"] for d in ds]) if has_ids else None,
+    )
+
+
+def reconcile_velocity_scale(tile_scales):
+    """The global velocity scale, from the per-tile scales the kick produced.
+
+    The engine cannot know the new global `max|v|` before it encodes, and the
+    two-pass alternative would need an O(N) float velocity buffer -- 206 GB at
+    C-gh, which is exactly the array D-v2-16 clause 1 deletes. It does not need
+    one: the kick already runs per tile in an O(cap) buffer, so each tile can
+    take its own `max|v|/32767` there, and because ownership is a PARTITION the
+    max over tiles is EXACTLY the global scale. The reduction is over a few
+    thousand host scalars.
+
+    The alternative of predicting the scale and refusing on overflow is not
+    implementable here: the refusal is only detectable after the force has been
+    consumed, and the force cannot be retained to retry with.
+
+    **Cost, measured rather than assumed.** Re-expressing a tile's code at the
+    global scale is a second rounding, so the RMS grows by `sqrt(1 + r^2)` with
+    `r = s_tile / s_global`. The design predicted `r << 1`; at cdev8 the median
+    tile sits at r = 0.40-0.80 and the 99th percentile at 0.90-0.99, because
+    `max|v|` tracks the bulk flow rather than a halo core. So the cost is ~1.12x
+    at the median and at most sqrt(2), against a velocity tier that passes its
+    bar by ~3 orders.
+    """
+    s = np.asarray(list(tile_scales), dtype=np.float64)
+    s = s[s > 0.0]
+    return float(s.max()) if len(s) else 1.0
+
+
+def drift_and_migrate(st, c_drift, vel_scale_new=None):
+    """Advance every particle by `c_drift * v` and re-home it. ONE pass.
+
+    Drift and migration are not separable once positions are bucket-relative:
+    after a drift a particle may have left its bucket, and there is no valid way
+    to store it where it sits, because D-007 forbids the saturating alternative.
+
+    **Eject before insert, and it is not an optimization.** A brick is read (and
+    its leavers removed) before any brick is written, so a destination's free
+    capacity at write time includes its OWN departures. Inserting as leavers are
+    found instead makes a brick absorb arrivals on top of a still-full run,
+    which overflows to the arena in exactly the dense bricks where the arena is
+    already under pressure.
+
+    Staging is bounded by SLAB, not by N. Bricks are numbered brick-major, so a
+    fixed `bx` is a contiguous block, and a particle moves at most one brick per
+    axis per step -- measured at every step of a 20-step cdev8 run, max
+    |delta brick| = 1 with 0.0000% over one -- so a slab's writes need only its
+    own ejection and its two x-neighbours'. Peak staging is a handful of slabs,
+    which scales as N^(2/3).
+    """
+    nb = st.bricks_per_side
+    s_old = st.vel_scale
+    s_new = float(vel_scale_new) if vel_scale_new else s_old
+
+    staged, emig, inserted = {}, {}, set()
+    n_over = 0
+    for s in range(nb):
+        staged[s], emig[s] = st._eject_slab(s, c_drift, s_old, s_new)
+        # a slab may be written once it and both x-neighbours have been ejected
+        for d in range(nb):
+            if d in inserted:
+                continue
+            if all(((d + o) % nb) in emig for o in (-1, 0, 1)):
+                n_over += st._insert_slab(d, staged, emig)
+                inserted.add(d)
+        # release what no pending write can still need
+        for s2 in list(staged):
+            if s2 in inserted:
+                del staged[s2]
+        for s2 in list(emig):
+            if all(((s2 + o) % nb) in inserted for o in (-1, 0, 1)):
+                del emig[s2]
+    if len(inserted) != nb:
+        raise AssertionError(f"{nb - len(inserted)} slabs were never written back")
+    st.vel_scale = s_new
+    return dict(n_arena_overflow=n_over, arena_used=st.arena_used, vel_scale=s_new)
 
 
 # ===========================================================================
@@ -448,6 +590,183 @@ class SlotState:
         return out
 
     # ------------------------------------------------------------ the cost
+
+    # ------------------------------------------------- drift and re-home
+
+    def slab_bricks(self, bx):
+        """The brick ordinals of one x-slab, as a contiguous range.
+
+        Bricks are numbered `(bx * nb + by) * nb + bz`, so a fixed `bx` is a
+        contiguous block -- which is what lets the pass below stage a slab as
+        flat arrays with offsets instead of a dict of per-brick arrays.
+        """
+        nb = self.bricks_per_side
+        return int(bx) * nb * nb, (int(bx) + 1) * nb * nb
+
+    def _eject_slab(self, bx, c_drift, s_old, s_new):
+        """Drift one slab's particles and split them into keepers and leavers.
+
+        Reads the state; writes NOTHING back. That phase separation is what makes
+        a double drift structurally impossible rather than merely unlikely: a
+        brick is only written once every brick that can send to it has been read.
+
+        Returns (keep, emig), each a dict of flat arrays plus the destination
+        bucket ordinal, so a slab costs O(slab) rather than O(N).
+        """
+        lo_b, hi_b = self.slab_bricks(bx)
+        p3 = self.buckets_per_brick
+        k_dest, k_off, k_w, k_id = [], [], [], []
+        e_dest, e_off, e_w, e_id = [], [], [], []
+        for b in range(lo_b, hi_b):
+            slots, x, v = self.decode_brick(b)
+            if not len(slots):
+                continue
+            # `decode_brick` returns this brick's ARENA residents too, so they are
+            # re-homed by this ejection like any other member. Their arena rows
+            # are released here, where the payload is consumed -- releasing them
+            # at insert instead double-counts them, which is how this was found
+            # (32771 particles reachable against 32768 stored). A row is only
+            # freed once its brick has been ejected, so a concurrent `_to_arena`
+            # cannot claim a row that still holds live state.
+            a_free = self.arena_slots_of_brick(b)
+            if len(a_free):
+                self.arena_bucket[a_free - self.arena_base] = -1
+            # Drift in the INTEGER domain. The wrap is exactly modular there
+            # (D-007), where `float_step_bullfrog`'s jnp.mod(x, L) is only
+            # nearly so, and adding the displacement to the lattice index cannot
+            # lose a small step to absorption in a large coordinate.
+            q = self.t9.quantum
+            i_new = np.mod(
+                np.rint(x / q + (float(c_drift) * v) / q).astype(np.int64), self.t9.n_levels
+            )
+            b_ijk = i_new // LEVELS_PER_BUCKET
+            off_new = (i_new - b_ijk * LEVELS_PER_BUCKET).astype(np.uint8)
+            dest = _bucket_flat_brick_major(b_ijk, self.t9, self.bricks_per_side)
+            # re-express the velocity at the new global scale (see `drift_and_migrate`)
+            w_new = _rescale_w(self.w[slots], s_old, s_new)
+            stay = (dest // p3) == b
+            ids_b = self.ids[slots] if self.ids is not None else None
+            k_dest.append(dest[stay])
+            k_off.append(off_new[stay])
+            k_w.append(w_new[stay])
+            k_id.append(ids_b[stay] if ids_b is not None else None)
+            e_dest.append(dest[~stay])
+            e_off.append(off_new[~stay])
+            e_w.append(w_new[~stay])
+            e_id.append(ids_b[~stay] if ids_b is not None else None)
+        return (
+            _cat(k_dest, k_off, k_w, k_id),
+            _cat(e_dest, e_off, e_w, e_id),
+        )
+
+    def _insert_slab(self, bx, staged, emig):
+        """Write one slab's bricks back: keepers + immigrants + arena residents.
+
+        Every brick's final membership passes through an O(brick) buffer here, so
+        this is also where a bucket that outgrew its brick escalates -- spare,
+        then arena, then a loud refusal, with no clamp anywhere (D-007).
+        """
+        nb = self.bricks_per_side
+        p3 = self.buckets_per_brick
+        lo_b, hi_b = self.slab_bricks(bx)
+        keep = staged[bx]
+        # immigrants can only come from this slab and its two x-neighbours: a
+        # particle moves at most ONE brick per axis per step, measured at every
+        # step of a 20-step cdev8 run (0.0000% over one, max |delta brick| = 1).
+        sources = {(int(bx) + o) % nb for o in (-1, 0, 1)}
+        imm = _cat_dicts([emig[s] for s in sorted(sources) if s in emig])
+        n_over = 0
+        for b in range(lo_b, hi_b):
+            sel_k = keep["dest"] // p3 == b
+            sel_i = imm["dest"] // p3 == b if len(imm["dest"]) else slice(0, 0)
+            # NB no arena term: a brick's arena residents were decoded and
+            # re-homed by its own ejection, and their rows released there.
+            has_i = len(imm["dest"]) > 0
+            dest = np.concatenate(
+                [
+                    keep["dest"][sel_k],
+                    imm["dest"][sel_i] if has_i else np.empty(0, np.int64),
+                ]
+            )
+            off = np.concatenate(
+                [
+                    keep["off"][sel_k],
+                    imm["off"][sel_i] if has_i else np.empty((0, 3), np.uint8),
+                ]
+            )
+            w = np.concatenate(
+                [
+                    keep["w"][sel_k],
+                    imm["w"][sel_i] if has_i else np.empty((0, 3), np.int16),
+                ]
+            )
+            ids = None
+            if self.ids is not None:
+                ids = np.concatenate(
+                    [
+                        keep["ids"][sel_k],
+                        imm["ids"][sel_i] if has_i else np.empty(0, np.int32),
+                    ]
+                )
+            n_over += self._write_brick(b, dest, off, w, ids)
+        return n_over
+
+    def _write_brick(self, b, dest, off, w, ids=None):
+        """Counting-sort one brick's members by bucket and write the run.
+
+        Re-bucketing is a PERMUTATION, not the monotone rearrangement `repack`
+        performs -- a particle can move from bucket 500 to bucket 3 -- so it needs
+        an O(brick) scratch copy and a counting sort rather than a block shift.
+        """
+        p3 = self.buckets_per_brick
+        lo, hi = self.brick_slot_range(b)
+        within = dest - b * p3
+        counts = np.bincount(within, minlength=p3).astype(np.int64)
+        cap = hi - lo
+        n_over = 0
+        if len(dest) > cap:
+            # the brick overflowed its allocation: the excess goes to the arena,
+            # newest-bucket-first so the run stays a prefix of the bucket order
+            order = np.argsort(within, kind="stable")
+            keep_n = cap
+            spill = order[keep_n:]
+            n_over = len(spill)
+            self._to_arena(
+                dest[spill], off[spill], w[spill], None if ids is None else ids[spill]
+            )
+            order = order[:keep_n]
+            within, dest, off, w = within[order], dest[order], off[order], w[order]
+            if ids is not None:
+                ids = ids[order]
+            counts = np.bincount(within, minlength=p3).astype(np.int64)
+        else:
+            order = np.argsort(within, kind="stable")
+            within, off, w = within[order], off[order], w[order]
+            if ids is not None:
+                ids = ids[order]
+        m = len(off)
+        self.off[lo : lo + m] = off
+        self.w[lo : lo + m] = w
+        if ids is not None:
+            self.ids[lo : lo + m] = ids
+        self.occupancy[b * p3 : (b + 1) * p3] = _to_index(counts, self.index_dtype, "migrated")
+        return n_over
+
+    def _to_arena(self, dest, off, w, ids=None):
+        """Park overflow in the arena, or REFUSE. Never clamp, never drop."""
+        free = np.nonzero(self.arena_bucket < 0)[0]
+        if len(free) < len(dest):
+            raise ValueError(
+                f"{len(dest)} particles overflow their brick's capacity and the arena of "
+                f"{self.n_arena} slots has only {len(free)} free. The layout does not clamp "
+                "or drop (D-007). Raise brick_slack or arena_frac."
+            )
+        a = free[: len(dest)]
+        self.arena_bucket[a] = dest
+        self.off[self.arena_base + a] = off
+        self.w[self.arena_base + a] = w
+        if ids is not None:
+            self.ids[self.arena_base + a] = ids
 
     def bytes_per_particle(self, payload=9.0):
         """The all-in figure, with `scaffold` reported and EMPTY.

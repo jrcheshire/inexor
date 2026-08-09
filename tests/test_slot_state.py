@@ -296,3 +296,192 @@ def test_free_slots_need_no_sentinel():
         m = st.brick_live_count(b)
         assert lo + m <= hi, "a brick holds more live rows than its allocation"
         assert len(st.brick_member_slots(b)) == m + len(st.arena_slots_of_brick(b))
+
+
+# ==================================== drift and re-home (S3/S4, one fused pass)
+
+
+def _drifted_reference(x, v, c, t9, vel_scale):
+    """Where every particle should land, computed independently of the pass.
+
+    Starts from what the container actually HOLDS, not from the caller's inputs:
+    the stored position is on the T9 lattice and the stored velocity is an int16
+    code at `vel_scale`. Referencing the raw inputs instead makes particles
+    within half a quantum of a bucket face disagree for a legitimate reason and
+    reads as a bug in the exchange -- which is how this helper was first written.
+    """
+    q = t9.quantum
+    i0 = np.mod(np.rint(x / q).astype(np.int64), t9.n_levels)
+    v_q = np.rint(v / vel_scale).astype(np.int16).astype(np.float64) * vel_scale
+    i = np.mod(np.rint(i0 + (c * v_q) / q).astype(np.int64), t9.n_levels)
+    return i // 256
+
+
+def test_the_pass_conserves_every_particle():
+    """D-007 forbids losing a particle as much as clamping one, and a re-home is
+    where one would go missing."""
+    _, _, st = _built(20)
+    n0 = st.n_live
+    for _ in range(3):
+        state.drift_and_migrate(st, 0.05)
+        assert st.check() is True
+        assert st.n_live == n0
+
+
+def test_every_particle_lands_in_the_bucket_its_drifted_position_calls_for():
+    """The pass's actual job, checked against an independent computation of the
+    destination rather than against the pass's own arithmetic."""
+    x, v, st = _built(21, with_ids=True)
+    c = 0.05
+    want = _drifted_reference(x, v, c, st.t9, st.vel_scale)
+    state.drift_and_migrate(st, c)
+    st.check()
+    for b in range(st.n_bricks):
+        slots = st.brick_member_slots(b)
+        if not len(slots):
+            continue
+        got = st._bucket_ijk_of_slots(b, slots)
+        assert np.array_equal(got, want[st.ids[slots]]), f"brick {b}: wrong destination bucket"
+
+
+def test_particles_cross_bucket_brick_and_the_periodic_seam():
+    """The fixture has to actually exercise the three crossings, or the
+    destination test above passes on a pass that never moves anything.
+
+    Needs a large drift: the bucket is 4 Mpc/h here and a brick side is 32, so
+    the ordinary fixture's ~0.1 Mpc/h step per unit coefficient reaches neither.
+    """
+    x = _positions(22)
+    v = np.random.default_rng(23).normal(scale=40.0, size=(N_PART**3, 3))
+    st = state.SlotState.build(x, v, _t9(), BRICKS, with_ids=True, arena_frac=0.25)
+    c = 1.0
+    before_b = np.mod(np.rint(x / st.t9.quantum).astype(np.int64), st.t9.n_levels) // 256
+    after_b = _drifted_reference(x, v, c, st.t9, st.vel_scale)
+    per = st.t9.n_buckets_side // st.bricks_per_side
+    nbk = st.t9.n_buckets_side
+
+    moved_bucket = np.any(before_b != after_b, axis=1)
+    moved_brick = np.any(before_b // per != after_b // per, axis=1)
+    # a seam crossing: the drift is large enough that the SHORT way round the
+    # box is not the way the coordinate moved, i.e. the wrap fired
+    raw = np.rint(x / st.t9.quantum + (c * v) / st.t9.quantum).astype(np.int64)
+    seam = np.any((raw < 0) | (raw >= st.t9.n_levels), axis=1)
+
+    assert moved_bucket.sum() > 0.5 * len(x), "fixture barely changes bucket"
+    assert moved_brick.sum() > 0.1 * len(x), "too few particles change BRICK"
+    assert seam.sum() > 0, "no particle crosses the periodic seam"
+    assert nbk == 16  # the geometry this reasoning is written against
+
+    state.drift_and_migrate(st, c)
+    assert st.check() is True
+    assert st.n_live == len(x)
+    for b in range(st.n_bricks):
+        slots = st.brick_member_slots(b)
+        if not len(slots):
+            continue
+        got = st._bucket_ijk_of_slots(b, slots)
+        assert np.array_equal(got, after_b[st.ids[slots]]), (
+            f"brick {b}: a particle crossing a brick or the seam landed wrong"
+        )
+
+
+def test_a_particle_is_drifted_exactly_once():
+    """The dangerous failure in a two-phase exchange: a record inserted into a
+    brick that has not yet been ejected gets drifted again, producing a slightly
+    wrong trajectory with nothing raising. Eject-before-insert makes it
+    structurally impossible; this asserts the structure rather than trusting it.
+
+    Two drifts of c would put a particle at 2c, so comparing against the
+    single-drift reference catches it -- and the ids make it per particle."""
+    x, v, st = _built(23, with_ids=True)
+    c = 0.08
+    once = _drifted_reference(x, v, c, st.t9, st.vel_scale)
+    twice = _drifted_reference(x, v, 2 * c, st.t9, st.vel_scale)
+    assert np.any(once != twice), "the fixture cannot tell one drift from two"
+    state.drift_and_migrate(st, c)
+    for b in range(st.n_bricks):
+        slots = st.brick_member_slots(b)
+        if not len(slots):
+            continue
+        got = st._bucket_ijk_of_slots(b, slots)
+        assert np.array_equal(got, once[st.ids[slots]])
+
+
+def test_the_velocity_scale_reconciliation_is_the_exact_global_max():
+    """The claim the whole scheme rests on: tile ownership is a partition, so a
+    max over per-tile scales IS the global scale, not an approximation."""
+    rng = np.random.default_rng(24)
+    v = rng.normal(size=(5000, 3))
+    tile = rng.integers(0, 37, size=5000)
+    scales = [np.max(np.abs(v[tile == t])) / 32767 for t in range(37) if np.any(tile == t)]
+    assert state.reconcile_velocity_scale(scales) == np.max(np.abs(v)) / 32767
+
+
+def test_rescaling_a_velocity_code_never_escapes_int16():
+    """Not a margin -- a consequence of s_new being the exact global max."""
+    from inexor.codec import assert_int16_range
+
+    rng = np.random.default_rng(25)
+    v = rng.normal(scale=3.0, size=(4000, 3))
+    s_tile = np.max(np.abs(v[:1000])) / 32767  # a tile below the global max
+    s_glob = np.max(np.abs(v)) / 32767
+    w = np.rint(v[:1000] / s_tile).astype(np.int16)
+    assert_int16_range(w)
+    assert_int16_range(state._rescale_w(w, s_tile, s_glob))
+
+
+def test_a_changed_velocity_scale_moves_no_particle_further_than_one_quantum():
+    x, v, st = _built(26)
+    s0 = st.vel_scale
+    state.drift_and_migrate(st, 0.0, vel_scale_new=s0 * 1.7)
+    assert st.check() is True
+    assert st.vel_scale == pytest.approx(s0 * 1.7)
+    seen = 0
+    for b in range(st.n_bricks):
+        slots, _, vb = st.decode_brick(b)
+        seen += len(slots)
+    assert seen == st.n_particles
+
+
+def test_the_arena_absorbs_a_brick_overflow_and_then_refuses():
+    """The D-007 ladder end to end: spare, then arena, then a loud refusal --
+    and never a clamp or a drop.
+
+    `brick_slack=0.0` leaves each brick exactly its build-time count, so any net
+    inflow overflows. The drift converges every particle toward the box centre,
+    which is the physical version of the failure: a collapsing halo outgrowing
+    its brick.
+    """
+    x = _positions(27)
+    # Converge on ONE brick's centre, not the box centre: with 2 bricks per side
+    # the box centre is the corner where all eight meet, so convergence there is
+    # roughly balanced and nothing overflows.
+    v = (L_BOX * 0.25 - x) * 2.0
+    st = state.SlotState.build(x, v, _t9(), BRICKS, brick_slack=0.0, arena_frac=0.30)
+    stats = state.drift_and_migrate(st, 0.15)
+    assert st.check() is True
+    assert st.n_live == x.shape[0], "the ladder lost particles"
+    assert stats["arena_used"] > 0, "fixture did not actually overflow a brick"
+
+    tight = state.SlotState.build(x, v, _t9(), BRICKS, brick_slack=0.0, arena_frac=0.0)
+    with pytest.raises(ValueError, match="does not clamp or drop"):
+        state.drift_and_migrate(tight, 0.15)
+
+
+def test_arena_residents_are_pulled_back_into_their_brick_run():
+    """An arena particle still BELONGS to its brick. If the pass did not pull it
+    back in, the arena would fill monotonically -- and D-v2-19 clause 4 measured
+    the cost of forgetting an arena resident at 98.4% of the force in its brick.
+    """
+    x = _positions(29)
+    v = (L_BOX * 0.25 - x) * 2.0
+    st = state.SlotState.build(x, v, _t9(), BRICKS, brick_slack=0.0, arena_frac=0.30)
+    state.drift_and_migrate(st, 0.15)
+    crowded = st.arena_used
+    assert crowded > 0
+    # reverse the velocities and let it expand again: the arena must drain
+    st.w[:] = -st.w
+    state.drift_and_migrate(st, 0.15)
+    assert st.check() is True
+    assert st.n_live == x.shape[0]
+    assert st.arena_used < crowded, f"arena never drains ({crowded} -> {st.arena_used})"
