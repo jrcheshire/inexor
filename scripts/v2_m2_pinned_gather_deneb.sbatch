@@ -1,18 +1,25 @@
 #!/bin/bash
-#SBATCH --job-name=inexor-m2-pinned
-#SBATCH --partition=gpu
+#SBATCH -J inexor-m2-pinned
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH -c 8
 #SBATCH --mem=24G
-#SBATCH --time=00:40:00
-#SBATCH --output=inexor-m2-pinned-%j.log
+#SBATCH -t 00:40:00
+#SBATCH -o %x-%j.log
 #
 # M-v2-2: does jax express the pinned host gather, or is an ffi extension owed?
 #
-# --mem IS MANDATORY on deneb, not boilerplate. The partition default is 124G
-# against a 56G allocatable node, so a job without it PENDS FOREVER (M1 job 9 was
-# scrapped for exactly this). 24G is generous for a probe whose largest array is
-# ~1 GB.
+# NO --partition: albireo has exactly one (`compute`, the default), and naming a
+# `gpu` partition is an invalid-partition rejection at submit.
+#
+# The GPU is requested by --gres, NOT by pinning the node with -w. deneb is the
+# only node carrying gpu:1 (antares has none), so the gres expresses the actual
+# requirement and Slurm does the routing -- which is the difference between a
+# spec that stays correct when the cluster changes and one that does not.
+#
+# --mem IS MANDATORY here, not boilerplate. The default is sized for antares
+# (124G) against deneb's 56G allocatable, so a job without it PENDS FOREVER (M1
+# job 9 was scrapped for exactly this). 24G is generous for a probe whose largest
+# array is ~1 GB.
 #
 # NO `set -e`: the legs are independent and cheapest-first, so an expected
 # failure on one must not take the rest of the run with it (M1 job 11's lesson).
