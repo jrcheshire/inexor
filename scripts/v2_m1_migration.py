@@ -235,7 +235,12 @@ def main():
 
     from inexor.codec import T9Layout
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table, float_step_bullfrog
-    from inexor.layout import BrickPackedLayout, bucket_order_key, choose_brick
+    from inexor.layout import (
+        BrickPackedLayout,
+        bucket_ijk_from_key,
+        bucket_order_key,
+        choose_brick,
+    )
 
     sys.path.insert(0, HERE)
 
@@ -246,6 +251,15 @@ def main():
         f"    bucket {t9.bucket_size:.3f} Mpc/h ({t9.n_buckets_side}^3), "
         f"brick {n_brick} fine cells ({bricks_per_side}^3), quantum {t9.quantum:.5f}"
     )
+
+    # M-v2-3 instrument geometry: buckets per brick side, and per TILE side (the
+    # engine takes the velocity scale per tile, so the ratio has to be measured
+    # over the tiles the force actually uses -- not over bricks).
+    # Derived from the bucket grid rather than from cell counts, so it is the
+    # SAME `per` bucket_order_key uses and cannot drift from it.
+    tiles_side = g["n_fine"] // tile
+    per_brick_buckets = t9.n_buckets_side // bricks_per_side
+    per_tile_buckets = t9.n_buckets_side // tiles_side
 
     x, v, cosmo = make_ics(g, args.seed)
     import jax.numpy as jnp
@@ -271,6 +285,8 @@ def main():
 
     xj = jnp.asarray(x, jnp.float64)
     vj = jnp.asarray(v, jnp.float64)
+    _k0, _, _ = bucket_order_key(np.asarray(x, dtype=np.float64), t9, bricks_per_side)
+    bijk_prev = bucket_ijk_from_key(_k0, t9, bricks_per_side)
     per_step = []
     t_run = time.perf_counter()
     for k, c in enumerate(coeffs):
@@ -294,6 +310,39 @@ def main():
         counts = np.bincount(key_now, minlength=lay.n_buckets).astype(np.int64)
         assert int(counts.sum()) == n, "counts lost particles"
 
+        # --- M-v2-3 (M1/M2/M-B1): three numbers the engine's design rests on and
+        # which this probe computed or could compute and never recorded.
+        #
+        # M1. `migrate` has always computed brick_migrant_frac (layout.py:543)
+        # and the card only ever carried the BUCKET one. They are different by
+        # ~50x and it is the brick number that sizes the engine's in-flight
+        # migrant buffer, because a bucket change inside a brick is a local
+        # repack while a brick change is a payload move between runs.
+        #
+        # M2. How far a particle moves in BRICKS per step. The engine's slab
+        # pipeline assumes at most one brick per step per axis; this is what
+        # proves or kills that, and it sizes the far-jumper arena term.
+        #
+        # M-B1. The velocity scale. The engine takes it per TILE during the kick
+        # (a reduction over a buffer already resident) and reconciles by a max
+        # over tiles, which is exactly the global max because tile ownership is a
+        # partition. The cost is one extra rounding, bounded by the ratio of the
+        # tile's own scale to the global one -- so that ratio's distribution IS
+        # the accuracy cost, and it has never been looked at.
+        bijk_now = bucket_ijk_from_key(key_now, t9, bricks_per_side)
+        d_brick = np.abs(bijk_now // per_brick_buckets - bijk_prev // per_brick_buckets)
+        d_brick = np.minimum(d_brick, bricks_per_side - d_brick)  # periodic
+        bijk_prev = bijk_now
+
+        v_np = np.asarray(vj, dtype=np.float64)
+        vabs = np.max(np.abs(v_np), axis=1)
+        vmax_global = float(vabs.max())
+        tijk = bijk_now // per_tile_buckets
+        tile_flat = (tijk[:, 0] * tiles_side + tijk[:, 1]) * tiles_side + tijk[:, 2]
+        tile_max = np.zeros(tiles_side**3)
+        np.maximum.at(tile_max, tile_flat, vabs)
+        ratio = tile_max[tile_max > 0] / vmax_global
+
         rep = None
         if args.repack_every and (k + 1) % args.repack_every == 0:
             t2 = time.perf_counter()
@@ -308,6 +357,29 @@ def main():
             wall_force_s=t_force,
             wall_migrate_s=t_mig,
             migrant_frac=stats["migrant_frac"],
+            # M1: computed since M-v2-1 and never written down. It is ~50x
+            # smaller than the bucket figure and it is the one that sizes the
+            # engine's in-flight migrant buffer.
+            brick_migrant_frac=stats.get("brick_migrant_frac"),
+            # M2: how far a particle moves in BRICKS. The engine's slab pipeline
+            # assumes at most one per axis per step.
+            d_brick=dict(
+                max=int(d_brick.max()),
+                frac_moving=float(np.mean(np.any(d_brick > 0, axis=1))),
+                frac_over_one=float(np.mean(np.any(d_brick > 1, axis=1))),
+            ),
+            # M-B1: the velocity-scale ratio. The engine takes the scale per tile
+            # during the kick and reconciles by a max over tiles, which is
+            # exactly the global max because ownership is a partition; the extra
+            # rounding costs sqrt(1 + r^2) on the RMS, so this distribution IS
+            # the accuracy cost.
+            vel=dict(
+                vmax=vmax_global,
+                ratio_p50=float(np.percentile(ratio, 50)),
+                ratio_p99=float(np.percentile(ratio, 99)),
+                ratio_max=float(ratio.max()),
+                n_tiles_occupied=int(ratio.size),
+            ),
             arena_used_frac=stats["arena_used"] / n,
             max_fill_frac=stats["max_fill_frac"],
             n_full_buckets=stats["n_full_buckets"],

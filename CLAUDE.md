@@ -12,8 +12,39 @@ mbody owns MLX/Apple-Silicon).
 
 ## Current milestone
 
-**M-v2-1 (codec + layout) BUILT; next rung is M-v2-2 (force promotion).** The
-gate week (V1, V2a, V2b, V3) and the V4 architecture freeze are CLOSED:
+**M-v2-1, M-v2-2 and M-v2-3 are CLOSED; M-v2-4 (f32 force mesh) is next.**
+M-v2-3's exit gate passed all three parts (Vista 898169/898242, record
+`runs/v2/m3_engine_record.md`, ratified as **D-v2-21**): the engine's force is
+bitwise the ratified path's at cgh64 -- 0 of 402,653,184 elements, driven from a
+DIFFERENT membership order than the reference, which is only possible because
+both paints became integer -- and the T9 codec costs 7.125e-4 at C-dev K=40
+against D-v2-9's 3e-2, a 42x margin, measured for the first time through the
+real two-level force and the real storage layout. State now lives in slot order,
+so the ~21 B/p of scaffolding and the int32 `key` ceiling are gone rather than
+widened. D-v2-18 is explicit that M-v2-4 gets its OWN gate and cannot ride on
+D-v2-9's or G6's. M-v2-2's gate is `runs/v2/m2_parity_record.md` (Vista 897904).
+
+Two things M-v2-3 found that no document had named, both now in D-v2-21.
+(1) **The tiled SHORT-range paint was order-dependent with no integer twin**
+(`forces.tile_paint_f64`), so D-v2-14 clause 4's premise — the layout is
+admissible only because the paint is order-independent — was FALSE on the arm
+carrying most of the force; D-v2-16 clause 2 named only the coarse
+`paint_tsc_int`. Both arms are integer now, and that is what makes the bitwise
+gate above possible from two DIFFERENT membership orders.
+(2) **M-v2-3's written exit gate could not be read literally**: no v1 parity
+config overlaps a v2 one (v1 is single-level at 2-4 Mpc/h, mesh:particle 1; v2
+is 0.25 Mpc/h at mesh:particle 2) and the v1 quantized arm's generator was
+deleted at the retirement. Replaced by the three-part gate D-v2-21 clause 6
+records.
+
+**Owed out of M-v2-3** (record's "Owed" section): the re-plumbed v1 float driver
+does not reproduce the stored v1 reference (5.32e-5 cells, 1-r 1.75e-8, kernel
+dtype excluded by measurement, cause unidentified, predates this milestone);
+`SlotState.repack` allocates O(N) where D-v2-19 clause 3 establishes a monotone
+in-place form; and the parity instrument compares an O(N) array, so **cgh64 is
+its ceiling** — hero-scale parity needs a per-tile statistical form.
+
+The gate week (V1, V2a, V2b, V3) and the V4 architecture freeze are CLOSED:
 D-v2-14..18 ratified 2026-08-08 and the build ladder is D-v2-18's seven rungs,
 M-v2-1 through M-v2-7. Two ADRs landed on top of the freeze the same day:
 **D-v2-19** (spare pools per brick; the re-sort is a monotone rearrangement,
@@ -41,6 +72,11 @@ conventions, gate D-013; Tier-B int16 below the mesh floor, gate D-014;
 2026-07-14 — the premise measured false** (`docs/retrospective.md` is the
 read-first record; D-015 passed before the halt). v1 M3/M4 are cancelled;
 `docs/roadmap.md` stands as the v1 historical record.
+**`runs/m1/` is ~1.3 GB, gitignored and NOT force-added** (`git ls-files runs/m1`
+is empty) — it exists on this laptop only. It holds the stored `mbody_final_*`,
+`disco_final_*` and `disco_coeffs_*` reference states that the surviving D-013
+arms compare against, so M-v2-3's regression leg depends on a working copy that
+no other machine can reconstruct. Do not move or clear it.
 
 Deneb working clone: `deneb:~/src/inexor` (fresh clone 2026-07-15, JC's
 `~/src` layout convention; origin = GitHub HTTPS + PAT via

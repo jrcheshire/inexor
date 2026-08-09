@@ -1067,3 +1067,76 @@ ratifying it did not measure it.
   `tests/test_brick_packed.py` (one test per write path), probe
   `scripts/v2_m1_migration.py --index-dtype`; tail measurements in
   `runs/v2/m1_brick_packed_record.md`.
+
+## D-v2-21 -- The engine core: integer paints on both arms, and a replaced exit gate
+
+- **Status:** accepted (JC, 2026-08-09, on sign-off of the M-v2-3 gate; the
+  acceptance was flagged plainly in-session against this draft rather than
+  clause by clause, the D-v2-10 precedent). Amends D-v2-16 clause 2 (which named
+  only the coarse paint) and discharges D-v2-18's M-v2-3 row and D-v2-20's
+  forward pointer.
+- **Record:** `runs/v2/m3_engine_record.md`; Vista jobs 898169, 898242; cards
+  `runs/v2/m3_gate_*.json`; probe `scripts/v2_m3_engine_gate.py`.
+- **Decision:**
+  1. **The primal paint is INTEGER on BOTH arms.** D-v2-16 clause 2 made
+     `paint_tsc_int` a required deliverable for the coarse arm and no document
+     named the same defect on the tiled SHORT arm, where most of a particle's
+     force comes from: `tile_paint_f64` accumulates through order-dependent f64
+     `.at[].add` and had no integer twin. D-v2-14 clause 4 admits the
+     brick-sorted layout **only because** the paint is order-independent, and
+     the layout reorders every step, so that premise was false on the arm that
+     matters. `forces.tile_paint_int` is the twin. Both low-level defaults stay
+     `"f64"` so every probe-parity comparison keeps comparing like with like;
+     **the engine selects `"int"`**, which is the choice `density_tsc`'s
+     docstring defers to this milestone.
+     NB this is not only a determinism change: the integer path quantizes corner
+     weights to `frac_bits` fixed point, so the short arm's ACCURACY moves too,
+     and `frac_bits` becomes a knob needing the strict 8x CIC stencil bound
+     rather than the 1x `check_int_paint_headroom` assumes by default.
+  2. **Also unreachable, and now wired:** `force_global(assign="tsc")` called
+     `paint_tsc_f64` DIRECTLY, so the compliant coarse paint existed, was tested
+     and could not be reached from any force path in the package.
+  3. **State lives in SLOT ORDER (`src/inexor/state.py`).** `key`,
+     `particle_to_slot` and `slot_to_particle` -- ~21 B/p against a ~10.5 B/p
+     budget -- do not exist, so the int32 `key` ceiling D-v2-20 refused to widen
+     is not raised but absent. `BrickPackedLayout` is untouched: D-v2-19 and
+     D-v2-20 are measurements OF it, the same relationship `v2_g5_core.py` has to
+     `forces.py` under D-v2-16 clause 7.
+  4. **The step is drift-synchronized: force -> kick -> ONE fused drift.** In
+     BullFrog DKD the velocity is shared across the step boundary, so the two
+     half-drifts combine exactly. This halves the layout work AND quantizes the
+     state once per step, which is the cadence D-v2-14's ratified figure was
+     measured at. Priced before it was built (JC's call): at cdev8 K=40 the
+     midpoint cadence measures 2.311e-4 against the boundary's 2.821e-4.
+     Consequence: the engine is NOT bitwise `float_step_bullfrog`, so the gate
+     compares against `engine.float_run_bullfrog_sync`, a matched driver; the
+     stepper itself is untouched.
+  5. **The velocity scale is taken per TILE during the kick and reconciled by a
+     max over tiles.** Because ownership is a partition that max is EXACTLY the
+     global scale, so the re-encode cannot clamp -- a theorem, not a margin. The
+     stored bit layout is unchanged. The alternative of predicting the scale and
+     refusing on overflow is **not implementable**: the refusal is only
+     detectable after the force has been consumed, and the force cannot be
+     retained to retry with (D-v2-16 clause 1 deletes it). Cost measured rather
+     than assumed: the per-tile-to-global scale ratio is 0.40-0.80 at the median,
+     so ~1.12x on velocity RMS and at most sqrt(2) -- NOT the nil the design
+     argued, since max|v| tracks the bulk flow rather than a halo core.
+  6. **D-v2-18's M-v2-3 exit gate is REPLACED.** "Correctness vs the v1 parity
+     arms where configs overlap" cannot be satisfied: no v1 configuration
+     overlaps a v2 one, and the v1 quantized arm's generator was deleted. The
+     three-part replacement (JC, 2026-08-08) and its results are in the record;
+     headline, the engine's force is bitwise the ratified path's at cgh64 --
+     **0 of 402,653,184 elements** -- and the codec costs **7.125e-4** at C-dev
+     K=40 against D-v2-9's 3e-2, a 42x margin, on the architecture that ships.
+  7. **Jitting the coarse sub-block gather is REFUSED.** Worth ~1.7x on the
+     step; under jit XLA reassociates the corner accumulation and the result
+     stops being bitwise the global gather (86 of 189 elements at 2.220e-16).
+     Staging is a memory decision and must not move a number, and D-v2-10/11/12
+     are measurements OF this path. Pinned by a test on the contract, not on the
+     attempt.
+- **What this does NOT establish.** Nothing at C-gh: the parity instrument
+  compares an O(N) array (3.0 GiB at cgh64, 206 GB at C-gh), so **cgh64 is its
+  ceiling in this form**. One seed per configuration. No performance claim. And
+  the re-plumbed v1 float driver does not reproduce the stored v1 reference
+  (5.320e-05 cells, 1-r = 1.75e-08, kernel dtype excluded by measurement) --
+  small, systematic, cause unidentified, and it predates this milestone.

@@ -1,0 +1,21 @@
+{
+ "config": "smoke",
+ "n_particles": 32768,
+ "elements": 98304,
+ "n_diff": 0,
+ "max_abs_delta": 0.0,
+ "oracle_peak": 1.4362598305580114,
+ "oracle_nonzero": 98304,
+ "cap_probe": 5120,
+ "cap_engine": 4750,
+ "partition_ok": true,
+ "n_overhang": 0,
+ "vacuous": false,
+ "ok": true,
+ "determinism": {
+  "n_diff": 0,
+  "occupied_cells": 32526,
+  "ok": true
+ },
+ "wall_s": 1.771160458913073
+}

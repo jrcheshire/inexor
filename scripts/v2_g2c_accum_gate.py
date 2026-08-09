@@ -264,7 +264,40 @@ def run_single(args):
         x_, v_ = float_step_bullfrog(x_, v_, (c_[0], c_[1], c_[2]), force_fn, L)
         return rt(x_, v_)
 
-    step_jit = jax.jit(step_and_rt, donate_argnums=(0, 1))
+    # M-v2-3 (2026-08-08): the DRIFT-SYNCHRONIZED cadence, which is what the
+    # engine runs and what this arm exists to price.
+    #
+    # In BullFrog DKD the velocity is shared across the step boundary -- the
+    # trailing half-drift of step n and the leading half-drift of step n+1 both
+    # use v_{n+1} -- so the two fuse into ONE drift of (h_n + h_{n+1}) and the
+    # engine carries positions at step MIDPOINTS. That halves the layout work
+    # (85.5% of the force on the production backend) and, more importantly here,
+    # it quantizes the state ONCE per step, which is the cadence D-v2-14's
+    # ratified 4.123e-4 was measured at. The boundary driver below quantizes
+    # once per step too, but at a different POINT in the step, and nothing has
+    # ever measured whether that matters. This arm measures it.
+    #
+    # The fused schedule is algebraically identical to the boundary one, so the
+    # `ref` arm under both cadences is a built-in control: they must agree to
+    # roundoff, and only roundoff.
+    def step_and_rt_mid(x_, v_, c_):
+        # state enters as (x at the midpoint, v at the step boundary)
+        g = force_fn(x_)
+        v_ = c_[1] * v_ + c_[2] * g
+        x_ = jnp.mod(x_ + c_[3] * v_, L)
+        return rt(x_, v_)
+
+    midpoint = args.cadence == "midpoint"
+    if midpoint:
+        # fused drift after kick k: h_k + h_{k+1}, and h_{K-1} alone on the last
+        # step so the trajectory lands on the same endpoint as the boundary one
+        h = coeffs[:, 0]
+        fused = np.concatenate([h[:-1] + h[1:], h[-1:]])
+        coeffs = np.concatenate([coeffs, fused[:, None]], axis=1)
+        # the leading half-drift that puts x on the first midpoint
+        x = jnp.mod(x + jnp.asarray(h[0], x.dtype) * v, L)
+
+    step_jit = jax.jit(step_and_rt_mid if midpoint else step_and_rt, donate_argnums=(0, 1))
     coeffs_dev = jnp.asarray(coeffs, jnp.float32)
 
     diag_last = {}
@@ -277,7 +310,9 @@ def run_single(args):
     diag_last = {k: float(val) for k, val in diag_last.items()}
 
     os.makedirs(STATE_DIR, exist_ok=True)
-    tag = f"{args.config}_{args.arm}_k{args.k}_m{n_mesh}"
+    # the cadence suffix is appended ONLY for the non-default cadence, so every
+    # already-written boundary-cadence state path stays byte-identical
+    tag = f"{args.config}_{args.arm}_k{args.k}_m{n_mesh}" + ("_mid" if midpoint else "")
     np.savez(
         os.path.join(STATE_DIR, f"{tag}.npz"),
         x=np.asarray(x, np.float32),
@@ -505,6 +540,15 @@ def main():
     ap.add_argument("--arm", default="ref", help=argparse.SUPPRESS)
     ap.add_argument("--k", type=int, default=10, help=argparse.SUPPRESS)
     ap.add_argument("--mesh", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument(
+        "--cadence",
+        default="boundary",
+        choices=("boundary", "midpoint"),
+        help="where the codec round-trip lands in the step. 'boundary' is the "
+        "ratified cadence (every D-v2-14 number). 'midpoint' is the "
+        "drift-synchronized one the M-v2-3 engine runs, where the two "
+        "half-drifts fuse into one; see step_and_rt_mid.",
+    )
     args = ap.parse_args()
 
     if args.single:

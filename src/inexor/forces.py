@@ -71,17 +71,26 @@ import numpy as np
 from .painting import (
     _CORNERS as _CIC_CORNERS,
 )
+from .codec import rint_i
 from .painting import (
     _TSC_CORNERS,
+    CIC_CELL_WEIGHT_BOUND,
+    check_int_paint_headroom,
     cic_read_vector,
+    counts_from_int,
     density_contrast,
+    density_tsc,
     paint_f32,
-    paint_tsc_f64,
     tsc_read_vector,
 )
 
 # Coarse:fine mesh ratio (PMFAST pattern; the config table's `coarse = fine/4`).
 COARSE_RATIO = 4
+
+# Fixed-point fraction bits for the integer paints on the tiled short arm. Same
+# default as `paint_int`/`paint_tsc_int`; a knob because the strict 8x CIC bound
+# makes it one (see `tile_paint_int`).
+TILE_FRAC_BITS = 12
 
 
 def k_components(n_mesh, box_size, fdtype=np.float32):
@@ -337,6 +346,8 @@ def force_global(
     clip=None,
     assign="cic",
     pos_gather=None,
+    paint="f64",
+    frac_bits=TILE_FRAC_BITS,
 ):
     """One global mesh solve of the chosen split kernel -> ((n,3) f64, max_match).
 
@@ -354,19 +365,28 @@ def force_global(
     its own particles' force at their TRUE positions. That arm is SHELVED
     (D-v2-12 killed independent tiles), and the seam is kept because reviving it
     is a named V4-architecture option, not because anything calls it today.
+
+    `paint` selects the coarse assignment's accumulator on the `tsc` branch:
+    "f64" is the order-dependent path D-v2-10/11/12 were measured with and stays
+    the DEFAULT, so every probe-parity test compares like with like; "int" is the
+    D-006-compliant path (D-v2-16 cl.2), which `paint_tsc_int` has implemented
+    since M-v2-2 and which NOTHING COULD REACH, because this function called
+    `paint_tsc_f64` directly rather than going through `density_tsc`. The engine
+    selects "int" explicitly -- `density_tsc`'s own docstring says M-v2-3 is
+    where that choice gets made.
+
+    **The `cic` branch deliberately has no such knob.** It is order-dependent
+    too, and it is not on the shipping path: TSC is the ratified coarse
+    assignment, and this branch serves the mono/F0 floors and the shelved arms.
+    An int option there would mean either dropping its f64 counts to
+    `density_contrast`'s f32 or growing a second decode, neither worth doing for
+    a path the engine never takes. Recorded so the asymmetry reads as a decision
+    rather than an oversight.
     """
-    cell = box_size / n_mesh
-    kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s)
-    max_applied = 1.0
-    if match is not None:
-        mf, max_applied = cic_match_factor((n_mesh,) * 3, match[0], match[1], clip=clip)
-        kers = tuple(k * mf for k in kers)
-    if assign == "cic":
-        delta = density_f64(positions, n_mesh, box_size, n_particles_total)
-    elif assign == "tsc":
-        delta = paint_tsc_f64(positions, n_mesh, box_size, n_particles_total)
-    else:
-        raise ValueError(f"assign must be 'cic' or 'tsc', got {assign!r}")
+    delta, kers, max_applied = _global_delta_and_kernels(
+        positions, n_mesh, box_size, n_particles_total, which,
+        r_s=r_s, match=match, clip=clip, assign=assign, paint=paint, frac_bits=frac_bits,
+    )
     dk = jnp.fft.rfftn(delta)
     g = [jnp.fft.irfftn(dk * jnp.asarray(k), s=(n_mesh,) * 3) for k in kers]
     rd = positions if pos_gather is None else jnp.asarray(pos_gather)
@@ -375,6 +395,72 @@ def force_global(
     else:
         out = tsc_read_vector(g[0], g[1], g[2], rd, n_mesh, box_size)
     return np.asarray(out, dtype=np.float64), max_applied
+
+
+def _global_delta_and_kernels(
+    positions, n_mesh, box_size, n_particles_total, which,
+    r_s=None, match=None, clip=None, assign="cic", paint="f64", frac_bits=TILE_FRAC_BITS,
+):
+    """The paint-and-kernel half of `force_global`, split out verbatim."""
+    cell = box_size / n_mesh
+    kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s)
+    max_applied = 1.0
+    if match is not None:
+        mf, max_applied = cic_match_factor((n_mesh,) * 3, match[0], match[1], clip=clip)
+        kers = tuple(k * mf for k in kers)
+    if assign == "cic":
+        if paint != "f64":
+            raise ValueError(
+                f"assign='cic' has no {paint!r} accumulator: the int CIC path is "
+                "density_contrast's, which carries f32 counts, and the coarse arm "
+                "ratified in D-v2-10 is TSC. Use assign='tsc' for the engine's "
+                "D-006-compliant long arm."
+            )
+        delta = density_f64(positions, n_mesh, box_size, n_particles_total)
+    elif assign == "tsc":
+        delta = density_tsc(
+            positions, n_mesh, box_size, n_particles_total, paint=paint, frac_bits=frac_bits
+        )
+    else:
+        raise ValueError(f"assign must be 'cic' or 'tsc', got {assign!r}")
+    return delta, kers, max_applied
+
+
+def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None):
+    """The three long-range force meshes from an ALREADY-PAINTED delta.
+
+    `force_global` paints from every position AND gathers at every position,
+    returning an `(n, 3)` array -- both halves O(N), and the engine needs
+    neither. It streams the paint brick by brick (integer accumulation, so the
+    chunked sum is bitwise the monolithic one) and reads the force per tile out
+    of a staged sub-block, so what it wants from the global arm is exactly this:
+    solve, and stop.
+
+    Bitwise identical to the corresponding part of `force_global` by
+    construction -- it is the same expression, called from both.
+    """
+    cell = box_size / n_mesh
+    kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s)
+    if match is not None:
+        mf, _ = cic_match_factor((n_mesh,) * 3, match[0], match[1], clip=clip)
+        kers = tuple(k * mf for k in kers)
+    dk = jnp.fft.rfftn(delta)
+    # sequential per-component solves: never three force meshes at once
+    return [jnp.fft.irfftn(dk * jnp.asarray(k), s=(n_mesh,) * 3) for k in kers]
+
+
+def tile_capacity(member_counts):
+    """The per-tile row capacity: a MAX over tiles, so one jitted program serves
+    every tile (a per-tile member count would key a new shape and recompile).
+
+    The package had no source for this -- `force_short_tiled` requires `cap` as a
+    required argument and only `scripts/v2_g5_core.tile_capacity` computed one,
+    so nothing in the package could drive the tiled force end to end.
+    """
+    counts = np.asarray(list(member_counts), dtype=np.int64)
+    if not len(counts):
+        raise ValueError("no tiles: cap is a max over tiles and there are none")
+    return int(counts.max())
 
 
 # ===========================================================================
@@ -554,6 +640,66 @@ def tile_paint_f64(u, live, shape, cell, mean):
     return mesh.reshape(nx, ny, nz) / float(mean), n_out
 
 
+def tile_paint_int(u, live, shape, cell, frac_bits=TILE_FRAC_BITS):
+    """Deterministic integer CIC paint of tile-local coords -> (int32 mesh, n_out).
+
+    The D-006 twin of `tile_paint_f64`, and the reason M-v2-3 needed one at all.
+    D-v2-14 clause 4 admits the brick-sorted layout only because the paint is
+    order-independent -- brick-sorting reorders particles every step, so an
+    order-dependent primal paint is not reproducible even on one machine. That
+    clause was discharged for the COARSE arm by `paint_tsc_int` (D-v2-16 cl.2)
+    and was simply never applied to the short arm, which is where most of a
+    particle's force comes from. Integer addition is associative, so this is
+    bit-identical regardless of the atomic order the member sequence produces.
+
+    Returns RAW fixed-point counts, exactly as `paint_int` does -- NOT counts/mean.
+    `tile_delta_from_int` is the decode, and it is separate because the mesh is
+    what a chunked accumulation adds into.
+
+    **This is not only a determinism change, and the difference is measurable.**
+    `tile_paint_f64` carries f64 corner weights; here they are quantized to
+    `frac_bits` fixed point and rounded through f32, as every other int paint in
+    this package does. So the short arm's ACCURACY moves too, which is why the
+    engine's flip is gated on re-measuring the accumulated quantization rather
+    than on this file's tests alone.
+
+    Headroom is checked against the STRICT 8x CIC stencil bound
+    (`painting.CIC_CELL_WEIGHT_BOUND`), not the 1x that `check_int_paint_headroom`
+    has always assumed by default -- a tile cell inside a collapsing halo is
+    exactly where the optimistic factor would be found out.
+    """
+    nx, ny, nz = (int(s) for s in shape)
+    scale = np.float32(2.0**frac_bits)  # np scalar: no device array at trace-build time
+    base, frac, ok, n_out = _tile_cic_pieces(u, live, (nx, ny, nz), cell)
+    mesh = jnp.zeros((nx * ny * nz,), dtype=jnp.int32)
+    wlo = 1.0 - frac
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                flat, w = _tile_corner(base, frac, wlo, (dx, dy, dz), (nx, ny, nz), ok)
+                mesh = mesh.at[flat].add(
+                    rint_i(w.astype(jnp.float32) * scale), mode="promise_in_bounds"
+                )
+    return mesh.reshape(nx, ny, nz), n_out
+
+
+def tile_delta_from_int(mesh_int, mean, frac_bits=TILE_FRAC_BITS, fdtype=jnp.float64):
+    """Decode `tile_paint_int`'s raw mesh to the same quantity `tile_paint_f64`
+    returns: counts/mean, with NO -1 (see `tile_paint_f64` for why the -1 is
+    unnecessary and why `mean` must be the GLOBAL config scalar)."""
+    return counts_from_int(mesh_int, frac_bits, fdtype=fdtype) / float(mean)
+
+
+def check_tile_paint_headroom(n_particles_total, frac_bits, max_cell_particles=1.0e4):
+    """`check_int_paint_headroom` at the strict 8x CIC bound. See `tile_paint_int`."""
+    check_int_paint_headroom(
+        n_particles_total,
+        frac_bits,
+        max_cell_particles=max_cell_particles,
+        bound=CIC_CELL_WEIGHT_BOUND,
+    )
+
+
 def tile_gather_vector(gx, gy, gz, u, live, shape, cell):
     """Read 3 tile fields with ONE shared CIC stencil (`cic_read_vector` twin,
     origin-shifted). Zeroed on ~live. Returns ((n,3) f64, n_out)."""
@@ -634,7 +780,8 @@ def stage_coarse_subblock(g_coarse, origin_cells, extent):
 
 
 def gather_coarse_subblock(
-    sub_x, sub_y, sub_z, positions, origin_cells, cell_coarse, n_coarse, assign="tsc"
+    sub_x, sub_y, sub_z, positions, origin_cells, cell_coarse, n_coarse, assign="tsc",
+    live=None,
 ):
     """Read the long force for one tile's rows out of a staged sub-block.
 
@@ -654,6 +801,16 @@ def gather_coarse_subblock(
     computes them, and only the integer index is shifted -- by
     `(base - origin) mod n_coarse`, which is exact. Values identical, weights
     identical, corner order identical, therefore bits identical.
+
+    **`live` exists because of a measured compile storm (M-v2-3).** Called once
+    per tile with each tile's own row count, this keys a NEW XLA shape per tile:
+    profiled at 2,107 compilations and 24.1 s of a 32.7 s engine step, 74% of it,
+    with 18.5 s inside `backend_compile_and_load`. That is exactly the trap
+    `make_tile_force_fn` documents for the short arm -- "a per-tile member count
+    would key a new shape and recompile per tile" -- and the fix is the same one:
+    the caller pads rows to a fixed capacity and passes the mask, so ONE compiled
+    program serves every tile. Padded rows read index 0 with zero weight, which
+    is the same no-op construction `_tile_corner` uses.
 
     The caller must pass only rows whose stencil fits the halo. Rows outside the
     tile's core would read wrapped values from the far side of the block,
@@ -679,15 +836,24 @@ def gather_coarse_subblock(
     # boundary back in range without touching any float
     i = jnp.mod(base - jnp.asarray(origin, dtype=jnp.int32), int(n_coarse))
 
-    lo_needed = int(np.asarray(i).min()) + first
-    hi_needed = int(np.asarray(i).max()) + first + len(w_axis) - 1
-    if lo_needed < 0 or hi_needed >= extent:
-        raise ValueError(
-            f"a row's {assign} stencil reaches outside the staged sub-block: needs "
-            f"[{lo_needed}, {hi_needed}] of [0, {extent - 1}]. Pass only the tile's OWNED "
-            "rows, or raise the halo -- reading past the block wraps to the far side of "
-            "the mesh and is silent."
-        )
+    i_np = np.asarray(i)
+    keep = np.ones(i_np.shape[0], dtype=bool) if live is None else np.asarray(live)
+    if keep.any():
+        lo_needed = int(i_np[keep].min()) + first
+        hi_needed = int(i_np[keep].max()) + first + len(w_axis) - 1
+        if lo_needed < 0 or hi_needed >= extent:
+            raise ValueError(
+                f"a row's {assign} stencil reaches outside the staged sub-block: needs "
+                f"[{lo_needed}, {hi_needed}] of [0, {extent - 1}]. Pass only the tile's OWNED "
+                "rows, or raise the halo -- reading past the block wraps to the far side of "
+                "the mesh and is silent."
+            )
+    if live is not None:
+        # padded rows read a valid address with zero weight, exactly as
+        # `_tile_corner` does; the index must stay in range for every row
+        m = jnp.asarray(keep)[:, None]
+        i = jnp.where(m, i, -first)
+        w_axis = tuple(jnp.where(m, w, 0.0) for w in w_axis)
 
     fx, fy, fz = (jnp.asarray(s).reshape(-1) for s in (sub_x, sub_y, sub_z))
     n = xp.shape[0]
@@ -708,7 +874,16 @@ def gather_coarse_subblock(
 # ===========================================================================
 
 
-def make_tile_force_fn(n_fine, box_size, n_particles_total, n_tile, b_fine, r_s=None):
+def make_tile_force_fn(
+    n_fine,
+    box_size,
+    n_particles_total,
+    n_tile,
+    b_fine,
+    r_s=None,
+    paint="f64",
+    frac_bits=TILE_FRAC_BITS,
+):
     """Build the jitted per-tile short-force program -> (one_tile, geom).
 
     ONE jitted program is reused for every tile, which is only possible because
@@ -736,7 +911,19 @@ def make_tile_force_fn(n_fine, box_size, n_particles_total, n_tile, b_fine, r_s=
     `one_tile(u, live) -> (g, owned, n_out)` where `owned` marks the rows this
     tile is responsible for (core, not buffer), so ownership is a partition and
     the kick can be applied tile-locally without any global force array.
+
+    `paint="f64"` is the DEFAULT and is the order-dependent accumulator every
+    D-v2-10/11/12 number was measured through, so the probe-parity tests keep
+    comparing like with like. `paint="int"` is `tile_paint_int`, order-independent
+    by associativity -- which is what D-v2-14 clause 4 requires of a layout that
+    reorders particles every step, and what makes a bitwise gate possible when
+    the engine's slot order differs from the probe's membership order. The engine
+    selects "int".
     """
+    if paint not in ("f64", "int"):
+        raise ValueError(f"paint must be 'f64' or 'int', got {paint!r}")
+    if paint == "int":
+        check_tile_paint_headroom(n_particles_total, frac_bits)
     cell = float(box_size) / int(n_fine)
     mean = float(n_particles_total) / float(n_fine) ** 3
     P, b_real = padded_size(n_tile, b_fine, n_fine=n_fine)
@@ -745,7 +932,11 @@ def make_tile_force_fn(n_fine, box_size, n_particles_total, n_tile, b_fine, r_s=
     core_hi = (b_real + int(n_tile)) * cell
 
     def one_tile(u, live):
-        delta, n_out_p = tile_paint_f64(u, live, (P,) * 3, cell, mean)
+        if paint == "int":
+            mesh_i, n_out_p = tile_paint_int(u, live, (P,) * 3, cell, frac_bits)
+            delta = tile_delta_from_int(mesh_i, mean, frac_bits)
+        else:
+            delta, n_out_p = tile_paint_f64(u, live, (P,) * 3, cell, mean)
         dk = jnp.fft.rfftn(delta)
         g = [jnp.fft.irfftn(dk * k, s=(P,) * 3) for k in kers]
         out, n_out_g = tile_gather_vector(g[0], g[1], g[2], u, live, (P,) * 3, cell)
@@ -753,7 +944,8 @@ def make_tile_force_fn(n_fine, box_size, n_particles_total, n_tile, b_fine, r_s=
         return out, owned, n_out_p + n_out_g
 
     geom = dict(P=int(P), b_realized=int(b_real), cell=cell, mean=mean,
-                core_lo=core_lo, core_hi=core_hi, n_side=int(n_fine) // int(n_tile))
+                core_lo=core_lo, core_hi=core_hi, n_side=int(n_fine) // int(n_tile),
+                paint=str(paint), frac_bits=int(frac_bits))
     return jax.jit(one_tile), geom
 
 
@@ -777,6 +969,8 @@ def force_short_tiled(
     pad_fill="cycle",
     sink=None,
     max_accumulate_bytes=MAX_ACCUMULATE_BYTES,
+    paint="f64",
+    frac_bits=TILE_FRAC_BITS,
 ):
     """Drive the tiled short force over every tile -> (g or None, diag).
 
@@ -785,6 +979,9 @@ def force_short_tiled(
     bucketing; passing them in is also what lets the parity gate drive this with
     the probe's own membership, so the comparison isolates the force computation
     from the exchange.
+
+    `paint` / `frac_bits` are passed straight to `make_tile_force_fn`; see there
+    for why "f64" is the default and the engine selects "int".
 
     `sink=None` accumulates into a global (n,3) host array and returns it. That
     is the path D-v2-16 clause 1 keeps FOR TESTS ONLY, and it refuses above
@@ -795,7 +992,8 @@ def force_short_tiled(
     """
     positions = np.asarray(positions)
     one_tile, geom = make_tile_force_fn(
-        n_fine, box_size, n_particles_total, n_tile, b_fine, r_s=r_s
+        n_fine, box_size, n_particles_total, n_tile, b_fine, r_s=r_s,
+        paint=paint, frac_bits=frac_bits,
     )
     P, b_real, cell = geom["P"], geom["b_realized"], geom["cell"]
     n_side = geom["n_side"]
@@ -860,6 +1058,8 @@ def force_short_tiled(
         padded_P=int(P),
         cap=int(cap),
         pad_fill=str(pad_fill),
+        paint=str(paint),
+        frac_bits=int(frac_bits),
         fft_work_ratio=float(len(tiles) * P**3 / float(n_fine) ** 3),
         # Superset overhang: brick-union members outside the padded mesh. Since
         # choose_brick gained `c | b_fine` the union is EXACTLY the padded box, so
