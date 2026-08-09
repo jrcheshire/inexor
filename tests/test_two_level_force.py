@@ -587,3 +587,97 @@ def test_regression_padding_rows_do_not_funnel_onto_flat_index_zero():
         "the masked row's index was rewritten -- that is the 2.2x contention bug"
     )
     assert float(w[0]) > 0.0 and float(w[1]) == 0.0, "masking must be on the WEIGHT"
+
+
+# ============================================= paint_tsc_int (D-v2-16 clause 2)
+
+
+def test_paint_tsc_int_is_order_independent():
+    """The whole point. `paint_tsc_f64` accumulates through order-dependent f64
+    `.at[].add`, so the ratified coarse arm violates D-006 today; integer
+    addition is associative, so this must be bit-identical under a permutation of
+    particle order. That is not hypothetical for us -- the brick-sorted layout
+    reorders particles every single step."""
+    import jax.numpy as jnp
+
+    pos = _positions(20, N_PART_T)
+    perm = np.random.default_rng(21).permutation(pos.shape[0])
+    a = painting.paint_tsc_int(jnp.asarray(pos), N_MESH, L_BOX)
+    b = painting.paint_tsc_int(jnp.asarray(pos[perm]), N_MESH, L_BOX)
+    assert np.array_equal(np.asarray(a), np.asarray(b)), (
+        "the integer TSC paint is order-DEPENDENT, which defeats its only purpose"
+    )
+    assert int(np.asarray(a).max()) > 0, "degenerate fixture: nothing was painted"
+
+
+def test_the_f64_tsc_paint_really_is_order_dependent_on_this_fixture():
+    """The control for the test above, and it is not a formality.
+
+    If the f64 twin happened to be order-invariant here, the integer test would
+    be comparing two arrays that agree for a reason having nothing to do with
+    integer arithmetic -- a pass proving nothing, which is the failure mode this
+    file exists to avoid. Measured on THIS fixture, and it is visible even on
+    CPU with no atomics involved: permuting the particles moves 770 of 4096 cells
+    at 4.4e-16, purely from the changed accumulation order.
+
+    So the defect D-v2-16 clause 2 names is real at f64 on any backend, and the
+    GPU-atomics story is an amplifier rather than the cause.
+    """
+    import jax.numpy as jnp
+
+    pos = _positions(22, N_PART_T)
+    perm = np.random.default_rng(23).permutation(pos.shape[0])
+    n_tot = N_PART_T**3
+    a = np.asarray(painting.paint_tsc_f64(jnp.asarray(pos), N_MESH, L_BOX, n_tot))
+    b = np.asarray(painting.paint_tsc_f64(jnp.asarray(pos[perm]), N_MESH, L_BOX, n_tot))
+    n_diff = int(np.count_nonzero(a != b))
+    assert n_diff > 0, (
+        "the f64 TSC paint is order-INVARIANT on this fixture, so the integer "
+        "test above proves nothing -- pick a fixture where the defect is visible"
+    )
+    # and it must be roundoff-scale, or something worse than ordering is wrong
+    assert float(np.max(np.abs(a - b))) < 1e-12
+
+
+def test_paint_tsc_int_matches_the_f64_twin_within_the_quantization_bound():
+    """Bounded agreement, not equality: the two differ by the per-corner
+    rounding, 27 corners at 2^-frac_bits each."""
+    import jax.numpy as jnp
+
+    pos = jnp.asarray(_positions(24, N_PART_T))
+    n_tot = N_PART_T**3
+    exact = np.asarray(painting.density_tsc(pos, N_MESH, L_BOX, n_tot, paint="f64"))
+    quant = np.asarray(painting.density_tsc(pos, N_MESH, L_BOX, n_tot, paint="int"))
+    mean = n_tot / float(N_MESH) ** 3
+    bound = 27 * 2.0**-12 / mean  # per-particle corner rounding, in delta units
+    err = float(np.max(np.abs(quant - exact)))
+    assert err < bound, f"max |delta_int - delta_f64| = {err:.3e} exceeds {bound:.3e}"
+    assert err > 0.0, "the two paints agree exactly, so the int path is not quantizing"
+
+
+def test_tsc_headroom_bound_is_the_derived_one_and_refuses_a_real_overflow():
+    """The 27-corner stencil's bound is 5.359375x the cell occupancy, not CIC's
+    implicit 1x. Both directions asserted: the shipped configuration must pass,
+    and a frac_bits that genuinely overflows must raise."""
+    assert painting.TSC_CELL_WEIGHT_BOUND == pytest.approx(5.359375)
+    painting.check_tsc_paint_headroom(N_PART_T**3, 12)  # production: ~9.8x headroom
+    with pytest.raises(ValueError, match="TSC int-paint headroom"):
+        painting.check_tsc_paint_headroom(10**9, 16)
+
+
+def test_the_tsc_headroom_bound_is_not_below_a_measured_worst_case():
+    """A derived bound is a claim. Check it against a construction that drives
+    one cell as hard as the stencil allows: every particle at the same cell
+    centre, where each contributes 0.75^3 to that cell."""
+    import jax.numpy as jnp
+
+    n = 500
+    cell = L_BOX / N_MESH
+    centre = np.full((n, 3), 4.0 * cell)  # exactly on a cell centre -> d = 0
+    mesh = np.asarray(painting.paint_tsc_int(jnp.asarray(centre), N_MESH, L_BOX))
+    hottest = int(mesh.max())
+    allowed = painting.TSC_CELL_WEIGHT_BOUND * n * 2.0**12
+    assert hottest <= allowed, f"measured peak {hottest} exceeds the derived bound {allowed:.3e}"
+    assert hottest == pytest.approx(0.75**3 * n * 2**12, rel=1e-3), (
+        "the fixture is not actually driving a cell to the single-cell maximum"
+    )

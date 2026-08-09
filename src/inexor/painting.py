@@ -179,6 +179,111 @@ def paint_tsc_f64(positions, n_mesh, box_size, n_particles_total):
     return mesh.reshape(N, N, N) / mean - 1.0
 
 
+# The worst-case per-cell weight sum for TSC, as a multiple of the maximum cell
+# occupancy. DERIVED, not measured, and it is not 1.
+#
+# Per axis the weights are w_m = 0.5(0.5-d)^2, w_0 = 0.75-d^2, w_p = 0.5(0.5+d)^2
+# for d in [-1/2, 1/2]. A given target cell can receive from any of the 27 cells
+# in its neighbourhood, and the largest weight a particle in each can send is set
+# by how many of its axes sit at offset 0 (max 0.75, at d=0) versus +-1 (max 0.5,
+# at d=+-1/2):
+#
+#     1 cell,  3 axes at offset 0     0.75^3            = 0.421875
+#     6 cells, 1 axis at +-1          0.5 * 0.75^2      = 0.281250  -> 1.6875
+#    12 cells, 2 axes at +-1          0.5^2 * 0.75      = 0.187500  -> 2.2500
+#     8 cells, 3 axes at +-1          0.5^3             = 0.125000  -> 1.0000
+#                                                          total    = 5.359375
+#
+# Each neighbour's maximum is attained at a different d, but they are different
+# PARTICLES in different cells, each free to sit at its own worst offset, so the
+# sum is a genuine upper bound rather than a sum of unattainable maxima.
+#
+# CIC's existing bound uses an implicit factor of 1, which is optimistic: a cell
+# receives from 8 cells with per-axis weights up to 1, so the strict CIC factor
+# is 8. It has never bitten because the default configuration carries ~52x
+# headroom, but it means this constant is not "the TSC version of a factor that
+# was 1" -- it is the first one that was derived at all.
+TSC_CELL_WEIGHT_BOUND = 5.359375
+
+
+def check_tsc_paint_headroom(n_particles_total, frac_bits, max_cell_particles=1.0e4):
+    """Setup-time refusal against int32 overflow in the TSC accumulator.
+
+    Same shape as `check_int_paint_headroom` but with the 27-corner stencil's own
+    bound, which is 5.36x the occupancy rather than CIC's implicit 1x. At the
+    default frac_bits=12 and 1e4 particles per cell the worst-case sum is
+    ~2.20e8 against 2^31, so ~9.8x headroom; at frac_bits=15 it is ~1.76e9 and
+    the margin is down to 1.2x, which is the regime this exists to refuse.
+    """
+    worst_cell_sum = (
+        TSC_CELL_WEIGHT_BOUND * min(float(n_particles_total), max_cell_particles)
+        * 2.0**frac_bits
+    )
+    if worst_cell_sum >= 2.0**31:
+        raise ValueError(
+            f"TSC int-paint headroom: worst-case cell sum ~{worst_cell_sum:.2e} >= 2^31 at "
+            f"frac_bits={frac_bits} (assumed max cell occupancy "
+            f"{max_cell_particles:.1e} particles, stencil bound "
+            f"{TSC_CELL_WEIGHT_BOUND}); lower frac_bits -- the int32 accumulator would "
+            "overflow (D-007-class corruption, not just imprecision)."
+        )
+
+
+def paint_tsc_int(positions, n_mesh, box_size, frac_bits=12):
+    """Deterministic integer-accumulation TSC paint. Returns the raw int32 mesh.
+
+    The D-v2-16 clause 2 deliverable. `paint_tsc_f64` accumulates through
+    order-dependent f64 `.at[].add`, so the coarse arm ratified in D-v2-10
+    violates D-006 today; integer addition is associative, so this is
+    bit-identical regardless of atomic order. It is also a precondition for the
+    brick-sorted layout, which reorders particles every step -- an
+    order-dependent primal paint on a state whose order changes every step is
+    not reproducible even on one machine.
+
+    Primal-only, exactly as `paint_int` is: the differentiable twin is
+    `paint_tsc_f64`, in the same relationship `paint_f32` has to `paint_int`.
+
+    NB the quantization is per CORNER, so the 27 rounded weights of one particle
+    do not sum to exactly 2^frac_bits the way the exact weights sum to 1. That is
+    the same trade `paint_int` makes across 8 corners and it is a mass error of
+    order 27 * 2^-frac_bits per particle, not a determinism problem.
+    """
+    scale = np.float32(2.0**frac_bits)  # np scalar: no device array at trace-build time
+    N = int(n_mesh)
+    cell = float(box_size) / N
+    base, w = _tsc_pieces(positions, cell)
+    mesh = jnp.zeros((N**3,), dtype=jnp.int32)
+    for corner in _TSC_CORNERS:
+        flat, ww = _tsc_corner_flat_weight(base, w, corner, N)
+        mesh = mesh.at[flat].add(
+            rint_i(ww.astype(jnp.float32) * scale), mode="promise_in_bounds"
+        )
+    return mesh.reshape(N, N, N)
+
+
+def density_tsc(positions, n_mesh, box_size, n_particles_total, paint="f64", frac_bits=12):
+    """delta from a TSC assignment -- the ONE interface over both TSC paints.
+
+    paint="int": the deterministic primal path (D-006 compliant).
+    paint="f64": the order-dependent differentiable twin.
+
+    **The default is "f64" and that is deliberate, not an oversight.** It is what
+    the ratified coarse arm ran, so it is what D-v2-10, D-v2-11 and D-v2-12
+    measured; flipping the default moves those numbers, which is an ADR-level
+    call rather than a promotion detail. M-v2-3 is where the engine chooses, and
+    until then the D-006-compliant path exists and is tested but is opt-in.
+    """
+    if paint == "int":
+        check_tsc_paint_headroom(n_particles_total, frac_bits)
+        counts = counts_from_int(paint_tsc_int(positions, n_mesh, box_size, frac_bits),
+                                 frac_bits, fdtype=jnp.float64)
+        mean = float(n_particles_total) / float(n_mesh) ** 3
+        return counts / mean - 1.0
+    if paint == "f64":
+        return paint_tsc_f64(positions, n_mesh, box_size, n_particles_total)
+    raise ValueError(f"paint must be 'int' or 'f64', got {paint!r}")
+
+
 def tsc_read_vector(gx, gy, gz, positions, n_mesh, box_size):
     """Read 3 mesh fields with ONE shared TSC stencil.
 
