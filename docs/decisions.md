@@ -1070,9 +1070,11 @@ ratifying it did not measure it.
 
 ## D-v2-21 -- The engine core: integer paints on both arms, and a replaced exit gate
 
-- **Status:** PROPOSED, drafted 2026-08-09 (M-v2-3). Nothing below is in force
-  until JC accepts it. Amends D-v2-16 clause 2 (which named only the coarse
-  paint) and discharges D-v2-18's M-v2-3 row and D-v2-20's forward pointer.
+- **Status:** accepted (JC, 2026-08-09, on sign-off of the M-v2-3 gate; the
+  acceptance was flagged plainly in-session against this draft rather than
+  clause by clause, the D-v2-10 precedent). Amends D-v2-16 clause 2 (which named
+  only the coarse paint) and discharges D-v2-18's M-v2-3 row and D-v2-20's
+  forward pointer.
 - **Record:** `runs/v2/m3_engine_record.md`; Vista jobs 898169, 898242; cards
   `runs/v2/m3_gate_*.json`; probe `scripts/v2_m3_engine_gate.py`.
 - **Decision:**
