@@ -17,11 +17,20 @@
  "bucket_cells": 2,
  "bucket_size": 2.0,
  "quantum": 0.0078125,
- "steps": 6,
+ "steps": 4,
  "seed": 0,
  "live_slack": 0.1,
  "live_arena_frac": 1.0,
  "initial_occupancy": {
+  "tail": {
+   "100": 0,
+   "300": 0,
+   "1000": 0,
+   "3000": 0,
+   "10000": 0,
+   "30000": 0,
+   "65535": 0
+  },
   "mean": 8.0,
   "mean_occupied": 8.0,
   "max": 30,
@@ -43,181 +52,161 @@
   "payload": 9.0,
   "bucket_index": 0.25,
   "brick_start": 1.000244140625,
-  "slack": 1.57708740234375,
-  "arena": 1.79022216796875,
-  "total": 13.6175537109375
+  "slack": 1.573516845703125,
+  "arena": 2.62518310546875,
+  "total": 14.448944091796875
  },
  "per_step": [
   {
    "step": 0,
    "repack": {
     "scratch_bytes": 262144,
-    "slots_used": 37742,
+    "slots_used": 37848,
     "slots_allocated": 74187,
     "max_brick_fill": 0.9090909090909091,
-    "wall_s": 0.0005810000002384186
+    "wall_s": 0.00044950004667043686
    },
-   "a": 0.14677992676220694,
-   "wall_force_s": 0.5926907500252128,
-   "wall_migrate_s": 0.0016012080013751984,
-   "migrant_frac": 0.089569091796875,
-   "arena_used_frac": 0.0284423828125,
-   "max_fill_frac": 2.3,
+   "a": 0.1778279410038923,
+   "wall_force_s": 0.5824783330317587,
+   "wall_migrate_s": 0.0020055000204592943,
+   "migrant_frac": 0.181060791015625,
+   "arena_used_frac": 0.055816650390625,
+   "max_fill_frac": 2.8,
    "n_full_buckets": 0,
    "occupancy": {
+    "tail": {
+     "100": 0,
+     "300": 0,
+     "1000": 0,
+     "3000": 0,
+     "10000": 0,
+     "30000": 0,
+     "65535": 0
+    },
     "mean": 8.0,
     "mean_occupied": 8.0,
-    "max": 38,
-    "p50": 8.0,
-    "p99": 21.050000000000182,
-    "p999": 28.0,
+    "max": 45,
+    "p50": 7.0,
+    "p99": 25.0,
+    "p999": 37.81000000000131,
     "n_empty": 0,
     "n_buckets": 4096,
-    "uint16_headroom": 1724.6052631578948
+    "uint16_headroom": 1456.3333333333333
    }
   },
   {
    "step": 1,
    "repack": {
     "scratch_bytes": 262144,
-    "slots_used": 37947,
+    "slots_used": 38146,
     "slots_allocated": 74187,
     "max_brick_fill": 0.9090909090909091,
-    "wall_s": 0.00048429099842906
+    "wall_s": 0.0004603331908583641
    },
-   "a": 0.21544346900318834,
-   "wall_force_s": 0.2661230831872672,
-   "wall_migrate_s": 0.0022022081539034843,
-   "migrant_frac": 0.21978759765625,
-   "arena_used_frac": 0.07159423828125,
-   "max_fill_frac": 2.5,
+   "a": 0.31622776601683794,
+   "wall_force_s": 0.25350795895792544,
+   "wall_migrate_s": 0.002684999955818057,
+   "migrant_frac": 0.43603515625,
+   "arena_used_frac": 0.145599365234375,
+   "max_fill_frac": 4.2727272727272725,
    "n_full_buckets": 0,
    "occupancy": {
+    "tail": {
+     "100": 2,
+     "300": 0,
+     "1000": 0,
+     "3000": 0,
+     "10000": 0,
+     "30000": 0,
+     "65535": 0
+    },
     "mean": 8.0,
-    "mean_occupied": 8.0,
-    "max": 62,
-    "p50": 7.0,
-    "p99": 29.0,
-    "p999": 47.905000000000655,
-    "n_empty": 0,
+    "mean_occupied": 8.007820136852395,
+    "max": 154,
+    "p50": 6.0,
+    "p99": 45.090000000000146,
+    "p999": 85.81800000000112,
+    "n_empty": 4,
     "n_buckets": 4096,
-    "uint16_headroom": 1057.016129032258
+    "uint16_headroom": 425.55194805194805
    }
   },
   {
    "step": 2,
    "repack": {
     "scratch_bytes": 262144,
-    "slots_used": 38143,
+    "slots_used": 38458,
     "slots_allocated": 74187,
     "max_brick_fill": 0.9090909090909091,
-    "wall_s": 0.00047645787708461285
+    "wall_s": 0.00043495791032910347
    },
-   "a": 0.31622776601683794,
-   "wall_force_s": 0.22623920789919794,
-   "wall_migrate_s": 0.0025615831837058067,
-   "migrant_frac": 0.343475341796875,
-   "arena_used_frac": 0.106170654296875,
-   "max_fill_frac": 3.1363636363636362,
+   "a": 0.5623413251903491,
+   "wall_force_s": 0.25406479090452194,
+   "wall_migrate_s": 0.0028453751001507044,
+   "migrant_frac": 0.649078369140625,
+   "arena_used_frac": 0.239166259765625,
+   "max_fill_frac": 26.857142857142858,
    "n_full_buckets": 0,
    "occupancy": {
+    "tail": {
+     "100": 22,
+     "300": 2,
+     "1000": 0,
+     "3000": 0,
+     "10000": 0,
+     "30000": 0,
+     "65535": 0
+    },
     "mean": 8.0,
-    "mean_occupied": 8.007820136852395,
-    "max": 156,
-    "p50": 6.0,
-    "p99": 45.0,
-    "p999": 89.5450000000028,
-    "n_empty": 4,
+    "mean_occupied": 8.173609378897481,
+    "max": 523,
+    "p50": 4.0,
+    "p99": 68.84000000000015,
+    "p999": 187.77600000001803,
+    "n_empty": 87,
     "n_buckets": 4096,
-    "uint16_headroom": 420.09615384615387
+    "uint16_headroom": 125.30592734225621
    }
   },
   {
    "step": 3,
    "repack": {
     "scratch_bytes": 262144,
-    "slots_used": 38366,
+    "slots_used": 38497,
     "slots_allocated": 74187,
     "max_brick_fill": 0.9090909090909091,
-    "wall_s": 0.0004522500094026327
-   },
-   "a": 0.46415888336127786,
-   "wall_force_s": 0.2687160831410438,
-   "wall_migrate_s": 0.0027472078800201416,
-   "migrant_frac": 0.473297119140625,
-   "arena_used_frac": 0.160369873046875,
-   "max_fill_frac": 11.666666666666666,
-   "n_full_buckets": 0,
-   "occupancy": {
-    "mean": 8.0,
-    "mean_occupied": 8.062992125984252,
-    "max": 334,
-    "p50": 5.0,
-    "p99": 55.36999999999989,
-    "p999": 201.81100000000106,
-    "n_empty": 32,
-    "n_buckets": 4096,
-    "uint16_headroom": 196.2125748502994
-   }
-  },
-  {
-   "step": 4,
-   "repack": {
-    "scratch_bytes": 262144,
-    "slots_used": 38466,
-    "slots_allocated": 74187,
-    "max_brick_fill": 0.9090909090909091,
-    "wall_s": 0.000464417040348053
-   },
-   "a": 0.6812920690579611,
-   "wall_force_s": 0.2899297089315951,
-   "wall_migrate_s": 0.0030565420165657997,
-   "migrant_frac": 0.55987548828125,
-   "arena_used_frac": 0.19891357421875,
-   "max_fill_frac": 19.0,
-   "n_full_buckets": 0,
-   "occupancy": {
-    "mean": 8.0,
-    "mean_occupied": 8.320975114271203,
-    "max": 634,
-    "p50": 4.0,
-    "p99": 75.0,
-    "p999": 240.07900000001837,
-    "n_empty": 158,
-    "n_buckets": 4096,
-    "uint16_headroom": 103.36750788643533
-   }
-  },
-  {
-   "step": 5,
-   "repack": {
-    "scratch_bytes": 262144,
-    "slots_used": 38510,
-    "slots_allocated": 74187,
-    "max_brick_fill": 0.9090909090909091,
-    "wall_s": 0.00047187507152557373
+    "wall_s": 0.000429708044975996
    },
    "a": 1.0,
-   "wall_force_s": 0.26905758306384087,
-   "wall_migrate_s": 0.0028152919840067625,
-   "migrant_frac": 0.5809326171875,
-   "arena_used_frac": 0.19696044921875,
-   "max_fill_frac": 16.0,
+   "wall_force_s": 0.26694291713647544,
+   "wall_migrate_s": 0.003290708875283599,
+   "migrant_frac": 0.725067138671875,
+   "arena_used_frac": 0.29168701171875,
+   "max_fill_frac": 20.0,
    "n_full_buckets": 0,
    "occupancy": {
+    "tail": {
+     "100": 32,
+     "300": 5,
+     "1000": 0,
+     "3000": 0,
+     "10000": 0,
+     "30000": 0,
+     "65535": 0
+    },
     "mean": 8.0,
-    "mean_occupied": 8.650475184794086,
-    "max": 797,
+    "mean_occupied": 8.666490346469189,
+    "max": 718,
     "p50": 3.0,
-    "p99": 89.13000000000011,
-    "p999": 471.6970000000133,
-    "n_empty": 308,
+    "p99": 96.0,
+    "p999": 419.2800000000061,
+    "n_empty": 315,
     "n_buckets": 4096,
-    "uint16_headroom": 82.22710163111668
+    "uint16_headroom": 91.27437325905292
    }
   }
  ],
- "wall_s": 1.9575027499813586,
+ "wall_s": 1.3860347499139607,
  "ratified_estimate": {
   "slack_and_arena_bpp": 0.9,
   "all_in_bpp": 10.15,

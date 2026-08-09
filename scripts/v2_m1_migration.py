@@ -133,9 +133,25 @@ def make_force(g, tile, buf, family="gauss", assign="tsc", match=True):
 # ---------------------------------------------------------------------------
 
 
+# Bucket counts above each threshold. The uint16 index ceiling is 65535, and
+# whether that is reachable at C-gh is a question about the FAR TAIL, which
+# percentiles cannot answer -- p99.9 is ~700 while the peak is ~14000, so the
+# interesting region is entirely above the last percentile reported. If the
+# occupancy distribution is volume-invariant (p99 and p99.9 are flat to ~2%
+# across 64x volume, so it is), then N(>x) PER UNIT VOLUME is a fixed function
+# and can be extrapolated -- and, crucially, the extrapolation can be CHECKED by
+# predicting a bigger box's peak from a smaller box's tail before it is trusted.
+TAIL_THRESHOLDS = (100, 300, 1000, 3000, 10000, 30000, 65535)
+
+
+def tail_counts(counts):
+    return {str(t): int((counts > t).sum()) for t in TAIL_THRESHOLDS}
+
+
 def occupancy_summary(counts, n):
     live = counts[counts > 0]
     return dict(
+        tail=tail_counts(counts),
         mean=float(counts.mean()),
         mean_occupied=float(live.mean()) if len(live) else 0.0,
         max=int(counts.max()),
