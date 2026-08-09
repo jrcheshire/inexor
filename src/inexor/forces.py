@@ -386,6 +386,7 @@ def force_global(
     pos_gather=None,
     paint="f64",
     frac_bits=TILE_FRAC_BITS,
+    fdtype=np.float64,
 ):
     """One global mesh solve of the chosen split kernel -> ((n,3) f64, max_match).
 
@@ -421,9 +422,11 @@ def force_global(
     a path the engine never takes. Recorded so the asymmetry reads as a decision
     rather than an oversight.
     """
+    fdtype = field_dtype(fdtype)
     delta, kers, max_applied = _global_delta_and_kernels(
         positions, n_mesh, box_size, n_particles_total, which,
         r_s=r_s, match=match, clip=clip, assign=assign, paint=paint, frac_bits=frac_bits,
+        fdtype=fdtype,
     )
     dk = jnp.fft.rfftn(delta)
     g = [jnp.fft.irfftn(dk * jnp.asarray(k), s=(n_mesh,) * 3) for k in kers]
@@ -432,20 +435,26 @@ def force_global(
         out = cic_read_vector(g[0], g[1], g[2], rd, n_mesh, box_size)
     else:
         out = tsc_read_vector(g[0], g[1], g[2], rd, n_mesh, box_size)
-    return np.asarray(out, dtype=np.float64), max_applied
+    return np.asarray(out, dtype=fdtype), max_applied
 
 
 def _global_delta_and_kernels(
     positions, n_mesh, box_size, n_particles_total, which,
     r_s=None, match=None, clip=None, assign="cic", paint="f64", frac_bits=TILE_FRAC_BITS,
+    fdtype=np.float64,
 ):
     """The paint-and-kernel half of `force_global`, split out verbatim."""
+    fdtype = field_dtype(fdtype)
     cell = box_size / n_mesh
-    kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s)
+    kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s, fdtype=fdtype)
     max_applied = 1.0
     if match is not None:
         mf, max_applied = cic_match_factor((n_mesh,) * 3, match[0], match[1], clip=clip)
-        kers = tuple(k * mf for k in kers)
+        # `mf` is a host f64 half-grid and `k` may be complex64, so an uncast
+        # multiply promotes the kernel back to complex128 and silently undoes
+        # the narrowing -- at the MATCHED coarse arm specifically, which is the
+        # one D-v2-10 ratified. Same trap as narrowing `ik` in `split_kernels`.
+        kers = tuple(k * mf.astype(fdtype, copy=False) for k in kers)
     if assign == "cic":
         if paint != "f64":
             raise ValueError(
@@ -454,17 +463,19 @@ def _global_delta_and_kernels(
                 "ratified in D-v2-10 is TSC. Use assign='tsc' for the engine's "
                 "D-006-compliant long arm."
             )
-        delta = density_f64(positions, n_mesh, box_size, n_particles_total)
+        delta = density_f64(positions, n_mesh, box_size, n_particles_total, fdtype=fdtype)
     elif assign == "tsc":
         delta = density_tsc(
-            positions, n_mesh, box_size, n_particles_total, paint=paint, frac_bits=frac_bits
+            positions, n_mesh, box_size, n_particles_total, paint=paint,
+            frac_bits=frac_bits, fdtype=fdtype,
         )
     else:
         raise ValueError(f"assign must be 'cic' or 'tsc', got {assign!r}")
     return delta, kers, max_applied
 
 
-def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None):
+def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None,
+                        fdtype=None):
     """The three long-range force meshes from an ALREADY-PAINTED delta.
 
     `force_global` paints from every position AND gathers at every position,
@@ -476,12 +487,33 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
 
     Bitwise identical to the corresponding part of `force_global` by
     construction -- it is the same expression, called from both.
+
+    **`fdtype=None` INFERS from `delta.dtype`, and an explicit disagreement is
+    a refusal rather than a cast (M-v2-4).** This is the seam where the engine's
+    coarse arm gets its precision, and the one thing that must not happen here
+    is a knob that reports success without applying: if a caller narrowed its
+    delta but the kernels stayed f64, the multiply would promote everything back
+    and the run would look correct while costing double. Refusing a mismatched
+    pair makes that unrepresentable instead of merely unlikely. Casting the
+    delta to match would be the friendly alternative and is exactly wrong -- it
+    would hide the caller's error.
     """
+    fdtype = field_dtype(delta.dtype if fdtype is None else fdtype)
+    if np.dtype(delta.dtype) != fdtype:
+        raise ValueError(
+            f"coarse_force_meshes: delta is {np.dtype(delta.dtype).name} but fdtype is "
+            f"{fdtype.name}. These must agree -- the kernels are built at fdtype and a "
+            "mismatched multiply promotes the whole solve back to the wider type, which "
+            "reads as a working f32 arm that is silently costing f64 memory. Narrow the "
+            "delta at its decode, or pass the dtype it already has."
+        )
     cell = box_size / n_mesh
-    kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s)
+    kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s, fdtype=fdtype)
     if match is not None:
         mf, _ = cic_match_factor((n_mesh,) * 3, match[0], match[1], clip=clip)
-        kers = tuple(k * mf for k in kers)
+        # cast for the same reason as in `_global_delta_and_kernels`: an f64
+        # match factor would promote a complex64 kernel back to complex128
+        kers = tuple(k * mf.astype(fdtype, copy=False) for k in kers)
     dk = jnp.fft.rfftn(delta)
     # sequential per-component solves: never three force meshes at once
     return [jnp.fft.irfftn(dk * jnp.asarray(k), s=(n_mesh,) * 3) for k in kers]
@@ -971,6 +1003,7 @@ def make_tile_force_fn(
     r_s=None,
     paint="f64",
     frac_bits=TILE_FRAC_BITS,
+    fdtype=jnp.float64,
 ):
     """Build the jitted per-tile short-force program -> (one_tile, geom).
 
@@ -1007,24 +1040,38 @@ def make_tile_force_fn(
     reorders particles every step, and what makes a bitwise gate possible when
     the engine's slot order differs from the probe's membership order. The engine
     selects "int".
+
+    `fdtype` (M-v2-4) sets the tile MESH and its kernels: delta, the FFT, the
+    three force meshes and the gather. **This arm is measured, not gated.** The
+    memory argument is about the global coarse mesh, which grows with the box; a
+    tile's working set is P^3 and box-independent, so narrowing it buys device
+    headroom per tile rather than capacity. It is threaded here because it is
+    the same plumbing, and because M-v2-6 needs to know whether the per-tile
+    working set can halve too.
     """
     if paint not in ("f64", "int"):
         raise ValueError(f"paint must be 'f64' or 'int', got {paint!r}")
     if paint == "int":
         check_tile_paint_headroom(n_particles_total, frac_bits)
+    fdtype = field_dtype(fdtype)
     cell = float(box_size) / int(n_fine)
     mean = float(n_particles_total) / float(n_fine) ** 3
     P, b_real = padded_size(n_tile, b_fine, n_fine=n_fine)
-    kers = [jnp.asarray(k) for k in split_kernels((P,) * 3, cell, "short", r_s=r_s)]
+    kers = [jnp.asarray(k) for k in split_kernels((P,) * 3, cell, "short", r_s=r_s,
+                                                  fdtype=fdtype)]
     core_lo = b_real * cell
     core_hi = (b_real + int(n_tile)) * cell
 
     def one_tile(u, live):
         if paint == "int":
             mesh_i, n_out_p = tile_paint_int(u, live, (P,) * 3, cell, frac_bits)
-            delta = tile_delta_from_int(mesh_i, mean, frac_bits)
+            # BY KEYWORD. This call dropped `fdtype` by being positional until
+            # M-v2-4, so the tile arm decoded at the f64 default no matter what
+            # the caller asked for -- the parameter existed and nothing could
+            # reach it.
+            delta = tile_delta_from_int(mesh_i, mean, frac_bits, fdtype=fdtype)
         else:
-            delta, n_out_p = tile_paint_f64(u, live, (P,) * 3, cell, mean)
+            delta, n_out_p = tile_paint_f64(u, live, (P,) * 3, cell, mean, fdtype=fdtype)
         dk = jnp.fft.rfftn(delta)
         g = [jnp.fft.irfftn(dk * k, s=(P,) * 3) for k in kers]
         out, n_out_g = tile_gather_vector(g[0], g[1], g[2], u, live, (P,) * 3, cell)
@@ -1033,7 +1080,7 @@ def make_tile_force_fn(
 
     geom = dict(P=int(P), b_realized=int(b_real), cell=cell, mean=mean,
                 core_lo=core_lo, core_hi=core_hi, n_side=int(n_fine) // int(n_tile),
-                paint=str(paint), frac_bits=int(frac_bits))
+                paint=str(paint), frac_bits=int(frac_bits), fdtype=fdtype.name)
     return jax.jit(one_tile), geom
 
 
@@ -1059,6 +1106,7 @@ def force_short_tiled(
     max_accumulate_bytes=MAX_ACCUMULATE_BYTES,
     paint="f64",
     frac_bits=TILE_FRAC_BITS,
+    fdtype=jnp.float64,
 ):
     """Drive the tiled short force over every tile -> (g or None, diag).
 
@@ -1081,7 +1129,7 @@ def force_short_tiled(
     positions = np.asarray(positions)
     one_tile, geom = make_tile_force_fn(
         n_fine, box_size, n_particles_total, n_tile, b_fine, r_s=r_s,
-        paint=paint, frac_bits=frac_bits,
+        paint=paint, frac_bits=frac_bits, fdtype=fdtype,
     )
     P, b_real, cell = geom["P"], geom["b_realized"], geom["cell"]
     n_side = geom["n_side"]
@@ -1098,7 +1146,7 @@ def force_short_tiled(
                 "That array is what D-v2-16 clause 1 deletes (2 x 206 GB at C-gh); pass a "
                 "tile-local `sink(idx, g_owned)` instead of raising the limit."
             )
-        g_out = np.zeros((n, 3), dtype=np.float64)
+        g_out = np.zeros((n, 3), dtype=geom["fdtype"])
     else:
         g_out = None
 
@@ -1148,6 +1196,7 @@ def force_short_tiled(
         pad_fill=str(pad_fill),
         paint=str(paint),
         frac_bits=int(frac_bits),
+        fdtype=geom["fdtype"],
         fft_work_ratio=float(len(tiles) * P**3 / float(n_fine) ** 3),
         # Superset overhang: brick-union members outside the padded mesh. Since
         # choose_brick gained `c | b_fine` the union is EXACTLY the padded box, so

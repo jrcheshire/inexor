@@ -531,6 +531,95 @@ def test_narrowing_the_weight_early_would_break_the_contract():
     )
 
 
+# ========================================== S5: both arms wired, end to end
+
+
+def test_the_global_arm_runs_f32_end_to_end():
+    pos = _positions(80)
+    n_tot = N_PART**3
+    g32, _ = forces.force_global(pos, N_MESH, L_BOX, n_tot, "long", r_s=R_S,
+                                 fdtype=np.float32)
+    delta32 = forces.density_f64(pos, N_MESH, L_BOX, n_tot, fdtype=np.float32)
+    meshes32 = forces.coarse_force_meshes(delta32, N_MESH, L_BOX, "long", r_s=R_S)
+    _assert_dtypes(
+        [("force_global(f32)", _name(g32), "float32")]
+        + [(f"coarse_force_meshes(f32)[{i}]", _name(m), "float32")
+           for i, m in enumerate(meshes32)]
+    )
+
+
+def test_the_match_factor_does_not_promote_the_kernel_back():
+    """The matched coarse arm is the one D-v2-10 ratified, so this is the arm
+    where a silent promotion would matter most.
+
+    `cic_match_factor` returns a host f64 half-grid. `complex64 * float64` is
+    complex128, so an uncast multiply undoes `split_kernels`' narrowing at
+    exactly the configuration that ships.
+    """
+    pos = _positions(81)
+    cell = L_BOX / N_MESH
+    g32, applied = forces.force_global(
+        pos, N_MESH, L_BOX, N_PART**3, "long", r_s=R_S,
+        match=(cell, cell / 2), assign="tsc", fdtype=np.float32,
+    )
+    assert _name(g32) == "float32", (
+        "the matched arm came back f64 -- the match factor is promoting the kernel"
+    )
+    assert applied > 1.0, "the match factor was inert, so this test proved nothing"
+
+
+def test_the_tile_arm_runs_f32_end_to_end_through_both_paints():
+    """Also the proof that `fdtype` now REACHES `tile_delta_from_int`.
+
+    `make_tile_force_fn` called it positionally until M-v2-4, so the tile arm
+    decoded at the f64 default whatever the caller asked for.
+    """
+    u, live, shape, cell = _tile_fixture(82)
+    for paint in ("f64", "int"):
+        one_tile, geom = forces.make_tile_force_fn(
+            N_FINE_T, L_BOX, N_PART_T**3, N_TILE_T, B_FINE_T, r_s=R_S,
+            paint=paint, fdtype=np.float32,
+        )
+        out, owned, _ = one_tile(u, live)
+        assert geom["fdtype"] == "float32", f"geom does not carry the dtype ({paint})"
+        assert _name(out) == "float32", (
+            f"one_tile(paint={paint!r}) returned {_name(out)} at fdtype=float32"
+        )
+        assert int(np.asarray(owned).sum()) > 0, "no owned rows; the fixture is vacuous"
+
+
+def test_force_short_tiled_carries_the_dtype_into_its_sink_and_diag():
+    def member_fn(_):
+        return np.arange(N_PART_T**3, dtype=np.int64)
+
+    pos = _positions(83, N_PART_T)
+    cap = N_PART_T**3
+    g, diag = forces.force_short_tiled(
+        pos, N_FINE_T, L_BOX, N_PART_T**3, N_TILE_T, B_FINE_T, member_fn, cap,
+        r_s=R_S, fdtype=np.float32,
+    )
+    assert diag["fdtype"] == "float32"
+    assert _name(g) == "float32", "the accumulate sink is still allocating f64"
+
+
+def test_coarse_force_meshes_refuses_a_dtype_it_was_not_given():
+    """The seam that makes a non-applying knob impossible rather than unlikely.
+
+    A caller who narrows the delta but leaves the kernels f64 gets a solve that
+    promotes back: correct numbers, double the memory, no symptom. Casting the
+    delta to match would hide that, so a disagreement raises.
+    """
+    import jax.numpy as jnp
+
+    pos = _positions(84)
+    d32 = forces.density_f64(pos, N_MESH, L_BOX, N_PART**3, fdtype=jnp.float32)
+    with pytest.raises(ValueError, match="delta is float32 but fdtype is float64"):
+        forces.coarse_force_meshes(d32, N_MESH, L_BOX, "long", r_s=R_S, fdtype=np.float64)
+    # and the agreeing call is fine
+    assert _name(forces.coarse_force_meshes(d32, N_MESH, L_BOX, "long", r_s=R_S,
+                                            fdtype=np.float32)[0]) == "float32"
+
+
 # ====================================================== the two promotion traps
 
 
