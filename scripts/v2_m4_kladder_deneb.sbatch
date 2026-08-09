@@ -104,26 +104,11 @@ rm -f "$STAMP"
 
 echo ""
 echo "=== SLOPE ==="
-pixi run -e gpu python - <<'PY'
-import glob, json, math, os
-rows = []
-for p in sorted(glob.glob("runs/v2/m4_gate_cdev8_accuracy_k*.json")):
-    with open(p) as fh:
-        d = json.load(fh)
-    if d.get("E_max") and d.get("k"):
-        rows.append((int(d["k"]), float(d["E_max"]), os.path.basename(p)))
-rows.sort()
-for k, e, name in rows:
-    print(f"  K={k:3d}  E={e:.3e}   {name}")
-if len(rows) >= 2:
-    (k0, e0, _), (k1, e1, _) = rows[0], rows[-1]
-    slope = math.log(e1 / e0) / math.log(k1 / k0)
-    print(f"  slope d(log E)/d(log K) over K={k0}..{k1}: {slope:.2f}")
-    print("  ~0.5 = random walk (benign); ~1.0 = systematic bias (blocks adoption);")
-    print("  ~0.0 = one-off, and cdev's 4.0e-05 needs a different explanation")
-else:
-    print("  fewer than two rungs succeeded; no slope")
-PY
+# The readout used to be inline here and fitted ENDPOINTS ONLY, which reported a
+# tidy -0.13 for data whose middle rung is 10x both ends on the median. It is a
+# script now, it least-squares over all rungs, it shows residuals, and it checks
+# monotonicity SEPARATELY -- a slope through non-monotone data is not a result.
+pixi run -e gpu python scripts/v2_m4_kladder_readout.py
 
 echo ""
 echo "rungs rc=${rc};  fresh cards: ${n}"
