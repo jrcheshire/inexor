@@ -12,8 +12,27 @@ mbody owns MLX/Apple-Silicon).
 
 ## Current milestone
 
-**M-v2-1 (codec + layout) BUILT; next rung is M-v2-2 (force promotion).** The
-gate week (V1, V2a, V2b, V3) and the V4 architecture freeze are CLOSED:
+**M-v2-1 (codec + layout) and M-v2-2 (force promotion) are CLOSED; M-v2-3
+(engine core on T9 state) is OPEN.** M-v2-2's exit gate passed on Vista job
+897904 — 0 of 402,653,184 elements differ at cgh64, T=256/b=32, the
+configuration every D-v2-10/11/12 number was measured at
+(`runs/v2/m2_parity_record.md`); D-v2-16 clause 7's three geometries are
+satisfied. M-v2-3 plan: `~/.claude/plans/hashed-scribbling-falcon.md`.
+
+Two things M-v2-3's planning session established that no ADR yet carries.
+(1) **The tiled SHORT-range paint is order-dependent and has no integer twin**
+(`forces.tile_paint_f64`), so D-v2-14 clause 4's premise — the layout is
+admissible only because the paint is order-independent — is currently FALSE on
+the arm that carries most of the force; D-v2-16 clause 2 named only the coarse
+`paint_tsc_int`. Both arms flip to integer paints in M-v2-3 (JC, 2026-08-08).
+(2) **M-v2-3's written exit gate cannot be read literally**: no v1 parity config
+overlaps a v2 one (v1 is single-level at 2-4 Mpc/h, mesh:particle 1; v2 is
+0.25 Mpc/h at mesh:particle 2) and the v1 quantized arm's generator was deleted
+at the retirement. Replaced by a three-part gate — bitwise identity to the
+probe, the accumulated-quantization measurement re-run on the shipping
+architecture, and the surviving D-013 arms as a regression on the shared code.
+
+The gate week (V1, V2a, V2b, V3) and the V4 architecture freeze are CLOSED:
 D-v2-14..18 ratified 2026-08-08 and the build ladder is D-v2-18's seven rungs,
 M-v2-1 through M-v2-7. Two ADRs landed on top of the freeze the same day:
 **D-v2-19** (spare pools per brick; the re-sort is a monotone rearrangement,
@@ -41,6 +60,11 @@ conventions, gate D-013; Tier-B int16 below the mesh floor, gate D-014;
 2026-07-14 — the premise measured false** (`docs/retrospective.md` is the
 read-first record; D-015 passed before the halt). v1 M3/M4 are cancelled;
 `docs/roadmap.md` stands as the v1 historical record.
+**`runs/m1/` is ~1.3 GB, gitignored and NOT force-added** (`git ls-files runs/m1`
+is empty) — it exists on this laptop only. It holds the stored `mbody_final_*`,
+`disco_final_*` and `disco_coeffs_*` reference states that the surviving D-013
+arms compare against, so M-v2-3's regression leg depends on a working copy that
+no other machine can reconstruct. Do not move or clear it.
 
 Deneb working clone: `deneb:~/src/inexor` (fresh clone 2026-07-15, JC's
 `~/src` layout convention; origin = GitHub HTTPS + PAT via
