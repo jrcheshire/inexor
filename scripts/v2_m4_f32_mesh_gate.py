@@ -595,6 +595,64 @@ def main():
     return 0
 
 
+def _provenance(args):
+    """Where this card was produced and what was asked of it.
+
+    THE BACKEND IS THE LOAD-BEARING FIELD, and its absence was a real hole: every
+    card written before this one recorded no device at all, so a reading produced
+    on XLA-CPU was indistinguishable by inspection from one produced on CUDA.
+    They are not interchangeable. Leg 1 exists to be compared ACROSS configs --
+    the cdev8 K=10 anchor is only an anchor for a cgh64 K=10 reading -- and cgh64
+    cannot run anywhere but a cluster GPU, so an anchor on the CPU backend
+    silently fails the one axis it was built to hold fixed.
+
+    `host_cores` is here for the same reason and is not decoration: the XLA-CPU
+    reduction order follows the host core count, so two CPU cards from machines
+    of different width are not bitwise comparable either. `xla_flags` and
+    `omp_num_threads` record the two environment knobs that have been believed
+    to change this workload's threading; `--xla_cpu_multi_thread_eigen=false` was
+    measured INERT on 2026-08-09 (13.60 vs 13.51 mean cores on a matmul), so
+    recording the string is how a future reader finds that out rather than
+    re-assuming it worked.
+
+    `knobs` is the invocation's REQUEST, not a realized value. The engine reports
+    `_b_realized` for b_fine precisely because requested and realized differ, and
+    no EngineConfig or SlotState is in scope here. Read it as "what was asked
+    for", which is exactly what decides whether two cards are comparable: the
+    K-ladder and seed-replicate jobs both ran `--slack 0.20 --arena-frac 0.08`,
+    and nothing on their cards said so.
+
+    `argv` is recorded verbatim because it cannot misrepresent the run.
+    """
+    import jax
+
+    dev = jax.devices()[0]
+    try:
+        x64 = bool(jax.config.jax_enable_x64)
+    except Exception:
+        x64 = None
+    prov = dict(
+        backend=dev.platform,
+        device_kind=dev.device_kind,
+        n_devices=jax.device_count(),
+        host_cores=os.cpu_count(),
+        x64=x64,
+        jax_version=jax.__version__,
+        xla_flags=os.environ.get("XLA_FLAGS"),
+        omp_num_threads=os.environ.get("OMP_NUM_THREADS"),
+        argv=sys.argv[1:],
+    )
+    # the ladder is synthetic -- it builds no SlotState, so the capacity knobs
+    # are untouched defaults there and recording them would invent a constraint
+    # that never applied
+    if args.leg in ("accuracy", "fine", "ledger", "floors"):
+        prov["knobs"] = dict(
+            slack=args.slack, arena_frac=args.arena_frac,
+            tile=args.tile, buf=args.buf, k=args.k, seed=args.seed,
+        )
+    return prov
+
+
 def _write(res, args):
     import subprocess
 
@@ -605,6 +663,7 @@ def _write(res, args):
     except Exception:
         res["commit"] = None
     res["slurm_job_id"] = os.environ.get("SLURM_JOB_ID")
+    res["provenance"] = _provenance(args)
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"m4_gate_{args.config}_{args.leg}{args.out_suffix}.json")
     with open(path, "w") as fh:

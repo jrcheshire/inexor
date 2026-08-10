@@ -41,14 +41,58 @@ def load(pattern):
             d = json.load(fh)
         if "E_max" not in d or "k" not in d:
             continue
+        prov = d.get("provenance") or {}
+        knobs = prov.get("knobs") or {}
         rows.append(dict(
             k=int(d["k"]), seed=int(d.get("seed", 0)),
             e_max=float(d["E_max"]), e_med=float(d["E_median"]),
             bins=int(d.get("n_band_bins", 0)),
             vacuous=bool(d.get("vacuous", False)),
             card=os.path.basename(p),
+            backend=prov.get("backend"),
+            host_cores=prov.get("host_cores"),
+            slack=knobs.get("slack"),
+            arena_frac=knobs.get("arena_frac"),
         ))
     return rows
+
+
+def check_comparability(rows):
+    """Refuse to pool cards that are not measurements of the same thing.
+
+    A glob is not an experiment. These rungs are pooled into per-K means and a
+    slope, which is only meaningful if every card ran the same estimator on the
+    same machinery -- and two axes can break that silently:
+
+      BACKEND. XLA-CPU and CUDA are different computations, not the same
+      computation at different speeds, and the CPU reduction order additionally
+      follows the host core count. A cdev8 K=10 anchor measured on a laptop CPU
+      cannot baseline a cgh64 reading measured on a cluster GPU, which is the
+      whole reason the anchor exists.
+
+      CAPACITY. `slack` and `arena_frac` set the brick/arena headroom. The
+      K-ladder and seed-replicate jobs both ran 0.20/0.08 and NOTHING on their
+      cards recorded it, so for a while the only evidence they matched lived in
+      two sbatch files.
+
+    Cards written before provenance existed report None. That is reported as
+    UNKNOWN rather than assumed compatible: an absent field is not a pass.
+    """
+    def spread(field):
+        return sorted({r[field] for r in rows}, key=lambda v: (v is None, v))
+
+    problems = []
+    for field, label in (("backend", "backend"), ("host_cores", "host cores"),
+                         ("slack", "slack"), ("arena_frac", "arena_frac")):
+        vals = spread(field)
+        if len(vals) > 1:
+            detail = ", ".join(
+                f"{'UNKNOWN' if v is None else v}"
+                f" ({sum(1 for r in rows if r[field] == v)} cards)" for v in vals
+            )
+            problems.append(f"{label}: {detail}")
+    unknown = [r["card"] for r in rows if r["backend"] is None]
+    return problems, unknown
 
 
 def _stats(vals):
@@ -72,6 +116,25 @@ def main():
 
     ks = sorted({r["k"] for r in rows})
     print(f"{len(rows)} cards over K = {ks}\n")
+
+    # BEFORE any pooling: are these cards measurements of the same thing?
+    problems, unknown = check_comparability(rows)
+    if unknown:
+        print(f"WARNING: {len(unknown)} card(s) predate provenance and record no backend "
+              "or capacity knobs. They cannot be shown to be comparable, and an absent "
+              "field is not a pass:")
+        for c in unknown:
+            print(f"    {c}")
+        print()
+    if problems:
+        print("REFUSING to pool these cards -- they disagree on an axis that changes the "
+              "measurement:")
+        for p in problems:
+            print(f"    {p}")
+        print("\n  Per-K means and a slope over a mixed set would be arithmetic on "
+              "incommensurable numbers. Re-glob one homogeneous set, or re-run the odd "
+              "cards where the rest were measured.")
+        return 2
 
     means = {}
     for k in ks:
