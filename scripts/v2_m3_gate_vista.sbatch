@@ -60,6 +60,13 @@ if d[0].platform == 'cpu':
 
 export OMP_NUM_THREADS=72   # one Grace socket; the layout is host numpy
 
+# STAMP: the CARDS WRITTEN block counts only files newer than this. Added
+# 2026-08-09 (M-v2-4): the glob below had no freshness filter, so a job that
+# wrote NOTHING still passed its own "zero cards written" FATAL on a previous
+# job's files. That is the 896055 failure -- a green row for a run that produced
+# nothing -- surviving in the guard built to catch it.
+STAMP="$(mktemp)"; touch "$STAMP"
+
 # No `set -e`: the legs are independent and the cheapest run first, so a failure
 # in one must not delete the evidence from the others (M1 job 11's lesson).
 NAMES=(); CODES=()
@@ -88,16 +95,16 @@ for i in "${!NAMES[@]}"; do
 done
 
 echo ""
-echo "=== CARDS WRITTEN ==="
+echo "=== CARDS WRITTEN (this job only) ==="
 n=0
-for f in runs/v2/m3_gate_*.json; do
-  [ -e "$f" ] || continue
+while IFS= read -r f; do
   echo "  $f"; n=$((n+1))
-done
+done < <(find runs/v2 -maxdepth 1 -name 'm3_gate_*.json' -newer "$STAMP" 2>/dev/null)
 [ "$n" -eq 0 ] && echo "  (none)"
+rm -f "$STAMP"
 
 echo ""
-echo "legs ok: ${ok} of ${#NAMES[@]};  cards: ${n}"
+echo "legs ok: ${ok} of ${#NAMES[@]};  fresh cards: ${n}"
 [ "$ok" -gt 0 ] || { echo "FATAL: zero legs succeeded"; exit 1; }
-[ "$n" -eq 0 ] && { echo "FATAL: zero cards written"; exit 1; }
+[ "$n" -eq 0 ] && { echo "FATAL: zero cards written by THIS job"; exit 1; }
 exit 0

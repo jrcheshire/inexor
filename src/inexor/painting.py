@@ -23,6 +23,25 @@ from .codec import rint_i
 _CORNERS = [(dx, dy, dz) for dx in (0, 1) for dy in (0, 1) for dz in (0, 1)]
 
 
+def field_dtype(fdtype):
+    """Normalize and validate a MESH/FIELD dtype (M-v2-4).
+
+    The one check on the jnp side, so a typo or a half-precision experiment
+    fails at the call rather than producing a field nothing downstream expects.
+
+    **This is for FIELDS, never for paint ACCUMULATORS.** The accumulators are
+    fixed by D-006 and are not a knob: int32 for the deterministic primal
+    paints, f64 for the differentiable twins, int64 for the engine's host
+    accumulation. Narrowing an accumulator would make the primal an f32
+    scatter-add, which is non-associative on CUDA and is the archived M0 R1
+    counterexample. What M-v2-4 narrows is where a DECODED field is handed on.
+    """
+    dt = np.dtype(fdtype)
+    if dt not in (np.dtype(np.float32), np.dtype(np.float64)):
+        raise ValueError(f"field dtype must be float32 or float64, got {dt.name}")
+    return dt
+
+
 def _cic_pieces(positions, n_mesh, box_size):
     """Base cell (stop_gradient, mbody painting.py:33 pattern) + fractional offset."""
     d = box_size / n_mesh
@@ -295,7 +314,8 @@ def paint_tsc_int(positions, n_mesh, box_size, frac_bits=12, live=None):
     return mesh.reshape(N, N, N)
 
 
-def density_tsc(positions, n_mesh, box_size, n_particles_total, paint="f64", frac_bits=12):
+def density_tsc(positions, n_mesh, box_size, n_particles_total, paint="f64", frac_bits=12,
+                fdtype=jnp.float64):
     """delta from a TSC assignment -- the ONE interface over both TSC paints.
 
     paint="int": the deterministic primal path (D-006 compliant).
@@ -306,16 +326,80 @@ def density_tsc(positions, n_mesh, box_size, n_particles_total, paint="f64", fra
     measured; flipping the default moves those numbers, which is an ADR-level
     call rather than a promotion detail. M-v2-3 is where the engine chooses, and
     until then the D-006-compliant path exists and is tested but is opt-in.
+
+    `fdtype` (M-v2-4) is the dtype of the RETURNED FIELD. The decode and the
+    mean subtraction stay f64 whatever it is.
+
+    **HOW MUCH THAT ORDERING BUYS: almost nothing, measured.** It is kept
+    because it costs nothing and is never worse, not because it rescues a case.
+    Recording the measurement, because the plausible-sounding argument for it is
+    wrong and would otherwise get re-derived:
+
+      - `counts_from_int` is exact while the raw sums fit f32's significand.
+        The usual statement of that is "< 2^24", which is SUFFICIENT but not
+        necessary -- what matters is significand width, not magnitude, so
+        `5000 * 2^12 = 625 * 2^15` decodes exactly despite being 2.05e7.
+      - the coarse mean is exactly 8.0 at every config in the table (mesh:
+        particle 2, coarse = fine/4), and `2**-frac_bits` is a power of two, so
+        `counts / mean` is an exact rescaling that cannot move the significand.
+        **Without the `- 1.0` the two orders are therefore bitwise identical,
+        always** -- which is why `tile_delta_from_int`, whose field carries no
+        `- 1`, gains nothing at all from the f64 decode.
+      - with the `- 1.0` they can differ, but only for a cell whose raw sum
+        needs more than 24 bits, i.e. >= 512x the mean. A near-mean cell has a
+        raw sum around 2^15 and is exact in BOTH orders. Measured at a raw sum
+        of 2^24 + 12345: f64-then-narrow is exact, direct-f32 is off by 3.05e-5
+        on a delta of 511 -- 6e-8 relative, on the cells that matter least.
+
+    So the Sterbenz-cancellation argument for this ordering is true and
+    IRRELEVANT: the operands it protects were never inexact. Past the bound the
+    f32 decode still rounds to nearest deterministically, so D-006 is untouched
+    either way and what is at stake is exactness, not reproducibility.
     """
+    fdtype = field_dtype(fdtype)
     if paint == "int":
         check_tsc_paint_headroom(n_particles_total, frac_bits)
         counts = counts_from_int(paint_tsc_int(positions, n_mesh, box_size, frac_bits),
                                  frac_bits, fdtype=jnp.float64)
         mean = float(n_particles_total) / float(n_mesh) ** 3
-        return counts / mean - 1.0
+        return (counts / mean - 1.0).astype(fdtype)
     if paint == "f64":
-        return paint_tsc_f64(positions, n_mesh, box_size, n_particles_total)
+        return paint_tsc_f64(positions, n_mesh, box_size, n_particles_total).astype(fdtype)
     raise ValueError(f"paint must be 'int' or 'f64', got {paint!r}")
+
+
+# THE GATHER NARROWING RULE (M-v2-4), obeyed identically by all four gathers --
+# the two here, `forces.tile_gather_vector` and `forces.gather_coarse_subblock`.
+#
+# Accumulate in the FIELD's dtype, and narrow the three-factor corner weight to
+# that dtype AFTER forming the product, never before.
+#
+# Both halves are load-bearing.
+#
+#   - Following the field is what makes an f32 arm real. `dtype=gx.dtype` alone
+#     does NOT: the weights come from f64 positions, and `f32_acc + f64_w *
+#     f32_field` promotes the whole accumulation back to f64. Three of these
+#     four already read the field's dtype and still returned f64 for exactly
+#     that reason. `tests/test_force_dtypes.py` pins the trap.
+#   - Narrowing the PRODUCT rather than the per-axis weights is what keeps
+#     `gather_coarse_subblock` bitwise `tsc_read_vector`, which is a D-v2-16
+#     clause 3 contract that has already refused a `jax.jit` at 2.220e-16.
+#     f32(a)*f32(b)*f32(c) is not f32(a*b*c), so a gather that narrowed its axis
+#     weights first would compute the product at a different precision than the
+#     global gather it must match. MEASURED in situ, not argued: narrowing early
+#     breaks the f32 contract on 113 of 186 elements at 1.19e-7, on the UNMASKED
+#     path -- so it diverges everywhere, not only where padded rows are masked.
+#     The two `ww` expressions are bitwise equal today (same three factors, same
+#     left-to-right order, same corner sequence), and casting a bitwise-equal
+#     pair leaves it bitwise equal, so the contract survives at BOTH dtypes.
+#     (Masking is a second, independent reason not to touch `w_axis`: the
+#     sub-block gather zeroes its axis weights for padded rows and the global
+#     gather has no mask at all.)
+#
+# Positions, cell indices and the fractional offsets stay f64 throughout: at
+# C-gh a global coordinate is O(1024) coarse cells, where an f32 ulp is 6.1e-5
+# cells against a T9 quantum of 0.0039, and narrowing them would move which cell
+# a particle lands in near a boundary.
 
 
 def tsc_read_vector(gx, gy, gz, positions, n_mesh, box_size):
@@ -324,17 +408,21 @@ def tsc_read_vector(gx, gy, gz, positions, n_mesh, box_size):
     The GATHER has no determinism problem at all -- it is a read followed by a
     per-particle sum in a fixed unrolled order, with no atomics -- so unlike the
     paint it needs no integer twin.
+
+    Dtype follows the field, per the narrowing rule above.
     """
     N = int(n_mesh)
     cell = float(box_size) / N
     base, w = _tsc_pieces(positions, cell)
     fx, fy, fz = gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)
     n = positions.shape[0]
-    ax = jnp.zeros((n,), dtype=gx.dtype)
-    ay = jnp.zeros((n,), dtype=gx.dtype)
-    az = jnp.zeros((n,), dtype=gx.dtype)
+    dt = gx.dtype
+    ax = jnp.zeros((n,), dtype=dt)
+    ay = jnp.zeros((n,), dtype=dt)
+    az = jnp.zeros((n,), dtype=dt)
     for corner in _TSC_CORNERS:
         flat, ww = _tsc_corner_flat_weight(base, w, corner, N)
+        ww = ww.astype(dt)
         ax = ax + ww * fx[flat]
         ay = ay + ww * fy[flat]
         az = az + ww * fz[flat]
@@ -343,15 +431,20 @@ def tsc_read_vector(gx, gy, gz, positions, n_mesh, box_size):
 
 def cic_read_vector(gx, gy, gz, positions, n_mesh, box_size):
     """Read 3 mesh fields with ONE shared CIC stencil (mbody painting.py:105;
-    ~40% reverse-mode memory saving measured there)."""
+    ~40% reverse-mode memory saving measured there).
+
+    Dtype follows the field, per the narrowing rule above.
+    """
     base, frac = _cic_pieces(positions, n_mesh, box_size)
     fx, fy, fz = gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)
     n = positions.shape[0]
-    ax = jnp.zeros((n,), dtype=gx.dtype)
-    ay = jnp.zeros((n,), dtype=gx.dtype)
-    az = jnp.zeros((n,), dtype=gx.dtype)
+    dt = gx.dtype
+    ax = jnp.zeros((n,), dtype=dt)
+    ay = jnp.zeros((n,), dtype=dt)
+    az = jnp.zeros((n,), dtype=dt)
     for corner in _CORNERS:
         flat, w = _corner_flat_weight(base, frac, corner, n_mesh)
+        w = w.astype(dt)
         ax = ax + w * fx[flat]
         ay = ay + w * fy[flat]
         az = az + w * fz[flat]

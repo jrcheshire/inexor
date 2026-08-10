@@ -865,6 +865,25 @@ ratifying it did not measure it.
      96 GB of HBM. Sub-block staging makes the whole force path O(tile) in
      device memory and removes the C-hero cliff by construction. (Derived, not
      measured.)
+
+     > **Correction, M-v2-4, 2026-08-09 (figures only; the decision stands).**
+     > Clause 3's two numbers are **f32**: 3 x 1024^3 x 4 B and 3 x 2048^3 x 4 B.
+     > `v4_architecture_record.md` item 6 derived them and labelled the dtype;
+     > this clause dropped the qualifier when it condensed, and so did the
+     > matching comment in `forces.py`. **The shipped engine has been running
+     > f64** -- `split_kernels` built its kernels at `np.float64` and the
+     > streamed coarse decode returns f64 -- so the resident cost has been
+     > **25.8 GB at C-gh and 206 GB at C-hero**, 2x this clause, from the freeze
+     > until M-v2-4. Nothing in the decision changes: staging removes the cliff
+     > at either dtype, more emphatically at f64, and clause 3's *reason* for
+     > being structural rather than an optimization is unaffected. What changes
+     > is that the C-gh figure was not the one the engine was paying. M-v2-4
+     > makes the artifact match the f32 row and replaces "derived, not measured"
+     > with a measured ladder over n_coarse = 128..2048.
+     >
+     > NB `g4_record.md` also carries a 103 GB, for C-gh's f32 POSITIONS
+     > (2048^3 x 3 x 4 B). Same arithmetic, different object; not the same
+     > number twice.
   4. **Geometry: T=256, b=32 for C-gh**, chosen on `cap` per
      `v4_pricing_record.md` section 7 and now supported by a second,
      independent argument -- gather saturates near 18 GB/s only at >= 256 KB
@@ -1143,3 +1162,69 @@ ratifying it did not measure it.
   reproduces the stored v1 reference EXACTLY (0.000e+00 cells), so the shared
   force/paint stack has not moved and D-013 is re-runnable, not only
   re-readable.
+
+## D-v2-22 -- The coarse force mesh is f32, and the prediction it missed is recorded as missed
+
+- **Status:** accepted (JC, 2026-08-10, clause by clause in session). Supplies
+  the measurement D-v2-16 clause 3 asserted without one, and discharges
+  D-v2-18's M-v2-4 row. Amends no ratified decision.
+- **Record:** `runs/v2/m4_f32_mesh_record.md`; deneb 399/400/408/410/411, Vista
+  899070 (partial), antares 415/416/417; cards `runs/v2/m4_gate_*.json`; probe
+  `scripts/v2_m4_f32_mesh_gate.py`.
+- **Decision:**
+  1. **The coarse force mesh is f32.** Measured saving on peak host memory is
+     **1.830x at n_coarse=1024** (88.36 -> 48.29 GiB), reproduced across
+     independent jobs and with the `f64_whole/f64_slab` control at 1.0000, so
+     the figure is not being credited with S6's slabbed decode. The fine mesh is
+     NOT changed: f32 pays on the coarse arm at hero scale and not on the tiled
+     fine mesh, and no fine-mesh adoption is proposed.
+  2. **Accuracy: tier 1 passed, tier 2 MISSED, and the miss is recorded as a
+     miss.** All 16 cards clear the 3.0e-3 budget share by 18x to 227x. **None**
+     reaches the pre-registered few x 1e-6 expectation; per-rung means sit 3.6,
+     7.5 and 5.7 times 1e-5 at K=20/40/80, which is 2.3-3.6 sigma above it. The
+     floors are reported as CONTEXT and deliberately not converted into the bar:
+     gating on a mesh floor was refused when this milestone's bar was set, and
+     converting one now would be a post-hoc statistic swap.
+  3. **What makes the miss tolerable is a measurement, not an argument.** On the
+     same estimand, same band and same config, the f64 reference already carries
+     **3.590e-2** from its own coarse mesh being finite, and **4.783e-2** from
+     its time step. E is 210x to 2718x below the first. A term three orders under
+     an error already accepted in the same quantity cannot change a result.
+  4. **No K-dependence and no volume dependence are readable.** deneb 399's
+     apparent K=40 anomaly was seed 0 scatter, killed by 400's replicates (1.78
+     sigma above K=20, 0.63 above K=80) against per-rung scatter of 41-73%. E
+     does not grow from cdev8 to cdev, a factor of 8 in volume. **The 512^3
+     rung is dropped** (JC): a paper-grade final validation is the context in
+     which a run at that scale earns its cost.
+  5. **Two cards above the 1e-4 investigation line are CLOSED** (JC), as single
+     seeds inside the measured per-rung scatter. `E_max` is a max over 25-51 bins
+     and therefore extreme-value; medians sit 3-8x lower and nearer the tier-2
+     prediction. Noted once. The statistic is not swapped.
+  6. **The pre-registered mechanism for the memory ratio was WRONG, and the
+     correction matters more than the number.** It predicted an approach to 2.0
+     as a fixed baseline dilutes. The peak decomposes exactly as 0.22 GiB
+     baseline + **8.0 B/cell int64 paint accumulator** + 40.1 B/cell float
+     working set at f32, reproducing both rungs to four digits. The accumulator
+     scales as n^3 exactly as the float payload does, so it never dilutes, and
+     the harness asymptote is 1.834 rather than 2.0. **That ceiling belongs to
+     the harness, not the engine**: `ladder_worker` holds the accumulator live
+     through the solve while `engine.py:372` frees it before line 375 solves.
+     Netted out, the ratio is 1.960 and 1.9945 at n=512 and n=1024. Both numbers
+     stand in the record because the second is a code reading, not a measurement.
+  7. **The adoption rationale includes a forward-looking argument that is NOT
+     ours to claim as measured** (JC): f32 is what accelerator hardware is
+     prioritizing, so the memory saving may carry a wallclock saving on the right
+     hardware. The f32 arm's solve is faster at every rung here (13.40 s vs
+     21.61 s at n=1024) but that is an XLA-CPU harness on one node and no
+     wallclock claim is made from it.
+- **What this does NOT establish.** The engine's end-to-end peak: this leg
+  measures the coarse-mesh working set in isolation, and the engine's true peak
+  may be set during the streamed paint where the accumulator IS co-resident.
+  Production scale: the largest rung measured is n_coarse=1024 and the C-gh
+  saving is this measurement carried up by arithmetic, reported as a bound.
+  Out-of-core behaviour at any rung. One seed at the cdev volume rung.
+  NB `cells_inexact_f32_max` went nonzero for the first time (2 of 2,097,152
+  cells at cdev). It is a headroom canary on a conversion **nothing performs** --
+  `engine.py:340` decodes the integer sum through f64 and narrows only the
+  order-unity result -- and it is a different quantity from D-v2-20's bucket
+  index, where narrowing to uint16 wrapped modularly. No action.
