@@ -52,26 +52,33 @@
 # expected at ~1.0 and is the control; if it is not ~1.0 the milestone's headline
 # ratio is contaminated.
 #
-# RUNGS 128 256 512. Extrapolating n^3 from the arm measured locally on CPU
-# (n=256: 1.880 GiB f64, 1.089 GiB f32, ratio 1.727, on a ~0.15-0.25 GiB
-# interpreter baseline):
+# RUNGS 128 256 512 by default, now with the top rung MEASURED rather than
+# projected (jobs 415/416, antares, f64_slab arm):
 #
-#     n=512    13.3 GiB f64 /  7.0 GiB f32     fits inside this 32G request
-#     n=1024  104.6 GiB f64 / 53.9 GiB f32     antares only, and tight
-#     n=2048  834.8 GiB f64 / 429.8 GiB f32    out of reach entirely
+#     n=128     0.65 GiB f64 /  0.65 GiB f32    baseline-dominated, ratio 1.000
+#     n=256     1.48 GiB f64 /  0.93 GiB f32    ratio 1.594 / 1.615
+#     n=512    11.25 GiB f64 /  6.23 GiB f32    ratio 1.805 / 1.805
+#     n=1024   ~90    GiB f64 / ~50    GiB f32  extrapolated x8 from n=512
+#     n=2048   ~720   GiB f64 / ~400   GiB f32  out of reach entirely
+#
+# The n=1024 figure is 8x the MEASURED n=512 arm, not the older 104.6 GiB
+# projected from n=256, and it is the number the --mem=110G override is sized
+# against. antares has 124 GB and is the only node that can host it, so the
+# override pins placement by memory rather than by name, as above.
 #
 # The leg reads RATIOS WITHIN a rung, so it needs BOTH arms alive at a rung to
-# yield anything, and the f64 arm dies first. n=1024 is newly plausible on
-# antares's 124 GB (the old header called it unreachable against deneb's 56 GB)
-# but it is not requested here: it would pin the job to one node at ~110G and
-# the f64 arm could still die and return no ratio. Recorded as an option, not
-# taken silently.
+# yield anything, and the f64 arm dies first. If n=1024's f64 arm does not fit,
+# the content check below fails the job on a missing top rung -- which is the
+# correct signal for a job whose whole purpose is that rung, and the surviving
+# lower rungs land on their own card because of SUFFIX.
 #
-# The leg's stated expectation is testable at 512: `f64_slab/f32_slab` should
-# approach 2.0 FROM BELOW as the fixed baseline dilutes, and the n=512
-# projection is already ~1.90. What is NOT tested is that it keeps approaching,
-# and an out-of-core coarse mesh at C-hero scale is unmeasured by this leg
-# either way. That is a real limit to record rather than paper over.
+# WHAT THE MEASURED RUNGS DO AND DO NOT SETTLE. `f64_slab/f32_slab` was
+# pre-registered to approach 2.0 FROM BELOW as the fixed interpreter baseline
+# dilutes, and 1.000 -> 1.594 -> 1.805 is that. The n=1024 rung is what turns
+# "approaching" into a trend with a fourth point; the predicted value is ~1.93.
+# An out-of-core coarse mesh at C-hero scale is unmeasured by this leg at any
+# rung, and the production-scale saving is this measurement carried up by
+# arithmetic rather than a reading. Both limits belong in the record.
 #
 # ONE SUBPROCESS PER (rung, arm), which the leg already does: ru_maxrss is a
 # high-water mark that never resets, so arms measured in one process report a
@@ -109,8 +116,16 @@ if d[0].platform != 'cpu':
 echo "--- host memory, against which the rung ceiling was chosen ---"
 free -g | head -2
 
-RUNGS="128 256 512"
-CARD=runs/v2/m4_gate_cdev_ladder.json
+# Overridable so the top-rung extension does not need a second copy of this file:
+#   sbatch --mem=110G --export=ALL,RUNGS="512 1024",SUFFIX="_top" <this>
+# 512 is carried into that run deliberately, as an overlap rung: it is measured
+# here already, so a disagreement between the two jobs is visible rather than
+# assumed away. SUFFIX keeps the extension on its own card so a rung that OOMs
+# cannot destroy the card that measured.
+RUNGS="${RUNGS:-128 256 512}"
+SUFFIX="${SUFFIX:-}"
+CARD="runs/v2/m4_gate_cdev_ladder${SUFFIX}.json"
+echo "rungs: ${RUNGS}   card: ${CARD}"
 
 STAMP="$(mktemp)"; touch "$STAMP"
 
@@ -122,7 +137,7 @@ STAMP="$(mktemp)"; touch "$STAMP"
 # that is intended, since a card whose every ratio reads 1.000 has no value to
 # preserve and leaving it invites it being read as a measurement.
 pixi run -e default python scripts/v2_m4_f32_mesh_gate.py \
-    --config cdev --leg ladder --rungs ${RUNGS}
+    --config cdev --leg ladder --rungs ${RUNGS} --out-suffix "${SUFFIX}"
 rc=$?
 
 echo ""
@@ -130,7 +145,7 @@ echo "=== CARDS WRITTEN (this job only) ==="
 n=0
 while IFS= read -r f; do
   echo "  $f"; n=$((n+1))
-done < <(find runs/v2 -maxdepth 1 -name 'm4_gate_cdev_ladder.json' -newer "$STAMP" 2>/dev/null)
+done < <(find runs/v2 -maxdepth 1 -name "$(basename "$CARD")" -newer "$STAMP" 2>/dev/null)
 [ "$n" -eq 0 ] && echo "  (none)"
 rm -f "$STAMP"
 
