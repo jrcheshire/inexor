@@ -138,12 +138,36 @@ rm -f "$STAMP"
 
 # A card that EXISTS is not a card that MEASURED. deneb 409 wrote this exact
 # file with rc=0 while 5 of 9 arms were dead and every surviving ratio was
-# exactly 1.000, so the file-exists check above passed on a void run. Assert the
-# CONTENT: a ratio per requested rung, the backend it was taken on, and that the
-# dtype ratio is not pinned at 1.0 (which is the signature of a peak the host
-# cannot see).
+# exactly 1.000, so the file-exists check above passed on a void run.
+#
+# WHAT THE VOID SIGNATURE ACTUALLY IS, corrected after job 415. The first form
+# of this check failed a rung whose ratio sat at 1.000000, and it failed 415 --
+# a run that measured perfectly well -- on rung 128 alone. `ru_maxrss` is a
+# high-water mark over the WHOLE process, so a rung reads 1.0 whenever the peak
+# is set by the jax import and XLA compile footprint rather than by the arrays:
+# at n=128 the dtype-sensitive payload is ~50 MB against a 0.65 GiB floor, and
+# both arms hit the identical import-driven maximum. That is baseline
+# domination, and it is physics, not blindness. 415's rungs read 1.000 / 1.594 /
+# 1.805, which is the predicted approach to 2.0 from below with the smallest
+# rung swamped.
+#
+# The 409 failure is distinguishable and the discriminator is the LARGEST rung,
+# where the payload is largest relative to the fixed baseline. When the host
+# cannot see the mesh at all, EVERY rung reads 1.0 including the top one. So the
+# rule is: the top rung must separate, and not every rung may be pinned. That
+# still fails 409 exactly as before. Relaxing "no rung at 1.0" to this is a
+# correction to a check I specified wrong, not a loosened tolerance -- the
+# science bar for this leg is D-v2-16 clause 3's residency claim, and nothing
+# about it moved.
+#
+# The control is now asserted too, which the first form omitted entirely: the
+# header says a `f64_whole_over_f64_slab` away from ~1.0 means the headline
+# ratio is contaminated by S6's slabbed decode, and a stated invariant no
+# consumer checks is decoration. 5% window; 415 read 0.9960 and 1.0002.
 pixi run -e default python - "$CARD" ${RUNGS} <<'PY'
 import json, sys
+
+CTL_TOL = 0.05
 
 card, rungs = sys.argv[1], sys.argv[2:]
 d = json.load(open(card))
@@ -154,6 +178,7 @@ bad = []
 if prov.get("backend") != "cpu":
     bad.append("backend is %r, not 'cpu'" % prov.get("backend"))
 
+separated = []
 for n in rungs:
     r = ratios.get(n)
     if r is None:
@@ -161,13 +186,38 @@ for n in rungs:
         continue
     dt = r.get("f64_slab_over_f32_slab")
     ctl = r.get("f64_whole_over_f64_slab")
-    print("  rung %-5s f64_slab/f32_slab = %.4f   control f64_whole/f64_slab = %s"
-          % (n, dt, "None" if ctl is None else "%.4f" % ctl))
+    pinned = dt is not None and abs(dt - 1.0) < 1e-6
+    print("  rung %-5s f64_slab/f32_slab = %s   control f64_whole/f64_slab = %s%s"
+          % (n, "None" if dt is None else "%.4f" % dt,
+             "None" if ctl is None else "%.4f" % ctl,
+             "   (baseline-dominated)" if pinned else ""))
     if dt is None:
         bad.append("rung %s dtype ratio is null" % n)
-    elif abs(dt - 1.0) < 1e-6:
-        bad.append("rung %s dtype ratio is 1.000000 -- the 409 signature, host "
-                   "memory blind to the mesh" % n)
+        continue
+    if not pinned:
+        separated.append((n, dt))
+        # the control only means something where the arms separate at all
+        if ctl is not None and abs(ctl - 1.0) > CTL_TOL:
+            bad.append("rung %s control f64_whole/f64_slab = %.4f, outside 1 +/- %.2f "
+                       "-- the headline ratio is contaminated by the slabbed decode"
+                       % (n, ctl, CTL_TOL))
+
+if ratios and not separated:
+    bad.append("EVERY rung is pinned at 1.000000 -- the 409 signature, host memory "
+               "blind to a mesh that is not on the host")
+elif separated:
+    top = rungs[-1]
+    if top not in [n for n, _ in separated]:
+        # only reachable when the top rung HAS a ratio; an absent one is already
+        # reported above, and calling that "pinned" would misdescribe it
+        if ratios.get(top) is not None:
+            bad.append("the top rung %s is pinned at 1.000000 -- it carries the largest "
+                       "payload against the fixed baseline, so it is the rung that "
+                       "cannot be baseline-dominated" % top)
+    else:
+        print("  separation at %d of %d rungs; top rung %s reads %.4f"
+              % (len(separated), len(rungs), top,
+                 dict(separated)[top]))
 
 dead = [r for r in d.get("rows", []) if r.get("failed")]
 if dead:
