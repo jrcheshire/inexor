@@ -12,7 +12,28 @@ mbody owns MLX/Apple-Silicon).
 
 ## Current milestone
 
-**M-v2-1, M-v2-2 and M-v2-3 are CLOSED; M-v2-4 (f32 force mesh) is next.**
+**M-v2-1 through M-v2-4 are CLOSED; M-v2-5 (streamed ICs + out-of-core FFT) is
+next.**
+
+**M-v2-4 (f32 coarse force mesh) closed 2026-08-10, ratified as D-v2-22**
+(record `runs/v2/m4_f32_mesh_record.md`). The coarse mesh is f32; the FINE mesh
+is not, and no fine-mesh adoption is proposed. Measured saving **1.830x** on
+peak host memory at n_coarse=1024 (88.36 -> 48.29 GiB, antares 415/416/417,
+control at 1.0000). Accuracy passes the 3.0e-3 budget share by 18-227x across
+16 cards and **misses the pre-registered few x 1e-6 expectation on every one**,
+recorded as a miss: what makes it tolerable is that the f64 reference already
+carries 3.590e-2 from its own coarse mesh being finite, measured on the same
+estimand and band, so E sits 210-2718x under it. Two cards above the 1e-4
+investigation line are closed as seed scatter (41-73% per rung).
+**The pre-registered approach-to-2.0 mechanism was wrong** and the correction is
+the useful part: the peak is 0.22 GiB baseline + **8.0 B/cell int64 paint
+accumulator** + 40.1 B/cell float working set at f32, so what caps the ratio
+scales as n^3 and never dilutes. That ceiling is the HARNESS's -- `engine.py:372`
+frees the accumulator before line 375 solves, which the ladder worker does not --
+so the engine-relevant ratio is 1.9945. Charter gate unrunnable for the second
+milestone running (`v2_g3_floors.py` drives the frozen probe's single-level
+monolithic force, so a package dtype never reaches it).
+
 M-v2-3's exit gate passed all three parts (Vista 898169/898242, record
 `runs/v2/m3_engine_record.md`, ratified as **D-v2-21**): the engine's force is
 bitwise the ratified path's at cgh64 -- 0 of 402,653,184 elements, driven from a
@@ -100,7 +121,7 @@ explicit `--mem` (see the umbrella albireo memory).
   the load-bearing novel pieces.
 - `docs/roadmap.md` — master plan M0-M4; M0 is a HARD go/no-go gate; each
   milestone gets a fresh detailed plan at its opening session.
-- `docs/decisions.md` — ADR log (D-001..D-015, D-v2-8..D-v2-20; D-v2-1..7 live
+- `docs/decisions.md` — ADR log (D-001..D-015, D-v2-8..D-v2-22; D-v2-1..7 live
   in the plan-plan table). Locked until re-litigated with JC. Note two ADRs
   supersede parts of D-v2-14: D-v2-19 (clause 3, layout) and D-v2-20 (clause
   2's index term) — read those before quoting a B/p figure.

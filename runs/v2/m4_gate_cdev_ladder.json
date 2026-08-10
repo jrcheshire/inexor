@@ -1,0 +1,138 @@
+{
+ "rows": [
+  {
+   "n_coarse": 128,
+   "arm": "f64_whole",
+   "dtype": "float64",
+   "force_mesh_dtype": "float64",
+   "rss_after_mesh_bytes": 702173184,
+   "rss_after_decode_bytes": 702173184,
+   "peak_rss_bytes": 702173184,
+   "solve_wall_s": 0.10205267183482647
+  },
+  {
+   "n_coarse": 128,
+   "arm": "f64_slab",
+   "dtype": "float64",
+   "force_mesh_dtype": "float64",
+   "rss_after_mesh_bytes": 702173184,
+   "rss_after_decode_bytes": 702173184,
+   "peak_rss_bytes": 702173184,
+   "solve_wall_s": 0.10451046470552683
+  },
+  {
+   "n_coarse": 128,
+   "arm": "f32_slab",
+   "dtype": "float32",
+   "force_mesh_dtype": "float32",
+   "rss_after_mesh_bytes": 702173184,
+   "rss_after_decode_bytes": 702173184,
+   "peak_rss_bytes": 702173184,
+   "solve_wall_s": 0.0905838287435472
+  },
+  {
+   "n_coarse": 256,
+   "arm": "f64_whole",
+   "dtype": "float64",
+   "force_mesh_dtype": "float64",
+   "rss_after_mesh_bytes": 702173184,
+   "rss_after_decode_bytes": 702173184,
+   "peak_rss_bytes": 1581977600,
+   "solve_wall_s": 0.37209481513127685
+  },
+  {
+   "n_coarse": 256,
+   "arm": "f64_slab",
+   "dtype": "float64",
+   "force_mesh_dtype": "float64",
+   "rss_after_mesh_bytes": 702173184,
+   "rss_after_decode_bytes": 702173184,
+   "peak_rss_bytes": 1588092928,
+   "solve_wall_s": 0.357371028047055
+  },
+  {
+   "n_coarse": 256,
+   "arm": "f32_slab",
+   "dtype": "float32",
+   "force_mesh_dtype": "float32",
+   "rss_after_mesh_bytes": 702173184,
+   "rss_after_decode_bytes": 702173184,
+   "peak_rss_bytes": 983150592,
+   "solve_wall_s": 0.26094975462183356
+  },
+  {
+   "n_coarse": 512,
+   "arm": "f64_whole",
+   "dtype": "float64",
+   "force_mesh_dtype": "float64",
+   "rss_after_mesh_bytes": 2297139200,
+   "rss_after_decode_bytes": 4444889088,
+   "peak_rss_bytes": 12082118656,
+   "solve_wall_s": 2.557622221764177
+  },
+  {
+   "n_coarse": 512,
+   "arm": "f64_slab",
+   "dtype": "float64",
+   "force_mesh_dtype": "float64",
+   "rss_after_mesh_bytes": 2296602624,
+   "rss_after_decode_bytes": 2363965440,
+   "peak_rss_bytes": 12081299456,
+   "solve_wall_s": 2.5759053910151124
+  },
+  {
+   "n_coarse": 512,
+   "arm": "f32_slab",
+   "dtype": "float32",
+   "force_mesh_dtype": "float32",
+   "rss_after_mesh_bytes": 2296590336,
+   "rss_after_decode_bytes": 2296590336,
+   "peak_rss_bytes": 6692999168,
+   "solve_wall_s": 1.6914923307485878
+  }
+ ],
+ "ratios": {
+  "128": {
+   "f64_slab_over_f32_slab": 1.0,
+   "f64_whole_over_f64_slab": 1.0
+  },
+  "256": {
+   "f64_slab_over_f32_slab": 1.615309944297933,
+   "f64_whole_over_f64_slab": 0.9961492631242295
+  },
+  "512": {
+   "f64_slab_over_f32_slab": 1.8050651363834145,
+   "f64_whole_over_f64_slab": 1.0000678072754494
+  }
+ },
+ "note": "one SUBPROCESS per (rung, arm): ru_maxrss is a high-water mark and never resets, so arms measured in one process report a monotone rise and the last arm always reads highest. Read the ratios, not the absolute peaks -- those carry a ~0.25 GiB interpreter+jax baseline.",
+ "reading": "`f64_whole_over_f64_slab` is the arm that keeps the dtype reading honest, and it is expected to be ~1.0: the slabbed decode shrinks the DECODE phase but the process high-water mark is set later, by the solve (kernel build + kernels + dk + three force meshes), and the decode transient is freed before any of that is allocated. So slabbing is not a peak reduction and must not be reported as one -- it would become one only if the solve's own peak came down, e.g. by caching the coarse kernels. `f64_slab_over_f32_slab` is the milestone's number and should approach 2.0 from below as the fixed baseline dilutes.",
+ "determinism": {
+  "n_diff": 0,
+  "occupied_cells": 158539,
+  "ok": true
+ },
+ "wall_s": 27.26290415180847,
+ "commit": "e88fb620d14019ad78507119e5365321511042de",
+ "slurm_job_id": "416",
+ "provenance": {
+  "backend": "cpu",
+  "device_kind": "cpu",
+  "n_devices": 1,
+  "host_cores": 28,
+  "x64": true,
+  "jax_version": "0.10.2",
+  "xla_flags": null,
+  "omp_num_threads": "8",
+  "argv": [
+   "--config",
+   "cdev",
+   "--leg",
+   "ladder",
+   "--rungs",
+   "128",
+   "256",
+   "512"
+  ]
+ }
+}
