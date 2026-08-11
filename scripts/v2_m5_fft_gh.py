@@ -50,7 +50,6 @@ being the production node whose host budget the claim is about):
 
 import argparse
 import hashlib
-import json
 import os
 import resource
 import sys
