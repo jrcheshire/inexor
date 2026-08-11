@@ -120,31 +120,33 @@ def lpt2_source_from_spec(delta_k, n_mesh, box_size, resident="mid", workdir=Non
     if workdir is None:
         raise ValueError("resident='low' stages derivatives to disk and requires workdir")
 
-    paths = {}
+    # StagedArray, not memmap: dirty mapped pages count in the process's RSS
+    # and would misreport the residency this policy exists to avoid (see
+    # ooc_fft.StagedArray).
+    staged = {}
     for i, j in _DIAG + _OFFDIAG:
-        path = os.path.join(workdir, f"phi_{i}{j}.npy")
-        mm = np.lib.format.open_memmap(path, mode="w+", dtype=rdt, shape=(n, n, n))
+        sa = ooc_fft.StagedArray.create(
+            os.path.join(workdir, f"phi_{i}{j}.npy"), rdt, (n, n, n)
+        )
         spec_ij = ooc_fft.deriv2_spec(delta_k, i, j, n, box_size, slab=slab)
         for lo, s in ooc_fft.inverse_to_slabs(spec_ij, n, slab=slab):
-            mm[lo : lo + s.shape[0]] = s
-        mm.flush()
-        del mm, spec_ij
-        paths[(i, j)] = path
+            sa.write_slab(lo, s)
+        del spec_ij
+        staged[(i, j)] = sa
 
-    mms = {ij: np.load(paths[ij], mmap_mode="r") for ij in _DIAG + _OFFDIAG}
     out = np.empty((n, n, n), dtype=rdt)
     for lo in range(0, n, slab):
         hi = min(lo + slab, n)
-        xx = np.asarray(mms[(0, 0)][lo:hi])
-        yy = np.asarray(mms[(1, 1)][lo:hi])
-        zz = np.asarray(mms[(2, 2)][lo:hi])
+        xx = staged[(0, 0)].read_slab(lo, hi)
+        yy = staged[(1, 1)].read_slab(lo, hi)
+        zz = staged[(2, 2)].read_slab(lo, hi)
         # the SAME per-element op sequence as the "mid" branch, slab-viewed
         a = xx * yy
         a += xx * zz
         a += yy * zz
         del xx, yy, zz
         for ij in _OFFDIAG:
-            t = np.asarray(mms[ij][lo:hi])
+            t = staged[ij].read_slab(lo, hi)
             a -= t * t
         out[lo:hi] = a
     return out

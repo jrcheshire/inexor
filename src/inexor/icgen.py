@@ -55,20 +55,18 @@ SCHEMA = "t9-slabs-1"
 MANIFEST = "manifest.json"
 
 
-def _open_stage(workdir, name, dtype, shape):
-    return np.lib.format.open_memmap(
-        os.path.join(workdir, name), mode="w+", dtype=dtype, shape=shape
-    )
-
-
 def _stage_spec_to(workdir, name, spec, n, slab):
-    """Inverse-transform a spectrum (consuming it) into a staged memmap."""
+    """Inverse-transform a spectrum (consuming it) into a StagedArray.
+
+    Explicit IO, never memmap: dirty mapped pages count in the process's RSS
+    and would misreport the very residency the staging exists to avoid (see
+    ooc_fft.StagedArray).
+    """
     rdt = np.float64 if spec.dtype == np.complex128 else np.float32
-    mm = _open_stage(workdir, name, rdt, (n, n, n))
+    sa = ooc_fft.StagedArray.create(os.path.join(workdir, name), rdt, (n, n, n))
     for lo, s in ooc_fft.inverse_to_slabs(spec, n, slab=slab):
-        mm[lo : lo + s.shape[0]] = s
-    mm.flush()
-    return os.path.join(workdir, name)
+        sa.write_slab(lo, s)
+    return sa
 
 
 def generate_t9_slabs(
@@ -119,30 +117,25 @@ def generate_t9_slabs(
     ooc_fft.mul_radial_inplace(
         spec, n, box, ic._poisson_fn(cosmo, tab, inverse=True), dc_value=1.0, slab=slab
     )
-    phi_path = os.path.join(stage, "phi.npy")
-    phi_mm = _open_stage(stage, "phi.npy", dt, (n, n, n))
+    phi_sa = ooc_fft.StagedArray.create(os.path.join(stage, "phi.npy"), dt, (n, n, n))
     tot = 0.0
     for lo, s in ooc_fft.inverse_to_slabs(spec, n, slab=slab):
-        phi_mm[lo : lo + s.shape[0]] = s
+        phi_sa.write_slab(lo, s)
         tot = ic.sq_sum_by_plane(s, tot)
-    phi_mm.flush()
-    del spec, phi_mm
+    del spec
     mean_phi2 = tot / n**3
 
-    phi_ro = np.load(phi_path, mmap_mode="r")
-
     def _png_slab(lo, hi):
-        p = np.asarray(phi_ro[lo:hi])
+        p = phi_sa.read_slab(lo, hi)
         return p + np.asarray(f_NL, dtype=p.dtype) * (p * p - np.asarray(mean_phi2, p.dtype))
 
     spec = ooc_fft.forward_from_slabs(_png_slab, n, slab=slab)
     ooc_fft.mul_radial_inplace(spec, n, box, ic._poisson_fn(cosmo, tab), dc_value=1.0, slab=slab)
-    delta_path = _stage_spec_to(stage, "delta.npy", spec, n, slab)
+    delta_sa = _stage_spec_to(stage, "delta.npy", spec, n, slab)
     del spec
 
     # --- LPT, streamed (lpt.lpt_ics's exact op sequence, order=2) ----------
-    delta_ro = np.load(delta_path, mmap_mode="r")
-    spec = ooc_fft.forward_from_slabs(lambda lo, hi: np.asarray(delta_ro[lo:hi]), n, slab=slab)
+    spec = ooc_fft.forward_from_slabs(delta_sa.read_slab, n, slab=slab)
     for ax in range(3):
         _stage_spec_to(stage, f"psi1_{ax}.npy",
                        ooc_fft.grad_invk2_spec(spec, ax, n, box, slab=slab), n, slab)
@@ -164,25 +157,22 @@ def generate_t9_slabs(
     vmax = 0.0
     umax = 0.0
     for ax in range(3):
-        p1 = np.load(os.path.join(stage, f"psi1_{ax}.npy"), mmap_mode="r")
-        p2 = np.load(os.path.join(stage, f"psi2_{ax}.npy"), mmap_mode="r")
-        u_mm = _open_stage(stage, f"u_{ax}.npy", dt, (n, n, n))
-        v_mm = _open_stage(stage, f"v_{ax}.npy", dt, (n, n, n))
+        p1 = ooc_fft.StagedArray.open(os.path.join(stage, f"psi1_{ax}.npy"), dt, (n, n, n))
+        p2 = ooc_fft.StagedArray.open(os.path.join(stage, f"psi2_{ax}.npy"), dt, (n, n, n))
+        u_sa = ooc_fft.StagedArray.create(os.path.join(stage, f"u_{ax}.npy"), dt, (n, n, n))
+        v_sa = ooc_fft.StagedArray.create(os.path.join(stage, f"v_{ax}.npy"), dt, (n, n, n))
         for lo in range(0, n, slab):
             hi = min(lo + slab, n)
-            a1 = np.asarray(p1[lo:hi])
-            a2 = np.asarray(p2[lo:hi])
+            a1 = p1.read_slab(lo, hi)
+            a2 = p2.read_slab(lo, hi)
             # lpt_ics's canonical combine, per element
             u = dt.type(D1) * a1
             u -= dt.type(D2) * a2
             v = a1 + dt.type(v_coef2) * a2
-            u_mm[lo:hi] = u
-            v_mm[lo:hi] = v
+            u_sa.write_slab(lo, u)
+            v_sa.write_slab(lo, v)
             vmax = max(vmax, float(np.max(np.abs(np.asarray(v, np.float64)))))
             umax = max(umax, float(np.max(np.abs(u))))
-        u_mm.flush()
-        v_mm.flush()
-        del p1, p2, u_mm, v_mm
 
     # codec.encode_velocities' scale, from the partition max (exact)
     scale = vmax / INT16_MAX
@@ -203,8 +193,10 @@ def generate_t9_slabs(
     per3 = per**3
     planes = n // nb  # particle planes per brick slab
     coords = np.arange(n, dtype=dt) * dt.type(box / n)  # lagrangian_grid's exact values
-    u_ro = [np.load(os.path.join(stage, f"u_{ax}.npy"), mmap_mode="r") for ax in range(3)]
-    v_ro = [np.load(os.path.join(stage, f"v_{ax}.npy"), mmap_mode="r") for ax in range(3)]
+    u_ro = [ooc_fft.StagedArray.open(os.path.join(stage, f"u_{ax}.npy"), dt, (n, n, n))
+            for ax in range(3)]
+    v_ro = [ooc_fft.StagedArray.open(os.path.join(stage, f"v_{ax}.npy"), dt, (n, n, n))
+            for ax in range(3)]
 
     staged = {d: {} for d in range(nb)}  # dest slab -> {src slab: contribution}
     done_src = np.zeros(nb, dtype=bool)
@@ -215,7 +207,10 @@ def generate_t9_slabs(
         return sorted({(d + o) % nb for o in range(-window, window + 1)})
 
     def _finalize(d):
-        parts = [staged[d][s] for s in sorted(staged[d])]  # ascending src = Lagrangian order
+        # ascending src, then chunk arrival order within a src = ascending
+        # Lagrangian index, which is what licenses the stable sort below to
+        # reproduce SlotState.build's global stable sort within every brick
+        parts = [p for s in sorted(staged[d]) for p in staged[d][s]]
         keyf = np.concatenate([p[0] for p in parts]) if parts else np.empty(0, np.int64)
         off = (np.concatenate([p[1] for p in parts]) if parts
                else np.empty((0, 3), np.uint8))
@@ -243,34 +238,38 @@ def generate_t9_slabs(
         return len(keyf)
 
     finalized = np.zeros(nb, dtype=bool)
+    chunk = max(1, min(slab, planes))  # emission transients are O(chunk), not O(brick slab)
     for src in range(nb):
-        lo = src * planes
-        x_slab = np.empty((planes * n * n, 3), dtype=np.float64)
-        v_slab = np.empty((planes * n * n, 3), dtype=np.float64)
-        for ax in range(3):
-            u = np.asarray(u_ro[ax][lo : lo + planes])
-            q = (
-                coords[lo : lo + planes].reshape(-1, 1, 1),
-                coords.reshape(1, -1, 1),
-                coords.reshape(1, 1, -1),
-            )[ax]
-            x_slab[:, ax] = np.mod(q + u, dt.type(box)).reshape(-1)
-            v_slab[:, ax] = np.asarray(v_ro[ax][lo : lo + planes], np.float64).reshape(-1)
-        off, bijk = encode_positions_host(x_slab, t9)
-        keyf = _bucket_flat_brick_major(bijk, t9, nb)
-        w = encode_velocities_host(v_slab, scale)
-        bx_dest = keyf // (nb * nb * per3)
-        ring = (bx_dest - src) % nb
-        bad = ~((ring <= window) | (ring >= nb - window))
-        if bad.any():
-            raise RuntimeError(
-                f"{int(bad.sum())} particles from source slab {src} routed outside the "
-                f"+-{window} window (the displacement bound above should have caught this)"
-            )
-        for d in np.unique(bx_dest):
-            m = bx_dest == d
-            staged[int(d)][src] = (keyf[m], off[m], w[m])
-        n_total += len(keyf)
+        for c0 in range(src * planes, (src + 1) * planes, chunk):
+            c1 = min(c0 + chunk, (src + 1) * planes)
+            rows = (c1 - c0) * n * n
+            x_ch = np.empty((rows, 3), dtype=np.float64)
+            v_ch = np.empty((rows, 3), dtype=np.float64)
+            for ax in range(3):
+                u = u_ro[ax].read_slab(c0, c1)
+                q = (
+                    coords[c0:c1].reshape(-1, 1, 1),
+                    coords.reshape(1, -1, 1),
+                    coords.reshape(1, 1, -1),
+                )[ax]
+                x_ch[:, ax] = np.mod(q + u, dt.type(box)).reshape(-1)
+                v_ch[:, ax] = v_ro[ax].read_slab(c0, c1).astype(np.float64).reshape(-1)
+            off, bijk = encode_positions_host(x_ch, t9)
+            keyf = _bucket_flat_brick_major(bijk, t9, nb)
+            w = encode_velocities_host(v_ch, scale)
+            del x_ch, v_ch, bijk
+            bx_dest = keyf // (nb * nb * per3)
+            ring = (bx_dest - src) % nb
+            bad = ~((ring <= window) | (ring >= nb - window))
+            if bad.any():
+                raise RuntimeError(
+                    f"{int(bad.sum())} particles from source slab {src} routed outside the "
+                    f"+-{window} window (the displacement bound above should have caught this)"
+                )
+            for d in np.unique(bx_dest):
+                m = bx_dest == d
+                staged[int(d)].setdefault(src, []).append((keyf[m], off[m], w[m]))
+            n_total += len(keyf)
         done_src[src] = True
         for d in range(nb):
             if not finalized[d] and all(done_src[s] for s in _sources(d)):

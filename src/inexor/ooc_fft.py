@@ -249,6 +249,76 @@ def deriv2_spec(spec, i, j, n_mesh, box_size, slab=_DEF_SLAB):
 
 
 # ---------------------------------------------------------------------------
+# disk staging (D-v2-15 clause 3) -- EXPLICIT IO, deliberately not memmap
+# ---------------------------------------------------------------------------
+
+
+class StagedArray:
+    """A disk-staged (n0, n, n) array written and read one axis-0 slab at a time.
+
+    Plain `.npy` on disk (np.load can always inspect it), but accessed through
+    explicit read()/write() calls rather than memmap ON PURPOSE: dirty pages
+    of a written memmap are MAPPED INTO THE PROCESS and count in ru_maxrss,
+    so a memmap-staged generator read ~175 B/p on its first smoke where its
+    heap holds ~8 -- the instrument was measuring reclaimable page cache as if
+    it were footprint (2026-08-10). Buffered file IO keeps those pages the
+    kernel's, so the process's memory story stays the true one.
+    """
+
+    def __init__(self, path, dtype, shape, mode):
+        self.path = path
+        self.dtype = np.dtype(dtype)
+        self.shape = tuple(int(s) for s in shape)
+        self._row = int(np.prod(self.shape[1:])) * self.dtype.itemsize
+        if mode == "w":
+            with open(path, "wb") as fh:
+                np.lib.format.write_array_header_1_0(
+                    fh, dict(descr=np.lib.format.dtype_to_descr(self.dtype),
+                             fortran_order=False, shape=self.shape)
+                )
+                self._data0 = fh.tell()
+            # pre-extend so out-of-order slab writes are well-defined
+            with open(path, "r+b") as fh:
+                fh.truncate(self._data0 + self._row * self.shape[0])
+        elif mode == "r":
+            with open(path, "rb") as fh:
+                version = np.lib.format.read_magic(fh)
+                readers = {(1, 0): np.lib.format.read_array_header_1_0,
+                           (2, 0): np.lib.format.read_array_header_2_0}
+                hdr_shape, fortran, hdr_dtype = readers[version](fh)
+                self._data0 = fh.tell()
+            if hdr_shape != self.shape or hdr_dtype != self.dtype or fortran:
+                raise ValueError(
+                    f"{path}: header {hdr_dtype}{hdr_shape} != expected {self.dtype}{self.shape}"
+                )
+        else:
+            raise ValueError(f"mode must be 'w' or 'r', got {mode!r}")
+
+    @classmethod
+    def create(cls, path, dtype, shape):
+        return cls(path, dtype, shape, "w")
+
+    @classmethod
+    def open(cls, path, dtype, shape):
+        return cls(path, dtype, shape, "r")
+
+    def write_slab(self, lo, arr):
+        arr = np.ascontiguousarray(arr, dtype=self.dtype)
+        if arr.shape[1:] != self.shape[1:]:
+            raise ValueError(f"slab shape {arr.shape} does not fit {self.shape}")
+        with open(self.path, "r+b") as fh:
+            fh.seek(self._data0 + self._row * int(lo))
+            fh.write(arr.tobytes())
+
+    def read_slab(self, lo, hi):
+        lo, hi = int(lo), int(hi)
+        with open(self.path, "rb") as fh:
+            fh.seek(self._data0 + self._row * lo)
+            buf = fh.read(self._row * (hi - lo))
+        return np.frombuffer(buf, dtype=self.dtype).reshape((hi - lo,) + self.shape[1:]).copy()
+
+
+# ---------------------------------------------------------------------------
 # the accounting function (mesh_bytes pattern) and its refusal
 # ---------------------------------------------------------------------------
 

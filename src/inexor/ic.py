@@ -105,10 +105,19 @@ def plane_key(key, i):
 
 
 def white_plane(key, i, n_mesh, fdtype=np.float32):
-    """One (N, N) unit-normal plane of the canonical stream, host numpy."""
+    """One (N, N) unit-normal plane of the canonical stream, host numpy.
+
+    Drawn on the CPU BACKEND EXPLICITLY, whatever device jax defaulted to:
+    everything else in the generator is host numpy, and letting the one jax
+    call float to CUDA would let a GPU node silently produce a different
+    stream (the normal transform's bits are not specified across backends).
+    Cross-MACHINE CPU identity is a reported check (the plane-0 fingerprint
+    on every card), not an assumption.
+    """
     _require_stream_config(fdtype)
     jdt = jnp.dtype(np.dtype(fdtype))
-    return np.asarray(jax.random.normal(plane_key(key, i), (n_mesh, n_mesh), dtype=jdt))
+    with jax.default_device(jax.devices("cpu")[0]):
+        return np.asarray(jax.random.normal(plane_key(key, i), (n_mesh, n_mesh), dtype=jdt))
 
 
 def white_slab(key, lo, hi, n_mesh, fdtype=np.float32):
