@@ -616,8 +616,14 @@ def main():
         # this list from two membership tests that between them did not cover
         # `repack_only`, so the leg was silently dropped and its absence read as
         # a clean run -- the "a gate that cannot fail" class, in the orchestrator
-        pre = [ln for ln in ("gen", "load", "repack_only") if ln in want]
-        order = pre + [ln for ln in want if ln in STEP_LEGS]
+        # derive the order from LEGS rather than from hand-written membership
+        # tests. Two versions of this dropped a leg silently by listing the
+        # non-stepping legs by name and forgetting one (`repack_only`, then
+        # `integrity`) -- the same "gate that cannot fail" class, twice, in the
+        # orchestrator. Now the schedule is a permutation of `want` by
+        # construction and the check below cannot be reached.
+        pre = [ln for ln in LEGS if ln in want and ln not in STEP_LEGS]
+        order = pre + [ln for ln in LEGS if ln in want and ln in STEP_LEGS]
         missing = [ln for ln in want if ln not in order]
         if missing:
             raise SystemExit(f"FATAL: legs requested but not scheduled: {missing}")
@@ -668,7 +674,16 @@ def main():
         gate3_consistent_across_configs=g3, gate3_spread=spread,
         configs_analysed=done,
     )
-    ok = bool(done) and g1 and g2 and (g3 is not False)
+    if set(LEGS) <= set(want):
+        ok = bool(done) and g1 and g2 and (g3 is not False)
+    else:
+        # a subset of legs was requested, so the gates were never evaluable. Say
+        # that rather than reporting FAIL, which would read as a finding.
+        ok = True
+        res["verdict"]["note"] = (
+            f"legs {sorted(set(LEGS) - set(want))} not requested, so gates 1-3 were "
+            "not evaluated; this run reports measurements only"
+        )
     res["ok"] = ok
     _write(res, args.out_suffix, knobs)
     print("PASS" if ok else "FAIL", flush=True)

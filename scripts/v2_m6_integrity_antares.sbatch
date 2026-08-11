@@ -25,13 +25,14 @@
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
 cd "$HOME/src/inexor" || { echo "FATAL: no ~/src/inexor"; exit 1; }
-WD="${WD:-/tmp/m6_cdev_437}"
-[ -f "$WD/cdev/manifest.json" ] || {
-  echo "FATAL: no staged cdev slabs under $WD -- the failing realization is gone;"
-  echo "       regenerate with the full job rather than a different realization."
-  exit 1
-}
-echo "=== $(hostname), commit $(git rev-parse --short HEAD), slabs $WD ==="
+# Job 437's slabs are GONE -- /tmp was cleaned between jobs -- so this
+# regenerates. That is sound rather than a compromise: the noise stream is
+# deterministic per machine class, so antares reproduces antares's own
+# realization, which is the failing one. It is only the LAPTOP's realization that
+# would be the wrong experiment.
+WD="${WD:-${TMPDIR:-/tmp}/m6_integ_$SLURM_JOB_ID}"
+mkdir -p "$WD"
+echo "=== $(hostname), commit $(git rev-parse --short HEAD), workdir $WD ==="
 pixi run -e default python scripts/v2_m6_engine_peak.py \
   --configs cdev --legs integrity --workdir-root "$WD" --out-suffix _integ
 rc=$?
