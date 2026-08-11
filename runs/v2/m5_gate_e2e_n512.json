@@ -1,0 +1,48 @@
+{
+ "ok": true,
+ "n": 512,
+ "bricks": 8,
+ "f_NL": 0.0,
+ "n_diff": {
+  "off": 0,
+  "w": 0,
+  "occupancy": 0,
+  "brick_start": 0
+ },
+ "vel_scale_equal": true,
+ "arena_empty": true,
+ "occupancy_peak_over_mean": 5.875,
+ "commit": "341d85e8c9cc9af20b24765a8cc1aca37b7a8c88",
+ "slurm_job_id": "427",
+ "provenance": {
+  "backend": "cpu",
+  "device_kind": "cpu",
+  "n_devices": 1,
+  "host_cores": 64,
+  "x64": true,
+  "jax_version": "0.10.2",
+  "threefry_partitionable": true,
+  "ic_stream": "m5-foldin-1",
+  "xla_flags": null,
+  "omp_num_threads": null,
+  "argv": [
+   "--leg",
+   "e2e",
+   "--n",
+   "512",
+   "--bricks",
+   "8",
+   "--slab",
+   "32",
+   "--out-suffix",
+   "_n512"
+  ],
+  "knobs": {
+   "n": 512,
+   "bricks": 8,
+   "slab": 32,
+   "seed": 0,
+   "f_nl": 0.0
+  }
+ }
+}

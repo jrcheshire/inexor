@@ -404,7 +404,7 @@ IC stage emits it. Each rung opens with its own detailed plan session.
 | M-v2-2 | harden and promote the two-level force; `paint_tsc_int`; the ffi pinned gather | bitwise parity vs the probe at 3 geometries; runtime invariants become tests; regression tests for the three measured bugs |
 | M-v2-3 | engine core on T9 state | correctness vs the v1 parity arms where configs overlap |
 | M-v2-4 | f32 force mesh | thread `fdtype`, re-run `v2_g3_floors.py` unchanged, read against the MESH FLOOR not zero; own gate, cannot ride on D-v2-9's or G6's |
-| M-v2-5 | streamed ICs + out-of-core FFT | tile-IC identity vs monolithic at f64; the transfer table's error < 1e-4 |
+| M-v2-5 | streamed ICs + out-of-core FFT | tile-IC identity vs monolithic at f64; the transfer table's error < 1e-4 -- **CLOSED 2026-08-10, D-v2-23**; the identity half re-scoped to decomposition invariance (D-v2-15 clause 5 makes the literal reading impossible; D-v2-23 clause 1), table error measured 2.571e-7 |
 | M-v2-6 | capacity | **a complete 2048^3 mock on one Vista gh node** |
 | M-v2-7 | output stage | HMF within 5%, halo b1 within 2% at k <= 0.25; squeezed B <= 15%; disco-mocks read-back |
 

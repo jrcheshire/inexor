@@ -1228,3 +1228,100 @@ ratifying it did not measure it.
   `engine.py:340` decodes the integer sum through f64 and narrows only the
   order-unity result -- and it is a different quantity from D-v2-20's bucket
   index, where narrowing to uint16 wrapped modularly. No action.
+
+## D-v2-23 -- The streamed IC stage: one plane-keyed stream, universal table nodes, an out-of-core FFT, and the replace-in-place bill
+
+- **Status:** accepted (JC, 2026-08-10, on the clause-by-clause close-out;
+  scoping calls ratified in session the same day). Discharges D-v2-18's
+  M-v2-5 row under the re-scope in clause 1 and implements D-v2-15 clauses
+  2-5. Amends no ratified decision; the bill in clause 6 states what moved
+  under every earlier record.
+- **Record:** `runs/v2/m5_ic_record.md`; deneb 427/428, Vista 902091 (failed
+  on its own instrument, superseded) / 902182; cards `runs/v2/m5_gate_*.json`;
+  probes `scripts/v2_m5_{ic_gate,table_bar,memladder,fft_gh}.py`.
+- **Decision:**
+  1. **The exit gate is decomposition invariance, not the charter row's
+     literal words** (JC, 2026-08-10 -- the third milestone running whose
+     written criterion could not be read literally). D-v2-15 clause 5 makes
+     "tile-IC identity vs monolithic" unreadable: no old-monolithic field
+     exists for the new tiles to equal. Ratified reading: (i) the new
+     construction is bitwise invariant to its decomposition (two full
+     generations at different slab knobs write byte-identical T9 payloads;
+     measured at n=64 and n=512 f64, plus every unit-scale identity); (ii)
+     the streamed generator through disk and the loader is bitwise
+     `SlotState.build` on the monolithic chain (n_diff 0 on every array,
+     velocity scale EXACTLY equal, at n in {32, 64, 512} and f_NL in
+     {0, 10}); (iii) old-vs-new is statistical only (32 seeds:
+     max|z| 1.79, chi2/dof 0.53, indistinguishable from the split-half
+     control).
+  2. **The noise stream is `m5-foldin-1`**: one axis-0 plane keyed by
+     `fold_in`, drawn on the CPU backend explicitly, random-access by
+     construction, under `jax_threefry_partitionable=True` (asserted, not
+     set). Cards carry `ic_stream` and readouts REFUSE to pool across it --
+     a seed denotes a realization only relative to a stream. Cross-machine
+     bitwise identity is reported (plane-0 fingerprint on every card), never
+     assumed. The global f_NL moment goes through `sq_sum_by_plane`, one
+     running fold threaded through slabs: per-slab subtotals re-associate
+     and moved the value at 1e-16 on first contact.
+  3. **The colour and transfer live on a 1D table with UNIVERSAL nodes**:
+     32768 log-spaced points on the fixed range [1e-4, 1e2] h/Mpc, P
+     log-log, T linear-in-ln k, refusal semantics preserved. Universal
+     because per-grid nodes broke G5b's shared-modes identity at 3-6e-9 (two
+     resolutions, two tables, interpolation error at the same physical k no
+     longer cancelling); on fixed nodes the check reads 7-8e-16, the
+     FFT-roundoff floor. The bar (JC): max relative P error over the
+     realized |k| range, per config, < 1e-4; **measured 2.571e-7 at C-dev =
+     C-gh = C-hero** (equality is the universal-node property), h^2
+     falsifier slope 1.998 across five densities, exact-multiset honesty
+     check under the sweep bound.
+  4. **The out-of-core FFT's compute unit is one plane, by measurement**:
+     pocketfft moves bits with batch size (341/68 differing elements for
+     pass 1/2 on first contact), so slab knobs are pure loop bounds and
+     "streamed == monolithic" is a theorem the tests confirm. Host-resident
+     k-space; disk stages REAL fields only, through EXPLICIT IO
+     (`StagedArray`) -- a written memmap's dirty pages land in ru_maxrss and
+     overstated the streamed arm ~20x on first smoke. `plan_bytes` /
+     `require_fits` refuse over-budget plans loudly; the f64 derivative plan
+     at 2048^3 refuses a 116 GB host BY DESIGN. **Capacity demonstrated
+     (Vista 902182): the 2048^3 transform the GH200's device cannot fit ran
+     in 40.4 GB of host (plan 36.0, x1.12), roundtrip 2.38e-6 against
+     RE-GENERATED noise, Parseval 1.69e-7, P(k) vs the BIN-AVERAGED oracle
+     max|z| 2.90 over 64 bins** -- the bin-centre form fails at exactly this
+     scale (deterministic Jensen term z = +15 at k ~ 0.2 at 2048^3 mode
+     counts; job 902091's only failure, diagnosed and fixed as instrument).
+  5. **The 90 B/p IC host term is DEAD, by the pre-registered fit** (Vista
+     gg 902300; the albireo route was abandoned when antares sat occupied):
+     net(n) = A n^3 + C over rungs 256/512/1024 on the CPU backend gives
+     **A = 8.79 B/p (bar 9.0), C = -0.18 GB** with residuals under 0.15 GB,
+     extrapolating to **75.3 GB at 2048^3 against the 77.3 GB bar**
+     (= 116/1.5; 1.54x under the cliff). Top rung raw: streamed 8.6 B/p
+     against the old-mirror's 95.7 -- an 11x reduction, with the old arm
+     REPRODUCING D-v2-15 clause 1's term as its own control. The first run
+     read A = 11.74 (the pre-registered A > 9 finding); chased to
+     `rfftn_ooc`'s pass-1 double-buffer (three spec-equivalents at one
+     moment), removed bitwise-neutrally, corroborated by the monolithic
+     colour and linear_density arms each dropping one spectrum-worth. The
+     0.79 B/p residual over the two-spectrum arithmetic is inside the bar
+     and deliberately not chased; the monolithic psi arm's 39.5 B/p stays
+     reported and unattributed (one wrong attribution already retracted).
+  6. **Replace-in-place, and its bill** (JC: replace, keep names, re-point
+     G5b). `inexor.ic`/`lpt` moved under every consumer; the guard is
+     IC_STREAM + the readout refusal, established BEFORE the replacement by
+     the licensed mirror (bitwise card at the S0 commit; the same leg now
+     asserts the fields MUST differ). f_NL differentiability RETIRED with v1
+     (the generator is host numpy; `colour_white` is the seam a gated jnp
+     twin would be built behind). G5b's `_colour` calls the seam (identity
+     0.000e+00 by construction, a live drift detector). The 48-seed
+     bispectrum calibration passes UNCHANGED on the new stream (c_cal 0.9726
+     was 0.979; discrimination control intact) -- no constant re-ratified.
+     `poisson_factor` survives as a small-n diagnostic behind a 512 ceiling.
+     `m1_export_ics.py` is historical (stored runs/m1 references are loaded,
+     never regenerated; D-013 stays re-runnable). Every card written before
+     this milestone is re-readable at its recorded commit and re-runnable
+     only there.
+- **What this does NOT establish:** cross-machine bitwise identity of the
+  stream; a full C-gh IC generation end to end (the FFT layer + colour ran;
+  the complete 2048^3 mock is M-v2-6, with staging traffic priced from the
+  measured 0.83-1.75 GB/s, not demonstrated); C-hero; f32-path invariance
+  beyond unit scale; the engine's end-to-end peak (M-v2-4's open item,
+  unchanged).

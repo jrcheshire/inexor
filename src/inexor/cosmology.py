@@ -260,3 +260,124 @@ def sigma_R(R, cosmo, z=0.0, backend="eh98", table=None):
     W = _tophat_window(k * R)
     s2 = simpson(k**3 * Pk0 * W**2 / (2.0 * math.pi**2), x=lnk)
     return math.sqrt(s2) * growth_factor_a(1.0 / (1.0 + z), cosmo)
+
+
+# ============================================================================
+# The M-v2-5 1D |k| table (D-v2-15 clause 2)
+# ============================================================================
+
+
+def _refuse_outside(k_arr, k_lo, k_hi, what):
+    # Same guard as linear_power's table backend: 1-ulp slack so exact-endpoint
+    # queries do not trip it; loud refusal, never extrapolation. An EMPTY query
+    # is a legitimate no-op (a slab-streamed caller's k-cut can empty a slab).
+    if k_arr.size == 0:
+        return
+    if k_arr.min() < k_lo * (1 - 1e-12) or k_arr.max() > k_hi * (1 + 1e-12):
+        raise ValueError(
+            f"requested k in [{k_arr.min():.3e}, {k_arr.max():.3e}] outside the "
+            f"{what} table range [{k_lo:.3e}, {k_hi:.3e}]; refusing to extrapolate"
+        )
+
+
+class ICKTable:
+    """1D log-spaced |k| table of the linear power AND the transfer function.
+
+    D-v2-15 clause 2: P(k) and T(k) are functions of |k| alone, so the IC
+    colour and the Poisson/transfer factor never need a 3D |k| grid -- the
+    measured ~90 B/p host term (job 896159) collapses to O(slab). Interpolation:
+    P is log-log linear (positive by construction); T is LINEAR in ln k (a
+    transfer function may cross zero in principle, so log-log is only safe for
+    P). Both refuse k outside the table range, exactly like
+    `linear_power(backend="table")`.
+
+    Deliberately NOT cached and NOT hashable: built once per run by
+    `ic_k_table` and passed explicitly, so no cache can alias across
+    cosmologies. Plain class rather than a frozen dataclass for the same
+    reason -- ndarray fields make generated __eq__/__hash__ traps.
+    """
+
+    __slots__ = ("k", "P", "T", "_lnk", "_lnP")
+
+    def __init__(self, k, P, T):
+        self.k = np.asarray(k, dtype=np.float64)
+        self.P = np.asarray(P, dtype=np.float64)
+        self.T = np.asarray(T, dtype=np.float64)
+        if not (self.k.ndim == 1 and self.k.shape == self.P.shape == self.T.shape):
+            raise ValueError("k, P, T must be 1D arrays of equal length")
+        if not np.all(np.diff(self.k) > 0):
+            raise ValueError("k must be strictly increasing")
+        if np.any(self.P <= 0):
+            raise ValueError("P must be positive (log-log interpolation)")
+        self._lnk = np.log(self.k)
+        self._lnP = np.log(self.P)
+
+    def P_of_k(self, k_hmpc):
+        """Linear P(k, z=0), log-log interpolated; refuses outside the range."""
+        k_arr = np.atleast_1d(np.asarray(k_hmpc, dtype=np.float64))
+        _refuse_outside(k_arr, self.k[0], self.k[-1], "P(k)")
+        return np.exp(np.interp(np.log(k_arr), self._lnk, self._lnP)).reshape(
+            np.shape(k_hmpc) if np.ndim(k_hmpc) else ()
+        )
+
+    def T_of_k(self, k_hmpc):
+        """Transfer T(k), linear-in-ln(k) interpolated; refuses outside the range."""
+        k_arr = np.atleast_1d(np.asarray(k_hmpc, dtype=np.float64))
+        _refuse_outside(k_arr, self.k[0], self.k[-1], "T(k)")
+        return np.interp(np.log(k_arr), self._lnk, self.T).reshape(
+            np.shape(k_hmpc) if np.ndim(k_hmpc) else ()
+        )
+
+
+# The universal table node range, h/Mpc -- the same span _eh98_amplitude's
+# normalization integral uses. UNIVERSAL, NOT PER-GRID, and that is
+# load-bearing: with nodes derived from (n_mesh, box_size), two resolutions
+# or box sizes carry two different tables, and the interpolation error at the
+# SAME physical k no longer cancels between them. G5b's shared-modes check
+# caught exactly that on first contact (2026-08-10): matched-phase rungs
+# coloured through per-grid tables disagreed at 3-6e-9 where the analytic
+# colour left 1e-15-class residuals. Fixed nodes make the interp error a
+# function of physical k alone, so it cancels in every shared-k comparison --
+# cross-resolution matched phase, box-ladder transport, all of them.
+K_TABLE_MIN = 1e-4
+K_TABLE_MAX = 1e2
+
+
+def ic_k_table(cosmo, n_mesh, box_size, n_points=32768, backend="eh98", table=None):
+    """Build the ICKTable for a production rfft grid, on UNIVERSAL nodes.
+
+    Nodes are n_points log-spaced over [K_TABLE_MIN, K_TABLE_MAX] regardless
+    of the grid (see the block comment above for why); (n_mesh, box_size) are
+    used to REFUSE a grid whose realized |k| range [2*pi/L, sqrt(3)*pi*n/L]
+    the universal range does not cover -- loud at build time, not at first
+    interpolation (every production config sits comfortably inside; a box
+    under ~0.07 Mpc/h or a cell under ~0.036 Mpc/h would not).
+
+    backend="eh98": P from `linear_power` (analytic, sigma8-normalized), T from
+    `transfer_eh98`. backend="table": P resampled from a (k, P) dump (CAMB),
+    which must cover the universal range; T stays eh98 -- the ic.py M1 scope
+    note stands (the table P(k) backend carries no T(k);
+    f_NL-with-CAMB-transfer is out of scope), and pretending to derive T from
+    a P dump would manufacture one silently.
+
+    n_points=32768 default: log-log linear interpolation error goes as the
+    square of the node spacing in ln k, and the universal range spans ~6
+    decades against the per-grid ~3.5, so the density is sized to keep the
+    measured error in the few x 1e-7 class (512 KB; probe
+    `v2_m5_table_bar.py` measures the scaling rather than trusting this
+    arithmetic).
+    """
+    n_mesh = int(n_mesh)
+    if n_mesh < 2:
+        raise ValueError(f"n_mesh must be >= 2, got {n_mesh}")
+    k_f = 2.0 * np.pi / box_size
+    k_grid_hi = math.sqrt(3.0) * np.pi * n_mesh / box_size
+    if k_f < K_TABLE_MIN or k_grid_hi > K_TABLE_MAX:
+        raise ValueError(
+            f"grid |k| range [{k_f:.3e}, {k_grid_hi:.3e}] exceeds the universal table "
+            f"range [{K_TABLE_MIN:.0e}, {K_TABLE_MAX:.0e}]; refusing at build time"
+        )
+    k = np.exp(np.linspace(np.log(K_TABLE_MIN), np.log(K_TABLE_MAX), int(n_points)))
+    P = linear_power(k, cosmo, z=0.0, backend=backend, table=table)
+    T = transfer_eh98(k, cosmo)
+    return ICKTable(k, P, T)

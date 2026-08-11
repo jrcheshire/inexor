@@ -1,0 +1,72 @@
+{
+ "ok": true,
+ "arms": {
+  "gaussian_delta_n64_f64": {
+   "n_diff": 0,
+   "rms": 2.486526185505142,
+   "expect_equal": true,
+   "ok": true
+  },
+  "gaussian_delta_n64_f32": {
+   "n_diff": 0,
+   "rms": 2.472609817107141,
+   "expect_equal": true,
+   "ok": true
+  },
+  "gaussian_delta_n128_f64": {
+   "n_diff": 0,
+   "rms": 3.241317208863439,
+   "expect_equal": true,
+   "ok": true
+  },
+  "gaussian_delta_n128_f32": {
+   "n_diff": 0,
+   "rms": 3.23231423867333,
+   "expect_equal": true,
+   "ok": true
+  },
+  "linear_density_n64_f64_fnl0": {
+   "n_diff": 0,
+   "rms": 2.4865261855051424,
+   "expect_equal": true,
+   "ok": true
+  },
+  "linear_density_n64_f64_fnl10": {
+   "n_diff": 0,
+   "rms": 2.4865264354825682,
+   "expect_equal": true,
+   "ok": true
+  },
+  "poisson_factor_n64": {
+   "n_diff": 0,
+   "rms": 81598.14576232439,
+   "expect_equal": true,
+   "ok": true
+  },
+  "different_seed_differs": {
+   "n_diff": 262144,
+   "rms": 2.4845590015091084,
+   "expect_equal": false,
+   "ok": true
+  }
+ },
+ "old_stream_fingerprint_n64_f64_seed0": "b7c625ea9c64774e51074efb0c9107412f468486d0e170937b2057ff1623c4cc",
+ "commit": "bd386789f475415deefb979d3822a11a2fe9e4bb",
+ "slurm_job_id": null,
+ "provenance": {
+  "backend": "cpu",
+  "device_kind": "cpu",
+  "n_devices": 1,
+  "host_cores": 16,
+  "x64": true,
+  "jax_version": "0.10.2",
+  "threefry_partitionable": true,
+  "ic_stream": "pre-m5-normal",
+  "xla_flags": null,
+  "omp_num_threads": null,
+  "argv": [
+   "--leg",
+   "mirror-license"
+  ]
+ }
+}

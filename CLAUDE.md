@@ -12,27 +12,37 @@ mbody owns MLX/Apple-Silicon).
 
 ## Current milestone
 
-**M-v2-1 through M-v2-4 are CLOSED; M-v2-5 (streamed ICs + out-of-core FFT) is
-next.**
+**M-v2-1 through M-v2-5 are CLOSED; M-v2-6 (capacity: a complete 2048^3 mock
+on one Vista gh node) is next.**
 
-**M-v2-4 (f32 coarse force mesh) closed 2026-08-10, ratified as D-v2-22**
-(record `runs/v2/m4_f32_mesh_record.md`). The coarse mesh is f32; the FINE mesh
-is not, and no fine-mesh adoption is proposed. Measured saving **1.830x** on
-peak host memory at n_coarse=1024 (88.36 -> 48.29 GiB, antares 415/416/417,
-control at 1.0000). Accuracy passes the 3.0e-3 budget share by 18-227x across
-16 cards and **misses the pre-registered few x 1e-6 expectation on every one**,
-recorded as a miss: what makes it tolerable is that the f64 reference already
-carries 3.590e-2 from its own coarse mesh being finite, measured on the same
-estimand and band, so E sits 210-2718x under it. Two cards above the 1e-4
-investigation line are closed as seed scatter (41-73% per rung).
-**The pre-registered approach-to-2.0 mechanism was wrong** and the correction is
-the useful part: the peak is 0.22 GiB baseline + **8.0 B/cell int64 paint
-accumulator** + 40.1 B/cell float working set at f32, so what caps the ratio
-scales as n^3 and never dilutes. That ceiling is the HARNESS's -- `engine.py:372`
-frees the accumulator before line 375 solves, which the ladder worker does not --
-so the engine-relevant ratio is 1.9945. Charter gate unrunnable for the second
-milestone running (`v2_g3_floors.py` drives the frozen probe's single-level
-monolithic force, so a package dtype never reaches it).
+**M-v2-5 (streamed ICs + out-of-core FFT) closed 2026-08-10, ratified as
+D-v2-23** (record `runs/v2/m5_ic_record.md`). The IC stage is rebuilt IN
+PLACE on the plane-keyed `m5-foldin-1` noise stream (one axis-0 plane keyed
+by `fold_in`, CPU-drawn; a seed now denotes a DIFFERENT realization than
+before -- cards carry `ic_stream` and readouts refuse to pool across it), a
+universal-node 1D P+T table (error 2.571e-7 vs the 1e-4 bar; nodes are
+FIXED [1e-4, 1e2] because per-grid nodes broke G5b's shared-modes identity),
+and a host-resident out-of-core FFT whose compute unit is ONE PLANE by
+measurement (pocketfft moves bits with batch size). Headlines: **the
+streamed generator reads 8.6 B/p where the old path reads 95.7** (fitted
+cubic 8.79 -> 75.3 GB at 2048^3 against the 116 GB GH200 host); **a 2048^3
+transform the device cannot fit ran correctly in 40.4 GB of host** (Vista
+902182: roundtrip 2.38e-6, Parseval 1.69e-7, P(k) vs the BIN-AVERAGED
+oracle max|z| 2.90); and **the loaded T9 state is bitwise the monolithic
+`SlotState.build`** at every scale tested (n up to 512, f_NL 0 and 10).
+f_NL differentiability is RETIRED with v1 (`ic.colour_white` is the seam a
+gated jnp twin would be built behind). `runs/m1` stored references remain
+valid (loaded, never regenerated); `m1_export_ics.py` is historical.
+Ops trap for any gg sbatch: `JAX_PLATFORMS=cpu` is LOAD-BEARING -- jax
+0.10's CUDA plugin hard-raises on cuInit on a GPU-less node, and
+`CONDA_OVERRIDE_CUDA` alone no longer suffices.
+
+**M-v2-4 (f32 coarse force mesh) closed 2026-08-10, D-v2-22** (record
+`runs/v2/m4_f32_mesh_record.md`): coarse mesh f32, fine unchanged; 1.830x
+peak host at n_coarse=1024; tier-2 accuracy miss recorded as a miss with
+the f64 reference's own 3.590e-2 mesh floor as context; the harness's
+1.834 asymptote is the 8.0 B/cell int64 paint accumulator (engine nets to
+1.9945).
 
 M-v2-3's exit gate passed all three parts (Vista 898169/898242, record
 `runs/v2/m3_engine_record.md`, ratified as **D-v2-21**): the engine's force is
@@ -121,7 +131,7 @@ explicit `--mem` (see the umbrella albireo memory).
   the load-bearing novel pieces.
 - `docs/roadmap.md` — master plan M0-M4; M0 is a HARD go/no-go gate; each
   milestone gets a fresh detailed plan at its opening session.
-- `docs/decisions.md` — ADR log (D-001..D-015, D-v2-8..D-v2-22; D-v2-1..7 live
+- `docs/decisions.md` — ADR log (D-001..D-015, D-v2-8..D-v2-23; D-v2-1..7 live
   in the plan-plan table). Locked until re-litigated with JC. Note two ADRs
   supersede parts of D-v2-14: D-v2-19 (clause 3, layout) and D-v2-20 (clause
   2's index term) — read those before quoting a B/p figure.

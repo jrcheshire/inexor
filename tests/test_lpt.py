@@ -141,3 +141,33 @@ def test_lagrangian_grid_forces_vanish(delta0):
     q = lagrangian_grid(N, L)
     g = make_force_fn(BoxConfig(n_mesh=N, box_size=L), paint="f32")(q)
     assert float(jnp.max(jnp.abs(g))) == 0.0
+
+
+def test_low_and_mid_residency_are_bitwise_identical(delta0, tmp_path):
+    """THE SECOND M-v2-5 IDENTITY GATE at unit scale: the disk-staged "low"
+    policy is a pure memory knob. Both policies must execute the identical
+    per-element op sequence, so delta2 and the full lpt_ics state agree BIT
+    FOR BIT -- and the six staged derivative files existing on disk is the
+    structural proof that "low" never held them resident."""
+    d0 = np.asarray(delta0, np.float64)
+    a_mid = lpt2_source(d0, L, fdtype=np.float64, resident="mid")
+    a_low = lpt2_source(d0, L, fdtype=np.float64, resident="low", workdir=str(tmp_path))
+    assert np.array_equal(a_low, a_mid), "residency policy moved delta2 bits"
+    staged = sorted(p.name for p in tmp_path.glob("phi_*.npy"))
+    assert staged == ["phi_00.npy", "phi_01.npy", "phi_02.npy",
+                      "phi_11.npy", "phi_12.npy", "phi_22.npy"]
+
+    x_mid, v_mid = lpt_ics(d0, L, 0.1, PLANCK, order=2, fdtype=np.float64)
+    x_low, v_low = lpt_ics(d0, L, 0.1, PLANCK, order=2, fdtype=np.float64,
+                           resident="low", workdir=str(tmp_path))
+    assert np.array_equal(x_low, x_mid) and np.array_equal(v_low, v_mid)
+
+    # anti-vacuity: a perturbed density must move delta2
+    d1 = d0.copy()
+    d1[3, 4, 5] += 1e-6
+    assert not np.array_equal(lpt2_source(d1, L, fdtype=np.float64), a_mid)
+    # refusals: an unknown policy and a workdir-less "low" must both be loud
+    with pytest.raises(ValueError, match="resident"):
+        lpt2_source(d0, L, fdtype=np.float64, resident="high")
+    with pytest.raises(ValueError, match="workdir"):
+        lpt2_source(d0, L, fdtype=np.float64, resident="low")

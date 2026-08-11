@@ -1,0 +1,172 @@
+{
+ "rungs": {
+  "128": {
+   "old_mirror_baseline": 313950208,
+   "old_mirror_colour": {
+    "peak": 583827456,
+    "net": 269877248,
+    "bpp": 128.6875
+   },
+   "old_mirror_linear_density": {
+    "peak": 634978304,
+    "net": 321028096,
+    "bpp": 153.078125
+   },
+   "new_mono_baseline": 313622528,
+   "new_mono_colour": {
+    "peak": 371851264,
+    "net": 58228736,
+    "bpp": 27.765625
+   },
+   "new_mono_linear_density": {
+    "peak": 404652032,
+    "net": 91029504,
+    "bpp": 43.40625
+   },
+   "new_mono_psi1": {
+    "peak": 467353600,
+    "net": 153731072,
+    "bpp": 73.3046875
+   },
+   "new_mono_full": {
+    "peak": 667353088,
+    "net": 353730560,
+    "bpp": 168.671875
+   },
+   "new_streamed_baseline": 316342272,
+   "new_streamed_full": {
+    "peak": 476184576,
+    "net": 159842304,
+    "bpp": 76.21875
+   }
+  },
+  "256": {
+   "old_mirror_baseline": 306905088,
+   "old_mirror_colour": {
+    "peak": 2291204096,
+    "net": 1984299008,
+    "bpp": 118.2734375
+   },
+   "old_mirror_linear_density": {
+    "peak": 2315255808,
+    "net": 2008350720,
+    "bpp": 119.70703125
+   },
+   "new_mono_baseline": 313868288,
+   "new_mono_colour": {
+    "peak": 662241280,
+    "net": 348372992,
+    "bpp": 20.7646484375
+   },
+   "new_mono_linear_density": {
+    "peak": 752599040,
+    "net": 438730752,
+    "bpp": 26.150390625
+   },
+   "new_mono_psi1": {
+    "peak": 1287503872,
+    "net": 973635584,
+    "bpp": 58.033203125
+   },
+   "new_mono_full": {
+    "peak": 2633744384,
+    "net": 2319876096,
+    "bpp": 138.275390625
+   },
+   "new_streamed_baseline": 313196544,
+   "new_streamed_full": {
+    "peak": 1352089600,
+    "net": 1038893056,
+    "bpp": 61.9228515625
+   }
+  },
+  "512": {
+   "old_mirror_baseline": 310755328,
+   "old_mirror_colour": {
+    "peak": 13323403264,
+    "net": 13012647936,
+    "bpp": 96.9517822265625
+   },
+   "old_mirror_linear_density": {
+    "peak": 13331759104,
+    "net": 13021003776,
+    "bpp": 97.0140380859375
+   },
+   "new_mono_baseline": 312934400,
+   "new_mono_colour": {
+    "peak": 2668986368,
+    "net": 2356051968,
+    "bpp": 17.553955078125
+   },
+   "new_mono_linear_density": {
+    "peak": 3818422272,
+    "net": 3505487872,
+    "bpp": 26.117919921875
+   },
+   "new_mono_psi1": {
+    "peak": 7595327488,
+    "net": 7282393088,
+    "bpp": 54.258056640625
+   },
+   "new_mono_full": {
+    "peak": 14050656256,
+    "net": 13737721856,
+    "bpp": 102.35400390625
+   },
+   "new_streamed_baseline": 313491456,
+   "new_streamed_full": {
+    "peak": 2405449728,
+    "net": 2091958272,
+    "bpp": 15.5863037109375
+   }
+  }
+ },
+ "fdtype": "float32",
+ "method": "one subprocess per (arm, rung, phase)",
+ "verdict": {
+  "top_rung": 512,
+  "streamed_bpp_top": 15.5863037109375,
+  "old_bpp_top": 97.0140380859375,
+  "fit_A_bpp": 12.454042318982388,
+  "fit_C_gb": 0.461359396571429,
+  "fit_resid_gb": [
+   -0.3276351123287675,
+   0.36858950136986257,
+   -0.040954389041096446
+  ],
+  "scaled_2048_gb": 107.44076832263015,
+  "tier1_pass": false,
+  "tier2_finding": true,
+  "content_guard_arms_separate": true
+ },
+ "ok": false,
+ "commit": "5cef32d06ec7062f3f4aa190b180b2d93089860c",
+ "slurm_job_id": null,
+ "provenance": {
+  "backend": "cpu",
+  "device_kind": "cpu",
+  "n_devices": 1,
+  "host_cores": 16,
+  "x64": false,
+  "jax_version": "0.10.2",
+  "threefry_partitionable": true,
+  "ic_stream": "m5-foldin-1",
+  "xla_flags": null,
+  "omp_num_threads": null,
+  "argv": [
+   "--rungs",
+   "128",
+   "256",
+   "512",
+   "--out-suffix",
+   "_smoke"
+  ],
+  "knobs": {
+   "n": 512,
+   "bricks": null,
+   "slab": 32,
+   "seed": 0,
+   "f_nl": 0.0
+  }
+ }
+}

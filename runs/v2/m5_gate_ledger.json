@@ -1,0 +1,41 @@
+{
+ "ok": true,
+ "dtypes_float64": true,
+ "dtypes_float32": true,
+ "random_access": true,
+ "colour_footprint": {
+  "baseline": 315260928,
+  "colour": 910147584,
+  "net": 594886656,
+  "field_bytes": 134217728,
+  "bar": 671088640,
+  "bar_derivation": "white 1x + spec 2x + out 1x + buffers 1x",
+  "old_path_class": "~16x field (measured 2.19 GB at n=256, job 896159)",
+  "ok": true
+ },
+ "commit": "9db6ca9d7c3a58093f9e14a223467c87c21e3a8e",
+ "slurm_job_id": null,
+ "provenance": {
+  "backend": "cpu",
+  "device_kind": "cpu",
+  "n_devices": 1,
+  "host_cores": 16,
+  "x64": true,
+  "jax_version": "0.10.2",
+  "threefry_partitionable": true,
+  "ic_stream": "m5-foldin-1",
+  "xla_flags": null,
+  "omp_num_threads": null,
+  "argv": [
+   "--leg",
+   "ledger"
+  ],
+  "knobs": {
+   "n": 64,
+   "bricks": 4,
+   "slab": 5,
+   "seed": 0,
+   "f_nl": 0.0
+  }
+ }
+}

@@ -1,5 +1,13 @@
 """M1 S5: export matched ICs + linear P(k) tables for the cross-code parity harness.
 
+HISTORICAL, OLD-STREAM GENERATOR (M-v2-5, 2026-08-10): `inexor.ic` was
+replaced in place (D-v2-15 clause 5 -- a seed now denotes a DIFFERENT
+realization), so re-running this at HEAD writes ICs the stored
+`runs/m1/mbody_final_*` / `disco_final_*` references were never run from,
+severing the cross-code correspondence under the same tag scheme. The
+stored `runs/m1/ics_*.npz` remain valid (the D-013 arms LOAD them, never
+regenerate); do not re-export over them.
+
 Runs in the INEXOR env (this repo, default env):
     JAX_ENABLE_X64 is set below -- exports are float64 end to end.
 
