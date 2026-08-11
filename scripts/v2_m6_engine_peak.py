@@ -469,20 +469,27 @@ def main():
                   f"{d['s_per_step']:.2f} s/step", flush=True)
         ks = np.array(sorted(args.k_ladder), dtype=np.float64)
         nets = np.array([rungs[str(int(k))]["net"] for k in ks])
-        slope, icpt = np.linalg.lstsq(
-            np.stack([ks, np.ones_like(ks)], axis=1), nets, rcond=None
-        )[0]
-        res["k_ladder"] = dict(
-            config=cfg, baseline_bytes=base, rungs=rungs,
-            per_step_bytes=float(slope), fixed_bytes=float(icpt),
-            resid_gb=[float(r / 1e9) for r in
-                      nets - (slope * ks + icpt)],
-            # a working set is K-INDEPENDENT; a slope means the run accumulates
-            accumulates_per_step=bool(slope > 0.05 * nets.max() / max(ks)),
-        )
-        print(f"[{cfg}] fit: {slope / 1e9:.3f} GB PER STEP + {icpt / 1e9:.3f} GB fixed; "
-              f"resid {['%.3f' % (r / 1e9) for r in nets - (slope * ks + icpt)]} GB",
-              flush=True)
+        res["k_ladder"] = dict(config=cfg, baseline_bytes=base, rungs=rungs)
+        if len(ks) >= 2:
+            # a two-parameter fit needs two rungs. One rung would return a
+            # least-norm solution rather than an error, i.e. a slope that looks
+            # like a measurement and is not one.
+            slope, icpt = np.linalg.lstsq(
+                np.stack([ks, np.ones_like(ks)], axis=1), nets, rcond=None
+            )[0]
+            resid = nets - (slope * ks + icpt)
+            res["k_ladder"].update(
+                per_step_bytes=float(slope), fixed_bytes=float(icpt),
+                resid_gb=[float(r / 1e9) for r in resid],
+                # a working set is K-INDEPENDENT; a slope means it accumulates
+                accumulates_per_step=bool(slope > 0.05 * nets.max() / max(ks)),
+            )
+            print(f"[{cfg}] fit: {slope / 1e9:.3f} GB PER STEP + "
+                  f"{icpt / 1e9:.3f} GB fixed; "
+                  f"resid {['%.3f' % (r / 1e9) for r in resid]} GB", flush=True)
+        else:
+            res["k_ladder"].update(per_step_bytes=None, fixed_bytes=None)
+            print(f"[{cfg}] one rung: no fit (a slope needs two)", flush=True)
         _write(res, args.out_suffix or "_kladder", knobs)
         return 0
 
