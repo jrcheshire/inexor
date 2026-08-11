@@ -424,17 +424,41 @@ def _diagnose_partition(st, cfg):
             continue
         brick_of_row = np.repeat(np.asarray(members, dtype=np.int64), counts)
         own = owned_mask_from_bricks(brick_of_row, t, cfg.n_tile, cfg.n_brick, nb)
-        claimed[np.asarray(slots)[own]] += 1
-    live = np.zeros(st.off.shape[0], dtype=bool)
+        # np.add.at, NOT `claimed[idx] += 1`. Fancy-index += increments a repeated
+        # index ONCE, so the buffered form cannot see the very duplication this is
+        # looking for -- the first version of this diagnostic reported zero
+        # double-claims on a state whose distinct-slot count was short by one.
+        np.add.at(claimed, np.asarray(slots)[own], 1)
+    # counts vs DISTINCT slots: `SlotState.check` compares counts (state.py:587),
+    # so an aliased slot passes it -- occupancy still sums to n_particles while
+    # one slot is reachable through two bricks and the reachable SET is short.
+    seen = np.zeros(st.off.shape[0], dtype=np.int64)
+    total_decoded = 0
     for b in range(st.n_bricks):
-        live[np.asarray(st.decode_brick(b)[0])] = True
+        s = np.asarray(st.decode_brick(b)[0])
+        total_decoded += len(s)
+        np.add.at(seen, s, 1)
+    live = seen > 0
+    aliased = np.nonzero(seen > 1)[0]
     unclaimed = np.nonzero(live & (claimed == 0))[0]
     twice = np.nonzero(claimed > 1)[0]
     lines = [
-        f"  live rows {int(live.sum())}, n_particles {st.n_particles}, "
+        f"  distinct live rows {int(live.sum())}, decoded WITH duplicates "
+        f"{total_decoded}, n_particles {st.n_particles}, "
         f"arena_used {st.arena_used} of {st.n_arena}",
+        f"  ALIASED slots (reachable through more than one brick) {len(aliased)}"
+        f"{': ' + str([int(q) for q in aliased[:5]]) if len(aliased) else ''}",
         f"  unclaimed {len(unclaimed)}, claimed-more-than-once {len(twice)}",
     ]
+    for s in aliased[:5]:
+        s = int(s)
+        bricks_with = [b for b in range(st.n_bricks)
+                       if s in set(int(q) for q in st.decode_brick(b)[0])]
+        lines.append(
+            f"  aliased slot {s}: seen {int(seen[s])}x in bricks {bricks_with[:6]}, "
+            f"off={[int(q) for q in st.off[s]]}, "
+            f"in_arena={s >= st.arena_base}"
+        )
     if misaligned:
         lines.append(
             f"  BRICK COUNT vs DECODE LENGTH disagree on {len(misaligned)} tiles: "
