@@ -49,7 +49,9 @@ import numpy as np
 
 from .codec import INT16_MAX
 from .forces import (
+    CAP_RUNGS_PER_OCTAVE,
     COARSE_HALO,
+    capacity_shape,
     coarse_force_meshes,
     coarse_subblock_origin_extent,
     gather_coarse_subblock,
@@ -98,6 +100,7 @@ class EngineConfig:
         repack_every=1,
         coarse_dtype="float64",
         fine_dtype="float64",
+        cap_rungs=CAP_RUNGS_PER_OCTAVE,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -129,6 +132,12 @@ class EngineConfig:
         # knob would then silently set two.
         self.coarse_dtype = _dtype_name(coarse_dtype, "coarse_dtype")
         self.fine_dtype = _dtype_name(fine_dtype, "fine_dtype")
+        # Rungs per octave for the per-tile buffer SHAPE ladder (M-v2-6 Stage 0).
+        # `cap` moves every step, so an unquantized shape leaks one XLA executable
+        # family per step. A knob rather than a constant because it trades padded
+        # rows against retained executables and the balance is machine-dependent:
+        # more rungs means less padding and more compilations.
+        self.cap_rungs = int(cap_rungs)
 
     @property
     def np_coarse_dtype(self):
@@ -353,7 +362,7 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False):
 # ===========================================================================
 
 
-def step(st, cfg, coeff, c_drift, collect=None, census=False):
+def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1 and
@@ -392,7 +401,16 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False):
     # part of its membership and `decode_bricks` returns them, so sizing `cap`
     # off the run length alone under-counts and the force refuses.
     counts = [sum(st.brick_member_count(b) for b in members[t]) for t in cfg.tiles]
-    cap = tile_capacity(counts)
+    cap_true = tile_capacity(counts)
+    # QUANTIZE THE SHAPE, do not use the true max. `cap_true` moves every step as
+    # occupancy shifts (measured at cdev8: ten distinct values over ten steps,
+    # 285,554 -> 397,319), so every buffer keyed on it keys a new XLA shape and
+    # the executable cache grows without bound -- a peak host RSS linear in K at
+    # 0.331 GB/step. `capacity_shape` puts it on a geometric ladder and
+    # `cap_shape` carries the previous value so it is monotone across the run.
+    # Padding is masked exactly as the within-step padding already is, so this is
+    # bitwise neutral; `tests/test_engine.py` pins that.
+    cap = capacity_shape(cap_true, rungs=cfg.cap_rungs, floor_shape=cap_shape)
 
     one_tile, geom = make_tile_force_fn(
         cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine,
@@ -477,7 +495,10 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False):
     st.vel_scale = s_new
 
     stats = drift_and_migrate(st, c_drift, vel_scale_new=s_new)
-    stats.update(cap=cap, n_tiles=len(cfg.tiles), vel_scale=s_new)
+    # both: `cap` is the SHAPE every buffer took, `cap_true` the max over tiles it
+    # was quantized from. Reporting only one of them hides either the padding cost
+    # or the shape churn, and the shape churn is what leaked.
+    stats.update(cap=cap, cap_true=cap_true, n_tiles=len(cfg.tiles), vel_scale=s_new)
     # the REALIZED dtypes, read off the arrays rather than echoed from the
     # config: a receipt that repeats what it was told cannot catch a knob that
     # did not apply, which is the whole failure mode this milestone is built
@@ -509,9 +530,13 @@ def run(st, cfg, coeffs, collect=None, census=False):
     lead, fused = fused_drifts(coeffs)
     drift_and_migrate(st, lead)  # onto the first midpoint
     out = []
+    # the buffer shape is carried ACROSS steps and only ever grows, so the run
+    # visits at most a few shapes instead of one per step (M-v2-6 Stage 0)
+    cap_shape = 0
     for k in range(len(fused)):
         stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
-                     census=census)
+                     census=census, cap_shape=cap_shape)
+        cap_shape = int(stats["cap"])
         if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
             stats["repack"] = st.repack(brick_slack=cfg.brick_slack)
         out.append(stats)

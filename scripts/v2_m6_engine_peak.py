@@ -298,6 +298,15 @@ def _worker(cfg, leg, k_steps, workdir, slack, arena_frac, alloc_margin):
         # it ACROSS steps.
         out["cap_per_step"] = [int(s["cap"]) for s in seen]
         out["cap_distinct"] = len({int(s["cap"]) for s in seen})
+        # `cap_true` is the unquantized max over tiles: what the shape WOULD have
+        # been, so the two distinct-counts are the before/after of the leak in one
+        # run rather than across two
+        if seen and "cap_true" in seen[0]:
+            out["cap_true_per_step"] = [int(s["cap_true"]) for s in seen]
+            out["cap_true_distinct"] = len({int(s["cap_true"]) for s in seen})
+            out["pad_frac_max"] = max(
+                s["cap"] / s["cap_true"] - 1.0 for s in seen if s["cap_true"]
+            )
         out["arena_used_per_step"] = [int(s.get("arena_used", -1)) for s in seen]
         st.check()
     out["maxrss"] = _maxrss_bytes()
@@ -425,6 +434,10 @@ def main():
                     help="run the `step` leg at each K and fit net peak vs K. A "
                          "peak that GROWS with step count is an accumulation, not "
                          "a working set -- the decisive test for a per-step leak.")
+    ap.add_argument("--cap-rungs", type=int, default=None,
+                    help="rungs per octave for the buffer-shape ladder. Exposed so "
+                         "the padding regime can be MOVED: a defect that survives "
+                         "rungs=1 and rungs=64 unchanged is not caused by padding.")
     ap.add_argument("--slack", type=float, default=0.20)
     ap.add_argument("--arena-frac", type=float, default=0.08)
     ap.add_argument("--alloc-margin", type=float, default=0.10)
@@ -462,8 +475,19 @@ def main():
         rungs = {}
         for k in sorted(args.k_ladder):
             d = _run(cfg, "step", k, wd, knobs)
-            rungs[str(k)] = dict(peak=d["maxrss"], net=d["maxrss"] - base,
-                                 s_per_step=d.get("s_per_step"), cap=d.get("cap"))
+            # the shape FAMILY, not just the last shape: the leak is one
+            # executable family per distinct shape, so `cap_distinct` is the
+            # quantity the ladder is supposed to collapse and `cap_true_distinct`
+            # is what it would have been without it
+            rungs[str(k)] = dict(
+                peak=d["maxrss"], net=d["maxrss"] - base,
+                s_per_step=d.get("s_per_step"), cap=d.get("cap"),
+                cap_per_step=d.get("cap_per_step"),
+                cap_distinct=d.get("cap_distinct"),
+                cap_true_per_step=d.get("cap_true_per_step"),
+                cap_true_distinct=d.get("cap_true_distinct"),
+                pad_frac_max=d.get("pad_frac_max"),
+            )
             print(f"[{cfg}] K={k}: peak {d['maxrss'] / 1e9:.3f} GB, "
                   f"net {(d['maxrss'] - base) / 1e9:.3f} GB, "
                   f"{d['s_per_step']:.2f} s/step", flush=True)

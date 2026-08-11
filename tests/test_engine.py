@@ -199,3 +199,102 @@ def test_the_engine_defaults_to_the_order_independent_paints():
     cfg = _cfg()
     assert cfg.paint_short == "int"
     assert cfg.paint_long == "int"
+
+
+# ------------------------------------------------- the capacity shape ladder
+# M-v2-6 Stage 0. `cap` moves every step as occupancy shifts, and every buffer
+# keyed on it keys a new XLA shape, so an unquantized cap leaks one executable
+# family per step: measured at cdev8, ten distinct caps over ten steps
+# (285,554 -> 397,319) and a peak host RSS LINEAR in K at 0.331 GB/step.
+
+
+def test_the_capacity_ladder_is_monotone_and_never_shrinks_a_shape():
+    """Both arguments monotone, and exactness on a rung.
+
+    Monotonicity is the load-bearing property: an octave-relative ladder would
+    map cap 1001 -> 1250 while cap 1024 -> 1024, and a shape schedule that can go
+    DOWN as cap goes up reintroduces exactly the churn this removes.
+    """
+    caps = np.arange(1, 5000)
+    shapes = np.array([forces.capacity_shape(int(c)) for c in caps])
+    assert np.all(shapes >= caps), "a shape must never be smaller than the rows it holds"
+    assert np.all(np.diff(shapes) >= 0), "the ladder must be monotone in cap"
+    # exact on a rung: powers of two are rungs for any rungs-per-octave
+    for e in range(1, 20):
+        assert forces.capacity_shape(1 << e) == 1 << e
+    # sticky: a dip in cap cannot shrink the shape
+    assert forces.capacity_shape(100, floor_shape=4096) == 4096
+    assert forces.capacity_shape(9000, floor_shape=4096) >= 9000
+
+
+def test_the_capacity_ladder_bounds_both_padding_and_shape_count():
+    """The two quantities the knob trades, asserted as bounds rather than checked
+    by eye: worst-case padding is one rung, and a doubling of cap costs exactly
+    `rungs` shapes."""
+    for rungs in (1, 2, 3, 4, 8):
+        ratio = 2.0 ** (1.0 / rungs)
+        caps = np.arange(1000, 20000, 7)
+        shapes = np.array([forces.capacity_shape(int(c), rungs=rungs) for c in caps])
+        # +1 absorbs the integer ceil on small rungs; the claim is the RATIO
+        assert np.all(shapes <= np.ceil(caps * ratio) + 1)
+        # the HALF-OPEN octave (2^k, 2^(k+1)] is what costs `rungs` shapes; the
+        # closed interval also contains the lower rung itself, which is where the
+        # first version of this assertion was simply wrong
+        lo, hi = 4096, 8192
+        n = len({forces.capacity_shape(c, rungs=rungs) for c in range(lo + 1, hi + 1)})
+        assert n == rungs, f"a half-open octave should cost {rungs} shapes, got {n}"
+
+
+def test_quantizing_the_capacity_shape_is_bitwise_neutral():
+    """THE GATE for the fix, and it is an identity rather than a threshold.
+
+    Padded rows are MASKED, not filled: the short arm passes `live`, the long arm
+    `live=lv`, masked rows contribute an integer paint weight of exactly zero, the
+    gathers do not mix rows, and both results are sliced back to the real count.
+    So a bigger buffer must give bit-identical state. Run with `cap_rungs=1`
+    (coarsest ladder, largest padding, and it lands on a different shape than the
+    fine ladder) against a run that pads as little as the ladder allows.
+    """
+    from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
+
+    cosmo = Cosmology()
+    co = bullfrog_float_coeffs(bullfrog_table(a_grid(0.1, 0.5, 3, "log"), cosmo))
+    finals = []
+    caps = []
+    for rungs in (1, 16):
+        cfg = _cfg(cap_rungs=rungs)
+        _, _, st = _state(cfg)
+        out = engine.run(st, cfg, co)
+        caps.append([s["cap"] for s in out])
+        finals.append((st.off.copy(), st.w.copy(), st.occupancy.copy(),
+                       st.brick_start.copy(), st.vel_scale))
+    assert caps[0] != caps[1], (
+        "the two arms took the SAME shapes, so this asserts nothing -- the knob "
+        "did not move (an arm must move its knob)"
+    )
+    a, b = finals
+    assert np.array_equal(a[0], b[0]), "positions differ: padding is not neutral"
+    assert np.array_equal(a[1], b[1]), "velocities differ: padding is not neutral"
+    assert np.array_equal(a[2], b[2]), "occupancy differs"
+    assert np.array_equal(a[3], b[3]), "brick_start differs"
+    assert a[4] == b[4], "velocity scale differs"
+
+
+def test_the_run_visits_few_shapes_and_they_never_decrease():
+    """The behavioural claim: a run's shape family is small and monotone. Without
+    the ladder, cdev8 took a distinct cap on all ten of ten steps."""
+    from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
+
+    cosmo = Cosmology()
+    co = bullfrog_float_coeffs(bullfrog_table(a_grid(0.1, 1.0, 8, "log"), cosmo))
+    cfg = _cfg()
+    _, _, st = _state(cfg)
+    out = engine.run(st, cfg, co)
+    shapes = [s["cap"] for s in out]
+    trues = [s["cap_true"] for s in out]
+    assert all(s >= t for s, t in zip(shapes, trues)), "a shape held fewer rows than cap"
+    assert shapes == sorted(shapes), "the shape schedule must be non-decreasing"
+    assert len(set(shapes)) <= max(2, len(shapes) // 2), (
+        f"{len(set(shapes))} distinct shapes over {len(shapes)} steps: the ladder "
+        "is not collapsing the shape family"
+    )

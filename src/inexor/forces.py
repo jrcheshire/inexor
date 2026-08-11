@@ -62,6 +62,7 @@ aliases them), D-v2-10 froze the gaussian family, and they stay in the probe as
 the research record.
 """
 
+import math
 from functools import lru_cache
 
 import jax
@@ -531,6 +532,59 @@ def tile_capacity(member_counts):
     if not len(counts):
         raise ValueError("no tiles: cap is a max over tiles and there are none")
     return int(counts.max())
+
+
+# Rungs per octave for the capacity LADDER below. Three gives a worst-case pad of
+# 2^(1/3) - 1 = 26% of rows and at most three distinct shapes per doubling of
+# `cap`; the knob trades padded rows (which cost staging, measured LINEAR in cap)
+# against retained XLA executables (which cost host memory and never come back).
+CAP_RUNGS_PER_OCTAVE = 3
+
+
+def capacity_shape(cap, rungs=CAP_RUNGS_PER_OCTAVE, floor_shape=0):
+    """Quantize `cap` UP onto a fixed geometric ladder, monotone in both arguments.
+
+    **This exists because `cap` moves every single step and every buffer keyed on
+    it keys a new XLA shape.** Measured at cdev8 (M-v2-6 Stage 0): `cap` took ten
+    distinct values over ten steps, 285,554 rising monotonically to 397,319 as
+    occupancy shifts, driving ~71 XLA compilations per step and a peak host RSS
+    LINEAR IN STEP COUNT at 0.331 GB/step (5.151 / 7.042 / 10.157 GB at
+    K = 5 / 10 / 20, fit residuals <= 0.143 GB). Executables and their buffers are
+    cached for the life of the process, so an unbounded shape family is an
+    unbounded leak. At C-gh's K and P that is the term that decides whether the
+    configuration runs at all.
+
+    M-v2-3 already fixed the WITHIN-step version of this twice -- padding the
+    long-range read to one shape (2,107 compilations, 24.1 s of a 32.7 s step) and
+    masking the streamed coarse paint. Nothing pinned the shape ACROSS steps, and
+    the general lesson was already on record: pad to a stable shape and MASK.
+
+    The ladder is `2^(j/rungs)`, anchored globally rather than at the current
+    `cap`, so the mapping depends only on `cap` and never on the history that
+    reached it -- an octave-relative ladder is NOT monotone (cap 1001 -> 1250 while
+    cap 1024 -> 1024) and a non-monotone shape schedule reintroduces churn.
+    `floor_shape` makes it sticky across steps so an occupancy dip cannot shrink
+    the shape and then regrow it, paying two compilations for no reason.
+
+    Padding is safe because it is MASKED, not filled: the short arm passes `live`
+    and the long arm `live=lv`, masked rows contribute an integer weight of exactly
+    zero to the paints, per-row gathers do not mix rows, and both results are
+    sliced back to the real row count. So a larger shape is BITWISE the smaller
+    one -- which is the gate, not a hope.
+    """
+    cap = int(cap)
+    floor_shape = int(floor_shape)
+    if cap <= 0:
+        return max(0, floor_shape)
+    rungs = int(rungs)
+    if rungs < 1:
+        raise ValueError(f"rungs must be >= 1, got {rungs}")
+    j = math.ceil(rungs * math.log2(cap))
+    s = int(math.ceil(2.0 ** (j / rungs)))
+    while s < cap:  # float error at a rung boundary, never more than one step
+        j += 1
+        s = int(math.ceil(2.0 ** (j / rungs)))
+    return max(s, floor_shape)
 
 
 # ===========================================================================
