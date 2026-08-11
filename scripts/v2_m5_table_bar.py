@@ -54,8 +54,11 @@ CONFIGS = {
     "chero": (4096, 2048.0),
 }
 
-DENSITY_LADDER = (800, 2048, 4000, 16384)
-N_POINTS_PRODUCTION = 16384
+# NB nodes are UNIVERSAL (cosmology.K_TABLE_MIN..MAX, ~6 decades) rather than
+# per-grid (~3.5 decades) since the G5b shared-modes finding of 2026-08-10;
+# the production density is sized for the wider span.
+DENSITY_LADDER = (800, 2048, 4000, 16384, 32768)
+N_POINTS_PRODUCTION = 32768
 
 
 def _sweep_e_max(tab, cosmo, k_lo, k_hi, pts_per_interval):

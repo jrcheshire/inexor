@@ -326,36 +326,55 @@ class ICKTable:
         )
 
 
-def ic_k_table(cosmo, n_mesh, box_size, n_points=16384, pad=1.02, backend="eh98", table=None):
-    """Build the ICKTable covering a production rfft grid's full |k| range.
+# The universal table node range, h/Mpc -- the same span _eh98_amplitude's
+# normalization integral uses. UNIVERSAL, NOT PER-GRID, and that is
+# load-bearing: with nodes derived from (n_mesh, box_size), two resolutions
+# or box sizes carry two different tables, and the interpolation error at the
+# SAME physical k no longer cancels between them. G5b's shared-modes check
+# caught exactly that on first contact (2026-08-10): matched-phase rungs
+# coloured through per-grid tables disagreed at 3-6e-9 where the analytic
+# colour left 1e-15-class residuals. Fixed nodes make the interp error a
+# function of physical k alone, so it cancels in every shared-k comparison --
+# cross-resolution matched phase, box-ladder transport, all of them.
+K_TABLE_MIN = 1e-4
+K_TABLE_MAX = 1e2
 
-    Range [k_f/pad, pad*sqrt(3)*k_Nyq] with k_f = 2*pi/L and k_Nyq = pi*n/L, so
-    every realized |k| on the (n, n, n//2+1) half-grid is interior -- including
-    the DC-substitute (the smallest nonzero |k| = k_f) that `gaussian_delta`
-    evaluates in place of k = 0.
+
+def ic_k_table(cosmo, n_mesh, box_size, n_points=32768, backend="eh98", table=None):
+    """Build the ICKTable for a production rfft grid, on UNIVERSAL nodes.
+
+    Nodes are n_points log-spaced over [K_TABLE_MIN, K_TABLE_MAX] regardless
+    of the grid (see the block comment above for why); (n_mesh, box_size) are
+    used to REFUSE a grid whose realized |k| range [2*pi/L, sqrt(3)*pi*n/L]
+    the universal range does not cover -- loud at build time, not at first
+    interpolation (every production config sits comfortably inside; a box
+    under ~0.07 Mpc/h or a cell under ~0.036 Mpc/h would not).
 
     backend="eh98": P from `linear_power` (analytic, sigma8-normalized), T from
-    `transfer_eh98`. backend="table": P resampled from a (k, P) dump (CAMB);
-    T stays eh98 -- the ic.py M1 scope note stands (the table P(k) backend
-    carries no T(k); f_NL-with-CAMB-transfer is out of scope), and pretending
-    to derive T from a P dump would manufacture one silently.
+    `transfer_eh98`. backend="table": P resampled from a (k, P) dump (CAMB),
+    which must cover the universal range; T stays eh98 -- the ic.py M1 scope
+    note stands (the table P(k) backend carries no T(k);
+    f_NL-with-CAMB-transfer is out of scope), and pretending to derive T from
+    a P dump would manufacture one silently.
 
-    n_points=16384 default: log-log linear interpolation error goes as the
-    square of the node spacing in ln k; at 4000 points over this range the
-    derived error is ~1e-5 against the 1e-4 bar (7-13x margin), and 16384
-    points buy ~17x more for 128 KB (probe `v2_m5_table_bar.py` measures the
-    scaling rather than trusting this arithmetic).
+    n_points=32768 default: log-log linear interpolation error goes as the
+    square of the node spacing in ln k, and the universal range spans ~6
+    decades against the per-grid ~3.5, so the density is sized to keep the
+    measured error in the few x 1e-7 class (512 KB; probe
+    `v2_m5_table_bar.py` measures the scaling rather than trusting this
+    arithmetic).
     """
     n_mesh = int(n_mesh)
     if n_mesh < 2:
         raise ValueError(f"n_mesh must be >= 2, got {n_mesh}")
-    if pad <= 1.0:
-        raise ValueError(f"pad must be > 1 (endpoints must be interior), got {pad}")
     k_f = 2.0 * np.pi / box_size
-    k_nyq = np.pi * n_mesh / box_size
-    k_lo = k_f / pad
-    k_hi = pad * math.sqrt(3.0) * k_nyq
-    k = np.exp(np.linspace(np.log(k_lo), np.log(k_hi), int(n_points)))
+    k_grid_hi = math.sqrt(3.0) * np.pi * n_mesh / box_size
+    if k_f < K_TABLE_MIN or k_grid_hi > K_TABLE_MAX:
+        raise ValueError(
+            f"grid |k| range [{k_f:.3e}, {k_grid_hi:.3e}] exceeds the universal table "
+            f"range [{K_TABLE_MIN:.0e}, {K_TABLE_MAX:.0e}]; refusing at build time"
+        )
+    k = np.exp(np.linspace(np.log(K_TABLE_MIN), np.log(K_TABLE_MAX), int(n_points)))
     P = linear_power(k, cosmo, z=0.0, backend=backend, table=table)
     T = transfer_eh98(k, cosmo)
     return ICKTable(k, P, T)

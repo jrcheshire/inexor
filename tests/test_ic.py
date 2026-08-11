@@ -53,7 +53,13 @@ def test_fnl_zero_round_trips_to_gaussian():
     assert float(jnp.max(jnp.abs(d0 - dg))) < 1e-4 * scale  # FFT round-off class
 
 
-def test_fnl_enters_linearly_and_differentiably():
+def test_fnl_enters_linearly():
+    """f_NL linearity by equal increments. The jax.grad arm this test used to
+    carry was RETIRED with v1 at M-v2-5 (JC, 2026-08-10): the generator is
+    host numpy through ooc_fft, and a jnp twin would ship two same-seed fields
+    differing in last bits -- the trap the one-stream design exists to
+    prevent. `colour_white` is the seam a differentiable twin would be built
+    behind if differentiable ICs are ever needed, gated then."""
     key = jax.random.PRNGKey(4)
 
     def field(f_nl):
@@ -64,12 +70,6 @@ def test_fnl_enters_linearly_and_differentiably():
     inc1 = np.asarray(d10 - d0, np.float64)
     inc2 = np.asarray(d20 - d10, np.float64)
     assert np.max(np.abs(inc2 - inc1)) < 1e-3 * np.max(np.abs(inc1))
-    # jax.grad through f_NL matches the (exact) linear slope
-    g = jax.grad(lambda f: jnp.sum(field(f) ** 2))(10.0)
-    fd = (float(jnp.sum(field(10.0 + 1.0) ** 2)) - float(jnp.sum(field(10.0 - 1.0) ** 2))) / 2.0
-    # f32 loss + f32 FD numerator: ~1e-2 agreement is the precision floor here;
-    # exact linearity is separately proven by the equal-increments assert above
-    assert float(g) == pytest.approx(fd, rel=2e-2)
 
 
 def test_primordial_potential_cobe_scale():
@@ -147,6 +147,60 @@ def test_white_noise_invariance_can_fail(x64):
         [white_slab(key, 1, n, n, np.float64), white_plane(key, 0, n, np.float64)[None]], axis=0
     )
     assert not np.array_equal(shifted, ref)
+
+
+def test_gaussian_delta_is_bitwise_the_streamed_assembly(x64):
+    """THE FIRST M-v2-5 IDENTITY GATE, at unit-test scale: the monolithic
+    convenience is the streamed generator at slab = N, bitwise. The streamed
+    arm here is built from ragged 5-plane noise slabs through
+    forward_from_slabs, coloured identically, and assembled from 3-plane
+    inverse slabs -- every loop bound different from the monolithic call."""
+    from inexor import ooc_fft
+    from inexor.cosmology import ic_k_table
+    from inexor.ic import _colour_fn, white_slab
+
+    n, box = 32, 128.0
+    key = jax.random.PRNGKey(6)
+    for fdt in (np.float64, np.float32):
+        ref = gaussian_delta(key, n, box, PLANCK, fdtype=fdt)
+        spec = ooc_fft.forward_from_slabs(
+            lambda lo, hi: white_slab(key, lo, hi, n, fdt), n, slab=5
+        )
+        tab = ic_k_table(PLANCK, n, box)
+        ooc_fft.mul_radial_inplace(spec, n, box, _colour_fn(tab, n, box), dc_value=0.0, slab=5)
+        streamed = np.empty((n, n, n), dtype=np.dtype(fdt))
+        for lo, s in ooc_fft.inverse_to_slabs(spec, n, slab=3):
+            streamed[lo : lo + s.shape[0]] = s
+        assert np.array_equal(streamed, ref), f"streamed assembly moved bits at {fdt}"
+        # anti-vacuity: a different seed's streamed assembly must not match
+        assert not np.array_equal(streamed, gaussian_delta(jax.random.PRNGKey(7), n, box,
+                                                           PLANCK, fdtype=fdt))
+
+
+def test_linear_density_mean_phi2_is_decomposition_invariant(x64):
+    """The fixed-order reduction: THREADING the running total through slabs of
+    any thickness replays the monolithic fold exactly. Summing slabs
+    separately and adding subtotals re-associates and moves last bits -- that
+    failure was MEASURED here first (a 16-plane grouping differed at 1e-16
+    relative), which is why the API threads `tot` instead of returning
+    per-slab sums to add."""
+    from inexor.ic import mean_sq_by_plane, sq_sum_by_plane
+
+    rng = np.random.default_rng(9)
+    f = rng.standard_normal((32, 32, 32))
+    ref = mean_sq_by_plane(f)
+    for t in (1, 7, 16, 32):
+        tot = 0.0
+        for lo in range(0, 32, t):
+            tot = sq_sum_by_plane(f[lo : min(lo + t, 32)], tot)
+        assert tot / f.size == ref, f"slab grouping t={t} moved the reduction"
+    # anti-vacuity: perturbing one element must move the reduction. NB a
+    # one-ulp bump is BELOW this statistic's resolution (it moves the square
+    # by ~4e-16 against a plane-sum ulp of ~2e-13 over 1024 O(1) terms), so
+    # the probe uses the smallest perturbation class the reduction can see.
+    g = f.copy()
+    g[13, 5, 7] += 1e-9
+    assert mean_sq_by_plane(g) != ref
 
 
 def test_white_noise_moments_sane():

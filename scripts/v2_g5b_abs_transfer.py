@@ -165,31 +165,32 @@ def _white_truncated(white_hi, n_lo):
 def _colour(white, n_mesh, L, cosmo):
     """delta from a GIVEN white-noise field -- ic.gaussian_delta's convention.
 
-    Mirrors ic.gaussian_delta (ic.py:34-62) exactly, host f64, with the white
-    noise injected rather than drawn. check_identity() asserts it reproduces
-    ic.gaussian_delta bit-for-bit at the same key, which is what licenses the
-    mirror.
+    RE-POINTED AT M-v2-5 (JC, 2026-08-10): this is now a thin call to
+    `ic.colour_white`, the package's own noise-injection seam, instead of a
+    probe-local mirror of the colour arithmetic. The original mirror's
+    bit-for-bit license died with the in-place ic.py replacement (new noise
+    stream, 1D-table colour, ooc_fft factorization); a mirror is exactly the
+    thing whose license dies when the implementation moves, which is why the
+    seam now exists. check_identity() still asserts the degenerate limit
+    reproduces ic.gaussian_delta bit-for-bit -- now a plumbing-drift detector
+    that holds by construction. NB: fields at a given SEED are new-stream
+    realizations; the recorded g5b cards (old stream) stand as measured at
+    their commits and are not comparable seed-by-seed.
     """
-    from inexor.cosmology import linear_power
+    from inexor import ic
 
-    N = n_mesh
-    dk = np.fft.rfftn(white)
-    kx = 2.0 * np.pi * np.fft.fftfreq(N, d=L / N)
-    kz = 2.0 * np.pi * np.fft.rfftfreq(N, d=L / N)
-    kk = np.sqrt(kx.reshape(N, 1, 1) ** 2 + kx.reshape(1, N, 1) ** 2 + kz.reshape(1, 1, -1) ** 2)
-    kk_safe = kk.copy()
-    kk_safe[0, 0, 0] = kk.flat[1]
-    colour = np.sqrt(linear_power(kk_safe.ravel(), cosmo).reshape(kk.shape) * N**3 / L**3)
-    colour[0, 0, 0] = 0.0
-    return np.fft.irfftn(dk * colour, s=(N, N, N))
+    return ic.colour_white(white, L, cosmo)
 
 
 def _white_hi(n_hi):
-    """The ONE white-noise field every rung derives from (host f64)."""
+    """The ONE white-noise field every rung derives from (host f64,
+    plane-keyed m5-foldin stream)."""
     import jax
 
     jax.config.update("jax_enable_x64", True)
-    return np.asarray(jax.random.normal(jax.random.PRNGKey(SEED), (n_hi,) * 3, dtype="float64"))
+    from inexor import ic
+
+    return ic.white_noise(jax.random.PRNGKey(SEED), n_hi, np.float64)
 
 
 def matched_delta(n_part, n_hi, L, cosmo):

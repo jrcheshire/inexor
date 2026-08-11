@@ -135,20 +135,28 @@ def _old_linear_density(key, n_mesh, box_size, cosmo, f_NL=0.0, fdtype=None):
 
 
 def leg_mirror_license():
-    """Bitwise identity of the mirror against inexor.ic, pre-replacement.
+    """The mirror against inexor.ic, with expectations set by the tree's era.
 
-    Assertions, each with n_diff reported:
-      - gaussian_delta: mirror == ic, N in {64, 128}, fdtype in {f64, f32}
-      - linear_density: mirror == ic at f_NL in {0, 10}, N=64, f64
-      - poisson_factor: mirror == ic, N=64
-    Anti-vacuity: the fields have real dynamic range (rms > 0.1), and a
-    different seed does NOT match (a comparison that cannot fail is not one).
+    PRE-REPLACEMENT (ic.IC_STREAM absent): bitwise identity on every arm --
+    the license, banked as the frozen card m5_gate_mirror-license.json at the
+    S0 commit. POST-REPLACEMENT (IC_STREAM present): the field arms MUST
+    DIFFER at every seed (D-v2-15 clause 5 -- identity here would mean the
+    fold_in stream was never wired), while poisson_factor, whose analytic body
+    did not move, MUST still match. Same instrument, two eras, both fail-able.
+
+    Anti-vacuity either way: the fields have real dynamic range (rms > 0.1),
+    and the different-seed control does NOT match.
     """
     import jax
     import jax.numpy as jnp
 
     from inexor import ic
     from inexor.config import Cosmology
+
+    new_stream = hasattr(ic, "IC_STREAM")
+    fields_equal = not new_stream
+    print(f"  era: {'post-replacement (fields must differ)' if new_stream else 'pre-replacement (license: fields must match)'}",
+          flush=True)
 
     cosmo = Cosmology()
     arms = {}
@@ -171,13 +179,13 @@ def leg_mirror_license():
             key = jax.random.PRNGKey(SEED)
             mine = _old_gaussian_delta(key, N, 128.0, cosmo, fdt)
             theirs = ic.gaussian_delta(key, N, 128.0, cosmo, fdtype=fdt)
-            _cmp(f"gaussian_delta_n{N}_{fname}", mine, theirs)
+            _cmp(f"gaussian_delta_n{N}_{fname}", mine, theirs, expect_equal=fields_equal)
 
     key = jax.random.PRNGKey(SEED)
     for f_NL in (0.0, 10.0):
         mine = _old_linear_density(key, 64, 128.0, cosmo, f_NL=f_NL, fdtype=jnp.float64)
         theirs = ic.linear_density(key, 64, 128.0, cosmo, f_NL=f_NL, fdtype=jnp.float64)
-        _cmp(f"linear_density_n64_f64_fnl{int(f_NL)}", mine, theirs)
+        _cmp(f"linear_density_n64_f64_fnl{int(f_NL)}", mine, theirs, expect_equal=fields_equal)
 
     _cmp(
         "poisson_factor_n64",
