@@ -12,11 +12,18 @@
 # comes up CPU -- which the probe REQUIRES (it refuses any other backend).
 # Staging goes to $SCRATCH via TMPDIR. NO set -e: the probe runs cheapest
 # rung first and its own exit code is the verdict.
+#
+# JAX_PLATFORMS=cpu is LOAD-BEARING on jax 0.10: CONDA_OVERRIDE_CUDA only
+# gets the env ACTIVATED; the CUDA plugin's discovery then hard-raises on
+# cuInit (error 303) on a GPU-less node instead of falling back (job 902236
+# died on exactly this). Forcing the platform skips plugin discovery -- the
+# probes' standing orchestrator pattern.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
 cd "$HOME/src/inexor" || exit 1
 export CONDA_OVERRIDE_CUDA=12.0
+export JAX_PLATFORMS=cpu
 pixi run -e gpu python -c "import jax; d=jax.devices(); print('jax', jax.__version__, d); assert d[0].platform=='cpu', 'expected CPU backend on gg'" \
   || { echo "FATAL: jax import/backend check failed"; exit 1; }
 
