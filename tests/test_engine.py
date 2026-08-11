@@ -379,3 +379,49 @@ def test_a_run_keeps_every_particle_owned_once_over_many_steps():
     out = engine.run(st, cfg, co)
     assert len(out) == 8
     st.check()
+
+
+def test_ownership_from_bricks_counts_every_stored_row_exactly_once():
+    """The partition the engine's assertion actually counts: rows in STORAGE.
+
+    `owned_mask` partitions space exactly and that is a different partition --
+    membership comes from brick ordinals, so a row whose stored brick disagrees
+    with its position by one cell is handed to one tile and assigned to another,
+    and nobody claims it (antares 436: one row of 16,777,216). This asserts the
+    storage-derived form over the real container, summed over every tile.
+    """
+    cfg = _cfg()
+    _, _, st = _state(cfg, 11)
+    b_real = cfg._b_realized
+    nb = cfg.n_fine // cfg.n_brick
+    total = 0
+    for t in cfg.tiles:
+        members = st.tile_bricks(t, cfg.n_tile, b_real, cfg.n_brick, cfg.n_fine)
+        brick_of_row = np.repeat(
+            np.asarray(members, dtype=np.int64),
+            [st.brick_member_count(b) for b in members],
+        )
+        own = forces.owned_mask_from_bricks(brick_of_row, t, cfg.n_tile, cfg.n_brick, nb)
+        total += int(own.sum())
+    assert total == st.n_particles, (
+        f"the tiles own {total} stored rows against {st.n_particles} particles"
+    )
+
+
+def test_every_brick_belongs_to_exactly_one_tile_core():
+    """The arithmetic the storage-derived partition rests on, asserted rather than
+    argued: the brick grid divides into tile cores with nothing left over."""
+    cfg = _cfg()
+    nb = cfg.n_fine // cfg.n_brick
+    per = cfg.n_tile // cfg.n_brick
+    assert nb % per == 0, "the brick grid does not divide into tile cores"
+    assert nb // per == cfg.tiles_side
+    claims = np.zeros(nb**3, dtype=np.int32)
+    all_bricks = np.arange(nb**3, dtype=np.int64)
+    for t in cfg.tiles:
+        claims += forces.owned_mask_from_bricks(
+            all_bricks, t, cfg.n_tile, cfg.n_brick, nb
+        ).astype(np.int32)
+    assert claims.min() == 1 and claims.max() == 1, (
+        f"{int((claims != 1).sum())} bricks of {nb**3} are not claimed exactly once"
+    )

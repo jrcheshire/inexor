@@ -556,10 +556,53 @@ def owning_tile(positions, cell, n_tile, n_fine):
 
 
 def owned_mask(positions, tijk, cell, n_tile, n_fine, live=None):
-    """Rows of `positions` owned by tile `tijk`; see `owning_tile`."""
+    """Rows of `positions` owned by tile `tijk`, by POSITION; see `owning_tile`.
+
+    Correct as a partition of SPACE, and that is not the partition the engine
+    needs -- see `owned_mask_from_bricks`, which is what `engine.step` uses. This
+    remains for `force_short_tiled`, whose injected `member_fn` returns particle
+    indices with no brick structure to derive ownership from.
+    """
     own = owning_tile(positions, cell, n_tile, n_fine)
     m = np.all(own == np.asarray(tijk, dtype=np.int64), axis=1)
     return m if live is None else (m & np.asarray(live, dtype=bool))
+
+
+def owned_mask_from_bricks(brick_of_row, tijk, n_tile, n_brick, nb):
+    """Rows owned by tile `tijk`, decided by the brick each row is STORED IN.
+
+    **This is the partition the engine's assertion actually counts, and deciding
+    ownership any other way is a second opinion that can disagree.** The
+    position-based form (`owned_mask`) partitions SPACE exactly, which is not the
+    same thing: membership comes from `SlotState.tile_bricks`, i.e. from brick
+    ORDINALS, so a row whose stored brick disagrees with its position by one cell
+    is handed to a tile that the position test then assigns elsewhere, and no tile
+    claims it. Measured: antares job 436 at cdev, one row of 16,777,216 unowned
+    with the position-based rule -- the same symptom as the tile-local float rule
+    it replaced, and a different cause. The ulp-gap reading of job 431 was
+    therefore incomplete: both rules fail here because both re-derive ownership
+    from a coordinate instead of reading it off the layout.
+
+    Storage-derived ownership cannot fail, and the argument is arithmetic rather
+    than empirical. Bricks per tile core is `n_tile // n_brick`, the brick grid is
+    `nb = n_fine // n_brick`, and `nb / (n_tile // n_brick) = n_fine // n_tile =
+    tiles_side` exactly, so the brick grid partitions into tile cores with nothing
+    left over: every brick belongs to exactly one core, hence every stored row to
+    exactly one tile. `brick_span` pads outward with `pad >= 0`, so a tile's
+    members always include its own core bricks. No float comparison is involved at
+    any point.
+
+    `brick_of_row` is the flat brick ordinal per decoded row, in the
+    `(bi * nb + bj) * nb + bk` convention `tile_bricks` builds and `decode_bricks`
+    concatenates in.
+    """
+    b = np.asarray(brick_of_row, dtype=np.int64)
+    nb = int(nb)
+    per = int(n_tile) // int(n_brick)
+    bi, rem = np.divmod(b, nb * nb)
+    bj, bk = np.divmod(rem, nb)
+    t = np.asarray(tijk, dtype=np.int64)
+    return (bi // per == t[0]) & (bj // per == t[1]) & (bk // per == t[2])
 
 
 def tile_capacity(member_counts):

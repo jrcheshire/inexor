@@ -53,7 +53,7 @@ from .forces import (
     COARSE_HALO,
     capacity_shape,
     coarse_force_meshes,
-    owned_mask,
+    owned_mask_from_bricks,
     coarse_subblock_origin_extent,
     gather_coarse_subblock,
     make_tile_force_fn,
@@ -462,6 +462,12 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
     pending = []  # (slots, v_new) held until the global scale is known
     for t in cfg.tiles:
         slots, x, v = st.decode_bricks(members[t])
+        # the brick each decoded row came from, in the order decode_bricks
+        # concatenates: this is what ownership is read off, NOT the position
+        brick_of_row = np.repeat(
+            np.asarray(members[t], dtype=np.int64),
+            [st.brick_member_count(b) for b in members[t]],
+        )
         m = len(slots)
         if m == 0:
             continue
@@ -473,11 +479,17 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
         origin, _ = tile_origin_extent(t, cfg.n_tile, b_real, cell)
         xg = x[idx]
         u = jnp.mod(jnp.asarray(xg) - jnp.asarray(origin), cfg.box_size)
-        # ownership from the GLOBAL position, in integers: an exact partition by
-        # construction. The tile-local float test it replaces left a ~1 ulp gap at
-        # every core plane and dropped a particle at cdev (antares job 431). See
-        # `forces.owning_tile`.
-        own = owned_mask(xg, t, cell, cfg.n_tile, cfg.n_fine, live=live)
+        # ownership from the brick each row is STORED IN, which is the same thing
+        # membership is built from, so the two cannot disagree. Two earlier rules
+        # both re-derived it from a coordinate and both lost exactly one row of
+        # 16,777,216 at cdev (antares 431 tile-local, 436 global-position). See
+        # `forces.owned_mask_from_bricks` for why this one cannot.
+        own_rows = owned_mask_from_bricks(
+            brick_of_row, t, cfg.n_tile, cfg.n_brick, cfg.n_fine // cfg.n_brick
+        )
+        own = np.zeros(cap, dtype=bool)
+        own[:m] = own_rows
+        own &= live
         g_short, owned, n_out = one_tile(u, jnp.asarray(live), jnp.asarray(own))
         g_short = np.asarray(g_short)[:m]
         owned = np.asarray(owned)[:m]
