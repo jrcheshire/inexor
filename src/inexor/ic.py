@@ -62,17 +62,27 @@ def gaussian_delta(
     return amplitude * jnp.fft.irfftn(dk, s=(N, N, N))
 
 
-def poisson_M(k, cosmo, z=0.0):
+def poisson_M(k, cosmo, z=0.0, table=None):
     """M(k, z) = (2/3) (c/H0)^2 k^2 T(k) D_md(z) / Omega_m, for arbitrary k.
 
     The Poisson/transfer factor relating potential and density,
     delta_lin(k, z) = M(k, z) phi(k). Accepts scalar or array k (h/Mpc),
     preserves shape; k = 0 maps to a safe transfer placeholder (M -> 0 there
     via the k^2 anyway). Host float64 (precision island).
+
+    table: an ICKTable (D-v2-15 clause 2). With one, T comes from the 1D
+    interpolated table -- O(len(k)) with no half-grid transfer evaluation --
+    and the k = 0 placeholder is the table's own smallest node (in range by
+    construction; the value never matters, k^2 zeroes it). table=None keeps
+    the analytic transfer for scalar/diagnostic callers.
     """
     k = np.asarray(k, dtype=np.float64)
-    k_safe = np.where(k > 0, k, 1.0)
-    T = transfer_eh98(k_safe.ravel(), cosmo).reshape(k.shape)
+    if table is not None:
+        k_safe = np.where(k > 0, k, table.k[0])
+        T = table.T_of_k(k_safe.ravel()).reshape(k.shape)
+    else:
+        k_safe = np.where(k > 0, k, 1.0)
+        T = transfer_eh98(k_safe.ravel(), cosmo).reshape(k.shape)
     a = 1.0 / (1.0 + z)
     D_md = growth_factor_md(a, cosmo)
     return (2.0 / 3.0) * C_OVER_H0**2 * k**2 * T * D_md / cosmo.Omega_m

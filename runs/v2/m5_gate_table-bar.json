@@ -1,0 +1,197 @@
+{
+ "configs": [
+  {
+   "config": "cdev",
+   "n_mesh": 256,
+   "box_size": 128.0,
+   "k_f": 0.04908738521234052,
+   "k_hi": 10.882796185405306,
+   "table_spec": {
+    "n_points": 16384,
+    "k_min": 0.04812488746307894,
+    "k_max": 11.100452109113414,
+    "backend": "eh98",
+    "sha256_kPT": "693d6b41d84e9d3290c06d1ce9cdc5ca0c5a8b3072fd282f8112fd8367dc8ffd"
+   },
+   "sweep": {
+    "e_max_33": 1.5953700505111357e-07,
+    "e_max_65": 1.5953700505111357e-07,
+    "argmax_k": 0.19875460374033607,
+    "resweep_drift": 0.0
+   },
+   "per_decade": [
+    {
+     "k_lo": 0.01,
+     "k_hi": 0.1,
+     "e_max": 6.596033863548456e-08
+    },
+    {
+     "k_lo": 0.1,
+     "k_hi": 1.0,
+     "e_max": 1.5953700505111357e-07
+    },
+    {
+     "k_lo": 1.0,
+     "k_hi": 10.0,
+     "e_max": 4.434559719435072e-09
+    },
+    {
+     "k_lo": 10.0,
+     "k_hi": 100.0,
+     "e_max": 1.3771972451337433e-09
+    }
+   ],
+   "honesty_resweep_ok": true,
+   "multiset_e_max": 1.2345514888156828e-07,
+   "honesty_multiset_ok": true,
+   "tier1_pass": true,
+   "tier2_finding": false
+  },
+  {
+   "config": "cgh",
+   "n_mesh": 2048,
+   "box_size": 1024.0,
+   "k_f": 0.006135923151542565,
+   "k_hi": 10.882796185405306,
+   "table_spec": {
+    "n_points": 16384,
+    "k_min": 0.006015610932884867,
+    "k_max": 11.100452109113414,
+    "backend": "eh98",
+    "sha256_kPT": "d657d9fffbafe6e841345dd87698065ef07059575a5d9d14b9c0d9ec135e4493"
+   },
+   "sweep": {
+    "e_max_33": 3.047857107807417e-07,
+    "e_max_65": 3.047857107807417e-07,
+    "argmax_k": 0.1987367426919742,
+    "resweep_drift": 0.0
+   },
+   "per_decade": [
+    {
+     "k_lo": 0.001,
+     "k_hi": 0.01,
+     "e_max": 1.5059557934016254e-08
+    },
+    {
+     "k_lo": 0.01,
+     "k_hi": 0.1,
+     "e_max": 1.2601272403323094e-07
+    },
+    {
+     "k_lo": 0.1,
+     "k_hi": 1.0,
+     "e_max": 3.047857107807417e-07
+    },
+    {
+     "k_lo": 1.0,
+     "k_hi": 10.0,
+     "e_max": 8.47151004901292e-09
+    },
+    {
+     "k_lo": 10.0,
+     "k_hi": 100.0,
+     "e_max": 2.625023087787781e-09
+    }
+   ],
+   "honesty_resweep_ok": true,
+   "tier1_pass": true,
+   "tier2_finding": false
+  },
+  {
+   "config": "chero",
+   "n_mesh": 4096,
+   "box_size": 2048.0,
+   "k_f": 0.0030679615757712823,
+   "k_hi": 10.882796185405306,
+   "table_spec": {
+    "n_points": 16384,
+    "k_min": 0.003007805466442433,
+    "k_max": 11.100452109113414,
+    "backend": "eh98",
+    "sha256_kPT": "9b3b831284784eb1a034fc1b7ee971f883c4031176e4e073c5b0f2ca60f14de1"
+   },
+   "sweep": {
+    "e_max_33": 3.6355559340783827e-07,
+    "e_max_65": 3.6355559340783827e-07,
+    "argmax_k": 0.19868099356568847,
+    "resweep_drift": 0.0
+   },
+   "per_decade": [
+    {
+     "k_lo": 0.001,
+     "k_hi": 0.01,
+     "e_max": 1.7961873988170396e-08
+    },
+    {
+     "k_lo": 0.01,
+     "k_hi": 0.1,
+     "e_max": 1.5031215894190098e-07
+    },
+    {
+     "k_lo": 0.1,
+     "k_hi": 1.0,
+     "e_max": 3.6355559340783827e-07
+    },
+    {
+     "k_lo": 1.0,
+     "k_hi": 10.0,
+     "e_max": 1.0085899448952773e-08
+    },
+    {
+     "k_lo": 10.0,
+     "k_hi": 100.0,
+     "e_max": 3.140863680251016e-09
+    }
+   ],
+   "honesty_resweep_ok": true,
+   "tier1_pass": true,
+   "tier2_finding": false
+  }
+ ],
+ "density_ladder": {
+  "rungs": [
+   {
+    "n_points": 800,
+    "h": 0.006809689190045096,
+    "e_max": 6.700802320069865e-05,
+    "argmax_k": 0.1990626601525353
+   },
+   {
+    "n_points": 2048,
+    "h": 0.002658007651610177,
+    "e_max": 1.0218507148440636e-05,
+    "argmax_k": 0.19871001209984765
+   },
+   {
+    "n_points": 4000,
+    "h": 0.0013605755596014083,
+    "e_max": 2.6775267711887096e-06,
+    "argmax_k": 0.19878015694090606
+   },
+   {
+    "n_points": 16384,
+    "h": 0.0003321089948633359,
+    "e_max": 1.5953700505111357e-07,
+    "argmax_k": 0.19875460374033607
+   }
+  ],
+  "slope": 1.9997122947020667,
+  "h2_ok": true
+ },
+ "ok": true,
+ "commit": "83cedb223c17ca53642e825dc0dd1f845d8a2be2",
+ "slurm_job_id": null,
+ "provenance": {
+  "backend": "cpu",
+  "device_kind": "cpu",
+  "n_devices": 1,
+  "host_cores": 16,
+  "x64": false,
+  "jax_version": "0.10.2",
+  "threefry_partitionable": true,
+  "ic_stream": "pre-m5-normal",
+  "xla_flags": null,
+  "omp_num_threads": null,
+  "argv": []
+ }
+}

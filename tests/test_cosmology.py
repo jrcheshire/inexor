@@ -15,6 +15,7 @@ from inexor.cosmology import (
     growth_factor_md,
     growth_rate_2,
     growth_rate_a,
+    ic_k_table,
     linear_power,
     sigma_R,
     transfer_eh98,
@@ -102,6 +103,97 @@ def test_distinct_cosmologies_do_not_share_caches():
     other = Cosmology(Omega_m=0.35, sigma8=0.75)
     assert sigma_R(8.0, other) == pytest.approx(0.75, rel=1e-3)
     assert sigma_R(8.0, PLANCK) == pytest.approx(0.81, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# ICKTable (M-v2-5, D-v2-15 clause 2)
+# ---------------------------------------------------------------------------
+
+
+def _realized_kmag(n, L):
+    """The exact |k| multiset of the (n, n, n//2+1) rfft half-grid."""
+    kx = 2.0 * np.pi * np.fft.fftfreq(n, d=L / n)
+    kz = 2.0 * np.pi * np.fft.rfftfreq(n, d=L / n)
+    kk = np.sqrt(
+        kx.reshape(n, 1, 1) ** 2 + kx.reshape(1, n, 1) ** 2 + kz.reshape(1, 1, -1) ** 2
+    )
+    return kk.ravel()
+
+
+def test_ic_k_table_meets_the_bar_on_the_full_cdev_multiset():
+    """Charter bar (JC 2026-08-10): max rel error of table P(k) vs analytic EH98
+    over EVERY realized |k| on the production rfft grid < 1e-4. Asserted here on
+    the exact C-dev multiset (n=256, L=128 -- 8.5e6 values, the one scale where
+    materializing it is the point); the C-gh/C-hero grids are the probe's job.
+    """
+    n, L = 256, 128.0
+    tab = ic_k_table(PLANCK, n, L)
+    kk = _realized_kmag(n, L)
+    kk = kk[kk > 0]  # DC is overwritten by every caller, never interpolated
+    P_tab = tab.P_of_k(kk)
+    P_ref = linear_power(kk, PLANCK)
+    e_max = np.max(np.abs(P_tab / P_ref - 1.0))
+    assert e_max < 1e-4, f"table error {e_max:.3e} over the 1e-4 bar"
+
+
+def test_ic_k_table_bar_can_fail():
+    """Anti-vacuity: a 32-point table must MISS the bar, or the bar tests nothing."""
+    n, L = 64, 128.0
+    tab = ic_k_table(PLANCK, n, L, n_points=32)
+    kk = _realized_kmag(n, L)
+    kk = kk[kk > 0]
+    e_max = np.max(np.abs(tab.P_of_k(kk) / linear_power(kk, PLANCK) - 1.0))
+    assert e_max > 1e-4, f"32-point table read {e_max:.3e}; the bar cannot fail"
+
+
+def test_ic_k_table_covers_the_grid_endpoints():
+    """The DC substitute (smallest nonzero |k| = k_f) and sqrt(3)*k_Nyq are both
+    interior: the refusal must NOT fire anywhere on the realized grid."""
+    n, L = 64, 128.0
+    tab = ic_k_table(PLANCK, n, L)
+    kk = _realized_kmag(n, L)
+    kk = kk[kk > 0]
+    tab.P_of_k(kk)  # would raise on any excursion
+    tab.T_of_k(kk)
+    k_f = 2.0 * np.pi / L
+    assert kk.min() == pytest.approx(k_f, rel=1e-12)
+    assert tab.k[0] < k_f and tab.k[-1] > kk.max()
+
+
+def test_ic_k_table_refuses_extrapolation():
+    tab = ic_k_table(PLANCK, 64, 128.0)
+    for bad in (tab.k[0] * 0.5, tab.k[-1] * 2.0):
+        with pytest.raises(ValueError, match="refusing to extrapolate"):
+            tab.P_of_k(np.array([bad]))
+        with pytest.raises(ValueError, match="refusing to extrapolate"):
+            tab.T_of_k(np.array([bad]))
+
+
+def test_ic_k_table_transfer_matches_eh98():
+    """T_of_k: exact at the nodes (np.interp identity), interp-error-class between."""
+    tab = ic_k_table(PLANCK, 256, 128.0)
+    sub = tab.k[:: len(tab.k) // 199]
+    assert np.array_equal(tab.T_of_k(sub), transfer_eh98(sub, PLANCK))
+    mid = np.sqrt(tab.k[100:-100:37] * tab.k[101:-99:37])  # geometric midpoints
+    assert np.allclose(tab.T_of_k(mid), transfer_eh98(mid, PLANCK), rtol=1e-4, atol=1e-8)
+
+
+def test_ic_k_tables_do_not_alias_across_cosmologies():
+    """No cache exists to share, and the tables must actually differ."""
+    other = Cosmology(Omega_m=0.35, sigma8=0.75)
+    t1 = ic_k_table(PLANCK, 64, 128.0)
+    t2 = ic_k_table(other, 64, 128.0)
+    assert not np.array_equal(t1.P, t2.P)
+    assert not np.array_equal(t1.T, t2.T)
+    assert np.array_equal(t1.k, t2.k)  # same grid geometry, different physics
+
+
+def test_ic_k_table_shape_and_scalar_handling():
+    tab = ic_k_table(PLANCK, 64, 128.0)
+    k2d = np.full((3, 4), 0.5)
+    assert tab.P_of_k(k2d).shape == (3, 4)
+    assert np.ndim(tab.P_of_k(0.5)) == 0
+    assert np.ndim(tab.T_of_k(0.5)) == 0
 
 
 def test_ccl_cross_check():

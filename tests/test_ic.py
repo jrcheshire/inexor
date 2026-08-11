@@ -75,6 +75,22 @@ def test_poisson_M_shape_and_limits():
     assert np.all(np.diff(M[1:]) > 0)  # rising with k over this range
 
 
+def test_poisson_M_table_path_matches_analytic():
+    """M-v2-5: the ICKTable transfer path agrees with the analytic one at
+    interp-error class, preserves shape, and keeps the k=0 -> M=0 contract."""
+    from inexor.cosmology import ic_k_table
+
+    tab = ic_k_table(PLANCK, 256, 128.0)
+    k = np.array([0.0, 0.05, 0.1, 0.5, 1.0, 5.0])
+    M_tab = poisson_M(k, PLANCK, table=tab)
+    M_ana = poisson_M(k, PLANCK)
+    assert M_tab.shape == k.shape
+    assert M_tab[0] == 0.0
+    assert np.allclose(M_tab[1:], M_ana[1:], rtol=1e-4)
+    # 2D shape preservation through the table path
+    assert poisson_M(np.full((2, 3), 0.1), PLANCK, table=tab).shape == (2, 3)
+
+
 def test_bispectrum_template_squeezed_divergence():
     b_squeezed = local_bispectrum_template([(1e-3, 0.1, 0.1)], PLANCK, f_NL=1.0)[0]
     b_equil = local_bispectrum_template([(0.1, 0.1, 0.1)], PLANCK, f_NL=1.0)[0]

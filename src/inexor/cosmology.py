@@ -260,3 +260,102 @@ def sigma_R(R, cosmo, z=0.0, backend="eh98", table=None):
     W = _tophat_window(k * R)
     s2 = simpson(k**3 * Pk0 * W**2 / (2.0 * math.pi**2), x=lnk)
     return math.sqrt(s2) * growth_factor_a(1.0 / (1.0 + z), cosmo)
+
+
+# ============================================================================
+# The M-v2-5 1D |k| table (D-v2-15 clause 2)
+# ============================================================================
+
+
+def _refuse_outside(k_arr, k_lo, k_hi, what):
+    # Same guard as linear_power's table backend: 1-ulp slack so exact-endpoint
+    # queries do not trip it; loud refusal, never extrapolation.
+    if k_arr.min() < k_lo * (1 - 1e-12) or k_arr.max() > k_hi * (1 + 1e-12):
+        raise ValueError(
+            f"requested k in [{k_arr.min():.3e}, {k_arr.max():.3e}] outside the "
+            f"{what} table range [{k_lo:.3e}, {k_hi:.3e}]; refusing to extrapolate"
+        )
+
+
+class ICKTable:
+    """1D log-spaced |k| table of the linear power AND the transfer function.
+
+    D-v2-15 clause 2: P(k) and T(k) are functions of |k| alone, so the IC
+    colour and the Poisson/transfer factor never need a 3D |k| grid -- the
+    measured ~90 B/p host term (job 896159) collapses to O(slab). Interpolation:
+    P is log-log linear (positive by construction); T is LINEAR in ln k (a
+    transfer function may cross zero in principle, so log-log is only safe for
+    P). Both refuse k outside the table range, exactly like
+    `linear_power(backend="table")`.
+
+    Deliberately NOT cached and NOT hashable: built once per run by
+    `ic_k_table` and passed explicitly, so no cache can alias across
+    cosmologies. Plain class rather than a frozen dataclass for the same
+    reason -- ndarray fields make generated __eq__/__hash__ traps.
+    """
+
+    __slots__ = ("k", "P", "T", "_lnk", "_lnP")
+
+    def __init__(self, k, P, T):
+        self.k = np.asarray(k, dtype=np.float64)
+        self.P = np.asarray(P, dtype=np.float64)
+        self.T = np.asarray(T, dtype=np.float64)
+        if not (self.k.ndim == 1 and self.k.shape == self.P.shape == self.T.shape):
+            raise ValueError("k, P, T must be 1D arrays of equal length")
+        if not np.all(np.diff(self.k) > 0):
+            raise ValueError("k must be strictly increasing")
+        if np.any(self.P <= 0):
+            raise ValueError("P must be positive (log-log interpolation)")
+        self._lnk = np.log(self.k)
+        self._lnP = np.log(self.P)
+
+    def P_of_k(self, k_hmpc):
+        """Linear P(k, z=0), log-log interpolated; refuses outside the range."""
+        k_arr = np.atleast_1d(np.asarray(k_hmpc, dtype=np.float64))
+        _refuse_outside(k_arr, self.k[0], self.k[-1], "P(k)")
+        return np.exp(np.interp(np.log(k_arr), self._lnk, self._lnP)).reshape(
+            np.shape(k_hmpc) if np.ndim(k_hmpc) else ()
+        )
+
+    def T_of_k(self, k_hmpc):
+        """Transfer T(k), linear-in-ln(k) interpolated; refuses outside the range."""
+        k_arr = np.atleast_1d(np.asarray(k_hmpc, dtype=np.float64))
+        _refuse_outside(k_arr, self.k[0], self.k[-1], "T(k)")
+        return np.interp(np.log(k_arr), self._lnk, self.T).reshape(
+            np.shape(k_hmpc) if np.ndim(k_hmpc) else ()
+        )
+
+
+def ic_k_table(cosmo, n_mesh, box_size, n_points=16384, pad=1.02, backend="eh98", table=None):
+    """Build the ICKTable covering a production rfft grid's full |k| range.
+
+    Range [k_f/pad, pad*sqrt(3)*k_Nyq] with k_f = 2*pi/L and k_Nyq = pi*n/L, so
+    every realized |k| on the (n, n, n//2+1) half-grid is interior -- including
+    the DC-substitute (the smallest nonzero |k| = k_f) that `gaussian_delta`
+    evaluates in place of k = 0.
+
+    backend="eh98": P from `linear_power` (analytic, sigma8-normalized), T from
+    `transfer_eh98`. backend="table": P resampled from a (k, P) dump (CAMB);
+    T stays eh98 -- the ic.py M1 scope note stands (the table P(k) backend
+    carries no T(k); f_NL-with-CAMB-transfer is out of scope), and pretending
+    to derive T from a P dump would manufacture one silently.
+
+    n_points=16384 default: log-log linear interpolation error goes as the
+    square of the node spacing in ln k; at 4000 points over this range the
+    derived error is ~1e-5 against the 1e-4 bar (7-13x margin), and 16384
+    points buy ~17x more for 128 KB (probe `v2_m5_table_bar.py` measures the
+    scaling rather than trusting this arithmetic).
+    """
+    n_mesh = int(n_mesh)
+    if n_mesh < 2:
+        raise ValueError(f"n_mesh must be >= 2, got {n_mesh}")
+    if pad <= 1.0:
+        raise ValueError(f"pad must be > 1 (endpoints must be interior), got {pad}")
+    k_f = 2.0 * np.pi / box_size
+    k_nyq = np.pi * n_mesh / box_size
+    k_lo = k_f / pad
+    k_hi = pad * math.sqrt(3.0) * k_nyq
+    k = np.exp(np.linspace(np.log(k_lo), np.log(k_hi), int(n_points)))
+    P = linear_power(k, cosmo, z=0.0, backend=backend, table=table)
+    T = transfer_eh98(k, cosmo)
+    return ICKTable(k, P, T)
