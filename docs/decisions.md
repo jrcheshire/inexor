@@ -1231,10 +1231,11 @@ ratifying it did not measure it.
 
 ## D-v2-23 -- The streamed IC stage: one plane-keyed stream, universal table nodes, an out-of-core FFT, and the replace-in-place bill
 
-- **Status:** PROPOSED (drafted 2026-08-10; scoping calls JC-ratified in
-  session that day). Discharges D-v2-18's M-v2-5 row under the re-scope in
-  clause 1 and implements D-v2-15 clauses 2-5. Amends no ratified decision;
-  the bill in clause 6 states what moved under every earlier record.
+- **Status:** accepted (JC, 2026-08-10, on the clause-by-clause close-out;
+  scoping calls ratified in session the same day). Discharges D-v2-18's
+  M-v2-5 row under the re-scope in clause 1 and implements D-v2-15 clauses
+  2-5. Amends no ratified decision; the bill in clause 6 states what moved
+  under every earlier record.
 - **Record:** `runs/v2/m5_ic_record.md`; deneb 427/428, Vista 902091 (failed
   on its own instrument, superseded) / 902182; cards `runs/v2/m5_gate_*.json`;
   probes `scripts/v2_m5_{ic_gate,table_bar,memladder,fft_gh}.py`.
