@@ -442,7 +442,31 @@ def _diagnose_partition(st, cfg):
     aliased = np.nonzero(seen > 1)[0]
     unclaimed = np.nonzero(live & (claimed == 0))[0]
     twice = np.nonzero(claimed > 1)[0]
+    # THREE censuses that must be identical, printed rather than inferred. Job 440
+    # showed decoded == distinct == n_particles - 1 with no aliasing, so a row is
+    # unreachable while `check` passes -- and `check` sums OCCUPANCY. Whichever
+    # pair disagrees localizes the defect: occupancy vs member_count is a counting
+    # bug, member_count vs decode is a span/decode bug.
+    p3 = st.buckets_per_brick
+    occ = st.occupancy.astype(np.int64)
+    occ_per_brick = occ.reshape(st.n_bricks, p3).sum(axis=1)
+    mc_per_brick = np.array(
+        [st.brick_member_count(b) for b in range(st.n_bricks)], dtype=np.int64
+    )
+    dec_per_brick = np.array(
+        [len(st.decode_brick(b)[0]) for b in range(st.n_bricks)], dtype=np.int64
+    )
+    bad = np.nonzero((occ_per_brick != mc_per_brick) | (mc_per_brick != dec_per_brick))[0]
+    detail = [
+        (int(b), int(occ_per_brick[b]), int(mc_per_brick[b]), int(dec_per_brick[b]))
+        for b in bad[:4]
+    ]
     lines = [
+        f"  CENSUS occupancy {int(occ_per_brick.sum()) + st.arena_used} "
+        f"(incl. arena), brick_member_count {int(mc_per_brick.sum())}, "
+        f"decode {int(dec_per_brick.sum())}, n_particles {st.n_particles}",
+        f"  bricks where the three disagree: {len(bad)} "
+        f"(brick, occ, member_count, decode)={detail}",
         f"  distinct live rows {int(live.sum())}, decoded WITH duplicates "
         f"{total_decoded}, n_particles {st.n_particles}, "
         f"arena_used {st.arena_used} of {st.n_arena}",
