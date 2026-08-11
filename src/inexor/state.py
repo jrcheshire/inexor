@@ -248,6 +248,19 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None):
     nb = st.bricks_per_side
     s_old = st.vel_scale
     s_new = float(vel_scale_new) if vel_scale_new else s_old
+    # D-007 SAYS NOTHING MAY BE DROPPED AND NOTHING CHECKED IT HERE. The slab
+    # schedule above releases a staged row once its destination slab has been
+    # written, which is only safe under the one-brick-per-axis-per-step assumption
+    # the docstring states -- verified at cdev8 over 20 steps, and cdev at K=5
+    # drifts much further per step than that. A particle that moves TWO bricks in
+    # x finds its destination already inserted and released, and is silently lost.
+    #
+    # Measured (M-v2-6, antares 441, cdev): occupancy, brick_member_count and
+    # decode all read 16,777,215 against n_particles 16,777,216 -- one particle
+    # gone, with every census agreeing, no aliasing and ownership a perfect
+    # partition. It surfaced ~200 lines away as the engine's ownership assertion,
+    # which cost four wrong diagnoses. A loss must be loud AT THE POINT OF LOSS.
+    n_before = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
 
     staged, emig, inserted = {}, {}, set()
     n_over = 0
@@ -269,8 +282,25 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None):
                 del emig[s2]
     if len(inserted) != nb:
         raise AssertionError(f"{nb - len(inserted)} slabs were never written back")
+    n_after = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    if n_after != n_before:
+        left = sum(len(v.get("dest", ())) for v in staged.values()) if staged else 0
+        raise ValueError(
+            f"the migration lost {n_before - n_after} particles ({n_before} -> "
+            f"{n_after} against {st.n_particles} stored). D-007 forbids dropping, "
+            "so this is corruption, not imprecision.\n"
+            f"  {len(staged)} slabs still staged at the end ({left} rows), "
+            f"{len(inserted)} of {nb} slabs inserted, arena {st.arena_used}/"
+            f"{st.n_arena}\n"
+            "  LEADING CAUSE: the slab schedule releases a staged row once its "
+            "destination is written, which assumes a particle moves at most ONE "
+            "brick per axis per step (this function's docstring, measured at cdev8 "
+            "over 20 steps). A larger drift breaks it -- reduce the step size, or "
+            "generalize the staging to the realized brick displacement."
+        )
     st.vel_scale = s_new
-    return dict(n_arena_overflow=n_over, arena_used=st.arena_used, vel_scale=s_new)
+    return dict(n_arena_overflow=n_over, arena_used=st.arena_used, vel_scale=s_new,
+                n_migrated_checked=n_after)
 
 
 # ===========================================================================
