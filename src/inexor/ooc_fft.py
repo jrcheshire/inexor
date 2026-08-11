@@ -118,7 +118,13 @@ def forward_from_slabs(slab_fn, n_mesh, slab=_DEF_SLAB, workers=_DEF_WORKERS):
                              f"want {(hi - lo, n, n)}")
         if spec is None:
             spec = np.empty(_spec_shape(n), dtype=_cdtype_for(s.dtype))
-        spec[lo:hi] = rfft2_slab(s, workers=workers)
+        # per plane DIRECTLY into the target rows -- a whole-slab intermediate
+        # here is a full spectrum copy at slab = n, which is how the memory
+        # ladder read A = 11.74 B/p against a 2-spectrum design (Vista 902241:
+        # source + intermediate + target = 3 spec-equivalents through
+        # rfftn_ooc). Same per-plane transforms, so no bit moves.
+        for i in range(hi - lo):
+            spec[lo + i] = scipy.fft.rfft2(s[i], workers=workers)
     fft_axis0_inplace(spec, workers=workers)
     return spec
 
@@ -151,10 +157,15 @@ def rfftn_ooc(field, workers=_DEF_WORKERS):
 
 
 def irfftn_ooc(spec, n_mesh, workers=_DEF_WORKERS):
-    """Monolithic convenience; consumes spec like the generator does."""
+    """Monolithic convenience; consumes spec like the generator does.
+
+    Iterates the inverse at the default slab rather than slab = n: the
+    whole-box slab buffer would be a second full field beside the assembled
+    output (the 902241 double-buffer class), and slab size cannot move a bit.
+    """
     n = int(n_mesh)
     out = np.empty((n, n, n), dtype=np.float64 if spec.dtype == np.complex128 else np.float32)
-    for lo, s in inverse_to_slabs(spec, n, slab=n, workers=workers):
+    for lo, s in inverse_to_slabs(spec, n, slab=_DEF_SLAB, workers=workers):
         out[lo : lo + s.shape[0]] = s
     return out
 

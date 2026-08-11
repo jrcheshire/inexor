@@ -65,7 +65,11 @@ def _psi_from_spec(spec, n_mesh, box_size, fdtype, slab=None):
     n = int(n_mesh)
     out = np.empty((n**3, 3), dtype=_np_dtype(fdtype))
     for ax in range(3):
-        comp_spec = ooc_fft.grad_invk2_spec(spec, ax, n, box_size, slab=slab or n)
+        # slab default 32, never n: at slab = n the multiplier build holds a
+        # full complex128 half-grid plus its f64 k^2 (~12 B/p of transient) --
+        # the 902241 ladder read the monolithic psi arm at 39.7 B/p against a
+        # ~28 design through exactly this. Slab size cannot move a bit.
+        comp_spec = ooc_fft.grad_invk2_spec(spec, ax, n, box_size, slab=slab)
         out[:, ax] = ooc_fft.irfftn_ooc(comp_spec, n).reshape(-1)
     return out
 
