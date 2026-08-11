@@ -53,6 +53,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .codec import (
+    INT16_MAX,
     LEVELS_PER_BUCKET,
     assert_int16_range,
     encode_velocities,
@@ -224,7 +225,29 @@ def reconcile_velocity_scale(tile_scales):
     return float(s.max()) if len(s) else 1.0
 
 
-def drift_and_migrate(st, c_drift, vel_scale_new=None):
+def brick_reach(st, c_drift, vel_scale=None):
+    """How many bricks a particle can cross in x during this drift. O(1).
+
+    An upper bound that is nearly TIGHT, which is what makes bounded staging
+    affordable: `w` is int16 so |v| <= vel_scale * INT16_MAX, and `vel_scale` is
+    defined as the partition max of |v| divided by INT16_MAX, so the product is
+    the fastest particle actually present rather than a pessimistic ceiling. No
+    pass over the state, and no dependence on the realized displacement being
+    small.
+
+    Peak staging is `2 * reach + 1` slabs, so this is also the knob that prices
+    the migration's memory: reach 1 reproduces the original three-slab schedule
+    exactly.
+    """
+    s = float(st.vel_scale if vel_scale is None else vel_scale)
+    nb = int(st.bricks_per_side)
+    extent = float(st.t9.box_size) / nb
+    if extent <= 0.0:
+        return nb
+    return int(np.ceil(abs(float(c_drift)) * s * INT16_MAX / extent))
+
+
+def drift_and_migrate(st, c_drift, vel_scale_new=None, max_staged_slabs=None):
     """Advance every particle by `c_drift * v` and re-home it. ONE pass.
 
     Drift and migration are not separable once positions are bucket-relative:
@@ -262,15 +285,34 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None):
     # which cost four wrong diagnoses. A loss must be loud AT THE POINT OF LOSS.
     n_before = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
 
+    # THE REACH, and it is a bound rather than an assumption. The schedule below
+    # releases a staged row once its destination has been written, so it must know
+    # how far a particle can travel. The old code hard-coded +-1 brick, which held
+    # at cdev8 and lost a particle at cdev.
+    #
+    # The bound is O(1) and nearly TIGHT, which is what makes this cheap: `w` is
+    # int16, so |v| <= vel_scale * INT16_MAX, and `vel_scale` is DEFINED as the
+    # partition max of |v| over INT16_MAX -- so that product is the actual maximum
+    # speed, not a pessimistic ceiling. No pass over the state is needed.
+    r_raw = brick_reach(st, c_drift, s_old)
+    # CLAMP rather than refuse. On a periodic grid a reach of nb // 2 already
+    # touches every slab, so beyond that the schedule is all-to-all and larger
+    # values say nothing extra. Refusing here would confuse "needs more memory"
+    # with "impossible": full staging is CORRECT, it just costs the whole state in
+    # flight, and at a 2-brick test grid that is nothing at all. Correctness is not
+    # the caller's choice; the memory budget is, and that is `max_staged_slabs`.
+    r = min(r_raw, nb // 2)
+    reach = range(-r, r + 1)
+
     staged, emig, inserted = {}, {}, set()
-    n_over = 0
+    n_over, peak_staged = 0, 0
     for s in range(nb):
         staged[s], emig[s] = st._eject_slab(s, c_drift, s_old, s_new)
-        # a slab may be written once it and both x-neighbours have been ejected
+        # a slab may be written once every slab that can REACH it has been ejected
         for d in range(nb):
             if d in inserted:
                 continue
-            if all(((d + o) % nb) in emig for o in (-1, 0, 1)):
+            if all(((d + o) % nb) in emig for o in reach):
                 n_over += st._insert_slab(d, staged, emig)
                 inserted.add(d)
         # release what no pending write can still need
@@ -278,8 +320,21 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None):
             if s2 in inserted:
                 del staged[s2]
         for s2 in list(emig):
-            if all(((s2 + o) % nb) in inserted for o in (-1, 0, 1)):
+            if all(((s2 + o) % nb) in inserted for o in reach):
                 del emig[s2]
+        peak_staged = max(peak_staged, len(staged))
+        if max_staged_slabs is not None and peak_staged > int(max_staged_slabs):
+            raise ValueError(
+                f"the migration is holding {peak_staged} slabs against a budget of "
+                f"{max_staged_slabs}. The drift reaches {r_raw} bricks on a "
+                f"{nb}-brick grid, so {2 * r + 1} slabs must be in flight.\n"
+                f"  c_drift={c_drift:.6g}, vel_scale={s_old:.6g}, max |dx| = "
+                f"{abs(float(c_drift)) * float(s_old) * INT16_MAX:.6g} against a "
+                f"brick of {float(st.t9.box_size) / nb:.6g}.\n"
+                "  Reduce the step size, use a coarser brick, or raise the budget "
+                "deliberately -- staging is bounded by (2 * reach + 1) slabs, so "
+                "this is a real memory cost and not a formality."
+            )
     if len(inserted) != nb:
         raise AssertionError(f"{nb - len(inserted)} slabs were never written back")
     n_after = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
@@ -299,8 +354,11 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None):
             "generalize the staging to the realized brick displacement."
         )
     st.vel_scale = s_new
+    # reach and peak staging REPORTED, so the memory bound is a measurement
+    # every step rather than a docstring claim that held at one configuration
     return dict(n_arena_overflow=n_over, arena_used=st.arena_used, vel_scale=s_new,
-                n_migrated_checked=n_after)
+                n_migrated_checked=n_after, brick_reach=r, brick_reach_raw=r_raw,
+                peak_staged_slabs=peak_staged)
 
 
 # ===========================================================================
