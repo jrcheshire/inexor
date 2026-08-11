@@ -1,10 +1,14 @@
 # M-v2-5: streamed ICs + the out-of-core FFT -- the milestone record
 
-**Status: DRAFT -- two cluster legs pending (deneb 428 memory ladder; Vista
-902182 leg VI rerun).** Branch `jc/m-v2-5-streamed-ics`; ADR D-v2-23 to
-follow. Charter: D-v2-18's ladder row, re-scoped per D-v2-15 clause 5
-(JC-ratified 2026-08-10, the third milestone whose written exit criterion
-could not be read literally; the gate docstring carries the reading).
+**Status: COMPLETE -- every gate green (2026-08-10).** Branch
+`jc/m-v2-5-streamed-ics`; ADR D-v2-23. Charter: D-v2-18's ladder row,
+re-scoped per D-v2-15 clause 5 (JC-ratified 2026-08-10, the third milestone
+whose written exit criterion could not be read literally; the gate docstring
+carries the reading). Headline: **the streamed generator reads 8.6 B/p where
+the old path reads 95.7 (fitted cubic 8.79, extrapolating to 75.3 GB at
+2048^3 against a 116 GB host), a 2048^3 transform the GH200's device cannot
+fit runs correctly in 40.4 GB of host, and the loaded state is bitwise the
+monolithic build.**
 
 ## What was built (all in-package unless noted)
 
@@ -45,7 +49,7 @@ could not be read literally; the gate docstring carries the reading).
 | e2e (leg III) | load(generate) == monolithic SlotState.build | laptop n=64 and **deneb 427 n=512 f64: n_diff 0 on off/w/occupancy/brick_start, vel_scale exactly equal, occupancy peak/mean 5.9** |
 | stats (leg IV) | seed-averaged <P_new>/<P_old>, 32 seeds n=128 | max\|z\| **1.79** (bar 4), chi2/dof **0.53** -- indistinguishable from the split-half control (1.71 / 0.60). Plane hashes distinct, moments 5-sigma clean, new != old bitwise at the same seed |
 | engine-smoke | K=3 engine steps from loaded vs built state | n_diff 0, decoded rms 19.1 |
-| memory ladder (leg V) | fitted cubic coefficient A of net(n) = A n^3 + C, CPU backend, antares | **[PENDING -- deneb 428]** bars: A <= 9.0 B/p, extrapolated 2048^3 < 77.3 GB; tier 2 A ~= 8.0 |
+| memory ladder (leg V) | fitted cubic coefficient A of net(n) = A n^3 + C, CPU backend, Vista gg | **PASS (902300): A = 8.79 B/p (bar 9.0), C = -0.18 GB, residuals 0.14/-0.15/0.02 GB; extrapolated 2048^3 total 75.3 GB (bar 77.3 = 116/1.5). Top rung raw: streamed 8.6 B/p vs old-mirror 95.7 -- an 11x reduction, and the old arm REPRODUCES D-v2-15 clause 1's ~90 B/p term (its own control).** The first glibc run (902241) read A = 11.74 -- the pre-registered A > 9 finding -- chased to `rfftn_ooc`'s pass-1 double-buffer (3 spec-equivalents at one moment; finding 7 below) and re-measured. new_mono full 75.5 B/p as expected (the monolithic convenience is not the memory product); its psi1 arm reads 39.5 against a ~28 design, unattributed and deliberately not chased (reported only). Card `m5_gate_memladder.json` |
 | 2048^3 OOC FFT (leg VI) | capacity + reference-free correctness on a GH200 | **PASS (Vista 902182, 7m46s, rc=0): roundtrip max\|d\|/rms 2.38e-6 (bar 1e-5), Parseval 1.69e-7 (bar 1e-6), peak host 40.4 GB vs plan_bytes' 36.0 (x1.12, bar 1.3), fwd/inv 85.7/85.9 s, io 0.83/1.42 GB/s write/read, invariance on the GH200 clean, f64 refusal fired, and P(k) vs the BIN-AVERAGED oracle max\|z\| 2.90 over 64 bins (bar 5).** The first run (902091) had failed ONLY its P(k) phase at max\|z\| 8.71 with the bin-centre oracle -- finding 4 below; every other number reproduces to the digit across the two jobs. Card `m5_gate_fft-gh.json` |
 
 ## Findings (each one caught by a gate this milestone built)
@@ -88,6 +92,20 @@ could not be read literally; the gate docstring carries the reading).
    shipped**: per-slab subtotals re-associate and moved <phi^2> at 1e-16;
    `sq_sum_by_plane` THREADS one running fold through the slabs, replaying
    the identical addition sequence under any grouping.
+7. **The ladder's fit found a real uncounted cubic term and the arithmetic
+   named it.** glibc run 902241: A = 11.74 B/p against the 2-spectrum
+   (8 B/p) design with C ~= 0 -- three spec-equivalents co-resident, and the
+   one such moment was `rfftn_ooc` at slab = n, where `rfft2_slab`
+   materialized the whole pass-1 result as an intermediate before the copy
+   into the target (source + intermediate + target). Fixed by writing per
+   plane directly into the target rows (bitwise-neutral; the suite's
+   identities pass unchanged); the re-run (902300) reads A = 8.79, and the
+   monolithic colour/linear_density arms each dropped exactly one
+   spectrum-worth (-4.1 B/p), corroborating the mechanism. NB the same
+   commit's fix to `_psi_from_spec`'s multiplier build did NOT move the
+   monolithic psi arm (39.7 -> 39.5), so that attribution is RETRACTED;
+   the arm stays a reported, unchased number. The residual A - 8.0 =
+   0.79 B/p is inside the pre-registered bar and deliberately not chased.
 
 ## Retired / re-ratified (the replace-in-place bill; D-v2-23 carries the table)
 
@@ -128,10 +146,17 @@ could not be read literally; the gate docstring carries the reading).
 
 ## Ops
 
-- deneb 427 (anchor, ~4 min in queue-to-done): clean. 428: pending behind
-  the mdnilc array on antares at submit time.
-- Vista 902091: 7m45s wall; failed only on the instrument defect above.
-  902182 = the rerun. Both submitted with `-A JPL-SPHEREx` (the sbatch now
-  carries it).
+- deneb 427 (anchor, ~4 min): clean. albireo 428 (ladder) CANCELLED unrun --
+  its --mem=110G admits only antares (deneb-the-node's 56 GB cannot host the
+  old arm's ~90 GB at n=1024) and antares sat occupied; the ladder moved to
+  a Vista gg node (JC's call).
+- Vista jobs: 902091 leg VI (7m45s; failed only its own P(k) instrument,
+  finding 4); 902182 leg VI PASS (7m46s); 902236 ladder DIED AT PRECONDITION
+  -- jax 0.10's CUDA plugin hard-raises on cuInit (error 303) on a GPU-less
+  gg node, so `CONDA_OVERRIDE_CUDA` alone no longer suffices and
+  `JAX_PLATFORMS=cpu` is LOAD-BEARING in any gg sbatch; 902241 ladder ran
+  clean and delivered the A = 11.74 finding; 902300 ladder PASS (27m52s).
+  All with `-A JPL-SPHEREx`.
+- Total cluster cost: ~1.2 gg/gh node-hours + ~5 min of deneb.
 - The branch was pushed by Claude at JC's explicit authorization
   (2026-08-10); deneb and Vista checkouts synced to it.

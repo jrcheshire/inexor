@@ -1288,11 +1288,21 @@ ratifying it did not measure it.
      max|z| 2.90 over 64 bins** -- the bin-centre form fails at exactly this
      scale (deterministic Jensen term z = +15 at k ~ 0.2 at 2048^3 mode
      counts; job 902091's only failure, diagnosed and fixed as instrument).
-  5. **The memory ladder** (antares, CPU backend, fitted cubic coefficient
-     of net(n) = A n^3 + C): [PENDING deneb 428 -- bars pre-registered:
-     A <= 9.0 B/p and extrapolated 2048^3 total < 77.3 GB; expectation
-     A ~= 8.0 (two co-resident complex64 spectra); the old-mirror arm must
-     reproduce clause 1 of D-v2-15 (~90 B/p).]
+  5. **The 90 B/p IC host term is DEAD, by the pre-registered fit** (Vista
+     gg 902300; the albireo route was abandoned when antares sat occupied):
+     net(n) = A n^3 + C over rungs 256/512/1024 on the CPU backend gives
+     **A = 8.79 B/p (bar 9.0), C = -0.18 GB** with residuals under 0.15 GB,
+     extrapolating to **75.3 GB at 2048^3 against the 77.3 GB bar**
+     (= 116/1.5; 1.54x under the cliff). Top rung raw: streamed 8.6 B/p
+     against the old-mirror's 95.7 -- an 11x reduction, with the old arm
+     REPRODUCING D-v2-15 clause 1's term as its own control. The first run
+     read A = 11.74 (the pre-registered A > 9 finding); chased to
+     `rfftn_ooc`'s pass-1 double-buffer (three spec-equivalents at one
+     moment), removed bitwise-neutrally, corroborated by the monolithic
+     colour and linear_density arms each dropping one spectrum-worth. The
+     0.79 B/p residual over the two-spectrum arithmetic is inside the bar
+     and deliberately not chased; the monolithic psi arm's 39.5 B/p stays
+     reported and unattributed (one wrong attribution already retracted).
   6. **Replace-in-place, and its bill** (JC: replace, keep names, re-point
      G5b). `inexor.ic`/`lpt` moved under every consumer; the guard is
      IC_STREAM + the readout refusal, established BEFORE the replacement by
