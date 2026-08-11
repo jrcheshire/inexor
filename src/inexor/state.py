@@ -108,6 +108,35 @@ def decode_positions_host(off, bucket_ijk, t9):
     return i.astype(np.float64) * t9.quantum
 
 
+def encode_velocities_host(v, scale):
+    """D-time velocities -> int16 at a GIVEN scale. Mirrors
+    `codec.encode_velocities`'s value path (rint at the scale, then int16),
+    with the scale supplied rather than derived -- the streamed builder knows
+    it from the partition-max over its staged slabs, exactly
+    `reconcile_velocity_scale`'s theorem at build time. The pre-cast range is
+    asserted (D-007): the theorem says it cannot fire, and the refusal is what
+    proves that rather than assumes it."""
+    w = np.rint(np.asarray(v, dtype=np.float64) / float(scale))
+    assert_int16_range(w)
+    return w.astype(np.int16)
+
+
+def _alloc_geometry(brick_counts, n_particles, brick_slack, alloc_margin, arena_frac):
+    """The D-v2-19 capacity arithmetic: (spare, brick_start, n_alloc, n_arena).
+
+    Split out of `SlotState.build` so the streamed loader derives its geometry
+    through THE SAME code path -- two implementations of one formula is how a
+    loader and a builder drift apart bitwise.
+    """
+    spare = np.ceil(brick_counts * float(brick_slack)).astype(np.int64)
+    spare = np.where(brick_counts > 0, np.maximum(spare, 1), spare)
+    brick_start = np.zeros(len(brick_counts) + 1, dtype=np.int64)
+    np.cumsum(brick_counts + spare, out=brick_start[1:])
+    n_alloc = int(np.ceil(int(brick_start[-1]) * (1.0 + float(alloc_margin))))
+    n_arena = int(np.ceil(n_particles * float(arena_frac)))
+    return spare, brick_start, n_alloc, n_arena
+
+
 def _bucket_flat_brick_major(bucket_ijk, t9, bricks_per_side):
     """Per-axis bucket -> brick-major flat ordinal. `layout.bucket_order_key`'s
     tail, split out so the exchange can key on a bucket it already has rather
@@ -306,17 +335,14 @@ class SlotState:
         brick_counts = np.bincount(brick, minlength=n_bricks).astype(np.int64)
         occupancy = np.bincount(key, minlength=n_bricks * per3).astype(np.int64)
 
-        spare = np.ceil(brick_counts * float(brick_slack)).astype(np.int64)
-        spare = np.where(brick_counts > 0, np.maximum(spare, 1), spare)
-        brick_start = np.zeros(n_bricks + 1, dtype=np.int64)
-        np.cumsum(brick_counts + spare, out=brick_start[1:])
+        _, brick_start, n_alloc, n_arena = _alloc_geometry(
+            brick_counts, n, brick_slack, alloc_margin, arena_frac
+        )
 
         order = _stable_sort_index(key)
         rank = _within_run_index(brick_counts)
         slots = brick_start[brick[order]] + rank
 
-        n_alloc = int(np.ceil(int(brick_start[-1]) * (1.0 + float(alloc_margin))))
-        n_arena = int(np.ceil(n * float(arena_frac)))
         n_rows = n_alloc + n_arena
 
         # the payload, written straight into slot order -- this is the whole point

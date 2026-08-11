@@ -241,7 +241,13 @@ def lpt_ics(delta0, box_size, a_init, cosmo, order=2, fdtype=np.float32,
     psi2 = second_order_displacement(delta0, L, fdtype, resident=resident, workdir=workdir)
     q = lagrangian_grid(N, L, fdtype)
     dt = _np_dtype(fdtype)
-    x = np.mod(q + dt.type(D1) * psi1 - dt.type(D2) * psi2, dt.type(L))
+    # THE canonical combine sequence, shared per element with the streamed
+    # generator (icgen stages U and V per slab with these exact ops): the
+    # displacement is formed FIRST, then added to q -- (q + D1 psi1) - D2 psi2
+    # associates differently and would break streamed == monolithic bitwise.
+    u = dt.type(D1) * psi1
+    u -= dt.type(D2) * psi2
+    x = np.mod(q + u, dt.type(L))
     v_coef2 = -(D2 * f2) / (D1 * f1)  # == +(6/7) D1 for EdS-approx D2, f2
     v = psi1 + dt.type(v_coef2) * psi2
     return x, v
