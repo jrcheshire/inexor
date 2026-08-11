@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J m6-peak-cdev
 #SBATCH -p compute
-#SBATCH --mem=48G
+#SBATCH --mem=100G
 #SBATCH -c 8
 #SBATCH -t 01:30:00
 #SBATCH -o m6-peak-cdev-%j.log
@@ -17,9 +17,14 @@
 # gets judged against, and it also answers whether the slope scales with cap or
 # with N.
 #
-# --mem=48G, not the 32G first proposed: deneb-the-node allows 56G, the quantity
-# being measured is an unbounded accumulation, and an OOM kill is not a
-# measurement (the standing rule is no doomed jobs, and express --mem not -w).
+# --mem=100G, not the 32G first proposed, and that is PLACEMENT expressed as a
+# resource rather than a hostname: only antares (28 c, 124 GB) can satisfy it,
+# deneb-the-node has 56 GB. The quantity being measured is an unbounded
+# accumulation -- at cdev the per-step slope should scale with `cap`, which is
+# ~7x cdev8's, so K=10 plausibly reaches ~23 GB -- and an OOM kill is not a
+# measurement. Same pattern the M-v2-4 ladder used to reach antares. NB this
+# means the card's host_cores is 28, not deneb's 64, so it is not poolable with
+# the thread-sweep cards; that is what the provenance refusal is for.
 # CPU env by construction (`default` is CPU-only jax, so the backend cannot
 # silently become CUDA) -- which this probe REQUIRES: ru_maxrss is HOST memory
 # and on CUDA the meshes are in VRAM, where every ratio reads 1.0 (deneb 409).
@@ -57,7 +62,7 @@ run_leg() {
 
 # cheapest first: the ladder reuses the staged slabs the full set generates
 run_leg "full-legs-cdev" pixi run -e default python scripts/v2_m6_engine_peak.py \
-  --configs cdev --k 10 --workdir-root "$TMPDIR" --out-suffix _cdev
+  --configs cdev --k 5 --workdir-root "$TMPDIR" --out-suffix _cdev
 run_leg "kladder-cdev" pixi run -e default python scripts/v2_m6_engine_peak.py \
   --configs cdev --k-ladder 5 10 --workdir-root "$TMPDIR" --out-suffix _kladder_cdev
 
