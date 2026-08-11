@@ -46,7 +46,7 @@ could not be read literally; the gate docstring carries the reading).
 | stats (leg IV) | seed-averaged <P_new>/<P_old>, 32 seeds n=128 | max\|z\| **1.79** (bar 4), chi2/dof **0.53** -- indistinguishable from the split-half control (1.71 / 0.60). Plane hashes distinct, moments 5-sigma clean, new != old bitwise at the same seed |
 | engine-smoke | K=3 engine steps from loaded vs built state | n_diff 0, decoded rms 19.1 |
 | memory ladder (leg V) | fitted cubic coefficient A of net(n) = A n^3 + C, CPU backend, antares | **[PENDING -- deneb 428]** bars: A <= 9.0 B/p, extrapolated 2048^3 < 77.3 GB; tier 2 A ~= 8.0 |
-| 2048^3 OOC FFT (leg VI) | capacity + reference-free correctness on a GH200 | first run (902091): **roundtrip max\|d\|/rms 2.38e-6 (bar 1e-5), Parseval 1.69e-7 (bar 1e-6), peak host 40.4 GB vs plan 36.0 (x1.12, bar 1.3), fwd/inv 85.7/86.1 s, io 0.93/1.75 GB/s write/read; invariance on the GH200 clean; f64 refusal fired.** P(k) phase failed at max\|z\| 8.71 -- the INSTRUMENT (below). Rerun with the bin-averaged oracle: **[PENDING -- Vista 902182]** |
+| 2048^3 OOC FFT (leg VI) | capacity + reference-free correctness on a GH200 | **PASS (Vista 902182, 7m46s, rc=0): roundtrip max\|d\|/rms 2.38e-6 (bar 1e-5), Parseval 1.69e-7 (bar 1e-6), peak host 40.4 GB vs plan_bytes' 36.0 (x1.12, bar 1.3), fwd/inv 85.7/85.9 s, io 0.83/1.42 GB/s write/read, invariance on the GH200 clean, f64 refusal fired, and P(k) vs the BIN-AVERAGED oracle max\|z\| 2.90 over 64 bins (bar 5).** The first run (902091) had failed ONLY its P(k) phase at max\|z\| 8.71 with the bin-centre oracle -- finding 4 below; every other number reproduces to the digit across the two jobs. Card `m5_gate_fft-gh.json` |
 
 ## Findings (each one caught by a gate this milestone built)
 
