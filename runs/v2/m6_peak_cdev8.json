@@ -1,0 +1,281 @@
+{
+ "k_steps": 10,
+ "legs": [
+  "gen",
+  "load",
+  "repack_only",
+  "step",
+  "step_f32",
+  "step_coarse_lo"
+ ],
+ "workdir_root": "/var/folders/qr/jl5mdztn3xzcfzg2z3z5z3880000gn/T/m6_peak",
+ "method": "one subprocess per (config, leg); ICs reach the engine through disk",
+ "gen_fdtype": "float32",
+ "pending_predicted_bpp": 32,
+ "knobs": {
+  "k": 10,
+  "legs": [
+   "gen",
+   "load",
+   "repack_only",
+   "step",
+   "step_f32",
+   "step_coarse_lo"
+  ],
+  "gen_fdtype": "float32",
+  "slack": 0.2,
+  "arena_frac": 0.08,
+  "alloc_margin": 0.1
+ },
+ "cdev8": {
+  "legs": {
+   "baseline": {
+    "maxrss": 312786944
+   },
+   "gen": {
+    "n_coarse": 64,
+    "bricks_per_side": 8,
+    "mesh_bytes": {
+     "coarse_accumulator": 2097152,
+     "coarse_decode_slab": 1048576,
+     "coarse_kernel_build_f64": 3244032,
+     "coarse_kernels": 6488064,
+     "coarse_fft_workspace": 2162688,
+     "coarse_delta": 2097152,
+     "coarse_force_resident": 6291456,
+     "tile_kernels": 51118080,
+     "tile_workspace": 92536832
+    },
+    "n_tiles": 64,
+    "maxrss": 611139584,
+    "bpp": 291.4140625
+   },
+   "load": {
+    "n_coarse": 64,
+    "bricks_per_side": 8,
+    "mesh_bytes": {
+     "coarse_accumulator": 2097152,
+     "coarse_decode_slab": 1048576,
+     "coarse_kernel_build_f64": 3244032,
+     "coarse_kernels": 6488064,
+     "coarse_fft_workspace": 2162688,
+     "coarse_delta": 2097152,
+     "coarse_force_resident": 6291456,
+     "tile_kernels": 51118080,
+     "tile_workspace": 92536832
+    },
+    "n_tiles": 64,
+    "state_bytes": {
+     "off": 8808723,
+     "w": 17617446,
+     "occupancy": 1048576,
+     "brick_start": 4104,
+     "arena_bucket": 1342184,
+     "ids": 0,
+     "total": 28821033
+    },
+    "bpp_claimed": {
+     "payload": 9.0,
+     "bucket_index": 0.5,
+     "brick_start": 0.001956939697265625,
+     "slack": 1.800886631011963,
+     "arena": 1.3600068092346191,
+     "ids": 0.0,
+     "total": 12.662850379943848,
+     "scaffold": 0.0
+    },
+    "n_particles": 2097152,
+    "n_rows": 2936241,
+    "n_slots": 2516789,
+    "n_arena": 167773,
+    "n_bricks": 512,
+    "peak_after_load": 366411776,
+    "maxrss": 366411776
+   },
+   "step": {
+    "n_coarse": 64,
+    "bricks_per_side": 8,
+    "mesh_bytes": {
+     "coarse_accumulator": 2097152,
+     "coarse_decode_slab": 1048576,
+     "coarse_kernel_build_f64": 3244032,
+     "coarse_kernels": 6488064,
+     "coarse_fft_workspace": 2162688,
+     "coarse_delta": 2097152,
+     "coarse_force_resident": 6291456,
+     "tile_kernels": 51118080,
+     "tile_workspace": 92536832
+    },
+    "n_tiles": 64,
+    "state_bytes": {
+     "off": 8808723,
+     "w": 17617446,
+     "occupancy": 1048576,
+     "brick_start": 4104,
+     "arena_bucket": 1342184,
+     "ids": 0,
+     "total": 28821033
+    },
+    "bpp_claimed": {
+     "payload": 9.0,
+     "bucket_index": 0.5,
+     "brick_start": 0.001956939697265625,
+     "slack": 1.800886631011963,
+     "arena": 1.3600068092346191,
+     "ids": 0.0,
+     "total": 12.662850379943848,
+     "scaffold": 0.0
+    },
+    "n_particles": 2097152,
+    "n_rows": 2936241,
+    "n_slots": 2516789,
+    "n_arena": 167773,
+    "n_bricks": 512,
+    "peak_after_load": 368934912,
+    "wall_s": 120.07024941686541,
+    "s_per_step": 12.007024941686542,
+    "k_steps": 10,
+    "cap": 397319,
+    "maxrss": 8480374784
+   },
+   "step_f32": {
+    "n_coarse": 64,
+    "bricks_per_side": 8,
+    "mesh_bytes": {
+     "coarse_accumulator": 2097152,
+     "coarse_decode_slab": 1048576,
+     "coarse_kernel_build_f64": 3244032,
+     "coarse_kernels": 3244032,
+     "coarse_fft_workspace": 1081344,
+     "coarse_delta": 1048576,
+     "coarse_force_resident": 3145728,
+     "tile_kernels": 51118080,
+     "tile_workspace": 92536832
+    },
+    "n_tiles": 64,
+    "state_bytes": {
+     "off": 8808723,
+     "w": 17617446,
+     "occupancy": 1048576,
+     "brick_start": 4104,
+     "arena_bucket": 1342184,
+     "ids": 0,
+     "total": 28821033
+    },
+    "bpp_claimed": {
+     "payload": 9.0,
+     "bucket_index": 0.5,
+     "brick_start": 0.001956939697265625,
+     "slack": 1.800886631011963,
+     "arena": 1.3600068092346191,
+     "ids": 0.0,
+     "total": 12.662850379943848,
+     "scaffold": 0.0
+    },
+    "n_particles": 2097152,
+    "n_rows": 2936241,
+    "n_slots": 2516789,
+    "n_arena": 167773,
+    "n_bricks": 512,
+    "peak_after_load": 368672768,
+    "wall_s": 108.8515355840791,
+    "s_per_step": 10.88515355840791,
+    "k_steps": 10,
+    "cap": 397316,
+    "maxrss": 6999457792
+   },
+   "step_coarse_lo": {
+    "n_coarse": 16,
+    "bricks_per_side": 8,
+    "mesh_bytes": {
+     "coarse_accumulator": 32768,
+     "coarse_decode_slab": 32768,
+     "coarse_kernel_build_f64": 55296,
+     "coarse_kernels": 110592,
+     "coarse_fft_workspace": 36864,
+     "coarse_delta": 32768,
+     "coarse_force_resident": 98304,
+     "tile_kernels": 51118080,
+     "tile_workspace": 92536832
+    },
+    "n_tiles": 64,
+    "state_bytes": {
+     "off": 8808723,
+     "w": 17617446,
+     "occupancy": 1048576,
+     "brick_start": 4104,
+     "arena_bucket": 1342184,
+     "ids": 0,
+     "total": 28821033
+    },
+    "bpp_claimed": {
+     "payload": 9.0,
+     "bucket_index": 0.5,
+     "brick_start": 0.001956939697265625,
+     "slack": 1.800886631011963,
+     "arena": 1.3600068092346191,
+     "ids": 0.0,
+     "total": 12.662850379943848,
+     "scaffold": 0.0
+    },
+    "n_particles": 2097152,
+    "n_rows": 2936241,
+    "n_slots": 2516789,
+    "n_arena": 167773,
+    "n_bricks": 512,
+    "peak_after_load": 370524160,
+    "wall_s": 125.91902370913886,
+    "s_per_step": 12.591902370913886,
+    "k_steps": 10,
+    "cap": 395874,
+    "maxrss": 7479902208
+   }
+  },
+  "analysis": null
+ },
+ "verdict": {
+  "gate1_mesh_model_ok": true,
+  "gate2_sees_on_bpp_term": true,
+  "gate3_consistent_across_configs": null,
+  "gate3_spread": null,
+  "configs_analysed": []
+ },
+ "ok": false,
+ "commit": "84f10c1ad3e31f141b88a52fff92d1f72cb8083e",
+ "slurm_job_id": null,
+ "provenance": {
+  "backend": "cpu",
+  "device_kind": "cpu",
+  "n_devices": 1,
+  "host_cores": 16,
+  "x64": false,
+  "jax_version": "0.10.2",
+  "threefry_partitionable": true,
+  "ic_stream": "m5-foldin-1",
+  "xla_flags": null,
+  "omp_num_threads": null,
+  "argv": [
+   "--configs",
+   "cdev8",
+   "--k",
+   "10",
+   "--out-suffix",
+   "_cdev8"
+  ],
+  "knobs": {
+   "k": 10,
+   "legs": [
+    "gen",
+    "load",
+    "repack_only",
+    "step",
+    "step_f32",
+    "step_coarse_lo"
+   ],
+   "gen_fdtype": "float32",
+   "slack": 0.2,
+   "arena_frac": 0.08,
+   "alloc_margin": 0.1
+  }
+ }
+}
