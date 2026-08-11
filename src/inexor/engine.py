@@ -401,6 +401,57 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False):
 # ===========================================================================
 
 
+def _diagnose_partition(st, cfg):
+    """Where the ownership deficit is, for the assertion's message.
+
+    Failure path only. The bare count ("16777215 against 16777216") is
+    unattributable and cost three wrong explanations before this existed: a
+    tile-local float gap, a position-vs-storage mismatch, and a lost row. Each was
+    consistent with the count and none was the cause. What actually distinguishes
+    them is WHICH rows are unclaimed and what is unusual about them, and the state
+    knows.
+    """
+    b_real = cfg._b_realized
+    nb = cfg.n_fine // cfg.n_brick
+    claimed = np.zeros(st.off.shape[0], dtype=np.int32)
+    misaligned = []
+    for t in cfg.tiles:
+        members = st.tile_bricks(t, cfg.n_tile, b_real, cfg.n_brick, cfg.n_fine)
+        slots, _, _ = st.decode_bricks(members)
+        counts = [st.brick_member_count(b) for b in members]
+        if int(np.sum(counts)) != len(slots):
+            misaligned.append((tuple(int(q) for q in t), int(np.sum(counts)), len(slots)))
+            continue
+        brick_of_row = np.repeat(np.asarray(members, dtype=np.int64), counts)
+        own = owned_mask_from_bricks(brick_of_row, t, cfg.n_tile, cfg.n_brick, nb)
+        claimed[np.asarray(slots)[own]] += 1
+    live = np.zeros(st.off.shape[0], dtype=bool)
+    for b in range(st.n_bricks):
+        live[np.asarray(st.decode_brick(b)[0])] = True
+    unclaimed = np.nonzero(live & (claimed == 0))[0]
+    twice = np.nonzero(claimed > 1)[0]
+    lines = [
+        f"  live rows {int(live.sum())}, n_particles {st.n_particles}, "
+        f"arena_used {st.arena_used} of {st.n_arena}",
+        f"  unclaimed {len(unclaimed)}, claimed-more-than-once {len(twice)}",
+    ]
+    if misaligned:
+        lines.append(
+            f"  BRICK COUNT vs DECODE LENGTH disagree on {len(misaligned)} tiles: "
+            f"{misaligned[:3]}"
+        )
+    for s in unclaimed[:5]:
+        s = int(s)
+        in_arena = s >= st.arena_base
+        bucket = int(st.arena_bucket[s - st.arena_base]) if in_arena else None
+        brick = int(np.searchsorted(st.brick_start, s, side="right") - 1)
+        lines.append(
+            f"  slot {s}: in_arena={in_arena} arena_bucket={bucket} "
+            f"brick_by_span={brick} off={[int(q) for q in st.off[s]]}"
+        )
+    return "\n".join(lines)
+
+
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
@@ -528,9 +579,14 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
         pending.append((slots[owned], v_new))
 
     if n_owned != st.n_particles:
+        # SELF-DIAGNOSING, because the bare count sent me down three wrong
+        # explanations. Computed only on the failure path, so the happy path pays
+        # nothing. It names where the deficit is rather than leaving it to be
+        # guessed from the geometry.
         raise AssertionError(
             f"the tiles own {n_owned} rows against {st.n_particles} particles: ownership "
-            "is supposed to be a partition, so this is a geometry error"
+            "is supposed to be a partition, so this is a geometry error.\n"
+            + _diagnose_partition(st, cfg)
         )
     if n_overhang:
         raise AssertionError(
