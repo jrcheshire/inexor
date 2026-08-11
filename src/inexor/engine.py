@@ -53,6 +53,7 @@ from .forces import (
     COARSE_HALO,
     capacity_shape,
     coarse_force_meshes,
+    owned_mask,
     coarse_subblock_origin_extent,
     gather_coarse_subblock,
     make_tile_force_fn,
@@ -432,8 +433,14 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
         live = np.zeros(cap, dtype=bool)
         live[:m] = True
         origin, _ = tile_origin_extent(t, cfg.n_tile, b_real, cell)
-        u = jnp.mod(jnp.asarray(x[idx]) - jnp.asarray(origin), cfg.box_size)
-        g_short, owned, n_out = one_tile(u, jnp.asarray(live))
+        xg = x[idx]
+        u = jnp.mod(jnp.asarray(xg) - jnp.asarray(origin), cfg.box_size)
+        # ownership from the GLOBAL position, in integers: an exact partition by
+        # construction. The tile-local float test it replaces left a ~1 ulp gap at
+        # every core plane and dropped a particle at cdev (antares job 431). See
+        # `forces.owning_tile`.
+        own = owned_mask(xg, t, cell, cfg.n_tile, cfg.n_fine, live=live)
+        g_short, owned, n_out = one_tile(u, jnp.asarray(live), jnp.asarray(own))
         g_short = np.asarray(g_short)[:m]
         owned = np.asarray(owned)[:m]
         n_overhang += int(n_out)

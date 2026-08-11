@@ -298,3 +298,84 @@ def test_the_run_visits_few_shapes_and_they_never_decrease():
         f"{len(set(shapes))} distinct shapes over {len(shapes)} steps: the ladder "
         "is not collapsing the shape family"
     )
+
+
+# ------------------------------------------------- ownership is a partition
+# M-v2-6. The old rule tested the TILE-LOCAL coordinate,
+# `all(u >= core_lo & u < core_hi)` with u = mod(x - origin, L) reached through a
+# DIFFERENT subtraction per tile, so neighbouring tiles' decisions were not
+# complementary in floating point. antares job 431 lost exactly one particle of
+# 16,777,216 at cdev to a ~1 ulp gap at a core plane. It is realization-dependent,
+# which is why it survived this long -- cdev passes on an Apple-arm64 realization
+# and fails on an x86-64 one, the streams being per-machine-class (D-v2-23).
+
+
+def _boundary_positions():
+    """Positions engineered to sit ON and either side of every core plane, plus
+    the wrap point -- the cases the old float rule could drop."""
+    cell = L_BOX / N_FINE
+    planes = np.arange(0, N_FINE + 1, N_TILE) * cell  # 0 .. L_BOX inclusive
+    eps = np.spacing(L_BOX)  # ~1 ulp at the box scale
+    coords = []
+    for p in planes:
+        coords += [p, np.nextafter(p, 0.0), np.nextafter(p, L_BOX), p - eps, p + eps]
+    coords = np.array([c for c in coords if 0.0 <= c < L_BOX], dtype=np.float64)
+    rng = np.random.default_rng(7)
+    extra = rng.uniform(0.0, L_BOX, size=64)
+    coords = np.concatenate([coords, extra])
+    # every combination of a boundary-ish coordinate on each axis
+    g = np.stack(np.meshgrid(coords, coords[:8], coords[:8], indexing="ij"), axis=-1)
+    return g.reshape(-1, 3)
+
+
+def test_ownership_is_an_exact_partition_including_on_the_core_planes():
+    """Every row owned by EXACTLY one tile. Not 'almost always' -- the engine
+    asserts this as a partition and the velocity-scale theorem depends on it."""
+    cfg = _cfg()
+    x = _boundary_positions()
+    cell = L_BOX / N_FINE
+    counts = np.zeros(len(x), dtype=np.int32)
+    for t in cfg.tiles:
+        counts += forces.owned_mask(x, t, cell, cfg.n_tile, cfg.n_fine).astype(np.int32)
+    assert counts.min() == 1 and counts.max() == 1, (
+        f"{int((counts == 0).sum())} rows owned by NO tile and "
+        f"{int((counts > 1).sum())} owned by more than one, of {len(x)}"
+    )
+
+
+def test_the_old_tile_local_rule_is_the_one_that_leaks():
+    """The regression's provenance, kept executable so the fix cannot be undone
+    quietly: reproduce the retired rule and show it drops rows the new one keeps.
+
+    If this ever stops finding a gap the test is vacuous, so it asserts that the
+    old rule DOES leak -- which is what makes it evidence rather than decoration.
+    """
+    cfg = _cfg()
+    x = _boundary_positions()
+    cell = L_BOX / N_FINE
+    b_real = cfg._b_realized
+    core_lo, core_hi = b_real * cell, (b_real + cfg.n_tile) * cell
+    old = np.zeros(len(x), dtype=np.int32)
+    for t in cfg.tiles:
+        origin, _ = forces.tile_origin_extent(t, cfg.n_tile, b_real, cell)
+        u = np.mod(x - np.asarray(origin), L_BOX)
+        old += np.all((u >= core_lo) & (u < core_hi), axis=1).astype(np.int32)
+    assert old.min() == 0, (
+        "the retired rule owned every row on this fixture, so it does not "
+        "demonstrate the defect -- strengthen the fixture rather than delete this"
+    )
+
+
+def test_a_run_keeps_every_particle_owned_once_over_many_steps():
+    """The engine's own partition assertion, exercised over a run rather than a
+    step: `engine.step` raises if the tiles do not own exactly n_particles rows,
+    so completing is the assertion passing at every step."""
+    from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
+
+    cosmo = Cosmology()
+    co = bullfrog_float_coeffs(bullfrog_table(a_grid(0.1, 1.0, 8, "log"), cosmo))
+    cfg = _cfg()
+    _, _, st = _state(cfg)
+    out = engine.run(st, cfg, co)
+    assert len(out) == 8
+    st.check()

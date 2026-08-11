@@ -188,8 +188,10 @@ def leg_force_parity(cfg, g, slack=0.10, arena_frac=0.02):
         live = np.zeros(cap_e, dtype=bool)
         live[:m] = True
         origin, _ = forces.tile_origin_extent(t, ec.n_tile, b_real, geom["cell"])
-        u = jnp.mod(jnp.asarray(xt[idx]) - jnp.asarray(origin), ec.box_size)
-        out, owned, _ = one_tile(u, jnp.asarray(live))
+        xg = xt[idx]
+        u = jnp.mod(jnp.asarray(xg) - jnp.asarray(origin), ec.box_size)
+        own = forces.owned_mask(xg, t, geom["cell"], ec.n_tile, ec.n_fine, live=live)
+        out, owned, _ = one_tile(u, jnp.asarray(live), jnp.asarray(own))
         out, owned = np.asarray(out)[:m], np.asarray(owned)[:m]
         rows = row_of_slot[slots[owned]]
         assert rows.min() >= 0, "a tile owned a slot that holds no live particle"

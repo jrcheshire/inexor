@@ -520,6 +520,48 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
     return [jnp.fft.irfftn(dk * jnp.asarray(k), s=(n_mesh,) * 3) for k in kers]
 
 
+def owning_tile(positions, cell, n_tile, n_fine):
+    """The tile coordinates that own each row, from the GLOBAL position alone.
+
+    **This is the single source of the ownership partition, and it has to be a
+    function of the global position or it is not a partition at all.** The old
+    form tested the TILE-LOCAL coordinate, `owned = all(u >= core_lo & u <
+    core_hi)` with `u = mod(x - origin, L)` computed with a DIFFERENT origin per
+    tile, so two neighbouring tiles decided the same particle through two
+    different subtractions and their decisions were not complementary in floating
+    point. Measured (M-v2-6, antares job 431, cdev): one particle of 16,777,216
+    owned by NO tile, tripping the partition assertion. At cdev the core is
+    [8.0, 72.0) and for a position a few ulp below a boundary `x + 8.0` can round
+    UP to exactly 72.0, so the lower tile disowns it, while `x - 56.0` rounds to
+    just under 8.0, so the upper tile disowns it too -- a gap about one ulp wide
+    at every core plane. It is realization-dependent, which is why it had never
+    fired: cdev passes on this laptop's realization and fails on antares's,
+    because the noise stream is per-machine-class (D-v2-23).
+
+    Deciding from the global position makes the partition exact BY CONSTRUCTION
+    rather than exact up to rounding: `floor(x / cell)` is one deterministic
+    integer per row, tiles divide the fine mesh exactly (`n_fine % n_tile == 0`),
+    so integer division sends every row to exactly one tile whatever the float
+    result was. A row cannot be claimed twice or dropped, which is the property
+    the assertion checks and the property D-v2-16 clause 1's tile-local sink and
+    M-v2-3's velocity-scale theorem both rest on.
+
+    Host numpy and integer on purpose: this is a layout question, not a force
+    question, and it does not belong inside the jitted kernel.
+    """
+    n_fine = int(n_fine)
+    ci = np.floor(np.asarray(positions, dtype=np.float64) / float(cell))
+    ci = np.mod(ci.astype(np.int64), n_fine)  # x == box_size exactly -> cell 0
+    return ci // int(n_tile)
+
+
+def owned_mask(positions, tijk, cell, n_tile, n_fine, live=None):
+    """Rows of `positions` owned by tile `tijk`; see `owning_tile`."""
+    own = owning_tile(positions, cell, n_tile, n_fine)
+    m = np.all(own == np.asarray(tijk, dtype=np.int64), axis=1)
+    return m if live is None else (m & np.asarray(live, dtype=bool))
+
+
 def tile_capacity(member_counts):
     """The per-tile row capacity: a MAX over tiles, so one jitted program serves
     every tile (a per-tile member count would key a new shape and recompile).
@@ -1116,7 +1158,14 @@ def make_tile_force_fn(
     core_lo = b_real * cell
     core_hi = (b_real + int(n_tile)) * cell
 
-    def one_tile(u, live):
+    def one_tile(u, live, owned):
+        # `owned` is SUPPLIED, not computed here. It used to be
+        # `live & all((u >= core_lo) & (u < core_hi), axis=1)`, which is not a
+        # partition in floating point because each tile reaches `u` through its
+        # own subtraction -- see `owning_tile` for the measured failure. Ownership
+        # is a layout property of the global position and is now decided there,
+        # exactly, in integers. It is passed through this function so the mask
+        # cannot drift apart from the force it labels.
         if paint == "int":
             mesh_i, n_out_p = tile_paint_int(u, live, (P,) * 3, cell, frac_bits)
             # BY KEYWORD. This call dropped `fdtype` by being positional until
@@ -1129,8 +1178,7 @@ def make_tile_force_fn(
         dk = jnp.fft.rfftn(delta)
         g = [jnp.fft.irfftn(dk * k, s=(P,) * 3) for k in kers]
         out, n_out_g = tile_gather_vector(g[0], g[1], g[2], u, live, (P,) * 3, cell)
-        owned = live & jnp.all((u >= core_lo) & (u < core_hi), axis=1)
-        return out, owned, n_out_p + n_out_g
+        return out, live & owned, n_out_p + n_out_g
 
     geom = dict(P=int(P), b_realized=int(b_real), cell=cell, mean=mean,
                 core_lo=core_lo, core_hi=core_hi, n_side=int(n_fine) // int(n_tile),
@@ -1227,8 +1275,10 @@ def force_short_tiled(
         live_np = np.zeros((cap,), dtype=bool)
         live_np[:m] = True
         origin, _ = tile_origin_extent(t, n_tile, b_real, cell)
-        u = jnp.mod(jnp.asarray(positions[idx_pad]) - jnp.asarray(origin), float(box_size))
-        out, owned, n_out = one_tile(u, jnp.asarray(live_np))
+        xg = positions[idx_pad]
+        u = jnp.mod(jnp.asarray(xg) - jnp.asarray(origin), float(box_size))
+        own_np = owned_mask(xg, t, cell, n_tile, n_fine, live=live_np)
+        out, owned, n_out = one_tile(u, jnp.asarray(live_np), jnp.asarray(own_np))
         out = np.asarray(out)
         owned = np.asarray(owned)
         n_overhang_total += int(n_out)

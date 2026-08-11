@@ -587,7 +587,11 @@ def test_the_tile_arm_runs_f32_end_to_end_through_both_paints():
             N_FINE_T, L_BOX, N_PART_T**3, N_TILE_T, B_FINE_T, r_s=R_S,
             paint=paint, fdtype=np.float32,
         )
-        out, owned, _ = one_tile(u, live)
+        # ownership is supplied now, not computed in the kernel: it is a layout
+        # property of the global position and the tile-local float test it
+        # replaces was not a partition (see forces.owning_tile). This fixture is
+        # tile-local only, so every live row is treated as owned.
+        out, owned, _ = one_tile(u, live, live)
         assert geom["fdtype"] == "float32", f"geom does not carry the dtype ({paint})"
         assert _name(out) == "float32", (
             f"one_tile(paint={paint!r}) returned {_name(out)} at fdtype=float32"

@@ -111,6 +111,7 @@ Usage:
 import argparse
 import json
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -407,6 +408,17 @@ def _write(res, suffix, knobs):
     res["slurm_job_id"] = os.environ.get("SLURM_JOB_ID")
     prov = m5._provenance(_A())
     prov["knobs"] = knobs
+    # ARCHITECTURE IS A COMPARABILITY AXIS, not a footnote (JC, 2026-08-11).
+    # M-v2-5 measured the IC noise stream differing between Apple arm64 and Linux
+    # aarch64, and M-v2-6 found a partition defect that fires on an x86-64
+    # realization of cdev and not on this laptop's -- so a seed does not name a
+    # realization across architectures, and neither peaks nor pass/fail transfer.
+    # NB Apple arm64 and Grace aarch64 are BOTH arm64 by `machine` and are still
+    # known to differ, so equal `arch` is necessary and not sufficient; `platform`
+    # separates them and is recorded beside it.
+    prov["arch"] = platform.machine()
+    prov["platform"] = sys.platform
+    prov["libc"] = "-".join(platform.libc_ver()) or None
     res["provenance"] = prov
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"m6_peak{suffix}.json")
