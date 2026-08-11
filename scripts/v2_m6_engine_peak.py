@@ -134,6 +134,7 @@ GEN_FDTYPE = np.float32  # the production generator dtype (M-v2-5 leg V)
 LEGS = {
     "gen": dict(steps=0, coarse="float64", coarse_div=1),
     "load": dict(steps=0, coarse="float64", coarse_div=1),
+    "integrity": dict(steps=0, coarse="float64", coarse_div=1, integrity=True),
     "repack_only": dict(steps=0, coarse="float64", coarse_div=1, repack=True),
     "step": dict(steps=None, coarse="float64", coarse_div=1),
     "step_f32": dict(steps=None, coarse="float32", coarse_div=1),
@@ -265,6 +266,82 @@ def _worker(cfg, leg, k_steps, workdir, slack, arena_frac, alloc_margin):
         n_bricks=int(st.n_bricks),
         peak_after_load=_maxrss_bytes(),
     )
+    if spec.get("integrity"):
+        # WHY THIS LEG EXISTS. cdev fails the engine's partition assertion at
+        # `16777215 rows against 16777216 particles` on x86 and not on Apple
+        # arm64, and I have now proposed three explanations from reading the code
+        # and been wrong twice (a tile-local float gap, then a position-vs-storage
+        # mismatch). This finds the missing row instead of arguing about it: every
+        # census the assertion could be comparing, plus the identity of whatever
+        # slot no tile claims.
+        import collections
+
+        from inexor import forces as F
+
+        b_real = ec._b_realized
+        nb = g["n_fine"] // ec.n_brick
+        per_brick_count = np.array(
+            [st.brick_member_count(b) for b in range(st.n_bricks)], dtype=np.int64
+        )
+        decoded_len = np.array(
+            [len(st.decode_brick(b)[0]) for b in range(st.n_bricks)], dtype=np.int64
+        )
+        claims = collections.Counter()
+        rows_decoded = 0
+        for t in ec.tiles:
+            members = st.tile_bricks(t, ec.n_tile, b_real, ec.n_brick, g["n_fine"])
+            slots, _, _ = st.decode_bricks(members)
+            rows_decoded += len(slots)
+            brick_of_row = np.repeat(
+                np.asarray(members, dtype=np.int64),
+                [st.brick_member_count(b) for b in members],
+            )
+            if len(brick_of_row) != len(slots):
+                out["MISALIGNED"] = dict(tile=list(map(int, t)),
+                                         counts=int(len(brick_of_row)),
+                                         decoded=int(len(slots)))
+                break
+            own = F.owned_mask_from_bricks(brick_of_row, t, ec.n_tile, ec.n_brick, nb)
+            for s in np.asarray(slots)[own]:
+                claims[int(s)] += 1
+        owned_total = sum(claims.values())
+        out["integrity"] = dict(
+            n_particles=int(st.n_particles),
+            n_live=int(st.n_live),
+            arena_used=int(st.arena_used),
+            sum_brick_member_count=int(per_brick_count.sum()),
+            sum_decoded_per_brick=int(decoded_len.sum()),
+            count_vs_decode_mismatched_bricks=int((per_brick_count != decoded_len).sum()),
+            rows_decoded_over_tiles=int(rows_decoded),
+            slots_claimed_once=int(sum(1 for v in claims.values() if v == 1)),
+            slots_claimed_twice_or_more=int(sum(1 for v in claims.values() if v > 1)),
+            owned_total=owned_total,
+            deficit=int(st.n_particles) - owned_total,
+            n_bricks=int(st.n_bricks),
+            bricks_per_side=int(nb),
+            bricks_per_core=int(ec.n_tile // ec.n_brick),
+            check_ok=bool(st.check()),
+        )
+        # name the missing slots, with everything needed to attribute them
+        live_slots = set()
+        for b in range(st.n_bricks):
+            live_slots.update(int(s) for s in st.decode_brick(b)[0])
+        missing = sorted(live_slots - set(claims))
+        out["integrity"]["n_missing_slots"] = len(missing)
+        det = []
+        for s in missing[:10]:
+            b = int(np.searchsorted(st.brick_start, s, side="right") - 1)
+            det.append(dict(
+                slot=int(s), brick=b,
+                in_arena=bool(s >= st.arena_base),
+                arena_bucket=(int(st.arena_bucket[s - st.arena_base])
+                              if s >= st.arena_base else None),
+                off=[int(q) for q in st.off[s]],
+            ))
+        out["integrity"]["missing_detail"] = det
+        print(json.dumps(dict(maxrss=_maxrss_bytes(), **out)), flush=True)
+        return
+
     if spec.get("repack"):
         # Isolate the repack transient DIRECTLY rather than by disabling it. The
         # first version of this leg ran the engine with repack_every=0 and the
