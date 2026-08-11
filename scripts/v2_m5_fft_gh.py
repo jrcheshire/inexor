@@ -211,7 +211,15 @@ def phase_coloured_pk(res, n):
     wgt_z[0] = 1.0
     if n % 2 == 0:
         wgt_z[-1] = 1.0
+    # THE ORACLE IS BIN-AVERAGED over the same modes and weights, never
+    # evaluated at a bin-centre or bin-mean k: at 2048^3 mode counts the
+    # deterministic Jensen term of P's curvature across a bin reaches
+    # z = +15 at k ~ 0.17-0.22 (measured 2026-08-10 -- job 902091 failed at
+    # max|z| 8.71 on exactly this), the same trap the bin-averaged bispectrum
+    # oracle exists for. Averaging P over the realized modes cancels it
+    # identically.
     psum = np.zeros(len(edges) - 1)
+    lsum = np.zeros(len(edges) - 1)
     ksum = np.zeros(len(edges) - 1)
     wsum = np.zeros(len(edges) - 1)
     for lo in range(0, n, 32):
@@ -223,23 +231,29 @@ def phase_coloured_pk(res, n):
         w3 = np.broadcast_to(wgt_z, kk.shape)
         idx = np.digitize(kk.ravel(), edges) - 1
         sel = (idx >= 0) & (idx < len(psum)) & (kk.ravel() > 0)
+        if not sel.any():
+            continue
+        wk = w3.ravel()[sel]
         np.add.at(psum, idx[sel], (p * w3).ravel()[sel])
-        np.add.at(ksum, idx[sel], (kk * w3).ravel()[sel])
-        np.add.at(wsum, idx[sel], w3.ravel()[sel])
+        np.add.at(lsum, idx[sel], tab.P_of_k(kk.ravel()[sel]) * wk)
+        np.add.at(ksum, idx[sel], kk.ravel()[sel] * wk)
+        np.add.at(wsum, idx[sel], wk)
     del spec
     good = wsum > 100
     pk = psum[good] / wsum[good] * box**3 / n**6
+    p_lin_binavg = lsum[good] / wsum[good]
     kmean = ksum[good] / wsum[good]
-    p_lin = tab.P_of_k(kmean)
-    z = (pk / p_lin - 1.0) / np.sqrt(2.0 / wsum[good])
+    z = (pk / p_lin_binavg - 1.0) / np.sqrt(2.0 / wsum[good])
     peak = _maxrss()
     res["coloured_pk"] = dict(
         n=n, box=box, gen_s=t_gen, bins=int(good.sum()),
         max_abs_z=float(np.abs(z).max()), peak_rss=peak,
+        k_mean=[float(v) for v in kmean],
+        z_profile=[float(v) for v in z],  # the max-over-band lesson: keep the shape
     )
     ok = bool(np.all(np.abs(z) < 5.0))
     print(f"  coloured P(k): {int(good.sum())} bins to 0.5 k_Nyq, "
-          f"max|z| {np.abs(z).max():.2f} (bar 5)", flush=True)
+          f"max|z| {np.abs(z).max():.2f} (bar 5, bin-averaged oracle)", flush=True)
     return ok
 
 

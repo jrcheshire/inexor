@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH -J m5-fft-gh
+#SBATCH -A JPL-SPHEREx
 #SBATCH -p gh
 #SBATCH -N 1
 #SBATCH -t 02:00:00

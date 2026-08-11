@@ -269,7 +269,10 @@ def sigma_R(R, cosmo, z=0.0, backend="eh98", table=None):
 
 def _refuse_outside(k_arr, k_lo, k_hi, what):
     # Same guard as linear_power's table backend: 1-ulp slack so exact-endpoint
-    # queries do not trip it; loud refusal, never extrapolation.
+    # queries do not trip it; loud refusal, never extrapolation. An EMPTY query
+    # is a legitimate no-op (a slab-streamed caller's k-cut can empty a slab).
+    if k_arr.size == 0:
+        return
     if k_arr.min() < k_lo * (1 - 1e-12) or k_arr.max() > k_hi * (1 + 1e-12):
         raise ValueError(
             f"requested k in [{k_arr.min():.3e}, {k_arr.max():.3e}] outside the "
