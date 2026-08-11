@@ -30,6 +30,85 @@ from .cosmology import growth_factor_md, linear_power, transfer_eh98
 # when lengths are measured in Mpc/h, so this is just c[km/s] / 100.
 C_OVER_H0 = 299792.458 / 100.0
 
+# The noise-stream identity (M-v2-5, D-v2-15 clause 5). A seed denotes a
+# realization only relative to a stream; cards record this constant so a
+# readout can refuse to pool measurements across streams. Bump it if the
+# construction below ever changes in any bit-visible way.
+IC_STREAM = "m5-foldin-1"
+
+
+# ============================================================================
+# Plane-keyed white noise (M-v2-5; D-v2-15 clause 5)
+#
+# The canonical noise unit is ONE plane along array axis 0 (the C-order slab
+# axis shared by the out-of-core FFT and the state layer's brick slabs; axis
+# reading JC-ratified 2026-08-10), keyed by `jax.random.fold_in(key, i)`.
+# Each plane's bits depend only on (base key, plane index, (N, N), dtype), so
+# ANY slab decomposition assembles the identical field -- invariance to slab
+# thickness is a property of the construction, not of the code path, and the
+# M-v2-5 gate tests the theorem. Deliberately a Python loop of per-plane
+# draws, never a vmap over folded keys: the per-plane stream is the one
+# construction in play.
+#
+# NOT bit-identical to the pre-M-v2-5 monolithic `jax.random.normal(key,
+# (N,N,N))` stream at any seed (clause 5: the stream is shape-dependent), and
+# not resolution-independent: fixed-phase cross-resolution comparison still
+# requires equal N.
+# ============================================================================
+
+
+def _require_stream_config(fdtype):
+    """Refuse silent stream or dtype drift, never degrade.
+
+    `fold_in`'s derived keys depend on `jax_threefry_partitionable` (True on
+    the pinned jax); a run under the other setting would be a DIFFERENT stream
+    carrying the same IC_STREAM tag, so it is refused rather than recorded.
+    An f64 request without x64 would silently come back f32 -- the engine's
+    `_refuse_f64_without_x64` logic, applied at the generator boundary.
+    """
+    if not jax.config.jax_threefry_partitionable:
+        raise RuntimeError(
+            "jax_threefry_partitionable is False; the m5-foldin stream is defined "
+            "under the partitionable PRNG (jax 0.10 default) and refuses to run "
+            "under any other setting"
+        )
+    if np.dtype(fdtype) == np.float64 and not jax.config.jax_enable_x64:
+        raise RuntimeError(
+            "float64 white noise requested without jax_enable_x64: jax would "
+            "silently return float32, and an 'f64 reference' would not be one"
+        )
+
+
+def plane_key(key, i):
+    """The canonical per-plane key: fold_in(base key, plane index)."""
+    return jax.random.fold_in(key, i)
+
+
+def white_plane(key, i, n_mesh, fdtype=np.float32):
+    """One (N, N) unit-normal plane of the canonical stream, host numpy."""
+    _require_stream_config(fdtype)
+    jdt = jnp.dtype(np.dtype(fdtype))
+    return np.asarray(jax.random.normal(plane_key(key, i), (n_mesh, n_mesh), dtype=jdt))
+
+
+def white_slab(key, lo, hi, n_mesh, fdtype=np.float32):
+    """Planes lo..hi-1 stacked along axis 0, (hi-lo, N, N) host numpy.
+
+    Random access by construction: generating planes [lo, hi) never touches
+    any other plane, and the result is bitwise the same rows of a full build.
+    """
+    if not (0 <= lo <= hi <= n_mesh):
+        raise ValueError(f"plane range [{lo}, {hi}) outside [0, {n_mesh})")
+    out = np.empty((hi - lo, n_mesh, n_mesh), dtype=np.dtype(fdtype))
+    for i in range(lo, hi):
+        out[i - lo] = white_plane(key, i, n_mesh, fdtype)
+    return out
+
+
+def white_noise(key, n_mesh, fdtype=np.float32):
+    """The full (N, N, N) white field: white_slab over every plane."""
+    return white_slab(key, 0, n_mesh, n_mesh, fdtype)
+
 
 def gaussian_delta(
     key, n_mesh, box_size, cosmo, fdtype=jnp.float32, amplitude=1.0, backend="eh98", table=None

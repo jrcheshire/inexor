@@ -12,14 +12,26 @@ from inexor.config import PLANCK
 from inexor.cosmology import linear_power
 from inexor.diagnostics import pk_estimator
 from inexor.ic import (
+    IC_STREAM,
     gaussian_delta,
     linear_density,
     local_bispectrum_template,
     poisson_M,
     primordial_potential,
+    white_noise,
+    white_plane,
+    white_slab,
 )
 
 N, L = 64, 500.0
+
+
+@pytest.fixture
+def x64():
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    yield
+    jax.config.update("jax_enable_x64", prev)
 
 
 def test_pk_recovery_within_sample_variance():
@@ -89,6 +101,71 @@ def test_poisson_M_table_path_matches_analytic():
     assert np.allclose(M_tab[1:], M_ana[1:], rtol=1e-4)
     # 2D shape preservation through the table path
     assert poisson_M(np.full((2, 3), 0.1), PLANCK, table=tab).shape == (2, 3)
+
+
+# ---------------------------------------------------------------------------
+# Plane-keyed white noise (M-v2-5, D-v2-15 clause 5)
+# ---------------------------------------------------------------------------
+
+
+def test_white_noise_is_invariant_to_slab_thickness(x64):
+    """The decomposition-invariance theorem, at f64 and f32: any tiling of the
+    same (seed, N, dtype) assembles the identical array, bit for bit. The
+    thickness set includes 7, which does not divide 32 -- the ragged final
+    slab is the off-by-one class."""
+    key = jax.random.PRNGKey(3)
+    n = 32
+    for fdt in (np.float64, np.float32):
+        ref = white_noise(key, n, fdt)
+        for t in (1, 7, 16, 32):
+            parts = [white_slab(key, lo, min(lo + t, n), n, fdt) for lo in range(0, n, t)]
+            assembled = np.concatenate(parts, axis=0)
+            assert assembled.dtype == np.dtype(fdt)
+            assert np.array_equal(assembled, ref), f"thickness {t} broke invariance at {fdt}"
+
+
+def test_white_slab_is_random_access(x64):
+    """A mid-field slab request never generates preceding planes and is bitwise
+    the same rows of a full build -- the property that makes the construction
+    streamable and spot-checkable at scale."""
+    key = jax.random.PRNGKey(3)
+    n = 32
+    ref = white_noise(key, n, np.float64)
+    assert np.array_equal(white_slab(key, 13, 20, n, np.float64), ref[13:20])
+
+
+def test_white_noise_invariance_can_fail(x64):
+    """Anti-vacuity: a different base seed and a shifted plane index must both
+    break the equality, or the invariance test asserts nothing."""
+    key = jax.random.PRNGKey(3)
+    n = 32
+    ref = white_noise(key, n, np.float64)
+    other_seed = white_noise(jax.random.PRNGKey(4), n, np.float64)
+    assert not np.array_equal(other_seed, ref)
+    assert not np.array_equal(white_plane(key, 1, n, np.float64), white_plane(key, 2, n, np.float64))
+    shifted = np.concatenate(
+        [white_slab(key, 1, n, n, np.float64), white_plane(key, 0, n, np.float64)[None]], axis=0
+    )
+    assert not np.array_equal(shifted, ref)
+
+
+def test_white_noise_moments_sane():
+    w = white_noise(jax.random.PRNGKey(0), 64, np.float32)
+    n_samp = w.size
+    assert abs(float(w.mean())) < 5.0 / np.sqrt(n_samp)
+    assert abs(float(w.var()) - 1.0) < 5.0 * np.sqrt(2.0 / n_samp)
+
+
+def test_white_noise_refuses_silent_f64_degradation():
+    """An f64 request without x64 must refuse, not silently return f32."""
+    if jax.config.jax_enable_x64:
+        pytest.skip("x64 already on in this process")
+    with pytest.raises(RuntimeError, match="without jax_enable_x64"):
+        white_plane(jax.random.PRNGKey(0), 0, 8, np.float64)
+
+
+def test_ic_stream_constant_exists():
+    assert IC_STREAM.startswith("m5-foldin")
 
 
 def test_bispectrum_template_squeezed_divergence():
