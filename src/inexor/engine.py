@@ -216,6 +216,44 @@ class EngineConfig:
             tile_workspace=pcells * (fw + 4 + 3 * fw) + phalf * 2 * fw,
         )
 
+    def step_bytes(self, n_particles, n_rows=None, cap=None):
+        """Per-step HOST terms that scale with PARTICLES, not with the mesh.
+
+        The companion to `mesh_bytes`, and it exists for the same reason: nothing
+        counted these either. M-v2-6 Stage 0 measured the engine's end-to-end peak
+        for the first time and found 8.2 GB at cdev8 where state plus
+        `mesh_bytes` plus the tile buffers modelled ~0.25 GB, so a planner built
+        only on `mesh_bytes` would have sized C-gh and been wrong by a factor of
+        thirty. A term that is not in the table cannot be traded against anything.
+
+        Terms, each pointing at the line that allocates it:
+
+        `kick_pending` -- `engine.py` holds `(slots int64, v_new f64)` per tile
+        until the velocity scale is reconciled, and ownership is a partition, so
+        at the end of the tile loop it holds exactly `n_particles` rows: 32 B/p,
+        **275 GB at C-gh**. This is the term the module docstring says does not
+        exist ("Nothing O(N) in floats, anywhere"). Slated for removal by
+        per-brick velocity scales; until then it is the binding term at scale and
+        it is reported rather than described.
+
+        `repack_scratch` -- `SlotState.repack` allocates `zeros_like` of `off` and
+        `w` while the originals stay live (`state.py:936-938`), so 9 B per ROW,
+        ~91 GB at C-gh. D-v2-19 clause 3 establishes the in-place form at
+        O(chunk); this is what it is worth.
+
+        `tile_buffers` -- the per-tile host working set, `cap`-sized. Needs a
+        measured `cap`; omitted when not supplied rather than guessed.
+        """
+        n = int(n_particles)
+        rows = int(n_rows) if n_rows is not None else int(round(n * 1.21))
+        out = dict(
+            kick_pending=n * (8 + 24),
+            repack_scratch=rows * 9,
+        )
+        if cap is not None:
+            out["tile_buffers"] = int(cap) * (8 + 1 + 24 + 24 + 1 + 8 + 24 + 24)
+        return out
+
     @property
     def n_brick(self):
         return choose_brick(self.n_tile, self._b_realized, self.n_fine)
