@@ -1,0 +1,32 @@
+{
+ "ok": true,
+ "n_diff": 0,
+ "decoded_rms": 19.1242787005764,
+ "k_steps": 3,
+ "config": "smoke",
+ "commit": "9db6ca9d7c3a58093f9e14a223467c87c21e3a8e",
+ "slurm_job_id": null,
+ "provenance": {
+  "backend": "cpu",
+  "device_kind": "cpu",
+  "n_devices": 1,
+  "host_cores": 16,
+  "x64": true,
+  "jax_version": "0.10.2",
+  "threefry_partitionable": true,
+  "ic_stream": "m5-foldin-1",
+  "xla_flags": null,
+  "omp_num_threads": null,
+  "argv": [
+   "--leg",
+   "engine-smoke"
+  ],
+  "knobs": {
+   "n": 64,
+   "bricks": 4,
+   "slab": 5,
+   "seed": 0,
+   "f_nl": 0.0
+  }
+ }
+}
