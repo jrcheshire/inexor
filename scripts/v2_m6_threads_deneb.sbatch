@@ -1,10 +1,21 @@
 #!/bin/bash
 #SBATCH -J m6-threads
 #SBATCH -p compute
-#SBATCH --mem=32G
+#SBATCH --exclusive
+#SBATCH --mem=24G
 #SBATCH -c 32
 #SBATCH -t 01:00:00
 #SBATCH -o m6-threads-%j.log
+# --exclusive IS LOAD-BEARING, not politeness. The deliverable is a thread-SCALING
+# curve on a MEMORY-BANDWIDTH-BOUND workload (the dominant op is a scattered
+# gather, 2.71 mean cores of 16 locally where a matmul reaches 13.6). Dedicated
+# cores do not give a dedicated memory controller, so a co-tenant on the same
+# node moves every timing in the sweep and the curve stops meaning anything. The
+# first submission (job 432) was cancelled for exactly this: it would have been
+# schedulable alongside another 8-core job on deneb.
+# `-c 32` also routes this to deneb-the-node rather than antares (28 cores) by
+# resource spec rather than by hostname -- deneb is the machine whose 2x over a
+# GH200 is the anomaly under test.
 # M-v2-6 Stage 1a: does THREAD COUNT explain the deneb-beats-GH200 2x?
 #
 # THE ANOMALY. On the same engine at cdev, deneb reads 24.89 s/step (job 411)
