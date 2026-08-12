@@ -386,6 +386,16 @@ def _worker(cfg, leg, k_steps, workdir, slack, arena_frac, alloc_margin):
                 s["cap"] / s["cap_true"] - 1.0 for s in seen if s["cap_true"]
             )
         out["arena_used_per_step"] = [int(s.get("arena_used", -1)) for s in seen]
+        # the migration's reach, bound and REALIZED, per step. The realized
+        # value is the field evidence for the missing-particle mechanism (a
+        # 2-brick x-mover at cdev, antares 442/445): job 445 confirmed the fix
+        # by completing, but its card could not say WHY, because these fields
+        # were not persisted. A claim like "at most one brick per axis" must be
+        # readable off the card, not reconstructed from a rerun.
+        out["brick_reach_per_step"] = [int(s.get("brick_reach", -1)) for s in seen]
+        out["brick_reach_realized_per_step"] = [
+            int(s.get("brick_reach_realized", -1)) for s in seen
+        ]
         st.check()
     out["maxrss"] = _maxrss_bytes()
     print(json.dumps(out), flush=True)
