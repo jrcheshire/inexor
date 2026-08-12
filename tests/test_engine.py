@@ -425,3 +425,95 @@ def test_every_brick_belongs_to_exactly_one_tile_core():
     assert claims.min() == 1 and claims.max() == 1, (
         f"{int((claims != 1).sum())} bricks of {nb**3} are not claimed exactly once"
     )
+
+
+# ------------------------------------------------- the phase hook (M-v2-6 Stage 0b)
+# A peak is a max and a max carries no timestamp. Stage 0 attributed the engine's
+# peak by differencing whole-run maxima between arms, and at cdev the terms it was
+# separating (67-179 MB) sat inside the run-to-run scatter of the maximum itself
+# (sigma 45-115 MB over five repeats of one leg, antares 445). The hook names the
+# boundaries so a caller can take a high-water mark per phase instead. These tests
+# pin the two properties the instrument rests on: the boundaries are where the
+# docstring says, and the hook cannot move a number.
+
+
+def _phase_names(cfg, seed, n_steps=2):
+    _, _, st = _state(cfg, seed)
+    a = a_grid(0.1, 1.0, n_steps, "log")
+    co = bullfrog_float_coeffs(bullfrog_table(a, Cosmology()))
+    seen = []
+    out = engine.run(st, cfg, co, phase=seen.append)
+    return seen, out, st
+
+
+def test_the_phase_hook_names_every_boundary_in_order():
+    """The per-step sequence, asserted exactly rather than by membership.
+
+    Membership would pass if the hook fired the right names in the wrong places,
+    which is the one failure that would silently misattribute a peak: a boundary
+    after the wrong statement reports another phase's allocation as this one's.
+    """
+    cfg = _cfg()
+    seen, out, _ = _phase_names(cfg, 21, n_steps=2)
+    assert seen[0] == "lead_drift", "the drift onto the first midpoint is unnamed"
+    per_step = seen[1:]
+    n_tiles = len(cfg.tiles)
+    # one step's worth: the three global phases, then the tile loop, then the tail
+    head = per_step[: 3 + 4 * n_tiles + 3]
+    assert head[:3] == ["coarse_paint", "coarse_solve", "membership"]
+    tile_block = head[3 : 3 + 4 * n_tiles]
+    assert tile_block == ["tile_decode", "tile_short", "tile_long", "tile_reduce"] * n_tiles, (
+        "the per-tile boundaries are not one clean repeating group per tile"
+    )
+    assert head[3 + 4 * n_tiles :] == ["tile_loop_end", "reconcile", "migrate"]
+    assert len(out) == 2
+
+
+def test_the_tile_loop_end_boundary_falls_after_every_tile():
+    """`pending` is largest at the end of the tile loop and nowhere else, so that
+    boundary is the only place a high-water mark can price it. If it fired inside
+    the loop it would price a fraction of the term and read as a smaller one."""
+    cfg = _cfg()
+    seen, _, _ = _phase_names(cfg, 22, n_steps=1)
+    i = seen.index("tile_loop_end")
+    assert seen[i - 1] == "tile_reduce", "the loop-end boundary is inside the loop"
+    assert "tile_reduce" not in seen[i:], "a tile ran after the loop-end boundary"
+    assert seen.count("tile_reduce") == len(cfg.tiles)
+
+
+def test_the_repack_boundary_fires_only_when_the_repack_does():
+    cfg_on = _cfg(repack_every=1)
+    seen_on, _, _ = _phase_names(cfg_on, 23, n_steps=2)
+    assert seen_on.count("repack") == 2
+    cfg_off = _cfg(repack_every=0)
+    seen_off, _, _ = _phase_names(cfg_off, 23, n_steps=2)
+    assert "repack" not in seen_off
+
+
+def test_the_phase_hook_cannot_move_a_number():
+    """Neutrality, asserted on the STATE and on the per-step diagnostics.
+
+    An instrument that perturbs what it measures is worse than no instrument,
+    and this one runs inside the hot loop. Both runs start from the same seed,
+    so every field must agree exactly -- not to a tolerance.
+    """
+    cfg = _cfg()
+    _, _, st_a = _state(cfg, 24)
+    _, _, st_b = _state(cfg, 24)
+    a = a_grid(0.1, 1.0, 3, "log")
+    co = bullfrog_float_coeffs(bullfrog_table(a, Cosmology()))
+    out_a = engine.run(st_a, cfg, co)
+    out_b = engine.run(st_b, cfg, co, phase=lambda _name: None)
+
+    assert np.array_equal(st_a.off, st_b.off), "positions moved under the hook"
+    assert np.array_equal(st_a.w, st_b.w), "velocity codes moved under the hook"
+    assert np.array_equal(st_a.occupancy, st_b.occupancy)
+    assert st_a.vel_scale == st_b.vel_scale
+    for sa, sb in zip(out_a, out_b):
+        for k in ("cap", "cap_true", "vel_scale", "coarse_peak_int", "arena_used"):
+            assert sa.get(k) == sb.get(k), f"the hook moved `{k}`"
+
+
+def test_the_default_hook_is_a_no_op_that_returns_nothing():
+    """`_no_phase` is what the hot loop calls when no caller asked for a trace."""
+    assert engine._no_phase("anything") is None

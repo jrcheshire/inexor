@@ -500,7 +500,11 @@ def _diagnose_partition(st, cfg):
     return "\n".join(lines)
 
 
-def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
+def _no_phase(_name):
+    """The default phase hook: does nothing, allocates nothing, returns nothing."""
+
+
+def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, phase=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1 and
@@ -509,14 +513,29 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
     `census=True` turns on the coarse decode census; see
     `coarse_delta_streamed`. Off by default: it is a gate instrument and costs
     two extra passes over the coarse mesh.
+
+    `phase`, if given, is called with a boundary NAME after each phase of the
+    step completes. It exists because a peak is a max and a max carries no
+    timestamp: M-v2-6 Stage 0 attributed the peak by differencing whole-run
+    maxima between arms, and at cdev the terms it was trying to separate
+    (67-179 MB) sat inside the run-to-run scatter of the maximum itself
+    (sigma 45-115 MB over five repeats of one leg, antares 445), so no
+    difference of maxima could be read. Naming the boundaries lets a caller
+    take a high-water mark PER PHASE instead, which is a measurement of where
+    the peak is rather than an inference from what it is not. The hook takes no
+    payload and returns nothing on purpose -- it must not be able to perturb
+    the step, and the default is a function that does nothing at all.
     """
     import jax.numpy as jnp
+
+    ph = phase if phase is not None else _no_phase
 
     alpha_k, bcoef = float(coeff[0]), float(coeff[1])
 
     # --- long arm: solve once, globally, on the coarse mesh
     mesh_stats = {}
     delta = coarse_delta_streamed(st, cfg, stats=mesh_stats, census=census)
+    ph("coarse_paint")
     # `coarse_force_meshes` infers from delta.dtype and REFUSES a mismatch, so
     # the dtype cannot silently disagree with what the config asked for
     g_coarse = coarse_force_meshes(
@@ -529,6 +548,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
         fdtype=cfg.np_coarse_dtype,
     )
     g_coarse = [np.asarray(g) for g in g_coarse]
+    ph("coarse_solve")
 
     # --- membership, and the capacity one jitted program needs
     b_real = cfg._b_realized
@@ -556,6 +576,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
         fdtype=cfg.np_fine_dtype,
     )
     cell = geom["cell"]
+    ph("membership")
 
     tile_scales, n_owned, n_overhang = [], 0, 0
     pending = []  # (slots, v_new) held until the global scale is known
@@ -589,10 +610,12 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
         own = np.zeros(cap, dtype=bool)
         own[:m] = own_rows
         own &= live
+        ph("tile_decode")
         g_short, owned, n_out = one_tile(u, jnp.asarray(live), jnp.asarray(own))
         g_short = np.asarray(g_short)[:m]
         owned = np.asarray(owned)[:m]
         n_overhang += int(n_out)
+        ph("tile_short")
         if not owned.any():
             continue
 
@@ -618,6 +641,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
             )
         )[:n_own]
 
+        ph("tile_long")
         g_tot = g_short[owned] + g_long
         v_new = alpha_k * v[owned] + bcoef * g_tot
         n_owned += int(owned.sum())
@@ -625,6 +649,12 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
         # over tiles is EXACTLY the global scale because ownership is a partition.
         tile_scales.append(float(np.max(np.abs(v_new))) / INT16_MAX)
         pending.append((slots[owned], v_new))
+        ph("tile_reduce")
+
+    # `pending` is at its largest HERE and nowhere else: it grows by one tile's
+    # owned rows per iteration and is consumed below. A boundary at the end of
+    # the loop is the only place a high-water mark can price it.
+    ph("tile_loop_end")
 
     if n_owned != st.n_particles:
         # SELF-DIAGNOSING, because the bare count sent me down three wrong
@@ -654,8 +684,15 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0):
             )
         st.write_velocities(slots, w.astype(np.int16))
     st.vel_scale = s_new
+    # NB `pending` is dead here but still REFERENCED until this function returns,
+    # so its 32 B/p stays live across the migrate. Freeing it is a candidate
+    # change, deliberately NOT made in the same commit as the instrument that
+    # would measure it -- an instrument and an intervention in one commit cannot
+    # be told apart afterwards.
+    ph("reconcile")
 
     stats = drift_and_migrate(st, c_drift, vel_scale_new=s_new)
+    ph("migrate")
     # both: `cap` is the SHAPE every buffer took, `cap_true` the max over tiles it
     # was quantized from. Reporting only one of them hides either the padding cost
     # or the shape churn, and the shape churn is what leaked.
@@ -685,21 +722,29 @@ def fused_drifts(coeffs):
     return float(h[0]), np.concatenate([h[:-1] + h[1:], h[-1:]])
 
 
-def run(st, cfg, coeffs, collect=None, census=False):
-    """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`."""
+def run(st, cfg, coeffs, collect=None, census=False, phase=None):
+    """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`.
+
+    `phase` is forwarded to `step`; see its docstring. The boundaries `run`
+    itself adds are the lead drift and the repack, so that every allocation in
+    the run falls inside exactly one named phase and the phases sum to the run.
+    """
     cfg.validate()
+    ph = phase if phase is not None else _no_phase
     lead, fused = fused_drifts(coeffs)
     drift_and_migrate(st, lead)  # onto the first midpoint
+    ph("lead_drift")
     out = []
     # the buffer shape is carried ACROSS steps and only ever grows, so the run
     # visits at most a few shapes instead of one per step (M-v2-6 Stage 0)
     cap_shape = 0
     for k in range(len(fused)):
         stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
-                     census=census, cap_shape=cap_shape)
+                     census=census, cap_shape=cap_shape, phase=phase)
         cap_shape = int(stats["cap"])
         if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
             stats["repack"] = st.repack(brick_slack=cfg.brick_slack)
+            ph("repack")
         out.append(stats)
     return out
 
