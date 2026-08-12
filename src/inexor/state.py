@@ -305,15 +305,24 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None, max_staged_slabs=None):
     reach = range(-r, r + 1)
 
     staged, emig, inserted = {}, {}, set()
-    n_over, peak_staged = 0, 0
+    consumed = {}  # emig rows an insert actually took, per source slab
+    n_over, peak_staged, realized_reach = 0, 0, 0
     for s in range(nb):
         staged[s], emig[s] = st._eject_slab(s, c_drift, s_old, s_new)
+        consumed[s] = 0
+        # the REALIZED x-reach, reported beside the bound: the bound said 2 at
+        # cdev while every record claimed "at most one brick per axis", and the
+        # gap between those two statements was a lost particle
+        if len(emig[s]["dest"]):
+            d_slab = emig[s]["dest"] // (st.buckets_per_brick * nb * nb)
+            disp = (d_slab - s + nb // 2) % nb - nb // 2
+            realized_reach = max(realized_reach, int(np.abs(disp).max()))
         # a slab may be written once every slab that can REACH it has been ejected
         for d in range(nb):
             if d in inserted:
                 continue
             if all(((d + o) % nb) in emig for o in reach):
-                n_over += st._insert_slab(d, staged, emig)
+                n_over += st._insert_slab(d, staged, emig, reach, consumed)
                 inserted.add(d)
         # release what no pending write can still need
         for s2 in list(staged):
@@ -321,6 +330,26 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None, max_staged_slabs=None):
                 del staged[s2]
         for s2 in list(emig):
             if all(((s2 + o) % nb) in inserted for o in reach):
+                # THE CENSUS, at the point of loss. Releasing an emig slab whose
+                # rows were not all consumed is exactly how the cdev particle
+                # vanished (antares 442): the schedule staged a 2-brick x-mover
+                # correctly, `_insert_slab` consumed only +-1 sources, and this
+                # deletion destroyed the row with nothing raising. The final
+                # n_before/n_after guard 200 lines of call stack away cost five
+                # wrong causes; this one names the row's displacement.
+                n_rows = len(emig[s2]["dest"])
+                if consumed[s2] != n_rows:
+                    d_slab = (emig[s2]["dest"] // (st.buckets_per_brick * nb * nb))
+                    disp = (d_slab - s2 + nb // 2) % nb - nb // 2
+                    hist = {int(k): int(c) for k, c in zip(*np.unique(disp, return_counts=True))}
+                    raise AssertionError(
+                        f"releasing emig slab {s2} with {n_rows - consumed[s2]} of "
+                        f"{n_rows} rows unconsumed (reach {r}, consumption offsets "
+                        f"{sorted({int(o) for o in reach})}). Destination-slab "
+                        f"displacement histogram for this slab's emigrants: {hist}. "
+                        "D-007 forbids dropping; an unconsumed emigrant is a particle "
+                        "about to be destroyed."
+                    )
                 del emig[s2]
         peak_staged = max(peak_staged, len(staged))
         if max_staged_slabs is not None and peak_staged > int(max_staged_slabs):
@@ -358,7 +387,7 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None, max_staged_slabs=None):
     # every step rather than a docstring claim that held at one configuration
     return dict(n_arena_overflow=n_over, arena_used=st.arena_used, vel_scale=s_new,
                 n_migrated_checked=n_after, brick_reach=r, brick_reach_raw=r_raw,
-                peak_staged_slabs=peak_staged)
+                brick_reach_realized=realized_reach, peak_staged_slabs=peak_staged)
 
 
 # ===========================================================================
@@ -870,7 +899,7 @@ class SlotState:
             _cat(e_dest, e_off, e_w, e_id),
         )
 
-    def _insert_slab(self, bx, staged, emig):
+    def _insert_slab(self, bx, staged, emig, reach=(-1, 0, 1), consumed=None):
         """Write one slab's bricks back: keepers + immigrants + arena residents.
 
         Every brick's final membership passes through an O(brick) buffer here, so
@@ -881,11 +910,21 @@ class SlotState:
         p3 = self.buckets_per_brick
         lo_b, hi_b = self.slab_bricks(bx)
         keep = staged[bx]
-        # immigrants can only come from this slab and its two x-neighbours: a
-        # particle moves at most ONE brick per axis per step, measured at every
-        # step of a 20-step cdev8 run (0.0000% over one, max |delta brick| = 1).
-        sources = {(int(bx) + o) % nb for o in (-1, 0, 1)}
-        imm = _cat_dicts([emig[s] for s in sorted(sources) if s in emig])
+        # Immigrants come from every slab within REACH, the same set the caller's
+        # schedule ejects before permitting this write. This was hard-coded to
+        # +-1 ("a particle moves at most ONE brick per axis per step, measured at
+        # cdev8") while the schedule in `drift_and_migrate` was generalized to the
+        # realized reach -- so a 2-brick x-mover at cdev was staged correctly,
+        # matched by NO insert, and destroyed by the release loop: the missing
+        # particle of 16,777,216 (antares 442). At reach 1 the set is identical
+        # to the old +-1, so every prior gate number is untouched.
+        sources = sorted({(int(bx) + o) % nb for o in reach})
+        if consumed is not None:
+            for s in sources:
+                if s in emig and len(emig[s]["dest"]):
+                    d_slab = emig[s]["dest"] // (p3 * nb * nb)
+                    consumed[s] += int(np.count_nonzero(d_slab == bx))
+        imm = _cat_dicts([emig[s] for s in sources if s in emig])
         n_over = 0
         for b in range(lo_b, hi_b):
             sel_k = keep["dest"] // p3 == b

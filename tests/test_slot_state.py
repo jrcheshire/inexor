@@ -385,6 +385,64 @@ def test_particles_cross_bucket_brick_and_the_periodic_seam():
         )
 
 
+def test_a_multi_brick_x_mover_survives_and_lands_right():
+    """The missing particle of 16,777,216 (antares 442), at unit scale.
+
+    `_insert_slab` consumed immigrants from hard-coded +-1 sources while the
+    schedule staged the realized reach, so a particle crossing TWO bricks in x
+    was staged correctly, matched by no insert, and destroyed by the release
+    loop. Needs >= 4 bricks per side: at this suite's usual nb=2, {bx-1,bx,bx+1}
+    mod 2 covers every slab and the defect is invisible -- which is why the
+    suite was green while cdev lost a particle.
+    """
+    nb4 = 4  # brick extent 16.0 at this fixture's box of 64
+    x = _positions(30)
+    v = np.random.default_rng(31).normal(scale=0.05, size=(N_PART**3, 3))
+    # mid-brick starts so the crossing count is unambiguous; movers in +x, -x
+    # (across the periodic seam), +y, and a diagonal -- one variable per row
+    x[0], v[0] = (8.0, 8.0, 8.0), (28.0, 0.0, 0.0)  # slab 0 -> 2
+    x[1], v[1] = (8.0, 40.0, 8.0), (-28.0, 0.0, 0.0)  # slab 0 -> 2 the short way round
+    x[2], v[2] = (40.0, 8.0, 8.0), (0.0, 28.0, 0.0)  # same slab, 2 bricks in y
+    x[3], v[3] = (40.0, 40.0, 40.0), (28.0, 28.0, 28.0)  # 2 bricks on every axis
+    st = state.SlotState.build(x, v, _t9(), nb4, with_ids=True, arena_frac=0.25)
+    c = 1.0
+    assert state.brick_reach(st, c) >= 2, "fixture does not reach 2 bricks"
+    want = _drifted_reference(x, v, c, st.t9, st.vel_scale)
+    state.drift_and_migrate(st, c)
+    assert st.check() is True
+    assert st.n_live == len(x)
+    for b in range(st.n_bricks):
+        slots = st.brick_member_slots(b)
+        if not len(slots):
+            continue
+        got = st._bucket_ijk_of_slots(b, slots)
+        assert np.array_equal(got, want[st.ids[slots]]), (
+            f"brick {b}: a multi-brick mover landed in the wrong bucket"
+        )
+
+
+def test_the_release_census_fires_on_a_dropped_emigrant(monkeypatch):
+    """The census must be able to FAIL, or it is a gate that cannot fail.
+
+    Reinstate the old defect -- consumption pinned to +-1 sources regardless of
+    the schedule's reach -- and require the release loop to refuse AT the release,
+    naming the unconsumed rows, rather than let the count guard catch it 200
+    lines later (or not at all).
+    """
+    orig = state.SlotState._insert_slab
+
+    def pinned(self, bx, staged, emig, reach=(-1, 0, 1), consumed=None):
+        return orig(self, bx, staged, emig, (-1, 0, 1), consumed)
+
+    monkeypatch.setattr(state.SlotState, "_insert_slab", pinned)
+    x = _positions(30)
+    v = np.random.default_rng(31).normal(scale=0.05, size=(N_PART**3, 3))
+    x[0], v[0] = (8.0, 8.0, 8.0), (28.0, 0.0, 0.0)
+    st = state.SlotState.build(x, v, _t9(), 4, with_ids=True, arena_frac=0.25)
+    with pytest.raises(AssertionError, match="unconsumed"):
+        state.drift_and_migrate(st, 1.0)
+
+
 def test_a_particle_is_drifted_exactly_once():
     """The dangerous failure in a two-phase exchange: a record inserted into a
     brick that has not yet been ejected gets drifted again, producing a slightly
