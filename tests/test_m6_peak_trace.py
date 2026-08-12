@@ -307,3 +307,34 @@ def test_the_step_ladder_splits_the_run_and_carries_the_climb():
     assert [d["peak"] for d in lad] == [300, 700]
     assert lad[0]["start"] == 60 and lad[1]["start"] == 350
     assert tr.step_ladder([]) == []
+
+
+# ---------------------------------------------- the worker/orchestrator contract
+# Job 447: the per-run print line was added after job 446 ran, so it had never
+# executed. It read `maxrss`, a field name belonging to Stage 0's worker whose
+# card this one is not, and the smoke leg died on a KeyError one run in. The
+# fields the two halves share are now declared once and checked at both ends.
+
+
+def test_the_orchestrator_reads_only_fields_the_worker_promises():
+    """The contract is not empty and names the field the arms are compared on.
+
+    `run_peak` is the load-bearing one: for a traced arm `ru_maxrss` is the peak
+    since the LAST boundary, so an orchestrator reading a raw maxrss would print
+    and aggregate a number that is not the run's peak.
+    """
+    assert tr.WORKER_FIELDS, "an empty contract checks nothing"
+    assert "run_peak" in tr.WORKER_FIELDS
+    for f in ("pad_ladder", "coarse_pad_distinct", "cap_distinct"):
+        assert f in tr.WORKER_FIELDS, f"{f} proves an A/B knob applied; it must arrive"
+
+
+def test_a_card_missing_a_contract_field_is_named_not_swallowed():
+    full = {f: 1 for f in tr.WORKER_FIELDS}
+    assert tr.missing_worker_fields(full) == []
+    short = dict(full)
+    del short["run_peak"]
+    del short["pad_ladder"]
+    assert tr.missing_worker_fields(short) == ["run_peak", "pad_ladder"]
+    # a card carrying MORE than the contract is fine: the trace arm adds a series
+    assert tr.missing_worker_fields({**full, "series": []}) == []

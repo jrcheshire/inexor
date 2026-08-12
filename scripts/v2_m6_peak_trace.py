@@ -362,7 +362,28 @@ def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin, pad_lad
     if tracer is not None:
         out.update(tracer.report())
     st.check()
+    gaps = missing_worker_fields(out)
+    assert not gaps, f"this worker did not emit {gaps}, which the orchestrator reads"
     print(json.dumps(out), flush=True)
+
+
+# The fields the ORCHESTRATOR reads back out of a worker card, common to every
+# arm. Declared once and checked at both ends: the worker asserts it emits them
+# before printing, `_spawn` asserts they arrived. Job 447 died here -- the
+# per-run print line was added after 446 and so had never executed, and it read
+# `maxrss`, a name carried over from Stage 0's worker whose card this one is not.
+# A KeyError one run into a five-hour job; the smoke leg caught it in ninety
+# seconds, which is the entire argument for running a smoke leg.
+WORKER_FIELDS = (
+    "arm", "k_steps", "wall_s", "s_per_step", "run_peak", "maxrss_raw", "rss_end",
+    "cap", "cap_distinct", "pad_ladder", "coarse_pad", "coarse_pad_distinct",
+)
+
+
+def missing_worker_fields(d):
+    """Which of the contract fields a card lacks. Empty means the card is
+    readable by everything downstream of it."""
+    return [f for f in WORKER_FIELDS if f not in d]
 
 
 def _spawn(cfg, arm, k_steps, workdir, knobs):
@@ -375,7 +396,14 @@ def _spawn(cfg, arm, k_steps, workdir, knobs):
     if not knobs.get("pad_ladder", True):
         cmd.append("--no-pad-ladder")
     out = subprocess.check_output(cmd, text=True, cwd=REPO)
-    return json.loads(out.strip().splitlines()[-1])
+    d = json.loads(out.strip().splitlines()[-1])
+    gaps = missing_worker_fields(d)
+    if gaps:
+        raise KeyError(
+            f"the {arm} worker card is missing {gaps}, which the orchestrator "
+            f"reads. It carries {sorted(d)}."
+        )
+    return d
 
 
 def _stats(xs):
@@ -571,8 +599,15 @@ def main():
             for i in range(a.repeats):
                 d = _spawn(cfg, arm, a.k, wd, knobs)
                 rs.append(d)
+                # `run_peak`, which is the field the ARMS ARE COMPARED ON: for
+                # a traced arm ru_maxrss is the peak since the last boundary,
+                # not the run's. The shape counts ride along so the A/B knob is
+                # visible as the job runs rather than only in the card.
                 print(f"[{cfg}] {arm} {i + 1}/{a.repeats}: peak "
-                      f"{d['maxrss'] / 1e9:.3f} GB, {d['s_per_step']:.2f} s/step",
+                      f"{d['run_peak'] / 1e9:.3f} GB, {d['s_per_step']:.2f} s/step, "
+                      f"pad {d['coarse_pad_distinct']} shape(s) "
+                      f"(ladder {'on' if d['pad_ladder'] else 'OFF'}), "
+                      f"cap {d['cap_distinct']}",
                       flush=True)
             runs[arm] = rs
         agg = _aggregate(runs)
