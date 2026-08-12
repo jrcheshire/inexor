@@ -120,10 +120,11 @@ def test_a_sigma_is_refused_below_three_points():
 
 
 def _agg(trace_peaks, control_peaks, phases):
+    lad = [dict(start=1.0, peak=2.0)]
     runs = {
-        "trace": [dict(maxrss=p, wall_s=1.0, phases=phases, unknown_phases=[])
-                  for p in trace_peaks],
-        "control": [dict(maxrss=p, wall_s=1.0) for p in control_peaks],
+        "trace": [dict(run_peak=p, maxrss_raw=p, wall_s=1.0, phases=phases,
+                       step_ladder=lad, unknown_phases=[]) for p in trace_peaks],
+        "control": [dict(run_peak=p, maxrss_raw=p, wall_s=1.0) for p in control_peaks],
     }
     return tr._aggregate(runs)
 
@@ -191,15 +192,21 @@ def test_growth_is_the_last_visit_minus_the_first_per_phase():
     question: job 445's cdev K-ladder fit 0.157 GB per step + 6.200 GB fixed,
     so something accumulates. Attribution has to be per phase -- a run-level
     slope is what Stage 0 already had and it named nothing."""
+    # a process whose resident set ratchets up: EVERY absolute peak rises, and
+    # only `coarse_paint`'s own increment does. Reading the absolute peak is the
+    # job 446 mistake and would credit both phases with a slope.
     series = [
         ("coarse_paint", 100, 10), ("tile_short", 500, 50),
-        ("coarse_paint", 180, 12), ("tile_short", 505, 51),
-        ("coarse_paint", 260, 11), ("tile_short", 495, 49),
+        ("coarse_paint", 700, 30), ("tile_short", 900, 50),
+        ("coarse_paint", 1300, 50), ("tile_short", 1500, 50),
     ]
     g = tr.phase_growth(series)
-    assert g["coarse_paint"]["growth"] == 160, "a rising phase must show its slope"
+    assert g["coarse_paint"]["growth"] == 40, "a phase allocating more each visit"
     assert g["coarse_paint"]["visits"] == 3
-    assert g["tile_short"]["growth"] == -5, "a flat phase must not be credited a slope"
+    assert g["tile_short"]["growth"] == 0, (
+        "a phase with a constant increment must not be credited a slope just "
+        "because the process around it grew"
+    )
 
 
 def test_growth_of_a_single_visit_phase_is_zero_not_missing():
@@ -207,7 +214,7 @@ def test_growth_of_a_single_visit_phase_is_zero_not_missing():
     with a zero rather than drop out of the table -- a term that vanishes is
     indistinguishable from one that was never counted."""
     g = tr.phase_growth([("lead_drift", 42, 42)])
-    assert g["lead_drift"] == dict(first_visit_peak=42, last_visit_peak=42,
+    assert g["lead_drift"] == dict(first_visit_delta=42, last_visit_delta=42,
                                    growth=0, visits=1)
 
 
@@ -233,8 +240,45 @@ def test_the_aggregate_carries_growth_across_repeats():
     ph = _phases(100)
     gr = {"coarse_paint": dict(growth=50, visits=5),
           "tile_short": dict(growth=-2, visits=40)}
-    runs = {"trace": [dict(maxrss=p, wall_s=1.0, phases=ph, growth=gr,
+    runs = {"trace": [dict(run_peak=p, maxrss_raw=p, wall_s=1.0, phases=ph,
+                           growth=gr, step_ladder=[dict(start=1.0, peak=2.0)],
                            unknown_phases=[]) for p in (99.0, 100.0, 101.0)]}
     g = tr._aggregate(runs)["trace"]["growth"]
     assert set(g) == {"coarse_paint", "tile_short"}
     assert g["coarse_paint"]["median"] == 50
+
+
+# ------------------------------------------------------------------ the run peak
+
+
+def test_the_run_peak_is_accumulated_not_read_at_the_end(fake_rss):
+    """`clear_refs` resets `mm->hiwater_rss`, which is what BOTH `VmHWM` and
+    getrusage's `ru_maxrss` report -- so after a traced run `ru_maxrss` gives
+    the peak since the last boundary, not the run's. Job 446 shipped that: it
+    read cdev8's traced peak as 1.824 GB against 2.010 actual, BELOW an untraced
+    control, which reads as the instrument lowering the peak and was the
+    instrument mismeasuring it. The max over boundaries is the run's high-water
+    by construction, and costs no extra syscall."""
+    fake_rss["pairs"] = [(10, 10), (100, 10), (900, 10), (120, 10), (120, 10)]
+    t = tr.PhaseTracer()
+    for name in ("coarse_paint", "tile_short", "migrate"):
+        t(name)
+    assert t.run_peak == 900, "the run peak must survive a later, smaller phase"
+    assert t.report()["run_peak"] == 900
+
+
+def test_the_step_ladder_splits_the_run_and_carries_the_climb():
+    """The process-wide climb, reported ONCE where it belongs rather than
+    restated per phase. Two rungs cannot tell a slope from the start of a curve,
+    which is the whole reason job 445's 0.157 GB/step fit (K=5 and K=10 alone)
+    cannot yet be extrapolated to a production K."""
+    series = [
+        ("lead_drift", 5, 5),
+        ("coarse_paint", 100, 40), ("tile_short", 300, 200), ("migrate", 250, 0),
+        ("coarse_paint", 400, 50), ("tile_short", 700, 300), ("migrate", 650, 0),
+    ]
+    lad = tr.step_ladder(series)
+    assert len(lad) == 2, "the ladder must split at each step, not at each phase"
+    assert [d["peak"] for d in lad] == [300, 700]
+    assert lad[0]["start"] == 60 and lad[1]["start"] == 350
+    assert tr.step_ladder([]) == []

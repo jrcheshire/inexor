@@ -63,7 +63,10 @@ GATED, and both gates are about the INSTRUMENT rather than the engine:
   GATE B (the phases account for the run): max over phases of the phase peak is
   within 2 sigma of the run peak. A phase decomposition whose largest phase
   falls short of the whole run has a peak living in unnamed code, and the
-  attribution below it would be an attribution of the wrong thing.
+  attribution below it would be an attribution of the wrong thing. In job 446
+  it failed NEGATIVE -- the top phase EXCEEDED the run peak, which is physically
+  impossible -- and that is what exposed `ru_maxrss` being reset by clear_refs
+  along with `VmHWM`. A gate on an impossibility is worth having.
 
 Neither gate can pass vacuously: A fails if the instrument perturbs, B fails if
 the boundaries miss the peak, and both are two-sided against a sigma measured
@@ -148,30 +151,56 @@ def _malloc_trim():
 
 
 def phase_growth(series):
-    """Per phase, the LAST visit's peak minus the FIRST visit's.
+    """Per phase, the trend in its OWN increment: last visit's delta minus first.
 
-    The one statistic a max cannot carry. A working set is K-independent, so a
-    phase whose peak rises visit over visit is accumulating something -- which
-    is what job 445's cdev K-ladder fit says the run does, at 0.157 GB per step
-    against a 6.200 GB fixed part, and what an unquantized shape at a call site
-    would produce (one retained XLA executable family per step).
+    **This was wrong in job 446 and the correction is the useful part.** It read
+    the trend in each phase's ABSOLUTE peak, and every phase's absolute peak
+    rises simply because the process's resident set ratchets upward through the
+    run -- so it reported +1233 to +1308 MB for `membership`, `coarse_solve`,
+    `coarse_paint` and `tile_decode` alike, which is one process-wide climb
+    restated twelve times, not an attribution. A phase that is itself
+    accumulating allocates MORE each visit, so the trend has to be read on the
+    increment, which is invariant to what everyone else has left resident.
 
-    Returned per phase rather than for the run, because attributing the slope
-    is the whole point: a run-level slope is what Stage 0 already had.
+    `step_ladder` carries the process-wide climb, once, where it belongs.
     """
     if not series:
         return {}
     first, last, visits = {}, {}, {}
-    for name, peak, _delta in series:
+    for name, _peak, delta in series:
         if name not in first:
-            first[name] = peak
-        last[name] = peak
+            first[name] = delta
+        last[name] = delta
         visits[name] = visits.get(name, 0) + 1
     return {
-        n: dict(first_visit_peak=first[n], last_visit_peak=last[n],
+        n: dict(first_visit_delta=first[n], last_visit_delta=last[n],
                 growth=last[n] - first[n], visits=visits[n])
         for n in first
     }
+
+
+def step_ladder(series, split="coarse_paint"):
+    """Per STEP: the resident set it started from, and the maximum it reached.
+
+    The process-wide climb, reported once. A working set is K-independent, so a
+    ladder that keeps rising means something accumulates; one that flattens
+    means the run was warming an allocator up. That distinction decides whether
+    job 445's cdev fit (0.157 GB PER STEP + 6.200 fixed, from K=5 and K=10
+    alone) may be extrapolated to a production K at all, and nothing measured
+    it -- two rungs cannot tell a slope from the start of a curve.
+    """
+    steps, cur = [], None
+    for rec in series or []:
+        if rec[0] == split:
+            if cur is not None:
+                steps.append(cur)
+            cur = []
+        if cur is not None:
+            cur.append(rec)
+    if cur:
+        steps.append(cur)
+    return [dict(start=s[0][1] - s[0][2], peak=max(r[1] for r in s), boundaries=len(s))
+            for s in steps]
 
 
 class PhaseTracer:
@@ -208,6 +237,17 @@ class PhaseTracer:
         self.order = []
         self.unknown = []
         self.series = [] if series else None
+        # THE RUN PEAK, and it has to be accumulated here rather than read at the
+        # end. `clear_refs` resets `mm->hiwater_rss`, and BOTH `VmHWM` and
+        # getrusage's `ru_maxrss` read that same field -- so after a traced run
+        # `ru_maxrss` reports the peak since the LAST boundary, not the run's.
+        # Job 446 shipped that mistake: it read cdev8's traced peak as 1.824 GB
+        # against 2.010 actual, i.e. 0.19 GB BELOW an untraced control, which
+        # looked like the instrument lowering the peak and was the instrument
+        # mismeasuring it. Each boundary's reading is the max since the previous
+        # reset, so the max over boundaries is exactly the run's high-water and
+        # costs no extra syscall.
+        self.run_peak = 0
         self._trim_if_asked()
         _reset_hwm()
         self._start = _rss()
@@ -228,6 +268,7 @@ class PhaseTracer:
         e["delta"] = max(e["delta"], hwm - self._start)
         e["rss_end"] = max(e["rss_end"], rss)
         e["visits"] += 1
+        self.run_peak = max(self.run_peak, hwm)
         if self.series is not None:
             self.series.append((name, hwm, hwm - self._start))
         self._trim_if_asked()
@@ -241,6 +282,8 @@ class PhaseTracer:
             unknown_phases=sorted(set(self.unknown)),
             series=self.series,
             growth=phase_growth(self.series),
+            step_ladder=step_ladder(self.series),
+            run_peak=self.run_peak,
         )
 
 
@@ -290,8 +333,15 @@ def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin):
     # `ru_maxrss` for the WHOLE process, so the traced and untraced arms are
     # compared on the identical statistic Stage 0 used. VmHWM is useless for
     # this at the end of a traced run: the tracer has been resetting it.
-    out["maxrss"] = p0._maxrss_bytes()
+    out["maxrss_raw"] = p0._maxrss_bytes()
     out["rss_end"] = _rss()
+    # the CONTROL arm never resets, so its ru_maxrss IS the run peak; a traced
+    # arm's is not (see `PhaseTracer.run_peak`). One field, `run_peak`, is what
+    # the arms are compared on, and the raw reading stays beside it so the
+    # reset is visible on the card rather than argued from a docstring.
+    out["run_peak"] = out["maxrss_raw"] if tracer is None else tracer.run_peak
+    out["hiwater_was_reset"] = bool(tracer is not None
+                                    and out["maxrss_raw"] < tracer.run_peak)
     out["cap"] = int(seen[-1]["cap"]) if seen else None
     out["cap_distinct"] = len({int(s["cap"]) for s in seen})
     if tracer is not None:
@@ -332,7 +382,8 @@ def _aggregate(runs):
         if not rs:
             continue
         a = dict(
-            run_peak=_stats([r["maxrss"] for r in rs]),
+            run_peak=_stats([r["run_peak"] for r in rs]),
+            run_peak_raw=_stats([r["maxrss_raw"] for r in rs]),
             wall_s=_stats([r["wall_s"] for r in rs]),
             repeats=len(rs),
         )
@@ -351,6 +402,12 @@ def _aggregate(runs):
                 for n in names
                 if all(n in r.get("growth", {}) for r in rs)
             }
+            nl = min(len(r.get("step_ladder", [])) for r in rs)
+            a["step_ladder"] = [
+                dict(start=_stats([r["step_ladder"][i]["start"] for r in rs]),
+                     peak=_stats([r["step_ladder"][i]["peak"] for r in rs]))
+                for i in range(nl)
+            ]
             a["unknown_phases"] = sorted({p for r in rs for p in r["unknown_phases"]})
         agg[arm] = a
     return agg
@@ -408,6 +465,17 @@ def _print(cfg, agg, verdict, unknown):
             print(f"[{cfg}] the peak GROWS most in `{top[0]}`: "
                   f"{top[1]['median'] / 1e6:+.0f} MB first visit to last "
                   f"(a working set is K-independent; a slope accumulates)", flush=True)
+    lad = agg.get("trace", {}).get("step_ladder")
+    if lad:
+        print(f"[{cfg}] per-step ladder (start -> peak, GB), median over repeats:",
+              flush=True)
+        print("    " + "  ".join(f"{d['start']['median'] / gb:.2f}->"
+                                 f"{d['peak']['median'] / gb:.2f}" for d in lad),
+              flush=True)
+        rise = lad[-1]["peak"]["median"] - lad[0]["peak"]["median"]
+        print(f"    step peak rises {rise / 1e6:+.0f} MB over {len(lad)} steps "
+              f"({rise / 1e6 / max(1, len(lad) - 1):+.0f} MB/step); a working set "
+              f"is K-independent", flush=True)
     for k in ("gate_a_instrument_neutral", "gate_b_phases_reach_the_peak"):
         print(f"[{cfg}] {k}: {verdict.get(k)}", flush=True)
     if verdict.get("top_phase"):
