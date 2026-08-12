@@ -148,7 +148,10 @@ echo "=== LEG SUMMARY ==="
 for i in "${!names[@]}"; do echo "  ${names[$i]}: rc=${codes[$i]}"; done
 echo "CARDS WRITTEN BY THIS JOB:"
 n=0
-for f in runs/v2/m6_peak_trace_padab_*.json; do
+# `m6_peak` + the out-suffix, which is what `_write` builds -- 446's cards read
+# m6_peak_trace_* only because its suffixes started `_trace`. A glob written for
+# those names would have found nothing here and failed a job that succeeded.
+for f in runs/v2/m6_peak_padab_*.json; do
   if [ -f "$f" ] && [ "$f" -nt "$STAMP" ]; then echo "  $f"; n=$((n + 1)); fi
 done
 [ "$n" -eq 0 ] && { echo "  (none)"; echo "FATAL: zero fresh cards"; exit 1; }
