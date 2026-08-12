@@ -86,9 +86,19 @@ TRACE="scripts/v2_m6_peak_trace.py"
 # to end anywhere. Stage 0's dropped a leg silently twice (`repack_only`, then
 # `integrity`) and each time the absence read as a clean run. Seconds, and it
 # exercises every path the cdev leg will take.
+#
+# `--arena-frac 0.20`, and the default 0.08 is why job 446's smoke leg died:
+# 29 particles overflowed their brick against an arena of 2622 slots with 9
+# free (`_to_arena`, the D-007 refusal working as designed -- the layout does
+# not clamp or drop). smoke has 32,768 particles, so 8% is 2622 slots and a
+# single clustered brick exhausts it; the same 8% at cdev is 1.3e6 slots and
+# job 445 ran there fine. NB the window has an upper edge too: at 0.30/0.30
+# the repack refuses for the opposite reason (42,835 slots plus a 9,831-slot
+# arena against the allocation), measured on the laptop across six (K, arena,
+# slack) points -- the same six confirmed the phase hook changes NO outcome.
 run_leg "smoke" pixi run -e default python $TRACE \
   --configs smoke --k 5 --repeats 3 --arms trace control trim \
-  --workdir-root "$TMPDIR" --out-suffix _trace_smoke
+  --arena-frac 0.20 --workdir-root "$TMPDIR" --out-suffix _trace_smoke
 
 # ---- cdev8: the config the Stage 0 peak instrument was developed on, so the
 # phase table can be read against numbers already on record.

@@ -460,7 +460,18 @@ def main():
         print(f"[{cfg}] baseline {base / 1e9:.3f} GB  (workdir {wd})", flush=True)
         runs = {}
         for arm in a.arms:
-            runs[arm] = [_spawn(cfg, arm, a.k, wd, knobs) for _ in range(a.repeats)]
+            # printed AS THEY LAND, not aggregated at the end. Job 446 ran the
+            # cdev8 leg for 17 minutes emitting nothing, so a hung run and a slow
+            # one look identical from the log -- and the log is all a cluster job
+            # gives you. The cost is one line per run.
+            rs = []
+            for i in range(a.repeats):
+                d = _spawn(cfg, arm, a.k, wd, knobs)
+                rs.append(d)
+                print(f"[{cfg}] {arm} {i + 1}/{a.repeats}: peak "
+                      f"{d['maxrss'] / 1e9:.3f} GB, {d['s_per_step']:.2f} s/step",
+                      flush=True)
+            runs[arm] = rs
         agg = _aggregate(runs)
         verdict = _verdict(agg)
         unknown = sorted({p for r in runs.get("trace", []) for p in r["unknown_phases"]})
