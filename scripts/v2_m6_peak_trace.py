@@ -538,9 +538,21 @@ def _print(cfg, agg, verdict, unknown):
     for k in ("gate_a_instrument_neutral", "gate_b_phases_reach_the_peak"):
         print(f"[{cfg}] {k}: {verdict.get(k)}", flush=True)
     if verdict.get("top_phase"):
-        print(f"[{cfg}] the peak is set in `{verdict['top_phase']}`; the run peak "
-              f"exceeds it by {verdict['run_peak_minus_top_phase'] / 1e6:.0f} MB "
-              f"({verdict['run_peak_minus_top_phase_sigma']:.1f} sigma)", flush=True)
+        # `control_peak_minus_top_phase`, and NOT the `run_peak_minus_top_phase`
+        # this line read until job 448: that key was renamed when gate B was
+        # rewired to the control arm, and comparing the trace arm's run peak with
+        # its own top phase is the vacuous comparison the rewiring removed. The
+        # old name existed under no condition, so this line raised on every leg
+        # with a trace arm. It had never run: 446 predates the rewiring.
+        short = verdict.get("control_peak_minus_top_phase")
+        if short is None:
+            print(f"[{cfg}] the peak is set in `{verdict['top_phase']}`; "
+                  f"{verdict.get('gate_b_note', 'gate B is not evaluable')}", flush=True)
+        else:
+            print(f"[{cfg}] the peak is set in `{verdict['top_phase']}`; the CONTROL "
+                  f"arm's peak exceeds it by {short / 1e6:.0f} MB "
+                  f"({verdict['control_peak_minus_top_phase_sigma']:.1f} sigma)",
+                  flush=True)
     if unknown:
         print(f"[{cfg}] UNKNOWN phase names emitted: {unknown}", flush=True)
 

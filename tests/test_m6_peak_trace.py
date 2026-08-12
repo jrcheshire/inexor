@@ -338,3 +338,46 @@ def test_a_card_missing_a_contract_field_is_named_not_swallowed():
     assert tr.missing_worker_fields(short) == ["run_peak", "pad_ladder"]
     # a card carrying MORE than the contract is fine: the trace arm adds a series
     assert tr.missing_worker_fields({**full, "series": []}) == []
+
+
+# ------------------------------------------------------------------ the printout
+# Jobs 447 and 448 both died in the orchestrator's print path, on two different
+# stale field names, and each cost a cluster job because nothing exercised it:
+# `_print` and the per-run line are the only code here that no test called. A
+# printout is not a result, but a printout that RAISES destroys one -- 448 died
+# before `p0._write`, so the leg produced no card at all. These tests call it.
+
+
+def _print_and_capture(capsys, agg):
+    tr._print("cdev", agg, tr._verdict(agg), [])
+    return capsys.readouterr().out
+
+
+def test_the_printout_survives_a_full_three_arm_job(capsys):
+    out = _print_and_capture(capsys, _agg([99.0, 100.0, 101.0], [99.0, 100.0, 101.0],
+                                          _phases(100)))
+    assert "the peak is set in `tile_short`" in out
+    assert "the CONTROL arm's peak exceeds it by" in out
+    assert "gate_a_instrument_neutral" in out and "gate_b_phases_reach_the_peak" in out
+
+
+def test_the_printout_survives_a_single_arm_job(capsys):
+    """The A/B legs run `--arms trace` alone, so gate B is not evaluable and the
+    keys it would have written do not exist. That must read as a note, not as a
+    KeyError: job 448's four A/B legs would each have run to completion and then
+    thrown away their card."""
+    agg = tr._aggregate({"trace": [
+        dict(run_peak=p, maxrss_raw=p, wall_s=1.0, phases=_phases(100),
+             step_ladder=[dict(start=1.0, peak=2.0)], unknown_phases=[])
+        for p in (99.0, 100.0, 101.0)]})
+    out = _print_and_capture(capsys, agg)
+    assert "the peak is set in `tile_short`" in out
+    assert "independent reference" in out, "the reason gate B is silent must be printed"
+    assert "None" in out
+
+
+def test_the_printout_survives_a_job_with_no_sigma(capsys):
+    """One repeat: no scatter, so neither gate is evaluable and the sigma the
+    phase table divides by does not exist."""
+    out = _print_and_capture(capsys, _agg([100.0], [100.0], _phases(100)))
+    assert "tile_short" in out
