@@ -157,10 +157,35 @@ def test_gate_b_fails_when_no_named_phase_reaches_the_run_peak():
     v = tr._verdict(agg)
     assert v["gate_b_phases_reach_the_peak"] is False
     assert v["top_phase"] == "tile_short"
-    assert v["run_peak_minus_top_phase"] == pytest.approx(40.0)
+    assert v["control_peak_minus_top_phase"] == pytest.approx(40.0)
 
     agg = _agg([99.0, 100.0, 101.0], [99.0, 100.0, 101.0], _phases(100))
     assert tr._verdict(agg)["gate_b_phases_reach_the_peak"] is True
+
+
+def test_gate_b_is_measured_against_the_CONTROL_not_against_itself():
+    """The traced run peak is the max over boundary readings, hence the max over
+    phase peaks by construction. Comparing the top phase against it returns zero
+    for any engine, any config, any defect -- so the reference has to be the
+    uninstrumented control. This test is the guard on that: the trace arm is
+    given a run peak EQUAL to its top phase (as the real probe always will) while
+    the control saw 40 units more, and the gate must still fail."""
+    agg = _agg([60.0, 60.0, 60.0], [99.0, 100.0, 101.0], _phases(60))
+    v = tr._verdict(agg)
+    assert v["gate_b_phases_reach_the_peak"] is False, (
+        "gate B compared the trace arm with itself and passed vacuously"
+    )
+    assert v["control_peak_minus_top_phase"] == pytest.approx(40.0)
+
+
+def test_gate_b_is_not_evaluable_without_a_control_arm():
+    agg = tr._aggregate({"trace": [
+        dict(run_peak=p, maxrss_raw=p, wall_s=1.0, phases=_phases(100),
+             step_ladder=[dict(start=1.0, peak=2.0)], unknown_phases=[])
+        for p in (99.0, 100.0, 101.0)]})
+    v = tr._verdict(agg)
+    assert v["gate_b_phases_reach_the_peak"] is None
+    assert "independent reference" in v["gate_b_note"]
 
 
 def test_the_gates_report_nothing_rather_than_passing_without_a_sigma():

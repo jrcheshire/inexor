@@ -61,7 +61,10 @@ GATED, and both gates are about the INSTRUMENT rather than the engine:
   are the same measurement.
 
   GATE B (the phases account for the run): max over phases of the phase peak is
-  within 2 sigma of the run peak. A phase decomposition whose largest phase
+  within 2 sigma of the CONTROL arm's run peak -- an independent, uninstrumented
+  measurement. Never against the traced run peak, which is the max over those
+  same phase peaks by construction and would make this gate return zero for any
+  engine and any defect. A phase decomposition whose largest phase
   falls short of the whole run has a peak living in unnamed code, and the
   attribution below it would be an attribution of the wrong thing. In job 446
   it failed NEGATIVE -- the top phase EXCEEDED the run peak, which is physically
@@ -422,16 +425,30 @@ def _verdict(agg):
         v["instrument_delta_bytes"] = d
         v["instrument_delta_sigma"] = d / ct["run_peak"]["sigma"]
         v["gate_a_instrument_neutral"] = bool(d <= GATE_SIGMA * ct["run_peak"]["sigma"])
-    if tr and "phases" in tr and tr["run_peak"]["sigma"]:
+    if tr and "phases" in tr:
         top = max(tr["phases"].items(), key=lambda kv: kv[1]["peak"]["median"])
-        short = tr["run_peak"]["median"] - top[1]["peak"]["median"]
         v["top_phase"] = top[0]
         v["top_phase_peak"] = top[1]["peak"]["median"]
-        v["run_peak_minus_top_phase"] = short
-        v["run_peak_minus_top_phase_sigma"] = short / tr["run_peak"]["sigma"]
-        v["gate_b_phases_reach_the_peak"] = bool(
-            abs(short) <= GATE_SIGMA * tr["run_peak"]["sigma"]
-        )
+        # AGAINST THE CONTROL ARM, and that is the whole point. The traced run
+        # peak is now the max over boundary readings, i.e. the max over phase
+        # peaks BY CONSTRUCTION -- so comparing the top phase against it would
+        # compare a number with itself and yield exactly zero for any engine, any
+        # config, any defect. Fixing the run-peak statistic turned this gate
+        # vacuous, and a gate that cannot fail is worse than no gate. The
+        # independent reference is `control`: an uninstrumented process whose
+        # `ru_maxrss` nothing reset.
+        if ct and ct["run_peak"]["sigma"]:
+            short = ct["run_peak"]["median"] - top[1]["peak"]["median"]
+            v["control_peak_minus_top_phase"] = short
+            v["control_peak_minus_top_phase_sigma"] = short / ct["run_peak"]["sigma"]
+            v["gate_b_phases_reach_the_peak"] = bool(
+                abs(short) <= GATE_SIGMA * ct["run_peak"]["sigma"]
+            )
+        else:
+            v["gate_b_note"] = (
+                "no control arm with a sigma, so the phase decomposition has no "
+                "independent reference and gate B is not evaluable"
+            )
     return v
 
 
