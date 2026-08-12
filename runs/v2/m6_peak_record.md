@@ -1,0 +1,260 @@
+# M-v2-6 Stage 0b: the engine's peak is set in the tile short-range force, and Stage 0's method could not have found it
+
+**Result: the peak is ATTRIBUTED.** At cdev (256^3, K=5) the run peak is set in
+`tile_short`, the per-tile short-range force, whose own increment is **3.432 GB
+= 26 sigma** of the run-to-run scatter of the peak itself. `kick_pending`, which
+`python -m inexor.plan` names as THE binding term at C-gh (274.9 GB), is
+**537 MB here and does not bind**: the two phases where it would appear increment
+0.000 and 0.140 GB. The decomposition is complete against an independent control
+(0.9 sigma at cdev, 0.12 at cdev8).
+
+Branch `jc/m-v2-6-capacity`. Measurements: **antares job 446** at
+`db1d13d`, four legs, ~3 h 40 m, zero SU. Cards `runs/v2/m6_peak_trace_*.json`
+(gitignored, also on `deneb:~/src/inexor/runs/v2/`). Instrument
+`scripts/v2_m6_peak_trace.py`; the phase hook is `engine.step`/`engine.run`'s
+`phase=` argument. Stage 0's instrument is `scripts/v2_m6_engine_peak.py` and
+job 445.
+
+**All four legs of 446 returned rc=1 and every failure was the probe, not the
+engine** (two defects, section 6). Every number below was recomputed offline
+from the per-visit series the cards persist, so no re-run was needed; the cards'
+own `aggregate` and `verdict` blocks predate the fixes and **must not be
+quoted**. A corrected-probe re-run is owed for a card whose verdict can be read
+directly.
+
+## 0. The reductions, stated once
+
+| quantity | reduction |
+|---|---|
+| run peak | max over the boundary readings in a run, then **median** over repeats |
+| phase increment | **max** over that phase's visits in a run, then median over repeats |
+| sigma | sd of the corrected run peak over repeats, same leg |
+| step ladder | max over the readings inside a step, split at each `coarse_paint`; median over repeats |
+| slope | OLS through the median ladder, with the per-repeat spread quoted beside it |
+
+The phase increment is a MAX and not a mean on purpose: a peak is set by one
+allocation moment, not by an average one. `tile_short` is visited 8 times a step
+at cdev and its per-visit increments run 1.6 GB with 3.4 GB outliers, so a mean
+would report a number no moment of the run ever reached.
+
+The control arm runs `phase=None` and so has no boundaries; its peak is its own
+`ru_maxrss`, which nothing reset. That is what makes it an independent
+measurement of the same quantity rather than a second copy of the trace arm.
+
+## 1. Where the peak is (cdev, 256^3, K=5, 5 repeats; sigma = 131 MB)
+
+| phase | own increment | sigma | visits/run |
+|---|---|---|---|
+| **`tile_short`** | **3.432 GB** | **26.2** | 40 |
+| `tile_long` | 1.492 GB | 11.4 | 40 |
+| `membership` | 1.318 GB | 10.1 | 5 |
+| `tile_decode` | 1.295 GB | 9.9 | 40 |
+| `coarse_paint` | 0.399 GB | 3.0 | 5 |
+| `coarse_solve` | 0.189 GB | 1.4 | 5 |
+| `tile_reduce` | 0.158 GB | 1.2 | 40 |
+| `reconcile` | 0.140 GB | 1.1 | 5 |
+| `lead_drift` | 0.093 GB | 0.7 | 1 |
+| `migrate` | 0.006 GB | 0.0 | 5 |
+| `tile_loop_end` | 0.000 GB | 0.0 | 5 |
+| `repack` | -0.001 GB | -0.0 | 5 |
+
+The ordering is stable across configs and across K: at cdev8 the top four are
+the same four (`tile_short` 0.287, `coarse_paint` 0.224, `tile_long` 0.162,
+`membership` 0.082 GB), and the cdev K=15 leg reproduces cdev K=5 to within a
+percent on every term above 0.1 GB (`tile_short` 3.417, `tile_long` 1.510,
+`membership` 1.318, `tile_decode` 1.300).
+
+**`kick_pending` does not bind where we can measure it.** Its derived 32 B/p is
+537 MB at cdev, a sixth of `tile_short`'s increment, and `reconcile` (which
+holds it) increments 0.140 GB while `tile_loop_end` increments 0.000. This is
+not a straight contradiction of `inexor.plan`: `pending` is O(N) while the tile
+transients scale with `cap`, and C-gh moves both. It does mean the plan's
+binding-term claim rests on arithmetic that has now been contradicted at the
+only scale anyone has measured, and it needs re-pricing rather than restating.
+
+**`mesh_bytes` under-counts this phase by 1.20 GB.** Its two fine-mesh terms sum
+to 2.235 GB (`tile_kernels` 0.791 + `tile_workspace` 1.443) against
+`tile_short`'s measured 3.432. At cdev8 the same comparison is 0.144 modelled
+against 0.287 measured, short by 0.143 GB, so the model is short by about a
+factor of 1.5 at both rungs rather than by a fixed offset. The sub-terms of the
+tile force are named nowhere in the package. This is the gap Stage 0's gate 1
+was groping for and could not resolve.
+
+## 2. Run peaks, and what the allocator is holding
+
+| config | trace | control | trim |
+|---|---|---|---|
+| cdev8 K=5 | 2.010 GB (sd 0.093) | 1.997 (0.112) | 1.366 (0.038) |
+| cdev K=5 | 7.461 GB (sd 0.131) | 7.576 (0.125) | 6.585 (0.030) |
+| cdev K=15 | 8.180 GB (sd 0.355, n=3) | -- | -- |
+
+- **Gate A (instrument neutrality):** trace minus control is -115 MB at cdev
+  (-0.9 sigma) and +13 MB at cdev8 (+0.12 sigma). The hook does not move the
+  peak it measures.
+- **Gate B (the decomposition is complete):** the top phase reaches the peak to
+  within the same 115 MB / 0.9 sigma, measured against the CONTROL arm rather
+  than against the trace arm's own run peak (section 6, defect 2).
+- **The control independently reproduces job 445's four cdev measurements**
+  (7.471 to 7.575 GB against 7.576 median here), which is the cross-check that
+  the two probes measure the same quantity by two different routes.
+- **glibc retention is 12% at cdev and 32% at cdev8** (trace vs trim). It
+  SHRINKS with config size, so one config's fraction must not be carried to
+  another. The `trim` arm is an instrument and never an operating point: it
+  bounds what is reclaimable, it does not propose reclaiming it.
+
+## 3. The K-growth is real, and about 60% of it is live memory
+
+The cdev K=15 median ladder, 15 steps:
+
+```
+6.64 6.83 6.92 7.27 7.29 7.40 7.43 7.45 7.53 7.63 7.87 7.94 8.03 8.12 8.18 GB
+```
+
+**+103 MB/step by OLS through the median ladder** (per-repeat slopes 77 / 144 /
+103, mean 108), linear and unsaturating over the whole range, with no flattening
+at the top. Consistent with job 445's independent 0.157 GB/step fit. At K=40,
+D-v2-14's ratified cadence, that extrapolates to about **+4 GB**.
+
+**How much survives `malloc_trim`, at both configs:**
+
+| config | trace slope | trim slope | difference | trim retains |
+|---|---|---|---|---|
+| cdev K=5 | 168 +- 14 MB/step | 99 +- 5 | 70 +- 15 (4.7 sigma) | 59% |
+| cdev8 K=5 | 124 +- 17 MB/step | 71 +- 5 | 53 +- 17 (3.1 sigma) | 57% |
+
+(per-repeat slopes, mean +- sem over 5 repeats; a first-to-last reduction that
+assumes no linearity gives the same split, 184/115 and 121/69 MB/step.)
+
+**So the majority of the growth is live memory and a reproducible ~40% is
+allocator retention.** Both configs agree on the fraction. This CORRECTS the
+first reading of this leg, which quoted the trim arm at +111 MB/step against the
+trace arm's +110 and concluded the growth survived trimming entirely; under the
+reductions in section 0 that comparison mixed a K=15 trace slope with a K=5 trim
+slope. The conclusion that matters is unchanged -- a retained executable family
+is live memory, and trimming cannot reach it -- but the expected signal of any
+fix is the live ~60%, not the whole slope.
+
+Note the K=5 legs give a slope from five points, so their per-repeat scatter is
+large (136 to 209 MB/step at cdev). The K=15 leg is the trustworthy slope; the
+K=5 legs are where the trace/trim contrast can be read, because only they have a
+trim arm.
+
+## 4. The leading cause, measured and now fixed
+
+`coarse_delta_streamed` sized its chunk buffer from the current occupancy
+(`engine.py`, the `pad` term), so it keyed a **new XLA shape every step**.
+Executables and their buffers are cached for the life of the process, so an
+unbounded shape family is an unbounded leak -- the same defect Stage 0 fixed for
+`cap` and left in place here.
+
+Measured at the smoke config, on the laptop, which is valid because a shape
+COUNT is exact arithmetic where a peak RSS is not:
+
+| | unquantized | on the ladder |
+|---|---|---|
+| distinct chunk shapes over 10 steps | **10** | **1** |
+| distinct chunk shapes over 15 steps | **14** | **1** |
+| distinct `cap` shapes over 10 steps | 10 | 1 (since Stage 0) |
+
+Fixed in `e2aebfe` by putting the chunk buffer on the same `capacity_shape`
+ladder with the same `cap_rungs` knob, carried monotonically across steps.
+Padding costs 24.7% of rows, inside the derived 2^(1/3) - 1 = 26.0% bound.
+Bitwise neutral by the masking argument the `cap` padding already stands on, and
+gated as an identity on the mesh rather than argued.
+
+**This is a candidate cause, not a measured fix.** Attributing the slope to
+shape churn is the hypothesis; the A/B against the measured +103 MB/step is the
+one antares job still owed. The instrument and the intervention are in separate
+commits deliberately -- an instrument and an intervention in one commit cannot
+be told apart afterwards.
+
+## 5. Why Stage 0 could not have found any of this
+
+Stage 0 differenced MAXIMA between arms. **A maximum carries no timestamp**, so
+differencing two of them assumes both were set at the same moment by the same
+phase, and nothing checked it.
+
+Job 445 contains five independent measurements of one identical leg (cdev, K=5,
+f64 coarse): the `step` leg 7.503 GB, the K-ladder's K=5 rung 7.280, and repeats
+at 7.538 / 7.575 / 7.471. That is **sigma = 115 MB over all five, 45 MB over the
+four tightest**, and nobody had computed it. Against that scatter:
+
+- gate 1's predicted f64-f32 signal is **67.6 MB = 0.6 sigma**, and its +-25%
+  tolerance is +-16.9 MB, a quarter of the noise;
+- the isolating arm removes 178.7 MB of modelled coarse mesh (1.6 sigma) and
+  read **132 MB HIGHER** than the leg it was isolating from.
+
+So the 2.034 mesh-model ratio on record is one draw of a noisy difference, not a
+finding, and "the mesh model does not describe this machine" is NOT established
+by it. (Section 1 shows the model IS short, by 1.20 GB on the tile force phase
+-- a real effect that this method could not have separated from its own noise.)
+Compounding it, half of gate 1's predicted signal (33.8 of 67.6 MB) is terms
+`mesh_bytes` itself labels TRANSIENT while the analysis summed every term as
+resident.
+
+**Do not re-run Stage 0's differencing arms**, and do not quote its numbers.
+
+**Correction to the earlier record**: Stage 0's cdev anchor was relayed as "four
+gates fail on their own terms". Only **gate 1** returned false. **Gate 2 PASSED**
+(`gate2_sees_on_bpp_term: true`, a one-sided floor at 0.8 x 32 B/p that the
+254.5 B/p residual clears 8x) and was vacuous at that margin. The repack
+transient (2.2 vs 12.6) and the state gap (13.74 vs 12.66) are
+REPORTED-NOT-GATED by the script's own pre-registration. Gate 3 needs a second
+config.
+
+## 6. Two probe defects, both mine, both caught by my own gates
+
+1. **`/proc/self/clear_refs` resets `mm->hiwater_rss`, which BOTH `VmHWM` and
+   getrusage's `ru_maxrss` report.** A traced arm's end-of-run `ru_maxrss` is
+   therefore the peak since the LAST boundary, not the run. I had written a
+   comment asserting the two were independent. Effect: the cdev8 trace arm read
+   1.824 GB against 2.010 actual, i.e. 0.19 GB BELOW the untraced control --
+   which looks exactly like the instrument suppressing the peak, the thing gate A
+   exists to catch, and gate A passed it anyway on a large sigma. **Gate B caught
+   it by failing in the physically impossible direction**: a phase's high-water
+   exceeding the process's. Fixed by accumulating the run peak inside the tracer
+   as a max over boundary readings, with `maxrss_raw` and `hiwater_was_reset`
+   kept on the card.
+2. **Fixing that made gate B vacuous.** The run peak became the max over phase
+   peaks BY CONSTRUCTION, so "does the top phase reach the run peak" compared a
+   number with itself and would have returned zero for any engine and any defect.
+   Now measured against the CONTROL arm, with a guard test that hands the trace
+   arm a peak exactly equal to its top phase and requires failure anyway.
+
+Also corrected in-session: `phase_growth` originally trended each phase's
+ABSOLUTE peak, which rises for every phase alike as the process ratchets up. It
+reported +1233 to +1308 MB for four unrelated phases -- one climb restated
+twelve times. It now reads each phase's own increment, with the climb carried
+once by the step ladder.
+
+## 7. What is NOT established
+
+- **Anything at production scale.** Every number here is cdev or cdev8. C-gh
+  moves `cap`, K, tile count and N together, and the two term families
+  (`pending` O(N) against the tile transients scaling with `cap`) move
+  differently under it.
+- **That the shape churn causes the K-growth.** Measured: the churn exists (10
+  shapes over 10 steps) and the growth exists (+103 MB/step). The link is
+  untested; that is the owed A/B.
+- **The memory cost per retained executable family**, which is what would turn
+  the shape count into a predicted GB/step.
+- **Any peak on macOS.** Darwin reads about 3x low and one laptop point read
+  6.484 and 9.855 GB minutes apart. Peak comparisons must live on one glibc
+  machine, and the trace probe refuses non-Linux rather than falling back.
+- **The sub-terms of the tile force**, which is what the 1.20 GB shortfall is
+  made of.
+
+## 8. Owed
+
+1. **One antares job**: the `pad` A/B against the measured +103 MB/step (expected
+   signal is the live ~60% of it), plus a corrected-probe re-run for a card whose
+   verdict can be read directly. Must be antares -- peaks are not comparable
+   across machines. Fold in `--arena-frac 0.20` for the smoke leg: at 0.08 it
+   dies in `_to_arena` (29 particles against 9 free slots, the D-007 refusal
+   working as designed on a 32,768-particle config), and 0.30/0.30 refuses from
+   the other side on the repack allocation.
+2. **Re-price `inexor.plan`'s C-gh binding term**, and name the `mesh_bytes`
+   sub-terms of the tile force.
+3. Stage 2a (per-brick velocity scales) removes the `pending` term, which this
+   measurement shows is smaller than the tile transient at cdev -- new
+   information for its priority, not a reason to drop it, since it is O(N).
