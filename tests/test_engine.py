@@ -300,6 +300,102 @@ def test_the_run_visits_few_shapes_and_they_never_decrease():
     )
 
 
+# ------------------------------------------------- the coarse chunk pad ladder
+# M-v2-6 Stage 0b. Stage 0 put `cap` on the ladder and left the SECOND shape
+# keyed on occupancy alone: `coarse_delta_streamed` sizes its chunk buffer from
+# `max(rows)`, which moves every step for the same reason `cap` does. Measured at
+# the smoke config, ten distinct pad values over ten steps against one for `cap`,
+# and antares 446 measured the run peak still climbing +110 MB/step at cdev,
+# linear over 15 steps and surviving malloc_trim (so it is live memory, and a
+# retained executable family is live memory).
+
+
+def _pad_shapes_of_a_run(cfg, co, seed=0):
+    """The shapes as XLA SEES them, taken at the call rather than off the stats.
+
+    Reading `coarse_pad` back out of the stats would pass if the field were
+    quantized while the buffer stayed raw, which is the one defect this fix could
+    plausibly have. `paint_tsc_int`'s first argument IS the buffer.
+    """
+    seen = []
+    real = engine.paint_tsc_int
+
+    def spy(xp, *a, **kw):
+        seen.append(int(xp.shape[0]))
+        return real(xp, *a, **kw)
+
+    engine.paint_tsc_int = spy
+    try:
+        _, _, st = _state(cfg, seed)
+        out = engine.run(st, cfg, co)
+    finally:
+        engine.paint_tsc_int = real
+    return seen, out
+
+
+def test_the_coarse_chunk_pad_collapses_to_a_small_shape_family():
+    """The behavioural claim, and it is exact arithmetic: a shape COUNT is
+    integer, so this is one of the few M-v2-6 numbers the laptop can settle.
+
+    The bound is DERIVED from the ladder rather than picked -- over a pad range
+    [lo, hi] the ladder offers `ceil(rungs * log2(hi/lo)) + 1` rungs, and the run
+    may visit no more than that. The vacuity guard is the load-bearing half: if
+    `coarse_pad_true` never moved at this config the assertion below would hold
+    for a ladder that did nothing at all.
+    """
+    import math
+
+    from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
+
+    cosmo = Cosmology()
+    co = bullfrog_float_coeffs(bullfrog_table(a_grid(0.1, 1.0, 8, "log"), cosmo))
+    cfg = _cfg()
+    seen, out = _pad_shapes_of_a_run(cfg, co)
+
+    trues = [s["coarse_pad_true"] for s in out]
+    shapes = [s["coarse_pad"] for s in out]
+    assert len(set(trues)) > 1, (
+        "the unquantized pad took ONE value at this config, so this test cannot "
+        "see the churn it exists to remove (an arm must move its knob)"
+    )
+    assert set(seen) <= set(shapes), "a paint ran at a shape the stats never reported"
+    assert all(s >= t for s, t in zip(shapes, trues)), "a pad held fewer rows than it must"
+    assert shapes == sorted(shapes), "the pad schedule must be non-decreasing"
+    rungs = math.ceil(cfg.cap_rungs * math.log2(max(trues) / min(trues))) + 1
+    assert len(set(seen)) <= rungs, (
+        f"{len(set(seen))} distinct pad shapes over {len(shapes)} steps against a "
+        f"ladder that offers {rungs} across this pad range"
+    )
+    assert len(set(seen)) < len(set(trues)), (
+        "the ladder collapsed nothing: as many shapes as unquantized pad values"
+    )
+
+
+def test_quantizing_the_coarse_pad_is_bitwise_neutral():
+    """THE GATE, an identity like the `cap` one and for the same reason: the pad
+    rows are masked (`live=lv`), a masked row contributes an integer weight of
+    exactly zero, and integer addition is associative -- so a bigger chunk buffer
+    must give a bit-identical mesh, not a nearly-identical one.
+
+    Compared on the MESH rather than on evolved state so a failure localizes
+    here; `test_quantizing_the_capacity_shape_is_bitwise_neutral` carries the
+    end-to-end version for `cap`.
+    """
+    cfg = _cfg()
+    _, _, st = _state(cfg, 3)
+    stats = {}
+    base = engine.coarse_delta_streamed(st, cfg, stats=stats)
+    pad_true = stats["coarse_pad_true"]
+    for floor in (pad_true, 2 * pad_true, 4 * pad_true + 7):
+        s2 = {}
+        got = engine.coarse_delta_streamed(st, cfg, stats=s2, pad_shape=floor)
+        assert s2["coarse_pad"] >= floor, "the floor did not apply: the knob did not move"
+        assert np.array_equal(got, base), (
+            f"the mesh moved at pad {s2['coarse_pad']} vs {stats['coarse_pad']}: "
+            "padding is not neutral"
+        )
+
+
 # ------------------------------------------------- ownership is a partition
 # M-v2-6. The old rule tested the TILE-LOCAL coordinate,
 # `all(u >= core_lo & u < core_hi)` with u = mod(x - origin, L) reached through a

@@ -312,7 +312,7 @@ class EngineConfig:
 # ===========================================================================
 
 
-def coarse_delta_streamed(st, cfg, stats=None, census=False):
+def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0):
     """delta on the coarse mesh, accumulated brick by brick.
 
     Integer addition is associative, so a chunked accumulation is **bitwise**
@@ -323,6 +323,10 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False):
 
     `stats`, if a dict, receives `coarse_peak_int` -- the max accumulated cell
     sum, which the int32 refusal below already computes, so it is free.
+
+    `pad_shape` is the previous step's chunk shape, carried forward so the shape
+    is monotone across a run for the same reason `cap` is; see the comment on
+    `pad` below and `forces.capacity_shape`.
 
     `census=True` additionally counts cells whose integer sum is NOT exactly
     representable in f32 (`coarse_cells_inexact_f32`). It is OPT-IN because it
@@ -347,7 +351,18 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False):
     # ONE shape for every chunk. A varying row count recompiles per chunk, which
     # profiled at 2.91 s of a 13.21 s step -- the same trap as the long-range
     # read. Padding is masked, not filled: an unmasked pad row would add mass.
-    pad = int(max(rows)) if rows else 0
+    #
+    # ONE shape ACROSS STEPS too, which the max alone does not give: occupancy
+    # shifts every step, so `max(rows)` took ten distinct values over ten steps
+    # at the smoke config (against one for `cap` since Stage 0 put that on the
+    # ladder), and every buffer keyed on it keys a new XLA shape whose executable
+    # is cached for the life of the process. That is the leading measured cause
+    # of the run peak's +110 MB/step at cdev (M-v2-6 Stage 0b, antares 446: the
+    # growth is linear over 15 steps, unsaturating, and survives malloc_trim, so
+    # it is live memory rather than allocator slack). Same ladder, same rungs
+    # knob, and the same masking argument makes it bitwise neutral.
+    pad_true = int(max(rows)) if rows else 0
+    pad = capacity_shape(pad_true, rungs=cfg.cap_rungs, floor_shape=pad_shape)
     for gg, m in zip(groups, rows):
         if m == 0:
             continue
@@ -389,6 +404,10 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False):
         if census:
             inexact += int(np.count_nonzero(s.astype(np.float32).astype(np.int64) != s))
     if stats is not None:
+        # both, for the same reason `cap`/`cap_true` are both reported: one hides
+        # the padding cost, the other hides the shape churn, and the churn leaked
+        stats["coarse_pad"] = pad
+        stats["coarse_pad_true"] = pad_true
         stats["coarse_peak_int"] = peak
         if census:
             stats["coarse_cells_inexact_f32"] = inexact
@@ -504,7 +523,8 @@ def _no_phase(_name):
     """The default phase hook: does nothing, allocates nothing, returns nothing."""
 
 
-def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, phase=None):
+def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
+         phase=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1 and
@@ -534,7 +554,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, phase
 
     # --- long arm: solve once, globally, on the coarse mesh
     mesh_stats = {}
-    delta = coarse_delta_streamed(st, cfg, stats=mesh_stats, census=census)
+    delta = coarse_delta_streamed(st, cfg, stats=mesh_stats, census=census, pad_shape=pad_shape)
     ph("coarse_paint")
     # `coarse_force_meshes` infers from delta.dtype and REFUSES a mismatch, so
     # the dtype cannot silently disagree with what the config asked for
@@ -735,13 +755,16 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None):
     drift_and_migrate(st, lead)  # onto the first midpoint
     ph("lead_drift")
     out = []
-    # the buffer shape is carried ACROSS steps and only ever grows, so the run
-    # visits at most a few shapes instead of one per step (M-v2-6 Stage 0)
+    # both buffer shapes are carried ACROSS steps and only ever grow, so the run
+    # visits at most a few shapes instead of one per step: `cap` from Stage 0,
+    # `coarse_pad` from Stage 0b, which measured the second one still churning
     cap_shape = 0
+    pad_shape = 0
     for k in range(len(fused)):
         stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
-                     census=census, cap_shape=cap_shape, phase=phase)
+                     census=census, cap_shape=cap_shape, pad_shape=pad_shape, phase=phase)
         cap_shape = int(stats["cap"])
+        pad_shape = int(stats["coarse_pad"])
         if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
             stats["repack"] = st.repack(brick_slack=cfg.brick_slack)
             ph("repack")
