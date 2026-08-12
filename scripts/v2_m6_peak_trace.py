@@ -290,7 +290,7 @@ class PhaseTracer:
         )
 
 
-def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin):
+def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin, pad_ladder=True):
     _require_linux()
     jax = p0._require_cpu()
     g = m3._geom(cfg)
@@ -307,6 +307,11 @@ def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin):
 
     cosmo = Cosmology()
     ec = p0._engine_config(g, "float64", 1, 1, slack)
+    # the A/B knob (M-v2-6 Stage 0b). OFF restores the pre-fix behaviour of the
+    # coarse chunk buffer -- a new XLA shape every step -- with `cap` left on
+    # its ladder in both arms, so the slope difference is attributable to one
+    # shape family. `coarse_pad_distinct` on the card is what proves it applied.
+    ec.pad_ladder = bool(pad_ladder)
     ec.validate()
     st = icgen.load_slot_state(
         workdir, brick_slack=slack, alloc_margin=alloc_margin, arena_frac=arena_frac
@@ -347,6 +352,13 @@ def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin):
                                     and out["maxrss_raw"] < tracer.run_peak)
     out["cap"] = int(seen[-1]["cap"]) if seen else None
     out["cap_distinct"] = len({int(s["cap"]) for s in seen})
+    # BOTH shape families, because an A/B that cannot show its knob moved is
+    # not an A/B: `pad_ladder` off must give one distinct pad per step and
+    # `cap_distinct` must be unchanged between the arms.
+    out["pad_ladder"] = bool(ec.pad_ladder)
+    out["coarse_pad"] = int(seen[-1]["coarse_pad"]) if seen else None
+    out["coarse_pad_distinct"] = len({int(s["coarse_pad"]) for s in seen})
+    out["coarse_pad_true_distinct"] = len({int(s["coarse_pad_true"]) for s in seen})
     if tracer is not None:
         out.update(tracer.report())
     st.check()
@@ -360,6 +372,8 @@ def _spawn(cfg, arm, k_steps, workdir, knobs):
         "--slack", str(knobs["slack"]), "--arena-frac", str(knobs["arena_frac"]),
         "--alloc-margin", str(knobs["alloc_margin"]),
     ]
+    if not knobs.get("pad_ladder", True):
+        cmd.append("--no-pad-ladder")
     out = subprocess.check_output(cmd, text=True, cwd=REPO)
     return json.loads(out.strip().splitlines()[-1])
 
@@ -515,10 +529,14 @@ def main():
     ap.add_argument("--slack", type=float, default=0.20)
     ap.add_argument("--arena-frac", type=float, default=0.08)
     ap.add_argument("--alloc-margin", type=float, default=0.10)
+    ap.add_argument("--no-pad-ladder", action="store_true",
+                    help="restore the pre-fix per-step chunk shape (the A arm of "
+                         "the M-v2-6 Stage 0b A/B); never an operating point")
     ap.add_argument("--worker", default=None)
     a = ap.parse_args()
 
-    knobs = dict(slack=a.slack, arena_frac=a.arena_frac, alloc_margin=a.alloc_margin)
+    knobs = dict(slack=a.slack, arena_frac=a.arena_frac, alloc_margin=a.alloc_margin,
+                 pad_ladder=not a.no_pad_ladder)
     if a.worker:
         cfg, arm, k, wd = a.worker.split(":", 3)
         _worker(cfg, arm, int(k), wd, **knobs)

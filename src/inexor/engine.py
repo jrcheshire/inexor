@@ -102,6 +102,7 @@ class EngineConfig:
         coarse_dtype="float64",
         fine_dtype="float64",
         cap_rungs=CAP_RUNGS_PER_OCTAVE,
+        pad_ladder=True,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -139,6 +140,14 @@ class EngineConfig:
         # rows against retained executables and the balance is machine-dependent:
         # more rungs means less padding and more compilations.
         self.cap_rungs = int(cap_rungs)
+        # The A/B knob for the SECOND shape ladder, and it exists only so the
+        # coarse chunk buffer can be turned back to its pre-fix behaviour with
+        # `cap` left on its ladder in both arms. Moving `cap_rungs` would move
+        # both ladders at once and the reading would be unattributable, which is
+        # the same reason `fine_dtype` does not follow `coarse_dtype`.
+        # False is NOT an operating point: it is the arm whose slope the fix is
+        # measured against.
+        self.pad_ladder = bool(pad_ladder)
 
     @property
     def np_coarse_dtype(self):
@@ -362,7 +371,11 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0):
     # it is live memory rather than allocator slack). Same ladder, same rungs
     # knob, and the same masking argument makes it bitwise neutral.
     pad_true = int(max(rows)) if rows else 0
-    pad = capacity_shape(pad_true, rungs=cfg.cap_rungs, floor_shape=pad_shape)
+    pad = (
+        capacity_shape(pad_true, rungs=cfg.cap_rungs, floor_shape=pad_shape)
+        if cfg.pad_ladder
+        else pad_true
+    )
     for gg, m in zip(groups, rows):
         if m == 0:
             continue

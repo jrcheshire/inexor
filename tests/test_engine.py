@@ -330,7 +330,7 @@ def _pad_shapes_of_a_run(cfg, co, seed=0):
         out = engine.run(st, cfg, co)
     finally:
         engine.paint_tsc_int = real
-    return seen, out
+    return seen, out, st
 
 
 def test_the_coarse_chunk_pad_collapses_to_a_small_shape_family():
@@ -350,7 +350,7 @@ def test_the_coarse_chunk_pad_collapses_to_a_small_shape_family():
     cosmo = Cosmology()
     co = bullfrog_float_coeffs(bullfrog_table(a_grid(0.1, 1.0, 8, "log"), cosmo))
     cfg = _cfg()
-    seen, out = _pad_shapes_of_a_run(cfg, co)
+    seen, out, _ = _pad_shapes_of_a_run(cfg, co)
 
     trues = [s["coarse_pad_true"] for s in out]
     shapes = [s["coarse_pad"] for s in out]
@@ -369,6 +369,43 @@ def test_the_coarse_chunk_pad_collapses_to_a_small_shape_family():
     assert len(set(seen)) < len(set(trues)), (
         "the ladder collapsed nothing: as many shapes as unquantized pad values"
     )
+
+
+def test_the_pad_ladder_knob_restores_the_churn_and_moves_no_bit():
+    """`pad_ladder=False` is the A arm of the owed A/B, so two things have to
+    hold or the job measures nothing: the knob must genuinely restore the churn
+    (otherwise the arms differ in name only), and the two arms must evolve to
+    bit-identical state (otherwise their peaks are not measurements of the same
+    engine and the slope difference is unattributable).
+
+    `cap` stays on its ladder in BOTH arms on purpose. Moving `cap_rungs` would
+    move both shape families at once.
+    """
+    from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
+
+    cosmo = Cosmology()
+    co = bullfrog_float_coeffs(bullfrog_table(a_grid(0.1, 1.0, 8, "log"), cosmo))
+    seen, caps, finals = {}, {}, {}
+    for on in (False, True):
+        cfg = _cfg(pad_ladder=on)
+        s, out, st = _pad_shapes_of_a_run(cfg, co)
+        seen[on] = s
+        caps[on] = [x["cap"] for x in out]
+        finals[on] = (st.off.copy(), st.w.copy(), st.occupancy.copy(),
+                      st.brick_start.copy(), st.vel_scale)
+    n_off, n_on = len(set(seen[False])), len(set(seen[True]))
+    assert n_off > n_on, (
+        f"the knob did not move: {n_off} distinct pad shapes with the ladder off "
+        f"against {n_on} with it on"
+    )
+    assert n_on == 1, f"the ladder should hold one shape over this run, got {n_on}"
+    assert caps[False] == caps[True], "cap moved between arms: the A/B is confounded"
+    a, b = finals[False], finals[True]
+    assert np.array_equal(a[0], b[0]), "positions differ between the A/B arms"
+    assert np.array_equal(a[1], b[1]), "velocities differ between the A/B arms"
+    assert np.array_equal(a[2], b[2]), "occupancy differs between the A/B arms"
+    assert np.array_equal(a[3], b[3]), "brick_start differs between the A/B arms"
+    assert a[4] == b[4], "velocity scale differs between the A/B arms"
 
 
 def test_quantizing_the_coarse_pad_is_bitwise_neutral():
