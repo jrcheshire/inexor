@@ -359,6 +359,26 @@ def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin, pad_lad
     out["coarse_pad"] = int(seen[-1]["coarse_pad"]) if seen else None
     out["coarse_pad_distinct"] = len({int(s["coarse_pad"]) for s in seen})
     out["coarse_pad_true_distinct"] = len({int(s["coarse_pad_true"]) for s in seen})
+    # PER STEP, the same fields Stage 0's instrument persists. The step ladder
+    # shows WHEN the peak moves; without these there is nothing to line a move up
+    # against, and job 450's cdev8 ladder has a +136 MB jump at step 11 that can
+    # only be guessed at. A shape change and an arena fill are both discrete
+    # events with a step index, so they are readable if and only if they are
+    # recorded per step. Twelve short integer lists; the cost is nothing.
+    out["cap_per_step"] = [int(x["cap"]) for x in seen]
+    out["cap_true_per_step"] = [int(x["cap_true"]) for x in seen]
+    out["coarse_pad_per_step"] = [int(x["coarse_pad"]) for x in seen]
+    out["coarse_pad_true_per_step"] = [int(x["coarse_pad_true"]) for x in seen]
+    out["arena_used_per_step"] = [int(x.get("arena_used", -1)) for x in seen]
+    out["brick_reach_realized_per_step"] = [
+        int(x.get("brick_reach_realized", -1)) for x in seen
+    ]
+    # a per-step series shorter than the run is worse than none: it would line up
+    # against the step ladder off by however many steps went missing, and the
+    # misalignment would look like a shifted cause
+    for f, v in list(out.items()):
+        if f.endswith("_per_step"):
+            assert len(v) == n_steps, f"{f} has {len(v)} entries for {n_steps} steps"
     if tracer is not None:
         out.update(tracer.report())
     st.check()
