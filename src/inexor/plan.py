@@ -86,13 +86,30 @@ def main(argv=None):
     ap.add_argument("--n-fine", type=int, default=None)
     ap.add_argument("--n-coarse", type=int, default=None)
     ap.add_argument("--tile", type=int, default=None)
-    ap.add_argument("--buf", type=int, default=32)
+    # None, not 32: the preset fill below only writes a field that is still None,
+    # so a non-None default here silently OUTRANKS the preset table. Every preset
+    # but `smoke` carries buf=32, which is why the shadowing was invisible -- and
+    # `smoke` (buf=8) was left unevaluable, T=16 + 2*32 = 80 against a 64 mesh
+    # tripping the degeneracy guard. Same class as a decayed default at a call
+    # site that omits the argument.
+    ap.add_argument("--buf", type=int, default=None)
     ap.add_argument("--coarse-dtype", default="float32")
     ap.add_argument("--fine-dtype", default="float64")
     ap.add_argument("--bucket-cells", type=int, default=2)
     ap.add_argument("--slack", type=float, default=0.10, help="per-brick spare fraction")
     ap.add_argument("--alloc-margin", type=float, default=0.10)
     ap.add_argument("--arena-frac", type=float, default=0.01)
+    # No default, and deliberately not derived: geometry alone UNDERSTATES it.
+    # `cap` is the max over tiles of the padded per-tile row count, so it carries
+    # (P/T)^3 x N/tiles, the geometric ladder's <=26.0%, AND the clustering spread
+    # of per-tile occupancy -- and that last part is what geometry cannot give.
+    # Measured excess over (P/T)^3 x N/tiles is 1.290x at cdev and 1.587x at cdev8,
+    # shrinking as per-tile occupancy grows, so a derived cap would look like a
+    # measurement and read low.
+    ap.add_argument("--cap", type=int, default=None,
+                    help="measured per-tile capacity, for the tile_buffers term. "
+                         "cdev/cgh64/C-gh share N/tile and P, so cdev's measured "
+                         "5284492 is the anchor for all three.")
     # BUDGETS ARE ARGUMENTS. No default host size: a wrong default is worse than
     # an absent one, because it silently makes a verdict up.
     ap.add_argument("--host-gb", type=float, default=None,
@@ -106,6 +123,8 @@ def main(argv=None):
         for k, v in PRESETS[args.preset].items():
             if getattr(args, k.replace("-", "_")) is None:
                 setattr(args, k.replace("-", "_"), v)
+    if args.buf is None:
+        args.buf = 32
     missing = [k for k in ("n_part", "box", "n_fine", "n_coarse", "tile")
                if getattr(args, k) is None]
     if missing:
@@ -139,7 +158,7 @@ def main(argv=None):
     _table("MESH, resident through the tile loop", resident)
     _table("MESH, transient (peak while that phase runs)", transient)
 
-    step = ec.step_bytes(n, n_rows=rows)
+    step = ec.step_bytes(n, n_rows=rows, cap=args.cap)
     _table("PER-STEP HOST TERMS THAT SCALE WITH PARTICLES", step)
 
     # ---- IC stage
@@ -156,10 +175,22 @@ def main(argv=None):
     print("\nBINDING TERMS")
     peak_est = sum(state.values()) + sum(resident.values()) + max(transient.values()) \
         + sum(step.values())
-    biggest = max(list(state.items()) + list(resident.items()) + list(step.items()),
+    # TRANSIENTS ARE CANDIDATES. They were excluded here, so the line could not
+    # name a transient however large -- at cdev it reported `tile_kernels` (0.791
+    # GB) while `tile_workspace` (1.443) was bigger and the phase MEASURED to set
+    # the peak is the tile force (job 446: `tile_short` increments 3.432 GB).
+    # A "largest term" line that structurally cannot name the measured winner is
+    # the shape of a gate that cannot fail.
+    biggest = max(list(state.items()) + list(resident.items()) + list(step.items())
+                  + [(f"{k} (transient)", v) for k, v in transient.items()],
                   key=lambda kv: kv[1])
     print(f"  a lower bound on the run's peak: {_fmt(peak_est)}")
     print(f"  largest single term: {biggest[0]} at {_fmt(biggest[1])}")
+    if "tile_buffers" not in step:
+        print("  NB `tile_buffers` is NOT in the total above: it needs a measured "
+              "`cap`,\n     and it is the per-tile host set that sits inside the phase "
+              "measured to\n     SET the peak at cdev. Pass --cap to include it "
+              "(cdev measured 5,284,492).")
     if args.host_gb is not None:
         budget = args.host_gb * GB
         ratio = peak_est / budget
