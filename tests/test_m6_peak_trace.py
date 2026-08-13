@@ -329,6 +329,20 @@ def test_the_orchestrator_reads_only_fields_the_worker_promises():
         assert f in tr.WORKER_FIELDS, f"{f} proves an A/B knob applied; it must arrive"
 
 
+def test_the_per_step_check_names_its_series_and_tolerates_the_float():
+    """Job 451, five legs for five: the length check swept the card for keys
+    ending `_per_step`, which also matched `s_per_step` -- a FLOAT, seconds per
+    step, on the card since Stage 0b -- and `len()` of a float raised after each
+    leg's full run and before its card. The check must name its series, pass a
+    card that also carries the float, and still catch a short series by name."""
+    card = {f"{n}_per_step": [1, 2, 3] for n in tr.PER_STEP_SERIES}
+    card["s_per_step"] = 0.7
+    tr.check_per_step_series(card, 3)  # the job-451 card shape; must not raise
+    card["cap_per_step"] = [1, 2]
+    with pytest.raises(AssertionError, match="cap_per_step has 2 entries for 3"):
+        tr.check_per_step_series(card, 3)
+
+
 def test_a_card_missing_a_contract_field_is_named_not_swallowed():
     full = {f: 1 for f in tr.WORKER_FIELDS}
     assert tr.missing_worker_fields(full) == []

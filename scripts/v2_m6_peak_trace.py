@@ -365,20 +365,15 @@ def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin, pad_lad
     # only be guessed at. A shape change and an arena fill are both discrete
     # events with a step index, so they are readable if and only if they are
     # recorded per step. Twelve short integer lists; the cost is nothing.
-    out["cap_per_step"] = [int(x["cap"]) for x in seen]
-    out["cap_true_per_step"] = [int(x["cap_true"]) for x in seen]
-    out["coarse_pad_per_step"] = [int(x["coarse_pad"]) for x in seen]
-    out["coarse_pad_true_per_step"] = [int(x["coarse_pad_true"]) for x in seen]
-    out["arena_used_per_step"] = [int(x.get("arena_used", -1)) for x in seen]
-    out["brick_reach_realized_per_step"] = [
-        int(x.get("brick_reach_realized", -1)) for x in seen
-    ]
+    for name in PER_STEP_SERIES:
+        out[f"{name}_per_step"] = [
+            int(x.get(name, -1)) if name in _PER_STEP_OPTIONAL else int(x[name])
+            for x in seen
+        ]
     # a per-step series shorter than the run is worse than none: it would line up
     # against the step ladder off by however many steps went missing, and the
     # misalignment would look like a shifted cause
-    for f, v in list(out.items()):
-        if f.endswith("_per_step"):
-            assert len(v) == n_steps, f"{f} has {len(v)} entries for {n_steps} steps"
+    check_per_step_series(out, n_steps)
     if tracer is not None:
         out.update(tracer.report())
     st.check()
@@ -398,6 +393,25 @@ WORKER_FIELDS = (
     "arm", "k_steps", "wall_s", "s_per_step", "run_peak", "maxrss_raw", "rss_end",
     "cap", "cap_distinct", "pad_ladder", "coarse_pad", "coarse_pad_distinct",
 )
+
+# The per-step series, declared ONCE and named EXPLICITLY at the check. Job 451
+# died here five for five: the check swept the card for keys ending
+# "_per_step", which also matched `s_per_step` -- a float, seconds per step, on
+# the card since Stage 0b -- and `len()` of a float raised after every leg's
+# full run and before its card. A name glob is a contract nobody wrote down.
+PER_STEP_SERIES = (
+    "cap", "cap_true", "coarse_pad", "coarse_pad_true",
+    "arena_used", "brick_reach_realized",
+)
+# absent from a step card these read -1 (older engines don't emit them); the
+# other four are load-bearing and a missing one must raise at the step, loudly
+_PER_STEP_OPTIONAL = frozenset({"arena_used", "brick_reach_realized"})
+
+
+def check_per_step_series(out, n_steps):
+    for f in PER_STEP_SERIES:
+        v = out[f"{f}_per_step"]
+        assert len(v) == n_steps, f"{f}_per_step has {len(v)} entries for {n_steps} steps"
 
 
 def missing_worker_fields(d):
