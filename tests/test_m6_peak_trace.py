@@ -107,6 +107,85 @@ def test_every_phase_the_engine_emits_is_declared():
     )
 
 
+# ------------------------------------------------------------------ the trim schedule
+
+
+@pytest.fixture
+def count_trims(monkeypatch):
+    n = {"calls": 0}
+    monkeypatch.setattr(tr, "_malloc_trim", lambda: n.__setitem__("calls", n["calls"] + 1))
+    return n
+
+
+def test_trim_step_fires_once_per_step_and_trim_all_fires_every_boundary(fake_rss,
+                                                                         count_trims):
+    """The two schedules differ by the tile loop's length, which at cdev8 is 263
+    boundaries per step. Job 452 measured the `all` schedule (-41% peak, +15%
+    wall) and that is the only one on record, so a step-boundary default was
+    being argued from a number 263x away from it."""
+    fake_rss["pairs"] = [(10, 10)] * 40
+    step = ("coarse_paint", "coarse_solve", "tile_short", "tile_long", "repack")
+
+    count_trims["calls"] = 0
+    t = tr.PhaseTracer(trim="step")
+    for _ in range(3):
+        for name in step:
+            t(name)
+    assert count_trims["calls"] == 3, "one trim per step, keyed on coarse_paint"
+    assert t.trim_calls == 3
+    assert t.report()["trim_mode"] == "step"
+
+    count_trims["calls"] = 0
+    t = tr.PhaseTracer(trim="all")
+    for _ in range(3):
+        for name in step:
+            t(name)
+    # +1: the constructor trims before the run, as it always has
+    assert count_trims["calls"] == 3 * len(step) + 1
+    assert t.trim_calls == 3 * len(step) + 1
+
+
+def test_the_step_boundary_phase_is_unconditional_in_the_engine():
+    """`trim_step` keys on `coarse_paint` because `repack` is CONDITIONAL --
+    `engine.run` calls it only when `cfg.repack_every` divides the step index, so
+    a repack-keyed trim would silently become every-Nth-step or never fire."""
+    import inspect
+
+    from inexor import engine
+
+    src = inspect.getsource(engine.step)
+    assert 'ph("coarse_paint")' in src, "the step boundary the trim keys on moved"
+    assert tr.STEP_BOUNDARY_PHASE == "coarse_paint"
+    run_src = inspect.getsource(engine.run)
+    assert "repack_every" in run_src and 'ph("repack")' in run_src, (
+        "if repack became unconditional this test should be revisited, not deleted"
+    )
+
+
+def test_trim_off_never_calls_it(fake_rss, count_trims):
+    fake_rss["pairs"] = [(10, 10)] * 10
+    t = tr.PhaseTracer(trim="off")
+    for name in ("coarse_paint", "tile_short"):
+        t(name)
+    assert count_trims["calls"] == 0 and t.trim_calls == 0
+
+
+def test_an_unknown_trim_mode_is_refused_not_treated_as_off(fake_rss):
+    """Silently reading an unknown mode as `off` would produce a card labelled
+    with an arm that did nothing -- and it would read as `trimming does not
+    help`, for every config, forever."""
+    with pytest.raises(ValueError, match="trim must be one of"):
+        tr.PhaseTracer(trim="every-other-tuesday")
+    assert tr.ARM_TRIM["trim_step"] == "step" and tr.ARM_TRIM["trim"] == "all"
+    assert set(tr.ARM_TRIM) | {"control"} == set(tr.ARMS)
+
+
+def test_the_card_contract_carries_the_trim_knob():
+    """`trim_calls` on the card is what proves the arm did what its name says."""
+    for f in ("trim_mode", "trim_calls"):
+        assert f in tr.WORKER_FIELDS
+
+
 # ------------------------------------------------------------------ the reduction
 
 

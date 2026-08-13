@@ -45,6 +45,18 @@ is a question about the engine rather than about the model.
               boundary is what separates the two. An INSTRUMENT ARM, never an
               operating point (the `cap_mult` precedent): a production run
               would pay the syscall.
+  trim_step   `malloc_trim(0)` ONCE per step, at `coarse_paint`. This is the
+              CANDIDATE OPERATING POINT, and it exists because `trim` cannot
+              price it: `trim` fires 263 times per step at cdev8 (10,521 calls
+              over K=40), so job 452's -41% peak at +15% wall bounds the most
+              aggressive schedule available and says nothing about a light-touch
+              one. What makes the light touch plausible is measurable in 452
+              already: in late steps the trim arm's resident floor is 1.072 GB
+              below the trace arm's at the step's FIRST boundary and only 0.828
+              GB below at its last, and it climbs +293 MB WITHIN a step despite
+              all 263 calls -- so the mid-step calls do not hold the floor down,
+              they only slow its re-growth. Pre-registered expectation: closer to
+              the `trim` arm than to `trace` on peak, at a wall cost near zero.
 
 ## What is REPORTED and what is GATED
 
@@ -97,7 +109,12 @@ import v2_m3_engine_gate as m3  # noqa: E402
 import v2_m6_engine_peak as p0  # noqa: E402
 
 CONFIGS = m3.CONFIGS
-ARMS = ("trace", "control", "trim")
+ARMS = ("trace", "control", "trim", "trim_step")
+# arm -> PhaseTracer trim mode. `control` has no tracer at all.
+ARM_TRIM = {"trace": "off", "trim": "all", "trim_step": "step"}
+TRIM_MODES = ("off", "all", "step")
+# `engine.step`'s first phase, emitted unconditionally once per step
+STEP_BOUNDARY_PHASE = "coarse_paint"
 GATE_SIGMA = 2.0
 
 # The phase names `engine.step` and `engine.run` emit, in the order a step
@@ -234,8 +251,15 @@ class PhaseTracer:
     phase's does.
     """
 
-    def __init__(self, trim=False, series=True):
+    def __init__(self, trim="off", series=True):
+        if trim is True:
+            trim = "all"
+        elif trim is False:
+            trim = "off"
+        if trim not in TRIM_MODES:
+            raise ValueError(f"trim must be one of {TRIM_MODES}, got {trim!r}")
         self.trim = trim
+        self.trim_calls = 0
         self.phases = {}
         self.order = []
         self.unknown = []
@@ -255,9 +279,26 @@ class PhaseTracer:
         _reset_hwm()
         self._start = _rss()
 
-    def _trim_if_asked(self):
-        if self.trim:
-            _malloc_trim()
+    def _trim_if_asked(self, name=None):
+        """`all` = every boundary (263 per step at cdev8); `step` = ONCE per step.
+
+        The two are a factor of 263 apart in call count, which is why `trim` alone
+        could not price a step-boundary default: job 452 measured -41% peak at
+        +15% wall for the 263x schedule and that bounds the most aggressive
+        possible version of the intervention, not the proposed one.
+
+        `step` keys on `coarse_paint` because it is `engine.step`'s FIRST phase
+        and is unconditional. `repack` would be the natural other end and is
+        wrong: it fires only when `cfg.repack_every` divides the step index
+        (`engine.py:781`), so a `repack`-keyed trim would silently become
+        every-Nth-step, or never.
+        """
+        if self.trim == "off":
+            return
+        if self.trim == "step" and name != STEP_BOUNDARY_PHASE:
+            return
+        _malloc_trim()
+        self.trim_calls += 1
 
     def __call__(self, name):
         hwm, rss = _hwm(), _rss()
@@ -274,7 +315,7 @@ class PhaseTracer:
         self.run_peak = max(self.run_peak, hwm)
         if self.series is not None:
             self.series.append((name, hwm, hwm - self._start))
-        self._trim_if_asked()
+        self._trim_if_asked(name)
         _reset_hwm()
         self._start = _rss()
 
@@ -287,6 +328,8 @@ class PhaseTracer:
             growth=phase_growth(self.series),
             step_ladder=step_ladder(self.series),
             run_peak=self.run_peak,
+            trim_mode=self.trim,
+            trim_calls=self.trim_calls,
         )
 
 
@@ -332,7 +375,7 @@ def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin, pad_lad
     import time
 
     seen = []
-    tracer = PhaseTracer(trim=(arm == "trim")) if arm != "control" else None
+    tracer = PhaseTracer(trim=ARM_TRIM[arm]) if arm != "control" else None
     t0 = time.perf_counter()
     engine.run(st, ec, co, collect=seen.append, phase=tracer)
     out["wall_s"] = time.perf_counter() - t0
@@ -356,6 +399,12 @@ def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin, pad_lad
     # not an A/B: `pad_ladder` off must give one distinct pad per step and
     # `cap_distinct` must be unchanged between the arms.
     out["pad_ladder"] = bool(ec.pad_ladder)
+    # The trim knob must PROVE it applied, and the proof is the call count: an arm
+    # that named a mode but never called `malloc_trim` would read as "trimming
+    # does not help" for every config forever. `trim` must be ~263x `trim_step`
+    # at cdev8, and `trim_step` must be exactly K.
+    out["trim_mode"] = ARM_TRIM.get(arm, "off")
+    out["trim_calls"] = int(tracer.trim_calls) if tracer is not None else 0
     out["coarse_pad"] = int(seen[-1]["coarse_pad"]) if seen else None
     out["coarse_pad_distinct"] = len({int(s["coarse_pad"]) for s in seen})
     out["coarse_pad_true_distinct"] = len({int(s["coarse_pad_true"]) for s in seen})
@@ -392,6 +441,7 @@ def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin, pad_lad
 WORKER_FIELDS = (
     "arm", "k_steps", "wall_s", "s_per_step", "run_peak", "maxrss_raw", "rss_end",
     "cap", "cap_distinct", "pad_ladder", "coarse_pad", "coarse_pad_distinct",
+    "trim_mode", "trim_calls",
 )
 
 # The per-step series, declared ONCE and named EXPLICITLY at the check. Job 451
