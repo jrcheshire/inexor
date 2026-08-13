@@ -1,6 +1,8 @@
 # M-v2-6 Stage 0b: the engine's peak is set in the tile short-range force, and Stage 0's method could not have found it
 
-**Result: the peak is ATTRIBUTED.** At cdev (256^3, K=5) the run peak is set in
+**Result: the peak is ATTRIBUTED, and its growth with K is a WARM-UP rather
+than a leak** (section 3, corrected from job 450 -- the earlier "linear,
+unsaturating, +4 GB at K=40" reading is retracted). At cdev (256^3, K=5) the run peak is set in
 `tile_short`, the per-tile short-range force, whose own increment is **3.432 GB
 = 26 sigma** of the run-to-run scatter of the peak itself. `kick_pending`, which
 `python -m inexor.plan` names as THE binding term at C-gh (274.9 GB), is
@@ -102,7 +104,62 @@ was groping for and could not resolve.
   another. The `trim` arm is an instrument and never an operating point: it
   bounds what is reclaimable, it does not propose reclaiming it.
 
-## 3. The K-growth is real, and about 60% of it is live memory
+## 3. The K-growth is a WARM-UP, not a leak, and the peak is the FLOOR rising
+
+**Superseded reading, corrected 2026-08-12 from job 450.** This section
+originally reported +103 MB/step "linear and unsaturating" and extrapolated
++4 GB at K=40. Both halves of that are wrong, and the data to see it was already
+in job 446: nobody split the ladder.
+
+**(a) The climb is in the resident FLOOR, and the within-step transient
+SHRINKS.** Job 450 persists each step's starting RSS beside its peak:
+
+| config, arm | step-start RSS | slope | within-step transient | slope |
+|---|---|---|---|---|
+| cdev, ladder off | 0.556 -> 2.747 GB | +108 +- 8 MB/step | 6.094 -> 5.384 GB | **-12 +- 5** |
+| cdev, ladder on | 0.563 -> 2.649 GB | +108 +- 10 | 6.068 -> 5.185 GB | **-27 +- 5** |
+| cdev8, ladder off | 0.337 -> 2.465 GB | +109 +- 6 | 1.185 -> 0.225 GB | **-27 +- 1** |
+| cdev8, ladder on | 0.337 -> 1.875 GB | +64 +- 2 | 1.159 -> 0.150 GB | **-26 +- 1** |
+
+No phase's own increment grows enough to matter: the largest trend at cdev is
+`tile_long` at +14 to +17 MB/step against a 108 MB/step floor rise, and most
+phase trends are NEGATIVE. So the peak does not climb because any phase's
+working set grows. It climbs because the floor underneath it does.
+
+**(b) Most of that floor is glibc's, not the engine's.** Job 446's trim arm cuts
+the floor rise by 3.5-4x at K=5 (cdev 354 -> 97 MB/step, cdev8 306 -> 103), which
+is the same allocator retention section 2 measures as a static 12-32%, seen in
+its accumulating form.
+
+**(c) At the anchor config the climb SATURATES, and that is why the
+extrapolation was wrong.** Splitting the cdev K=15 ladder in half:
+
+| config, arm | steps 1-8 | steps 8-15 | decay |
+|---|---|---|---|
+| cdev, ladder on | +146 MB/step | **+28** | 118 +- 12 (81%, 10 sigma) |
+| cdev, ladder off | +155 | **+59** | 96 +- 14 (62%) |
+| cdev8, ladder on | +19 | +54 | **-35 +- 9 (steepens)** |
+| cdev8, ladder off | +64 | +89 | **-25 +- 9 (steepens)** |
+
+The cdev median ladder makes it plain: 6.64 -> 7.63 GB over the first eight
+steps, then 7.63 -> 7.86 over the next seven, with the last five steps moving
+-15, +11, +68, -8, +53, -9 MB against a 131 MB run-to-run sigma. A single OLS
+slope through that curve is dominated by the early rise and says nothing about
+where it lands. **`+103 MB/step` was a straight line fitted to a knee.**
+
+**cdev8 does the opposite and steepens**, so this is not one mechanism at both
+rungs, and neither ladder is long enough to say where either lands. That
+disagreement is the argument for MEASURING K=40 rather than fitting anything
+through K=15.
+
+**What this changes.** The capacity question M-v2-6 exists to answer is whether a
+complete mock fits on one node at D-v2-14's ratified K=40. Nothing on record
+measures a run longer than 15 steps. The "+4 GB at K=40" that fell out of this
+section was an extrapolation through a knee at one config and through a
+steepening curve at the other, and it should not be quoted in either direction
+until K=40 has been run.
+
+## 3a. The original reading, kept for the mechanism
 
 The cdev K=15 median ladder, 15 steps:
 
@@ -111,9 +168,10 @@ The cdev K=15 median ladder, 15 steps:
 ```
 
 **+103 MB/step by OLS through the median ladder** (per-repeat slopes 77 / 144 /
-103, mean 108), linear and unsaturating over the whole range, with no flattening
-at the top. Consistent with job 445's independent 0.157 GB/step fit. At K=40,
-D-v2-14's ratified cadence, that extrapolates to about **+4 GB**.
+103, mean 108), consistent with job 445's independent 0.157 GB/step fit. The
+"linear and unsaturating, so about +4 GB at K=40" that followed is RETRACTED:
+section 3 shows the same ladder decays by 81% between its first and second
+halves, and an OLS slope cannot see that.
 
 **How much survives `malloc_trim`, at both configs:**
 
@@ -246,15 +304,21 @@ once by the step ladder.
 
 ## 8. Owed
 
-1. **One antares job**: the `pad` A/B against the measured +103 MB/step (expected
-   signal is the live ~60% of it), plus a corrected-probe re-run for a card whose
-   verdict can be read directly. Must be antares -- peaks are not comparable
-   across machines. Fold in `--arena-frac 0.20` for the smoke leg: at 0.08 it
-   dies in `_to_arena` (29 particles against 9 free slots, the D-007 refusal
-   working as designed on a 32,768-particle config), and 0.30/0.30 refuses from
-   the other side on the repack allocation.
-2. **Re-price `inexor.plan`'s C-gh binding term**, and name the `mesh_bytes`
+1. **DONE (job 450), and the hypothesis mostly failed.** The `pad` A/B: the
+   knob applied cleanly (15 chunk shapes -> 3, `cap` unchanged at 2 in both
+   arms), and it moves cdev8 hard but the anchor barely. cdev8 slope 82 +- 5 ->
+   38 +- 3 MB/step (-54%, 7.1 sigma) and peak 2.676 -> 2.065 GB (-23%); cdev
+   slope 97 +- 10 -> 80 +- 8 (-17%, **1.3 sigma**) and peak 8.221 -> 7.888 GB
+   (-4%, 2.3 sigma). The off arm reproduces 446 (97 +- 10 against 103 MB/step,
+   8.221 against 8.180 GB), so the comparison is sound. **Keep the fix** -- it is
+   free, bitwise neutral, and removes twelve executable families -- but describe
+   it as removing a term, not as fixing the growth.
+2. **A K=40 run at the ratified cadence**, which is now the measurement that
+   decides the capacity question and the only one that can. Nothing on record
+   exceeds K=15, both configs' ladders are still moving there, and they move in
+   OPPOSITE directions in the second half.
+3. **Re-price `inexor.plan`'s C-gh binding term**, and name the `mesh_bytes`
    sub-terms of the tile force.
-3. Stage 2a (per-brick velocity scales) removes the `pending` term, which this
+4. Stage 2a (per-brick velocity scales) removes the `pending` term, which this
    measurement shows is smaller than the tile transient at cdev -- new
    information for its priority, not a reason to drop it, since it is O(N).
