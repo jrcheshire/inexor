@@ -38,7 +38,10 @@
 #
 # Budget ~3.3 h. --mem=100G is placement: only antares (28 c, 124 GB) satisfies
 # it, and every peak on record is antares. Nothing here touches /work.
-# NO set -e, deliberately: independent legs, per-leg exit codes.
+# NO set -e, deliberately: independent legs, per-leg exit codes -- EXCEPT the
+# smoke leg, which gates everything after it. Job 451's smoke caught the probe
+# defect in leg 1 and the job spent every long leg on it anyway: the legs are
+# independent of each other, not of the instrument they share.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
@@ -88,6 +91,10 @@ TRACE="scripts/v2_m6_peak_trace.py"
 run_leg "smoke" pixi run -e default python $TRACE \
   --configs smoke --k 5 --repeats 3 --arms trace control trim \
   --arena-frac 0.20 --workdir-root "$TMPDIR" --out-suffix _klong_smoke
+[ "${codes[0]}" -ne 0 ] && {
+  echo "FATAL: smoke failed; a broken probe would burn every long leg (job 451)"
+  exit 1
+}
 
 # ---- cdev8 at the ratified cadence, and then half again as long. THREE arms at
 # K=40 so gate A and gate B are evaluable at long K for the first time: every
