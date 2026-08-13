@@ -1,8 +1,10 @@
 # M-v2-6 Stage 0b: the engine's peak is set in the tile short-range force, and Stage 0's method could not have found it
 
-**Result: the peak is ATTRIBUTED, and its growth with K is a WARM-UP rather
-than a leak** (section 3, corrected from job 450 -- the earlier "linear,
-unsaturating, +4 GB at K=40" reading is retracted). At cdev (256^3, K=5) the run peak is set in
+**Result: the peak is ATTRIBUTED, and its growth with K is a WARM-UP that
+SATURATES** (section 3, corrected from job 450; section 3b measures K=40 and
+K=60 and closes it -- the earlier "linear, unsaturating, +4 GB at K=40" reading
+is retracted, and **at the ratified K=40 the anchor lands at 7.727 GB, flat
+against 7.888 at K=15**). At cdev (256^3, K=5) the run peak is set in
 `tile_short`, the per-tile short-range force, whose own increment is **3.432 GB
 = 26 sigma** of the run-to-run scatter of the peak itself. `kick_pending`, which
 `python -m inexor.plan` names as THE binding term at C-gh (274.9 GB), is
@@ -197,6 +199,73 @@ large (136 to 209 MB/step at cdev). The K=15 leg is the trustworthy slope; the
 K=5 legs are where the trace/trim contrast can be read, because only they have a
 trim arm.
 
+## 3b. K=40 and K=60, MEASURED (antares 452) -- the peak does NOT grow with K, and both rungs are ONE mechanism
+
+**Job 452 at `6d68bfa`, five legs all rc=0, ~4.9 h, zero SU. Cards
+`runs/v2/m6_peak_klong_*.json`.** Provenance matches 450 and 446 (antares, CPU
+backend, 28 cores, jax 0.10.2), so the cross-job comparisons below are on one
+machine and one backend. Reductions are section 0's, applied unchanged; slopes
+are SPLIT, never one OLS through the range.
+
+**(a) The number the capacity question rests on: cdev at K=40 is 7.727 GB**
+(sd 0.282, n=3), against job 450's matched cdev K=15 of 7.888 GB -- flat to
+slightly LOWER at 2.7x the steps. Section 3's retracted extrapolation implied
+~11.4 GB. Within 452 alone the plateau needs no cross-job comparison: the last
+ten steps of the K=40 ladder span 0.088 GB against a 282 MB run-to-run sigma.
+
+| config | K | trace | control | trim |
+|---|---|---|---|---|
+| cdev8 | 40 | 2.147 GB (sd 0.044) | 2.036 (0.069) | 1.276 (0.021) |
+| cdev8 | 60 | 2.254 GB (sd 0.183) | -- | -- |
+| **cdev** | **40** | **7.727 GB (sd 0.282)** | -- | -- |
+
+**(b) The floor's rise decelerates at EVERY config, so section 3's "cdev8 does
+the opposite" is SUPERSEDED.** Floor slope by thirds of each run:
+
+| config, K | first third | second third | last third | floor at end |
+|---|---|---|---|---|
+| cdev, K=40 | +79.0 | +8.5 | +4.4 MB/step | 2.542 GB |
+| cdev8, K=40 | +37.5 | +29.7 | +9.0 | 1.943 GB |
+| cdev8, K=60 | +28.0 | +22.4 | +3.9 | 1.957 GB (flat: 1.967 -> 1.957) |
+
+cdev turns over by ~step 13 and cdev8 by ~step 40-45, and cdev8's K=60 floor
+ENDS where its K=40 floor ends. So the two rungs are the same saturating
+warm-up at different timescales, and section 3's "not one mechanism at both
+rungs" was an artifact of a 15-step window catching cdev8 mid-rise while cdev
+had already turned over. **A window too short to reach saturation can make one
+curve look like two mechanisms** -- the sequel to that section's own lesson
+about fitting a line to a knee, and the reason K=60 was worth its leg.
+
+**(c) Both gates PASS at K=40, the first evaluation beyond K=5.** On the cdev8
+K=40 leg (the only one with a control arm): gate A reads **-1.6 sigma**, the
+trace arm sitting 111 MB ABOVE the control, which is the safe direction for an
+instrument; gate B passes; `tile_short` still sets the peak. Instrument
+neutrality at the ratified cadence is now measured rather than assumed.
+
+**(d) The unattributed jump class is ATTRIBUTED, on the first job carrying the
+per-step fields.** At cdev8 K=40 the largest single step-to-step move in the
+peak is **+169 MB at step 22 = 3.8 sigma**, and `cap_per_step` changes at
+exactly step 22 (330,281 -> 416,128) -- the one remaining rung crossing in the
+run. So the `cap` ladder's residual cost is one bounded discrete event per
+crossing, not a diffuse climb, and job 450's +136 MB step-11 jump is of this
+class. The trim arm's largest move (+67 MB at step 20) lands on the one
+`coarse_pad` crossing, the same way.
+
+**(e) `malloc_trim` is priced, but NOT the version anyone proposed.** The trim
+arm cuts the cdev8 K=40 peak 2.147 -> 1.276 GB (**-41%**) and the floor slope
++21.0 -> +4.2 MB/step (5x), at 14.96 against 12.98 s/step (**+15% wall**). Two
+things must travel with those numbers:
+
+- **The arm trims at EVERY phase boundary, which is 263 calls per step at cdev8**
+  (10,521 series entries over 40 steps), not once per step. The proposed
+  operating point -- a `malloc_trim` at the step boundary -- is a different
+  intervention by a factor of 263 in call count, and neither its recovery nor
+  its wall cost is measured. The 41%/+15% pair does not price it.
+- **Retention shrinks with config size** (12% at cdev K=5, 32% at cdev8 K=5,
+  41% at cdev8 K=40), so 41% must not be carried to C-gh, and **cdev trim at
+  K=40 was not run** -- the anchor's retention at the ratified cadence is
+  unmeasured, and that is the number a promote-to-default decision rests on.
+
 ## 4. The leading cause, measured and now fixed
 
 `coarse_delta_streamed` sized its chunk buffer from the current occupancy
@@ -301,6 +370,12 @@ once by the step ladder.
   machine, and the trace probe refuses non-Linux rather than falling back.
 - **The sub-terms of the tile force**, which is what the 1.20 GB shortfall is
   made of.
+- **What a STEP-boundary `malloc_trim` recovers or costs.** Section 3b(e): the
+  trim arm calls it 263x per step, so it bounds what is reclaimable by the most
+  aggressive possible schedule and prices nothing cheaper.
+- **The anchor's retention at the ratified cadence.** cdev trim exists at K=5
+  only (12%); cdev8's grew from 32% to 41% between K=5 and K=40, so the anchor's
+  cannot be inferred from either.
 
 ## 8. Owed
 
@@ -313,12 +388,25 @@ once by the step ladder.
    8.221 against 8.180 GB), so the comparison is sound. **Keep the fix** -- it is
    free, bitwise neutral, and removes twelve executable families -- but describe
    it as removing a term, not as fixing the growth.
-2. **A K=40 run at the ratified cadence**, which is now the measurement that
-   decides the capacity question and the only one that can. Nothing on record
-   exceeds K=15, both configs' ladders are still moving there, and they move in
-   OPPOSITE directions in the second half.
-3. **Re-price `inexor.plan`'s C-gh binding term**, and name the `mesh_bytes`
-   sub-terms of the tile force.
+2. **DONE (job 452): K=40 and K=60 are measured, and the peak does not grow with
+   K.** Section 3b. cdev lands at 7.727 GB against 7.888 at K=15; both rungs
+   saturate; both gates pass at long K; the jump class is attributed to a `cap`
+   rung crossing. **Now owed out of it:** a cdev trim leg at K=40 (the anchor's
+   retention at the ratified cadence), and a step-boundary trim arm, because the
+   measured arm trims 263x per step and so does not price the proposed default.
+3. **Re-priced (2026-08-13): `kick_pending` SURVIVES as the C-gh binding term**,
+   and the reason is that `cap` does not grow. The config table holds the fine
+   cell fixed and grows volume at T=256/b=32, so cdev, cgh64 and C-gh share
+   N/tile = 2,097,152 and P = 320: the tile transient is the SAME 2.235 GB
+   modelled (3.432 measured) at all three, while `kick_pending` grows 512x to
+   274.9 GB. Crossover at n_part ~ 475, so **the anchor is the last rung where
+   the tile force wins** and section 1's finding never contradicted the planner.
+   `kick_pending` alone is 2.37x a 116 GB host. Section 3b adds that the tile
+   transient is K-invariant too, so everything growing from the anchor to C-gh
+   is the O(N) family. Three defects fixed in `plan.py` on the way (transients
+   were not candidates for the largest-term line; `tile_buffers` vanished
+   without a `cap`; `--buf` shadowed the preset table). Still owed: name the
+   `mesh_bytes` sub-terms of the tile force.
 4. Stage 2a (per-brick velocity scales) removes the `pending` term, which this
    measurement shows is smaller than the tile transient at cdev -- new
    information for its priority, not a reason to drop it, since it is O(N).
