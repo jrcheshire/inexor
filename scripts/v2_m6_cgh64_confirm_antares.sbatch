@@ -73,9 +73,14 @@ mkdir -p "$TMPDIR"
 echo "=== $(hostname): $(nproc) cores, commit $(git rev-parse --short HEAD) ==="
 free -g | head -2
 
+# SIZED FROM THE REQUIREMENT, not rounded up to a comfortable number. The IC
+# stage writes ~20 full-grid f32 files at 512^3 (0.537 GB each = 10.7 GB) plus
+# ~1.3 GB of T9 slabs, so ~12-13 GB peak; 20 leaves real headroom. The previous
+# guard said 40 for no reason I can reconstruct, and job 458 refused on it with
+# 33 GB free -- correctly by its own terms, and needlessly.
 avail=$(df -BG --output=avail "$TMPDIR" | tail -1 | tr -dc '0-9')
-echo "scratch available under TMPDIR: ${avail} GB"
-[ "${avail:-0}" -lt 40 ] && { echo "FATAL: want >=40 GB of scratch, have ${avail}"; exit 1; }
+echo "scratch available under TMPDIR: ${avail} GB (need ~13, guard at 20)"
+[ "${avail:-0}" -lt 20 ] && { echo "FATAL: want >=20 GB of scratch, have ${avail}"; exit 1; }
 
 STAMP="$TMPDIR/.stamp"; touch "$STAMP"
 
@@ -121,5 +126,24 @@ for f in runs/v2/m6_peak_cgh64confirm_*.json; do
 done
 [ "$n" -eq 0 ] && { echo "  (none)"; echo "FATAL: zero fresh cards"; exit 1; }
 echo "($n fresh cards)"
-echo "TMPDIR left for inspection: $TMPDIR"
+
+# CLEAN ON SUCCESS, KEEP ON FAILURE. Every M-v2-6 sbatch before this one ended
+# with an unconditional "TMPDIR left for inspection", so every GREEN run leaked
+# its staging: 19 directories and ~33 GB had accumulated on antares by
+# 2026-08-14, and since /tmp there is on the ROOT filesystem that is a node
+# problem rather than a job problem. Job 458 refused to start on its own scratch
+# guard because of it.
+#
+# Inspection is only ever wanted when something went wrong, and that is exactly
+# when this keeps it. Deletion is by `find -delete` over a path that carries the
+# job id, never a recursive blast at a variable that might be empty: files
+# first, then empty directories, so the blast radius is bounded by construction.
+if [ $rc_total -eq 0 ] && [ -n "$SLURM_JOB_ID" ] && [ -d "$TMPDIR" ]; then
+  before=$(du -sh "$TMPDIR" 2>/dev/null | cut -f1)
+  find "$TMPDIR" -type f -delete
+  find "$TMPDIR" -depth -type d -empty -delete
+  echo "TMPDIR cleaned on success (was $before): $TMPDIR"
+else
+  echo "TMPDIR KEPT for inspection (rc=$rc_total): $TMPDIR"
+fi
 exit $rc_total
