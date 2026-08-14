@@ -78,6 +78,57 @@ def test_the_crossover_sits_between_the_anchor_and_cgh64():
     assert 400 < round(n_cross ** (1 / 3)) < 500
 
 
+def test_the_tile_kernel_build_reproduces_the_measured_phase():
+    """The M-v2-6 correction, pinned against MEASUREMENTS at two configs.
+
+    `mesh_bytes` counted only the three complex kernels `split_kernels` returns
+    and none of what it holds live to build them -- `k2_true`, `k2_safe`, `fac`
+    (f64 half-grids) and `pref` (fine dtype) -- so it read 48*phalf where the
+    peak is 80*phalf at f64. The coarse arm always carried the analogous term;
+    the tile arm never did.
+
+    The numbers are the `membership` phase from `v2_m6_host_bytes.py`, which is
+    where `make_tile_force_fn` is called. Two configs because one cannot separate
+    the kernel axis from the particle axis: they move together on every rung of
+    the config table, and only cdev's 15.48x phalf against 8.00x particles
+    splits them.
+    """
+    for name, measured_mb in (("cdev8", 85.60), ("cdev", 1319.45)):
+        m = _ec(name).mesh_bytes()
+        build = (m["tile_kernels"] + m["tile_kernel_build_f64"] + m["tile_kernel_pref"])
+        assert build / 1e6 == pytest.approx(measured_mb, rel=0.02), (
+            f"{name}: modelled {build / 1e6:.2f} MB against a measured "
+            f"{measured_mb} MB for the tile kernel build"
+        )
+        # and the correction is 5/3 of the old term at f64, by derivation
+        assert build == pytest.approx(m["tile_kernels"] * 5 / 3, rel=1e-9)
+
+
+def test_the_low_rank_ik_grids_are_why_the_factor_is_five_thirds():
+    """If `kernel_grids` ever returned full ik half-grids instead of low-rank
+    broadcasts, the build would cost 3 more f64 grids and the factor would be
+    2.17, not 5/3. The docstring promises low-rank; this fails if it stops."""
+    from inexor.forces import kernel_grids
+
+    ikx, iky, ikz, k2_true, k2_safe = kernel_grids((16, 16, 16), 1.0, np.float64)
+    for a in (ikx, iky, ikz):
+        assert a.size <= 16, f"ik grid is full-rank ({a.size} elements); the 5/3 is stale"
+    assert k2_true.size == k2_safe.size == 16 * 16 * 9
+
+
+def test_both_arms_count_the_prefactor():
+    """`pref` is a full half-grid in BOTH arms and was in neither."""
+    m = _ec("cdev").mesh_bytes()
+    assert m["coarse_kernel_pref"] > 0 and m["tile_kernel_pref"] > 0
+
+
+def test_the_coarse_force_copy_is_counted_because_both_copies_are_live():
+    """`g_coarse = [np.asarray(g) for g in g_coarse]` rebinds after the
+    comprehension, so the jax originals survive their numpy copies' creation."""
+    m = _ec("cdev").mesh_bytes()
+    assert m["coarse_force_copy_transient"] == m["coarse_force_resident"]
+
+
 # ------------------------------------------------------------------ the reduction
 
 

@@ -152,6 +152,11 @@ def main(argv=None):
     print(f"  {'':<20}  {sum(state.values()) / n:6.2f} B/p")
 
     mesh = ec.mesh_bytes()
+    # `tile_kernel_build_f64`/`tile_kernel_pref` are TRANSIENT: they are live only
+    # while `split_kernels` runs, and it runs inside the `membership` phase every
+    # step because `make_tile_force_fn` is not cached. They still set the peak
+    # there -- M-v2-6 measured that phase as the largest single term at both cdev8
+    # and cdev -- so classifying them as transient is about WHEN, not whether.
     resident = {k: v for k, v in mesh.items() if k in (
         "coarse_delta", "coarse_force_resident", "tile_kernels")}
     transient = {k: v for k, v in mesh.items() if k not in resident}

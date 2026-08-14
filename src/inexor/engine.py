@@ -216,11 +216,38 @@ class EngineConfig:
             coarse_kernel_build_f64=3 * half * 8,   # k2_true/k2_safe/fac, the island
             coarse_kernels=3 * half * 2 * cw,
             coarse_fft_workspace=half * 2 * cw,
+            # `pref = (fac / k2_safe).astype(fdtype)` is a fourth full half-grid
+            # and was in neither arm's accounting (`forces.split_kernels`).
+            coarse_kernel_pref=half * cw,
             # --- coarse, resident through the tile loop
             coarse_delta=cells * cw,
             coarse_force_resident=3 * cells * cw,
+            # `g_coarse = [np.asarray(g) for g in g_coarse]` rebinds only after
+            # the comprehension completes, so the jax originals and their numpy
+            # copies are live TOGETHER. M-v2-6 measured `coarse_solve` at 14.19 MB
+            # (cdev8) and 110.89 (cdev) against 6.29 and 50.33 for one copy; the
+            # coarse_div arm moved it 7.3x for an 8x change in cells, which is
+            # what identifies this as a cells term rather than a particle one.
+            coarse_force_copy_transient=3 * cells * cw,
             # --- fine, resident through the tile loop
             tile_kernels=3 * phalf * 2 * fw,
+            # THE BUILD, which the tile arm never counted though the coarse arm
+            # always did. `split_kernels` holds `k2_true`, `k2_safe` and `fac` as
+            # full f64 half-grids plus `pref` at the fine dtype while it
+            # materialises the three complex kernels, so the peak of a build is
+            # 80*phalf at f64 where this dict modelled 48. The `ik_j` are LOW-RANK
+            # broadcasts ((nx,1,1) etc.) and cost nothing, which is why the factor
+            # is 5/3 and not larger.
+            #
+            # Measured, and the reason this is a derivation rather than a fit:
+            # `membership` (the phase that calls `make_tile_force_fn`) reads 85.60
+            # MB at cdev8 against 51.12 modelled and 1319.45 at cdev against
+            # 791.28 -- ratios of 1.675 and 1.667 against a derived 5/3. The
+            # config ladder alone could not have found this: particles, coarse
+            # cells and phalf scale together on every rung, and it took cdev's
+            # 15.48x phalf against 8.00x particles to separate them.
+            tile_kernel_build_f64=3 * phalf * 8,
+            tile_kernel_pref=phalf * fw,
             # --- fine, transient per tile
             tile_workspace=pcells * (fw + 4 + 3 * fw) + phalf * 2 * fw,
         )
