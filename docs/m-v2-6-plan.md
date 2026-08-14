@@ -52,18 +52,24 @@ talking about it.
 | 6 | write the record and the re-scoping ADR | open |
 | P | portability (`inexor.plan`, parameters, running-elsewhere) | **1 of 3 done** |
 
-**A wall-clock problem surfaced on 2026-08-14 and may reorder all of this.**
-Job 455 measured cgh64 (512^3) at **2622.6 s/step** on antares against cdev's
-61 s -- 43x the wall for 8x the particles, and 3.3x past the band that job
-pre-registered. Per its own pre-registration the reasoning behind any request
-sized from it is wrong rather than imprecise, so nothing was scaled from it.
-The candidate cause is `_insert_slab` scanning every row of a slab once per
-brick (`N x n_bricks^2`, i.e. N^(5/3)), which predicts 42x against the measured
-43x -- but that is a derivation matching one ratio, not an attribution, and
-job 456 is the one-axis test that settles it. **If it holds, this is a harder
-blocker than the memory ceiling and it precedes everything in the table above,
-including the machine-choice measurement**, which would otherwise be pricing a
-bottleneck that should not exist.
+**A wall-clock problem surfaced on 2026-08-14, was attributed, and is FIXED.**
+Job 455 measured cgh64 (512^3) at **2622.6 s/step**, 3.3x past its own
+pre-registered band, so nothing was sized from it. `_insert_slab` was scanning
+every row of a slab once per brick -- `N x n_bricks^2`, i.e. N^(5/3). A one-axis
+arm confirmed it (job 456: particles fixed, insert 3.793 -> 10.756 -> 39.626 s
+as bricks per side went 8 -> 16 -> 32, with the last rung predicted at 38.6 s
+before it ran), the fix landed (`10d1a2d`), and the end-to-end confirmation
+(job 459, identical to 455) reads **608.67 s/step -- 4.31x, with the scan
+accounting for 77% of a whole engine step.** Full numbers, including a memory
+prediction that MISSED its band and a confounded comparison, are in
+`runs/v2/m6_scaling_record.md`.
+
+**What this does to the table above:** nothing is unblocked yet, but nothing is
+newly blocked either. The machine-choice measurement would have been pricing
+this bottleneck had it run first, which is the argument for having stopped. What
+remains open is whether the step is now LINEAR in N -- job 460 supplies the
+matched-knob cdev point that decides it, and until then no production wall
+should be quoted from 608.67 either.
 
 Discharged along the way, and not to be re-proposed:
 
