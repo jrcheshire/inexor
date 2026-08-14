@@ -140,15 +140,64 @@ was not touched. It reads 1.161 / 1.275 / 2.515 against 456's 1.160 / 1.269 /
 conditions are therefore identical between the two jobs and the insert change is
 the only variable.
 
+## 5b. Job 459 -- the end-to-end confirmation, and one prediction missed
+
+Identical to 455 in config, knobs, legs, machine and cores.
+
+| | job 455 (before) | job 459 (after) | change |
+|---|---|---|---|
+| s/step | 2622.57 | **608.67** | **-2013.9 s, 4.31x** |
+| peak host RSS | 14.447 GB | 11.600 GB | -2.847 GB |
+
+**PREDICTION B (wall): passed, by a wide margin.** Pre-registered at >=250 s off
+and falsified below 150. Measured 2014 s off. The 250 s floor was the KEEPER
+scan alone scaled to this configuration's particle count; the realized saving is
+~8x that, which is what the immigrant half predicts at depth 3, where seven
+slabs of emigrants are staged instead of the probe's three.
+
+**This ANSWERS section 6's first entry.** The scan was **77% of the whole engine
+step** at cgh64 -- force, kick, drift, migrate and repack included. Applying the
+same term to cdev (8x fewer particles, nb 16 vs 32, depth 2 vs 3 => 44.8x less
+scan) puts its scan at ~45 s of its 61 s step, 74%. The two agree, so "the scan
+explains the 43x" now rests on a measurement rather than on a matching ratio.
+
+**PREDICTION A (memory): FAILED its own band.** Predicted ~10.1 GB, i.e. a 3-5
+GB drop, from `kick_pending` priced at 4.295 GB here. Measured 2.847 GB. Below
+the band, so it is recorded as a miss.
+
+**And the comparison is CONFOUNDED, which is my design error.** Job 455 predates
+BOTH the per-brick velocity scales and the grouping fix, so two interventions sit
+between it and 459 and the memory delta cannot be attributed to either alone.
+The wall is safe -- the grouping is measured directly and in isolation by
+456/457, and the velocity change has no plausible wall effect at this size -- but
+the memory number is not. This repository already carries the lesson in
+`engine.py`'s own comment: *an instrument and an intervention in one commit
+cannot be told apart afterwards.* I did it at the job level instead.
+
+The likely reading, and it is UNMEASURED: a peak is a maximum over the step, and
+job 446 established that the engine's peak is set in `tile_short`, not in the
+kick. `pending` grew through the tile loop and was largest at its end, so
+deleting it removes only however much had accumulated at the moment the peak was
+actually set -- not its final 4.295 GB. That would explain a partial drop
+without anything being wrong. Confirming it needs a run with only one of the two
+changes, which does not exist.
+
 ## 6. What is NOT established
 
-- **That this explains job 455's 43x.** The derivation predicts the ratio to 2%
-  and the scan is measured directly, but nothing has checked what FRACTION of a
-  cgh64 step the insert was. `s_per_step` covers force, kick, drift, migrate and
-  repack. If the wall barely moves, the scan is real and minor here, and the 43x
-  needs another explanation. **Job 459 is the like-for-like re-run of 455 that
-  settles it** -- identical config, knobs, legs, machine and cores -- with the
-  wall drop pre-registered at >=250 s and falsified below 150.
+- ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
+  scan was 77% of a cgh64 step, and the same term put at cdev's configuration
+  gives 74% of its step. See section 5b.
+- **What the 2.847 GB of memory belongs to.** Two interventions sit between 455
+  and 459, so the drop cannot be attributed to either. Section 5b.
+- **That the remaining 608.67 s/step is now linear in N.** It is 10x cdev's
+  pre-fix 61 s for 8x the particles, but cdev's post-fix wall has never been
+  measured and the two runs also differ in `arena_frac` (0.08 against 0.20),
+  which changes the row count every per-step pass walks. A matched-knob cdev
+  point is the cheap next measurement and nothing should be projected before it.
+- **That the 43x itself was a clean comparison.** cdev's 61 s came from the trim
+  work at different `arena_frac`, so the headline ratio that started this was
+  knob-mismatched. It does not affect sections 3 and 5, whose arms hold every
+  knob fixed, but the 43x should not be quoted as a controlled number.
 - **Any production projection.** Three points after the fix, and the residual is
   not flat (0.91x then 1.67x), so at least two effects remain -- one of them
   almost certainly the per-brick Python loop, which runs nb^3 times per step.
@@ -161,8 +210,15 @@ the only variable.
 
 ## 7. Owed
 
-1. Read out job 459 against section 1's numbers.
-2. Extend the brick ladder past nb=32 before any production wall is quoted.
-3. `eject`'s nb-growth, if it ever matters next to what remains.
-4. The per-brick loop itself: nb^3 Python iterations per step is the shape the
+1. ~~Read out job 459.~~ DONE, section 5b. Wall passed; the memory prediction
+   missed its band and its comparison is confounded.
+2. **A matched-knob cdev point on the current code**, which is what says whether
+   the step is now linear in N. Cheap, and everything about production sizing
+   waits on it.
+3. Extend the brick ladder past nb=32 before any production wall is quoted.
+4. `eject`'s nb-growth, if it ever matters next to what remains.
+5. The per-brick loop itself: nb^3 Python iterations per step is the shape the
    residual points at, and it is a different fix from this one.
+6. A velocity-change-only run, if the memory attribution ever needs to be
+   clean. Not owed for its own sake -- the term is gone either way and the
+   planner prices it -- but the 2.847 GB stays unattributed until then.
