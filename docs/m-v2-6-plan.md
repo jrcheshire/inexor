@@ -1,13 +1,16 @@
 # M-v2-6 -- capacity: a complete 2048^3 dark-matter mock on one node
 
-**Status:** OPEN. Branch `jc/m-v2-6-capacity` (at `6ed4b47` when this was
-written), no PR. Stages 0 and 1a are discharged; Stage 2a is the active work.
+**Status:** OPEN. Branch `jc/m-v2-6-capacity`, no PR. The memory removals are
+DONE and production now fits a CPU-only node on the arithmetic floor; **the
+binding constraint has moved to wall**, where it is ~90x off this plan's own
+bar. See the ledger below.
 
 **Provenance.** This refreshes the planning session of 2026-08-11, whose original
 lives at `~/.claude/plans/enumerated-foraging-wadler.md` and is superseded by this
 file rather than edited. The design, the rejected alternatives and the gates are
 carried over unchanged; what moved is recorded in "What changed" below. The
-measurements are NOT here -- they live in `runs/v2/m6_peak_record.md`.
+measurements are NOT here -- they live in `runs/v2/m6_peak_record.md` (memory)
+and `runs/v2/m6_scaling_record.md` (time).
 
 ## The gate, re-scoped
 
@@ -74,12 +77,14 @@ accounting for 77% of a whole engine step.** Full numbers, including a memory
 prediction that MISSED its band and a confounded comparison, are in
 `runs/v2/m6_scaling_record.md`.
 
-**What this does to the table above:** nothing is unblocked yet, but nothing is
-newly blocked either. The machine-choice measurement would have been pricing
-this bottleneck had it run first, which is the argument for having stopped. What
-remains open is whether the step is now LINEAR in N -- job 460 supplies the
-matched-knob cdev point that decides it, and until then no production wall
-should be quoted from 608.67 either.
+**Is the step linear in N now? Effectively yes.** Job 460's matched-knob cdev
+point reads 48.53 s/step against cgh64's 608.67 -- 12.54x for 8x the particles,
+an exponent of 1.22. That is NOT an algorithmic term: staging depth was not held
+fixed between the two runs (reach [1,2,1] against [3,3,2]), and 8 x 1.73 = 13.8x
+brackets it with nothing left over. Depth grows because a larger box carries
+faster particles, which is physics, not code. Job 461 confirmed the migration is
+linear in N once depth IS pinned. Details and the confound in
+`runs/v2/m6_scaling_record.md` section 5c.
 
 Discharged along the way, and not to be re-proposed:
 
@@ -105,14 +110,14 @@ lower bound is `state resident + mesh resident + every per-particle per-step ter
 | state, resident | 98.5 | 11.47 B/p all-in |
 | mesh, resident through the tile loop | 18.0 | |
 | largest single mesh transient | 12.9 | `coarse_kernel_build_f64` |
-| `kick_pending` | **274.9** | Stage 2a |
-| `repack_scratch` | **93.5** | Stage 2b |
+| `kick_pending` | **274.9** | REMOVED (`8179cec`) |
+| `repack_scratch` | **93.5 -> 115.4 measured -> 21.8** | REWRITTEN (`c647e8e`) |
 | `migrate_staging` | 12.8 | N^(2/3), corrected 2026-08-13 |
 | `tile_buffers` | 0.6 | |
 
-**Stage 2a is necessary and NOT sufficient, and the record currently overstates
-it.** "The only thing between this engine and a capacity run" is true of the
-largest single term and false of the fit:
+**Removing the largest term was necessary and not sufficient**, which is worth
+keeping because a reading that stopped there would have concluded the opposite.
+It took both removals to reach a node:
 
 | after | lower bound | vs gh (116 GB) | vs gg (237 GB) |
 |---|---|---|---|
