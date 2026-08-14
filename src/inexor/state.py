@@ -268,6 +268,48 @@ def _cat_dicts(ds):
     )
 
 
+def _group_by_brick(brick_of_row, lo_b, hi_b):
+    """Rows grouped by destination brick: a permutation plus CSR offsets.
+
+    **This replaces a scan per brick, and that scan was the engine's wall.**
+    `_insert_slab` used to select each brick's rows with `dest // p3 == b`
+    inside the brick loop, so every brick read every row of the slab. A slab
+    holds ~N/nb rows and contains nb^2 bricks over nb slabs, which comes to
+    `N x nb^2` comparisons per step -- N^(5/3), not N. Measured on deneb
+    (job 456, particles fixed at 256^3, staging depth pinned at 1): insert time
+    3.793 -> 10.756 -> 39.626 s as bricks per side went 8 -> 16 -> 32, against a
+    prediction of 38.6 s at the last rung made before it ran. Carried to C-gh
+    that term alone is ~87 h per step.
+
+    One grouping pass instead. Rows outside `[lo_b, hi_b)` are dropped rather
+    than refused: the immigrant buffer holds every emigrant from every reaching
+    slab, and only some are bound for this one -- the old mask discarded them
+    silently by never matching, and this reproduces that.
+
+    **Order within a brick is preserved**, which is what makes the change
+    bitwise neutral rather than merely equivalent: the boolean mask it replaces
+    yielded rows in their original order, a stable sort does the same, and the
+    encode that follows is order-dependent through a float max.
+    """
+    n_b = int(hi_b) - int(lo_b)
+    off = np.zeros(n_b + 1, dtype=np.int64)
+    brick_of_row = np.asarray(brick_of_row, dtype=np.int64)
+    if not len(brick_of_row) or n_b <= 0:
+        return np.empty(0, dtype=np.int64), off
+    within = brick_of_row - int(lo_b)
+    idx = np.flatnonzero((within >= 0) & (within < n_b))
+    if not len(idx):
+        return np.empty(0, dtype=np.int64), off
+    w = within[idx]
+    np.cumsum(np.bincount(w, minlength=n_b), out=off[1:])
+    # uint16 where it fits, because numpy's stable sort takes the RADIX path
+    # only for 1- and 2-byte integer types -- the same fact that bought
+    # `migrate` 5.3x on its own sort. nb^2 is 16,384 at C-gh, so it fits there;
+    # above 65,535 this falls back to a comparison sort rather than pretending.
+    key = w.astype(np.uint16) if n_b <= np.iinfo(np.uint16).max else w
+    return idx[np.argsort(key, kind="stable")], off
+
+
 def reconcile_velocity_scale(tile_scales):
     """The global velocity scale, from the per-tile scales the kick produced.
 
@@ -1052,12 +1094,16 @@ class SlotState:
                     consumed[s] += int(np.count_nonzero(d_slab == bx))
         imm = _cat_dicts([emig[s] for s in sources if s in emig])
         n_over = 0
-        for b in range(lo_b, hi_b):
-            sel_k = keep["dest"] // p3 == b
-            sel_i = imm["dest"] // p3 == b if len(imm["dest"]) else slice(0, 0)
+        # GROUP ONCE, then slice. See `_group_by_brick` for what this replaces
+        # and what it was measured to cost.
+        k_ord, k_off = _group_by_brick(keep["dest"] // p3, lo_b, hi_b)
+        i_ord, i_off = _group_by_brick(imm["dest"] // p3, lo_b, hi_b)
+        for j, b in enumerate(range(lo_b, hi_b)):
+            sel_k = k_ord[k_off[j] : k_off[j + 1]]
+            sel_i = i_ord[i_off[j] : i_off[j + 1]]
             # NB no arena term: a brick's arena residents were decoded and
             # re-homed by its own ejection, and their rows released there.
-            has_i = len(imm["dest"]) > 0
+            has_i = len(sel_i) > 0
             dest = np.concatenate(
                 [
                     keep["dest"][sel_k],

@@ -567,3 +567,68 @@ def test_arena_residents_are_pulled_back_into_their_brick_run():
     assert st.check() is True
     assert st.n_live == x.shape[0]
     assert st.arena_used < crowded, f"arena never drains ({crowded} -> {st.arena_used})"
+
+
+# ============================================ grouping rows by destination brick
+# M-v2-6. `_insert_slab` used to select each brick's rows with a boolean mask
+# inside the brick loop, so every brick scanned every row of its slab: N x nb^2
+# comparisons per step, N^(5/3) rather than N. Measured on deneb (job 456,
+# particles fixed at 256^3, staging depth pinned at 1) insert time went
+# 3.793 -> 10.756 -> 39.626 s for bricks per side 8 -> 16 -> 32, against 38.6 s
+# predicted for the last rung BEFORE it ran. At C-gh that term alone is ~87 h
+# per step. `_group_by_brick` replaces it with one grouping pass.
+
+
+def test_grouping_by_brick_reproduces_the_per_brick_mask_exactly():
+    """The identity that makes the replacement bitwise neutral, not merely
+    equivalent: same rows AND same order within every brick.
+
+    Order is load-bearing downstream -- the destination scale is a max over the
+    brick's rows and the encode that follows is order-dependent through it -- so
+    membership alone would not be enough. `np.array_equal` on the index arrays
+    asserts both at once where a set comparison would pass on a permutation.
+    """
+    rng = np.random.default_rng(5)
+    lo_b, hi_b = 12, 28
+    # deliberately spans OUTSIDE the slab: the immigrant buffer carries every
+    # emigrant from every reaching slab and only some are bound for this one.
+    # The mask discarded those by never matching; this must drop them the same
+    # way rather than raising or mis-binning them.
+    brick_of_row = rng.integers(lo_b - 6, hi_b + 6, size=2000)
+    order, off = state._group_by_brick(brick_of_row, lo_b, hi_b)
+
+    n_in = int(((brick_of_row >= lo_b) & (brick_of_row < hi_b)).sum())
+    assert off[0] == 0 and off[-1] == n_in
+    assert len(order) == n_in
+    assert n_in < len(brick_of_row), "fixture has no out-of-slab rows to drop"
+    for j, b in enumerate(range(lo_b, hi_b)):
+        want = np.flatnonzero(brick_of_row == b)
+        got = order[off[j] : off[j + 1]]
+        assert np.array_equal(got, want), f"brick {b}: membership or order differs"
+    assert (np.diff(off) > 0).any(), "every brick came out empty; the fixture is vacuous"
+
+
+def test_grouping_by_brick_handles_the_empty_and_all_outside_cases():
+    """Both reachable in a real run: a slab with no keepers, and an immigrant
+    buffer none of whose rows are bound for this slab."""
+    order, off = state._group_by_brick(np.empty(0, np.int64), 4, 9)
+    assert len(order) == 0 and np.array_equal(off, np.zeros(6, dtype=np.int64))
+
+    order, off = state._group_by_brick(np.array([0, 1, 2, 40, 41]), 4, 9)
+    assert len(order) == 0 and off[-1] == 0
+
+
+def test_grouping_by_brick_takes_the_radix_path_where_the_range_allows():
+    """The key is cast to uint16 when the brick count fits, because numpy's
+    stable sort is a RADIX sort only for 1- and 2-byte integer types -- the same
+    fact that bought `migrate` 5.3x on its own sort. Asserted through behaviour
+    at both sides of the boundary rather than by reading the cast: the result
+    must be identical either way, which is what says the optimization is safe."""
+    rng = np.random.default_rng(11)
+    lo_b = 0
+    for hi_b in (1 << 10, (1 << 16) + 4):  # under and over the uint16 ceiling
+        brick_of_row = rng.integers(lo_b, hi_b, size=500)
+        order, off = state._group_by_brick(brick_of_row, lo_b, hi_b)
+        for j in np.unique(brick_of_row):
+            want = np.flatnonzero(brick_of_row == j)
+            assert np.array_equal(order[off[j] : off[j + 1]], want)
