@@ -47,7 +47,7 @@ and deleting them is what makes that configuration runnable.
 
 import numpy as np
 
-from .codec import INT16_MAX
+from .codec import INT16_MAX, assert_int16_range
 from .forces import (
     CAP_RUNGS_PER_OCTAVE,
     COARSE_HALO,
@@ -63,7 +63,7 @@ from .forces import (
 )
 from .layout import assert_brick_divides_buffer, choose_brick
 from .painting import check_tsc_paint_headroom, paint_tsc_int
-from .state import drift_and_migrate, reconcile_velocity_scale
+from .state import drift_and_migrate
 
 __all__ = ["EngineConfig", "coarse_delta_streamed", "float_run_bullfrog_sync", "run", "step"]
 
@@ -264,13 +264,17 @@ class EngineConfig:
 
         Terms, each pointing at the line that allocates it:
 
-        `kick_pending` -- `engine.py` holds `(slots int64, v_new f64)` per tile
-        until the velocity scale is reconciled, and ownership is a partition, so
-        at the end of the tile loop it holds exactly `n_particles` rows: 32 B/p,
-        **275 GB at C-gh**. This is the term the module docstring says does not
-        exist ("Nothing O(N) in floats, anywhere"). Slated for removal by
-        per-brick velocity scales; until then it is the binding term at scale and
-        it is reported rather than described.
+        `brick_scales` -- one f64 per brick, the array that REPLACED
+        `kick_pending`. That term held `(slots int64, v_new f64)` for every owned
+        row until a global velocity scale could be reconciled -- 32 B/p, 274.9 GB
+        at C-gh, the largest single term in the configuration and the one the
+        module docstring wrongly claimed did not exist ("Nothing O(N) in floats,
+        anywhere"). Per-brick scales delete the wait that forced it: a brick's
+        rows are all kicked in one tile, so its scale is known immediately. What
+        is left is `n_bricks * 8` -- 16.8 MB at C-gh, five orders down, and it is
+        RESIDENT rather than per-step, so it is carried in the state table
+        instead. The line stays here reading zero because a term that vanishes
+        from a table is indistinguishable from one that was never counted.
 
         `repack_scratch` -- `SlotState.repack` allocates `zeros_like` of `off` and
         `w` while the originals stay live (`state.py:936-938`), so 9 B per ROW,
@@ -299,7 +303,7 @@ class EngineConfig:
         # completes before the step's peak and so is never co-resident with it.
         nb = max(1, self.n_fine // self.n_brick)
         out = dict(
-            kick_pending=n * (8 + 24),
+            kick_pending=0,
             repack_scratch=rows * 9,
             migrate_staging=int(round(190.0 * n / nb)),
         )
@@ -656,7 +660,12 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     ph("membership")
 
     tile_scales, n_owned, n_overhang = [], 0, 0
-    pending = []  # (slots, v_new) held until the global scale is known
+    # NO `pending`. It held `(slots int64, v_new f64)` for every owned row until
+    # the last tile had been kicked, because a GLOBAL scale cannot be known
+    # before then -- 32 B/p, 274.9 GB at C-gh, and the largest single term in the
+    # whole configuration. Per-brick scales remove the wait rather than the
+    # array: a brick's rows are all kicked in one tile, so its scale is known the
+    # moment that tile is done and its codes can be written immediately.
     for t in cfg.tiles:
         slots, x, v = st.decode_bricks(members[t])
         # the brick each decoded row came from, in the order decode_bricks
@@ -722,10 +731,33 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         g_tot = g_short[owned] + g_long
         v_new = alpha_k * v[owned] + bcoef * g_tot
         n_owned += int(owned.sum())
-        # per-tile scale: a reduction over a buffer already resident. The max
-        # over tiles is EXACTLY the global scale because ownership is a partition.
-        tile_scales.append(float(np.max(np.abs(v_new))) / INT16_MAX)
-        pending.append((slots[owned], v_new))
+        # QUANTIZE AND WRITE HERE, per brick, instead of holding `v_new`.
+        # `decode_bricks` concatenates brick by brick and ownership is read off
+        # the brick a row is STORED in, so the owned rows are whole brick blocks
+        # and stay contiguous under the mask -- which is what lets a run scan
+        # replace a sort. The assertion below is on that contiguity, because it
+        # is load-bearing and free to check: if a brick ever appeared in two
+        # runs, the second run would silently overwrite the first one's scale
+        # and decode every row of it wrong.
+        slots_o, bricks_o = slots[owned], brick_of_row[owned]
+        cut = np.flatnonzero(np.diff(bricks_o)) + 1
+        run_lo = np.concatenate(([0], cut))
+        run_hi = np.concatenate((cut, [len(bricks_o)]))
+        if len(np.unique(bricks_o)) != len(run_lo):
+            raise AssertionError(
+                f"tile {t}: owned rows are not grouped by brick "
+                f"({len(run_lo)} runs over {len(np.unique(bricks_o))} bricks). The "
+                "per-brick scale depends on a brick's rows being contiguous."
+            )
+        for lo_r, hi_r in zip(run_lo, run_hi):
+            vb = v_new[lo_r:hi_r]
+            s_b = float(np.max(np.abs(vb))) / INT16_MAX
+            s_b = s_b if s_b > 0.0 else 1.0
+            w_b = np.rint(vb / s_b)
+            assert_int16_range(w_b)
+            st.write_velocities(slots_o[lo_r:hi_r], w_b.astype(np.int16))
+            st.vel_scale[int(bricks_o[lo_r])] = s_b
+            tile_scales.append(s_b)
         ph("tile_reduce")
 
     # `pending` is at its largest HERE and nowhere else: it grows by one tile's
@@ -750,30 +782,22 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
             "nonzero overhang means the decomposition is wrong rather than wasteful."
         )
 
-    s_new = reconcile_velocity_scale(tile_scales)
-    for slots, v_new in pending:
-        w = np.rint(v_new / s_new)
-        if np.abs(w).max() > INT16_MAX:
-            raise ValueError(
-                f"velocity code {np.abs(w).max():.0f} escapes int16 after reconciliation. "
-                "That is supposed to be impossible: s_new is the max over a PARTITION of "
-                "the particles, so no row can exceed it. The partition is broken."
-            )
-        st.write_velocities(slots, w.astype(np.int16))
-    st.vel_scale = s_new
-    # NB `pending` is dead here but still REFERENCED until this function returns,
-    # so its 32 B/p stays live across the migrate. Freeing it is a candidate
-    # change, deliberately NOT made in the same commit as the instrument that
-    # would measure it -- an instrument and an intervention in one commit cannot
-    # be told apart afterwards.
+    # Nothing to reconcile: every brick's codes were written at its own scale
+    # inside the loop. The phase boundary stays so the trace keeps its shape and
+    # a peak comparison against every card on record is still like-for-like.
     ph("reconcile")
 
-    stats = drift_and_migrate(st, c_drift, vel_scale_new=s_new)
+    stats = drift_and_migrate(st, c_drift)
     ph("migrate")
     # both: `cap` is the SHAPE every buffer took, `cap_true` the max over tiles it
     # was quantized from. Reporting only one of them hides either the padding cost
     # or the shape churn, and the shape churn is what leaked.
-    stats.update(cap=cap, cap_true=cap_true, n_tiles=len(cfg.tiles), vel_scale=s_new)
+    # `vel_scale` stays a SCALAR in the stats dict -- the max over bricks, which
+    # `drift_and_migrate` already put there -- so every reader of a card keeps
+    # working. `vel_scale_min` is beside it: the two together are what say how
+    # much the per-brick scales actually spread, and a single number cannot.
+    stats.update(cap=cap, cap_true=cap_true, n_tiles=len(cfg.tiles),
+                 vel_scale_kick_max=float(max(tile_scales)) if tile_scales else 1.0)
     # the REALIZED dtypes, read off the arrays rather than echoed from the
     # config: a receipt that repeats what it was told cannot catch a knob that
     # did not apply, which is the whole failure mode this milestone is built

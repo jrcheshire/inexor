@@ -53,7 +53,10 @@ def test_streamed_build_is_bitwise_the_monolithic_one(tmp_path, f_NL):
     assert st.occupancy.dtype == ref.occupancy.dtype
     assert np.array_equal(st.off, ref.off), "position payload moved bits"
     assert np.array_equal(st.w, ref.w), "velocity payload moved bits"
-    assert st.vel_scale == ref.vel_scale, "the partition-max scale must be EXACT"
+    assert np.array_equal(st.vel_scale, ref.vel_scale), (
+        "the per-brick scales must be EXACT, brick for brick: the streamed\n"
+        "generator and the monolithic build take the same max over the same rows"
+    )
     assert st.n_particles == ref.n_particles == N**3
     assert st.arena_base == ref.arena_base and st.n_arena == ref.n_arena
     assert st.arena_used == 0
@@ -63,7 +66,15 @@ def test_streamed_build_is_bitwise_the_monolithic_one(tmp_path, f_NL):
     occ = np.asarray(st.occupancy, np.int64)
     assert occ.max() >= 2 * max(occ[occ > 0].mean(), 1)
     assert man["ic_stream"] == ic.IC_STREAM
-    assert man["vel_scale"] == st.vel_scale
+    # the manifest keeps ONE number, and it must be the max over the per-brick
+    # scales: bricks partition the particles, so the largest brick scale is the
+    # global max|v|/INT16_MAX the manifest records.
+    assert man["vel_scale"] == pytest.approx(st.vel_scale.max())
+    assert st.vel_scale.shape == (NB**3,)
+    assert st.vel_scale.min() < st.vel_scale.max(), (
+        "every brick got the same scale, so this fixture cannot tell a per-brick\n"
+        "scale from a global one and the comparison above is vacuous"
+    )
 
 
 def test_streamed_build_identity_can_fail(tmp_path):
@@ -89,16 +100,28 @@ def test_loader_refuses_crc_corruption(tmp_path):
     )
     victim = os.path.join(str(tmp_path), "t9_slab_0001.npz")
     with np.load(victim) as z:
-        meta, occ, off, w = str(z["meta"]), z["occupancy"], z["off"], z["w"]
+        meta, occ, off, w, sc = (
+            str(z["meta"]), z["occupancy"], z["off"], z["w"], z["scale"]
+        )
     w = w.copy()
     w[0, 0] ^= 1  # one flipped bit in one velocity code
-    np.savez(victim, meta=meta, occupancy=occ, off=off, w=w)
+    np.savez(victim, meta=meta, occupancy=occ, off=off, w=w, scale=sc)
     with pytest.raises(ValueError, match="crc mismatch"):
         icgen.load_slot_state(str(tmp_path))
     # and the crc actually covers what it claims: restoring the byte loads clean
     w[0, 0] ^= 1
-    np.savez(victim, meta=meta, occupancy=occ, off=off, w=w)
+    np.savez(victim, meta=meta, occupancy=occ, off=off, w=w, scale=sc)
     icgen.load_slot_state(str(tmp_path)).check()
+
+    # the SCALE array is covered too. It is new, it is per brick, and a silently
+    # wrong scale decodes every velocity in that brick by a wrong factor without
+    # touching a single payload byte -- so leaving it out of the crc would be the
+    # one corruption the loader could not see.
+    sc = sc.copy()
+    sc[0] *= 1.5
+    np.savez(victim, meta=meta, occupancy=occ, off=off, w=w, scale=sc)
+    with pytest.raises(ValueError, match="crc mismatch"):
+        icgen.load_slot_state(str(tmp_path))
 
 
 def test_generator_refuses_displacement_over_the_window(tmp_path):

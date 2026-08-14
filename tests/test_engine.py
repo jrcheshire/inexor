@@ -180,7 +180,13 @@ def test_a_short_run_advances_and_stays_consistent():
     )
 
 
-def test_the_velocity_scale_is_reconciled_and_never_clamps():
+def test_the_velocity_scale_is_per_brick_and_never_clamps():
+    """Per-brick scales removed the 32 B/p `pending` array, and with it the
+    theorem that made overflow impossible. Under one global scale the encode
+    could not escape int16 because the scale was a max over a PARTITION; per
+    brick it can, whenever a fast particle drifts into a quiet brick. So the
+    range assertion below is doing real work now where it was a formality
+    before, and the spread assertion is what says the fixture could expose it."""
     from inexor.codec import assert_int16_range
 
     cfg = _cfg()
@@ -189,7 +195,12 @@ def test_the_velocity_scale_is_reconciled_and_never_clamps():
     co = bullfrog_float_coeffs(bullfrog_table(a, Cosmology()))
     engine.run(st, cfg, co)
     assert_int16_range(st.w)  # raises if any code escaped int16
-    assert st.vel_scale > 0.0
+    assert st.vel_scale.shape == (st.n_bricks,)
+    assert st.vel_scale.min() > 0.0, "a zero scale is a division by zero on decode"
+    assert st.vel_scale.min() < st.vel_scale.max(), (
+        "every brick ended on the same scale, so this fixture cannot tell a "
+        "per-brick scale from a global one"
+    )
 
 
 def test_the_engine_defaults_to_the_order_independent_paints():
@@ -267,7 +278,7 @@ def test_quantizing_the_capacity_shape_is_bitwise_neutral():
         out = engine.run(st, cfg, co)
         caps.append([s["cap"] for s in out])
         finals.append((st.off.copy(), st.w.copy(), st.occupancy.copy(),
-                       st.brick_start.copy(), st.vel_scale))
+                       st.brick_start.copy(), st.vel_scale.copy()))
     assert caps[0] != caps[1], (
         "the two arms took the SAME shapes, so this asserts nothing -- the knob "
         "did not move (an arm must move its knob)"
@@ -277,7 +288,7 @@ def test_quantizing_the_capacity_shape_is_bitwise_neutral():
     assert np.array_equal(a[1], b[1]), "velocities differ: padding is not neutral"
     assert np.array_equal(a[2], b[2]), "occupancy differs"
     assert np.array_equal(a[3], b[3]), "brick_start differs"
-    assert a[4] == b[4], "velocity scale differs"
+    assert np.array_equal(a[4], b[4]), "velocity scale differs"
 
 
 def test_the_run_visits_few_shapes_and_they_never_decrease():
@@ -392,7 +403,7 @@ def test_the_pad_ladder_knob_restores_the_churn_and_moves_no_bit():
         seen[on] = s
         caps[on] = [x["cap"] for x in out]
         finals[on] = (st.off.copy(), st.w.copy(), st.occupancy.copy(),
-                      st.brick_start.copy(), st.vel_scale)
+                      st.brick_start.copy(), st.vel_scale.copy())
     n_off, n_on = len(set(seen[False])), len(set(seen[True]))
     assert n_off > n_on, (
         f"the knob did not move: {n_off} distinct pad shapes with the ladder off "
@@ -405,7 +416,7 @@ def test_the_pad_ladder_knob_restores_the_churn_and_moves_no_bit():
     assert np.array_equal(a[1], b[1]), "velocities differ between the A/B arms"
     assert np.array_equal(a[2], b[2]), "occupancy differs between the A/B arms"
     assert np.array_equal(a[3], b[3]), "brick_start differs between the A/B arms"
-    assert a[4] == b[4], "velocity scale differs between the A/B arms"
+    assert np.array_equal(a[4], b[4]), "velocity scale differs between the A/B arms"
 
 
 def test_quantizing_the_coarse_pad_is_bitwise_neutral():
@@ -641,7 +652,7 @@ def test_the_phase_hook_cannot_move_a_number():
     assert np.array_equal(st_a.off, st_b.off), "positions moved under the hook"
     assert np.array_equal(st_a.w, st_b.w), "velocity codes moved under the hook"
     assert np.array_equal(st_a.occupancy, st_b.occupancy)
-    assert st_a.vel_scale == st_b.vel_scale
+    assert np.array_equal(st_a.vel_scale, st_b.vel_scale)
     for sa, sb in zip(out_a, out_b):
         for k in ("cap", "cap_true", "vel_scale", "coarse_peak_int", "arena_used"):
             assert sa.get(k) == sb.get(k), f"the hook moved `{k}`"

@@ -147,6 +147,12 @@ def main(argv=None):
         "bucket_index": t9.index_bytes(),
         "arena_bucket": arena * 8,
         "brick_start": (ec.n_brick and (args.n_fine // ec.n_brick) ** 3 + 1) * 8,
+        # THE ARRAY THAT REPLACED `kick_pending`. One f64 per brick, resident,
+        # against 32 B per PARTICLE held per-step: 16.8 MB against 274.9 GB at
+        # C-gh. It is listed rather than folded into the noise because the term
+        # it replaced was the binding one, and a reader comparing this table to
+        # an older card needs to see where that went.
+        "brick_scales": (ec.n_brick and (args.n_fine // ec.n_brick) ** 3) * 8,
     }
     _table("STATE (resident for the whole run)", state)
     print(f"  {'':<20}  {sum(state.values()) / n:6.2f} B/p")

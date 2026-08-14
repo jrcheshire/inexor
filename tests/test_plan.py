@@ -57,21 +57,33 @@ def test_the_tile_transient_does_not_grow_from_the_anchor_to_c_gh(name):
         assert mb[term] == ab[term], f"{term} moved off the anchor at {name}"
 
 
-def test_kick_pending_alone_exceeds_a_gh_host_at_c_gh():
-    """The verdict does not depend on any other term or on the model's known
-    incompleteness: 32 B/p over 2048^3 is 274.9 GB against a ~116 GB host, so
-    C-gh cannot fit while the term exists even if everything else were free."""
+def test_kick_pending_is_gone_and_its_replacement_is_five_orders_smaller():
+    """`kick_pending` WAS the binding term: 32 B/p over 2048^3 = 274.9 GB against
+    a ~116 GB host, enough on its own to keep C-gh off a `gh` node even if
+    everything else were free. Per-brick velocity scales removed the reason it
+    existed -- the engine no longer waits for a global reduction before it can
+    encode -- and what replaced it is one f64 per brick.
+
+    The line is asserted to still EXIST and read zero rather than deleted. A term
+    that vanishes from a table is indistinguishable from one that was never
+    counted, which is the failure mode this whole planner was built against.
+    """
     n = PRESETS["c-gh"]["n_part"] ** 3
-    pending = _ec("c-gh").step_bytes(n)["kick_pending"]
-    assert pending == n * 32
-    assert pending / 116e9 > 2.0
+    ec = _ec("c-gh")
+    assert ec.step_bytes(n)["kick_pending"] == 0
+    assert "kick_pending" in ec.step_bytes(n), "the retired term must stay visible"
+    n_bricks = (PRESETS["c-gh"]["n_fine"] // ec.n_brick) ** 3
+    assert n_bricks * 8 < 0.02e9, "the replacement should be tens of MB, not GB"
+    assert (n * 32) / (n_bricks * 8) > 1e4, "expected five orders, not a trim"
 
 
-def test_the_crossover_sits_between_the_anchor_and_cgh64():
-    """Where `kick_pending` overtakes the tile force phase. cdev is the only
-    config whose peak has been measured and it is the LAST rung on which the tile
-    force wins -- which is why the measurement and the model disagreed without
-    contradicting each other."""
+def test_the_crossover_that_made_the_anchor_the_last_tile_dominated_rung():
+    """KEPT AS A RECORD, and it no longer describes the engine. It is where
+    `kick_pending` overtook the tile force phase, and it is why the one measured
+    peak (cdev) and the model disagreed at C-gh without contradicting each other:
+    the anchor was the last rung on which the tile force won. The term is gone
+    now, so nothing crosses here any more -- but the reasoning is what a future
+    reader needs to interpret every card measured before the removal."""
     measured_tile_phase = 3.432e9  # job 446, cdev, `tile_short` own increment
     n_cross = measured_tile_phase / 32
     assert PRESETS["cdev"]["n_part"] ** 3 < n_cross < PRESETS["cgh64"]["n_part"] ** 3
@@ -180,11 +192,34 @@ def test_the_largest_term_line_can_name_a_transient(capsys):
     assert "largest single term: tile_workspace (transient)" in out
 
 
-def test_the_binding_term_at_c_gh_is_kick_pending(capsys):
+def test_the_binding_term_at_c_gh_is_now_the_repack_scratch(capsys):
+    """With `kick_pending` gone the largest single term is `repack_scratch`, and
+    C-gh STILL does not fit a `gh` host -- 2.04x rather than 4.41x. Worth pinning
+    both halves: removing the largest term was necessary and is not sufficient,
+    and a reading that stopped at "the binding term was removed" would have
+    concluded the opposite."""
     main(["--preset", "c-gh", "--host-gb", "116", "--cap", "5284492"])
     out = capsys.readouterr().out
-    assert "largest single term: kick_pending" in out
+    assert "largest single term: repack_scratch" in out
     assert "DOES NOT FIT" in out
+    ratio = float(out.split("DOES NOT FIT (")[1].split("x")[0])
+    assert 1.9 < ratio < 2.2, f"expected ~2.04x a gh host after the removal, got {ratio}"
+
+
+def test_removing_the_repack_scratch_too_would_still_not_reach_a_gh_host(capsys):
+    """Where the remaining gap is, stated as a test so it cannot be forgotten:
+    state (98.6 GB resident) plus the resident mesh (18.0) is already 116.5 GB
+    against a 116 GB hard cliff, BEFORE any transient. So no per-step removal
+    reaches a `gh` node -- the resident floor alone clears it -- which is what
+    makes the target machine a scoping question rather than an optimization."""
+    main(["--preset", "c-gh", "--host-gb", "116", "--cap", "5284492"])
+    out = capsys.readouterr().out
+    state_total = float(out.split("STATE")[1].split("total")[1].split("GB")[0])
+    mesh_res = float(out.split("MESH, resident")[1].split("total")[1].split("GB")[0])
+    assert state_total + mesh_res > 116.0, (
+        "the resident floor no longer clears a gh host, so this test's premise -- "
+        "and the milestone's target-machine argument -- needs re-deriving"
+    )
 
 
 def test_an_absent_cap_names_the_omission_instead_of_dropping_it(capsys):
@@ -213,7 +248,7 @@ def test_the_estimate_is_a_lower_bound_and_says_so(capsys):
     out = capsys.readouterr().out
     assert "LOWER BOUND" in out and "not a measurement" in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    assert est == pytest.approx(3.982, abs=0.01)
+    assert est == pytest.approx(3.445, abs=0.01)
     assert est < 7.461, "the bound must sit under the measured peak it bounds"
 
 

@@ -56,7 +56,6 @@ from .codec import (
     INT16_MAX,
     LEVELS_PER_BUCKET,
     assert_int16_range,
-    encode_velocities,
     refuse_ids_above_int32,
 )
 from .layout import (
@@ -152,26 +151,95 @@ def _bucket_flat_brick_major(bucket_ijk, t9, bricks_per_side):
 
 
 def _rescale_w(w, s_old, s_new):
-    """Re-express an int16 velocity code at a new scale.
+    """Re-express int16 velocity codes at a new scale. Per-row scales allowed.
 
-    Exact when the scales are equal, which is the common case within a step; the
-    general path decodes and re-rounds. It CANNOT overflow, and that is a
-    theorem rather than a margin: `s_new` is the max over tiles of each tile's
-    own `max|v|/32767`, and tile ownership is a partition, so `s_new` is exactly
-    the global `max|v|/32767` and `|rint(v/s_new)| <= 32767` for every particle.
+    `s_old` and `s_new` are scalars or (n,) arrays broadcast over rows. Exact
+    when the scales are equal, which stays the common case; the general path
+    decodes and re-rounds.
+
+    **The no-overflow property is no longer free, and this is the function where
+    that changed.** Under one global scale it was a theorem: `s_new` was the max
+    over a PARTITION of the particles, so `|rint(v/s_new)| <= 32767` could not
+    fail. Per brick it is false in general -- a fast particle drifting out of a
+    dense brick into a quiet one needs more range than the quiet brick's own
+    maximum provides -- so the caller must supply an `s_new` that already covers
+    every row it passes, and `_insert_slab` is the only place that can, because
+    it is the first point at which a brick's full post-migration membership is
+    known. The assertion below is not a formality: D-007 forbids the saturating
+    alternative, so a wrap here is silent corruption of the state.
     """
-    if s_old == s_new:
+    s_old = np.asarray(s_old, dtype=np.float64)
+    s_new = np.asarray(s_new, dtype=np.float64)
+    if s_old.shape == () and s_new.shape == () and s_old == s_new:
         return w
-    out = np.rint(np.asarray(w, dtype=np.float64) * (float(s_old) / float(s_new)))
+    w = np.asarray(w, dtype=np.int16)
+    if not len(w):
+        return w
+    ratio = np.divide(
+        s_old, s_new, out=np.zeros(np.broadcast(s_old, s_new).shape), where=s_new > 0.0
+    )
+    if ratio.ndim:
+        ratio = ratio[:, None]
+    out = np.rint(w.astype(np.float64) * ratio)
+    if np.abs(out).max(initial=0.0) > INT16_MAX:
+        raise ValueError(
+            f"velocity code {np.abs(out).max():.0f} escapes int16 under a rescale to a "
+            "scale that does not cover it. Per-brick scales make this reachable where a "
+            "global scale made it impossible; the caller must fix the destination scale "
+            "over the rows it is about to write. D-007 forbids the clamp."
+        )
     return out.astype(np.int16)
 
 
-def _cat(dest, off, w, ids):
+def _scales_from_sorted(absv_sorted, brick_counts):
+    """Per-brick velocity scale from a brick-major-sorted |v|_inf column.
+
+    `reduceat` rather than `np.maximum.at`: the latter is a ufunc.at loop and is
+    orders slower at IC scale, and this runs over every particle. Passing only
+    the starts of NON-EMPTY bricks is what makes it correct -- an empty brick has
+    zero width, so the segment between two non-empty starts is exactly the first
+    one's particles, and reduceat's documented misbehaviour on equal consecutive
+    indices (it returns the element rather than the identity) is never reached.
+
+    An empty brick, or one whose particles are all at rest, gets 1.0 rather than
+    0.0. A zero scale is not a smaller scale, it is a division by zero on the
+    next decode, and it would encode a genuinely-zero velocity no better.
+    """
+    n_bricks = len(brick_counts)
+    s = np.zeros(n_bricks, dtype=np.float64)
+    starts = np.zeros(n_bricks, dtype=np.int64)
+    np.cumsum(brick_counts[:-1], out=starts[1:])
+    nz = brick_counts > 0
+    if len(absv_sorted) and nz.any():
+        s[nz] = np.maximum.reduceat(np.asarray(absv_sorted, dtype=np.float64), starts[nz])
+    s /= INT16_MAX
+    return np.where(s > 0.0, s, 1.0)
+
+
+def _encode_at(v, scales_per_row):
+    """Quantize float velocities at a per-row scale. No clip: D-007."""
+    v = np.asarray(v, dtype=np.float64)
+    if not len(v):
+        return np.zeros((0, 3), dtype=np.int16)
+    w = np.rint(v / np.asarray(scales_per_row, dtype=np.float64)[:, None])
+    assert_int16_range(w)
+    return w.astype(np.int16)
+
+
+def _cat(dest, off, w, ids, src=None):
     out = dict(
         dest=np.concatenate(dest) if dest else np.empty(0, np.int64),
         off=np.concatenate(off) if off else np.empty((0, 3), np.uint8),
         w=np.concatenate(w) if w else np.empty((0, 3), np.int16),
     )
+    # The SOURCE brick, carried on emigrants only. An emigrant's code is written
+    # at its old brick's scale and can only be re-expressed at the destination's
+    # once that is fixed, so the reader needs to know which scale it is holding.
+    # Keepers do not carry it because their source IS `dest // buckets_per_brick`
+    # -- tagging them would put 4 B on the majority of staged rows to store what
+    # is already there.
+    if src is not None:
+        out["src"] = np.concatenate(src) if src else np.empty(0, np.int32)
     # The id column rides with the payload or it is worse than useless: it would
     # keep pointing at whoever USED to occupy the slot, so every id-based check
     # silently compares the wrong particles. Found exactly that way.
@@ -187,13 +255,16 @@ def _cat_dicts(ds):
             off=np.empty((0, 3), np.uint8),
             w=np.empty((0, 3), np.int16),
             ids=None,
+            src=np.empty(0, np.int32),
         )
     has_ids = ds[0].get("ids") is not None
+    has_src = ds[0].get("src") is not None
     return dict(
         dest=np.concatenate([d["dest"] for d in ds]),
         off=np.concatenate([d["off"] for d in ds]),
         w=np.concatenate([d["w"] for d in ds]),
         ids=np.concatenate([d["ids"] for d in ds]) if has_ids else None,
+        src=np.concatenate([d["src"] for d in ds]) if has_src else None,
     )
 
 
@@ -238,8 +309,15 @@ def brick_reach(st, c_drift, vel_scale=None):
     Peak staging is `2 * reach + 1` slabs, so this is also the knob that prices
     the migration's memory: reach 1 reproduces the original three-slab schedule
     exactly.
+
+    With per-brick scales the bound takes the MAX over bricks, which is still the
+    fastest particle present and so still nearly tight -- the fastest particle
+    sets its own brick's scale exactly. It is the whole grid's bound rather than
+    a per-brick one on purpose: the schedule is global, so a per-brick reach
+    would have to be reconciled into one number anyway, and taking the max is
+    that reconciliation.
     """
-    s = float(st.vel_scale if vel_scale is None else vel_scale)
+    s = float(np.max(st.vel_scale if vel_scale is None else vel_scale))
     nb = int(st.bricks_per_side)
     extent = float(st.t9.box_size) / nb
     if extent <= 0.0:
@@ -247,7 +325,7 @@ def brick_reach(st, c_drift, vel_scale=None):
     return int(np.ceil(abs(float(c_drift)) * s * INT16_MAX / extent))
 
 
-def drift_and_migrate(st, c_drift, vel_scale_new=None, max_staged_slabs=None):
+def drift_and_migrate(st, c_drift, max_staged_slabs=None):
     """Advance every particle by `c_drift * v` and re-home it. ONE pass.
 
     Drift and migration are not separable once positions are bucket-relative:
@@ -269,8 +347,14 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None, max_staged_slabs=None):
     which scales as N^(2/3).
     """
     nb = st.bricks_per_side
-    s_old = st.vel_scale
-    s_new = float(vel_scale_new) if vel_scale_new else s_old
+    # A SNAPSHOT, not a reference. `_insert_slab` rewrites a brick's scale as it
+    # writes that brick, while ejections still to come must decode at the
+    # PRE-migration scales. The schedule happens to eject a brick before
+    # inserting it, so the live array would give the same answer today -- which
+    # is exactly the kind of incidental correctness this module has been bitten
+    # by, so the two arrays are separated by construction instead. 8 B per brick,
+    # 16.8 MB at C-gh.
+    scales = np.array(st.vel_scale, dtype=np.float64, copy=True)
     # D-007 SAYS NOTHING MAY BE DROPPED AND NOTHING CHECKED IT HERE. The slab
     # schedule above releases a staged row once its destination slab has been
     # written, which is only safe under the one-brick-per-axis-per-step assumption
@@ -294,7 +378,7 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None, max_staged_slabs=None):
     # int16, so |v| <= vel_scale * INT16_MAX, and `vel_scale` is DEFINED as the
     # partition max of |v| over INT16_MAX -- so that product is the actual maximum
     # speed, not a pessimistic ceiling. No pass over the state is needed.
-    r_raw = brick_reach(st, c_drift, s_old)
+    r_raw = brick_reach(st, c_drift, scales)
     # CLAMP rather than refuse. On a periodic grid a reach of nb // 2 already
     # touches every slab, so beyond that the schedule is all-to-all and larger
     # values say nothing extra. Refusing here would confuse "needs more memory"
@@ -308,7 +392,7 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None, max_staged_slabs=None):
     consumed = {}  # emig rows an insert actually took, per source slab
     n_over, peak_staged, realized_reach = 0, 0, 0
     for s in range(nb):
-        staged[s], emig[s] = st._eject_slab(s, c_drift, s_old, s_new)
+        staged[s], emig[s] = st._eject_slab(s, c_drift, scales)
         consumed[s] = 0
         # the REALIZED x-reach, reported beside the bound: the bound said 2 at
         # cdev while every record claimed "at most one brick per axis", and the
@@ -322,7 +406,7 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None, max_staged_slabs=None):
             if d in inserted:
                 continue
             if all(((d + o) % nb) in emig for o in reach):
-                n_over += st._insert_slab(d, staged, emig, reach, consumed)
+                n_over += st._insert_slab(d, staged, emig, reach, consumed, scales=scales)
                 inserted.add(d)
         # release what no pending write can still need
         for s2 in list(staged):
@@ -357,8 +441,8 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None, max_staged_slabs=None):
                 f"the migration is holding {peak_staged} slabs against a budget of "
                 f"{max_staged_slabs}. The drift reaches {r_raw} bricks on a "
                 f"{nb}-brick grid, so {2 * r + 1} slabs must be in flight.\n"
-                f"  c_drift={c_drift:.6g}, vel_scale={s_old:.6g}, max |dx| = "
-                f"{abs(float(c_drift)) * float(s_old) * INT16_MAX:.6g} against a "
+                f"  c_drift={c_drift:.6g}, max vel_scale={float(np.max(scales)):.6g}, "
+                f"max |dx| = {abs(float(c_drift)) * float(np.max(scales)) * INT16_MAX:.6g} against a "
                 f"brick of {float(st.t9.box_size) / nb:.6g}.\n"
                 "  Reduce the step size, use a coarser brick, or raise the budget "
                 "deliberately -- staging is bounded by (2 * reach + 1) slabs, so "
@@ -382,10 +466,13 @@ def drift_and_migrate(st, c_drift, vel_scale_new=None, max_staged_slabs=None):
             "over 20 steps). A larger drift breaks it -- reduce the step size, or "
             "generalize the staging to the realized brick displacement."
         )
-    st.vel_scale = s_new
+    # NB no `st.vel_scale = ...` here: every brick's scale was fixed by its own
+    # insert, over the membership that insert actually wrote.
     # reach and peak staging REPORTED, so the memory bound is a measurement
     # every step rather than a docstring claim that held at one configuration
-    return dict(n_arena_overflow=n_over, arena_used=st.arena_used, vel_scale=s_new,
+    return dict(n_arena_overflow=n_over, arena_used=st.arena_used,
+                vel_scale=float(np.max(st.vel_scale)),
+                vel_scale_min=float(np.min(st.vel_scale)),
                 n_migrated_checked=n_after, brick_reach=r, brick_reach_raw=r_raw,
                 brick_reach_realized=realized_reach, peak_staged_slabs=peak_staged)
 
@@ -405,7 +492,12 @@ class SlotState:
     occupancy: np.ndarray  # uint32 (n_buckets,) THE index; also bucket bounds
     off: np.ndarray  # uint8 (n_alloc + n_arena, 3)
     w: np.ndarray  # int16 (n_alloc + n_arena, 3)
-    vel_scale: float
+    # float64 (n_bricks,) -- ONE SCALE PER BRICK, not per state. 8 B per brick is
+    # 16.8 MB at C-gh against the 274.9 GB `kick_pending` array a single global
+    # scale forces the engine to hold, because a global scale cannot be known
+    # until every tile has been kicked. See `_insert_slab` for where a brick's
+    # scale is fixed and why it cannot be fixed earlier.
+    vel_scale: np.ndarray
     arena_base: int
     arena_bucket: np.ndarray  # int64 (n_arena,) -1 where free
     n_particles: int
@@ -464,9 +556,11 @@ class SlotState:
 
         # the payload, written straight into slot order -- this is the whole point
         off_all, bijk = encode_positions_host(x, t9)
-        w_all, scale = encode_velocities(np.asarray(v, dtype=np.float64))
-        w_all = np.asarray(w_all)
-        assert_int16_range(w_all)
+        # ONE SCALE PER BRICK, taken over that brick's own particles. `order` is
+        # brick-major, so the reduction rides the sort the layout already needs.
+        v = np.asarray(v, dtype=np.float64)
+        scale = _scales_from_sorted(np.abs(v).max(axis=1)[order], brick_counts)
+        w_all = _encode_at(v, scale[brick])
 
         off = np.zeros((n_rows, 3), dtype=np.uint8)
         w = np.zeros((n_rows, 3), dtype=np.int16)
@@ -486,7 +580,7 @@ class SlotState:
             occupancy=_to_index(occupancy, index_dtype, "initial"),
             off=off,
             w=w,
-            vel_scale=float(scale),
+            vel_scale=scale,
             arena_base=n_alloc,
             arena_bucket=np.full(n_arena, -1, dtype=np.int64),
             n_particles=n,
@@ -640,12 +734,19 @@ class SlotState:
 
     # ---------------------------------------------------------- decoding
 
-    def decode_brick(self, brick_flat):
+    def decode_brick(self, brick_flat, scales=None):
         """(slots, x, v) for every particle of this brick, arena included.
 
         O(brick) floats -- ~4096 particles at C-gh, about 100 KB. Nothing here
         is ever O(N) in floats; a global (n,3) f64 array is 206 GB at C-gh and
         deleting it is D-v2-16 clause 1.
+
+        `scales` overrides `self.vel_scale`, and the migration passes a SNAPSHOT
+        taken before any brick was rewritten. That is structural rather than
+        defensive: `_insert_slab` rewrites a brick's scale in place, so a decode
+        that read the live array would be correct only for as long as the
+        schedule happens to eject every brick before inserting it. Making the
+        caller name the array it means removes the dependence on that ordering.
         """
         lo = int(self.brick_start[brick_flat])
         m = self.brick_live_count(brick_flat)
@@ -661,7 +762,8 @@ class SlotState:
             )
             bijk = np.concatenate([bijk, a_b])
         x = decode_positions_host(self.off[slots], bijk, self.t9)
-        v = self.w[slots].astype(np.float64) * self.vel_scale
+        s = (self.vel_scale if scales is None else scales)[brick_flat]
+        v = self.w[slots].astype(np.float64) * s
         return slots, x, v
 
     # ---------------------------------------------------------- the check
@@ -802,16 +904,20 @@ class SlotState:
                     out.append((bi * nb + bj) * nb + bk)
         return out
 
-    def decode_bricks(self, bricks):
+    def decode_bricks(self, bricks, scales=None):
         """(slots, x, v) over a list of bricks, concatenated.
 
         O(tile) floats. The tile is the largest float working set on the engine
         path, by design: a global (n,3) f64 array is 206 GB at C-gh and deleting
         both of them is D-v2-16 clause 1.
+
+        Rows stay grouped by brick in the order `bricks` gives, which the kick
+        relies on: it fixes one scale per brick, and a brick's rows being
+        contiguous is what lets it do that without a sort.
         """
         s, xs, vs = [], [], []
         for b in bricks:
-            sl, x, v = self.decode_brick(b)
+            sl, x, v = self.decode_brick(b, scales=scales)
             if len(sl):
                 s.append(sl)
                 xs.append(x)
@@ -842,7 +948,7 @@ class SlotState:
         nb = self.bricks_per_side
         return int(bx) * nb * nb, (int(bx) + 1) * nb * nb
 
-    def _eject_slab(self, bx, c_drift, s_old, s_new):
+    def _eject_slab(self, bx, c_drift, scales):
         """Drift one slab's particles and split them into keepers and leavers.
 
         Reads the state; writes NOTHING back. That phase separation is what makes
@@ -855,9 +961,9 @@ class SlotState:
         lo_b, hi_b = self.slab_bricks(bx)
         p3 = self.buckets_per_brick
         k_dest, k_off, k_w, k_id = [], [], [], []
-        e_dest, e_off, e_w, e_id = [], [], [], []
+        e_dest, e_off, e_w, e_id, e_src = [], [], [], [], []
         for b in range(lo_b, hi_b):
-            slots, x, v = self.decode_brick(b)
+            slots, x, v = self.decode_brick(b, scales=scales)
             if not len(slots):
                 continue
             # `decode_brick` returns this brick's ARENA residents too, so they are
@@ -882,29 +988,49 @@ class SlotState:
             b_ijk = i_new // LEVELS_PER_BUCKET
             off_new = (i_new - b_ijk * LEVELS_PER_BUCKET).astype(np.uint8)
             dest = _bucket_flat_brick_major(b_ijk, self.t9, self.bricks_per_side)
-            # re-express the velocity at the new global scale (see `drift_and_migrate`)
-            w_new = _rescale_w(self.w[slots], s_old, s_new)
+            # NO RESCALE HERE, and that is the change per-brick scales force. A
+            # row leaves at its OWN brick's scale and is re-expressed once, in
+            # `_insert_slab`, at the destination's -- which cannot be known here
+            # because it depends on every other brick that sends to that
+            # destination. Rescaling twice (out to a common scale, then in) would
+            # round twice where this rounds once.
+            w_cur = self.w[slots]
             stay = (dest // p3) == b
             ids_b = self.ids[slots] if self.ids is not None else None
             k_dest.append(dest[stay])
             k_off.append(off_new[stay])
-            k_w.append(w_new[stay])
+            k_w.append(w_cur[stay])
             k_id.append(ids_b[stay] if ids_b is not None else None)
             e_dest.append(dest[~stay])
             e_off.append(off_new[~stay])
-            e_w.append(w_new[~stay])
+            e_w.append(w_cur[~stay])
             e_id.append(ids_b[~stay] if ids_b is not None else None)
+            e_src.append(np.full(int((~stay).sum()), b, dtype=np.int32))
         return (
             _cat(k_dest, k_off, k_w, k_id),
-            _cat(e_dest, e_off, e_w, e_id),
+            _cat(e_dest, e_off, e_w, e_id, src=e_src),
         )
 
-    def _insert_slab(self, bx, staged, emig, reach=(-1, 0, 1), consumed=None):
+    def _insert_slab(self, bx, staged, emig, reach=(-1, 0, 1), consumed=None, scales=None):
         """Write one slab's bricks back: keepers + immigrants + arena residents.
 
         Every brick's final membership passes through an O(brick) buffer here, so
         this is also where a bucket that outgrew its brick escalates -- spare,
         then arena, then a loud refusal, with no clamp anywhere (D-007).
+
+        **It is also the only place a brick's velocity scale can be fixed**, and
+        that is a consequence of deleting the global scale rather than a choice.
+        A scale must cover every row it encodes. Under one global scale the kick
+        could compute that by reducing over tiles, at the price of holding every
+        tile's new velocities until the last tile was done -- 274.9 GB at C-gh.
+        Per brick, the kick can only see the rows it owns NOW, and a brick's
+        membership changes under it during the drift. Here, and only here, both
+        halves are in hand: the keepers this brick retained and the immigrants
+        every reaching slab sent it. So the scale is taken over the union and
+        every row is expressed at it, in one rounding.
+
+        `scales` is the pre-migration snapshot, needed because a row arrives
+        holding a code written at its SOURCE brick's scale.
         """
         nb = self.bricks_per_side
         p3 = self.buckets_per_brick
@@ -944,12 +1070,30 @@ class SlotState:
                     imm["off"][sel_i] if has_i else np.empty((0, 3), np.uint8),
                 ]
             )
+            w_k = keep["w"][sel_k]
+            w_i = imm["w"][sel_i] if has_i else np.empty((0, 3), np.int16)
+            # THE SCALE, over the union and before anything is written. Keepers
+            # hold codes at this brick's own pre-migration scale; immigrants hold
+            # codes at whichever brick sent them. Both are turned back into
+            # physical magnitudes to take the max, then everything is expressed
+            # once at the result -- so the only rounding a row sees this step is
+            # this one.
+            s_k = float(scales[b])
+            s_i = scales[imm["src"][sel_i]] if has_i and imm.get("src") is not None else None
+            vmax = 0.0
+            if len(w_k):
+                vmax = max(vmax, float(np.abs(w_k).max()) * s_k)
+            if len(w_i):
+                vmax = max(vmax, float((np.abs(w_i).max(axis=1) * s_i).max()))
+            s_b = vmax / INT16_MAX
+            s_b = s_b if s_b > 0.0 else 1.0
             w = np.concatenate(
                 [
-                    keep["w"][sel_k],
-                    imm["w"][sel_i] if has_i else np.empty((0, 3), np.int16),
+                    _rescale_w(w_k, s_k, s_b),
+                    _rescale_w(w_i, s_i, s_b) if len(w_i) else w_i,
                 ]
             )
+            self.vel_scale[b] = s_b
             ids = None
             if self.ids is not None:
                 ids = np.concatenate(
@@ -1111,6 +1255,10 @@ class SlotState:
         n = float(self.n_particles)
         index = self.n_buckets * self.occupancy.dtype.itemsize / n
         brick_csr = (len(self.brick_start)) * 8 / n
+        # what per-brick velocity scales cost, counted rather than described.
+        # 8 B per brick against the 32 B PER PARTICLE the global scale forced the
+        # engine to hold: 16.8 MB against 274.9 GB at C-gh.
+        scales = len(np.atleast_1d(self.vel_scale)) * 8 / n
         slack = (self.n_slots - self.n_particles) * payload / n
         arena = self.n_arena * (payload + 8) / n
         ids = (0.0 if self.ids is None else 4.0)
@@ -1121,6 +1269,7 @@ class SlotState:
             slack=slack,
             arena=arena,
             ids=ids,
-            total=payload + index + brick_csr + slack + arena + ids,
+            brick_scales=scales,
+            total=payload + index + brick_csr + slack + arena + ids + scales,
             scaffold=0.0,
         )

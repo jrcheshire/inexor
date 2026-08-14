@@ -205,7 +205,7 @@ def test_the_round_trip_is_exact_to_the_quantum_and_the_velocity_scale():
         a = np.sort(got_x[:, ax])
         e = np.sort(np.mod(np.rint(x[:, ax] / st.t9.quantum), st.t9.n_levels) * st.t9.quantum)
         assert np.allclose(a, e, atol=0.51 * st.t9.quantum), f"axis {ax} positions moved"
-    assert np.max(np.abs(np.sort(got_v.ravel()) - np.sort(v.ravel()))) <= st.vel_scale
+    assert np.max(np.abs(np.sort(got_v.ravel()) - np.sort(v.ravel()))) <= st.vel_scale.max()
 
 
 def test_ids_follow_their_particle_through_the_reordering():
@@ -251,14 +251,24 @@ def test_the_int32_key_ceiling_is_not_reachable_because_key_is_gone():
 def test_the_all_in_cost_lands_near_the_ratified_figure():
     """D-v2-20's ~10.54 B/p: payload 9.00 + index 0.50 + brick CSR + slack +
     arena. The fixture's bucket grid is far coarser per particle than C-gh's, so
-    this is a shape check on the accounting, not a reproduction of the number."""
+    this is a shape check on the accounting, not a reproduction of the number.
+
+    `brick_scales` JOINED the sum when velocity scales went per brick, so the
+    all-in figure moved -- on this fixture by 0.002 B/p, and at C-gh by 0.0020
+    (16.8 MB over 8.59e9 particles). Recorded here rather than absorbed: the
+    ratified number is a number of record, and it is now larger by a term that
+    bought the deletion of 274.9 GB. The trade is the point, and a silent bump
+    would hide both halves of it.
+    """
     _, _, st = _built(9)
     bpp = st.bytes_per_particle()
     assert bpp["payload"] == 9.0
     assert bpp["ids"] == 0.0
     assert bpp["total"] == pytest.approx(
-        sum(bpp[k] for k in ("payload", "bucket_index", "brick_start", "slack", "arena", "ids"))
+        sum(bpp[k] for k in ("payload", "bucket_index", "brick_start", "slack", "arena",
+                             "ids", "brick_scales"))
     )
+    assert bpp["brick_scales"] > 0.0, "the per-brick scales must be counted, not implied"
     # slack is the pooled 10%, and pooling per BRICK is what makes it 10% rather
     # than the 12.5% floor per-bucket granularity forces (D-v2-19 clause 1)
     assert 0.5 < bpp["slack"] < 1.6, f"slack {bpp['slack']:.3f} B/p is not the pooled 10%"
@@ -301,18 +311,27 @@ def test_free_slots_need_no_sentinel():
 # ==================================== drift and re-home (S3/S4, one fused pass)
 
 
-def _drifted_reference(x, v, c, t9, vel_scale):
+def _drifted_reference(x, v, c, t9, scales, bricks_per_side):
     """Where every particle should land, computed independently of the pass.
 
     Starts from what the container actually HOLDS, not from the caller's inputs:
     the stored position is on the T9 lattice and the stored velocity is an int16
-    code at `vel_scale`. Referencing the raw inputs instead makes particles
-    within half a quantum of a bucket face disagree for a legitimate reason and
-    reads as a bug in the exchange -- which is how this helper was first written.
+    code at ITS OWN BRICK's scale. Referencing the raw inputs instead makes
+    particles within half a quantum of a bucket face disagree for a legitimate
+    reason and reads as a bug in the exchange -- which is how this helper was
+    first written.
+
+    The brick is re-derived from the position through `bucket_order_key`, the
+    same definition `SlotState.build` quantizes against, rather than read back
+    out of the container. Reading it back would make this compare the pass with
+    itself.
     """
     q = t9.quantum
     i0 = np.mod(np.rint(x / q).astype(np.int64), t9.n_levels)
-    v_q = np.rint(v / vel_scale).astype(np.int16).astype(np.float64) * vel_scale
+    key, _, _ = layout.bucket_order_key(x, t9, int(bricks_per_side))
+    per3 = (t9.n_buckets_side // int(bricks_per_side)) ** 3
+    s = np.asarray(scales)[key // per3][:, None]
+    v_q = np.rint(v / s).astype(np.int16).astype(np.float64) * s
     i = np.mod(np.rint(i0 + (c * v_q) / q).astype(np.int64), t9.n_levels)
     return i // 256
 
@@ -333,7 +352,7 @@ def test_every_particle_lands_in_the_bucket_its_drifted_position_calls_for():
     destination rather than against the pass's own arithmetic."""
     x, v, st = _built(21, with_ids=True)
     c = 0.05
-    want = _drifted_reference(x, v, c, st.t9, st.vel_scale)
+    want = _drifted_reference(x, v, c, st.t9, st.vel_scale, st.bricks_per_side)
     state.drift_and_migrate(st, c)
     st.check()
     for b in range(st.n_bricks):
@@ -356,7 +375,7 @@ def test_particles_cross_bucket_brick_and_the_periodic_seam():
     st = state.SlotState.build(x, v, _t9(), BRICKS, with_ids=True, arena_frac=0.25)
     c = 1.0
     before_b = np.mod(np.rint(x / st.t9.quantum).astype(np.int64), st.t9.n_levels) // 256
-    after_b = _drifted_reference(x, v, c, st.t9, st.vel_scale)
+    after_b = _drifted_reference(x, v, c, st.t9, st.vel_scale, st.bricks_per_side)
     per = st.t9.n_buckets_side // st.bricks_per_side
     nbk = st.t9.n_buckets_side
 
@@ -407,7 +426,7 @@ def test_a_multi_brick_x_mover_survives_and_lands_right():
     st = state.SlotState.build(x, v, _t9(), nb4, with_ids=True, arena_frac=0.25)
     c = 1.0
     assert state.brick_reach(st, c) >= 2, "fixture does not reach 2 bricks"
-    want = _drifted_reference(x, v, c, st.t9, st.vel_scale)
+    want = _drifted_reference(x, v, c, st.t9, st.vel_scale, st.bricks_per_side)
     state.drift_and_migrate(st, c)
     assert st.check() is True
     assert st.n_live == len(x)
@@ -431,8 +450,8 @@ def test_the_release_census_fires_on_a_dropped_emigrant(monkeypatch):
     """
     orig = state.SlotState._insert_slab
 
-    def pinned(self, bx, staged, emig, reach=(-1, 0, 1), consumed=None):
-        return orig(self, bx, staged, emig, (-1, 0, 1), consumed)
+    def pinned(self, bx, staged, emig, reach=(-1, 0, 1), consumed=None, scales=None):
+        return orig(self, bx, staged, emig, (-1, 0, 1), consumed, scales=scales)
 
     monkeypatch.setattr(state.SlotState, "_insert_slab", pinned)
     x = _positions(30)
@@ -453,8 +472,8 @@ def test_a_particle_is_drifted_exactly_once():
     single-drift reference catches it -- and the ids make it per particle."""
     x, v, st = _built(23, with_ids=True)
     c = 0.08
-    once = _drifted_reference(x, v, c, st.t9, st.vel_scale)
-    twice = _drifted_reference(x, v, 2 * c, st.t9, st.vel_scale)
+    once = _drifted_reference(x, v, c, st.t9, st.vel_scale, st.bricks_per_side)
+    twice = _drifted_reference(x, v, 2 * c, st.t9, st.vel_scale, st.bricks_per_side)
     assert np.any(once != twice), "the fixture cannot tell one drift from two"
     state.drift_and_migrate(st, c)
     for b in range(st.n_bricks):
@@ -490,10 +509,15 @@ def test_rescaling_a_velocity_code_never_escapes_int16():
 
 def test_a_changed_velocity_scale_moves_no_particle_further_than_one_quantum():
     x, v, st = _built(26)
-    s0 = st.vel_scale
-    state.drift_and_migrate(st, 0.0, vel_scale_new=s0 * 1.7)
+    s0 = st.vel_scale.copy()
+    # There is no external scale setter any more: a brick's scale is fixed by
+    # `_insert_slab` over the membership it writes. A zero drift keeps every
+    # particle where it is, so every brick re-derives the SAME scale from the
+    # same rows -- which is the degenerate case worth pinning, because it says
+    # the re-derivation is idempotent rather than drifting a little each step.
+    state.drift_and_migrate(st, 0.0)
     assert st.check() is True
-    assert st.vel_scale == pytest.approx(s0 * 1.7)
+    assert np.array_equal(st.vel_scale, s0), "a zero drift moved a brick's scale"
     seen = 0
     for b in range(st.n_bricks):
         slots, _, vb = st.decode_brick(b)

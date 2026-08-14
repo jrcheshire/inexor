@@ -47,11 +47,17 @@ from .state import (
     SlotState,
     _alloc_geometry,
     _bucket_flat_brick_major,
+    _encode_at,
+    _scales_from_sorted,
     encode_positions_host,
-    encode_velocities_host,
 )
 
-SCHEMA = "t9-slabs-1"
+# BUMPED at per-brick velocity scales (M-v2-6). A `-1` slab stores ONE scale for
+# the whole state; a `-2` slab stores one per brick. The arrays are otherwise
+# identical, so a `-1` file would load without error and decode every velocity
+# at the wrong scale -- silently, and by a factor that varies brick to brick.
+# Refusing it is the only way that cannot happen.
+SCHEMA = "t9-slabs-2"
 MANIFEST = "manifest.json"
 
 
@@ -214,25 +220,38 @@ def generate_t9_slabs(
         keyf = np.concatenate([p[0] for p in parts]) if parts else np.empty(0, np.int64)
         off = (np.concatenate([p[1] for p in parts]) if parts
                else np.empty((0, 3), np.uint8))
-        w = (np.concatenate([p[2] for p in parts]) if parts
-             else np.empty((0, 3), np.int16))
+        v = (np.concatenate([p[2] for p in parts]) if parts
+             else np.empty((0, 3), np.float64))
         order = _stable_sort_index(keyf)
-        keyf, off, w = keyf[order], off[order], w[order]
+        keyf, off, v = keyf[order], off[order], v[order]
         lo_bucket = d * nb * nb * per3
         occ = np.bincount(keyf - lo_bucket, minlength=nb * nb * per3).astype(np.int64)
+        # ONE SCALE PER BRICK, over this slab's bricks only -- which is sound
+        # because a brick belongs to exactly one x-slab, so no other slab can
+        # contribute to it. `keyf` is ascending and buckets are brick-major, so
+        # the rows are already grouped by brick and the same reduction
+        # `SlotState.build` performs applies unchanged. Encoding through the
+        # identical helper is what makes the bitwise gate against `build` hold by
+        # construction rather than by two implementations agreeing.
+        lo_brick = d * nb * nb
+        bcounts = occ.reshape(nb * nb, per3).sum(axis=1)
+        scale_d = _scales_from_sorted(np.abs(v).max(axis=1), bcounts)
+        w = _encode_at(v, scale_d[keyf // per3 - lo_brick])
         meta = dict(
             schema=SCHEMA,
             bx=d,
             n_rows=int(len(keyf)),
             bucket_lo=int(lo_bucket),
+            brick_lo=int(lo_brick),
             crc32=dict(
                 occupancy=zlib.crc32(occ.tobytes()),
                 off=zlib.crc32(off.tobytes()),
                 w=zlib.crc32(w.tobytes()),
+                scale=zlib.crc32(scale_d.tobytes()),
             ),
         )
         path = os.path.join(workdir, f"t9_slab_{d:04d}.npz")
-        np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w)
+        np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w, scale=scale_d)
         staged[d].clear()
         written.append(os.path.basename(path))
         return len(keyf)
@@ -256,8 +275,7 @@ def generate_t9_slabs(
                 v_ch[:, ax] = v_ro[ax].read_slab(c0, c1).astype(np.float64).reshape(-1)
             off, bijk = encode_positions_host(x_ch, t9)
             keyf = _bucket_flat_brick_major(bijk, t9, nb)
-            w = encode_velocities_host(v_ch, scale)
-            del x_ch, v_ch, bijk
+            del x_ch, bijk
             bx_dest = keyf // (nb * nb * per3)
             ring = (bx_dest - src) % nb
             bad = ~((ring <= window) | (ring >= nb - window))
@@ -268,7 +286,13 @@ def generate_t9_slabs(
                 )
             for d in np.unique(bx_dest):
                 m = bx_dest == d
-                staged[int(d)].setdefault(src, []).append((keyf[m], off[m], w[m]))
+                # the FLOAT velocity is staged, not a code. A brick's scale is a
+                # max over contributors that arrive from several source slabs, so
+                # it is not known until `_finalize`; encoding here and re-encoding
+                # there would round twice where `SlotState.build` rounds once, and
+                # the bitwise gate against it would fail for that reason alone.
+                # Costs 24 B/row instead of 6 over a window of slabs.
+                staged[int(d)].setdefault(src, []).append((keyf[m], off[m], v_ch[m]))
             n_total += len(keyf)
         done_src[src] = True
         for d in range(nb):
@@ -340,11 +364,13 @@ def load_slot_state(
 
     slabs = []
     occupancy = np.empty(n_bricks * per3, dtype=np.int64)
+    # one scale per brick, reassembled from the slabs that own them
+    vel_scale = np.ones(n_bricks, dtype=np.float64)
     for fname in man["files"]:
         with np.load(os.path.join(workdir, fname)) as z:
             meta = json.loads(str(z["meta"]))
-            occ, off, w = z["occupancy"], z["off"], z["w"]
-        for name, arr in (("occupancy", occ), ("off", off), ("w", w)):
+            occ, off, w, sc = z["occupancy"], z["off"], z["w"], z["scale"]
+        for name, arr in (("occupancy", occ), ("off", off), ("w", w), ("scale", sc)):
             crc = zlib.crc32(arr.tobytes())
             if crc != meta["crc32"][name]:
                 raise ValueError(
@@ -353,6 +379,7 @@ def load_slot_state(
                 )
         d = int(meta["bx"])
         occupancy[d * nb * nb * per3 : (d + 1) * nb * nb * per3] = occ
+        vel_scale[d * nb * nb : (d + 1) * nb * nb] = sc
         slabs.append((d, off, w, occ))
 
     brick_counts = occupancy.reshape(n_bricks, per3).sum(axis=1)
@@ -379,7 +406,7 @@ def load_slot_state(
         occupancy=_to_index(occupancy, index_dtype, "initial"),
         off=off_all,
         w=w_all,
-        vel_scale=float(man["vel_scale"]),
+        vel_scale=vel_scale,
         arena_base=n_alloc,
         arena_bucket=np.full(n_arena, -1, dtype=np.int64),
         n_particles=n,
