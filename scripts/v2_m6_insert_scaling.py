@@ -75,6 +75,37 @@ BOX = 128.0
 BUCKET_CELLS = 2
 
 
+def _validate_rungs(rungs):
+    """Refuse an illegal ladder BEFORE any rung runs.
+
+    Job 456's control arm died six seconds in on `n_part=192`: the T9 lattice
+    needs a power-of-two level count (`n_part * 256 / bucket_cells`), so 192 is
+    not constructible, and the layout refused exactly as it should. The defect
+    was mine and it was in the FIXTURE -- and the local smoke could not have
+    caught it, because the smoke used 32 and 64 and both are legal. That is the
+    same class as the two jobs earlier in this milestone that died on a print:
+    a value that had never been evaluated until the cluster evaluated it.
+
+    So the ladder is constructed and checked here, cheaply, before the first
+    build. `T9Layout` raises on the power-of-two condition and the divisibility
+    of the bucket grid by the brick count is asserted beside it.
+    """
+    bad = []
+    for n_part, nb in rungs:
+        try:
+            t9 = T9Layout(BOX, int(n_part), BUCKET_CELLS)
+        except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+            bad.append(f"n_part={n_part}: {exc}")
+            continue
+        if t9.n_buckets_side % int(nb):
+            bad.append(
+                f"n_part={n_part}, nb={nb}: bricks_per_side must divide the "
+                f"{t9.n_buckets_side} bucket grid"
+            )
+    if bad:
+        raise SystemExit("ILLEGAL LADDER, refusing before any rung runs:\n  " + "\n  ".join(bad))
+
+
 def _build(n_part, nb, seed=SEED):
     """A uniform-random state at (n_part, nb). Positions are random rather than
     grid-like on purpose: a lattice puts every particle at a bucket centre and
@@ -197,20 +228,30 @@ def main(argv=None):
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args(argv)
 
+    # THE LADDERS, declared before they are run so `_validate_rungs` can refuse
+    # an illegal one up front rather than partway through (job 456's control arm
+    # died six seconds in on a fixture I had never evaluated).
     if args.arm == "smoke":
-        # tiny, and it exercises BOTH ladders' code paths end to end
-        rungs = [_rung(32, 8, 1), _rung(32, 16, 1), _rung(64, 8, 1)]
-        axis = "smoke"
+        # tiny, and it exercises BOTH ladders' code paths end to end. NB it
+        # cannot validate the other arms' fixtures -- every value here is legal,
+        # which is precisely why 456's bad rung got past it.
+        ladder, axis, reps = [(32, 8), (32, 16), (64, 8)], "smoke", 1
     elif args.arm == "bricks":
-        # ARM A: particles fixed, brick count doubling. nb must divide the
-        # bucket grid (n_part / BUCKET_CELLS = 128 here), so 8/16/32 are legal
-        # and 24 is not.
-        rungs = [_rung(256, nb, args.repeats) for nb in (8, 16, 32)]
-        axis = "bricks_per_side at fixed n_part=256"
+        # ARM A: particles fixed, brick count doubling.
+        ladder = [(256, nb) for nb in (8, 16, 32)]
+        axis, reps = "bricks_per_side at fixed n_part=256", args.repeats
     else:
-        # ARM B (control): brick count fixed, particles varied 8x
-        rungs = [_rung(n, 16, args.repeats) for n in (128, 192, 256)]
-        axis = "n_part at fixed bricks_per_side=16"
+        # ARM B (control): brick count fixed, particles varied 64x.
+        # `n_part` must be a POWER OF TWO -- the T9 lattice needs
+        # `n_part * 256 / bucket_cells` levels to be one, or the periodic wrap
+        # would saturate instead of wrapping (D-007). 192 is not, which is what
+        # killed this arm in job 456; 64/128/256 are, and each keeps the bucket
+        # grid divisible by nb=16.
+        ladder = [(n, 16) for n in (64, 128, 256)]
+        axis, reps = "n_part at fixed bricks_per_side=16", args.repeats
+
+    _validate_rungs(ladder)
+    rungs = [_rung(n_part, nb, reps) for n_part, nb in ladder]
 
     res = dict(
         arm=args.arm,
