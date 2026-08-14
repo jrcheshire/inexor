@@ -266,6 +266,87 @@ things must travel with those numbers:
   K=40 was not run** -- the anchor's retention at the ratified cadence is
   unmeasured, and that is the number a promote-to-default decision rests on.
 
+## 3c. The trim SCHEDULE (antares 453): the light touch is falsified, the anchor is not
+
+Three legs rc=0, ~5.5 h, zero SU, `6898ec5`. Cards
+`runs/v2/m6_peak_trimsched_*.json`. The arm exists because section 3b(e) could
+not price the proposed default: `trim` fires at every phase boundary and
+`trim_step` once per step, a factor of 263 apart at cdev8. Knob proof on the
+cards, exactly as pre-registered: `trim_calls` = 10,522 / 40 / 0 at cdev8 and
+1,562 / 40 at cdev.
+
+| config | trace | `trim` (all boundaries) | `trim_step` (1/step) |
+|---|---|---|---|
+| cdev8 K=40 | 2.016 GB | 1.294 (-35.8%), 15.00 s/step | **2.124 (0%)**, 13.07 s/step |
+| cdev K=40 | 7.727 (452) | **6.533 (-15.5%)**, 62.10 s/step | 7.333 (-5.1%), 61.43 s/step |
+
+**(a) The pre-registered falsifier FIRED.** `trim_step` was to land nearer `trim`
+than trace; at cdev8 it lands AT trace, past the 1.71 GB line. The reasoning it
+came from was wrong in a specific way worth keeping: 452's trim arm sits 1.072 GB
+under trace at a step's first boundary and 0.828 under at its last, which I read
+as the periodic reset doing the work -- but that 1.072 GB gap **is itself the
+accumulated product of the previous steps' mid-step calls**. Remove them and the
+mechanism that built it goes too. The caveat was noted when the prediction was
+written and the optimistic reading was pre-registered anyway, which is exactly
+what pre-registration is for.
+
+**(b) The anchor inverts the economics, and it is the config that matters.** Full
+trim costs **+15.0% wall at cdev8 but +1.6% at cdev**, because cdev has 39 phase
+boundaries per step against cdev8's 263. Boundary count falls as tiles grow, so
+the trade IMPROVES toward production: 15.5% of peak for 1.6% of wall at the
+anchor. Retention itself still shrinks with config size (12% cdev K=5, 15.5% cdev
+K=40, 32% cdev8 K=5, 35.8% cdev8 K=40), so neither figure may be carried to C-gh.
+
+**(c) Still an instrument, still JC's call.** Promoting `trim` to an operating
+point is a ratification (the `cap_mult` precedent), not a code change.
+
+## 3d. The host-byte instrument, and why the config ladder could not do this
+
+`scripts/v2_m6_host_bytes.py` measures what the engine ALLOCATES rather than what
+the process holds: exact, deterministic, laptop, ~90 s at cdev8. Technique and
+its blind spots are in its module docstring; the peak is bit-identical across
+runs where an RSS peak scatters 44-282 MB.
+
+**The ladder is degenerate for attribution.** particles / coarse cells / tile
+kernels scale 64.00x / 64.00x / 61.18x from smoke to cdev8 -- by construction,
+since the config table fixes the fine cell and grows volume. Per-phase ratios
+landed at 35-52x and matched none of them; a model revised on that data would
+have been attributing by coincidence. What worked was arms moving ONE axis:
+
+| arm | moves | result |
+|---|---|---|
+| `coarse_div` 1->2 | cells /8 at fixed particles | `coarse_solve` 14.19 -> 1.94 MB (7.3x); `coarse_paint` moves only -1.91 MB against a derived -1.84; `membership`/`tile_short` EXACTLY identical |
+| `slack` 0.2->0.5 | rows 1.217x at fixed particles | **every per-step phase 1.000x**; only the state moves (1.188x) |
+| cdev vs cdev8 | phalf 15.48x vs particles 8.00x | `membership` 1319.45 MB against a pre-registered 1326 (all-kernel), 1067 (mixed), 685 (all-particle) |
+
+**What went into the planner** (`engine.mesh_bytes`/`step_bytes`, commits
+`7908b54` and `d8798ee`), each derived from source and checked at two configs:
+- `tile_kernel_build_f64` + `tile_kernel_pref`: `split_kernels` holds `k2_true`,
+  `k2_safe`, `fac` and `pref` live while building the three complex kernels, so a
+  build peaks at 80*phalf where this modelled 48. The `ik_j` are LOW-RANK
+  broadcasts, which is why the factor is exactly 5/3. Modelled vs measured 85.20
+  / 85.60 MB at cdev8 and 1318.91 / 1319.45 at cdev. The coarse arm always
+  carried the analogous term.
+- `coarse_kernel_pref`, the same omission on the coarse arm.
+- `coarse_force_copy_transient`: `[np.asarray(g) for g in g_coarse]` rebinds only
+  after the comprehension, so both copies are live.
+- `migrate_staging = 190 B * N / bricks_per_side`: **N^(2/3), not N**, because
+  `drift_and_migrate` walks x-slabs and releases each as soon as every write that
+  could reach it has happened. The coefficient agreeing across 8x in N (181.7 vs
+  198.9 B per slab-particle) is what tests the shape. **12.75 GB at C-gh against
+  1632 GB for an O(N) reading.** `lead_drift` is the same function but completes
+  before the loop, so it is never co-resident and is not added.
+
+**The cdev floor moves 3.783 -> 3.982 GB against a measured 7.461** (1.97x ->
+1.87x low). It is still a floor. **The C-gh verdict is unchanged**: `kick_pending`
+274.9 GB, 2.37x a 116 GB host.
+
+**Unattributed, and stopped deliberately:** `tile_reduce` (200 MB) and
+`reconcile` (127 MB) at cdev. Their cdev8 values are 7.53 and 2.73 MB, so the
+26.6x / 46.4x ratios are fragile against a fixed overhead. `tile_reduce` is in
+the tile loop, so `cap` is the suspect and isolating it needs an engine seam
+(`engine.run` hardcodes the initial `cap_shape = 0`).
+
 ## 4. The leading cause, measured and now fixed
 
 `coarse_delta_streamed` sized its chunk buffer from the current occupancy
