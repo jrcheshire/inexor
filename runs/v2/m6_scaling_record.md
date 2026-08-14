@@ -187,6 +187,43 @@ actually set -- not its final 4.295 GB. That would explain a partial drop
 without anything being wrong. Confirming it needs a run with only one of the two
 changes, which does not exist.
 
+## 5c. Job 460 -- the matched-knob cdev point, and a confound I failed to control
+
+Same code, machine, cores, legs, K and knobs as 459; only the configuration
+moves. This is the first cdev/cgh64 pair on record that is comparable at all.
+
+| | cdev (460) | cgh64 (459) | ratio |
+|---|---|---|---|
+| particles | 1.68e7 | 1.34e8 | 8.0x |
+| s/step | **48.53** | 608.67 | **12.54x** |
+| peak host RSS | 6.851 GB | 11.600 GB | 1.69x |
+| mean staged slabs (2r+1) | 3.67 | 6.33 | 1.73x |
+| `cap` (per-tile capacity) | 4.19-5.28e6 | 5.28-6.66e6 | ~1.1x |
+
+12.54x for 8x the particles is an effective exponent of **1.22** -- down from
+1.67 before the fix, and by this job's own pre-registration ("below ~50 s/step a
+superlinear term survives") that is the superlinear branch.
+
+**It should not be read that way, and the reason is a confound of mine.**
+Staging depth was NOT held fixed between the two runs: cdev drifted at reach
+[1,2,1] and cgh64 at [3,3,2]. That is 1.73x more staged data per step, and
+8 x 1.73 = **13.8x**, which brackets the measured 12.54x with nothing left over
+for an algorithmic term. Section 4 of this record explains at length why an
+unpinned depth makes an arm unreadable, and pins it in the probe for exactly
+that reason. I then built this pair and let it float.
+
+**The depth difference is physical rather than a defect.** Brick extent is
+IDENTICAL at both configurations -- 8 Mpc/h -- because the config table holds
+the fine cell fixed and grows the box, so nb scales with L. Depth differs
+because the larger box carries higher peak velocities, so a particle crosses
+more bricks per step. That is the simulation being bigger.
+
+**One clean result falls out**, and it is the first confirmation of it on
+matched runs rather than by derivation: `cap` barely moves between the two
+configurations, so the per-tile working set does not grow with the box. That is
+why the peak rises only 1.69x for 8x the particles, and it is the planner's own
+claim that cdev, cgh64 and C-gh share particles-per-tile and padded tile side.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
