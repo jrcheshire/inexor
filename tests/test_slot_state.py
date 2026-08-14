@@ -632,3 +632,106 @@ def test_grouping_by_brick_takes_the_radix_path_where_the_range_allows():
         for j in np.unique(brick_of_row):
             want = np.flatnonzero(brick_of_row == j)
             assert np.array_equal(order[off[j] : off[j + 1]], want)
+
+
+# ================================================== repack, in place (M-v2-6)
+# The out-of-place form allocates 11.1 B/row (measured, flat over 64x in N) and
+# ~115 GB at C-gh -- the largest single term left after the velocity array went.
+# D-v2-19 clause 3 named `BrickPackedLayout.repack` as the in-place form to port
+# on a reported scratch of 0.13-0.52 MB "independent of N", but that counts only
+# its chunk buffers: measured it is 39.4 B/row, so the port would have been a
+# 3.55x regression. The clause's REASONING (a monotone rearrangement, not a
+# sort) is what the replacement uses.
+
+
+def _repack_pair(seed, nb=4, arena_frac=0.25, drifts=(), brick_slack=0.10):
+    """Two identical states, one repacked each way. Optional drifts first, so
+    the arena is NON-EMPTY -- the arena fold-in is the part with no analogue in
+    the layout module and the part most likely to be got wrong.
+
+    `brick_slack=0.0` is how the arena is forced: spare then floors at ONE slot
+    per occupied brick, so any brick that gains two particles spills. Reaching
+    the arena by drifting harder does not work, because a larger drift moves
+    particles between bricks without concentrating them."""
+    x = _positions(seed)
+    v = np.random.default_rng(seed + 1).normal(scale=0.05, size=(N_PART**3, 3))
+    kw = dict(with_ids=True, arena_frac=arena_frac, brick_slack=brick_slack)
+    a = state.SlotState.build(x, v, _t9(), nb, **kw)
+    b = state.SlotState.build(x, v, _t9(), nb, **kw)
+    for c in drifts:
+        state.drift_and_migrate(a, c)
+        state.drift_and_migrate(b, c)
+    return a, b
+
+
+def test_the_in_place_repack_is_elementwise_the_out_of_place_one():
+    """The gate the plan asks for, and it compares against the REFERENCE
+    implementation kept in the module rather than against a property.
+
+    A property ("every particle is in its bucket") can hold for two different
+    layouts; only elementwise equality says the rearrangement is the same one.
+    `ids` is included because it is what makes the comparison per PARTICLE --
+    without it, two states could agree on payload and still have permuted rows
+    within a bucket.
+    """
+    a, b = _repack_pair(41)
+    ra = a.repack()
+    rb = b._repack_reference()
+
+    assert np.array_equal(a.off, b.off), "position payload differs"
+    assert np.array_equal(a.w, b.w), "velocity payload differs"
+    assert np.array_equal(a.ids, b.ids), "ids differ: rows permuted within a bucket"
+    assert np.array_equal(a.brick_start, b.brick_start)
+    assert np.array_equal(a.occupancy, b.occupancy)
+    assert a.occupancy.dtype == b.occupancy.dtype
+    assert a.arena_base == b.arena_base
+    assert np.array_equal(a.arena_bucket, b.arena_bucket)
+    assert ra["slots_used"] == rb["slots_used"]
+    assert a.check() is True
+
+
+def test_the_in_place_repack_matches_with_a_NON_EMPTY_arena():
+    """The arena fold-in is the part `layout.py` has no analogue for. A repack
+    from a freshly built state never exercises it, so this drifts first and
+    asserts the arena was actually populated -- otherwise the test above and
+    this one are the same test."""
+    a, b = _repack_pair(43, drifts=(0.4, 0.4), brick_slack=0.0)
+    assert a.arena_used > 0, "fixture never spilled to the arena; the case is untested"
+    a.repack()
+    b._repack_reference()
+    assert np.array_equal(a.off, b.off)
+    assert np.array_equal(a.w, b.w)
+    assert np.array_equal(a.ids, b.ids)
+    assert np.array_equal(a.occupancy, b.occupancy)
+    assert np.array_equal(a.brick_start, b.brick_start)
+    assert a.arena_used == 0, "the fold-in must leave the arena empty"
+    assert a.check() is True
+
+
+def test_the_in_place_repack_conserves_particles_over_repeated_steps():
+    """D-007 forbids dropping, and this container has lost exactly one particle
+    before. Repack repeatedly, interleaved with drifts, and count."""
+    a, _ = _repack_pair(45, drifts=())
+    n0 = a.n_live
+    for c in (0.3, 0.3, 0.3):
+        state.drift_and_migrate(a, c)
+        a.repack()
+        assert a.check() is True
+        assert a.n_live == n0, f"lost {n0 - a.n_live} particles"
+
+
+def test_the_in_place_repack_reports_scratch_that_includes_everything():
+    """The reference's `scratch_bytes` omitted three O(N) arrays and so read as
+    a constant while the real cost was linear. This one must report a figure
+    that actually bounds what it allocated, so the same mistake cannot be made
+    twice on the same term.
+    """
+    a, _ = _repack_pair(47, drifts=(0.4,), brick_slack=0.0)
+    n_rows = a.off.shape[0]
+    r = a.repack()
+    assert "scratch_bytes" in r
+    # a brick plus the lifted arena, not a row-count-sized array
+    assert r["scratch_bytes"] < 0.5 * n_rows * 9, (
+        "scratch is a large fraction of the payload, so this is not the in-place form"
+    )
+    assert r["scratch_bytes"] > 0, "a scratch figure of zero is not credible"

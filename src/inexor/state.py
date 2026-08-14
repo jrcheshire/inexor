@@ -1209,8 +1209,20 @@ class SlotState:
         if ids is not None:
             self.ids[self.arena_base + a] = ids
 
-    def repack(self, brick_slack=0.10):
-        """Redistribute BRICK capacity to match current occupancy.
+    def _repack_reference(self, brick_slack=0.10):
+        """The out-of-place repack, KEPT AS THE IDENTITY ORACLE for `repack`.
+
+        Not on the hot path and not to be called by the engine: it allocates
+        `zeros_like` of `off` and `w`, measured at 11.1 B/row and ~115 GB at
+        C-gh, which is what `repack` below exists to avoid. It stays because
+        this container has lost a particle before and cost five sessions to
+        find it, so the in-place version is gated on reproducing this one
+        ELEMENTWISE rather than on a property that might hold for two different
+        reasons. Deleting it would retire that gate to save nothing.
+
+        Original docstring follows.
+
+        Redistribute BRICK capacity to match current occupancy.
 
         **Required, not an optimization.** D-v2-19 clause 3 measured that frozen
         capacity fails at every granularity -- per-brick, a collapsing halo
@@ -1278,6 +1290,169 @@ class SlotState:
         self.arena_bucket[:] = -1
         self._invalidate_arena_index()
         return dict(slots_used=n_alloc, slots_per_particle=n_alloc / max(self.n_particles, 1))
+
+    def repack(self, brick_slack=0.10):
+        """Redistribute BRICK capacity to match current occupancy, IN PLACE.
+
+        Required, not an optimization -- D-v2-19 clause 3 measured that frozen
+        capacity fails at every granularity, so pooling, repack and a small
+        arena are all three needed.
+
+        **Why this is not the port D-v2-19 clause 3 named.** That clause points
+        at `layout.BrickPackedLayout.repack` and its reported `scratch_bytes` of
+        0.13-0.52 MB "independent of N". That figure counts only two chunk
+        buffers; the function also allocates `live`, `parts` and `final` at one
+        row each and MEASURES 39.4 B/row against this container's 11.1
+        (`scripts/v2_m6_repack_bytes.py`, flat to 2.6% over 64x in N), so
+        porting it would have multiplied the term by 3.55x. The clause's
+        REASONING is what survives and is what this uses: a repack is a monotone
+        rearrangement, not a sort.
+
+        **The rearrangement in two directional passes.** Compaction only ever
+        moves a row left and expansion only ever moves it right, so:
+
+          A. ascending, move each brick's MAIN run down to `main_pos[b]`. Safe
+             because a run's live rows cannot exceed its own allocation, so
+             `sum(run_counts[:b]) <= brick_start[b]` with no exceptions.
+          B. descending, write each brick's final block at `new_start[b]`. Safe
+             because `new_start[b] >= main_pos[b]` -- the new starts include
+             both the arena residents and the spare.
+
+        Main runs are compacted WITHOUT their arena residents on purpose. Folding
+        them in during pass A would break its guarantee: `counts` includes arena
+        rows, so `sum(counts[:b])` can exceed `brick_start[b]` by the arena
+        residents of earlier bricks, and the write would land on the next
+        brick's unread rows. They are merged in pass B instead, where the
+        destination already has room for them.
+
+        **Scratch is one brick plus the live arena**, and both are reported. The
+        arena lift is O(arena_used) rather than O(brick) -- 0.77 GB at C-gh at
+        the default 1% arena against the 115 GB this replaces -- and it is
+        needed because pass B's writes can reach past the OLD `arena_base` when
+        the allocation grows, which would clobber residents before they are
+        read. Reported rather than described, because a term omitted from a
+        scratch figure is exactly what hid the 39.4 above.
+        """
+        p3 = self.buckets_per_brick
+        run_counts = np.asarray(self.occupancy, dtype=np.int64).reshape(self.n_bricks, p3)
+        run_counts = run_counts.sum(axis=1)
+        occ = self.occupancy.astype(np.int64)
+        arena_live = np.nonzero(self.arena_bucket >= 0)[0]
+        if len(arena_live):
+            occ = occ + np.bincount(self.arena_bucket[arena_live], minlength=self.n_buckets)
+        counts = occ.reshape(self.n_bricks, p3).sum(axis=1)
+        spare = np.ceil(counts * float(brick_slack)).astype(np.int64)
+        spare = np.where(counts > 0, np.maximum(spare, 1), spare)
+        new_start = np.zeros(self.n_bricks + 1, dtype=np.int64)
+        np.cumsum(counts + spare, out=new_start[1:])
+        n_alloc = int(new_start[-1])
+        if n_alloc + self.n_arena > self.off.shape[0]:
+            raise ValueError(
+                f"repack needs {n_alloc} slots plus a {self.n_arena}-slot arena against an "
+                f"allocation of {self.off.shape[0]}. Raise alloc_margin at build."
+            )
+
+        scratch = 0
+        # ---- lift the live arena rows out, grouped by brick, before anything moves
+        a_rows = self.arena_base + arena_live
+        a_bucket = self.arena_bucket[arena_live]
+        a_ord = np.argsort(a_bucket // p3, kind="stable")
+        a_bucket = a_bucket[a_ord]
+        a_off = self.off[a_rows[a_ord]].copy()
+        a_w = self.w[a_rows[a_ord]].copy()
+        a_ids = None if self.ids is None else self.ids[a_rows[a_ord]].copy()
+        scratch += a_off.nbytes + a_w.nbytes + (0 if a_ids is None else a_ids.nbytes)
+        a_edge = np.searchsorted(a_bucket // p3, np.arange(self.n_bricks + 1))
+
+        # ---- pass A: compact the main runs leftward
+        main_pos = np.zeros(self.n_bricks + 1, dtype=np.int64)
+        np.cumsum(run_counts, out=main_pos[1:])
+        for b in range(self.n_bricks):
+            m = int(run_counts[b])
+            src, dst = int(self.brick_start[b]), int(main_pos[b])
+            if m == 0 or src == dst:
+                continue
+            # `.copy()` because source and destination overlap and numpy's slice
+            # assignment gives no ordering guarantee across an overlap.
+            buf_off = self.off[src : src + m].copy()
+            buf_w = self.w[src : src + m].copy()
+            scratch = max(scratch, buf_off.nbytes + buf_w.nbytes)
+            self.off[dst : dst + m] = buf_off
+            self.w[dst : dst + m] = buf_w
+            if self.ids is not None:
+                self.ids[dst : dst + m] = self.ids[src : src + m].copy()
+
+        # ---- pass B: expand rightward, merging the arena residents back in
+        new_occ = np.zeros(self.n_buckets, dtype=np.int64)
+        bucket_ids = np.arange(p3, dtype=np.int64)
+        for b in range(self.n_bricks - 1, -1, -1):
+            m = int(run_counts[b])
+            k = int(a_edge[b + 1] - a_edge[b])
+            if m + k == 0:
+                continue
+            mp, ns = int(main_pos[b]), int(new_start[b])
+            # the main rows' buckets are DERIVED from occupancy, never read back
+            # off the array, so pass A moving them cannot desynchronize this
+            within = np.repeat(bucket_ids, occ_b := np.asarray(
+                self.occupancy[b * p3 : (b + 1) * p3], dtype=np.int64))
+            del occ_b
+            if k:
+                within = np.concatenate([within, a_bucket[a_edge[b] : a_edge[b + 1]] - b * p3])
+            # STABLE, and over the concatenation main-then-arena: that is the
+            # exact order `_repack_reference` produces, and the identity gate
+            # compares against it elementwise.
+            order = np.argsort(within, kind="stable")
+            cat_off = self.off[mp : mp + m]
+            cat_w = self.w[mp : mp + m]
+            if k:
+                cat_off = np.concatenate([cat_off, a_off[a_edge[b] : a_edge[b + 1]]])
+                cat_w = np.concatenate([cat_w, a_w[a_edge[b] : a_edge[b + 1]]])
+            else:
+                cat_off, cat_w = cat_off.copy(), cat_w.copy()
+            scratch = max(scratch, cat_off.nbytes + cat_w.nbytes + within.nbytes + order.nbytes)
+            self.off[ns : ns + m + k] = cat_off[order]
+            self.w[ns : ns + m + k] = cat_w[order]
+            if self.ids is not None:
+                cat_i = self.ids[mp : mp + m]
+                if k:
+                    cat_i = np.concatenate([cat_i, a_ids[a_edge[b] : a_edge[b + 1]]])
+                else:
+                    cat_i = cat_i.copy()
+                self.ids[ns : ns + m + k] = cat_i[order]
+            new_occ[b * p3 : (b + 1) * p3] = np.bincount(within[order], minlength=p3)
+            # ZERO THE SPARE. The out-of-place form allocates `zeros_like` and
+            # writes only live rows, so every non-live byte is 0 (ids -1). Left
+            # alone, an in-place repack would carry stale payload in the gaps --
+            # semantically dead, since liveness is derived from `occupancy`, but
+            # it would make two states with identical live content differ
+            # bytewise, and this project compares states bytewise. The gap sits
+            # above `new_start[b] >= main_pos[b]`, so it cannot reach a main
+            # block still waiting to be read.
+            gap_lo, gap_hi = ns + m + k, int(new_start[b + 1])
+            if gap_hi > gap_lo:
+                self.off[gap_lo:gap_hi] = 0
+                self.w[gap_lo:gap_hi] = 0
+                if self.ids is not None:
+                    self.ids[gap_lo:gap_hi] = -1
+
+        # everything past the new allocation, arena included: the arena is empty
+        # after a fold-in, so it must READ empty too
+        self.off[n_alloc:] = 0
+        self.w[n_alloc:] = 0
+        if self.ids is not None:
+            self.ids[n_alloc:] = -1
+        self.brick_start = new_start
+        self.occupancy = _to_index(new_occ, self.index_dtype, "repacked")
+        self.arena_base = n_alloc
+        self.arena_bucket[:] = -1
+        self._invalidate_arena_index()
+        return dict(
+            slots_used=n_alloc,
+            slots_per_particle=n_alloc / max(self.n_particles, 1),
+            # EVERYTHING transient, not just the largest buffer. The figure this
+            # function replaces omitted three O(N) arrays and read as a constant.
+            scratch_bytes=int(scratch),
+        )
 
     def _bucket_flat_of_slots(self, brick_flat, slots):
         """Flat bucket ordinal per slot, run rows then arena rows."""

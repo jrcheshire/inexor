@@ -192,18 +192,42 @@ def test_the_largest_term_line_can_name_a_transient(capsys):
     assert "largest single term: tile_workspace (transient)" in out
 
 
-def test_the_binding_term_at_c_gh_is_now_the_repack_scratch(capsys):
-    """With `kick_pending` gone the largest single term is `repack_scratch`, and
-    C-gh STILL does not fit a `gh` host -- 2.04x rather than 4.41x. Worth pinning
-    both halves: removing the largest term was necessary and is not sufficient,
-    and a reading that stopped at "the binding term was removed" would have
-    concluded the opposite."""
+def test_the_binding_term_at_c_gh_is_now_the_state_itself(capsys):
+    """The end of the removals: with `kick_pending` deleted and the repack
+    rewritten in place, no TRANSIENT is the largest term any more -- the state
+    payload is, at 9 B/p. There is nothing left to remove that is not the
+    simulation itself, so any further reduction is a codec question rather than
+    an accounting one.
+
+    C-gh still does not fit a `gh` host (1.42x, from 4.41x at the start of
+    M-v2-6), and that gap is now structural: state plus resident mesh alone
+    clears 116 GB. The `gg` test below is the one that changed."""
     main(["--preset", "c-gh", "--host-gb", "116", "--cap", "5284492"])
     out = capsys.readouterr().out
-    assert "largest single term: repack_scratch" in out
+    assert "largest single term: t9_payload" in out
     assert "DOES NOT FIT" in out
     ratio = float(out.split("DOES NOT FIT (")[1].split("x")[0])
-    assert 2.0 < ratio < 2.5, f"expected ~2.23x a gh host after the removal, got {ratio}"
+    assert 1.2 < ratio < 1.7, f"expected ~1.42x a gh host, got {ratio}"
+
+
+def test_c_gh_now_fits_a_cpu_only_node_with_margin(capsys):
+    """THE first time the production configuration fits anything.
+
+    At the start of M-v2-6 the lower bound was 511.2 GB, 2.16x even a 237 GB
+    `gg` node. Deleting `kick_pending` (274.9 GB) and rewriting the repack in
+    place (115.4 -> 21.8) puts it at 164.6, which is 0.69x. Pinned because the
+    margin is what makes a capacity run proposable at all, and because a
+    regression in either term would silently take it away.
+
+    It is still a LOWER BOUND, and one measured to read ~1.9x low at cdev, so
+    fitting on paper is not the same as fitting. That is what the capacity run
+    is for."""
+    main(["--preset", "c-gh", "--host-gb", "237", "--cap", "5284492"])
+    out = capsys.readouterr().out
+    assert "FITS" in out and "DOES NOT FIT" not in out
+    est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
+    assert est == pytest.approx(164.6, abs=1.0)
+    assert est < 237.0 * 0.8, "the margin is thinner than the bound's own known error"
 
 
 def test_removing_the_repack_scratch_too_would_still_not_reach_a_gh_host(capsys):
@@ -248,9 +272,9 @@ def test_the_estimate_is_a_lower_bound_and_says_so(capsys):
     out = capsys.readouterr().out
     assert "LOWER BOUND" in out and "not a measurement" in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    # 3.445 -> 3.488 when repack_scratch went from a DERIVED 9 B/row to a
-    # MEASURED 11.1 (scripts/v2_m6_repack_bytes.py).
-    assert est == pytest.approx(3.488, abs=0.01)
+    # 3.445 (derived 9 B/row) -> 3.488 (measured 11.1, out of place) -> 3.305
+    # (measured 2.1, in place). scripts/v2_m6_repack_bytes.py.
+    assert est == pytest.approx(3.305, abs=0.01)
     assert est < 7.461, "the bound must sit under the measured peak it bounds"
 
 
@@ -301,11 +325,12 @@ def test_the_repack_scratch_coefficient_is_the_measured_one_not_the_payload_widt
     ec = _ec("c-gh")
     rows = int(np.ceil(np.ceil(n * 1.10) * 1.10))
     scratch = ec.step_bytes(n, n_rows=rows)["repack_scratch"]
-    assert scratch / rows == pytest.approx(11.1, abs=0.05)
-    assert scratch > 110e9, "at C-gh this term alone is about a whole gh host"
-    assert scratch / rows > 9.0, (
-        "the coefficient fell back to the payload width; the occupancy arrays "
-        "and the sort are real and were measured"
+    # 9 derived -> 11.1 measured out of place -> 2.1 measured in place.
+    assert scratch / rows == pytest.approx(2.1, abs=0.05)
+    assert scratch < 30e9, "the in-place rewrite should put this well under a gh host"
+    assert scratch / rows < 9.0, (
+        "the coefficient is back at or above the payload width, so the repack is "
+        "copying the payload again rather than rearranging it in place"
     )
 
 
@@ -329,4 +354,6 @@ def test_the_in_place_reference_would_make_the_repack_scratch_worse():
     current = _ec("c-gh").step_bytes(n, n_rows=rows)["repack_scratch"]
     reference_would_be = rows * 39.4
     assert reference_would_be > current, "the port is only worth doing if it wins"
-    assert reference_would_be / current == pytest.approx(3.55, abs=0.15)
+    # 3.55x worse than the out-of-place form it would have replaced; against
+    # the in-place form actually written it is ~19x worse.
+    assert reference_would_be / current > 15.0

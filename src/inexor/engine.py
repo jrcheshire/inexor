@@ -283,7 +283,12 @@ class EngineConfig:
         / 11.06, `scripts/v2_m6_repack_bytes.py`). The extra ~2 B/row is the two
         int64 occupancy arrays over `n_buckets` plus the sort, and it carries
         because `n_buckets` and `n_rows` keep their ratio up the config table.
-        So ~115 GB at C-gh rather than 91 -- about a whole `gh` host on its own.
+        That was ~115 GB at C-gh. **Rewritten in place (M-v2-6) it measures 2.1
+        B/row** -- 2.135 and 2.066 at 2.1M and 16.8M particles -- so ~22 GB, a
+        5.3x reduction, and the term stops being the binding one. What remains
+        is almost entirely the two int64 occupancy arrays, which are per-BUCKET;
+        narrowing them to the index dtype would roughly halve it again and is
+        not done here because it has not been measured.
 
         **D-v2-19 clause 3's in-place form does NOT fix it, and the clause's own
         number is what hid that.** `BrickPackedLayout.repack` reports
@@ -320,8 +325,12 @@ class EngineConfig:
         nb = max(1, self.n_fine // self.n_brick)
         out = dict(
             kick_pending=0,
-            # 11.1 MEASURED, not the 9 derived from the payload width alone.
-            repack_scratch=int(round(rows * 11.1)),
+            # 2.1 MEASURED, after the in-place rewrite (was 11.1 out of place).
+            # What remains is almost entirely the two int64 occupancy arrays,
+            # which are per-BUCKET rather than per-row -- so this coefficient
+            # only holds while n_buckets and n_rows keep their ratio, which they
+            # do up the config table.
+            repack_scratch=int(round(rows * 2.1)),
             migrate_staging=int(round(190.0 * n / nb)),
         )
         if cap is not None:
