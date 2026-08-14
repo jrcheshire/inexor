@@ -203,7 +203,7 @@ def test_the_binding_term_at_c_gh_is_now_the_repack_scratch(capsys):
     assert "largest single term: repack_scratch" in out
     assert "DOES NOT FIT" in out
     ratio = float(out.split("DOES NOT FIT (")[1].split("x")[0])
-    assert 1.9 < ratio < 2.2, f"expected ~2.04x a gh host after the removal, got {ratio}"
+    assert 2.0 < ratio < 2.5, f"expected ~2.23x a gh host after the removal, got {ratio}"
 
 
 def test_removing_the_repack_scratch_too_would_still_not_reach_a_gh_host(capsys):
@@ -248,7 +248,9 @@ def test_the_estimate_is_a_lower_bound_and_says_so(capsys):
     out = capsys.readouterr().out
     assert "LOWER BOUND" in out and "not a measurement" in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    assert est == pytest.approx(3.445, abs=0.01)
+    # 3.445 -> 3.488 when repack_scratch went from a DERIVED 9 B/row to a
+    # MEASURED 11.1 (scripts/v2_m6_repack_bytes.py).
+    assert est == pytest.approx(3.488, abs=0.01)
     assert est < 7.461, "the bound must sit under the measured peak it bounds"
 
 
@@ -281,3 +283,50 @@ def test_a_preset_buffer_is_not_shadowed_by_the_flag_default(capsys):
     assert "b=8" in capsys.readouterr().out
     main(["--preset", "smoke", "--host-gb", "116", "--buf", "4"])
     assert "b=4" in capsys.readouterr().out, "an explicit flag must still win"
+
+
+def test_the_repack_scratch_coefficient_is_the_measured_one_not_the_payload_width():
+    """9 B/row is what `off` and `w` come to; 11.1 is what the function costs.
+
+    The gap is two int64 occupancy arrays over `n_buckets` plus the sort, and it
+    was invisible for as long as the term was derived from the payload width
+    alone. Measured flat to 2.6% over 64x in particle count -- 11.35 / 11.09 /
+    11.06 B/row at 262k / 2.1M / 16.8M particles -- which is what says it is a
+    coefficient and not a fixed cost being amortized.
+
+    Pinned because the derived figure is the intuitive one and would be an easy
+    "simplification" to reintroduce.
+    """
+    n = PRESETS["c-gh"]["n_part"] ** 3
+    ec = _ec("c-gh")
+    rows = int(np.ceil(np.ceil(n * 1.10) * 1.10))
+    scratch = ec.step_bytes(n, n_rows=rows)["repack_scratch"]
+    assert scratch / rows == pytest.approx(11.1, abs=0.05)
+    assert scratch > 110e9, "at C-gh this term alone is about a whole gh host"
+    assert scratch / rows > 9.0, (
+        "the coefficient fell back to the payload width; the occupancy arrays "
+        "and the sort are real and were measured"
+    )
+
+
+def test_the_in_place_reference_would_make_the_repack_scratch_worse():
+    """D-v2-19 clause 3 points at `BrickPackedLayout.repack` as the in-place
+    form to port, on a reported `scratch_bytes` of 0.13-0.52 MB "independent of
+    N". That figure counts only its two chunk buffers; the function also
+    allocates `live`, `parts` and `final` at one row each, and measures 39.4
+    B/row against the 11.1 it would replace -- a 3.55x REGRESSION.
+
+    This test pins the arithmetic consequence rather than re-running the
+    measurement, so the conclusion survives without the probe: any replacement
+    must beat the current coefficient, and the reference does not.
+
+    The clause's REASONING is not in dispute and is what licenses a real fix: a
+    repack is a monotone rearrangement, not a sort, so an O(brick) walk exists.
+    The reference is simply not that implementation.
+    """
+    n = PRESETS["c-gh"]["n_part"] ** 3
+    rows = int(np.ceil(np.ceil(n * 1.10) * 1.10))
+    current = _ec("c-gh").step_bytes(n, n_rows=rows)["repack_scratch"]
+    reference_would_be = rows * 39.4
+    assert reference_would_be > current, "the port is only worth doing if it wins"
+    assert reference_would_be / current == pytest.approx(3.55, abs=0.15)

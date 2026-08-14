@@ -276,10 +276,26 @@ class EngineConfig:
         instead. The line stays here reading zero because a term that vanishes
         from a table is indistinguishable from one that was never counted.
 
-        `repack_scratch` -- `SlotState.repack` allocates `zeros_like` of `off` and
-        `w` while the originals stay live (`state.py:936-938`), so 9 B per ROW,
-        ~91 GB at C-gh. D-v2-19 clause 3 establishes the in-place form at
-        O(chunk); this is what it is worth.
+        `repack_scratch` -- `SlotState.repack` allocates `zeros_like` of `off`
+        and `w` while the originals stay live. The DERIVED figure was 9 B per
+        row (3 for `off` plus 6 for `w`); MEASURED it is **11.1 B/row**, flat to
+        2.6% across 64x in particle count (262k / 2.1M / 16.8M -> 11.35 / 11.09
+        / 11.06, `scripts/v2_m6_repack_bytes.py`). The extra ~2 B/row is the two
+        int64 occupancy arrays over `n_buckets` plus the sort, and it carries
+        because `n_buckets` and `n_rows` keep their ratio up the config table.
+        So ~115 GB at C-gh rather than 91 -- about a whole `gh` host on its own.
+
+        **D-v2-19 clause 3's in-place form does NOT fix it, and the clause's own
+        number is what hid that.** `BrickPackedLayout.repack` reports
+        `scratch_bytes` of 0.13-0.52 MB "independent of N", but that counts only
+        its two chunk buffers (`layout.py:662,670`); it also allocates `live`,
+        `parts` and `final` at one row each. Measured **39.4 B/row**, flat over
+        the same 64x, so porting it would multiply this term by 3.55x. The
+        reported figure is not merely low, it has the wrong SHAPE: a fixed
+        buffer divided by a growing row count reads as N-independent while the
+        real cost is linear. The clause's REASONING -- a repack is a monotone
+        rearrangement, not a sort -- is sound and is what licenses a genuinely
+        O(brick) implementation. The reference simply is not one.
 
         `tile_buffers` -- the per-tile host working set, `cap`-sized. Needs a
         measured `cap`; omitted when not supplied rather than guessed.
@@ -304,7 +320,8 @@ class EngineConfig:
         nb = max(1, self.n_fine // self.n_brick)
         out = dict(
             kick_pending=0,
-            repack_scratch=rows * 9,
+            # 11.1 MEASURED, not the 9 derived from the payload width alone.
+            repack_scratch=int(round(rows * 11.1)),
             migrate_staging=int(round(190.0 * n / nb)),
         )
         if cap is not None:
