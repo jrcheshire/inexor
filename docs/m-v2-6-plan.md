@@ -33,20 +33,37 @@ The re-scope needs its own ADR (see Stage 6); it is not yet written.
 
 ## Status ledger
 
-| stage | what | status |
+The stage numbers are this document's internal labels and mean nothing outside
+it. The "what" column is the real name of each piece of work; use that when
+talking about it.
+
+| stage | what it actually is | status |
 |---|---|---|
-| 0 | end-to-end peak instrument | **DONE** + a Stage 0b the plan did not anticipate |
-| 1a | does thread count explain deneb-beats-GH200 | **DONE, answered: no** |
-| 1b | three-arm pricing (gg / gh / x86) | **NOT RUN.** Needs a Slurm proposal |
-| 2a | `pending` -> per-brick velocity scales | **ACTIVE** |
-| 2b | `repack`'s O(N) scratch | open, owed since M-v2-3 |
-| 2c | coarse paint sub-block decomposition | open, premise re-verified 2026-08-14 |
-| 2d | `load_slot_state`'s peak | open |
-| 3 | streaming parity instrument | open |
-| 4 | output stage (writer, P(k), disk accounting) | open |
-| 5 | the capacity runs | open, gated on 1b + 2 |
-| 6 | record + re-scoping ADR | open |
-| P | portability (`inexor.plan`, params, running-elsewhere) | **1 of 3 done** |
+| 0 | build a tool that measures the engine's total memory, which nothing did | **DONE** + a Stage 0b the plan did not anticipate |
+| 1a | check whether thread count explained deneb beating a GH200 | **DONE, answered: no.** The step is serial |
+| 1b | time the same run on several machines to decide where production goes | **NOT RUN.** Needs a Slurm proposal, and see the note below |
+| 2a | remove the 275 GB velocity array via per-brick scales | **BUILT 2026-08-14** (`8179cec`); accuracy checkpoint owed |
+| 2b | remove the 94 GB scratch buffer in the periodic re-layout | open, owed since M-v2-3, **now the largest single term** |
+| 2c | stop building a full-size mesh for every small chunk of particles | open, premise re-verified 2026-08-14 |
+| 2d | lower the memory spike while loading ICs from disk | open |
+| 3 | rewrite the correctness check so it needs no 206 GB array | open |
+| 4 | write the output: save state, compute P(k), budget the disk | open |
+| 5 | do the capacity runs | open, gated on 1b + 2 |
+| 6 | write the record and the re-scoping ADR | open |
+| P | portability (`inexor.plan`, parameters, running-elsewhere) | **1 of 3 done** |
+
+**A wall-clock problem surfaced on 2026-08-14 and may reorder all of this.**
+Job 455 measured cgh64 (512^3) at **2622.6 s/step** on antares against cdev's
+61 s -- 43x the wall for 8x the particles, and 3.3x past the band that job
+pre-registered. Per its own pre-registration the reasoning behind any request
+sized from it is wrong rather than imprecise, so nothing was scaled from it.
+The candidate cause is `_insert_slab` scanning every row of a slab once per
+brick (`N x n_bricks^2`, i.e. N^(5/3)), which predicts 42x against the measured
+43x -- but that is a derivation matching one ratio, not an attribution, and
+job 456 is the one-axis test that settles it. **If it holds, this is a harder
+blocker than the memory ceiling and it precedes everything in the table above,
+including the machine-choice measurement**, which would otherwise be pricing a
+bottleneck that should not exist.
 
 Discharged along the way, and not to be re-proposed:
 
@@ -83,9 +100,9 @@ largest single term and false of the fit:
 
 | after | lower bound | vs gh (116 GB) | vs gg (237 GB) |
 |---|---|---|---|
-| today | 511.2 GB | 4.41x | 2.16x |
-| 2a | 236.3 GB | 2.04x | 1.00x -- at the edge |
-| 2a + 2b | 142.8 GB | 1.23x | 0.60x |
+| before the velocity change | 511.2 GB | 4.41x | 2.16x |
+| **after it (MEASURED, `8179cec`)** | **236.3 GB** | **2.04x** | **1.00x -- at the edge** |
+| + removing the re-layout scratch | 142.8 GB | 1.23x | 0.60x |
 
 Two consequences the 08-11 plan could not have drawn:
 
@@ -108,7 +125,37 @@ and `repack_scratch` are summed as co-resident, which is correct today --
 `pending` is dead after the reconciliation loop but stays REFERENCED until `step`
 returns (`engine.py:764`), which spans `drift_and_migrate`.
 
-## Stage 2a -- the 275 GB term (ACTIVE)
+## Stage 2a -- the 275 GB term (BUILT 2026-08-14, `8179cec`)
+
+**Done, gate green (429 passed / 1 skipped, determinism tier 16, lint clean).**
+The measured effect is in the planner: C-gh's lower bound went 511.2 -> 236.3 GB
+and the largest single term is now `repack_scratch` at 93.5 GB. What replaced
+the array is 16.8 MB, counted in both the container's own figure and the
+planner's rather than described.
+
+**The design below had a hole and the build is where it is handled.** Under one
+global scale `_rescale_w` could not overflow int16 and said so as a theorem: the
+scale was a max over a PARTITION. Per brick that is false -- a fast particle
+drifting out of a dense brick into a quiet one needs more range than the quiet
+brick's own maximum provides -- and D-007 forbids the clamp, so a wrap is silent
+corruption rather than imprecision. The plan's "no second rounding is introduced
+anywhere" was wrong for migrants for the same reason.
+
+The obvious fix does not work: covering a brick's neighbours would bound who can
+arrive, but computing it needs every neighbour's new velocities before any of
+them are encoded, and holding those IS the 275 GB array. So a brick's scale is
+fixed in `_insert_slab`, the first and only point where its full post-migration
+membership exists. Ejection no longer rescales; it stages each emigrant's source
+brick (4 B, emigrants only) so the insert can take a true max and express
+everything at it in one rounding. `_rescale_w` now refuses out of range instead
+of asserting it cannot happen.
+
+**Still owed:** the accuracy checkpoint below. It can move either way -- scales
+are up to ~2.5x finer, and migrants now see two roundings where one global scale
+gave them one -- so it needs the anchor run rather than an argument.
+
+The rest of this section is the design as ratified, kept for its rejected
+alternatives.
 
 Generalize `vel_scale` from a scalar to one f64 per brick (`n_bricks` x 8 B =
 16.8 MB at C-gh). Each brick's velocities are quantized **once**, at its own
