@@ -43,7 +43,7 @@ talking about it.
 | 1a | check whether thread count explained deneb beating a GH200 | **DONE, answered: no.** The step is serial |
 | 1b | time the same run on several machines to decide where production goes | **NOT RUN.** Needs a Slurm proposal, and see the note below |
 | 2a | remove the 275 GB velocity array via per-brick scales | **BUILT 2026-08-14** (`8179cec`); accuracy checkpoint owed |
-| 2b | remove the 94 GB scratch buffer in the periodic re-layout | open, owed since M-v2-3, **now the largest single term** |
+| 2b | remove the scratch buffer in the periodic re-layout | **DONE 2026-08-14** (`c647e8e`): 11.1 -> 2.1 B/row measured, 115.4 -> 21.8 GB |
 | 2c | stop building a full-size mesh for every small chunk of particles | open, premise re-verified 2026-08-14 |
 | 2d | lower the memory spike while loading ICs from disk | open |
 | 3 | rewrite the correctness check so it needs no 206 GB array | open |
@@ -51,6 +51,16 @@ talking about it.
 | 5 | do the capacity runs | open, gated on 1b + 2 |
 | 6 | write the record and the re-scoping ADR | open |
 | P | portability (`inexor.plan`, parameters, running-elsewhere) | **1 of 3 done** |
+
+**THE BINDING CONSTRAINT IS NOW WALL, NOT MEMORY.** Production fits a CPU-only
+node on the arithmetic floor (see the next section), but cgh64 runs at 608.67
+s/step, which extrapolates to ~11 h/step and ~18 days per realization at the
+ratified K=40 -- against this plan's own "under 5 h each" test, a ~90x gap. The
+largest untested lever is that the step is SERIAL (the thread sweep was flat
+from 1 to 32 threads) while tiles and bricks are independent by construction, so
+tens of cores sit idle. That is the same order as the gap and it is a hypothesis,
+not a plan: job 463 is timing the phases, because nothing has, and today has
+twice punished acting on a derivation that had not been measured.
 
 **A wall-clock problem surfaced on 2026-08-14, was attributed, and is FIXED.**
 Job 455 measured cgh64 (512^3) at **2622.6 s/step**, 3.3x past its own
@@ -106,9 +116,25 @@ largest single term and false of the fit:
 
 | after | lower bound | vs gh (116 GB) | vs gg (237 GB) |
 |---|---|---|---|
-| before the velocity change | 511.2 GB | 4.41x | 2.16x |
-| **after it (MEASURED, `8179cec`)** | **236.3 GB** | **2.04x** | **1.00x -- at the edge** |
-| + removing the re-layout scratch | 142.8 GB | 1.23x | 0.60x |
+| at the start of M-v2-6 | 511.2 GB | 4.41x | 2.16x |
+| the velocity array removed (`8179cec`) | 236.3 GB | 2.04x | 1.00x -- at the edge |
+| the repack coefficient MEASURED, not derived | 258.2 GB | 2.23x | 1.09x |
+| **the repack rewritten in place (`c647e8e`)** | **164.6 GB** | **1.42x** | **0.69x -- FITS** |
+
+**Production fits a CPU-only node, and that is new.** Two removals did it: the
+274.9 GB velocity array, and the repack scratch at 115.4 -> 21.8 GB. The middle
+row is worth keeping -- correcting the repack coefficient from a DERIVED 9 B/row
+to a MEASURED 11.1 made the picture temporarily WORSE, which is what an honest
+accounting does.
+
+**The largest single term is now `t9_payload` itself**, so there is nothing
+further to remove that is not the simulation; any further reduction is a codec
+question. A `gh` node remains out of reach and the reason is structural rather
+than incidental: state plus resident mesh alone clears 116 GB.
+
+Standing caveat: this is an arithmetic lower bound, measured to read ~1.9x low
+against the one configuration where it has been checked. **Fitting on paper is
+not fitting**, and the capacity run is what would settle it.
 
 Two consequences the 08-11 plan could not have drawn:
 
