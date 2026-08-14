@@ -129,6 +129,44 @@ def test_the_coarse_force_copy_is_counted_because_both_copies_are_live():
     assert m["coarse_force_copy_transient"] == m["coarse_force_resident"]
 
 
+def test_migration_staging_is_n_to_the_two_thirds_not_n():
+    """The shape is derived, the coefficient is measured, and two configs
+    agreeing on the coefficient is what tests the shape.
+
+    `drift_and_migrate` walks x-slabs and releases each as soon as every write
+    that could reach it is done, so rows in flight are a few SLABS -- N divided
+    by bricks_per_side, which itself grows as N^(1/3). Modelling it as O(N) would
+    overstate it by 8x at C-gh, which is the whole reason it earns a term.
+    """
+    for name, measured_mb in (("cdev8", 47.62), ("cdev", 208.58)):
+        p = PRESETS[name]
+        got = _ec(name).step_bytes(p["n_part"] ** 3)["migrate_staging"]
+        assert got / 1e6 == pytest.approx(measured_mb, rel=0.08), (
+            f"{name}: modelled {got / 1e6:.2f} MB against a measured {measured_mb}"
+        )
+    # and the SHAPE: 8x the particles must give 4x the term, not 8x
+    a = _ec("cdev8").step_bytes(PRESETS["cdev8"]["n_part"] ** 3)["migrate_staging"]
+    b = _ec("cdev").step_bytes(PRESETS["cdev"]["n_part"] ** 3)["migrate_staging"]
+    assert b / a == pytest.approx(4.0, rel=0.02), "migration staging stopped being N^(2/3)"
+
+
+def test_per_step_terms_do_not_depend_on_slack():
+    """Measured: raising slack 0.2 -> 0.5 moves n_rows 1.217x and EVERY per-step
+    phase by exactly 1.000x. Slack buys spare slots in the storage arrays, which
+    the state pays for and the step never touches, because the step decodes live
+    members rather than rows. So only `repack_scratch` may carry `n_rows` here.
+    """
+    ec = _ec("cdev8")
+    n = PRESETS["cdev8"]["n_part"] ** 3
+    a = ec.step_bytes(n, n_rows=int(n * 1.2))
+    b = ec.step_bytes(n, n_rows=int(n * 1.5))
+    for k in a:
+        if k == "repack_scratch":
+            assert b[k] > a[k]
+        else:
+            assert a[k] == b[k], f"{k} moved with n_rows; the slack arm says it must not"
+
+
 # ------------------------------------------------------------------ the reduction
 
 
@@ -167,13 +205,15 @@ def test_an_absent_cap_names_the_omission_instead_of_dropping_it(capsys):
 
 
 def test_the_estimate_is_a_lower_bound_and_says_so(capsys):
-    """It is 1.97x low at the one config where it has been checked (3.783 GB
-    against job 446's measured 7.461), so nothing may read it as a prediction."""
+    """Still a floor, and still known-soft: 3.982 GB against job 446's measured
+    7.461 at cdev, so 1.87x low where it has been checked. It was 3.783 (1.97x)
+    before the M-v2-6 terms went in -- the corrections close some of the gap and
+    are not claimed to close all of it, which is why the wording stays."""
     main(["--preset", "cdev", "--host-gb", "124", "--cap", "5284492"])
     out = capsys.readouterr().out
     assert "LOWER BOUND" in out and "not a measurement" in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    assert est == pytest.approx(3.783, abs=0.01)
+    assert est == pytest.approx(3.982, abs=0.01)
     assert est < 7.461, "the bound must sit under the measured peak it bounds"
 
 

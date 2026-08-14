@@ -282,9 +282,26 @@ class EngineConfig:
         """
         n = int(n_particles)
         rows = int(n_rows) if n_rows is not None else int(round(n * 1.21))
+        # MIGRATION STAGING IS N^(2/3), NOT N, and that is the whole reason it is
+        # worth a line. `state.drift_and_migrate` walks x-slabs and releases a
+        # staged slab as soon as every write that could reach it has happened, so
+        # the rows in flight are a handful of SLABS rather than the state: a slab
+        # is N / bricks_per_side, and bricks_per_side grows as N^(1/3), so this
+        # term grows as N^(2/3). Carrying it as an O(N) term would overstate it by
+        # 8x at C-gh.
+        #
+        # The coefficient is measured, the SHAPE is derived, and two configs agree
+        # on the coefficient which is what tests the shape: 181.7 B per
+        # slab-particle at cdev8 and 198.9 at cdev, an 8x change in N (`migrate`
+        # own-increment 47.62 and 208.58 MB, M-v2-6 host-byte instrument).
+        # `lead_drift` is the SAME function called once before the loop and runs
+        # 77.3 / 92.7 B on the same basis; it is not added here because it
+        # completes before the step's peak and so is never co-resident with it.
+        nb = max(1, self.n_fine // self.n_brick)
         out = dict(
             kick_pending=n * (8 + 24),
             repack_scratch=rows * 9,
+            migrate_staging=int(round(190.0 * n / nb)),
         )
         if cap is not None:
             out["tile_buffers"] = int(cap) * (8 + 1 + 24 + 24 + 1 + 8 + 24 + 24)
