@@ -92,10 +92,17 @@ run_leg() {
 PHASE="scripts/v2_m6_phase_time.py"
 GATE="scripts/v2_m3_engine_gate.py"
 
+# A SMOKE MUST NOT BE HARSHER THAN THE LEG IT GATES, and job 462 died proving
+# it: the accuracy smoke ran at K=3 where the real leg runs K=40, and a SMALLER
+# K drifts FURTHER per step, so it hit the D-007 arena refusal in a regime the
+# real run never enters. 31 s and no long legs burned -- the gating worked and
+# the smoke was wrong. Both halves now run at their leg's own cadence and knobs.
+# Same class as the n_part=192 fixture earlier today: a parameter chosen for
+# cheapness without checking it against the regime it stands in for.
 run_leg "smoke" bash -c "
-  pixi run -e default python $PHASE --config smoke --k 3 --repeats 2 \
+  pixi run -e default python $PHASE --config smoke --k 5 --repeats 2 \
     --slack 0.20 --arena-frac 0.20 --out-suffix _pa_smoke &&
-  pixi run -e default python $GATE --config smoke --leg accum --k 3 \
+  pixi run -e default python $GATE --config smoke --leg accum --k 40 \
     --out-suffix _pa_smoke"
 [ "${codes[0]}" -ne 0 ] && {
   echo "FATAL: smoke failed; a broken probe would burn every long leg (job 451)"
