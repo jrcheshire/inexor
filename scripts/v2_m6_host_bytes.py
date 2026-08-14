@@ -163,7 +163,8 @@ def _ensure_ics(cfg, wd, slack, arena_frac, alloc_margin):
     )
 
 
-def run_once(cfg, k_steps, workdir, slack=0.2, arena_frac=0.08, alloc_margin=0.1):
+def run_once(cfg, k_steps, workdir, slack=0.2, arena_frac=0.08, alloc_margin=0.1,
+             coarse_div=1):
     """One run. Returns the tracer report plus the exact state term."""
     jax = p0._require_cpu()
     g = m3._geom(cfg)
@@ -178,7 +179,13 @@ def run_once(cfg, k_steps, workdir, slack=0.2, arena_frac=0.08, alloc_margin=0.1
     ic.white_plane(key, 0, 8, p0.GEN_FDTYPE)  # backend init, as the RSS probe does
 
     cosmo = Cosmology()
-    ec = p0._engine_config(g, "float64", 1, 1, slack)
+    # coarse_div is the ISOLATING ARM. On the standard config ladder particles,
+    # coarse cells and the tile kernels all scale together (64.00x / 64.00x /
+    # 61.18x from smoke to cdev8), because the table fixes the fine cell and
+    # grows volume -- so no pair of ladder configs can tell those terms apart.
+    # Dividing n_coarse at FIXED particle count moves cells by 1/div^3 and
+    # nothing else, which is the only way to attribute a coarse term.
+    ec = p0._engine_config(g, "float64", 1, int(coarse_div), slack)
     ec.validate()
     st = icgen.load_slot_state(
         workdir, brick_slack=slack, alloc_margin=alloc_margin, arena_frac=arena_frac
@@ -261,6 +268,10 @@ def main(argv=None):
     ap.add_argument("--arena-frac", type=float, default=0.08)
     ap.add_argument("--alloc-margin", type=float, default=0.1)
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--coarse-div", type=int, default=1,
+                    help="divide n_coarse by this at FIXED particles: the arm "
+                         "that separates coarse-mesh terms from particle terms, "
+                         "which no pair of config-table rungs can do")
     ap.add_argument("--vs-model", action="store_true",
                     help="compare against EngineConfig.step_bytes term by term")
     ap.add_argument("--out", default=None)
@@ -274,13 +285,13 @@ def main(argv=None):
         _ensure_ics(a.config, wd, a.slack, a.arena_frac, a.alloc_margin)
 
     for _ in range(a.warmup):  # compile, then throw the numbers away
-        run_once(a.config, a.k, wd, a.slack, a.arena_frac, a.alloc_margin)
-    reps = [run_once(a.config, a.k, wd, a.slack, a.arena_frac, a.alloc_margin)
+        run_once(a.config, a.k, wd, a.slack, a.arena_frac, a.alloc_margin, a.coarse_div)
+    reps = [run_once(a.config, a.k, wd, a.slack, a.arena_frac, a.alloc_margin, a.coarse_div)
             for _ in range(a.repeats)]
     r = reps[0]
     ok, msg = compare_repeats(reps)
 
-    print(f"\n=== {a.config}, K={a.k}, {a.repeats} runs "
+    print(f"\n=== {a.config}, K={a.k}, coarse_div={a.coarse_div}, {a.repeats} runs "
           f"({r['n_particles']:,} particles, {r['n_rows']:,} rows) ===")
     print(f"  DETERMINISM: {msg}")
     if r["unknown_phases"]:
@@ -316,6 +327,7 @@ def main(argv=None):
     if a.out:
         with open(a.out, "w") as fh:
             json.dump(dict(config=a.config, k=a.k, repeats=a.repeats,
+                       coarse_div=a.coarse_div,
                            determinism_ok=ok, determinism=msg, runs=reps), fh)
         print(f"\n  card -> {a.out}")
     return 0 if ok is not False else 1
