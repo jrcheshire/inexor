@@ -5,8 +5,13 @@ and it opens with a measurement that broke its own pre-registration.
 
 Jobs: **455** (antares, the sizing run that found it), **456** (deneb, the
 one-axis attribution), **457** (deneb, the same probe after the fix), **459**
-(antares, the end-to-end confirmation -- IN FLIGHT at the time of writing; its
-numbers are NOT in this document and section 6 says what it will settle).
+(antares, the end-to-end confirmation; section 5b). 458 was refused by its own
+scratch guard and ran nothing -- see section 5b's note on why that mattered.
+
+**Headline: the engine step at cgh64 went 2622.57 -> 608.67 s, 4.31x, because
+77% of it was one scan.** The memory half of 459 missed its pre-registered band
+AND is confounded; section 5b says so plainly rather than reporting the wall
+alone.
 
 Commits: `10d1a2d` (the fix), `e435538` (the probe), `fb3a5bf` (a fixture guard).
 
