@@ -252,7 +252,9 @@ figure that predated the migration fix. Measured, the device-eligible phases
 (the JAX ones) are **85.6% at the anchor and 88.9% at cdev8**, so at the
 recorded 6.8x device speedup the ceiling is **~3.7x**. The reasoning was sound
 and the input was stale; the GPU question is not settled toward CPU and the
-single-node accelerator-on/off test is the instrument.
+single-node accelerator-on/off test is the instrument. **That test has now run
+and the answer is 1.28x, not ~3.7x -- section 5e. The 6.8x device speedup does
+not generalize across the JAX phases; eligibility is not speedup.**
 
 **A term the cheap configuration hid:** `coarse_paint` is 5.0% at cdev8 and
 13.8% at the anchor -- 10x in absolute terms for 8x the particles, mildly
@@ -285,6 +287,75 @@ said the storage decision should be re-opened rather than recorded as a pass.
 K=5 against K=3, so deneb is roughly 1.13x faster per step. Smaller than the
 machine-choice discussion assumed. A matched pair would be cheap and has not
 been run.
+
+## 5e. Vista 912457 -- the single-node accelerator A/B: the GPU buys 1.28x, and the pre-registration MISSED
+
+`scripts/v2_m6_gpu_ab_vista.sbatch` driving `v2_m6_phase_time.py` at commit
+`024523a`: one gh node, the same checkout and knobs in both arms (cdev, K=3,
+repeats 2, slack 0.20, arena 0.20), differing ONLY in `JAX_PLATFORMS`. The
+backend is asserted per arm before its leg runs (sbatch lines 97/108), so
+neither arm can silently be the other. Pre-registered: **2.5-4.5x on wall, and
+the host phases within noise across arms or the run is VOID.**
+
+**The run is VALID and the band was missed by 2x at its floor.** All four legs
+rc=0; `instrument_neutral: true` in both arms (overhead -0.083 s GPU / -0.124 s
+CPU against material bounds of 1.46 / 1.87 s); the six host phases agree across
+arms to 1.4% in aggregate (31.26 s GPU-arm vs 31.69 s CPU-arm over the K=3 run;
+worst absolute difference `migrate` at 0.22 s, worst relative `membership` at
+13% on a 0.11 s absolute). So the VOID clause did not fire, and the verdict
+stands:
+
+    CPU-only   31.14 s/step
+    GPU on     24.39 s/step        ratio 1.277x   (pre-registered 2.5-4.5x)
+
+Per phase, seconds over the whole K=3 run:
+
+| phase | CPU arm | GPU arm | ratio |
+|---|---|---|---|
+| `tile_short` | 31.79 | 9.47 | 3.36x faster |
+| `tile_long` | 16.60 | 6.52 | 2.55x faster |
+| `coarse_paint` | 13.29 | 25.84 | **1.94x SLOWER** |
+| `migrate` | 14.99 | 14.77 | 1.01 (host) |
+| `tile_decode` | 7.67 | 7.49 | 1.02 (host) |
+| `lead_drift` + `tile_reduce` + `repack` + `membership` | 9.03 | 8.99 | 1.00 (host) |
+
+**Where the 3.7x went.** The tile forces accelerate roughly as the ceiling
+assumed (3.36x and 2.55x against the 6.8x input), but `coarse_paint` -- JAX,
+device-eligible, 14.2% of the CPU-arm step -- runs 1.94x slower on the GPU and
+gives back 12.6 s of the 32.4 s the tile forces save. It is now **35.3% of the
+GPU-arm step, the single largest phase there**. The 5d ceiling arithmetic
+treated "device-eligible" as "accelerates at the measured device speedup", and
+that 6.8x was measured on the tile force alone; carried to a phase with a
+different structure it is not even the right sign.
+
+**The mechanism of the `coarse_paint` regression is NOT measured.** The
+candidate is structural -- the phase allocates a full `n_coarse^3` mesh per
+chunk and streams host-resident chunks, so a GPU backend adds a transfer per
+chunk to work that is allocation-bound -- but that is a reading of the code,
+not an attribution. It does not need chasing on its own: the phase is already
+the named wall+memory target, and any fix that stops materializing the full
+mesh per chunk changes both arms.
+
+**Charging verdict at the Stage 1b bar.** gg = 0.33 against gh = 1.0
+SU/node-hr, so the GPU must clear ~3x on wall to win on charging. It measured
+1.28x. Even granting the full D-v2-21 gather-compile lever (~1.7x on record,
+not exercised in either arm here) the stack is ~2.2x, still under the bar --
+and the CPU side keeps its own memory advantage (237 GB gg against the 116 GB
+gh cliff, which the C-gh state alone now exceeds). **On this record the
+production node is CPU-only unless something changes the coarse_paint story.**
+
+**Incidental, not controlled:** the Vista Grace CPU arm (31.14 s/step) beats
+deneb's job-463 anchor (43.02 s/step) by 1.38x at the same knobs but K=3
+against K=5, and the profile INVERTS across machines -- deneb is
+`tile_long`-dominated (48.8%) where Grace is `tile_short`-dominated (34.0%).
+The machine-choice discussion should use matched-K pairs before quoting either
+number.
+
+**What 5e does NOT establish:** the ratio at cgh64 or C-gh (the phase mix moves
+with configuration -- `coarse_paint` was 5.0% at cdev8 and 13.8% at cdev, so
+its GPU penalty plausibly GROWS toward production, but that is a projection);
+the `coarse_paint` regression's mechanism; anything about the tile-parallelism
+lever, which is untouched by this A/B and is now the largest one standing.
 
 ## 6. What is NOT established
 
@@ -326,3 +397,8 @@ been run.
 6. A velocity-change-only run, if the memory attribution ever needs to be
    clean. Not owed for its own sake -- the term is gone either way and the
    planner prices it -- but the 2.847 GB stays unattributed until then.
+7. ~~The single-node accelerator A/B.~~ DONE (Vista 912457, section 5e): the
+   GPU buys 1.28x against a pre-registered 2.5-4.5x, and `coarse_paint`
+   regresses 1.94x on device. The `coarse_paint` mechanism is owed only if a
+   GPU path is ever pursued; the phase is already the wall+memory target on
+   CPU.
