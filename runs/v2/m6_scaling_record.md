@@ -357,6 +357,58 @@ its GPU penalty plausibly GROWS toward production, but that is a projection);
 the `coarse_paint` regression's mechanism; anything about the tile-parallelism
 lever, which is untouched by this A/B and is now the largest one standing.
 
+## 5f. Job 464 -- the cgh64 phase table: NEITHER pre-registered branch fired, and `migrate` is the largest phase
+
+`scripts/v2_m6_w0_cgh64_antares.sbatch` (antares, commit `9339e78`, K=3,
+repeats 2, slack/arena 0.20 -- jobs 455/459's knobs). Valid: both legs rc=0,
+`instrument_neutral: true`, and the control arm reproduces job 459
+independently (612.32 vs 608.67 s/step, 0.6%), which is what licenses reading
+the phases against that wall.
+
+    migrate        197.36 s/step   32.2%     tile_decode   16.90   2.8%
+    tile_long      176.93 s/step   28.9%     lead_drift    10.11   1.7%
+    coarse_paint   125.03 s/step   20.4%     tile_reduce    6.95   1.1%
+    tile_short      75.39 s/step   12.3%     repack         2.91   0.5%
+
+**The pre-registration -- `coarse_paint` >= ~40% confirms the ~N^2 term,
+<= ~20% refutes it -- landed at 20.4%, in the dead zone, and the derivation
+OVERPREDICTED.** Derived: 64x growth cdev -> cgh64 (8x chunks x 8x mesh
+cells). Measured: 125.03 vs 5.94 s/step = 21.0x raw across machines (~18.6x
+after the ~1.13x deneb-vs-antares correction from 5c, which is incidental,
+not controlled). So the phase IS superlinear (~2.3x excess over the 8x
+particle ratio) but ~3.4x less than the full-mesh arithmetic says --
+something inside the phase (the chunk's own scatter? the brick decode?) is a
+large share the derivation did not model. **Consequence: Stage 2c stays
+justified (bitwise, removes a 20% term and the per-chunk transient), but its
+C-gh payoff must NOT be quoted from the N^2 arithmetic until W0b decomposes
+the phase.**
+
+**THE FINDING, unpredicted: `migrate` is the LARGEST phase at cgh64 --
+32.2%, 197.36 s/step -- against 6.5% (2.80 s/step) at cdev (deneb 463).**
+That is ~70x raw for 8x the particles (~62x machine-corrected). Section 5d's
+"the migration is DONE as an optimization target" was a statement about cdev
+and does not survive at scale. Known candidate contributors, none of which is
+a measured decomposition: staging depth [3,3,2] vs [1,2,1] (~1.73x, physical
+-- section 5c); the per-brick Python loop (nb^3 = 32,768 calls vs 4,096);
+eject's own 2.15x growth (section 6, unchased). The config ladder cannot
+attribute this (degenerate by construction); it needs one-axis arms, and
+naming migrate's exponent is now the W0b work that gates any C-gh wall
+number.
+
+**The device-eligible share SHRINKS with scale: ~62% at cgh64** (tile_long
+28.9 + tile_short 12.3 + coarse_paint 20.4) **against 85.6% at cdev** -- the
+accelerator ceiling, already measured at 1.28x realized (5e), gets worse at
+the configuration that matters. The parallel-tile-loop lever covers
+tile_long + tile_short + tile_decode + tile_reduce = 45.1% at cgh64; 2c
+targets 20.4%; the remaining 32.2% is migrate's own problem.
+
+**NOT established:** the C-gh phase table (extrapolating an unmodeled ~70x
+is exactly the trap the pre-fix section 5 numbers fell into); the
+migrate-internal split (eject / insert / per-brick overhead / staging);
+which term inside coarse_paint carries the excess. Smoke-config shares
+(tile_long 74.1%) are dispatch overhead at tiny tiles and transfer to
+nothing.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
@@ -402,3 +454,10 @@ lever, which is untouched by this A/B and is now the largest one standing.
    regresses 1.94x on device. The `coarse_paint` mechanism is owed only if a
    GPU path is ever pursued; the phase is already the wall+memory target on
    CPU.
+8. **The migrate decomposition (from job 464, section 5f).** One-axis arms
+   for eject vs insert vs the per-brick Python overhead vs staging depth --
+   the phase is 32.2% at cgh64, grew ~70x for 8x particles, and no C-gh wall
+   number is quotable until its exponent has a mechanism. This is W0b of the
+   wall plan and it now gates W1's C-gh payoff claim too (the coarse_paint
+   derivation missed by 3.4x; both phases need the model corrected against
+   the smoke/cdev/cgh64 three-point ladder).
