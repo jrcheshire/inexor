@@ -548,6 +548,11 @@ class SlotState:
     # `arena_bucket`, cached because computing it per call is an O(n_arena) scan
     # and the callers are per-brick. See `arena_slots_of_brick`.
     _arena_by_brick: dict = None
+    # ascending free arena-relative rows, also a pure cache over `arena_bucket`.
+    # None = dirty; the next claim rebuilds it with the same nonzero scan the
+    # uncached path ran per call, so claim ORDER (lowest slots first) is
+    # unchanged. See `_to_arena` for why this exists.
+    _arena_free: object = None
 
     # -------------------------------------------------------------- building
 
@@ -725,6 +730,7 @@ class SlotState:
 
     def _invalidate_arena_index(self):
         self._arena_by_brick = None
+        self._arena_free = None
 
     def _build_arena_index(self):
         """Group the occupied arena rows by brick, ONCE."""
@@ -1018,7 +1024,18 @@ class SlotState:
             a_free = self.arena_slots_of_brick(b)
             if len(a_free):
                 self.arena_bucket[a_free - self.arena_base] = -1
-                self._invalidate_arena_index()
+                # Releasing brick b's rows changes the index by EXACTLY one key,
+                # so drop that key instead of invalidating the whole cache. The
+                # sledgehammer here was 51% of an arena-occupied migrate: each
+                # invalidation forced the NEXT brick's decode to rebuild the
+                # whole index, A x O(n_arena) per migrate (2,008 rebuilds of a
+                # 3.4M-row arena in one profiled cdev call; the engine-scale
+                # term is 5g of the scaling record). The free-list goes dirty
+                # rather than maintained: freed rows must re-enter in ascending
+                # slot order, which only the rebuild scan guarantees.
+                if self._arena_by_brick is not None:
+                    self._arena_by_brick.pop(int(b), None)
+                self._arena_free = None
             # Drift in the INTEGER domain. The wrap is exactly modular there
             # (D-007), where `float_step_bullfrog`'s jnp.mod(x, L) is only
             # nearly so, and adding the displacement to the lattice index cannot
@@ -1193,8 +1210,19 @@ class SlotState:
         return n_over
 
     def _to_arena(self, dest, off, w, ids=None):
-        """Park overflow in the arena, or REFUSE. Never clamp, never drop."""
-        free = np.nonzero(self.arena_bucket < 0)[0]
+        """Park overflow in the arena, or REFUSE. Never clamp, never drop.
+
+        The free scan is CACHED (`_arena_free`), rebuilt only after a release
+        dirtied it -- at most once per eject->claim transition instead of the
+        per-call `np.nonzero` this ran before (1,988 calls, 2.99 s of a 13.8 s
+        arena-occupied cdev migrate; scaling record 5g). Claims still take the
+        LOWEST free slots, because the rebuild is the same ascending scan and
+        claims only ever consume its head, so the arena layout is bitwise the
+        uncached path's.
+        """
+        free = self._arena_free
+        if free is None:
+            free = np.nonzero(self.arena_bucket < 0)[0]
         if len(free) < len(dest):
             raise ValueError(
                 f"{len(dest)} particles overflow their brick's capacity and the arena of "
@@ -1202,8 +1230,20 @@ class SlotState:
                 "or drop (D-007). Raise brick_slack or arena_frac."
             )
         a = free[: len(dest)]
+        self._arena_free = free[len(dest):]
         self.arena_bucket[a] = dest
-        self._invalidate_arena_index()
+        # Surgical index update, exact by construction: a rebuild groups live
+        # rows by brick in ascending slot order, so appending the newly claimed
+        # slots to their bricks' keys and re-sorting each touched key produces
+        # the rebuild's own content without the O(n_arena) pass.
+        idx = self._arena_by_brick
+        if idx is not None:
+            bricks = np.asarray(dest, dtype=np.int64) // self.buckets_per_brick
+            slots_abs = self.arena_base + a
+            for b in np.unique(bricks):
+                add = slots_abs[bricks == b]
+                cur = idx.get(int(b))
+                idx[int(b)] = np.sort(np.concatenate([cur, add])) if cur is not None else add
         self.off[self.arena_base + a] = off
         self.w[self.arena_base + a] = w
         if ids is not None:

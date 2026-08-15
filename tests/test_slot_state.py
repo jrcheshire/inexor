@@ -735,3 +735,58 @@ def test_the_in_place_repack_reports_scratch_that_includes_everything():
         "scratch is a large fraction of the payload, so this is not the in-place form"
     )
     assert r["scratch_bytes"] > 0, "a scratch figure of zero is not credible"
+
+
+# ------------------------------------------- the arena caches are pure caches
+
+
+def test_the_arena_caches_are_pure_and_match_a_rebuild_under_migration():
+    """The surgical index update + lazy free-list vs rebuild-on-every-read.
+
+    Two identical arena-heavy states run the same drift chain. The oracle arm
+    (`st_b`) gets an instance-level shim that INVALIDATES before every
+    `arena_slots_of_brick` read, so every index it ever consumes is a fresh
+    O(n_arena) rebuild and every `_to_arena` claim rescans the free list --
+    exactly the pre-5g semantics, mid-migrate included. The fast arm (`st_a`)
+    runs the maintained caches. An impure cache diverges the arena LAYOUT
+    (the free list decides which slot a spilled particle lands in), so
+    elementwise equality of every stored array is the whole claim.
+
+    Built at brick_slack=0.0 because a 0.10-slack uniform state parks nothing
+    in the arena and this would be a gate that cannot fail; the assert on
+    `arena_used` enforces that the test is actually exercising the machinery.
+    """
+    x, v, st_a = _built(seed=3, brick_slack=0.0, arena_frac=0.30, with_ids=True)
+    _, _, st_b = _built(seed=3, brick_slack=0.0, arena_frac=0.30, with_ids=True)
+
+    orig = state.SlotState.arena_slots_of_brick
+
+    def rebuild_every_read(brick_flat):
+        st_b._invalidate_arena_index()
+        return orig(st_b, brick_flat)
+
+    st_b.arena_slots_of_brick = rebuild_every_read
+
+    extent = L_BOX / BRICKS
+    c = 0.6 * extent / (float(np.max(st_a.vel_scale)) * state.INT16_MAX)
+    fields = ("off", "w", "occupancy", "brick_start", "vel_scale", "arena_bucket", "ids")
+    for k in range(4):
+        state.drift_and_migrate(st_a, c)
+        state.drift_and_migrate(st_b, c)
+        for f in fields:
+            assert np.array_equal(getattr(st_a, f), getattr(st_b, f)), (k, f)
+        assert st_a.arena_used > 0, "arena never exercised; the test is vacuous"
+        # the maintained index must BE a fresh rebuild's content
+        maintained = st_a._arena_by_brick
+        if maintained is not None:
+            fresh = dict(maintained)  # keep a handle; _build replaces the cache
+            rebuilt = st_a._build_arena_index()
+            assert set(fresh) == set(rebuilt)
+            for b in rebuilt:
+                assert np.array_equal(fresh[b], rebuilt[b]), b
+        # the maintained free list must BE the scan's answer
+        if st_a._arena_free is not None:
+            assert np.array_equal(
+                st_a._arena_free, np.nonzero(st_a.arena_bucket < 0)[0]
+            )
+        st_a.check()
