@@ -355,6 +355,10 @@ def _worker(cfg, arm, k_steps, workdir, slack, arena_frac, alloc_margin, pad_lad
     # its ladder in both arms, so the slope difference is attributable to one
     # shape family. `coarse_pad_distinct` on the card is what proves it applied.
     ec.pad_ladder = bool(pad_ladder)
+    # a per-phase high-water mark is VOID under overlap: a boundary hook cannot
+    # see work that runs concurrently, so this instrument is serial-only by
+    # construction and must refuse loudly if the executor knob ever reaches it
+    assert ec.tile_workers == 1, "peak tracing is only readable on the serial executor"
     ec.validate()
     st = icgen.load_slot_state(
         workdir, brick_slack=slack, alloc_margin=alloc_margin, arena_frac=arena_frac

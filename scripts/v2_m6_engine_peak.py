@@ -209,12 +209,17 @@ def _require_cpu():
 def _engine_config(g, coarse_dtype, repack_every, coarse_div, slack):
     from inexor import engine
 
-    return engine.EngineConfig(
+    ec = engine.EngineConfig(
         box_size=g["L"], n_part=g["n_part"], n_fine=g["n_fine"],
         n_coarse=g["n_coarse"] // coarse_div,
         n_tile=g["tile"], b_fine=g["buf"], alpha=m3.ALPHA,
         brick_slack=slack, repack_every=repack_every, coarse_dtype=coarse_dtype,
     )
+    # a peak card from a pooled run would not be comparable to any card on
+    # record (worker RSS lives in other processes; overlap voids per-phase
+    # attribution), so this instrument is serial-only by construction
+    assert ec.tile_workers == 1, "peak cards are only readable on the serial executor"
+    return ec
 
 
 def _worker(cfg, leg, k_steps, workdir, slack, arena_frac, alloc_margin):

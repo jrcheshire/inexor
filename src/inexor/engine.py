@@ -61,6 +61,7 @@ from .forces import (
     make_tile_force_fn,
     stage_coarse_subblock,
     tile_capacity,
+    tile_geom,
     tile_origin_extent,
 )
 from .layout import assert_brick_divides_buffer, choose_brick
@@ -109,6 +110,8 @@ class EngineConfig:
         cap_rungs=CAP_RUNGS_PER_OCTAVE,
         pad_ladder=True,
         paint_subblock=True,
+        tile_workers=1,
+        worker_affinity=True,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -160,6 +163,18 @@ class EngineConfig:
         # that restores the full-mesh-per-chunk behaviour, the same pattern as
         # `pad_ladder`.
         self.paint_subblock = bool(paint_subblock)
+        # W2: the tile-loop executor. 1 = the serial loop, exactly as before
+        # (no-worse-defaults until the pooled gate passes on the target
+        # machine); > 1 = the process pool in `executor.py`, which drives the
+        # SAME `tile_task` from workers -- canary C2 measured 10.4x at W=8 on
+        # gg with bitwise identity on three architectures (Vista 913729).
+        # `worker_affinity` pins each worker to a disjoint core set BEFORE jax
+        # imports there: XLA-CPU sizes its spin pool by VISIBLE cores and
+        # ignores every thread env var, and the un-pinned pool measured walls
+        # GROWING with W (antares 466); worth 20-49% on gg. A knob so the
+        # effect stays measurable, not because off is ever an operating point.
+        self.tile_workers = int(tile_workers)
+        self.worker_affinity = bool(worker_affinity)
 
     @property
     def np_coarse_dtype(self):
@@ -372,6 +387,8 @@ class EngineConfig:
         assert_brick_divides_buffer(self.n_tile, self._b_realized, self.n_brick, self.n_fine)
         if self.paint_long == "int":
             check_tsc_paint_headroom(self.n_total, self.frac_bits)
+        if self.tile_workers < 1:
+            raise ValueError(f"tile_workers must be >= 1, got {self.tile_workers}")
         self._refuse_f64_without_x64()
         return True
 
@@ -857,7 +874,7 @@ def apply_result(st, res):
 
 
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
-         phase=None, tile_force=None):
+         phase=None, tile_force=None, pool=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1 and
@@ -872,6 +889,17 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     per-step rebuild re-traces and re-compiles the same program every step
     (~1.5 s/step, constant -- canary C0). Standalone calls omit it and build
     their own, unchanged.
+
+    `pool`, if given, is a live `executor.TilePool`: the tile loop dispatches
+    `tile_task` over its workers and applies results in arrival order, instead
+    of running task+apply inline in tile order. `run` owns the pool's
+    lifecycle. In pool mode the intra-tile phase boundaries do not fire (a
+    boundary hook cannot see overlapped work) and the stats carry the busy
+    triple -- per-phase worker busy seconds, realized concurrency, idle --
+    which is what distinguishes "not enough parallel work" from "workers
+    starved" from "slower per tile under contention". `tile_force` may then be
+    `(None, geom)`: the parent never runs a tile itself, so it needs the
+    geometry but not the kernels.
 
     `phase`, if given, is called with a boundary NAME after each phase of the
     step completes. It exists because a peak is a max and a max carries no
@@ -959,18 +987,33 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # array: a brick's rows are all kicked in one tile, so its scale is known the
     # moment that tile is done and `apply_result` writes its codes immediately.
     #
-    # This is the SERIAL executor: task and apply inline, in tile order. The
-    # pool executor distributes the same `tile_task` over workers and applies
-    # in arrival order; the bitwise gate compares the two.
-    for t in cfg.tiles:
-        res = tile_task(st, one_tile, C, g_coarse, t, members[t], ph=ph)
+    # TWO executors of ONE function. Serial: task and apply inline, in tile
+    # order. Pool: the same `tile_task` from workers, applied in arrival order.
+    # The bitwise executor-identity gate compares the two.
+    tasks = [(t, members[t]) for t in cfg.tiles]
+    if pool is not None:
+        pool.stage_step(g_coarse, C)
+        results = pool.imap(tasks)
+    else:
+        results = (tile_task(st, one_tile, C, g_coarse, t, bricks, ph=ph)
+                   for t, bricks in tasks)
+    t_loop = time.perf_counter()
+    busy = dict(decode=0.0, short=0.0, long=0.0, quant=0.0)
+    rss = {}
+    for res in results:
         n_owned += res["n_owned"]
         n_overhang += res["n_out"]
+        if "worker" in res:
+            rss[res["worker"]] = max(rss.get(res["worker"], 0.0), res["rss_mb"])
         if res["empty"]:
             continue
         apply_result(st, res)
         tile_scales.extend(res["run_scales"].tolist())
-        ph("tile_reduce")
+        for key, v_b in res["busy"].items():
+            busy[key] += v_b
+        if pool is None:
+            ph("tile_reduce")
+    loop_wall = time.perf_counter() - t_loop
 
     # The boundary stays so the trace keeps its shape and peak comparisons
     # against every card on record are like-for-like. (The `pending` array it
@@ -1011,6 +1054,18 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # much the per-brick scales actually spread, and a single number cannot.
     stats.update(cap=cap, cap_true=cap_true, n_tiles=len(cfg.tiles),
                  vel_scale_kick_max=float(max(tile_scales)) if tile_scales else 1.0)
+    # ALWAYS on the card, 1 included: a pooled run's per-phase memory and
+    # boundary timings are void under overlap, and the comparability check
+    # refuses to read them against serial cards only if the knob is recorded
+    stats["tile_workers"] = int(getattr(cfg, "tile_workers", 1))
+    if pool is not None:
+        b_sum = float(sum(busy.values()))
+        stats["pool"] = dict(
+            workers=pool.workers, wall_s=loop_wall, busy_s=busy, busy_total_s=b_sum,
+            concurrency=(b_sum / loop_wall) if loop_wall > 0 else 0.0,
+            idle_s=pool.workers * loop_wall - b_sum,
+            rss_mb=rss,
+        )
     # the REALIZED dtypes, read off the arrays rather than echoed from the
     # config: a receipt that repeats what it was told cannot catch a knob that
     # did not apply, which is the whole failure mode this milestone is built
@@ -1045,37 +1100,54 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None):
     """
     cfg.validate()
     ph = phase if phase is not None else _no_phase
-    # ONCE per run, not per step: the rebuild re-traces and re-compiles the
-    # same jitted program and rebuilds the kernel triple every step (canary
-    # C0: ~1.5 s/step, constant). The triple is now resident for the whole
-    # run instead of a per-step `membership` transient -- a named boundary so
-    # every allocation still falls inside exactly one phase.
-    tile_force = make_tile_force_fn(
-        cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine,
-        r_s=cfg.r_s, paint=cfg.paint_short, frac_bits=cfg.frac_bits,
-        fdtype=cfg.np_fine_dtype,
-    )
+    pool = None
+    if cfg.tile_workers > 1:
+        # the pool's workers each build their own kernels + jitted program, so
+        # the parent needs only the geometry -- bit-identical numbers from
+        # `tile_geom` without the kernel triple's memory or the trace
+        from .executor import TilePool
+
+        pool = TilePool(st, cfg)
+        tile_force = (None, tile_geom(
+            cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine,
+            paint=cfg.paint_short, frac_bits=cfg.frac_bits, fdtype=cfg.np_fine_dtype,
+        ))
+    else:
+        # ONCE per run, not per step: the rebuild re-traces and re-compiles the
+        # same jitted program and rebuilds the kernel triple every step (canary
+        # C0: ~1.5 s/step, constant). The triple is now resident for the whole
+        # run instead of a per-step `membership` transient -- a named boundary
+        # so every allocation still falls inside exactly one phase.
+        tile_force = make_tile_force_fn(
+            cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine,
+            r_s=cfg.r_s, paint=cfg.paint_short, frac_bits=cfg.frac_bits,
+            fdtype=cfg.np_fine_dtype,
+        )
     ph("kernel_build")
-    lead, fused = fused_drifts(coeffs)
-    drift_and_migrate(st, lead)  # onto the first midpoint
-    ph("lead_drift")
-    out = []
-    # both buffer shapes are carried ACROSS steps and only ever grow, so the run
-    # visits at most a few shapes instead of one per step: `cap` from Stage 0,
-    # `coarse_pad` from Stage 0b, which measured the second one still churning
-    cap_shape = 0
-    pad_shape = 0
-    for k in range(len(fused)):
-        stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
-                     census=census, cap_shape=cap_shape, pad_shape=pad_shape, phase=phase,
-                     tile_force=tile_force)
-        cap_shape = int(stats["cap"])
-        pad_shape = int(stats["coarse_pad"])
-        if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
-            stats["repack"] = st.repack(brick_slack=cfg.brick_slack)
-            ph("repack")
-        out.append(stats)
-    return out
+    try:
+        lead, fused = fused_drifts(coeffs)
+        drift_and_migrate(st, lead)  # onto the first midpoint
+        ph("lead_drift")
+        out = []
+        # both buffer shapes are carried ACROSS steps and only ever grow, so the
+        # run visits at most a few shapes instead of one per step: `cap` from
+        # Stage 0, `coarse_pad` from Stage 0b, which measured it still churning
+        cap_shape = 0
+        pad_shape = 0
+        for k in range(len(fused)):
+            stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
+                         census=census, cap_shape=cap_shape, pad_shape=pad_shape,
+                         phase=phase, tile_force=tile_force, pool=pool)
+            cap_shape = int(stats["cap"])
+            pad_shape = int(stats["coarse_pad"])
+            if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
+                stats["repack"] = st.repack(brick_slack=cfg.brick_slack)
+                ph("repack")
+            out.append(stats)
+        return out
+    finally:
+        if pool is not None:
+            pool.close()
 
 
 def float_run_bullfrog_sync(x, v, coeffs, force_fn, box_size):

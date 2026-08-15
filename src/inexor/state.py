@@ -1481,8 +1481,14 @@ class SlotState:
         self.w[n_alloc:] = 0
         if self.ids is not None:
             self.ids[n_alloc:] = -1
-        self.brick_start = new_start
-        self.occupancy = _to_index(new_occ, self.index_dtype, "repacked")
+        # CONTENTS, not bindings: the pool executor shares these arrays with
+        # worker processes through shared memory, so their addresses must
+        # survive a repack. Both shapes are build-time-fixed (n_bricks + 1 and
+        # n_buckets), so the copy-back is exact, and `_to_index` still guards
+        # the narrowing. `arena_base` is a scalar and rides the per-step task
+        # header instead.
+        self.brick_start[...] = new_start
+        self.occupancy[...] = _to_index(new_occ, self.index_dtype, "repacked")
         self.arena_base = n_alloc
         self.arena_bucket[:] = -1
         self._invalidate_arena_index()

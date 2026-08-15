@@ -1193,13 +1193,12 @@ def make_tile_force_fn(
     if paint == "int":
         check_tile_paint_headroom(n_particles_total, frac_bits)
     fdtype = field_dtype(fdtype)
-    cell = float(box_size) / int(n_fine)
-    mean = float(n_particles_total) / float(n_fine) ** 3
-    P, b_real = padded_size(n_tile, b_fine, n_fine=n_fine)
+    geom = tile_geom(n_fine, box_size, n_particles_total, n_tile, b_fine,
+                     paint=paint, frac_bits=frac_bits, fdtype=fdtype)
+    cell, mean = geom["cell"], geom["mean"]
+    P = geom["P"]
     kers = [jnp.asarray(k) for k in split_kernels((P,) * 3, cell, "short", r_s=r_s,
                                                   fdtype=fdtype)]
-    core_lo = b_real * cell
-    core_hi = (b_real + int(n_tile)) * cell
 
     def one_tile(u, live, owned):
         # `owned` is SUPPLIED, not computed here. It used to be
@@ -1223,10 +1222,29 @@ def make_tile_force_fn(
         out, n_out_g = tile_gather_vector(g[0], g[1], g[2], u, live, (P,) * 3, cell)
         return out, live & owned, n_out_p + n_out_g
 
-    geom = dict(P=int(P), b_realized=int(b_real), cell=cell, mean=mean,
+    return jax.jit(one_tile), geom
+
+
+def tile_geom(n_fine, box_size, n_particles_total, n_tile, b_fine,
+              paint="f64", frac_bits=TILE_FRAC_BITS, fdtype=jnp.float64):
+    """The geometry half of `make_tile_force_fn`, without building anything.
+
+    One source of truth for the numbers `make_tile_force_fn` publishes in its
+    `geom` dict, so a caller that does not need the kernels -- the pool
+    executor's parent process, which never runs a tile itself -- can get
+    bit-identical `cell`/`mean`/`P` without paying the kernel triple's memory
+    or the jit trace. `make_tile_force_fn` reads its own locals back from this
+    dict, so the two cannot drift.
+    """
+    fdtype = field_dtype(fdtype)
+    cell = float(box_size) / int(n_fine)
+    mean = float(n_particles_total) / float(n_fine) ** 3
+    P, b_real = padded_size(n_tile, b_fine, n_fine=n_fine)
+    core_lo = b_real * cell
+    core_hi = (b_real + int(n_tile)) * cell
+    return dict(P=int(P), b_realized=int(b_real), cell=cell, mean=mean,
                 core_lo=core_lo, core_hi=core_hi, n_side=int(n_fine) // int(n_tile),
                 paint=str(paint), frac_bits=int(frac_bits), fdtype=fdtype.name)
-    return jax.jit(one_tile), geom
 
 
 # A global (n,3) f64 force array is 2 x 206 GB at C-gh -- the two arrays whose

@@ -109,7 +109,7 @@ def _enable_x64():
     jax.config.update("jax_enable_x64", True)
 
 
-def _build(cfg_name, slack, arena_frac, tile=None, buf=32):
+def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1):
     _enable_x64()
     import jax.numpy as jnp  # noqa: F401  (engine import order)
 
@@ -134,6 +134,7 @@ def _build(cfg_name, slack, arena_frac, tile=None, buf=32):
     ec = engine.EngineConfig(
         box_size=g["L"], n_part=g["n_part"], n_fine=g["n_fine"], n_coarse=g["n_coarse"],
         n_tile=g["tile"], b_fine=g["buf"], alpha=m3.ALPHA, brick_slack=slack,
+        tile_workers=tile_workers,
     )
     ec.validate()
     st = state.SlotState.build(x, v, t9, ec.n_brick and (g["n_fine"] // ec.n_brick),
@@ -141,15 +142,21 @@ def _build(cfg_name, slack, arena_frac, tile=None, buf=32):
     return engine, ec, st, cosmo, a_grid, bullfrog_float_coeffs, bullfrog_table
 
 
-def _one(cfg_name, k, slack, arena_frac, timed, tile=None, buf=32):
-    engine, ec, st, cosmo, a_grid, bfc, bft = _build(cfg_name, slack, arena_frac, tile, buf)
+def _one(cfg_name, k, slack, arena_frac, timed, tile=None, buf=32, tile_workers=1):
+    engine, ec, st, cosmo, a_grid, bfc, bft = _build(
+        cfg_name, slack, arena_frac, tile, buf, tile_workers
+    )
     a_steps = a_grid(m3.A_INIT, m3.A_FINAL, k, m3.SPACING)
     co = bfc(bft(a_steps, cosmo))
     ph = PhaseTimer() if timed else None
+    seen = []
     t0 = time.perf_counter()
-    engine.run(st, ec, co, phase=ph) if timed else engine.run(st, ec, co)
+    if timed:
+        engine.run(st, ec, co, phase=ph, collect=seen.append)
+    else:
+        engine.run(st, ec, co, collect=seen.append)
     wall = time.perf_counter() - t0
-    return wall, (ph.report() if ph else None)
+    return wall, (ph.report() if ph else None), seen
 
 
 def main(argv=None):
@@ -165,6 +172,11 @@ def main(argv=None):
                          "second arm would inherit it")
     ap.add_argument("--tile", type=int, default=None)
     ap.add_argument("--buf", type=int, default=32)
+    ap.add_argument("--tile-workers", type=int, default=1,
+                    help="run the POOL executor with this many workers (1 = "
+                         "serial, unchanged). Under overlap the tile_* boundary "
+                         "rows read ~0 by construction; the pooled reading is "
+                         "the busy triple reported under 'pool' on the card")
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args(argv)
 
@@ -181,17 +193,18 @@ def main(argv=None):
         # per step and can exhaust the arena where the real run does not, which
         # is how the first version of this line died.
         _one(args.config, args.k, args.slack, args.arena_frac, False,
-             args.tile, args.buf)
+             args.tile, args.buf, args.tile_workers)
 
     traced, control = [], []
-    reports = []
+    reports, pool_steps = [], []
     for _ in range(int(args.repeats)):
-        w, rep = _one(args.config, args.k, args.slack, args.arena_frac, True,
-                      args.tile, args.buf)
+        w, rep, seen = _one(args.config, args.k, args.slack, args.arena_frac, True,
+                            args.tile, args.buf, args.tile_workers)
         traced.append(w)
         reports.append(rep)
-        w2, _ = _one(args.config, args.k, args.slack, args.arena_frac, False,
-                     args.tile, args.buf)
+        pool_steps.extend(s["pool"] for s in seen if "pool" in s)
+        w2, _, _ = _one(args.config, args.k, args.slack, args.arena_frac, False,
+                        args.tile, args.buf, args.tile_workers)
         control.append(w2)
 
     t_med, c_med = float(np.median(traced)), float(np.median(control))
@@ -211,7 +224,23 @@ def main(argv=None):
         phase_frac={n: (merged[n] / tot if tot else 0.0) for n in names},
         s_per_step=t_med / max(int(args.k), 1),
         unknown_phases=sorted({p for r in reports for p in r["unknown_phases"]}),
+        tile_workers=int(args.tile_workers),
     )
+    if pool_steps:
+        # the pooled reading: per-step busy triple, medians over every traced
+        # step. Boundary rows above stay on the card but read ~0 for the tile
+        # phases -- overlapped work is invisible to a boundary hook.
+        res["pool"] = dict(
+            wall_s_median=float(np.median([p["wall_s"] for p in pool_steps])),
+            busy_s_median={n: float(np.median([p["busy_s"][n] for p in pool_steps]))
+                           for n in ("decode", "short", "long", "quant")},
+            busy_total_s_median=float(np.median([p["busy_total_s"] for p in pool_steps])),
+            concurrency_median=float(np.median([p["concurrency"] for p in pool_steps])),
+            idle_s_median=float(np.median([p["idle_s"] for p in pool_steps])),
+            rss_mb_max=float(max((max(p["rss_mb"].values()) for p in pool_steps
+                                  if p["rss_mb"]), default=-1.0)),
+            workers=int(pool_steps[0]["workers"]),
+        )
     # GATE: the instrument must not MATERIALLY move the wall it reports.
     #
     # Two sigma alone does not work here, and finding that out is why the bound
@@ -240,6 +269,11 @@ def main(argv=None):
 
     print(f"{args.config} K={args.k}: traced {t_med:.2f} s, control {c_med:.2f} s "
           f"(sd {c_sd:.2f}), {res['s_per_step']:.2f} s/step")
+    if pool_steps:
+        p = res["pool"]
+        print(f"  pool W={p['workers']}: tile-loop wall {p['wall_s_median']:.2f} s/step, "
+              f"concurrency {p['concurrency_median']:.2f}, idle {p['idle_s_median']:.2f} s, "
+              f"max worker RSS {p['rss_mb_max']:.0f} MB")
     print(f"  instrument neutral: {res['instrument_neutral']} "
           f"(overhead {res['instrument_overhead_s']:+.3f} s against a "
           f"{bound:.3f} s bound, set by {res['gate_bound_that_bound']})")
