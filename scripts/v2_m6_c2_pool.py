@@ -185,8 +185,20 @@ def _rss_mb():
     return -1.0
 
 
-def _worker_init(shm_names, shapes, dtypes, small, C, fn_args):
-    """Attach shm state views, rebuild the read-only SlotState, compile one_tile."""
+def _worker_init(shm_names, shapes, dtypes, small, C, fn_args, core_sets, rank_counter):
+    """Attach shm state views, rebuild the read-only SlotState, compile one_tile.
+
+    AFFINITY FIRST, before jax exists in this process: XLA-CPU sizes its
+    spin-waiting pool by the VISIBLE cores and ignores every thread env var
+    (umbrella: thread-count-is-part-of-the-pin; affinity is the only knob).
+    Job 466 measured the un-pinned consequence on antares: walls GROWING with
+    W (9.05 -> 11.50 s, W=2 -> 16) as 16 workers each spun a 28-core pool.
+    """
+    if core_sets is not None and hasattr(os, "sched_setaffinity"):
+        with rank_counter.get_lock():
+            rank = rank_counter.value
+            rank_counter.value += 1
+        os.sched_setaffinity(0, set(core_sets[rank % len(core_sets)]))
     t0 = time.perf_counter()
     from inexor import state as state_mod
     from inexor.forces import make_tile_force_fn
@@ -278,6 +290,8 @@ def main():
     ap.add_argument("--slack", type=float, default=0.20)
     ap.add_argument("--arena-frac", type=float, default=0.20)
     ap.add_argument("--xla-flags", default=None, help="C3 sweep passthrough for workers")
+    ap.add_argument("--affinity", action="store_true",
+                    help="pin each worker to a disjoint core set (Linux; the C3 knob)")
     ap.add_argument("--out", default=os.path.join("runs", "v2", "m6_c2_pool.json"))
     a = ap.parse_args()
 
@@ -347,9 +361,16 @@ def main():
     mismatch_total = 0
     try:
         for W in a.workers:
+            core_sets = None
+            if a.affinity and hasattr(os, "sched_getaffinity"):
+                cores = sorted(os.sched_getaffinity(0))
+                per = max(1, len(cores) // W)
+                core_sets = [cores[i * per:(i + 1) * per] or cores[-per:] for i in range(W)]
+            rank_counter = ctx.Value("i", 0)
             t0 = time.perf_counter()
             with ctx.Pool(W, initializer=_worker_init,
-                          initargs=(shm_names, shapes, dtypes, small, C, fn_args)) as pool:
+                          initargs=(shm_names, shapes, dtypes, small, C, fn_args,
+                                    core_sets, rank_counter)) as pool:
                 # first pass warms nothing extra (compile ran in init) but
                 # faults shm pages into each worker; timed passes follow
                 st_par = _clone(st)
@@ -415,6 +436,7 @@ def main():
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     with open(a.out, "w") as fh:
         json.dump(dict(config=a.config, tile=a.tile, buf=a.buf, n_tiles=len(tiles),
+                       affinity=bool(a.affinity),
                        cap=C["cap"], serial_wall_s=serial_wall, arms=arms,
                        bitwise_mismatches=mismatch_total, verdict=verdict,
                        commit=commit, machine=platform.machine(),
