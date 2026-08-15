@@ -4,7 +4,7 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 02:00:00
-#SBATCH -A jpl-spherex
+#SBATCH -A JPL-SPHEREx
 #SBATCH -o m6-gpu-ab-%j.log
 # Does the accelerator earn its place? ONE node, GPU on against GPU off.
 #
