@@ -409,6 +409,62 @@ which term inside coarse_paint carries the excess. Smoke-config shares
 (tile_long 74.1%) are dispatch overhead at tiny tiles and transfer to
 nothing.
 
+## 5g. Job 465 + the arena A/B: migrate's ~70x is the ARENA INDEX CHURN, attributed in three steps
+
+**Step 1 -- the exoneration (antares job 465, `v2_m6_migrate_depth.py`,
+commit `00ba689`; every rung valid, spreads <= 0.1 s).** A five-point drift
+ladder at fixed config separates migrant VOLUME (three reach-1 rungs) from
+staged DEPTH (reach-2/3 rungs read against the volume fit), at cdev and
+cgh64:
+
+- cgh64/cdev at matched drift-fraction: **7.89-7.98x on every rung** --
+  exactly linear in N, eject and insert separately.
+- Depth excess: **1.00x at every reach, both configs** -- staged depth costs
+  nothing beyond the migrants it carries. Volume slope 0.11 s/Mrow at both.
+- The probe migrating **100.5M particles (75% of the box)** at cgh64 costs
+  **30.5 s** where the engine's migrate at a few-percent volume costs 197.4
+  s/step (5f). N, volume and depth are all EXONERATED; the pre-registered
+  branch 1 fired: the cost lives in a condition the probe did not share.
+
+**Step 2 -- the one-axis arena arm (laptop, valid stand-in: the control
+reproduces antares 2.6-3.5 s at cdev).** The one structural difference found:
+job 465's uniform states never overflow a brick, so `arena_used = 0` on
+every rung, while the engine's clustered state runs with ~0.9M arena
+residents at cdev. Rebuilt with `brick_slack=0.0` (arena forced occupied,
+`--calls 2` so the measured call runs on a pre-populated arena, the engine's
+steady condition): **total 2.6-3.5 -> 12.4-14.7 s at identical N, volume and
+depth -- ~4.5x, in BOTH eject (1.5 -> 7.0 s) and insert (1.3 -> 7.2 s).**
+Cards `m6_migrate_depth_arena_{ctl,on}.json`.
+
+**Step 3 -- the attribution (cProfile, one arena-occupied cdev migrate,
+13.8 s):**
+
+    _build_arena_index   2,008 calls   7.01 s   51% of the migrate
+    _to_arena            1,988 calls   2.99 s   (its own nonzero free-list scan)
+
+The mechanism, verified in source: `_eject_slab` releases ONE brick's arena
+rows and calls `_invalidate_arena_index()` (state.py:1021); the next brick's
+`decode_brick` calls `arena_slots_of_brick`, which rebuilds the WHOLE
+brick->arena index -- an O(n_arena) pass (state.py:726-741). With A
+arena-holding bricks that is A x O(n_arena) per migrate: at the profiled
+configuration 2,008 x 3.4M ~ 7e9 element-visits = the 7.01 s measured. At
+the engine's cgh64 (n_arena 26.8M, A plausibly 5-15k) that is 1.4-4e11 --
+**100-300 s, the size of 5f's missing ~170 s** -- and the term scales as
+A x n_arena, both growing with N, which is the ~70x-for-8x shape. The scan
+fixed in section 3 has a sibling, and it is the arena index.
+
+**The fix this points at (NOT yet built):** the invalidation is a
+sledgehammer where the release is exact -- ejecting brick b's arena rows
+removes exactly key b from the index, an O(1) dict update; `_to_arena`'s
+claim adds rows to exactly one key. The free-list `np.nonzero` scan wants a
+maintained stack. Same class as the `_insert_slab` fix: targeted rewrite,
+gated on an identity (post-migrate arena content elementwise equal, ids
+included -- this container lost a particle once).
+
+**NOT established:** A (arena-holding brick count) at the engine's cgh64 --
+the 100-300 s is a bracket from a plausible range, not a measurement; the
+engine-side confirmation is the phase table re-run after the fix.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The

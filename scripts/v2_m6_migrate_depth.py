@@ -74,7 +74,7 @@ CONFIGS = {
 }
 
 
-def _build(n_part, nb, box, seed=SEED):
+def _build(n_part, nb, box, seed=SEED, brick_slack=0.10, arena_frac=0.20):
     rng = np.random.default_rng(seed)
     n = int(n_part) ** 3
     x = rng.uniform(0.0, box, size=(n, 3))
@@ -82,8 +82,16 @@ def _build(n_part, nb, box, seed=SEED):
     t9 = T9Layout(box, int(n_part), BUCKET_CELLS)
     # arena 0.20 = the timing-leg convention: the drift ladder migrates up to
     # ~78% of particles (smoke, f=2.85) against the engine's few percent, and a
-    # D-007 arena refusal must not be able to end a TIMING rung
-    return state.SlotState.build(x, v, t9, int(nb), arena_frac=0.20)
+    # D-007 arena refusal must not be able to end a TIMING rung.
+    # `brick_slack` is the ARENA-OCCUPANCY axis (job 465 follow-up): at the
+    # default 0.10 a uniform state never overflows a brick and the arena stays
+    # EMPTY (job 465 measured arena_used = 0 on every rung), which is the one
+    # structural difference from the engine's clustered state. slack 0.0 makes
+    # immigrants overflow into the arena, so migrate runs in the engine-like
+    # regime where `_eject_slab`'s per-brick index invalidation interleaves
+    # with O(n_arena) rebuilds.
+    return state.SlotState.build(x, v, t9, int(nb), brick_slack=brick_slack,
+                                 arena_frac=arena_frac)
 
 
 def _timed_migrate(st, c_drift):
@@ -125,16 +133,44 @@ def _timed_migrate(st, c_drift):
     return acc
 
 
-def run_config(name, cfg):
-    print(f"== {name}: n_part={cfg['n_part']} nb={cfg['nb']} box={cfg['box']}")
+def run_config(name, cfg, brick_slack=0.10, arena_frac=0.20, calls=1):
+    print(f"== {name}: n_part={cfg['n_part']} nb={cfg['nb']} box={cfg['box']} "
+          f"slack={brick_slack} arena={arena_frac} calls={calls}")
     extent = cfg["box"] / cfg["nb"]
     rungs = []
     for f, target in zip(FRACTIONS, TARGET_REACH):
         reps = []
         for _ in range(cfg["repeats"]):
-            st = _build(cfg["n_part"], cfg["nb"], cfg["box"])
+            st = _build(cfg["n_part"], cfg["nb"], cfg["box"],
+                        brick_slack=brick_slack, arena_frac=arena_frac)
             c1 = extent / (float(np.max(st.vel_scale)) * state.INT16_MAX)
-            reps.append(_timed_migrate(st, f * c1))
+            # `calls > 1` CHAINS migrates on one state: call 1 populates the
+            # arena from the drift, call 2+ measures migrate with the arena
+            # already resident -- the engine's steady condition. Each call is
+            # its own timing; only the LAST lands in `reps` (the steady one),
+            # the chain is carried on the rung as `chain_total_s`/`chain_arena`.
+            chain_t, chain_a = [], []
+            try:
+                for _ in range(int(calls) - 1):
+                    warm = _timed_migrate(st, f * c1)
+                    chain_t.append(warm["total_s"])
+                    chain_a.append(warm["arena_used"])
+                r_last = _timed_migrate(st, f * c1)
+            except (RuntimeError, ValueError) as exc:
+                # the D-007 arena/capacity refusal: a REFUSED rung is a marked
+                # row, not a lost card -- slack-0 arms push migrant volumes the
+                # arena cannot always absorb, and that is a finding, not noise
+                print(f"  f={f:4.2f} REFUSED: {str(exc).splitlines()[0][:100]}")
+                reps = []
+                rungs.append(dict(f=float(f), target_reach=int(target), void=True,
+                                  refused=str(exc).splitlines()[0][:200]))
+                break
+            if chain_t:
+                r_last["chain_total_s"] = chain_t
+                r_last["chain_arena"] = chain_a
+            reps.append(r_last)
+        if not reps:
+            continue
         r = dict(
             f=float(f), target_reach=int(target),
             c_drift=float(f * c1),
@@ -159,7 +195,8 @@ def run_config(name, cfg):
               flush=True)
 
     out = dict(config=name, **{k: cfg[k] for k in ("n_part", "nb", "box", "repeats")},
-               n_particles=cfg["n_part"] ** 3, rungs=rungs)
+               n_particles=cfg["n_part"] ** 3, brick_slack=brick_slack,
+               arena_frac=arena_frac, calls=calls, rungs=rungs)
 
     # 1. the volume law at fixed depth: total_s vs migrant rows over the three
     # reach-1 rungs (a line through three points -- reported, and the residual
@@ -194,6 +231,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", nargs="+", default=["smoke"],
                     choices=sorted(CONFIGS))
+    ap.add_argument("--brick-slack", type=float, default=0.10)
+    ap.add_argument("--arena-frac", type=float, default=0.20)
+    ap.add_argument("--calls", type=int, default=1)
     ap.add_argument("--out", default=os.path.join("runs", "v2", "m6_migrate_depth.json"))
     a = ap.parse_args()
 
@@ -202,7 +242,8 @@ def main():
     results = []
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     for name in a.config:
-        results.append(run_config(name, CONFIGS[name]))
+        results.append(run_config(name, CONFIGS[name], brick_slack=a.brick_slack,
+                                  arena_frac=a.arena_frac, calls=a.calls))
         with open(a.out, "w") as fh:
             json.dump(dict(results=results, partial=(len(results) < len(a.config))),
                       fh, indent=1)
