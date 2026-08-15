@@ -543,6 +543,52 @@ tile_short 16.3%, migrate 5.2%, decode 3.8%. The tile phases sum to 63.6%;
 **coarse_paint is now the largest single non-tile term and carries the
 superlinear residual (5f), so Stage 2c is the next fix on the ladder.**
 
+## 5i. Vista 913729 -- C2 on gg: the pool design PASSES on the target hardware
+
+(After two ~10 s env casualties, 913639/913656: the scratch purge had eaten
+the Vista env's stale-atime symlinks -- `bin/python` gone, `python3.14`
+intact -- and the rebuild then hit a half-extracted `libprotobuf` in the
+$HOME rattler cache. `pixi clean cache` + reinstall on idev, JC's hands per
+the TACC rule. The hard-fail preamble caught both for ~zero SU.)
+
+**The pre-registered bar -- efficiency >= 50% at W=8, evaluated HERE --
+passes decisively.** Honest metric is tiles/s (the serial baseline runs
+single-threaded and slightly slow on gg, so the naive efficiency prints
+exceed 100%; and the script's own "redesign" verdict lines apply the 50% bar
+at MAX W, which was never the criterion -- read the cards, not the verdict
+strings):
+
+    pinned, cdev8/64 tiles:   serial 4.4 tiles/s
+      W=8    45 tiles/s  (10.4x)   busy/tile 176 ms   idle ~0
+      W=16   68 tiles/s  (15.5x)   busy/tile 233 ms
+      W=32   78 tiles/s  (17.9x)   busy/tile 380 ms
+      W=64   85 tiles/s  (19.4x)   busy/tile 709 ms   idle 2.95 s
+
+- **The ceiling is ~19-20x at this config**, emerging as busy-inflation
+  beyond W=16 -- the same bandwidth signature as antares, but at 14x the
+  throughput. The machine matters exactly as 5h said: antares capped at
+  1.4x, the laptop at 2.7x, Grace at ~19x.
+- **Pinning WINS on gg** (unlike antares): un-pinned reads 7.0x / 11.4x /
+  14.7x at W=8/16/32 against pinned 10.4x / 15.5x / 17.9x -- 20-49%. Grace's
+  two NUMA domains are real; affinity stays (C4 answered).
+- **Bitwise n_diff = 0 at every width in every arm** -- the third
+  architecture (after macOS-arm64 and x86) on which the disjoint-write
+  premise has now held exactly.
+- **P=320: 7.47x at W=8 over 8 tiles** (quantization-perfect), RSS 5.6
+  GB/worker, matching antares -- the gg width arithmetic at production tile
+  shape stands at ~20 workers in the ~120 GB budget.
+- Caveats: 64 tiles quantizes the high-W rungs (W=64 = one tile per worker),
+  so the ceiling number is approximate until a larger tile population is
+  measured; and the serial baseline's own thread budget on gg (nproc read 1
+  in the batch shell) makes cross-machine SERIAL comparisons unreliable --
+  tiles/s within one machine is the only number quoted here.
+
+**Consequence: W2's engine surgery is green-lit by the plan's own criterion.**
+The pool skeleton (persistent spawn workers, shm state, parent-applied
+writes, per-worker affinity) is the design as canaried; the coarse-paint
+chunks are pool-eligible by the same associativity argument and should ride
+the same executor.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
