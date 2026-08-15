@@ -491,6 +491,58 @@ occupancy penalty is deleted, volume slope back to 0.13 s/Mrow. Card
 a cgh64 phase re-run (prediction: migrate 197.4 -> ~30 s/step class, step
 612 -> ~450 s).
 
+## 5h. Job 467 -- the arena fix confirmed at the engine, and the C3 affinity arm falsified
+
+**Leg 4, the confirmation (antares, commit `1ae14cf`, same knobs as 464;
+instrument neutral; leg 7,018 s):**
+
+    cgh64, s/step:          pre-fix (464)    post-fix (467)
+    step                        612.32           457.45      1.34x
+    migrate                     197.36            23.72      8.3x  (32.2% -> 5.2%)
+    tile_long                   176.93           192.09      +8.6%
+    coarse_paint                125.03           132.53      +6.0%
+    tile_short                   75.39            74.51      -1.2%
+    tile_decode                  16.90            17.30      +2.4%
+
+**The pre-registered core landed: migrate fell to the predicted class (~30 s;
+measured 23.7) and the step to the predicted ~450 s class.** The 5g
+attribution is confirmed at the engine: the arena index churn WAS the ~170 s.
+The cumulative cgh64 ladder now reads **2622.6 (pre-scan-fix) -> 612.3 (scan
+fix, `10d1a2d`) -> 457.5 (arena fix) = 5.73x in two attributed fixes.**
+
+**Neutrality clause: PARTIALLY met, recorded rather than absorbed.**
+tile_short/decode/reduce are within noise, but tile_long +8.6% and
+coarse_paint +6.0% exceed the within-job sigma (~2.9 s/step). The books
+balance (migrate's -173.6 vs the step's -154.9; the difference IS those
+drifts), nothing in the fix touches either phase, and cross-job scatter at
+cgh64 has never been characterized (one run per version, different days) --
+the likely reading is node-state scatter, but it stays UNEXPLAINED on this
+record. A same-day A/B pair would characterize it if the neutrality claim
+ever needs to be airtight.
+
+**Legs 2-3, C3: per-worker affinity does NOT fix the pool scaling.** Pinned
+walls at cdev8/64 tiles: 9.54/9.19/10.30/10.95 s at W=2/4/8/16 against
+un-pinned 466's 9.05/9.57/10.93/11.50 -- within ~5%, efficiency still 7% at
+W=16 (it did cut idle-worker RSS, 836 vs 1583 MB at W=16). Bitwise 0 at
+every width in every arm, still. The diagnostic triple names the shape:
+idle ~0 while per-tile busy inflates ~linearly with W (296/570/1256/2555 ms
+at W=2/4/8/16 vs 195 serial) -- **aggregate throughput is FLAT at ~6.4
+tiles/s regardless of W: a shared-resource ceiling, not a dispatch defect.**
+Leading candidate: memory bandwidth (the laptop at ~500+ GB/s plateaus at
+2.7x; antares caps at 1.4x). Confound noted: the serial baseline may recruit
+XLA intra-op parallelism a 1-core-pinned worker cannot, inflating the
+per-tile ratio -- but that cannot flatten AGGREGATE throughput.
+**Consequence: antares is the WRONG VENUE for the C2 scaling verdict**
+(bottleneck identity is hardware-specific); the verdict belongs on a gg node
+(~500 GB/s/socket, first-touch NUMA control), which is also the target.
+P=320 RSS re-read pinned: 5.6-5.8 GB/worker, unchanged -- the gg width
+arithmetic is ~20 workers per 120 GB, not 35-45, if gg reproduces it.
+
+**The post-fix phase mix at cgh64:** tile_long 42.0%, coarse_paint 29.0%,
+tile_short 16.3%, migrate 5.2%, decode 3.8%. The tile phases sum to 63.6%;
+**coarse_paint is now the largest single non-tile term and carries the
+superlinear residual (5f), so Stage 2c is the next fix on the ladder.**
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
