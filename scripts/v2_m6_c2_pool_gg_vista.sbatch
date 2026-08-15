@@ -37,7 +37,7 @@ command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
 cd "$HOME/src/inexor" || { echo "FATAL: no ~/src/inexor"; exit 1; }
 export JAX_PLATFORMS=cpu
 export CONDA_OVERRIDE_CUDA=12.0
-pixi run -e default python -c "
+pixi run -e gpu python -c "
 import jax
 assert jax.devices()[0].platform == 'cpu', 'expected the CPU backend'
 print('jax', jax.__version__)
@@ -62,22 +62,22 @@ run_leg() {
 
 C2="scripts/v2_m6_c2_pool.py"
 
-run_leg "smoke" pixi run -e default python $C2 --config cdev8 --tile 64 \
+run_leg "smoke" pixi run -e gpu python $C2 --config cdev8 --tile 64 \
   --workers 2 --repeats 1 --affinity --out runs/v2/m6_c2_pool_gg_smoke.json
 [ "${codes[0]}" -ne 0 ] && {
   echo "FATAL: smoke failed (bitwise or crash); not burning the long legs"
   exit 1
 }
 
-run_leg "gg-pinned" pixi run -e default python $C2 --config cdev8 --tile 64 \
+run_leg "gg-pinned" pixi run -e gpu python $C2 --config cdev8 --tile 64 \
   --workers 8 16 32 64 --repeats 3 --affinity \
   --out runs/v2/m6_c2_pool_gg_pinned.json
 
-run_leg "gg-unpinned" pixi run -e default python $C2 --config cdev8 --tile 64 \
+run_leg "gg-unpinned" pixi run -e gpu python $C2 --config cdev8 --tile 64 \
   --workers 8 16 32 --repeats 3 \
   --out runs/v2/m6_c2_pool_gg_unpinned.json
 
-run_leg "gg-p320" pixi run -e default python $C2 --config cdev --tile 256 \
+run_leg "gg-p320" pixi run -e gpu python $C2 --config cdev --tile 256 \
   --workers 8 16 --repeats 2 --affinity \
   --out runs/v2/m6_c2_pool_gg_cdev.json
 
