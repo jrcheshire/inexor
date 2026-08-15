@@ -224,6 +224,68 @@ configurations, so the per-tile working set does not grow with the box. That is
 why the peak rises only 1.69x for 8x the particles, and it is the planner's own
 claim that cdev, cgh64 and C-gh share particles-per-tile and padded tile side.
 
+## 5d. Job 463 -- where the wall goes, and the accuracy checkpoint discharged
+
+`scripts/v2_m6_phase_time.py`, deneb, instrument neutral at both configurations
+(overhead +0.211 s of a 1.184 s bound at cdev8, -0.407 of 4.310 at cdev).
+
+| phase | cdev8 | cdev (anchor) |
+|---|---|---|
+| `tile_long` (the UNCOMPILED sub-block gather) | 50.4% | **48.8%** |
+| `tile_short` (the jitted short-range force) | 33.5% | 22.9% |
+| `coarse_paint` | 5.0% | 13.8% |
+| `migrate` | 2.2% | 6.5% |
+| `tile_decode` | 7.0% | 4.2% |
+| `tile_reduce` | 0.9% | 1.6% |
+| everything else | <1% each | <1% each |
+
+**The migration is DONE as an optimization target**: 6.5% of the anchor step and
+2.2% of the cheap one, after being 77% of it this morning.
+
+**`tile_long` is now the engine**, at about half the step at both rungs. It is
+the gather D-v2-21 refuses to compile on a 2.2e-16 bitwise break, and it costs
+MORE than the jitted force it feeds.
+
+**This falsifies an Amdahl argument made earlier the same day.** I argued the
+accelerator's ceiling was ~1.14x, from a "host plumbing is ~88% of a tile"
+figure that predated the migration fix. Measured, the device-eligible phases
+(the JAX ones) are **85.6% at the anchor and 88.9% at cdev8**, so at the
+recorded 6.8x device speedup the ceiling is **~3.7x**. The reasoning was sound
+and the input was stale; the GPU question is not settled toward CPU and the
+single-node accelerator-on/off test is the instrument.
+
+**A term the cheap configuration hid:** `coarse_paint` is 5.0% at cdev8 and
+13.8% at the anchor -- 10x in absolute terms for 8x the particles, mildly
+superlinear. That is the phase allocating a full `n_coarse^3` mesh per chunk,
+re-verified live on 2026-08-14, and it is one of the few items that would help
+wall and memory together.
+
+**Parallelism ceiling, and it is lower at the anchor than the cheap rung
+suggests.** The tile phases are 77.5% of the anchor step against 91.8% at
+cdev8, so parallelising that loop alone caps at **4.4x** rather than 12x -- 8
+large tiles instead of 64 small ones leaves the coarse paint and the migration
+proportionally bigger. NB the tile-parallelism and accelerator levers are
+largely THE SAME 86% exploited two ways, not multiplicative.
+
+**The accuracy checkpoint owed by the per-brick velocity scales: PASSED, and it
+IMPROVED.** `v2_m3_engine_gate.py --leg accum --config cdev --k 40`, at the
+M-v2-3 gate's own knobs so the comparison is like-for-like:
+
+    ratified (global scale)   7.125e-4   42.1x under D-v2-9's 3e-2 bar
+    per-brick scales          4.120e-4   72.8x under the same bar
+
+A 1.73x improvement, inside the "within ~2x either way" band pre-registered
+before the run and in the predicted direction: finer per-brick scales (r_p50
+0.40-0.80 of the global max) beat the extra rounding a migrant now takes at its
+destination brick's scale. Nowhere near the ~3e-3 point at which the sbatch
+said the storage decision should be re-opened rather than recorded as a pass.
+
+**Incidental, and not a controlled comparison:** the anchor phase leg reads
+43.02 s/step on deneb against job 460's 48.53 on antares at the same knobs but
+K=5 against K=3, so deneb is roughly 1.13x faster per step. Smaller than the
+machine-choice discussion assumed. A matched pair would be cheap and has not
+been run.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
@@ -254,9 +316,9 @@ claim that cdev, cgh64 and C-gh share particles-per-tile and padded tile side.
 
 1. ~~Read out job 459.~~ DONE, section 5b. Wall passed; the memory prediction
    missed its band and its comparison is confounded.
-2. **A matched-knob cdev point on the current code**, which is what says whether
-   the step is now linear in N. Cheap, and everything about production sizing
-   waits on it.
+2. ~~A matched-knob cdev point.~~ DONE (job 460, section 5c).
+2b. ~~Where the wall goes.~~ DONE (job 463, section 5d). ~~The accuracy
+   checkpoint the velocity change owed.~~ DONE and PASSED, 4.120e-4.
 3. Extend the brick ladder past nb=32 before any production wall is quoted.
 4. `eject`'s nb-growth, if it ever matters next to what remains.
 5. The per-brick loop itself: nb^3 Python iterations per step is the shape the
