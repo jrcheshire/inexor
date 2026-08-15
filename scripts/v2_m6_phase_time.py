@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 import v2_m3_engine_gate as m3  # noqa: E402
 
 PHASES = (
-    "lead_drift", "coarse_paint", "coarse_solve", "membership",
+    "kernel_build", "lead_drift", "coarse_paint", "coarse_solve", "membership",
     "tile_decode", "tile_short", "tile_long", "tile_reduce",
     "tile_loop_end", "reconcile", "migrate", "repack",
 )

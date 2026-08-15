@@ -609,8 +609,9 @@ def test_the_phase_hook_names_every_boundary_in_order():
     """
     cfg = _cfg()
     seen, out, _ = _phase_names(cfg, 21, n_steps=2)
-    assert seen[0] == "lead_drift", "the drift onto the first midpoint is unnamed"
-    per_step = seen[1:]
+    assert seen[0] == "kernel_build", "the once-per-run force build is unnamed"
+    assert seen[1] == "lead_drift", "the drift onto the first midpoint is unnamed"
+    per_step = seen[2:]
     n_tiles = len(cfg.tiles)
     # one step's worth: the three global phases, then the tile loop, then the tail
     head = per_step[: 3 + 4 * n_tiles + 3]

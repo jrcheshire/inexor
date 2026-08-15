@@ -121,7 +121,7 @@ GATE_SIGMA = 2.0
 # visits them. Listed here so the probe REFUSES a name it does not know rather
 # than silently reporting a partial decomposition if the engine gains a phase.
 PHASES = (
-    "lead_drift", "coarse_paint", "coarse_solve", "membership",
+    "kernel_build", "lead_drift", "coarse_paint", "coarse_solve", "membership",
     "tile_decode", "tile_short", "tile_long", "tile_reduce",
     "tile_loop_end", "reconcile", "migrate", "repack",
 )

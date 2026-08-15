@@ -45,6 +45,8 @@ global `(n,3)` f64 arrays that would otherwise appear are 206 GB each at C-gh,
 and deleting them is what makes that configuration runnable.
 """
 
+import time
+
 import numpy as np
 
 from .codec import INT16_MAX, assert_int16_range
@@ -65,7 +67,10 @@ from .layout import assert_brick_divides_buffer, choose_brick
 from .painting import check_tsc_paint_headroom, paint_tsc_int, paint_tsc_int_subblock
 from .state import drift_and_migrate
 
-__all__ = ["EngineConfig", "coarse_delta_streamed", "float_run_bullfrog_sync", "run", "step"]
+__all__ = [
+    "EngineConfig", "apply_result", "coarse_delta_streamed", "float_run_bullfrog_sync",
+    "run", "step", "tile_task",
+]
 
 
 def _dtype_name(x, what):
@@ -711,8 +716,148 @@ def _no_phase(_name):
     """The default phase hook: does nothing, allocates nothing, returns nothing."""
 
 
+def tile_task(st, one_tile, C, g_coarse, t, bricks, ph=_no_phase):
+    """One tile of the kick: decode -> short + long force -> quantize per brick.
+
+    Reads `st` and writes NOTHING: every write the tile owes comes back in the
+    returned dict, and `apply_result` is the only place they land. This is the
+    executor seam -- the serial loop in `step` calls task and apply inline, and
+    the pool executor distributes the task over workers -- so a bitwise gate
+    between the two compares two executors of ONE function rather than two
+    codebases. Promoted from `scripts/v2_m6_c2_pool.py` (C2 of the wall plan),
+    which keeps its own copy as the ratified canary.
+
+    `C` is the per-step header: geometry ints, `cap`, and the kick
+    coefficients. Small and picklable by construction, because in pool mode it
+    rides to the workers with every task.
+
+    `ph` is the phase hook (see `step`); the serial executor passes the real
+    one so the per-phase high-water boundaries stay exactly where the
+    monolithic loop had them. The `busy` wall times are returned either way --
+    under overlap they are the only per-phase timing that means anything,
+    since a boundary hook cannot see work that runs concurrently.
+    """
+    import jax.numpy as jnp
+
+    t_dec = time.perf_counter()
+    slots, x, v = st.decode_bricks(bricks)
+    # the brick each decoded row came from, in the order decode_bricks
+    # concatenates: this is what ownership is read off, NOT the position
+    brick_of_row = np.repeat(
+        np.asarray(bricks, dtype=np.int64), [st.brick_member_count(b) for b in bricks]
+    )
+    m = len(slots)
+    if m == 0:
+        return dict(t=t, empty=True, n_owned=0, n_out=0)
+    if m > C["cap"]:
+        raise RuntimeError(f"tile {t}: {m} members > cap {C['cap']}")
+    idx = np.resize(np.arange(m), C["cap"])
+    live = np.zeros(C["cap"], dtype=bool)
+    live[:m] = True
+    origin, _ = tile_origin_extent(t, C["n_tile"], C["b_real"], C["cell"])
+    u = jnp.mod(jnp.asarray(x[idx]) - jnp.asarray(origin), C["box"])
+    # ownership from the brick each row is STORED IN, which is the same thing
+    # membership is built from, so the two cannot disagree. Two earlier rules
+    # both re-derived it from a coordinate and both lost exactly one row of
+    # 16,777,216 at cdev (antares 431 tile-local, 436 global-position). See
+    # `forces.owned_mask_from_bricks` for why this one cannot.
+    own_rows = owned_mask_from_bricks(
+        brick_of_row, t, C["n_tile"], C["n_brick"], C["n_fine"] // C["n_brick"]
+    )
+    own = np.zeros(C["cap"], dtype=bool)
+    own[:m] = own_rows
+    own &= live
+    ph("tile_decode")
+    t_short = time.perf_counter()
+    g_short, owned, n_out = one_tile(u, jnp.asarray(live), jnp.asarray(own))
+    g_short = np.asarray(g_short)[:m]
+    owned = np.asarray(owned)[:m]
+    ph("tile_short")
+    t_long = time.perf_counter()
+    if not owned.any():
+        return dict(t=t, empty=True, n_owned=0, n_out=int(n_out))
+
+    # the long force at the SAME owned rows, out of a staged sub-block
+    o_cells, extent = coarse_subblock_origin_extent(
+        t, C["n_tile"], C["n_coarse"], C["n_fine"], halo=COARSE_HALO
+    )
+    sub = [stage_coarse_subblock(g, o_cells, extent) for g in g_coarse]
+    # Padded to `cap` with a live mask, for the SAME reason the short arm is:
+    # a per-tile row count keys a new XLA shape, so every tile recompiles.
+    # Profiled before the fix at 2,107 compilations and 24.1 s of a 32.7 s
+    # step -- 74% of it, 18.5 s inside backend_compile_and_load. One shape
+    # serves every tile.
+    n_own = int(owned.sum())
+    xo = np.zeros((C["cap"], 3), dtype=np.float64)
+    xo[:n_own] = x[owned]
+    lv = np.zeros(C["cap"], dtype=bool)
+    lv[:n_own] = True
+    g_long = np.asarray(
+        gather_coarse_subblock(
+            *sub, jnp.asarray(xo), o_cells, C["coarse_cell"], C["n_coarse"],
+            assign="tsc", live=lv,
+        )
+    )[:n_own]
+    ph("tile_long")
+    t_quant = time.perf_counter()
+    g_tot = g_short[owned] + g_long
+    v_new = C["alpha_k"] * v[owned] + C["bcoef"] * g_tot
+    # QUANTIZE HERE, per brick, instead of holding `v_new` for a global scale.
+    # `decode_bricks` concatenates brick by brick and ownership is read off
+    # the brick a row is STORED in, so the owned rows are whole brick blocks
+    # and stay contiguous under the mask -- which is what lets a run scan
+    # replace a sort. The assertion below is on that contiguity, because it
+    # is load-bearing and free to check: if a brick ever appeared in two
+    # runs, the second run would silently overwrite the first one's scale
+    # and decode every row of it wrong.
+    slots_o, bricks_o = slots[owned], brick_of_row[owned]
+    cut = np.flatnonzero(np.diff(bricks_o)) + 1
+    run_lo = np.concatenate(([0], cut))
+    run_hi = np.concatenate((cut, [len(bricks_o)]))
+    if len(np.unique(bricks_o)) != len(run_lo):
+        raise AssertionError(
+            f"tile {t}: owned rows are not grouped by brick "
+            f"({len(run_lo)} runs over {len(np.unique(bricks_o))} bricks). The "
+            "per-brick scale depends on a brick's rows being contiguous."
+        )
+    w_codes = np.empty((n_own, 3), dtype=np.int16)
+    run_bricks = np.empty(len(run_lo), dtype=np.int64)
+    run_scales = np.empty(len(run_lo), dtype=np.float64)
+    for i, (lo, hi) in enumerate(zip(run_lo, run_hi)):
+        vb = v_new[lo:hi]
+        s_b = float(np.max(np.abs(vb))) / INT16_MAX
+        s_b = s_b if s_b > 0.0 else 1.0
+        w_b = np.rint(vb / s_b)
+        assert_int16_range(w_b)
+        w_codes[lo:hi] = w_b.astype(np.int16)
+        run_bricks[i] = int(bricks_o[lo])
+        run_scales[i] = s_b
+    t_end = time.perf_counter()
+    return dict(
+        t=t, empty=False, slots_o=slots_o, w_codes=w_codes, run_bricks=run_bricks,
+        run_scales=run_scales, n_owned=n_own, n_out=int(n_out),
+        busy=dict(decode=t_short - t_dec, short=t_long - t_short,
+                  long=t_quant - t_long, quant=t_end - t_quant),
+    )
+
+
+def apply_result(st, res):
+    """Apply one tile's writes: velocity codes at owned rows, per-brick scales.
+
+    Disjoint across tiles because ownership is a partition (asserted in
+    `step`), so ANY application order gives the same state -- which is what
+    lets the pool executor apply results in arrival order. Batched writes are
+    bitwise the per-run writes the loop used to do: same rows, same values,
+    disjoint runs.
+    """
+    if res["empty"]:
+        return
+    st.write_velocities(res["slots_o"], res["w_codes"])
+    st.vel_scale[res["run_bricks"]] = res["run_scales"]
+
+
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
-         phase=None):
+         phase=None, tile_force=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1 and
@@ -721,6 +866,12 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     `census=True` turns on the coarse decode census; see
     `coarse_delta_streamed`. Off by default: it is a gate instrument and costs
     two extra passes over the coarse mesh.
+
+    `tile_force`, if given, is the `(one_tile, geom)` pair from
+    `make_tile_force_fn`; `run` builds it once and passes it down, because the
+    per-step rebuild re-traces and re-compiles the same program every step
+    (~1.5 s/step, constant -- canary C0). Standalone calls omit it and build
+    their own, unchanged.
 
     `phase`, if given, is called with a boundary NAME after each phase of the
     step completes. It exists because a peak is a max and a max carries no
@@ -778,13 +929,27 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # bitwise neutral; `tests/test_engine.py` pins that.
     cap = capacity_shape(cap_true, rungs=cfg.cap_rungs, floor_shape=cap_shape)
 
-    one_tile, geom = make_tile_force_fn(
-        cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine,
-        r_s=cfg.r_s, paint=cfg.paint_short, frac_bits=cfg.frac_bits,
-        fdtype=cfg.np_fine_dtype,
-    )
+    if tile_force is None:
+        # standalone calls build per step, as before; `run` hoists the build to
+        # once per run -- it re-traces and re-compiles `one_tile` every call
+        # (~1.5 s/step at cdev, constant: canary C0) and rebuilds the kernel
+        # triple, which is the `membership` phase's transient
+        tile_force = make_tile_force_fn(
+            cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine,
+            r_s=cfg.r_s, paint=cfg.paint_short, frac_bits=cfg.frac_bits,
+            fdtype=cfg.np_fine_dtype,
+        )
+    one_tile, geom = tile_force
     cell = geom["cell"]
     ph("membership")
+
+    # the per-step header `tile_task` runs from: everything it needs that is
+    # not an array. In pool mode this is what rides to the workers per task.
+    C = dict(
+        cap=int(cap), n_tile=cfg.n_tile, n_brick=cfg.n_brick, n_fine=cfg.n_fine,
+        n_coarse=cfg.n_coarse, box=cfg.box_size, coarse_cell=cfg.coarse_cell,
+        cell=cell, b_real=int(b_real), alpha_k=alpha_k, bcoef=bcoef,
+    )
 
     tile_scales, n_owned, n_overhang = [], 0, 0
     # NO `pending`. It held `(slots int64, v_new f64)` for every owned row until
@@ -792,104 +957,25 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # before then -- 32 B/p, 274.9 GB at C-gh, and the largest single term in the
     # whole configuration. Per-brick scales remove the wait rather than the
     # array: a brick's rows are all kicked in one tile, so its scale is known the
-    # moment that tile is done and its codes can be written immediately.
+    # moment that tile is done and `apply_result` writes its codes immediately.
+    #
+    # This is the SERIAL executor: task and apply inline, in tile order. The
+    # pool executor distributes the same `tile_task` over workers and applies
+    # in arrival order; the bitwise gate compares the two.
     for t in cfg.tiles:
-        slots, x, v = st.decode_bricks(members[t])
-        # the brick each decoded row came from, in the order decode_bricks
-        # concatenates: this is what ownership is read off, NOT the position
-        brick_of_row = np.repeat(
-            np.asarray(members[t], dtype=np.int64),
-            [st.brick_member_count(b) for b in members[t]],
-        )
-        m = len(slots)
-        if m == 0:
+        res = tile_task(st, one_tile, C, g_coarse, t, members[t], ph=ph)
+        n_owned += res["n_owned"]
+        n_overhang += res["n_out"]
+        if res["empty"]:
             continue
-        if m > cap:
-            raise RuntimeError(f"tile {t}: {m} members > cap {cap}")
-        idx = np.resize(np.arange(m), cap) if m else np.zeros(cap, dtype=np.int64)
-        live = np.zeros(cap, dtype=bool)
-        live[:m] = True
-        origin, _ = tile_origin_extent(t, cfg.n_tile, b_real, cell)
-        xg = x[idx]
-        u = jnp.mod(jnp.asarray(xg) - jnp.asarray(origin), cfg.box_size)
-        # ownership from the brick each row is STORED IN, which is the same thing
-        # membership is built from, so the two cannot disagree. Two earlier rules
-        # both re-derived it from a coordinate and both lost exactly one row of
-        # 16,777,216 at cdev (antares 431 tile-local, 436 global-position). See
-        # `forces.owned_mask_from_bricks` for why this one cannot.
-        own_rows = owned_mask_from_bricks(
-            brick_of_row, t, cfg.n_tile, cfg.n_brick, cfg.n_fine // cfg.n_brick
-        )
-        own = np.zeros(cap, dtype=bool)
-        own[:m] = own_rows
-        own &= live
-        ph("tile_decode")
-        g_short, owned, n_out = one_tile(u, jnp.asarray(live), jnp.asarray(own))
-        g_short = np.asarray(g_short)[:m]
-        owned = np.asarray(owned)[:m]
-        n_overhang += int(n_out)
-        ph("tile_short")
-        if not owned.any():
-            continue
-
-        # the long force at the SAME owned rows, out of a staged sub-block
-        o_cells, extent = coarse_subblock_origin_extent(
-            t, cfg.n_tile, cfg.n_coarse, cfg.n_fine, halo=COARSE_HALO
-        )
-        sub = [stage_coarse_subblock(g, o_cells, extent) for g in g_coarse]
-        # Padded to `cap` with a live mask, for the SAME reason the short arm is:
-        # a per-tile row count keys a new XLA shape, so every tile recompiles.
-        # Profiled before the fix at 2,107 compilations and 24.1 s of a 32.7 s
-        # step -- 74% of it, 18.5 s inside backend_compile_and_load. One shape
-        # serves every tile.
-        n_own = int(owned.sum())
-        xo = np.zeros((cap, 3), dtype=np.float64)
-        xo[:n_own] = x[owned]
-        lv = np.zeros(cap, dtype=bool)
-        lv[:n_own] = True
-        g_long = np.asarray(
-            gather_coarse_subblock(
-                *sub, jnp.asarray(xo), o_cells, cfg.coarse_cell, cfg.n_coarse,
-                assign="tsc", live=lv,
-            )
-        )[:n_own]
-
-        ph("tile_long")
-        g_tot = g_short[owned] + g_long
-        v_new = alpha_k * v[owned] + bcoef * g_tot
-        n_owned += int(owned.sum())
-        # QUANTIZE AND WRITE HERE, per brick, instead of holding `v_new`.
-        # `decode_bricks` concatenates brick by brick and ownership is read off
-        # the brick a row is STORED in, so the owned rows are whole brick blocks
-        # and stay contiguous under the mask -- which is what lets a run scan
-        # replace a sort. The assertion below is on that contiguity, because it
-        # is load-bearing and free to check: if a brick ever appeared in two
-        # runs, the second run would silently overwrite the first one's scale
-        # and decode every row of it wrong.
-        slots_o, bricks_o = slots[owned], brick_of_row[owned]
-        cut = np.flatnonzero(np.diff(bricks_o)) + 1
-        run_lo = np.concatenate(([0], cut))
-        run_hi = np.concatenate((cut, [len(bricks_o)]))
-        if len(np.unique(bricks_o)) != len(run_lo):
-            raise AssertionError(
-                f"tile {t}: owned rows are not grouped by brick "
-                f"({len(run_lo)} runs over {len(np.unique(bricks_o))} bricks). The "
-                "per-brick scale depends on a brick's rows being contiguous."
-            )
-        for lo_r, hi_r in zip(run_lo, run_hi):
-            vb = v_new[lo_r:hi_r]
-            s_b = float(np.max(np.abs(vb))) / INT16_MAX
-            s_b = s_b if s_b > 0.0 else 1.0
-            w_b = np.rint(vb / s_b)
-            assert_int16_range(w_b)
-            st.write_velocities(slots_o[lo_r:hi_r], w_b.astype(np.int16))
-            st.vel_scale[int(bricks_o[lo_r])] = s_b
-            tile_scales.append(s_b)
+        apply_result(st, res)
+        tile_scales.extend(res["run_scales"].tolist())
         ph("tile_reduce")
 
-    # `pending` is at its largest HERE and nowhere else: it grows by one tile's
-    # owned rows per iteration and is consumed below. A boundary at the end of
-    # the loop is the only place a high-water mark can price it.
+    # The boundary stays so the trace keeps its shape and peak comparisons
+    # against every card on record are like-for-like. (The `pending` array it
+    # was placed to price was deleted with the per-brick scales; nothing
+    # accumulates across the loop any more.)
     ph("tile_loop_end")
 
     if n_owned != st.n_particles:
@@ -959,6 +1045,17 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None):
     """
     cfg.validate()
     ph = phase if phase is not None else _no_phase
+    # ONCE per run, not per step: the rebuild re-traces and re-compiles the
+    # same jitted program and rebuilds the kernel triple every step (canary
+    # C0: ~1.5 s/step, constant). The triple is now resident for the whole
+    # run instead of a per-step `membership` transient -- a named boundary so
+    # every allocation still falls inside exactly one phase.
+    tile_force = make_tile_force_fn(
+        cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine,
+        r_s=cfg.r_s, paint=cfg.paint_short, frac_bits=cfg.frac_bits,
+        fdtype=cfg.np_fine_dtype,
+    )
+    ph("kernel_build")
     lead, fused = fused_drifts(coeffs)
     drift_and_migrate(st, lead)  # onto the first midpoint
     ph("lead_drift")
@@ -970,7 +1067,8 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None):
     pad_shape = 0
     for k in range(len(fused)):
         stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
-                     census=census, cap_shape=cap_shape, pad_shape=pad_shape, phase=phase)
+                     census=census, cap_shape=cap_shape, pad_shape=pad_shape, phase=phase,
+                     tile_force=tile_force)
         cap_shape = int(stats["cap"])
         pad_shape = int(stats["coarse_pad"])
         if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
