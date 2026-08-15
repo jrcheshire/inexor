@@ -465,6 +465,32 @@ included -- this container lost a particle once).
 the 100-300 s is a bracket from a plausible range, not a measurement; the
 engine-side confirmation is the phase table re-run after the fix.
 
+**THE FIX IS IN (2026-08-15): surgical per-key index updates + a lazy
+free-list.** Eject drops exactly key b instead of invalidating the cache;
+`_to_arena` claims off a maintained ascending free-list, rebuilt at most once
+per eject->claim transition; the repack paths keep the full invalidation.
+Three gates, because the first one has a measured blind spot:
+
+1. **Cache-purity A/B** (`test_the_arena_caches_are_pure_and_match_a_rebuild_
+   under_migration`): fast path vs an oracle arm that rebuilds before EVERY
+   index read, elementwise state equality over a 4-migrate chain, plus the
+   maintained index/free-list against fresh rebuilds. Mutation-tested: a
+   stale-release mutation FAILS it; **a wrong-claim-order mutation PASSES it**,
+   because both arms share the claim policy -- a purity test cannot see a
+   consistently-applied policy change. Known limit, hence gate 2.
+2. **Pre-fix/post-fix bitwise chain** (worktree of the parent commit, same
+   seeded slack-0 state, 4 migrates, 5,162 arena residents):
+   off/w/occupancy/arena_bucket/vel_scale/ids all n_diff 0. The fix IS the
+   old behavior, claim policy included.
+3. Full suite 440/1 + test-det 16.
+
+**Payoff at the laptop arm:** arena-occupied cdev migrate 12.4-14.7 s ->
+**2.90-3.47 s**, within ~10% of the arena-EMPTY control (2.6-3.5 s) -- the
+occupancy penalty is deleted, volume slope back to 0.13 s/Mrow. Card
+`m6_migrate_depth_arena_fixed.json`. **Owed: the engine-side confirmation**,
+a cgh64 phase re-run (prediction: migrate 197.4 -> ~30 s/step class, step
+612 -> ~450 s).
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The

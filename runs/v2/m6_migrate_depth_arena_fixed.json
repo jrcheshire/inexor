@@ -1,0 +1,119 @@
+{
+ "results": [
+  {
+   "config": "cdev",
+   "n_part": 256,
+   "nb": 16,
+   "box": 128.0,
+   "repeats": 3,
+   "n_particles": 16777216,
+   "brick_slack": 0.0,
+   "arena_frac": 0.2,
+   "calls": 2,
+   "rungs": [
+    {
+     "f": 0.3,
+     "target_reach": 1,
+     "c_drift": 0.412607903341139,
+     "eject_s": 1.6554810839734273,
+     "insert_s": 1.2305815399886342,
+     "total_s": 2.901566707994789,
+     "total_s_spread": 0.058801040999242105,
+     "n_emig": 1986982,
+     "brick_reach": 1,
+     "brick_reach_realized": 1,
+     "peak_staged_slabs": 2,
+     "arena_used": 68688,
+     "n_arena_overflow": 68688,
+     "void": false
+    },
+    {
+     "f": 0.6,
+     "target_reach": 1,
+     "c_drift": 0.825215806682278,
+     "eject_s": 1.7995175430114614,
+     "insert_s": 1.4282477079541422,
+     "total_s": 3.2511513750068843,
+     "total_s_spread": 0.05028270900947973,
+     "n_emig": 3811426,
+     "brick_reach": 1,
+     "brick_reach_realized": 1,
+     "peak_staged_slabs": 2,
+     "arena_used": 92725,
+     "n_arena_overflow": 92725,
+     "void": false
+    },
+    {
+     "f": 0.95,
+     "target_reach": 1,
+     "c_drift": 1.3065916939136069,
+     "eject_s": 1.8165555030136602,
+     "insert_s": 1.5274572940397775,
+     "total_s": 3.3752818339999067,
+     "total_s_spread": 0.10884004199760966,
+     "n_emig": 5740002,
+     "brick_reach": 1,
+     "brick_reach_realized": 1,
+     "peak_staged_slabs": 2,
+     "arena_used": 110414,
+     "n_arena_overflow": 110414,
+     "void": false
+    },
+    {
+     "f": 1.9,
+     "target_reach": 2,
+     "c_drift": 2.6131833878272137,
+     "eject_s": 1.751286708007683,
+     "insert_s": 1.6192339160043048,
+     "total_s": 3.4194201249920297,
+     "total_s_spread": 0.12079179100692272,
+     "n_emig": 9991556,
+     "brick_reach": 2,
+     "brick_reach_realized": 2,
+     "peak_staged_slabs": 4,
+     "arena_used": 136470,
+     "n_arena_overflow": 136470,
+     "void": false,
+     "volume_pred_s": 3.948076940236664,
+     "depth_excess_s": -0.5286568152446343
+    },
+    {
+     "f": 2.85,
+     "target_reach": 3,
+     "c_drift": 3.9197750817408203,
+     "eject_s": 1.6003736680286238,
+     "insert_s": 1.8147729589836672,
+     "total_s": 3.4710746250057127,
+     "total_s_spread": 0.2450772909942316,
+     "n_emig": 12848855,
+     "brick_reach": 3,
+     "brick_reach_realized": 3,
+     "peak_staged_slabs": 6,
+     "arena_used": 144113,
+     "n_arena_overflow": 144113,
+     "void": false,
+     "volume_pred_s": 4.307052402878549,
+     "depth_excess_s": -0.8359777778728361
+    }
+   ],
+   "volume_fit": {
+    "slope_s_per_row": 1.2563454599672084e-07,
+    "intercept_s": 2.692792338375852,
+    "mid_residual_s": 0.07951226152093449
+   }
+  }
+ ],
+ "commit": "f26e98f",
+ "machine": "arm64",
+ "system": "Darwin",
+ "argv": [
+  "--config",
+  "cdev",
+  "--brick-slack",
+  "0.0",
+  "--calls",
+  "2",
+  "--out",
+  "runs/v2/m6_migrate_depth_arena_fixed.json"
+ ]
+}
