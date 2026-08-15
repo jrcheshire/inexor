@@ -114,3 +114,54 @@ def test_headroom_guard_fires():
     with pytest.raises(ValueError, match="headroom"):
         check_int_paint_headroom(2**30, frac_bits=12, max_cell_particles=2.0**20)
     check_int_paint_headroom(1024**3, frac_bits=12)  # flagship class w/ arch budget: fine
+
+
+# ------------------------------------------------- the sub-block TSC paint
+
+
+def test_the_subblock_tsc_paint_is_bitwise_the_global_one():
+    """Weights global, index rebased: every per-corner integer contribution
+    must be bit-identical to `paint_tsc_int`'s, scattered into the block's
+    place. Exercised where the trap lives: an interior block, a block
+    WRAPPING the periodic boundary, a degenerate full-axis block, and masked
+    pad rows."""
+    from inexor import painting
+
+    N, box = 16, 32.0
+    cell = box / N
+    rng = np.random.default_rng(7)
+
+    def _case(origin, extent, n_pad):
+        # positions whose TSC bases stay in [origin+1, origin+extent-2] per
+        # axis (mod N); a full axis (extent == N) draws the whole box
+        cols = []
+        for a in range(3):
+            if int(extent[a]) >= N:
+                cols.append(rng.uniform(0.0, box, size=96))
+            else:
+                lo = (origin[a] + 1 - 0.4) * cell
+                hi = (origin[a] + int(extent[a]) - 2 + 0.4) * cell
+                cols.append(np.mod(rng.uniform(lo, hi, size=96), box))
+        x = np.stack(cols, axis=-1)
+        xp = np.concatenate([x, np.zeros((n_pad, 3))]) if n_pad else x
+        lv = np.zeros(len(xp), dtype=bool)
+        lv[: len(x)] = True
+        full = np.asarray(
+            painting.paint_tsc_int(jnp.asarray(xp), N, box, 12, live=jnp.asarray(lv))
+        )
+        sub = np.asarray(
+            painting.paint_tsc_int_subblock(
+                jnp.asarray(xp), tuple(origin), tuple(extent), N, box, 12,
+                live=jnp.asarray(lv),
+            )
+        )
+        placed = np.zeros((N, N, N), dtype=np.int32)
+        ax = [(np.arange(int(extent[a])) + int(origin[a])) % N for a in range(3)]
+        placed[np.ix_(*ax)] = sub
+        assert np.array_equal(placed, full), (origin, extent)
+        assert full.sum() > 0, "no mass painted; comparison is vacuous"
+
+    _case((3, 3, 3), (8, 8, 8), n_pad=0)  # interior
+    _case((3, 3, 3), (8, 8, 8), n_pad=32)  # masked pad rows
+    _case((13, 13, 13), (8, 8, 8), n_pad=0)  # wraps the periodic boundary
+    _case((0, 13, 3), (16, 8, 8), n_pad=0)  # x is the degenerate full axis

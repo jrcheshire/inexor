@@ -314,6 +314,57 @@ def paint_tsc_int(positions, n_mesh, box_size, frac_bits=12, live=None):
     return mesh.reshape(N, N, N)
 
 
+def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
+                           frac_bits=12, live=None):
+    """Integer TSC paint into a coarse SUB-BLOCK. Returns the raw int32 block.
+
+    The paint-side twin of `forces.gather_coarse_subblock`, carrying the same
+    bitwise contract for the same measured reason: the weights come from the
+    GLOBAL coordinate, exactly as `paint_tsc_int` computes them, and only the
+    integer index is rebased by `(base + corner - origin) mod n_mesh` -- which
+    is exact -- so every per-corner integer contribution is bit-identical to
+    the full-mesh paint's. Shifting the coordinate instead would change the
+    last bits of the fractional offset (measured at 8.9e-16 on the gather arm)
+    and break the streamed-vs-monolithic pin.
+
+    CONTAINMENT IS THE CALLER'S CONTRACT, checked on the HOST, not in here: a
+    live row whose stencil leaves the block would wrap to the far side
+    silently (the D-v2-21 failure class), and an in-jit guard on a concrete
+    value is what makes the fine-arm gather uncompilable. The engine derives
+    `origin/extent` from the chunk's brick cuboid (stencil bound: base can
+    round up to the cell AT the cuboid's upper edge, corners reach one
+    further, so extent = span + 3) and asserts containment per chunk in
+    numpy before calling. Masked pad rows are routed to cell 0 with a
+    quantized weight of exactly zero -- in bounds and bitwise inert.
+
+    An axis whose extent equals `n_mesh` is the degenerate full-axis case
+    (origin 0), which the engine uses whenever span + 3 would exceed the
+    mesh -- keeping the caller's scatter-add indices unique per axis.
+    """
+    scale = np.float32(2.0**frac_bits)
+    N = int(n_mesh)
+    cell = float(box_size) / N
+    ex, ey, ez = (int(e) for e in extent)
+    ox, oy, oz = (int(o) for o in origin_cells)
+    base, w = _tsc_pieces(positions, cell)
+    mesh = jnp.zeros((ex * ey * ez,), dtype=jnp.int32)
+    m = None if live is None else jnp.asarray(live)
+    for corner in _TSC_CORNERS:
+        dx, dy, dz = corner
+        lx = (base[:, 0] + dx - ox) % N
+        ly = (base[:, 1] + dy - oy) % N
+        lz = (base[:, 2] + dz - oz) % N
+        ww = w[dx + 1][:, 0] * w[dy + 1][:, 1] * w[dz + 1][:, 2]
+        flat = (lx * ey + ly) * ez + lz
+        if m is not None:
+            ww = jnp.where(m, ww, 0.0)
+            flat = jnp.where(m, flat, 0)
+        mesh = mesh.at[flat].add(
+            rint_i(ww.astype(jnp.float32) * scale), mode="promise_in_bounds"
+        )
+    return mesh.reshape(ex, ey, ez)
+
+
 def density_tsc(positions, n_mesh, box_size, n_particles_total, paint="f64", frac_bits=12,
                 fdtype=jnp.float64):
     """delta from a TSC assignment -- the ONE interface over both TSC paints.

@@ -588,10 +588,19 @@ superlinear residual (5f), so Stage 2c is the next fix on the ladder.**
    regresses 1.94x on device. The `coarse_paint` mechanism is owed only if a
    GPU path is ever pursued; the phase is already the wall+memory target on
    CPU.
-8. **The migrate decomposition (from job 464, section 5f).** One-axis arms
-   for eject vs insert vs the per-brick Python overhead vs staging depth --
-   the phase is 32.2% at cgh64, grew ~70x for 8x particles, and no C-gh wall
-   number is quotable until its exponent has a mechanism. This is W0b of the
-   wall plan and it now gates W1's C-gh payoff claim too (the coarse_paint
-   derivation missed by 3.4x; both phases need the model corrected against
-   the smoke/cdev/cgh64 three-point ladder).
+8. ~~The migrate decomposition (from job 464, section 5f).~~ DONE, sections
+   5g/5h: the arena index churn, attributed in three steps, fixed, and
+   confirmed at the engine (197.4 -> 23.7 s/step).
+9. **Stage 2c is BUILT and bitwise (2026-08-15), and its WALL payoff at cdev
+   on the laptop is ~2%** -- 5.70 vs 5.81 s with the knob proven applied (64
+   vs 0 sub-block chunks; `EngineConfig.paint_subblock`, the `pad_ladder` A/B
+   pattern; gates: the streamed-vs-monolithic pin, a 4-case unit identity
+   incl. periodic wrap + masked pads + the full-axis degenerate, a
+   containment guard with a passing and a failing direction, suite 443/1).
+   So the full-mesh-per-chunk term is NOT what dominates coarse_paint at
+   cdev-on-M4 -- exactly the trap 5f warned about ("do not quote 2c's payoff
+   from the N^2 arithmetic") -- and the phase's internal composition at
+   cgh64/antares is UNMEASURED. The memory half is structural regardless
+   (the per-chunk full-mesh transient, 4.3 + 8.6 GB at C-gh, is deleted).
+   **Owed: the cgh64 wall A/B via the knob** (one phase-time leg per arm),
+   which is also the coarse_paint decomposition's first one-axis arm.

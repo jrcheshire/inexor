@@ -62,7 +62,7 @@ from .forces import (
     tile_origin_extent,
 )
 from .layout import assert_brick_divides_buffer, choose_brick
-from .painting import check_tsc_paint_headroom, paint_tsc_int
+from .painting import check_tsc_paint_headroom, paint_tsc_int, paint_tsc_int_subblock
 from .state import drift_and_migrate
 
 __all__ = ["EngineConfig", "coarse_delta_streamed", "float_run_bullfrog_sync", "run", "step"]
@@ -103,6 +103,7 @@ class EngineConfig:
         fine_dtype="float64",
         cap_rungs=CAP_RUNGS_PER_OCTAVE,
         pad_ladder=True,
+        paint_subblock=True,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -148,6 +149,12 @@ class EngineConfig:
         # False is NOT an operating point: it is the arm whose slope the fix is
         # measured against.
         self.pad_ladder = bool(pad_ladder)
+        # Stage 2c: paint each chunk into a coarse sub-block instead of a full
+        # mesh. Bitwise-neutral by the associativity of integer addition (the
+        # streamed-vs-monolithic pin is the regression); False = the A/B arm
+        # that restores the full-mesh-per-chunk behaviour, the same pattern as
+        # `pad_ladder`.
+        self.paint_subblock = bool(paint_subblock)
 
     @property
     def np_coarse_dtype(self):
@@ -395,6 +402,59 @@ class EngineConfig:
 # ===========================================================================
 
 
+def _chunk_cuboid(chunk_index, chunk_len, nb, n_coarse):
+    """Map a brick-major run of `chunk_len` bricks to a coarse-cell cuboid.
+
+    Returns `(cell_origin (3,), cell_span (3,))`, or None when the run is not
+    a cuboid -- and None simply routes that chunk to the full-mesh paint, so
+    this is a fast path with a bitwise-identical fallback, never a
+    requirement. A run IS a cuboid exactly when the chunk length divides the
+    brick grid cleanly: whole i-planes (nb^2 | L), whole j-rows within one
+    plane (nb | L and L | nb^2), or a fraction of one row (L | nb). All three
+    also make every chunk the SAME shape (L | nb^3, so no tail chunk), which
+    is what keeps the sub-block paint on one XLA shape.
+    """
+    L = int(chunk_len)
+    nb = int(nb)
+    if L <= 0 or nb**3 % L or int(n_coarse) % nb:
+        return None
+    if L % (nb * nb) == 0:
+        shape = (L // (nb * nb), nb, nb)
+    elif L % nb == 0 and (nb * nb) % L == 0:
+        shape = (1, L // nb, nb)
+    elif nb % L == 0:
+        shape = (1, 1, L)
+    else:
+        return None
+    bpc = int(n_coarse) // nb
+    s = int(chunk_index) * L
+    b0 = np.array([s // (nb * nb), (s // nb) % nb, s % nb], dtype=np.int64)
+    return b0 * bpc, np.array(shape, dtype=np.int64) * bpc
+
+
+def _assert_stencil_contained(x, coarse_cell, origin, extent, n_coarse):
+    """The host-side half of `paint_tsc_int_subblock`'s containment contract.
+
+    Cheap (one rint + compare over the chunk's real rows), OUTSIDE the jit --
+    which is exactly what the fine arm's in-jit guard could not be (D-v2-21).
+    A violation means the cuboid derivation is wrong, and the failure mode it
+    prevents is a stencil corner wrapping to the far side of the block
+    SILENTLY, so this refuses rather than falls back.
+    """
+    base = np.rint(x / float(coarse_cell)).astype(np.int64)
+    for ax in range(3):
+        if int(extent[ax]) >= int(n_coarse):
+            continue  # full axis: any index is in range by construction
+        local = (base[:, ax] - int(origin[ax])) % int(n_coarse)
+        if not ((local >= 1) & (local <= int(extent[ax]) - 2)).all():
+            raise ValueError(
+                f"sub-block paint containment violated on axis {ax}: a chunk row's "
+                f"TSC base falls outside [origin+1, origin+extent-2] "
+                f"(origin {int(origin[ax])}, extent {int(extent[ax])}, n {n_coarse}). "
+                "The cuboid derivation is wrong; refusing rather than wrapping silently."
+            )
+
+
 def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0):
     """delta on the coarse mesh, accumulated brick by brick.
 
@@ -450,7 +510,22 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0):
         if cfg.pad_ladder
         else pad_true
     )
-    for gg, m in zip(groups, rows):
+    # SUB-BLOCK PAINT (Stage 2c). The full-mesh form allocated and accumulated
+    # an n_coarse^3 mesh PER CHUNK -- chunks ~ n_bricks ~ N and per-chunk mesh
+    # ~ n_coarse^3 ~ N, a superlinear term measured at 20.4% of the cgh64 step
+    # (job 464) and growing. A chunk is a brick-major run, i.e. a spatial
+    # cuboid, so its TSC footprint is a bounded sub-block: paint there, then
+    # add the block into the accumulator through per-axis wrapped indices.
+    # Integer addition is associative and the sub-block contributions are
+    # bit-identical to the full paint's (weights global, index rebased), so
+    # the accumulated mesh is BITWISE unchanged -- the streamed-vs-monolithic
+    # pin is the regression. An axis whose span+3 would reach n_coarse runs
+    # full-axis instead, which keeps the scatter indices unique per axis (a
+    # repeated index under fancy-indexed += would drop adds).
+    nb_side = cfg.n_fine // cfg.n_brick
+    coarse_cell = cfg.box_size / float(n)
+    n_sub = 0
+    for gi, (gg, m) in enumerate(zip(groups, rows)):
         if m == 0:
             continue
         _, x, _ = st.decode_bricks(gg)
@@ -458,10 +533,33 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0):
         xp[:m] = x
         lv = np.zeros(pad, dtype=bool)
         lv[:m] = True
-        mesh += np.asarray(
-            paint_tsc_int(jnp.asarray(xp), n, cfg.box_size, cfg.frac_bits, live=lv),
+        cub = (
+            _chunk_cuboid(gi, cfg.chunk_bricks, nb_side, n)
+            if cfg.paint_subblock
+            else None
+        )
+        if cub is None:
+            mesh += np.asarray(
+                paint_tsc_int(jnp.asarray(xp), n, cfg.box_size, cfg.frac_bits, live=lv),
+                dtype=np.int64,
+            )
+            continue
+        c0, span = cub
+        origin = np.where(span + 3 >= n, 0, (c0 - 1) % n)
+        extent = np.where(span + 3 >= n, n, span + 3)
+        _assert_stencil_contained(x, coarse_cell, origin, extent, n)
+        sub = np.asarray(
+            paint_tsc_int_subblock(
+                jnp.asarray(xp), tuple(int(o) for o in origin),
+                tuple(int(e) for e in extent), n, cfg.box_size, cfg.frac_bits,
+                live=lv,
+            ),
             dtype=np.int64,
         )
+        ax = [(np.arange(int(extent[a]), dtype=np.int64) + int(origin[a])) % n
+              for a in range(3)]
+        mesh[np.ix_(*ax)] += sub
+        n_sub += 1
     peak = int(np.abs(mesh).max())
     if peak >= 2**31:
         raise ValueError(
@@ -496,6 +594,9 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0):
         stats["coarse_pad"] = pad
         stats["coarse_pad_true"] = pad_true
         stats["coarse_peak_int"] = peak
+        # how many chunks took the sub-block path: an A/B whose knob did not
+        # apply must be readable as such (a knob must prove it applied)
+        stats["coarse_subblock_chunks"] = n_sub
         if census:
             stats["coarse_cells_inexact_f32"] = inexact
             stats["coarse_exact_decode_ok"] = inexact == 0

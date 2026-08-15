@@ -329,18 +329,28 @@ def _pad_shapes_of_a_run(cfg, co, seed=0):
     plausibly have. `paint_tsc_int`'s first argument IS the buffer.
     """
     seen = []
-    real = engine.paint_tsc_int
+    real_full = engine.paint_tsc_int
+    real_sub = engine.paint_tsc_int_subblock
 
-    def spy(xp, *a, **kw):
+    def spy_full(xp, *a, **kw):
         seen.append(int(xp.shape[0]))
-        return real(xp, *a, **kw)
+        return real_full(xp, *a, **kw)
 
-    engine.paint_tsc_int = spy
+    def spy_sub(xp, *a, **kw):
+        seen.append(int(xp.shape[0]))
+        return real_sub(xp, *a, **kw)
+
+    # both entry points: since Stage 2c the chunk buffer reaches XLA through
+    # `paint_tsc_int_subblock` on cuboid chunks and `paint_tsc_int` only on the
+    # fallback path -- the buffer is the first argument of either
+    engine.paint_tsc_int = spy_full
+    engine.paint_tsc_int_subblock = spy_sub
     try:
         _, _, st = _state(cfg, seed)
         out = engine.run(st, cfg, co)
     finally:
-        engine.paint_tsc_int = real
+        engine.paint_tsc_int = real_full
+        engine.paint_tsc_int_subblock = real_sub
     return seen, out, st
 
 
@@ -661,3 +671,42 @@ def test_the_phase_hook_cannot_move_a_number():
 def test_the_default_hook_is_a_no_op_that_returns_nothing():
     """`_no_phase` is what the hot loop calls when no caller asked for a trace."""
     assert engine._no_phase("anything") is None
+
+
+# ------------------------------------------------- the sub-block coarse paint
+
+
+def test_the_subblock_paint_knob_is_bitwise_and_genuinely_applies():
+    """Stage 2c's gate: the sub-block path must change NO bit of the coarse
+    delta, and the A/B knob must prove it applied -- an arm whose knob did not
+    move measures nothing (both stats fields assert it here)."""
+    cfg_on = _cfg()
+    cfg_off = _cfg(paint_subblock=False)
+    _, _, st1 = _state(cfg_on, 5)
+    _, _, st2 = _state(cfg_off, 5)
+    s_on, s_off = {}, {}
+    a = engine.coarse_delta_streamed(st1, cfg_on, stats=s_on)
+    b = engine.coarse_delta_streamed(st2, cfg_off, stats=s_off)
+    assert s_on["coarse_subblock_chunks"] > 0, "the sub-block path never fired: vacuous A/B"
+    assert s_off["coarse_subblock_chunks"] == 0, "the OFF arm took the sub-block path"
+    assert np.array_equal(a, b), "the sub-block paint moved a bit of the coarse delta"
+    assert float(np.abs(a).max()) > 0.1, "degenerate density field; comparison is vacuous"
+
+
+def test_the_subblock_containment_guard_fires_on_a_wrong_cuboid():
+    """The host-side half of the containment contract must REFUSE, not wrap:
+    a stencil corner leaving the block wraps silently inside the jit (the
+    D-v2-21 failure class), so the guard in front of it is the safety."""
+    rng = np.random.default_rng(0)
+    x = rng.uniform(0.0, L_BOX, size=(64, 3))
+    cell = L_BOX / N_COARSE
+    with pytest.raises(ValueError, match="containment violated"):
+        engine._assert_stencil_contained(
+            x, cell, np.array([0, 0, 0]), np.array([4, 4, 4]), N_COARSE
+        )
+    # and the passing direction, so the test cannot rot into always-raising
+    lo, hi = 5.5 * cell, 8.4 * cell  # bases 6..8 -> [origin+1, origin+extent-2]
+    x_ok = rng.uniform(lo, hi, size=(64, 3))
+    engine._assert_stencil_contained(
+        x_ok, cell, np.array([5, 5, 5]), np.array([7, 7, 7]), N_COARSE
+    )
