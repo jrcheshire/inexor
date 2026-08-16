@@ -4,6 +4,7 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 01:30:00
+#SBATCH -A JPL-SPHEREx
 #SBATCH -o m6-c5-migrate-%j.log
 # C5: does `migrate` PARALLELISE, or does it inflate like `tile_long`?
 #
