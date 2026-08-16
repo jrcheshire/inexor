@@ -589,6 +589,153 @@ writes, per-worker affinity) is the design as canaried; the coarse-paint
 chunks are pool-eligible by the same associativity argument and should ride
 the same executor.
 
+## 5j. Vista 914085 -- the W2 exit measurement on gg: 3.92x end to end, and the wall is now `migrate`
+
+**Job 914085, gg i614-021, 1:25:40, ~0.47 SU, commit `afabe49`. Five legs, four
+rc=0 and one rc=2; the job's `exit 1` is the sbatch's any-leg rule firing on
+that rc=2, NOT a crash.** `scripts/v2_m6_phase_time.py:313` returns 2 on exactly
+one condition, `instrument_neutral is False`, and the W=32 leg's traced-vs-control
+overhead was +4.724 s against its own 4.211 s material bound. All five cards were
+written. The W=32 **phase table** is therefore not readable at the pre-registered
+tolerance; its wall is (the control arm, 210.56 s, is the neutral number and
+agrees with the traced arm to 2.2%).
+
+**Pre-registration honesty note.** The plan said Amdahl the serial leg's phase
+table BEFORE reading the pooled legs. The job log carried all five legs in one
+tail and they were read together. The arithmetic below uses only the serial
+table as input, but it was NOT read blind and is not claimed as a blind
+prediction.
+
+### The serial reference, measured on the same machine in the same job
+
+cgh64, K=3, `s_per_step` **284.496** (traced 853.487 s, control 857.320 s,
+overhead -3.832 against a 17.146 bound, neutral). This leg exists because
+antares' 457.5 s/step does not transfer across architectures, and it is the only
+baseline any ratio here is taken against.
+
+    tile_short      225.882 s   26.5%      migrate        93.757 s   11.0%
+    tile_long       214.358 s   25.1%      tile_decode    61.048 s    7.2%
+    coarse_paint    190.809 s   22.4%      tile_reduce    27.075 s    3.2%
+                                            lead_drift    27.031 s    3.2%
+                                            repack        11.547 s    1.4%
+
+Pool-eligible work (the four tile phases + `coarse_paint`) = 719.172 of 853.487 s
+= **84.26%**. Serial residue = 134.315 s = **15.74%**, so the **Amdahl ceiling is
+6.35x** and no worker count can beat it.
+
+### What the pool actually delivered
+
+| W | Amdahl | s/step | speedup | % of Amdahl | tile loop s/step | tile speedup |
+|---|---|---|---|---|---|---|
+| serial | 1.00x | 284.496 | 1.000x | -- | 176.121 | 1.00x |
+| 8 | 3.806x | 81.516 | **3.490x** | 91.7% | 27.011 | 6.52x |
+| 16 | 4.761x | 72.642 | **3.916x** | 82.3% | 20.020 | 8.80x |
+| 32 | 5.443x | 71.760 | **3.965x** | 72.8% | 18.296 | 9.63x |
+
+**W=32 buys 1.2% over W=16** (72.642 -> 71.760 s/step) for twice the workers, and
+is the leg that broke its own neutrality bound. The operating point is W=8 or
+W=16, and the gap between them is 12.2% of wall.
+
+`coarse_paint` pooled BETTER than the tile loop at every width -- 63.603 s/step
+serial -> 7.500 / 5.573 / 4.897, i.e. **8.48x / 11.41x / 12.99x** against the tile
+loop's 6.52 / 8.80 / 9.63. Stage C's decision to put the coarse chunks on the same
+executor is vindicated by its own number, and the phase that section 5h called
+"the next fix on the ladder" is no longer the target.
+
+### The mechanism: the workers do MORE work as W grows, and it is one phase
+
+The pool triple makes this direct. Aggregate worker-seconds per step against the
+serial cost of the identical work:
+
+    per step        serial     W=8       W=16      W=32     inflation @32
+    decode          20.349    22.156    23.426    25.890      1.27x
+    short           75.294    92.152   122.027   189.247      2.51x
+    long            71.453    90.340   161.909   295.089      4.13x
+    quant            9.025     7.795     8.074     8.497      0.94x
+    busy total     176.121   212.357   315.307   518.638      2.94x
+    idle             --        3.854     6.287    34.225
+
+**`tile_long` is the whole story: 4.13x the worker-seconds at W=32 for identical
+physics, while `quant` gets slightly FASTER and `decode` is nearly flat.** The
+long-range arm is the FFT-heavy one and the most bandwidth-hungry; this is the
+same busy-inflation signature 5h measured on antares and 5i measured on the C2
+canary, now confirmed inside the engine on the target machine. Pool efficiency
+(serial work over W x tile wall) is **81.5% / 55.0% / 30.1%**.
+
+So the shortfall against Amdahl is not dispatch overhead and not load imbalance
+at W=8 or W=16 (idle is 3.9 and 6.3 s/step). It is a shared-resource ceiling
+inside one phase. At W=32 imbalance does appear (idle 34.2 s/step, 6.2% of
+worker-seconds) on top of it.
+
+### The C2 canary's 10.4x does not survive contact with the engine
+
+5i measured 10.4x at W=8 on the canary; the engine's tile loop gets **6.52x**.
+The canary timed the tile force alone, while the engine's loop carries decode and
+quantize with it and drives them from shm-adopted state. **Quote 6.52x, not 10.4x,
+for the engine.** The canary's ~19x ceiling is likewise an upper bound on a
+narrower quantity; the engine's own tile-loop curve is flattening by W=32 (9.63x)
+and there is no measurement above it.
+
+### `migrate` is now the wall, and pooling made it slightly worse
+
+    per step       serial    W=8     W=16    W=32
+    migrate        31.252   32.794  32.780  33.643    (+4.9% / +4.9% / +7.6%)
+    share of step   11.0%    40.3%   45.3%   47.5%
+
+The whole serial residue inflated ~5% under pooling (134.289 -> 140.462 / 140.535
+/ 142.965 s over 3 steps), uniformly across `migrate`, `lead_drift` and `repack`.
+Candidate causes are the shm rebind and first-touch NUMA placement of pages the
+workers now also read; **UNATTRIBUTED, and it is a ~5% tax on 16% of the step, so
+it does not change any decision here.**
+
+What does change a decision: `migrate` was 5.2% of the step at 5h's antares
+reading and is **45% of it at W=16 on gg**. It is host numpy, so it is untouched
+by both the pool and the GPU lane. Every further wall fix points at it.
+
+### What this projects to at C-gh, and what licenses the projection
+
+Carrying cgh64 to C-gh is **64x in particles at the ratified K=40**. The tile term
+carries by V4's finding that per-tile cost tracks `cap` and not tile count, with
+`cap` fixed across the config table; `coarse_paint` carries with the coarse mesh.
+**`migrate` has no such license** -- its sort is N log N and 5d's staging term is
+N^(2/3) -- so the number below is a floor for that phase, not an estimate.
+
+    gg, per realization at C-gh (64x, K=40):
+      serial                   202.3 h     40.5x the 5 h bar
+      pooled W=8                58.0 h     11.6x
+      pooled W=16               51.7 h     10.3x
+      pooled W=32               51.0 h     10.2x
+
+      of the W=16 figure:  migrate 23.3 h   tile loop 14.2 h
+                           lead_drift 6.7   coarse_paint 4.0   repack 2.8
+
+**`migrate` alone is 4.7x the whole bar.** That is the readout's single most
+consequential line: the tile loop could go to zero and the engine would still miss
+5 h/realization by 7.4x.
+
+### Owed out of this section
+
+- The **W5 operating-point checkpoint with JC**: W=8 vs W=16, trim on/off, and
+  the realization wall + SU re-derived from the numbers above.
+- `migrate`'s own decomposition at cgh64 post-arena-fix. 5g attributed the
+  ~170 s churn; what the residual 31 s/step is made of has never been broken down,
+  and it is now the largest term in the engine.
+
+**NOT established by this job:**
+
+- **Any pool footprint at C-gh.** `rss_mb_max` is `VmHWM` of the single largest
+  worker (`executor.py:56` -> `engine.py:1035` -> `phase_time.py:254`), and the
+  shm-adopted state pages count in EVERY worker's VmHWM while existing once
+  physically. **The 9024 / 8408 / 7799 MB figures therefore cannot be multiplied
+  by W**, and the pool's incremental footprint is unmeasured. 5i's "~20 workers
+  in the ~120 GB budget" also predates the state's fall to 164.6 GB on a 237 GB
+  node, which leaves ~72 GB of headroom, not 120. **W may be memory-capped below
+  16 at C-gh and this job could not see it** -- cgh64's state is 1/64 of C-gh's.
+  This is a W5 input and needs its own measurement.
+- The tile-loop ceiling above W=32.
+- Whether the ~5% residue inflation persists at C-gh scale or is a cgh64 artifact.
+- The W=32 phase table (instrument non-neutral; the wall stands).
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
@@ -650,3 +797,16 @@ the same executor.
    (the per-chunk full-mesh transient, 4.3 + 8.6 GB at C-gh, is deleted).
    **Owed: the cgh64 wall A/B via the knob** (one phase-time leg per arm),
    which is also the coarse_paint decomposition's first one-axis arm.
+   IN FLIGHT as antares 474 (the `on` arm read out at 375.35 s/step,
+   `tile_long` 51.9%; the `off` arm was still running at the time of writing).
+   NB 5j has since measured `coarse_paint` pooling at 8.5-13.0x on gg, so the
+   phase is no longer the wall target whatever this A/B says -- it now reads as
+   a memory result plus an attribution, not a wall fix.
+10. **`migrate`'s decomposition at cgh64, post-arena-fix.** 5j puts it at 45%
+   of a W=16 step and 4.7x the whole 5 h bar on its own at C-gh. 5g attributed
+   and removed the ~170 s index churn; the residual ~31 s/step has never been
+   broken down. This is now the largest term in the engine and the only one
+   that both the pool and the GPU lane leave untouched.
+11. **The pool's incremental memory footprint**, which 5j could not measure:
+   per-worker `VmHWM` double-counts the shm state, and cgh64's state is 1/64 of
+   C-gh's. W may be memory-capped below 16 at C-gh. A W5 input.
