@@ -700,6 +700,13 @@ carries by V4's finding that per-tile cost tracks `cap` and not tile count, with
 **`migrate` has no such license** -- its sort is N log N and 5d's staging term is
 N^(2/3) -- so the number below is a floor for that phase, not an estimate.
 
+> **CORRECTED by section 5m (2026-08-16). The four figures below are 3-15% too
+> high and `lead_drift`'s 6.7 h is wrong by 13x.** `lead_drift` is one call of
+> `drift_and_migrate` BEFORE the step loop (`engine.py:1157`), so amortizing it
+> over K=3 and re-multiplying by K=40 charged it 40 times where it happens once.
+> Corrected: serial 196.3, W=8 51.6, **W=16 45.2**, W=32 44.2 h, with
+> `lead_drift` 0.51 h. The block is left standing as written; use 5m's table.
+
     gg, per realization at C-gh (64x, K=40):
       serial                   202.3 h     40.5x the 5 h bar
       pooled W=8                58.0 h     11.6x
@@ -711,7 +718,8 @@ N^(2/3) -- so the number below is a floor for that phase, not an estimate.
 
 **`migrate` alone is 4.7x the whole bar.** That is the readout's single most
 consequential line: the tile loop could go to zero and the engine would still miss
-5 h/realization by 7.4x.
+5 h/realization by 7.4x. (That sentence survives the 5m correction unchanged --
+migrate's 23.3 h is per-step work and is not one of the terms that moved.)
 
 ### Owed out of this section
 
@@ -869,6 +877,113 @@ beat a sort).
   is now the question that decides whether 23.3 h is reducible.
 - Anything about the `argsort` term beyond its rank.
 
+## 5m. Vista 914640 -- C5 complete: affinity is not a lever for `migrate`, and 5j's C-gh projection was 14% too high
+
+**Three legs, all rc=0, gg node i617-041, commit `b969628`, ~0.1 SU.** The pinned
+leg was read out at the 5l wrap and is summarised there; this section adds the
+unpinned arm, which is what the job was extended to get, and one correction to
+5j that the readout surfaced and that matters more than the arm did.
+
+### The affinity arm: pinning does nothing until the pool is oversubscribed
+
+`discard` transport, cgh64, nb=32, identical in every other knob:
+
+| W | pinned | unpinned | pinning worth | pinned eff | unpinned eff |
+|---|---|---|---|---|---|
+| 4 | 3.27x | 3.25x | 0.6% | 81.8% | 81.4% |
+| 8 | 5.99x | 6.05x | **-1.0%** | 74.9% | 75.6% |
+| 16 | 9.90x | 8.98x | 10.2% | 61.9% | 56.1% |
+| 32 | 14.02x | 10.48x | 33.8% | 43.8% | 32.8% |
+
+**At W=8 the unpinned arm is very slightly FASTER**, so the effect is not merely
+small at the candidate operating point, it is absent. Pinning becomes real only
+at W=16 and above, i.e. once workers outnumber what the phase can keep busy.
+
+**This is a genuine contrast with the tile pool, on the same machine.** 5i
+measured affinity worth 20-49% for C2. The two phases are in different regimes:
+`tile_long` is FFT-heavy and bandwidth-hungry, where placement decides which
+socket's memory a worker pulls through, and `migrate` is per-row numpy whose
+traffic is order 1% of the fabric. The pre-registration in 5l predicted exactly
+this asymmetry from that mechanism, and the arm confirms the mechanism, not just
+the number. **Keep pinning on** (it costs nothing and the tile pool needs it),
+but do not credit it for anything on the migrate side.
+
+**Transport ranking is unchanged by pinning.** At W=32 pinned: `discard` 14.02x,
+`counts` 14.07x, `pickle` 7.32x. Returning the arrays costs ~2x, which is the
+shm-slab return path C2 named. Busy-inflation is 1.01-1.05x in every arm at
+every W, against `tile_long`'s 4.13x.
+
+**On the phase**, unchanged from the pinned readout: `eject` is 12.99 s of
+migrate's 33.26 s, so perfect eject parallelism gives **1.64x on the phase and
+no more**; the best measured leg gives 1.57x (1.51x with a realistic transport).
+`insert`'s 19.7 s is the whole of what remains and is untouched by this job.
+
+**The smoke leg refused to give a verdict, by design** (serial eject 0.056 s, so
+pool creation sets the wall) and printed the refusal rather than a 0.08x
+"speedup". That is the intended behaviour of a harness-dominated arm.
+
+### The correction: `lead_drift` is once per run, and 5j charged it 40 times
+
+`lead_drift` is not a phase in its own right. It is **one call of
+`drift_and_migrate` before the step loop** (`engine.py:1157`, "onto the first
+midpoint"); the only other call site is `engine.py:1074`, which is the per-step
+`migrate`. The phase cards report whole-run totals, and `s_per_step` divides the
+whole run by `k`. So a one-time cost was amortized over K=3 and then
+re-multiplied by K=40, charging it **13.3x** what it costs.
+
+Recomputed from the same four cards, splitting the once-per-run terms
+(`lead_drift`, `kernel_build`) out of the per-step recurring cost:
+
+| arm | recorded in 5j | corrected | error |
+|---|---|---|---|
+| serial | 202.3 h | **196.3 h** | +3.0% |
+| pooled W=8 | 58.0 h | **51.6 h** | +12.3% |
+| pooled W=16 | 51.7 h | **45.2 h** | +14.2% |
+| pooled W=32 | 51.0 h | **44.2 h** | +15.5% |
+
+The error grows with W because the once-per-run term does not pool (it is host
+numpy) while everything around it does, so it is a larger share of a smaller
+number. The corrected W=16 budget at C-gh, per realization:
+
+    migrate          23.31 h      per step
+    tile loop        14.24 h      per step, pooled 8.80x
+    coarse_paint      3.96 h      per step, pooled 11.41x
+    repack            2.84 h      per step
+    coarse_solve      0.27 h      per step
+    membership        0.11 h      per step
+    lead_drift        0.51 h      ONCE PER RUN
+    kernel_build     ~0.00 h      ONCE PER RUN
+    ----------------------------
+    total            45.24 h
+
+**What this changes.** The engine is 45.2 h/realization at W=16 on one gg node,
+not 51.7. `lead_drift` is off the target list: it was the third-largest term on
+record and is now the sixth, at half an hour. `migrate` is 51.5% of the
+realization and every other conclusion in 5j about it stands, because it was
+never one of the mis-scaled terms.
+
+**How it got in, and the cheap guard against the next one.** The projection
+multiplied a phase table by `64 * K` uniformly, which is correct only for phases
+that run once per step. Nothing in the card marks which phases those are, and
+the two that do not (`lead_drift`, `kernel_build`) are exactly the two the
+engine calls outside the loop. A per-phase call count on the card would have
+made this unmissable and is owed (item 12).
+
+### What 5m does NOT establish
+
+- **Anything about `insert`.** C5 measured `_eject_slab` only, deliberately,
+  because it writes nothing back and so raises no correctness question. `insert`
+  writes, and its disjoint-write premise needs proving the way C2 proved it for
+  tiles before any build.
+- **That the corrected 45.2 h is achievable.** It is the same projection as
+  before with an arithmetic fault removed; every caveat 5j attached to it stands,
+  including that `migrate`'s C-gh term is a **floor** (its sort is N log N and
+  its staging is N^(2/3), and neither was measured above cgh64).
+- **The pool's memory footprint at C-gh**, which is still unmeasured and may cap
+  W below 16.
+- **That affinity is irrelevant at C-gh.** The arm ran at cgh64, where the state
+  is 1/64 of production and fits differently across the two sockets.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
@@ -948,3 +1063,16 @@ beat a sort).
 11. **The pool's incremental memory footprint**, which 5j could not measure:
    per-worker `VmHWM` double-counts the shm state, and cgh64's state is 1/64 of
    C-gh's. W may be memory-capped below 16 at C-gh. A W5 input.
+12. **A per-phase CALL COUNT on the phase card.** Section 5m found that 5j's
+   C-gh projection charged `lead_drift` 40 times for a call the engine makes
+   once, because the card records seconds per phase with nothing saying which
+   phases run per step. Two of the twelve boundaries sit outside the step loop
+   (`lead_drift`, `kernel_build`) and a reader cannot tell from the card. Cheap
+   in the instrument, and it turns a class of projection fault into an
+   impossible one.
+13. **~~Does `migrate` parallelize?~~ ANSWERED, Vista 914640, sections 5l/5m:
+   yes, at 74.9-76.2% efficiency at W=8 with busy-inflation 1.01-1.05x.** It is
+   NOT bandwidth-bound like `tile_long`. **What it opens: `insert`.** C5 covered
+   `eject` only, which caps the phase at 1.64x; `insert` is 19.7 of the 33.26 s
+   and needs its disjoint-write premise proved as C2 proved it for tiles before
+   anything is built on it.
