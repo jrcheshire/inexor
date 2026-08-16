@@ -477,7 +477,7 @@ def _assert_stencil_contained(x, coarse_cell, origin, extent, n_coarse):
             )
 
 
-def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0):
+def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=None):
     """delta on the coarse mesh, accumulated brick by brick.
 
     Integer addition is associative, so a chunked accumulation is **bitwise**
@@ -492,6 +492,12 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0):
     `pad_shape` is the previous step's chunk shape, carried forward so the shape
     is monotone across a run for the same reason `cap` is; see the comment on
     `pad` below and `forces.capacity_shape`.
+
+    `pool`, if given, runs each chunk's decode + sub-block paint on the tile
+    pool's workers (W2 Stage C); the ACCUMULATION stays here, where integer
+    associativity makes arrival order bitwise the serial order. `census=True`
+    and the full-mesh A/B arm (`paint_subblock=False`) route serial regardless,
+    so the gate instruments never read a pooled mesh.
 
     `census=True` additionally counts cells whose integer sum is NOT exactly
     representable in f32 (`coarse_cells_inexact_f32`). It is OPT-IN because it
@@ -547,6 +553,25 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0):
     nb_side = cfg.n_fine // cfg.n_brick
     coarse_cell = cfg.box_size / float(n)
     n_sub = 0
+    pooled_workers = 0
+    if pool is not None and cfg.paint_subblock and not census:
+        # W2 Stage C: chunks on the workers, integer accumulation here. The
+        # serial loop below is unchanged and remains the oracle the
+        # streamed-vs-monolithic pin reads.
+        pool.stage_coarse(dict(pad=int(pad), n_coarse=n, box=cfg.box_size,
+                               frac_bits=cfg.frac_bits,
+                               chunk_bricks=cfg.chunk_bricks, nb_side=nb_side))
+        tasks = [(gi, np.asarray(gg, dtype=np.int64))
+                 for gi, (gg, m) in enumerate(zip(groups, rows)) if m]
+        for res in pool.imap_coarse(tasks):
+            if res["empty"]:
+                continue
+            ax = [(np.arange(int(res["extent"][a]), dtype=np.int64)
+                   + int(res["origin"][a])) % n for a in range(3)]
+            mesh[np.ix_(*ax)] += res["sub"]
+            n_sub += 1
+        pooled_workers = pool.workers
+        groups = []  # the serial loop below must not run the chunks again
     for gi, (gg, m) in enumerate(zip(groups, rows)):
         if m == 0:
             continue
@@ -617,8 +642,10 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0):
         stats["coarse_pad_true"] = pad_true
         stats["coarse_peak_int"] = peak
         # how many chunks took the sub-block path: an A/B whose knob did not
-        # apply must be readable as such (a knob must prove it applied)
+        # apply must be readable as such (a knob must prove it applied) --
+        # same rule for the pool (0 = the serial path painted this mesh)
         stats["coarse_subblock_chunks"] = n_sub
+        stats["coarse_pooled_workers"] = pooled_workers
         if census:
             stats["coarse_cells_inexact_f32"] = inexact
             stats["coarse_exact_decode_ok"] = inexact == 0
@@ -921,7 +948,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
 
     # --- long arm: solve once, globally, on the coarse mesh
     mesh_stats = {}
-    delta = coarse_delta_streamed(st, cfg, stats=mesh_stats, census=census, pad_shape=pad_shape)
+    delta = coarse_delta_streamed(st, cfg, stats=mesh_stats, census=census,
+                                  pad_shape=pad_shape, pool=pool)
     ph("coarse_paint")
     # `coarse_force_meshes` infers from delta.dtype and REFUSES a mismatch, so
     # the dtype cannot silently disagree with what the config asked for

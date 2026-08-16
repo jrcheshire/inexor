@@ -101,6 +101,44 @@ def test_the_pool_executor_identity_with_a_resident_arena():
     _assert_states_identical(s1, s2)
 
 
+def test_the_pooled_coarse_paint_is_bitwise_the_serial_one():
+    """Stage C in isolation: the same mesh, chunk by chunk, from workers.
+
+    Integer accumulation is associative, so the arrival-order adds must give
+    the EXACT serial mesh -- the same property the streamed paint itself
+    stands on. Compared through the decoded float delta, which is what the
+    solver consumes."""
+    from inexor.executor import TilePool
+
+    cfg = _cfg(tile_workers=2)
+    x = _positions(11)
+    v = np.random.default_rng(12).normal(scale=0.5, size=x.shape)
+    t9 = T9Layout(box_size=L_BOX, n_part=N_PART, bucket_cells=2)
+    st = state.SlotState.build(x, v, t9, N_FINE // cfg.n_brick, arena_frac=0.05)
+    stats_ser, stats_pool = {}, {}
+    ref = engine.coarse_delta_streamed(st, cfg, stats=stats_ser)
+    pool = TilePool(st, cfg)
+    try:
+        got = engine.coarse_delta_streamed(st, cfg, stats=stats_pool, pool=pool)
+    finally:
+        pool.close()
+    n = int((np.asarray(ref) != np.asarray(got)).sum())
+    assert n == 0, f"{n} of {ref.size} coarse cells differ between executors"
+    # the knob must prove it applied, in both directions
+    assert stats_ser["coarse_pooled_workers"] == 0
+    assert stats_pool["coarse_pooled_workers"] == 2
+    assert stats_pool["coarse_subblock_chunks"] == stats_ser["coarse_subblock_chunks"] > 0
+    # census routes SERIAL regardless of the pool: the gate instrument must
+    # never read a pooled mesh
+    pool2 = TilePool(st, cfg)
+    stats_census = {}
+    try:
+        engine.coarse_delta_streamed(st, cfg, stats=stats_census, census=True, pool=pool2)
+    finally:
+        pool2.close()
+    assert stats_census["coarse_pooled_workers"] == 0
+
+
 def test_the_pool_survives_and_restores_state_ownership():
     """After a pooled run the state must be backed by ordinary memory again
     (the shm segments are unlinked), and still usable."""

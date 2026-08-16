@@ -100,11 +100,14 @@ def _worker_init(shm_names, shapes, dtypes, small, fn_args, x64, core_sets, rank
               segs=segs, st=None, step=None, init_s=time.perf_counter() - t0)
 
 
-def _worker_task(arg):
-    """One tile. The facade is rebuilt once per STEP, not per task: its lazy
-    brick->arena index would otherwise be reconstructed O(n_arena) per tile,
-    and it must not survive a step boundary because migrate moves the arena."""
-    t, bricks, C = arg
+def _ensure_facade(C):
+    """The worker's read-only SlotState, rebuilt once per DISPATCH EPOCH.
+
+    Not per task: the facade's lazy brick->arena index would otherwise be
+    reconstructed O(n_arena) per tile. And it must not survive an epoch
+    boundary, because migrate moves the arena and repack moves `arena_base`
+    between dispatches -- the header carries both the epoch and the scalar.
+    """
     if _G["step"] != C["step"]:
         from inexor.state import SlotState
 
@@ -117,12 +120,56 @@ def _worker_task(arg):
             n_particles=small["n_particles"], ids=None,
         )
         _G["step"] = C["step"]
+    return _G["st"]
+
+
+def _worker_task(arg):
+    """One tile of the kick; the writes ride back for the parent to apply."""
+    t, bricks, C = arg
+    st = _ensure_facade(C)
     from inexor.engine import tile_task
 
-    res = tile_task(_G["st"], _G["one_tile"], C, _G["g_coarse"], tuple(t), bricks)
+    res = tile_task(st, _G["one_tile"], C, _G["g_coarse"], tuple(t), bricks)
     res["worker"] = os.getpid()
     res["rss_mb"] = _rss_mb()
     return res
+
+
+def _worker_coarse_task(arg):
+    """One coarse-paint chunk: decode -> sub-block integer paint (W2 Stage C).
+
+    The ACCUMULATION stays in the parent, where integer associativity makes
+    any application order bitwise the serial one; a worker only ever returns
+    its chunk's bounded sub-block. Mirrors the sub-block branch of
+    `engine.coarse_delta_streamed` line for line."""
+    gi, bricks, H = arg
+    st = _ensure_facade(H)
+    import jax.numpy as jnp
+
+    from inexor.engine import _assert_stencil_contained, _chunk_cuboid
+    from inexor.painting import paint_tsc_int_subblock
+
+    n = H["n_coarse"]
+    _, x, _ = st.decode_bricks(bricks)
+    m = len(x)
+    if m == 0:
+        return dict(gi=gi, empty=True)
+    xp = np.zeros((H["pad"], 3), dtype=np.float64)
+    xp[:m] = x
+    lv = np.zeros(H["pad"], dtype=bool)
+    lv[:m] = True
+    c0, span = _chunk_cuboid(gi, H["chunk_bricks"], H["nb_side"], n)
+    origin = np.where(span + 3 >= n, 0, (c0 - 1) % n)
+    extent = np.where(span + 3 >= n, n, span + 3)
+    _assert_stencil_contained(x, H["box"] / float(n), origin, extent, n)
+    sub = np.asarray(
+        paint_tsc_int_subblock(
+            jnp.asarray(xp), tuple(int(o) for o in origin),
+            tuple(int(e) for e in extent), n, H["box"], H["frac_bits"], live=lv,
+        ),
+        dtype=np.int64,
+    )
+    return dict(gi=gi, empty=False, origin=origin, extent=extent, sub=sub)
 
 
 class TilePool:
@@ -231,6 +278,23 @@ class TilePool:
             raise RuntimeError("imap before stage_step: the workers have no header")
         C = self._C
         return self._pool.imap_unordered(_worker_task, [(t, b, C) for t, b in tasks])
+
+    def stage_coarse(self, H):
+        """Publish the coarse-paint header (W2 Stage C). No arrays move: the
+        workers read state through shm and the mesh accumulates parent-side.
+        Its own epoch, distinct from the tile loop's, so the facade is rebuilt
+        after the migrate that ended the previous step."""
+        self._step += 1
+        self._H = dict(H, step=self._step, arena_base=int(self.st.arena_base))
+
+    def imap_coarse(self, tasks):
+        """Arrival-order iterator of coarse-chunk sub-blocks."""
+        if getattr(self, "_H", None) is None:
+            raise RuntimeError("imap_coarse before stage_coarse: no header")
+        H = self._H
+        return self._pool.imap_unordered(
+            _worker_coarse_task, [(gi, b, H) for gi, b in tasks]
+        )
 
     def close(self):
         if getattr(self, "_pool", None) is not None:
