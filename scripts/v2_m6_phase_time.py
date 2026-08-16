@@ -96,6 +96,12 @@ class PhaseTimer:
 _IC_CACHE = {}
 
 
+def _eject_calls():
+    """The compiled path's call count, or 0 if it was never imported."""
+    mod = sys.modules.get("inexor.eject_jax")
+    return int(getattr(mod, "CALLS", 0)) if mod is not None else 0
+
+
 def _enable_x64():
     """Callers opt in; library code never toggles it (repo convention).
 
@@ -110,7 +116,7 @@ def _enable_x64():
 
 
 def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1,
-           paint_subblock=True):
+           paint_subblock=True, eject_kernel="numpy"):
     _enable_x64()
     import jax.numpy as jnp  # noqa: F401  (engine import order)
 
@@ -136,6 +142,7 @@ def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1,
         box_size=g["L"], n_part=g["n_part"], n_fine=g["n_fine"], n_coarse=g["n_coarse"],
         n_tile=g["tile"], b_fine=g["buf"], alpha=m3.ALPHA, brick_slack=slack,
         tile_workers=tile_workers, paint_subblock=paint_subblock,
+        eject_kernel=eject_kernel,
     )
     ec.validate()
     st = state.SlotState.build(x, v, t9, ec.n_brick and (g["n_fine"] // ec.n_brick),
@@ -144,9 +151,10 @@ def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1,
 
 
 def _one(cfg_name, k, slack, arena_frac, timed, tile=None, buf=32, tile_workers=1,
-         paint_subblock=True):
+         paint_subblock=True, eject_kernel="numpy"):
     engine, ec, st, cosmo, a_grid, bfc, bft = _build(
-        cfg_name, slack, arena_frac, tile, buf, tile_workers, paint_subblock
+        cfg_name, slack, arena_frac, tile, buf, tile_workers, paint_subblock,
+        eject_kernel,
     )
     a_steps = a_grid(m3.A_INIT, m3.A_FINAL, k, m3.SPACING)
     co = bfc(bft(a_steps, cosmo))
@@ -179,6 +187,10 @@ def main(argv=None):
                          "coarse paint (bitwise neutral; NOT an operating "
                          "point). The card carries coarse_subblock_chunks so "
                          "the knob proves it applied")
+    ap.add_argument("--eject-kernel", default="numpy", choices=("numpy", "jax"),
+                    help="`migrate`'s row kernel. The card carries an eject_jax "
+                         "CALL COUNT so a leg that silently fell back to numpy "
+                         "reads as a broken instrument, not as a null result.")
     ap.add_argument("--tile-workers", type=int, default=1,
                     help="run the POOL executor with this many workers (1 = "
                          "serial, unchanged). Under overlap the tile_* boundary "
@@ -200,21 +212,22 @@ def main(argv=None):
         # per step and can exhaust the arena where the real run does not, which
         # is how the first version of this line died.
         _one(args.config, args.k, args.slack, args.arena_frac, False,
-             args.tile, args.buf, args.tile_workers, bool(args.paint_subblock))
+             args.tile, args.buf, args.tile_workers, bool(args.paint_subblock),
+             args.eject_kernel)
 
     traced, control = [], []
     reports, pool_steps, sub_chunks = [], [], []
     for _ in range(int(args.repeats)):
         w, rep, seen = _one(args.config, args.k, args.slack, args.arena_frac, True,
                             args.tile, args.buf, args.tile_workers,
-                            bool(args.paint_subblock))
+                            bool(args.paint_subblock), args.eject_kernel)
         traced.append(w)
         reports.append(rep)
         pool_steps.extend(s["pool"] for s in seen if "pool" in s)
         sub_chunks.extend(int(s.get("coarse_subblock_chunks", -1)) for s in seen)
         w2, _, _ = _one(args.config, args.k, args.slack, args.arena_frac, False,
                         args.tile, args.buf, args.tile_workers,
-                        bool(args.paint_subblock))
+                        bool(args.paint_subblock), args.eject_kernel)
         control.append(w2)
 
     t_med, c_med = float(np.median(traced)), float(np.median(control))
@@ -235,6 +248,8 @@ def main(argv=None):
         s_per_step=t_med / max(int(args.k), 1),
         unknown_phases=sorted({p for r in reports for p in r["unknown_phases"]}),
         tile_workers=int(args.tile_workers),
+        eject_kernel=str(args.eject_kernel),
+        eject_jax_calls=_eject_calls(),
         paint_subblock=bool(args.paint_subblock),
         # the knob's own receipt: >0 sub-block chunks per step when on, 0 when
         # the full-mesh arm ran (a knob must prove it applied)

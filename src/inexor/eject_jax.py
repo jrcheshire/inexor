@@ -47,6 +47,13 @@ PAD_MULTIPLE = 4096
 
 _CACHE: dict = {}
 
+#: RECEIPT, not telemetry. A knob that selects this path must be able to prove it
+#: applied -- a run whose `eject_kernel="jax"` silently fell back would read as a
+#: null result for the compiled path rather than as a broken instrument, and this
+#: milestone has already shipped one card whose arm never ran. Probes read this
+#: before and after a timed region and put the delta on the card.
+CALLS = 0
+
 
 def _padded(n):
     return int(PAD_MULTIPLE * int(np.ceil(max(1, n) / PAD_MULTIPLE)))
@@ -138,6 +145,8 @@ def eject_rows(t9, nb, off, bijk, w, ids, scale, c_drift, brick_id):
     """
     import jax.numpy as jnp
 
+    global CALLS
+    CALLS += 1
     require_x64()
     n = int(len(off))
     n_pad = _padded(n)
