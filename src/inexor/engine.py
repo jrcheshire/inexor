@@ -105,6 +105,7 @@ class EngineConfig:
         chunk_bricks=64,
         brick_slack=0.10,
         repack_every=1,
+        eject_kernel="numpy",
         coarse_dtype="float64",
         fine_dtype="float64",
         cap_rungs=CAP_RUNGS_PER_OCTAVE,
@@ -134,6 +135,7 @@ class EngineConfig:
         # engine hit the D-007 refusal with a full arena by step 10 at `smoke`.
         self.brick_slack = float(brick_slack)
         self.repack_every = int(repack_every)
+        self.eject_kernel = str(eject_kernel)
         # M-v2-4. TWO knobs, defaulting independently, deliberately NOT coupled:
         # the coarse mesh is the gated arm (it grows with the box and is the
         # binding resident term at hero scale) and the fine tile mesh is
@@ -1071,7 +1073,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # a peak comparison against every card on record is still like-for-like.
     ph("reconcile")
 
-    stats = drift_and_migrate(st, c_drift)
+    stats = drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel)
     ph("migrate")
     # both: `cap` is the SHAPE every buffer took, `cap_true` the max over tiles it
     # was quantized from. Reporting only one of them hides either the padding cost
@@ -1154,7 +1156,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None):
     ph("kernel_build")
     try:
         lead, fused = fused_drifts(coeffs)
-        drift_and_migrate(st, lead)  # onto the first midpoint
+        drift_and_migrate(st, lead, kernel=cfg.eject_kernel)  # onto the first midpoint
         ph("lead_drift")
         out = []
         # both buffer shapes are carried ACROSS steps and only ever grow, so the

@@ -1093,6 +1093,76 @@ describing the thing it is named after.
   carries structurally (5l) but the arena occupancy and clustering do not.
 - **Any engine-level number.** Nothing is promoted; `_eject_slab` is unchanged.
 
+## 5o. The compiled eject path is IN, bitwise, at 1.30x on the phase
+
+**Built, gated and measured on the laptop; no cluster time.** `EngineConfig.eject_kernel`
+(default `"numpy"`, unchanged) routes `drift_and_migrate` to `SlotState._eject_slab_jax`,
+a separate implementation in `src/inexor/eject_jax.py`. The numpy path is not
+conditionally modified anywhere: an A/B whose arms share their lines cannot see a
+change to those lines, so the duplication IS the control.
+
+**Engine-level A/B at cdev (16.8M particles, f=2.85, arena occupied at 126,864
+rows), both arms in one process:**
+
+    numpy      3.146 s
+    jax cold   2.628 s   1.20x
+    jax warm   2.419 s   1.30x   <- the operating number
+    BITWISE: 0 of 65,444,664 `off` elements, 0 everywhere else, stats dict equal
+
+**The pre-registration landed.** 5n predicted that compiling `kernel` + `partition`
+(58-65% of eject at 9-12x) bounds eject at 2.31x and therefore the phase at
+**1.28x**. Measured 1.30x. That is the first number in this milestone where the
+decomposition predicted an engine-level result before it was built.
+
+**Two structural choices, both forced rather than chosen:**
+
+- **The decode is skipped, not recomputed.** `_eject_slab` calls `decode_brick`,
+  which builds float `x` and `v`, then re-derives the lattice index from them.
+  The compiled path goes from `(off, bijk, w)` straight to the new index, so it
+  resolves slots WITHOUT decoding. The arena splice is reproduced line for line,
+  because a divergence there is a lost particle and this function has produced
+  one before (5-l era, five wrong diagnoses).
+- **The partition is GLOBAL, not per brick.** `_cat` already concatenates all
+  bricks' keepers into one array and all leavers into another, so the target order
+  is every keeper in brick-major order then every leaver. Producing exactly that
+  makes both results contiguous SLICES of one buffer -- the host does no gather
+  and no concatenate, which is why the partition's share is removed rather than
+  merely accelerated. A first version implemented a per-brick segmented partition
+  and was thrown away as soon as this was noticed.
+
+### The gates, and what mutation testing said about them
+
+7 tests, all exact equality, none a tolerance. Suite 454 passed / 1 skipped (from
+447), `test-det` 16, lint clean.
+
+Mutation-tested, and **it found a dead test**: `round` -> `floor` fails 4 of 7 and
+reversing the leaver order fails 4 of 7, but corrupting the padded rows' brick id
+passed 7 of 7. The reason is that the fixture's slab holds exactly 8,192 rows,
+a multiple of `PAD_MULTIPLE`, **so the padding path never executed in any test**.
+A test that shrinks `PAD_MULTIPLE` to force a real pad now exists, and it asserts
+the pad is non-zero before asserting anything else.
+
+**The two padding guards are individually redundant and jointly load-bearing**,
+which is measured: removing the `real` mask alone passes 7/7 (the `-1` brick
+sentinel catches it), changing the sentinel alone passes 7/7 (`real` catches it),
+removing both fails 5/7. So no test can defend either one by itself, and the
+module says so at the line rather than leaving a green suite to imply otherwise.
+
+### What 5o does NOT establish
+
+- **Anything at cgh64 or C-gh.** This is a cdev A/B on one machine. The 1.30x
+  carries only as far as the decomposition it was predicted from, and 5n's own
+  cross-architecture legs showed `numpy_batched` INVERTING between arm64 and x86.
+- **That the default should change.** `eject_kernel` defaults to `"numpy"` and
+  nothing in the engine, the probes or the sbatches selects `"jax"` yet. Promotion
+  is a JC call and wants a cgh64 leg first.
+- **Any interaction with the worker pool.** `executor.TilePool` sets affinity
+  before jax exists in a worker; this module imports jax lazily so that ordering
+  is preserved, but the combination is untested.
+- **The realization figure.** If 1.30x carried to C-gh it would take `migrate`
+  23.31 -> 17.9 h and the realization 45.24 -> 39.8 h. That is arithmetic, not a
+  measurement.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The

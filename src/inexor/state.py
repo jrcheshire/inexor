@@ -367,7 +367,7 @@ def brick_reach(st, c_drift, vel_scale=None):
     return int(np.ceil(abs(float(c_drift)) * s * INT16_MAX / extent))
 
 
-def drift_and_migrate(st, c_drift, max_staged_slabs=None):
+def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy"):
     """Advance every particle by `c_drift * v` and re-home it. ONE pass.
 
     Drift and migration are not separable once positions are bucket-relative:
@@ -434,7 +434,7 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None):
     consumed = {}  # emig rows an insert actually took, per source slab
     n_over, peak_staged, realized_reach = 0, 0, 0
     for s in range(nb):
-        staged[s], emig[s] = st._eject_slab(s, c_drift, scales)
+        staged[s], emig[s] = st._eject_slab(s, c_drift, scales, kernel=kernel)
         consumed[s] = 0
         # the REALIZED x-reach, reported beside the bound: the bound said 2 at
         # cdev while every record claimed "at most one brick per axis", and the
@@ -996,7 +996,82 @@ class SlotState:
         nb = self.bricks_per_side
         return int(bx) * nb * nb, (int(bx) + 1) * nb * nb
 
-    def _eject_slab(self, bx, c_drift, scales):
+    def _eject_slab_jax(self, bx, c_drift, scales):
+        """`_eject_slab` with the drift and the partition compiled.
+
+        Same contract, same return value, same mutations, and gated elementwise
+        against the numpy path (`tests/test_eject_jax.py`). The split of labour
+        is section 5n's decomposition: the row arithmetic and the keep/leave
+        partition go to XLA (58-65% of the call, 20-80x above the machine's
+        traffic floor), while slot resolution and the arena splice stay here
+        because they are pointer-chasing at 8-30x the floor.
+
+        The two structural differences from the numpy path, both deliberate:
+
+        1. **The decode is not done here.** The numpy path calls `decode_brick`,
+           which builds `x` and `v` in float, and then re-derives the lattice
+           index from them. The compiled kernel goes from `(off, bijk, w)`
+           straight to the new index, so this resolves slots WITHOUT decoding.
+           The arena splice is reproduced line for line because a divergence
+           there is a lost particle, which this function has produced before.
+        2. **One call for the whole slab, not one per brick.** `_cat` already
+           concatenates all bricks' keepers into one array and all bricks'
+           leavers into another, so the target order is global rather than
+           per-brick, which makes both results contiguous slices of one buffer.
+        """
+        from .eject_jax import eject_rows
+        from .layout import bucket_ijk_from_key
+
+        lo_b, hi_b = self.slab_bricks(bx)
+        offs, bijks, ws, ids_l, sc_l, bid_l = [], [], [], [], [], []
+        for b in range(lo_b, hi_b):
+            lo = int(self.brick_start[b])
+            m = self.brick_live_count(b)
+            slots = np.arange(lo, lo + m, dtype=np.int64)
+            bijk = self.bucket_ijk_of_live_slots(b)
+            a = self.arena_slots_of_brick(b)
+            if len(a):
+                slots = np.concatenate([slots, a])
+                bijk = np.concatenate(
+                    [bijk,
+                     bucket_ijk_from_key(self.arena_bucket[a - self.arena_base],
+                                         self.t9, self.bricks_per_side)]
+                )
+            if not len(slots):
+                continue
+            # the release, identical to the numpy path INCLUDING the surgical
+            # index drop (5g: invalidating the whole index was 51% of an
+            # arena-occupied migrate)
+            if len(a):
+                self.arena_bucket[a - self.arena_base] = -1
+                if self._arena_by_brick is not None:
+                    self._arena_by_brick.pop(int(b), None)
+                self._arena_free = None
+            offs.append(self.off[slots])
+            bijks.append(bijk)
+            ws.append(self.w[slots])
+            if self.ids is not None:
+                ids_l.append(self.ids[slots])
+            sc_l.append(np.full((len(slots), 1), float(scales[b]), dtype=np.float64))
+            bid_l.append(np.full(len(slots), b, dtype=np.int64))
+
+        if not offs:
+            return (_cat([], [], [], []), _cat([], [], [], [], src=[]))
+
+        dest, off_new, w_out, ids_out, src_out, n_keep = eject_rows(
+            self.t9, self.bricks_per_side,
+            np.concatenate(offs), np.concatenate(bijks), np.concatenate(ws),
+            np.concatenate(ids_l) if ids_l else None,
+            np.concatenate(sc_l), c_drift, np.concatenate(bid_l),
+        )
+        keep = dict(dest=dest[:n_keep], off=off_new[:n_keep], w=w_out[:n_keep],
+                    ids=None if ids_out is None else ids_out[:n_keep])
+        emig = dict(dest=dest[n_keep:], off=off_new[n_keep:], w=w_out[n_keep:],
+                    ids=None if ids_out is None else ids_out[n_keep:],
+                    src=src_out[n_keep:].astype(np.int32))
+        return keep, emig
+
+    def _eject_slab(self, bx, c_drift, scales, kernel="numpy"):
         """Drift one slab's particles and split them into keepers and leavers.
 
         Reads the state; writes NOTHING back. That phase separation is what makes
@@ -1005,7 +1080,16 @@ class SlotState:
 
         Returns (keep, emig), each a dict of flat arrays plus the destination
         bucket ordinal, so a slab costs O(slab) rather than O(N).
+
+        `kernel="jax"` routes to `_eject_slab_jax`, which is gated elementwise
+        against this function. This one stays the reference and is never
+        conditionally modified: an A/B whose arms share their lines cannot see a
+        change to those lines (umbrella `ab_arms_sharing_code_are_policy_blind`).
         """
+        if kernel == "jax":
+            return self._eject_slab_jax(bx, c_drift, scales)
+        if kernel != "numpy":
+            raise ValueError(f"unknown eject kernel {kernel!r}; expected 'numpy' or 'jax'")
         lo_b, hi_b = self.slab_bricks(bx)
         p3 = self.buckets_per_brick
         k_dest, k_off, k_w, k_id = [], [], [], []
