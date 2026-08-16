@@ -90,13 +90,28 @@ run_leg "smoke-jax" pixi run -e default python $PHASE $SMOKE \
   --eject-kernel jax --out-suffix _c8_smoke_jax
 run_leg "smoke-jax-pooled" pixi run -e default python $PHASE $SMOKE \
   --eject-kernel jax --tile-workers 4 --out-suffix _c8_smoke_jax_w4
+# rc=2 IS NOT A CRASH. `v2_m6_phase_time.py:313` returns 2 on exactly one
+# condition -- `instrument_neutral is False` -- which at cdev8/K=3/repeats=1 is a
+# statement about the probe's own overhead against a tight bound, not about the
+# engine. The FIRST run of this job (antares 481) aborted here because this gate
+# treated any non-zero rc as fatal, wasting the cgh64 legs on a smoke leg whose
+# only job is to exercise code paths. That is the same confusion 5j recorded
+# after 914085 ("read what a leg's rc MEANS before reporting a job failed"),
+# made operational instead of editorial.
+#
+# So: at SMOKE scale, neutrality is reported and not gated. At cgh64 it still
+# gates, because there the overhead bound is loose relative to a 375 s step and a
+# non-neutral instrument would really mean the numbers are unreadable.
 for i in 0 1 2; do
-  [ "${codes[$i]}" -ne 0 ] && {
+  if [ "${codes[$i]}" -eq 2 ]; then
+    echo "NOTE: smoke leg ${names[$i]} was instrument-non-neutral (rc=2). Smoke "
+    echo "      exercises paths; it does not measure. Continuing."
+  elif [ "${codes[$i]}" -ne 0 ]; then
     echo "FATAL: smoke leg ${names[$i]} failed (rc=${codes[$i]}); not burning the cgh64 legs"
     echo "=== LEG SUMMARY ==="
     for j in "${!names[@]}"; do echo "  ${names[$j]}: rc=${codes[$j]}"; done
     exit 1
-  }
+  fi
 done
 
 # 2. THE ENGINE PAIR at cgh64, serial: gaps 1 and 2 together, since the engine's
