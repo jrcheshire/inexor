@@ -984,6 +984,115 @@ made this unmissable and is owed (item 12).
 - **That affinity is irrelevant at C-gh.** The arm ran at cgh64, where the state
   is 1/64 of production and fits differently across the two sockets.
 
+## 5n. C6 -- the row kernel compiles bitwise at ~9-12x, and the win is the COMPILER not the device
+
+**Laptop (M4, arm64) + deneb 479 (x86 + RTX 3050), zero SU, ~8 s of compute.**
+Instrument `scripts/v2_m6_c6_jit.py`. This exists because 5l's "the phase is
+irreducible row work and the only lever is parallelism" does not follow from
+what 5l measured: per-row says the cost scales with rows, not that a row is
+cheap. JC raised the same point independently ("a lot of raw numpy operations
+that I suspect could be jit-ed").
+
+### The kernel is far off the floor and compiles BITWISE
+
+Every number below is against a single-core streaming rate measured in the same
+process (`c = a + b` over out-of-cache f64), so "slow" is relative to the
+machine rather than to an intuition. At cdev = 4,096 rows/brick, the granularity
+`choose_brick` fixes at EVERY rung of the config table including C-hero (5l):
+
+| arm | laptop ns/row | vs floor | deneb ns/row | vs floor | bitwise |
+|---|---|---|---|---|---|
+| `numpy_perbrick` (current) | 27.96 | 80x | 22.86 | 20x | reference |
+| `numpy_batched` | 27.16 | 78x | 33.87 | 30x | yes |
+| `jax_cpu` | 2.40 | 6.9x | 2.44 | 2.2x | **yes** |
+| `jax_dev` | -- | -- | 2.71 | 2.4x | **yes** |
+
+**The compiled twin is bitwise identical on both machines and on CUDA.** That
+was the real risk and it is the load-bearing result: XLA could have contracted
+`x / q + (c * v) / q` into an FMA, which would have made the twin a
+different-numbers path rather than a drop-in, and under D-007 a different-numbers
+path in the migration is not adoptable at all. It did not.
+
+**The `vs floor` column moves 4x between machines and the `ns/row` column barely
+moves.** The M4 streams 130 GB/s on one core against deneb's 39.8, so the same
+absolute work reads as 80x the floor on one and 20x on the other. **Quote the
+absolute ns/row across machines and the floor ratio only within one** -- the
+ratio is a property of the pair.
+
+**`numpy_batched` inverts across architectures: 1.03x on the laptop, 0.67x on
+deneb** -- batching is a 1.5x LOSS on x86. A slab's arrays are ~25 MB and a
+brick's are ~100 KB, so the per-brick structure is cache-resident on x86 and the
+batched form is not. It independently reproduces 5l's per-brick finding from the
+other side (there is no per-brick overhead worth removing) and adds a reason not
+to "just vectorize across the slab".
+
+### The device arm LOST, and the result is about PCIe rather than about GPUs
+
+Pre-registered: the device beats the jitted CPU arm by 2-6x. **Measured 0.90x**
+(2.71 vs 2.44 ns/row), a miss in the opposite direction to the band.
+
+**It should not be read as a GPU verdict, and the reason is already on this
+project's record.** `m2_pinned_gather_record` establishes that deneb is an RTX
+3050 over PCIe at ~13 GB/s against C-gh's NVLink-C2C at 176-221 GB/s, ~15x, and
+that "transfer columns are uninformative about production". The timed region
+here includes the device-to-host readback of ~20 MB of outputs, which the CPU arm
+does not pay: at deneb's link that is order 1.5 ms against the arm's total
+2.85 ms. **So more than half of the device arm may be the link.** The kernel's
+own time is UNMEASURED and a no-readback arm is what would separate them.
+
+**What the job does settle** is the venue question it was submitted for, in the
+weaker form: nothing here argues for moving this phase to a device, and the
+compiled CPU twin gets ~9-12x on both architectures for no transfer at all. For
+`migrate`, the lever is the compiler. NB the transfer objection does NOT scale
+up to a structural argument at C-gh: the phase costs ~2,098 s/step there against
+~0.5 s to move the whole 98.6 GB state over an NVLink-C2C link, so a device route
+is not transfer-blocked in production even though it is here.
+
+### Where `_eject_slab` goes, and it holds across architectures
+
+Each component replayed on the real arrays, with the parts REQUIRED to sum to
+the whole:
+
+| component | laptop % of eject | deneb % of eject |
+|---|---|---|
+| `kernel` | 35.1 | 27.6 |
+| `partition` (the keep/leave split) | 30.2 | 30.5 |
+| `slots+bijk` | 13.3 | 16.1 |
+| `gather` | 13.4 | 15.0 |
+| `concat` | 10.9 | 12.5 |
+| **reconstruction** | **102.8%** | **101.7%** |
+
+**The reconstruction check earned itself on its first run**: the initial version
+let three replays re-do the slot gather internally and the parts summed to
+**144%** of the call. A decomposition that does not add up has found some of the
+phase and is silent about the rest, and that silence is how a lever gets aimed at
+the wrong term -- which is exactly what this section is correcting in 5l.
+
+**`kernel` + `partition` are 58-65% of eject and are the two terms furthest off
+the floor.** Both are elementwise/compress work of the kind that just compiled at
+9-12x. Compiling both bounds `eject` at **2.31x** (laptop shares), against
+**1.15x** for the kernel alone -- which is why the instrument prints the phase
+bound beside every speedup rather than the speedup on its own.
+
+**`_insert_slab` is the larger half (19.68 of migrate's 33.26 s, 5l) and its top
+line is an `argsort`** at ~30% of the call on both machines, then `_write_brick`,
+then `_group_by_brick`. D-v2-19 already argued that bucket order is a FIXED
+spatial ordering, so a counting or merge form should beat a comparison sort --
+the same lever it named for `repack`, now with a second phase behind it. Ranked
+by cProfile rather than replayed, deliberately: a timed replay of insert would
+have to reimplement the spare/arena escalation, and a reimplementation stops
+describing the thing it is named after.
+
+### What 5n does NOT establish
+
+- **The device kernel's own speed.** The device arm's timed region includes
+  readback; a no-readback arm is owed before any GPU claim about this phase.
+- **That compiling `partition` gets the kernel's factor.** It is the same class
+  of work and that is a hypothesis, not a measurement.
+- **Anything at cgh64 or C-gh.** These are cdev legs. The brick granularity
+  carries structurally (5l) but the arena occupancy and clustering do not.
+- **Any engine-level number.** Nothing is promoted; `_eject_slab` is unchanged.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
