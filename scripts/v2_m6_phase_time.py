@@ -109,7 +109,8 @@ def _enable_x64():
     jax.config.update("jax_enable_x64", True)
 
 
-def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1):
+def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1,
+           paint_subblock=True):
     _enable_x64()
     import jax.numpy as jnp  # noqa: F401  (engine import order)
 
@@ -134,7 +135,7 @@ def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1):
     ec = engine.EngineConfig(
         box_size=g["L"], n_part=g["n_part"], n_fine=g["n_fine"], n_coarse=g["n_coarse"],
         n_tile=g["tile"], b_fine=g["buf"], alpha=m3.ALPHA, brick_slack=slack,
-        tile_workers=tile_workers,
+        tile_workers=tile_workers, paint_subblock=paint_subblock,
     )
     ec.validate()
     st = state.SlotState.build(x, v, t9, ec.n_brick and (g["n_fine"] // ec.n_brick),
@@ -142,9 +143,10 @@ def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1):
     return engine, ec, st, cosmo, a_grid, bullfrog_float_coeffs, bullfrog_table
 
 
-def _one(cfg_name, k, slack, arena_frac, timed, tile=None, buf=32, tile_workers=1):
+def _one(cfg_name, k, slack, arena_frac, timed, tile=None, buf=32, tile_workers=1,
+         paint_subblock=True):
     engine, ec, st, cosmo, a_grid, bfc, bft = _build(
-        cfg_name, slack, arena_frac, tile, buf, tile_workers
+        cfg_name, slack, arena_frac, tile, buf, tile_workers, paint_subblock
     )
     a_steps = a_grid(m3.A_INIT, m3.A_FINAL, k, m3.SPACING)
     co = bfc(bft(a_steps, cosmo))
@@ -172,6 +174,11 @@ def main(argv=None):
                          "second arm would inherit it")
     ap.add_argument("--tile", type=int, default=None)
     ap.add_argument("--buf", type=int, default=32)
+    ap.add_argument("--paint-subblock", type=int, default=1, choices=(0, 1),
+                    help="Stage 2c A/B arm: 0 restores the full-mesh-per-chunk "
+                         "coarse paint (bitwise neutral; NOT an operating "
+                         "point). The card carries coarse_subblock_chunks so "
+                         "the knob proves it applied")
     ap.add_argument("--tile-workers", type=int, default=1,
                     help="run the POOL executor with this many workers (1 = "
                          "serial, unchanged). Under overlap the tile_* boundary "
@@ -193,18 +200,21 @@ def main(argv=None):
         # per step and can exhaust the arena where the real run does not, which
         # is how the first version of this line died.
         _one(args.config, args.k, args.slack, args.arena_frac, False,
-             args.tile, args.buf, args.tile_workers)
+             args.tile, args.buf, args.tile_workers, bool(args.paint_subblock))
 
     traced, control = [], []
-    reports, pool_steps = [], []
+    reports, pool_steps, sub_chunks = [], [], []
     for _ in range(int(args.repeats)):
         w, rep, seen = _one(args.config, args.k, args.slack, args.arena_frac, True,
-                            args.tile, args.buf, args.tile_workers)
+                            args.tile, args.buf, args.tile_workers,
+                            bool(args.paint_subblock))
         traced.append(w)
         reports.append(rep)
         pool_steps.extend(s["pool"] for s in seen if "pool" in s)
+        sub_chunks.extend(int(s.get("coarse_subblock_chunks", -1)) for s in seen)
         w2, _, _ = _one(args.config, args.k, args.slack, args.arena_frac, False,
-                        args.tile, args.buf, args.tile_workers)
+                        args.tile, args.buf, args.tile_workers,
+                        bool(args.paint_subblock))
         control.append(w2)
 
     t_med, c_med = float(np.median(traced)), float(np.median(control))
@@ -225,6 +235,10 @@ def main(argv=None):
         s_per_step=t_med / max(int(args.k), 1),
         unknown_phases=sorted({p for r in reports for p in r["unknown_phases"]}),
         tile_workers=int(args.tile_workers),
+        paint_subblock=bool(args.paint_subblock),
+        # the knob's own receipt: >0 sub-block chunks per step when on, 0 when
+        # the full-mesh arm ran (a knob must prove it applied)
+        coarse_subblock_chunks_per_step=sorted(set(sub_chunks)),
     )
     if pool_steps:
         # the pooled reading: per-step busy triple, medians over every traced
