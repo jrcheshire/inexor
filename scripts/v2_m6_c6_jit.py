@@ -475,7 +475,14 @@ def run(cfg_name, arms, repeats, fraction, out_path, decompose=False):
             import jax.numpy as jnp
 
             jax.config.update("jax_enable_x64", True)
-            devs = [d for d in jax.devices() if (d.platform == "cpu") == (want == "cpu")]
+            # `jax.devices()` returns the DEFAULT backend's devices only, so on a
+            # GPU machine the bare call would hand the cpu arm a cuda device and
+            # the arm would silently measure the wrong backend (or, with the
+            # platform filter, skip itself). Ask for the platform by name.
+            try:
+                devs = jax.devices("cpu" if want == "cpu" else "gpu")
+            except RuntimeError:
+                devs = []
             if not devs:
                 print(f"  {arm:16s} SKIPPED -- no {want} device visible")
                 results[arm] = dict(skipped=True, reason=f"no {want} device")
@@ -495,8 +502,13 @@ def run(cfg_name, arms, repeats, fraction, out_path, decompose=False):
 
             results.setdefault(arm, {})["device"] = str(dev)
             results[arm]["platform"] = dev.platform
-            if dev.platform != ("cpu" if want == "cpu" else dev.platform):
-                print(f"  {arm:16s} REFUSING -- asked for {want}, got {dev.platform}")
+            # NOT `!= (cpu if want == cpu else dev.platform)`, which was the
+            # first form here and is a gate that cannot fail: the device branch
+            # compared dev.platform with itself. Name both sides.
+            expected = ("cpu",) if want == "cpu" else ("cuda", "gpu", "rocm")
+            if dev.platform not in expected:
+                print(f"  {arm:16s} REFUSING -- asked for {want} (one of {expected}), "
+                      f"got {dev.platform}")
                 return 2
         else:
             raise SystemExit(f"unknown arm {arm}")
