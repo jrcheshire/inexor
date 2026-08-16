@@ -736,6 +736,46 @@ consequential line: the tile loop could go to zero and the engine would still mi
 - Whether the ~5% residue inflation persists at C-gh scale or is a cgh64 artifact.
 - The W=32 phase table (instrument non-neutral; the wall stands).
 
+## 5k. Antares 474 -- Stage 2c at cgh64: 2.66x on the phase, and the cdev number did not transfer
+
+**Four legs, all rc=0, both phase-time arms instrument-neutral, commit
+`afabe49`.** The A/B is the `EngineConfig.paint_subblock` knob with both arms in
+ONE job, which is also what controls the cross-job drift 5h left unexplained.
+
+    cgh64, s/step        2c OFF     2c ON     ratio
+    step                 450.970   375.346    1.202x
+    coarse_paint         130.343    48.937    2.663x
+    tile_long            188.336   194.660    0.968x
+    tile_short            73.590    73.030    1.008x
+    migrate               23.723    23.700    1.001x
+    tile_decode           17.480    17.610    0.993x
+    chunks/step                0       512    (knob proven applied)
+
+**The payoff is 2.66x on `coarse_paint` and 20.2% on the whole step.** The
+laptop-at-cdev measurement recorded in owed item 9 was **~2%**, and it did not
+transfer -- the phase's composition is genuinely different at the two
+configurations, which is what 5f warned about from the other direction ("do not
+quote 2c's payoff from the N^2 arithmetic"). The arithmetic overpredicted at
+cdev and roughly landed at cgh64. **The general form: a wall payoff measured at
+the small config is not a bound on the large one in either direction.**
+
+**Cross-job reproduction, which is the other thing this job bought.** Against
+job 467's post-arena-fix table, 474's `off` arm reads `tile_long` 194.66 vs
+192.09 s/step (+1.3%), `coarse_paint` 130.34 vs 132.53 (-1.7%), `migrate` 23.72
+vs 23.72 (0.0%), step 450.97 vs 457.45 (-1.4%). **5h's unexplained +8.6% /
++6.0% drift does not reappear**, so the likely reading there was node-state
+scatter and the paired-arm design is what makes this one airtight.
+
+**The antares cgh64 ladder now reads 2622.6 -> 612.3 -> 457.5 -> 375.3 s/step.**
+
+**No double counting with 5j:** the gg cards carry `paint_subblock: true`, so
+2c was already ON for every number in that section and the 51.7 h C-gh
+projection already includes this win.
+
+**Identity legs:** pooled-vs-serial n_diff 0 at cdev8 and cdev (`m6_w2_identity_
+{cdev8,cdev}.json`), the fourth and fifth architectures-plus-configs on which the
+executor's disjoint-write premise has held exactly.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
@@ -797,11 +837,13 @@ consequential line: the tile loop could go to zero and the engine would still mi
    (the per-chunk full-mesh transient, 4.3 + 8.6 GB at C-gh, is deleted).
    **Owed: the cgh64 wall A/B via the knob** (one phase-time leg per arm),
    which is also the coarse_paint decomposition's first one-axis arm.
-   IN FLIGHT as antares 474 (the `on` arm read out at 375.35 s/step,
-   `tile_long` 51.9%; the `off` arm was still running at the time of writing).
-   NB 5j has since measured `coarse_paint` pooling at 8.5-13.0x on gg, so the
-   phase is no longer the wall target whatever this A/B says -- it now reads as
-   a memory result plus an attribution, not a wall fix.
+   **DONE, antares 474 -- see section 5k. The cdev reading did NOT transfer:
+   the cgh64 payoff is 2.66x on the phase and 20.2% on the step.** The
+   sentence first written here, that 2c "reads as a memory result plus an
+   attribution, not a wall fix", was written from the cdev number before 474's
+   `off` arm finished and is WRONG at cgh64. Corrected rather than deleted,
+   because the mistake is the transferable part: a wall payoff measured at
+   cdev-on-M4 does not carry to cgh64.
 10. **`migrate`'s decomposition at cgh64, post-arena-fix.** 5j puts it at 45%
    of a W=16 step and 4.7x the whole 5 h bar on its own at C-gh. 5g attributed
    and removed the ~170 s index churn; the residual ~31 s/step has never been
