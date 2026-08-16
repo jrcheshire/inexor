@@ -255,6 +255,149 @@ def _gate_against_engine(st, bx, c_drift, scales, packed):
     )
 
 
+def _decompose_eject(st, bx, c_drift, scales, repeats, floor_ns, n_rows, t_eject):
+    """Where the OTHER 64% of `_eject_slab` goes, against the same floor.
+
+    Every component is timed by replaying the exact operation on the exact
+    arrays, in the same per-brick loop `_eject_slab` uses, so no component is a
+    rewrite of what the engine does. **The parts are then required to add up to
+    the whole** (`reconstruction` below): a decomposition whose pieces sum to
+    60% of the measured call has found 60% of the phase and is silent about the
+    rest, and silence there is exactly how a lever gets aimed at the wrong term.
+    """
+    lo_b, hi_b = st.slab_bricks(bx)
+    bricks = list(range(lo_b, hi_b))
+    t9, nb = st.t9, st.bricks_per_side
+
+    # PRECOMPUTED ONCE, and every replay below consumes these rather than
+    # re-deriving them. The first version of this function let three replays
+    # re-do the slot gather internally and the parts summed to 144% of the whole
+    # -- the reconstruction check is what caught it, which is the entire reason
+    # it is a check and not a printout.
+    from inexor.layout import bucket_ijk_from_key
+
+    per = []
+    for b in bricks:
+        lo = int(st.brick_start[b])
+        m = st.brick_live_count(b)
+        slots = np.arange(lo, lo + m, dtype=np.int64)
+        bijk = st.bucket_ijk_of_live_slots(b)
+        a = st.arena_slots_of_brick(b)
+        if len(a):
+            slots = np.concatenate([slots, a])
+            bijk = np.concatenate(
+                [bijk, bucket_ijk_from_key(st.arena_bucket[a - st.arena_base], t9, nb)]
+            )
+        if not len(slots):
+            continue
+        off_b, w_b = st.off[slots], st.w[slots]
+        ids_b = st.ids[slots] if st.ids is not None else None
+        sc = np.full((len(slots), 1), float(scales[b]), dtype=np.float64)
+        brow = np.full(len(slots), b, dtype=np.int64)
+        d, on, stq = _kernel_numpy(off_b, bijk, w_b, sc, c_drift, t9, nb, brow)
+        per.append(dict(b=b, slots=slots, bijk=bijk, off=off_b, w=w_b, ids=ids_b,
+                        sc=sc, brow=brow, dest=d, off_new=on, stay=stq))
+
+    def _slots_bijk():
+        """decode_brick MINUS the decode: slot range, bucket ijk, arena splice."""
+        for p in per:
+            b = p["b"]
+            lo = int(st.brick_start[b])
+            m = st.brick_live_count(b)
+            slots = np.arange(lo, lo + m, dtype=np.int64)
+            bijk = st.bucket_ijk_of_live_slots(b)
+            a = st.arena_slots_of_brick(b)
+            if len(a):
+                slots = np.concatenate([slots, a])
+                bijk = np.concatenate(
+                    [bijk, bucket_ijk_from_key(st.arena_bucket[a - st.arena_base], t9, nb)]
+                )
+
+    def _gather():
+        for p in per:
+            sl = p["slots"]
+            _ = st.off[sl]
+            _ = st.w[sl]
+            if st.ids is not None:
+                _ = st.ids[sl]
+
+    def _kernel():
+        for p in per:
+            _kernel_numpy(p["off"], p["bijk"], p["w"], p["sc"], c_drift, t9, nb, p["brow"])
+
+    def _partition():
+        for p in per:
+            d, on, stq, w_cur, ids_b = p["dest"], p["off_new"], p["stay"], p["w"], p["ids"]
+            _ = (d[stq], on[stq], w_cur[stq], None if ids_b is None else ids_b[stq])
+            ns = ~stq
+            _ = (d[ns], on[ns], w_cur[ns], None if ids_b is None else ids_b[ns],
+                 np.full(int(ns.sum()), p["b"], dtype=np.int32))
+
+    def _concat():
+        kd = [p["dest"][p["stay"]] for p in per]
+        ko = [p["off_new"][p["stay"]] for p in per]
+        kw = [p["w"][p["stay"]] for p in per]
+        ki = [None if p["ids"] is None else p["ids"][p["stay"]] for p in per]
+        state._cat(kd, ko, kw, ki)
+
+    comps = [("slots+bijk", _slots_bijk), ("gather", _gather), ("kernel", _kernel),
+             ("partition", _partition), ("concat", _concat)]
+    out, total = {}, 0.0
+    print("  -- where _eject_slab goes (each replayed on the real arrays) --")
+    for name, fn in comps:
+        t, _ = _time(fn, repeats)
+        ns = t / n_rows * 1e9
+        total += t
+        out[name] = dict(s=t, ns_per_row=ns, over_floor=ns / floor_ns,
+                         frac_of_eject=t / t_eject)
+        print(f"  {name:14s} {t*1e3:8.2f} ms  {ns:7.2f} ns/row  {ns/floor_ns:6.1f}x floor  "
+              f"{100*t/t_eject:5.1f}% of eject")
+    rec = total / t_eject
+    print(f"  {'SUM':14s} {total*1e3:8.2f} ms  {'':7s}  {'':6s}       {100*rec:5.1f}% "
+          f"reconstruction of the {t_eject*1e3:.1f} ms call")
+    out["_reconstruction"] = rec
+    out["_ok"] = bool(0.80 <= rec <= 1.20)
+    if not out["_ok"]:
+        print(f"  WARNING: the parts reconstruct {100*rec:.0f}% of the whole, so this "
+              f"decomposition does NOT describe the call and must not be quoted as one.")
+    return out
+
+
+def _profile_insert(st, bx, c_drift, scales, top=12):
+    """`insert` is 19.68 of migrate's 33.26 s (5l) and is the larger half.
+
+    RANKING ONLY, by cProfile, deliberately: a timed replay of insert would have
+    to reimplement the spare/arena escalation, and a reimplementation is how a
+    benchmark stops describing the thing it is named after. The ranking is enough
+    to choose what to decompose next.
+    """
+    import cProfile
+    import copy
+    import pstats
+    import io
+
+    st2 = copy.deepcopy(st)
+    sc = np.array(scales, copy=True)
+    nb = st2.bricks_per_side
+    staged, emig, consumed = {}, {}, {}
+    r = min(state.brick_reach(st2, c_drift, sc), nb // 2)
+    reach = range(-r, r + 1)
+    for s in range(nb):
+        staged[s], emig[s] = st2._eject_slab(s, c_drift, sc)
+        consumed[s] = 0
+    pr = cProfile.Profile()
+    pr.enable()
+    st2._insert_slab(bx, staged, emig, reach, consumed, scales=sc)
+    pr.disable()
+    buf = io.StringIO()
+    pstats.Stats(pr, stream=buf).sort_stats("tottime").print_stats(top)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    print("  -- _insert_slab, ranked by tottime (profiler-inflated; ranking only) --")
+    for ln in lines[4:4 + top + 1]:
+        print("   " + ln[:118])
+    return buf.getvalue()
+
+
 def _time(fn, repeats):
     ts = []
     out = None
@@ -265,7 +408,7 @@ def _time(fn, repeats):
     return float(np.median(ts)), out
 
 
-def run(cfg_name, arms, repeats, fraction, out_path):
+def run(cfg_name, arms, repeats, fraction, out_path, decompose=False):
     cfg = CONFIGS[cfg_name]
     st = _build(cfg["n_part"], cfg["nb"], cfg["box"], brick_slack=0.0, arena_frac=0.20)
     scales = np.array(st.vel_scale, dtype=np.float64, copy=True)
@@ -413,11 +556,17 @@ def run(cfg_name, arms, repeats, fraction, out_path):
     results["_eject_full_s"] = t_ej
     results["_kernel_frac_of_eject"] = frac
 
+    decomp, insert_profile = None, None
+    if decompose:
+        decomp = _decompose_eject(st, bx, c_drift, scales, repeats, floor_ns, n_rows, t_ej)
+        insert_profile = _profile_insert(st, bx, c_drift, scales)
+
     card = dict(
         config=cfg_name, n_part=cfg["n_part"], nb=cfg["nb"], box=cfg["box"],
         fraction=fraction, c_drift=c_drift, slab=bx, n_rows=n_rows,
         n_bricks=len(per_brick), repeats=repeats, bytes_per_row=BYTES_PER_ROW,
         stream=stream, floor_ns_per_row=floor_ns, gate=gate, arms=results,
+        eject_decomposition=decomp, insert_profile=insert_profile,
         commit=_git_commit(), host=platform.node(), python=platform.python_version(),
         numpy=np.__version__, slurm_job_id=os.environ.get("SLURM_JOB_ID"),
     )
@@ -436,10 +585,12 @@ def main():
     ap.add_argument("--repeats", type=int, default=5)
     ap.add_argument("--fraction", type=float, default=2.85,
                     help="drift as a fraction of the reach-1 threshold (5l's f)")
+    ap.add_argument("--decompose", action="store_true",
+                    help="also decompose _eject_slab and rank _insert_slab")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     out = a.out or os.path.join(REPO, "runs", "v2", f"m6_c6_jit_{a.config}.json")
-    raise SystemExit(run(a.config, a.arms, a.repeats, a.fraction, out))
+    raise SystemExit(run(a.config, a.arms, a.repeats, a.fraction, out, a.decompose))
 
 
 if __name__ == "__main__":
