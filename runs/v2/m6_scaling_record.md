@@ -1227,6 +1227,76 @@ Suite 471 passed / 1 skipped (from 454), `test-det` 16, lint clean.
   grouping and `repack`'s arena lift), whose keys are brick ordinals running to
   2.1e6 at C-gh and so do not fit the narrow path.
 
+## 5q. Antares 480 -- the radix fix transfers exactly; the compiled eject DECAYS with scale
+
+**Three legs, all rc=0, ~8 min, zero SU, commit `6b643b6`.** Three arms in one
+process per config, state rebuilt from the same seed, `_stable_order`
+monkeypatched back to the comparison sort for the baseline arm.
+
+| config | machine | baseline | radix | compiled | radix | stacked |
+|---|---|---|---|---|---|---|
+| cdev | laptop, arm64 | 2.965 s | 2.619 | 1.948 | 1.13x | **1.52x** |
+| cdev | antares, x86 | 3.915 s | 3.471 | 2.781 | 1.13x | **1.41x** |
+| cgh64 | antares, x86 | 31.270 s | 27.566 | 23.119 | 1.13x | **1.35x** |
+
+**Bitwise PASS at every config and every arm**, by sha256 over each state array
+plus the migration stats dict. That was the requirement rather than a
+prediction, and it is what licenses everything else here.
+
+### The two halves behave completely differently, and only one was predictable
+
+**The radix sort transfers EXACTLY: 1.13x, 1.13x, 1.13x.** Three independent
+measurements across two architectures and a 64x change in particle count,
+agreeing to two decimals. The mechanism is why: `buckets_per_brick` is 512 at
+every rung by construction, so the key range, the sort's asymptotic class and
+the ratio between the two paths are all scale-invariant. Pre-registered
+1.05-1.25x; landed dead centre.
+
+**The compiled eject DECAYS: 1.36x over radix on the laptop, 1.25x at the same
+config on x86, 1.19x at cgh64.** So the laptop's headline 1.52x is the most
+favourable point of three and **should not be quoted**; the number that describes
+production is **1.35x**. Pre-registered 1.3-1.8x stacked, so this lands at the
+bottom of the band -- a hit, but the band's width is doing the work.
+
+**The decay is consistent with 5n's own floor measurement and was foreseeable
+from it.** `jax_cpu` was already only 2.2-6.9x above the machine's traffic floor
+where the numpy path was 20-80x. A kernel that close to the floor has little
+room left, and at cgh64 a slab carries 4.19M rows against cdev's 1.05M, so the
+compiled arm is working on arrays far past any cache and is bound by the same
+memory system the floor describes. **I did not put that together before running,
+and the pre-registered band was wide enough to absorb it, which is not the same
+as having predicted it.**
+
+### What this does to the ladder
+
+Applying 1.35x to `migrate`'s 23.31 h gives **17.3 h**, and the realization
+**45.24 -> 39.2 h**. The radix half alone would give 20.6 h and 42.6 h.
+
+**Read the probe-to-engine ratio before quoting any of it.** This probe's cgh64
+baseline is 31.27 s against the engine's own post-arena-fix migrate of 23.72
+s/step on the same machine (antares 467/474), a ratio of 1.32x -- consistent with
+5l's measured 1.40x for the same instrument, and inside the 2x bar that section
+pre-registered. The absolute seconds here are the PROBE's; the ratios are what
+carry to the engine, because both arms run the engine's own code.
+
+### What 5q does NOT establish
+
+- **Any engine-level number.** Every figure here is `drift_and_migrate` called
+  directly on a synthetic state. The engine's own phase timing has not been
+  re-measured since either change landed.
+- **Anything about the worker pool.** All three legs are single-process.
+  `executor.TilePool` sets worker affinity BEFORE jax exists in the process and
+  `eject_jax` imports lazily to preserve that, but the combination is reasoning,
+  not a measurement, and it is the last thing standing between the compiled path
+  and a default flip.
+- **That 1.19x is the compiled path's floor.** The trend across three points is
+  downward and C-gh is another 64x beyond cgh64; nothing here says where it
+  settles, and the honest reading is that the compiled half's contribution at
+  production is BOUNDED ABOVE by 1.19x rather than equal to it.
+- **The clustered-state case.** `_build` makes a uniform state; the engine's is
+  evolved and clustered, which 5l flagged as the one structural difference this
+  probe family carries.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
