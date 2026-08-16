@@ -776,6 +776,99 @@ projection already includes this win.
 {cdev8,cdev}.json`), the fourth and fifth architectures-plus-configs on which the
 executor's disjoint-write premise has held exactly.
 
+## 5l. Antares 478 -- migrate decomposed: the per-brick loop is 2%, and the phase is irreducible row work
+
+**Four legs, all rc=0, ~1.2 node-hours, zero SU, commit `02fd53b`.** This
+answers owed item 10. **The pre-registered per-brick hypothesis is FALSIFIED at
+the granularity the config table actually runs**, and the falsification is worth
+more than a confirmation would have been, because it closes a lane.
+
+### The reproduction gate passed, so the instrument describes the engine
+
+Probe **33.25 s** at cgh64/f=2.85/reach 3 against the engine's own **23.72
+s/step** (antares 467 and 474, identical to 2 dp) = **1.40x, inside the 2.0x
+bar.** The probe's state is synthetic and uniform where the engine's is evolved
+and clustered, so this was a hypothesis and is now a measurement. Everything
+below is licensed by it and nothing below should be quoted without it.
+
+### Two things fell out of the gate leg before the scan ran
+
+**Staged depth is FREE.** The reach-2 and reach-3 rungs land at **0.99x and
+1.00x** of what the reach-1 volume law alone predicts. W0b's second
+pre-registered branch -- "if the depth excess is large, depth is the mechanism
+and the fix is scheduling/staging" -- is dead. The slab schedule, the staging
+bound, the release logic: none of it is where the time goes.
+
+**The volume law is 0.12 s/Mrow on a 21.45 s intercept** (mid-point residual
++0.08 s, so it is a line and not a curve being read as one). At the production
+rung that is 12.1 s of migrant-proportional work against **21.5 s that does not
+depend on migrant volume at all.**
+
+### The nb axis, read by SEGMENT because the scan has a knee
+
+    f=2.85, N = 512^3 fixed, box fixed, reach 3 at every rung:
+      nb              16        32        64
+      rows/brick   32,768     4,096       512
+      total_s       31.90     33.26     51.01      +4%  then  +53%
+      eject_s       11.53     12.99     25.03
+      insert_s      19.68     19.68     25.45
+
+    per-brick share by segment (alpha / 3):
+                          total     eject    insert
+      nb 16->32 (4,096 rows)   2.0%     5.7%     0.0%
+      nb 32->64   (512 rows)  20.6%    31.5%    12.4%
+
+**The whole-scan OLS reads 11% and describes NEITHER segment.** The instrument I
+shipped committed exactly the error the umbrella record already names -- one OLS
+slope cannot tell a line from a knee -- and the reader now reports segments
+first. Per-brick overhead is a LOCAL quantity: it only bites once a brick is
+small enough that per-call cost rivals its row work, which happens between 4,096
+and 512 rows per brick.
+
+**Which segment is production is not a judgement call, it is structural.**
+`choose_brick(n_tile, b_fine, n_fine)` returns the largest divisor of all three
+that is `<= b_fine`, and the config table fixes `tile=256, buf=32` at every
+rung, so it returns **32 everywhere**; `nb = n_fine/32 = n_part/16`; hence
+**rows/brick = 16^3 = 4,096 at cdev, cdev8, cgh64, C-gh AND C-hero alike.**
+C-gh (2048^3, nb=128, 2.1e6 bricks) sits at the same point on this curve as
+cgh64. So the bracketing segment is nb 16->32, and **the per-brick Python loop
+is 2.0% of migrate at every configuration this project will ever run.**
+
+**Consequence: vectorizing the slab loop buys ~2%, and owed item 10's leading
+candidate is closed as a lever.** The pre-registered alpha ~ 0 branch fires:
+migrate is per-ROW work, and the only lever is parallelism -- which means it
+joins the pool and inherits 5j's bandwidth ceiling rather than escaping it.
+
+### What migrate is actually made of
+
+**`eject` is blind to migrant volume: 13.08 vs 12.99 s for 2.27x the migrants**
+(44.3M -> 100.5M at nb=32). It is the drift, and the drift touches every
+particle by definition -- `_eject_slab` computes a new position for every row in
+every brick, not for the movers. That ~13 s is the same kind of term as the
+state payload was on the memory side: **it is not overhead, it is the
+simulation**, and no restructuring removes it.
+
+**`insert` is where the volume lives:** 12.65 -> 19.68 s across the same 2.27x.
+
+The profile agrees and names no single dominant line (ranking only; profiler
+overhead inflates the seconds): `_insert_slab` 19.1 s cumulative, `_eject_slab`
+13.3 s, `_write_brick` 7.0 s over 32,768 calls, `decode_brick` 5.0 s,
+and **`argsort` 4.63 s over 32,832 calls = ~14% of the phase** -- real per-brick
+sorting work, the one remaining named candidate, and the same shape D-v2-19
+flagged in `repack` (bucket order is a fixed spatial ordering, so a merge should
+beat a sort).
+
+### What this does NOT establish
+
+- **That the 2.0% carries to the ENGINE's clustered state.** The gate validates
+  the probe's TOTAL to 1.40x; the per-brick share specifically is measured on
+  synthetic uniform state at `brick_slack=0.0` and is not separately validated.
+- **That migrate parallelizes at all.** It is numpy over large arrays and is a
+  strong candidate to be bandwidth-bound exactly as `tile_long` is (5j), in
+  which case the pool buys much less than its worker count. Unmeasured, and it
+  is now the question that decides whether 23.3 h is reducible.
+- Anything about the `argsort` term beyond its rank.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
@@ -844,11 +937,14 @@ executor's disjoint-write premise has held exactly.
    `off` arm finished and is WRONG at cgh64. Corrected rather than deleted,
    because the mistake is the transferable part: a wall payoff measured at
    cdev-on-M4 does not carry to cgh64.
-10. **`migrate`'s decomposition at cgh64, post-arena-fix.** 5j puts it at 45%
-   of a W=16 step and 4.7x the whole 5 h bar on its own at C-gh. 5g attributed
-   and removed the ~170 s index churn; the residual ~31 s/step has never been
-   broken down. This is now the largest term in the engine and the only one
-   that both the pool and the GPU lane leave untouched.
+10. ~~**`migrate`'s decomposition at cgh64, post-arena-fix.**~~ **DONE, antares
+   478, section 5l.** Depth is free (0.99-1.00x of the volume law); the
+   per-brick Python loop is **2.0%** at the 4,096 rows/brick the config table
+   fixes at EVERY rung, so vectorizing the slab loop is closed as a lever;
+   `eject` is the drift over all N and is blind to migrant volume. migrate is
+   per-row work. **What it opens: does migrate parallelize, or is it
+   bandwidth-bound like `tile_long`?** That is now the question deciding
+   whether the 23.3 h is reducible at all, and it is a W5 input.
 11. **The pool's incremental memory footprint**, which 5j could not measure:
    per-worker `VmHWM` double-counts the shm state, and cgh64's state is 1/64 of
    C-gh's. W may be memory-capped below 16 at C-gh. A W5 input.

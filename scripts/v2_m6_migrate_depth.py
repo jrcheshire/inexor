@@ -380,6 +380,22 @@ def main():
             # local quantity, evaluated at the geometric mean of the scanned
             # nb, and it is only meaningful while the volume check below holds.
             row["per_brick_share"] = float(np.clip(row["alpha_total"] / 3.0, 0.0, 1.0))
+            # ...BUT A SINGLE OLS ALPHA CANNOT TELL A LINE FROM A KNEE, and this
+            # scan HAS one: job 478 read 31.90 / 33.26 / 51.01 s at nb 16/32/64,
+            # i.e. +4% then +53%, and the three-point fit averaged those into a
+            # share of 11% that describes NEITHER segment. Per-brick overhead
+            # only bites once a brick is small enough that per-call cost rivals
+            # its row work, so the exponent is a LOCAL quantity and the segment
+            # containing the production granularity is the only one that reads.
+            # Segments are reported first for exactly that reason.
+            seg = []
+            for i in range(len(nb) - 1):
+                a = float(np.log(tot[i + 1] / tot[i]) / np.log(nb[i + 1] / nb[i]))
+                seg.append(dict(nb_lo=int(nb[i]), nb_hi=int(nb[i + 1]),
+                                rows_per_brick_lo=float(pairs[i][0]["rows_per_brick"]),
+                                alpha=a,
+                                per_brick_share=float(np.clip(a / 3.0, 0.0, 1.0))))
+            row["segments"] = seg
             for key in ("eject_s", "insert_s"):
                 y = np.array(row[key], dtype=np.float64)
                 row["alpha_" + key.split("_")[0]] = (
@@ -394,7 +410,13 @@ def main():
                   f"  (eject {row['alpha_eject']:+.2f}, "
                   f"insert {row['alpha_insert']:+.2f})"
                   f"  -> per-brick share "
-                  f"{row['per_brick_share'] * 100:.0f}%")
+                  f"{row['per_brick_share'] * 100:.0f}% (WHOLE-SCAN OLS; read "
+                  f"the segments)")
+            for s in row["segments"]:
+                print(f"           nb {s['nb_lo']:>3}->{s['nb_hi']:<3} "
+                      f"({s['rows_per_brick_lo']:.0f} rows/brick): alpha "
+                      f"{s['alpha']:+.2f} -> per-brick share "
+                      f"{s['per_brick_share'] * 100:.0f}%")
             print("           migrants " + " / ".join(f"{int(v):,}" for v in emig)
                   + f"  (spread {row['emig_spread']:.2f}x"
                   + ("; matched-f volume invariance HOLDS)"
