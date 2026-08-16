@@ -268,6 +268,41 @@ def _cat_dicts(ds):
     )
 
 
+def _stable_order(key, n_values):
+    """`argsort(kind="stable")` on numpy's RADIX path when the key range allows.
+
+    **The fact this exists for.** numpy's stable sort is a radix sort only for 1-
+    and 2-byte integer types; anything wider gets timsort. Bucket ordinals within
+    a brick are tiny -- `buckets_per_brick` is 512 at cdev, cgh64, C-gh AND
+    C-hero alike, because the config table holds the bucket grid and the brick
+    grid in step -- but they are computed as int64 and so were sorted by
+    comparison. The identical change bought `migrate`'s own sort 5.3x (89.6 ->
+    17.0 ms at 2.1e6 rows) and `_group_by_brick` already did it locally, while
+    four other sites in this module did not.
+
+    **The permutation is IDENTICAL, not merely equivalent.** A narrowing cast is
+    order-preserving for non-negative keys inside the target's range, and stable
+    sorts agree on ties, so the returned order is the same one `argsort` on the
+    wide key gives. That is what makes this bitwise neutral, which it has to be:
+    the encode downstream is order-dependent through a float max.
+
+    **The range is CHECKED, not assumed.** numpy narrows modularly, so a key of
+    65536 would store as 0 and silently sort first -- exactly the failure mode
+    D-v2-20 found in `migrate` and `repack`, where `.astype(uint16)` was called
+    bare and a wrapped occupancy relocated every later bucket in the brick. A key
+    out of range falls back to the wide sort rather than wrapping.
+    """
+    key = np.asarray(key)
+    if not len(key):
+        return np.argsort(key, kind="stable")
+    hi = int(key.max())
+    lo = int(key.min())
+    if lo >= 0 and hi < min(int(n_values), np.iinfo(np.uint16).max + 1):
+        narrow = np.uint8 if hi <= np.iinfo(np.uint8).max else np.uint16
+        return np.argsort(key.astype(narrow), kind="stable")
+    return np.argsort(key, kind="stable")
+
+
 def _group_by_brick(brick_of_row, lo_b, hi_b):
     """Rows grouped by destination brick: a permutation plus CSR offsets.
 
@@ -1268,7 +1303,7 @@ class SlotState:
         if len(dest) > cap:
             # the brick overflowed its allocation: the excess goes to the arena,
             # newest-bucket-first so the run stays a prefix of the bucket order
-            order = np.argsort(within, kind="stable")
+            order = _stable_order(within, p3)
             keep_n = cap
             spill = order[keep_n:]
             n_over = len(spill)
@@ -1281,7 +1316,7 @@ class SlotState:
                 ids = ids[order]
             counts = np.bincount(within, minlength=p3).astype(np.int64)
         else:
-            order = np.argsort(within, kind="stable")
+            order = _stable_order(within, p3)
             within, off, w = within[order], off[order], w[order]
             if ids is not None:
                 ids = ids[order]
@@ -1395,7 +1430,7 @@ class SlotState:
             if not len(slots):
                 continue
             dest = self._bucket_flat_of_slots(b, slots)
-            order = np.argsort(dest - b * p3, kind="stable")
+            order = _stable_order(dest - b * p3, p3)
             lo = int(new_start[b])
             m = len(order)
             off[lo : lo + m] = self.off[slots[order]]
@@ -1525,7 +1560,7 @@ class SlotState:
             # STABLE, and over the concatenation main-then-arena: that is the
             # exact order `_repack_reference` produces, and the identity gate
             # compares against it elementwise.
-            order = np.argsort(within, kind="stable")
+            order = _stable_order(within, p3)
             cat_off = self.off[mp : mp + m]
             cat_w = self.w[mp : mp + m]
             if k:

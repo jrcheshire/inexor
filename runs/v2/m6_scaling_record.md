@@ -1163,6 +1163,70 @@ module says so at the line rather than leaving a green suite to imply otherwise.
   23.31 -> 17.9 h and the realization 45.24 -> 39.8 h. That is arithmetic, not a
   measurement.
 
+## 5p. The insert-side sort was on the comparison path, and fixing it is 1.13x
+
+**The lever D-v2-19 named, found in four places rather than one.** 5n ranked
+`_insert_slab` by tottime and its top line was an `argsort` at ~30% of the call
+on both architectures. The cause is not that the sort is the wrong algorithm for
+the job: it is that **numpy's `kind="stable"` is a radix sort only for 1- and
+2-byte integer types**, and every one of these keys is a bucket ordinal computed
+as int64. So they were paying a comparison sort for a key that fits in two bytes.
+
+**This is the same fact that bought `migrate`'s own sort 5.3x** (89.6 -> 17.0 ms
+at 2.1e6 rows) and it is already written into `_group_by_brick`'s comment, where
+the cast was applied. Four other sites in the same module never got it:
+`_write_brick`'s two (the hot pair, one per brick per slab), `_repack_reference`'s,
+and `repack`'s. **A fix recorded in one function did not reach its siblings**,
+which is the transferable part of this section.
+
+`buckets_per_brick` is **512 at cdev, cgh64, C-gh and C-hero alike** -- the config
+table moves the bucket grid and the brick grid together -- so the narrow path is
+taken at every rung this project will run, by the same structural argument 5l made
+for rows/brick.
+
+### The measurement
+
+Same-process A/B at cdev, `_stable_order` monkeypatched back to the wide sort for
+the control arm, so both arms see one machine state (5k's lesson about cross-job
+drift):
+
+    wide (timsort)   2.965 s     radix   2.619 s    = 1.13x on the whole phase
+    BITWISE: 0 of 65,444,664 `off` elements, 0 everywhere else, stats dict equal
+
+**Stacked with 5o's compiled eject, the phase is 1.52x** (2.965 -> 1.948 s), and
+the compiled path itself reads 1.36x on top of the radix fix rather than 5o's
+1.30x, because the denominator shrank. Carried to C-gh that arithmetic gives
+`migrate` 23.31 -> 15.3 h and the realization 45.24 -> 37.2 h. **Arithmetic, not
+a measurement**: both legs are cdev on one machine.
+
+### The narrowing is checked, because this project has been bitten by it
+
+`np.astype` narrows MODULARLY, so a key of 65536 stores as 0 and sorts first.
+D-v2-20 found exactly that already live in `migrate` and `repack`, where the cast
+was bare and a wrapped occupancy relocated the span of every later bucket in the
+brick. `_stable_order` reads the key's actual min and max and falls back to the
+wide sort rather than wrapping -- the range is a property of the values, not a
+promise from the caller.
+
+17 tests: agreement with the wide `argsort` on random keys at five range sizes and
+on eight adversarial patterns, stability asserted directly on a tie case, and both
+out-of-range and negative keys asserted to fall back. **Plus an anti-vacuity test
+that spies on the dtype reaching `np.argsort`** -- without it, a `_stable_order`
+that simply forwarded to the wide sort would pass every other test in the file,
+and the suite would be asserting that a function equals itself.
+
+Suite 471 passed / 1 skipped (from 454), `test-det` 16, lint clean.
+
+### What 5p does NOT establish
+
+- **Any number at cgh64 or C-gh.** Both the 1.13x and the stacked 1.52x are cdev.
+- **That `argsort` is now innocent.** It was ~30% of `_insert_slab` and this makes
+  it cheaper, not absent; `_write_brick` and `_group_by_brick` remain the next two
+  lines and neither has been decomposed the way `_eject_slab` was in 5n.
+- **Anything about the two sites deliberately left alone** (`_arena_by_brick`'s
+  grouping and `repack`'s arena lift), whose keys are brick ordinals running to
+  2.1e6 at C-gh and so do not fit the narrow path.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
