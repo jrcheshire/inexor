@@ -1297,6 +1297,87 @@ carry to the engine, because both arms run the engine's own code.
   evolved and clustered, which 5l flagged as the one structural difference this
   probe family carries.
 
+## 5r. Antares 482 -- at the ENGINE the compiled eject is 1.10x, and the pooled arm OOM'd
+
+**Seven legs, six rc=0, one rc=137, ~3.3 h, zero SU, commit `c32536d`.** The
+receipt worked as designed: numpy legs read `eject_jax_calls=0`, the serial jax
+leg 384.
+
+**A first attempt (antares 481) was destroyed by my own gate** and is recorded
+because the mistake is the transferable part: `smoke-numpy` returned rc=2, which
+`v2_m6_phase_time.py:313` emits on exactly one condition (`instrument_neutral is
+False`), and the smoke gate treated any non-zero rc as fatal and skipped every
+cgh64 leg. **That is 5j's own lesson made operational** -- the section written
+after 914085 says "read what a leg's rc MEANS before reporting a job failed",
+and this acted on the same confusion, destroying a run rather than a paragraph.
+Neutrality is now reported at smoke scale and gated only at cgh64.
+
+### The engine numbers, cgh64, serial
+
+| phase | numpy arm | jax arm | |
+|---|---|---|---|
+| `migrate` | 22.13 s/step | **20.16** | **1.10x** |
+| `lead_drift` (once) | 18.74 s | 16.46 | 1.14x |
+| tile force (long+short) | 274.84 | 279.38 | 0.98x |
+| **step** | **381.46** | **388.99** | **0.98x** |
+
+**The phase ratio landed at the bottom of the pre-registered 1.10-1.25x band**,
+against 1.19x for the same comparison on the probe (5q). The engine's state is
+clustered where the probe's is uniform, which was the named reason to expect a
+gap, and it moved the way clustering would move it.
+
+**The step got 2.0% SLOWER and that is not a finding.** The tile force, which
+neither arm touches, differs by 1.7% between the two legs; 5k already measured
+cross-leg drift of +8.6% / +6.0% at this exact configuration and attributed it to
+node state. A 2% step-level difference sits well inside that, so the honest
+statement is that **the step-level effect of the compiled eject is not resolvable
+here**, in either direction. Only the phase ratio is.
+
+**The leverage is much smaller than the C-gh projection implies, and the reason
+is the machine.** `migrate` is **5.8% of a serial step on antares** and 7.7% of a
+W=8 step, against **45% of a W=16 step on gg** (5j). 5e already recorded that the
+profile inverts across machines, and pooling removes tile-loop cost that antares
+carries. So a 1.10x on `migrate` is worth ~0.6% of a step here and would be worth
+~4% at gg's W=16 mix. **Antares measures the RATIO; only gg measures what it is
+worth.**
+
+Carried to C-gh at gg's mix: `migrate` 23.31 -> 21.2 h and the realization
+45.24 -> **43.1 h**. That supersedes the 39.2 h in 5q, which stacked the probe's
+1.35x; the engine says the compiled half is 1.10x, not 1.19x, and the radix
+half's engine-level effect has never been isolated (both arms here already carry
+it).
+
+### The pooled jax leg OOM'd, and the shape names the cause
+
+`cgh64-w8-jax` was SIGKILLed at 1685 s, `JobState=OUT_OF_MEMORY`, 3 oom-kill
+events, no card. The kernel log gives the shape per killed worker:
+
+    anon-rss 6.54 GB   shmem-rss 1.77 GB   total-vm 11.2 GB
+
+Eight workers at ~6.5 GB of PRIVATE memory is ~52 GB before the parent, and the
+matched numpy leg reports `rss_mb_max` 8710 MB, so the pool alone was already
+near the 64 GB request. The compiled eject runs in the PARENT (the pool owns the
+tile loop, not the migration), where it adds the padded slab arrays and an XLA
+CPU arena on top -- order 1-2 GB at a 4.19M-row slab. **That is what tipped it.**
+
+**This is a statement about a 64 GB REQUEST, not about a node.** Antares has
+124 GB and I asked for 64. So the finding is relative and real -- at identical
+W and config the numpy arm fits where the jax arm does not -- and the absolute
+question is unanswered. It also gives record owed item 11 (the pool's incremental
+footprint) its first data point.
+
+### What 5r does NOT establish
+
+- **The pooled jax number.** The leg that would have answered pre-registration
+  (b) never produced a card. A re-run at `--mem=100G` is owed and is ~45 min.
+- **The radix fix at the engine.** Both arms carry it. The numpy arm's 22.13
+  s/step against the pre-change 23.72 (467/474) is 1.07x, but that is a
+  cross-job comparison at exactly the scale 5k showed drifts 6-8%, so it is
+  consistent-with and not a measurement.
+- **Anything at gg.** Every leg is antares. The ratio should carry; the step-level
+  worth does not, and the C-gh projection above uses gg's phase mix with
+  antares' ratio, which is a splice rather than a measurement.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
