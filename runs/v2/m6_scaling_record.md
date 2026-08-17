@@ -1378,6 +1378,101 @@ footprint) its first data point.
   worth does not, and the C-gh projection above uses gg's phase mix with
   antares' ratio, which is a splice rather than a measurement.
 
+## 5s. Vista 916177 + antares 483 -- on the PRODUCTION machine the compiled eject is 1.26x, and the realization is 40.0 h
+
+**Two jobs. Vista `gg` 916177: six legs, four rc=0, two rc=2 (instrument
+non-neutrality, not crashes), ~2.2 h, ~0.7 SU. Antares 483: the pooled pair
+re-run at `--mem=100G`, both rc=0, zero SU.** Receipts read 0 / 384 calls as
+expected on every leg.
+
+### The ratio is a MACHINE PROPERTY, and 5r measured it on the wrong machine
+
+`migrate` phase ratio, numpy arm over jax arm, same code, same clustered state:
+
+| machine | arch | serial | W=8 / W=16 |
+|---|---|---|---|
+| antares (5r, 483) | x86 | 1.10x | 1.11x (W=8) |
+| **gg (this job)** | **Grace, arm64** | **1.29x** | **1.26x (W=16)** |
+
+**Pre-registration (a) MISSED**: I predicted 1.05-1.25x on gg, i.e. that antares'
+1.10x would transfer. It did not, and the direction is consistent across every
+measurement now on record: the probe's jax-over-radix figure was 1.36x on the M4
+(arm64), 1.25x on antares (x86) and 1.19x at cgh64 on x86, and the engine reads
+1.10x on x86 against 1.26-1.29x on Grace. **arm64 favours the compiled path**,
+which reads as numpy being weaker relative to XLA there rather than as anything
+about our kernel. **gg is the production candidate and it is arm64**, so 5r's
+1.10x was the least relevant of the numbers available and I presented it as the
+engine's answer.
+
+### At W=16 the step-level effect is resolvable, and the untouched phases prove it
+
+    gg, cgh64, W=16          numpy      jax     ratio
+      migrate                31.43    24.95    1.260x
+      lead_drift (once)       9.68     7.17    1.351x
+      tile_loop_end          20.27    20.01    1.013x
+      coarse_paint            5.40     5.41    0.998x
+      repack                  4.50     4.74    0.951x
+      coarse_solve            0.41     0.43    0.968x
+      STEP                   72.18    63.14    1.143x
+
+**Only the two phases that ARE `drift_and_migrate` moved.** `lead_drift` is the
+same function called once before the loop, and it moves with `migrate`; every
+phase neither arm touches sits within 5%. That internal control is worth more
+than the neutrality gate here, and it is what makes the 14.3% step-level result
+readable where 5r's 2% on antares was not.
+
+**Corroboration, unprompted:** this job's W=16 numpy leg reads 72.18 s/step
+against 5j's 72.642 from a different job on a different day (0.6%), and its
+serial leg 293.75 against 5j's 284.5 (3.2%). The instrument reproduces itself.
+
+### The two rc=2 legs are scatter, not overhead, and they bound the noise
+
+`serial_jax` reported overhead **-35.0 s** against a 17.4 s bound: the traced
+pass ran FASTER than its control, which cannot be instrument overhead. `w16_numpy`
+missed by +4.77 against 4.24. Read as noise rather than as a gate, they say
+run-to-run scatter on gg is **~4% at serial and ~2.3% at W=16**, which is the
+right yardstick for everything above: 26% on the phase and 14.3% on the W=16 step
+clear it comfortably, and the serial legs' `tile_decode` moving 12.6% in an arm
+that cannot affect it is the same scatter showing up where it is harmless.
+
+### The C-gh projection, measured rather than spliced
+
+Once-per-run terms split out, as 5m established:
+
+    W=16 numpy   recurring 62.18 s/step  ->  44.74 h/realization  (migrate 22.35 h)
+    W=16 jax     recurring 55.69 s/step  ->  39.99 h/realization  (migrate 17.74 h)
+
+**40.0 h, from 44.7.** The numpy arm's 44.74 h independently reproduces 5m's
+45.24 h to 1.1%, computed from different cards in a different job. This
+**supersedes 5r's 43.1 h**, which spliced antares' ratio onto gg's mix and which
+5r flagged as a splice at the time.
+
+### The pool memory question is answered, and the OOM was mine
+
+Antares 483 at `--mem=100G`: both arms complete, `migrate` 22.41 -> 20.27 =
+1.11x, worker `rss_mb_max` 8585 vs 8684 MB. On gg at W=16 the jax arm's workers
+are **smaller** than the numpy arm's (8249 vs 8302 MB). So the compiled path adds
+nothing worker-side -- it runs in the parent, exactly as designed -- and 482's
+OOM was a 64 GB request on a 124 GB node, not a property of the combination.
+
+**Pre-registration (c) was unmeasurable as written and that is my error, not the
+instrument's.** I predicted a 1-3 GB PARENT-side increment; the card reports the
+largest WORKER's RSS. The per-worker figures differ by ~1%, which is consistent
+with the prediction and does not test it. Antares has no `slurmdbd`, so there is
+no `sacct MaxRSS` to recover the job peak retroactively. **The parent-side
+footprint of the compiled path remains unmeasured**, bounded only by "more than
+64 GB total at W=8, less than 100".
+
+### What 5s does NOT establish
+
+- **Anything at C-gh.** 39.99 h is cgh64 x 64 x K=40 with the once-per-run terms
+  handled; every caveat 5j attached to that projection stands, including that
+  `migrate`'s term is a FLOOR (its sort is N log N, its staging N^(2/3)).
+- **The x86 case.** On Stampede3 h100 -- the venue named for the 4096^3 target --
+  the ratio to expect is antares' 1.10x, not gg's 1.26x.
+- **The radix fix at the engine on gg.** Both arms carry it, as on antares.
+- **The parent's memory cost**, per above.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
