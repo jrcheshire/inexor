@@ -160,6 +160,33 @@ def test_padding_path_is_exercised_and_bitwise(x64, monkeypatch):
     eject_jax._CACHE.clear()
 
 
+def test_engine_default_is_jax_and_actually_routes(x64):
+    """The DEFAULT must reach the compiled path, not merely name it.
+
+    Flipping `EngineConfig.eject_kernel` to "jax" changed nothing that ran,
+    because `v2_m6_phase_time.py` carried its own `eject_kernel="numpy"` default
+    that shadowed the library's -- and the full suite stayed green through the
+    flip, because nothing asserted the default was exercised. So this asserts
+    both halves: the declared default, and a CALL COUNT proving a default-config
+    engine step went through `eject_jax`.
+    """
+    from inexor import eject_jax, engine
+
+    cfg = engine.EngineConfig(
+        box_size=8.0, n_part=16, n_fine=32, n_coarse=16, n_tile=16, b_fine=8,
+        alpha=0.5,
+    )
+    assert cfg.eject_kernel == "jax", "the engine default is no longer the compiled path"
+
+    st = _state(n_part=16, nb=2, box=8.0)
+    before = eject_jax.CALLS
+    state.drift_and_migrate(st, _c_drift(st, 0.95), kernel=cfg.eject_kernel)
+    assert eject_jax.CALLS > before, (
+        "the default named 'jax' but eject_jax was never called -- a knob that "
+        "does not prove it applied"
+    )
+
+
 def test_x64_guard_fires():
     """With x64 off the compiled path must REFUSE, not narrow silently."""
     from inexor import eject_jax

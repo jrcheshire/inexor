@@ -105,7 +105,7 @@ class EngineConfig:
         chunk_bricks=64,
         brick_slack=0.10,
         repack_every=1,
-        eject_kernel="numpy",
+        eject_kernel="jax",
         coarse_dtype="float64",
         fine_dtype="float64",
         cap_rungs=CAP_RUNGS_PER_OCTAVE,

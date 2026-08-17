@@ -403,6 +403,13 @@ def brick_reach(st, c_drift, vel_scale=None):
 
 
 def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy"):
+    # NB this default stays "numpy" while `EngineConfig.eject_kernel` defaults to
+    # "jax", and the asymmetry is deliberate. The engine always passes the config
+    # value, so nothing routes through this default in production; what DOES use
+    # it is `tests/test_eject_jax.py`, whose reference arm calls this bare and
+    # compares against `kernel="jax"`. Unifying the two defaults would make that
+    # gate compare jax with jax -- a gate that cannot fail, in the one place the
+    # compiled path is proved bitwise.
     """Advance every particle by `c_drift * v` and re-home it. ONE pass.
 
     Drift and migration are not separable once positions are bucket-relative:

@@ -96,6 +96,12 @@ class PhaseTimer:
 _IC_CACHE = {}
 
 
+#: the eject kernel the ENGINE actually ran with, set by `_build`. Reported
+#: instead of `args.eject_kernel` because the probe's own default used to
+#: shadow the library's, so a card could name a knob the run never used.
+_RESOLVED_EJECT = None
+
+
 def _eject_calls():
     """The compiled path's call count, or 0 if it was never imported."""
     mod = sys.modules.get("inexor.eject_jax")
@@ -116,7 +122,7 @@ def _enable_x64():
 
 
 def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1,
-           paint_subblock=True, eject_kernel="numpy"):
+           paint_subblock=True, eject_kernel=None):
     _enable_x64()
     import jax.numpy as jnp  # noqa: F401  (engine import order)
 
@@ -142,16 +148,18 @@ def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1,
         box_size=g["L"], n_part=g["n_part"], n_fine=g["n_fine"], n_coarse=g["n_coarse"],
         n_tile=g["tile"], b_fine=g["buf"], alpha=m3.ALPHA, brick_slack=slack,
         tile_workers=tile_workers, paint_subblock=paint_subblock,
-        eject_kernel=eject_kernel,
+        **({} if eject_kernel is None else {"eject_kernel": eject_kernel}),
     )
     ec.validate()
+    global _RESOLVED_EJECT
+    _RESOLVED_EJECT = str(ec.eject_kernel)
     st = state.SlotState.build(x, v, t9, ec.n_brick and (g["n_fine"] // ec.n_brick),
                                brick_slack=slack, arena_frac=arena_frac)
     return engine, ec, st, cosmo, a_grid, bullfrog_float_coeffs, bullfrog_table
 
 
 def _one(cfg_name, k, slack, arena_frac, timed, tile=None, buf=32, tile_workers=1,
-         paint_subblock=True, eject_kernel="numpy"):
+         paint_subblock=True, eject_kernel=None):
     engine, ec, st, cosmo, a_grid, bfc, bft = _build(
         cfg_name, slack, arena_frac, tile, buf, tile_workers, paint_subblock,
         eject_kernel,
@@ -187,10 +195,13 @@ def main(argv=None):
                          "coarse paint (bitwise neutral; NOT an operating "
                          "point). The card carries coarse_subblock_chunks so "
                          "the knob proves it applied")
-    ap.add_argument("--eject-kernel", default="numpy", choices=("numpy", "jax"),
-                    help="`migrate`'s row kernel. The card carries an eject_jax "
-                         "CALL COUNT so a leg that silently fell back to numpy "
-                         "reads as a broken instrument, not as a null result.")
+    ap.add_argument("--eject-kernel", default=None, choices=("numpy", "jax"),
+                    help="`migrate`'s row kernel. Default None = FOLLOW "
+                         "EngineConfig, so this probe cannot mask a change to the "
+                         "library default (it did, once). The card records the "
+                         "RESOLVED value plus an eject_jax CALL COUNT, so a leg "
+                         "that silently fell back reads as a broken instrument "
+                         "rather than as a null result.")
     ap.add_argument("--tile-workers", type=int, default=1,
                     help="run the POOL executor with this many workers (1 = "
                          "serial, unchanged). Under overlap the tile_* boundary "
@@ -248,7 +259,7 @@ def main(argv=None):
         s_per_step=t_med / max(int(args.k), 1),
         unknown_phases=sorted({p for r in reports for p in r["unknown_phases"]}),
         tile_workers=int(args.tile_workers),
-        eject_kernel=str(args.eject_kernel),
+        eject_kernel=_RESOLVED_EJECT,
         eject_jax_calls=_eject_calls(),
         paint_subblock=bool(args.paint_subblock),
         # the knob's own receipt: >0 sub-block chunks per step when on, 0 when
