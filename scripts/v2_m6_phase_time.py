@@ -122,7 +122,7 @@ def _enable_x64():
 
 
 def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1,
-           paint_subblock=True, eject_kernel=None):
+           paint_subblock=True, eject_kernel=None, migrate_pooled=False):
     _enable_x64()
     import jax.numpy as jnp  # noqa: F401  (engine import order)
 
@@ -149,6 +149,7 @@ def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1,
         n_tile=g["tile"], b_fine=g["buf"], alpha=m3.ALPHA, brick_slack=slack,
         tile_workers=tile_workers, paint_subblock=paint_subblock,
         **({} if eject_kernel is None else {"eject_kernel": eject_kernel}),
+        **({"migrate_pooled": True} if migrate_pooled else {}),
     )
     ec.validate()
     global _RESOLVED_EJECT
@@ -159,10 +160,10 @@ def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1,
 
 
 def _one(cfg_name, k, slack, arena_frac, timed, tile=None, buf=32, tile_workers=1,
-         paint_subblock=True, eject_kernel=None):
+         paint_subblock=True, eject_kernel=None, migrate_pooled=False):
     engine, ec, st, cosmo, a_grid, bfc, bft = _build(
         cfg_name, slack, arena_frac, tile, buf, tile_workers, paint_subblock,
-        eject_kernel,
+        eject_kernel, migrate_pooled,
     )
     a_steps = a_grid(m3.A_INIT, m3.A_FINAL, k, m3.SPACING)
     co = bfc(bft(a_steps, cosmo))
@@ -207,6 +208,13 @@ def main(argv=None):
                          "serial, unchanged). Under overlap the tile_* boundary "
                          "rows read ~0 by construction; the pooled reading is "
                          "the busy triple reported under 'pool' on the card")
+    ap.add_argument("--migrate-pooled", action="store_true",
+                    help="idle-half Stage 2: route drift_and_migrate through "
+                         "the pool (needs --tile-workers > 1). The card carries "
+                         "migrate_pooled_workers_per_step as the receipt -- a 0 "
+                         "there means the knob did not apply (or the reach "
+                         "fallback fired) and the migrate row is a SERIAL "
+                         "number wearing a pooled label")
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args(argv)
 
@@ -224,21 +232,26 @@ def main(argv=None):
         # is how the first version of this line died.
         _one(args.config, args.k, args.slack, args.arena_frac, False,
              args.tile, args.buf, args.tile_workers, bool(args.paint_subblock),
-             args.eject_kernel)
+             args.eject_kernel, bool(args.migrate_pooled))
 
     traced, control = [], []
     reports, pool_steps, sub_chunks = [], [], []
+    mig_workers, mig_pool_steps = [], []
     for _ in range(int(args.repeats)):
         w, rep, seen = _one(args.config, args.k, args.slack, args.arena_frac, True,
                             args.tile, args.buf, args.tile_workers,
-                            bool(args.paint_subblock), args.eject_kernel)
+                            bool(args.paint_subblock), args.eject_kernel,
+                            bool(args.migrate_pooled))
         traced.append(w)
         reports.append(rep)
         pool_steps.extend(s["pool"] for s in seen if "pool" in s)
         sub_chunks.extend(int(s.get("coarse_subblock_chunks", -1)) for s in seen)
+        mig_workers.extend(int(s.get("migrate_pooled_workers", -1)) for s in seen)
+        mig_pool_steps.extend(s["migrate_pool"] for s in seen if "migrate_pool" in s)
         w2, _, _ = _one(args.config, args.k, args.slack, args.arena_frac, False,
                         args.tile, args.buf, args.tile_workers,
-                        bool(args.paint_subblock), args.eject_kernel)
+                        bool(args.paint_subblock), args.eject_kernel,
+                        bool(args.migrate_pooled))
         control.append(w2)
 
     t_med, c_med = float(np.median(traced)), float(np.median(control))
@@ -265,7 +278,26 @@ def main(argv=None):
         # the knob's own receipt: >0 sub-block chunks per step when on, 0 when
         # the full-mesh arm ran (a knob must prove it applied)
         coarse_subblock_chunks_per_step=sorted(set(sub_chunks)),
+        migrate_pooled=bool(args.migrate_pooled),
+        # the Stage 2 receipt, same discipline: W on every step or the migrate
+        # row was not measured pooled
+        migrate_pooled_workers_per_step=sorted(set(mig_workers)),
     )
+    if mig_pool_steps:
+        res["migrate_pool"] = dict(
+            workers=int(mig_pool_steps[0]["workers"]),
+            window=int(mig_pool_steps[0]["window"]),
+            scratch_mb=float(mig_pool_steps[0]["scratch_mb"]),
+            spill_rows_median=float(np.median([p["spill_rows"] for p in mig_pool_steps])),
+            spill_bytes_median=float(np.median([p["spill_bytes"] for p in mig_pool_steps])),
+            eject_busy_s_median=float(np.median([p["eject_busy_s"] for p in mig_pool_steps])),
+            insert_busy_s_median=float(np.median([p["insert_busy_s"] for p in mig_pool_steps])),
+            # the pooled arm's compiled-kernel receipt: the top-level
+            # eject_jax_calls reads the PARENT counter and is 0 by construction
+            # here; this one is summed from the workers and must be nb per pass
+            # on a jax rung
+            eject_jax_calls_per_step=sorted({int(p["eject_jax_calls"]) for p in mig_pool_steps}),
+        )
     if pool_steps:
         # the pooled reading: per-step busy triple, medians over every traced
         # step. Boundary rows above stay on the card but read ~0 for the tile

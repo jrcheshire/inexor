@@ -40,7 +40,8 @@ def _arm(a, workers):
     import v2_m6_phase_time as pt
 
     engine, ec, st, cosmo, a_grid, bfc, bft = pt._build(
-        a.config, a.slack, a.arena_frac, tile=a.tile, buf=a.buf, tile_workers=workers
+        a.config, a.slack, a.arena_frac, tile=a.tile, buf=a.buf, tile_workers=workers,
+        migrate_pooled=bool(a.migrate_pooled and workers > 1),
     )
     co = bfc(bft(a_grid(m3.A_INIT, m3.A_FINAL, a.k, m3.SPACING), cosmo))
     t0 = time.perf_counter()
@@ -57,6 +58,11 @@ def main():
     ap.add_argument("--arena-frac", type=float, default=0.20)
     ap.add_argument("--tile", type=int, default=None)
     ap.add_argument("--buf", type=int, default=32)
+    ap.add_argument("--migrate-pooled", action="store_true",
+                    help="route the POOLED arm's migrate through the pool "
+                         "(idle-half Stage 2); the serial arm stays serial and "
+                         "the verdict additionally requires the receipt "
+                         "migrate_pooled_workers == workers on every step")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -78,14 +84,24 @@ def main():
     pool_last = stats2[-1].get("pool") or {}
     coarse_pooled = int(stats2[-1].get("coarse_pooled_workers", 0))
     applied = pool_last.get("workers") == a.workers and coarse_pooled == a.workers
+    mig1 = [int(s.get("migrate_pooled_workers", -1)) for s in stats1]
+    mig2 = [int(s.get("migrate_pooled_workers", -1)) for s in stats2]
+    if a.migrate_pooled:
+        # every step, both directions -- a 0 on the pooled arm can also mean
+        # the reach fallback fired, which voids this leg as an identity check
+        mig_ok = all(m == 0 for m in mig1) and all(m == a.workers for m in mig2)
+    else:
+        mig_ok = all(m == 0 for m in mig1 + mig2)
 
-    ok = total == 0 and cap_ok and ab_ok and applied
+    ok = total == 0 and cap_ok and ab_ok and applied and mig_ok
     for f, n in diffs.items():
         print(f"  {f:12s} n_diff={n}")
     print(f"  cap ladder equal: {cap_ok} ({caps1} vs {caps2})")
     print(f"  arena_base equal: {ab_ok}")
     print(f"  pooled arms applied (tile={pool_last.get('workers')}, "
           f"coarse={coarse_pooled}, want {a.workers}): {applied}")
+    print(f"  migrate receipts (serial {sorted(set(mig1))}, pooled "
+          f"{sorted(set(mig2))}, --migrate-pooled={a.migrate_pooled}): {mig_ok}")
     print(f"  walls: serial {wall1:.1f} s, pooled W={a.workers} {wall2:.1f} s")
     print(f"VERDICT: {'IDENTICAL' if ok else 'FAIL'} (total n_diff {total})")
 
@@ -94,7 +110,8 @@ def main():
             ["git", "-C", REPO, "rev-parse", "--short", "HEAD"], text=True).strip()
     except Exception:
         commit = None
-    out = a.out or os.path.join(REPO, "runs", "v2", f"m6_w2_identity_{a.config}.json")
+    tag = "_migpool" if a.migrate_pooled else ""
+    out = a.out or os.path.join(REPO, "runs", "v2", f"m6_w2_identity_{a.config}{tag}.json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as fh:
         json.dump(dict(
@@ -102,6 +119,8 @@ def main():
             slack=a.slack, arena_frac=a.arena_frac, diffs=diffs,
             cap_ladder_serial=caps1, cap_ladder_pooled=caps2,
             arena_base_equal=ab_ok, arms_applied=applied,
+            migrate_pooled=bool(a.migrate_pooled), migrate_receipts_ok=mig_ok,
+            migrate_pool_last=stats2[-1].get("migrate_pool"),
             serial_wall_s=wall1, pooled_wall_s=wall2,
             pool_last_step=pool_last, verdict="IDENTICAL" if ok else "FAIL",
             commit=commit, slurm_job_id=os.environ.get("SLURM_JOB_ID"),
