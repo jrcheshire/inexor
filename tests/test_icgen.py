@@ -162,3 +162,113 @@ def test_slab_files_carry_their_own_integrity(tmp_path):
             assert meta["schema"] == icgen.SCHEMA
             for name in ("occupancy", "off", "w"):
                 assert zlib.crc32(z[name].tobytes()) == meta["crc32"][name]
+
+
+# --------------------------------------------------------------------------
+# M-v2-6 Stage 4(a): the writer, and the round trip on an EVOLVED state
+
+
+def _evolved_state(seed=3, n_part=16, nb=4, box=16.0, steps=3, arena_frac=0.05, slack=0.02):
+    """A state that has actually been through the engine's exchange: live
+    spares occupied and, at this slack, a populated arena. Both are things a
+    freshly loaded state never has, and both are what the writer has to
+    compact away."""
+    rng = np.random.default_rng(seed)
+    g = (np.arange(n_part) + 0.5) * (box / n_part)
+    q = np.stack(np.meshgrid(g, g, g, indexing="ij"), axis=-1).reshape(-1, 3)
+    x = np.mod(q + rng.normal(scale=0.25 * box / n_part, size=q.shape), box)
+    v = rng.normal(scale=0.5, size=x.shape)
+    t9 = T9Layout(box, n_part, 2)
+    st = state.SlotState.build(
+        x, v, t9, nb, brick_slack=slack, arena_frac=arena_frac, with_ids=False
+    )
+    for _ in range(steps):
+        state.drift_and_migrate(st, 0.5)
+    return st
+
+
+def _all_rows(st):
+    """Every particle as (bucket, off, w), sorted -- the container's content
+    with its allocation layout and intra-bucket order divided out."""
+    rows = []
+    for b in range(st.n_bricks):
+        slots = st.brick_member_slots(b)
+        live = st.brick_live_count(b)
+        keys = np.concatenate([
+            st.bucket_flat_of_live_slots(b),
+            st.arena_bucket[slots[live:] - st.arena_base],
+        ])
+        rows.append(np.column_stack([keys, st.off[slots], st.w[slots]]).astype(np.int64))
+    out = np.concatenate(rows)
+    return out[np.lexsort(out.T[::-1])]
+
+
+def _crcs(workdir):
+    with open(os.path.join(workdir, icgen.MANIFEST)) as fh:
+        man = json.load(fh)
+    out = {}
+    for f in man["files"]:
+        with np.load(os.path.join(workdir, f)) as z:
+            out[f] = json.loads(str(z["meta"]))["crc32"]
+    return man, out
+
+
+def test_write_t9_slabs_round_trips_an_evolved_state(tmp_path):
+    """The Stage 4(a) gate. Not array equality against `st`: the writer
+    compacts, so `brick_start` and intra-bucket row order legitimately move,
+    and D-v2-21 established that order carries no physics. The invariant is a
+    FIXED POINT -- write, load, write again, byte for byte -- plus particle
+    level conservation across the trip."""
+    st = _evolved_state()
+    assert st.arena_used > 0, "vacuous: this state has no arena residents to fold back"
+    assert st.n_live == st.n_particles
+
+    d1, d2 = str(tmp_path / "w1"), str(tmp_path / "w2")
+    icgen.write_t9_slabs(st, d1)
+    st2 = icgen.load_slot_state(d1)
+    icgen.write_t9_slabs(st2, d2)
+
+    man1, c1 = _crcs(d1)
+    man2, c2 = _crcs(d2)
+    assert c1 == c2, "the writer is not a fixed point: a second trip changed the bytes"
+    assert man1["n_particles"] == man2["n_particles"] == st.n_live
+
+    # the trip preserved the PARTICLES, not merely the byte layout
+    np.testing.assert_array_equal(_all_rows(st), _all_rows(st2))
+    np.testing.assert_array_equal(st.vel_scale, st2.vel_scale)
+    st2.check()
+
+
+def test_write_t9_slabs_does_not_recompute_vel_scale(tmp_path):
+    """`generate_t9_slabs` derives each brick's scale from the velocities it is
+    encoding. Doing that here would re-encode `w` against a new scale and lose
+    bits on any brick whose membership changed, so the scales must ride out
+    verbatim. Planting a perturbed scale proves the writer copies rather than
+    derives."""
+    st = _evolved_state()
+    st.vel_scale[:] = st.vel_scale * 1.5
+    icgen.write_t9_slabs(st, str(tmp_path))
+    st2 = icgen.load_slot_state(str(tmp_path))
+    np.testing.assert_array_equal(st.vel_scale, st2.vel_scale)
+    np.testing.assert_array_equal(_all_rows(st), _all_rows(st2))
+
+
+def test_write_t9_slabs_refuses_to_drop_ids_silently(tmp_path):
+    """IDs are not in the schema, so writing a state that carries them loses
+    data. It must say so rather than succeed quietly."""
+    st = _evolved_state()
+    st.ids = np.arange(len(st.off), dtype=np.int64)
+    with pytest.raises(ValueError, match="drop_ids"):
+        icgen.write_t9_slabs(st, str(tmp_path))
+    icgen.write_t9_slabs(st, str(tmp_path), drop_ids=True)
+    assert icgen.load_slot_state(str(tmp_path)).ids is None
+
+
+def test_write_t9_slabs_manifest_is_written_last(tmp_path):
+    """The completeness contract `load_slot_state` refuses on: slabs without a
+    manifest are an interrupted write, not a loadable state."""
+    st = _evolved_state()
+    icgen.write_t9_slabs(st, str(tmp_path))
+    os.remove(str(tmp_path / icgen.MANIFEST))
+    with pytest.raises(FileNotFoundError, match="refusing to load"):
+        icgen.load_slot_state(str(tmp_path))

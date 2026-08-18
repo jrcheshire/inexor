@@ -414,3 +414,127 @@ def load_slot_state(
     )
     st.check()
     return st
+
+
+def write_t9_slabs(st, workdir, provenance=None, drop_ids=False):
+    """Write a `SlotState` as T9 slabs: the exact inverse of `load_slot_state`.
+
+    Same `t9-slabs-2` schema `generate_t9_slabs` emits, so an evolved state and
+    a freshly generated one are indistinguishable on disk and the loader needs
+    no new branch. This is M-v2-6 Stage 4(a): until it existed the engine could
+    run a realization and had nowhere to put the result.
+
+    **The state is COMPACTED on the way out, and that is not bookkeeping.** A
+    freshly loaded state is tight -- every brick's rows sit at `brick_start`,
+    spares are zero, the arena is empty -- but an evolved one has live spares
+    and arena residents, and `brick_start` reflects whatever the repack last
+    chose. The slab format has no room for any of that, so the writer emits
+    each brick's TRUE membership (its live run plus its arena residents, an
+    arena particle still belongs to its brick) in bucket order, tight. The
+    allocation geometry is deliberately not preserved: `load_slot_state`
+    re-derives it from the occupancy through `_alloc_geometry`, the same call
+    `SlotState.build` makes, so it is a function of the data plus the slack
+    parameters rather than something the file should pin.
+
+    **`vel_scale` is copied through, never recomputed.** `generate_t9_slabs`
+    derives each brick's scale from the velocities it is about to encode, which
+    is right at generation and WRONG here: `w` is already int16 against the
+    existing scale, so re-deriving one from decoded velocities would re-encode
+    every row and lose bits on any brick whose membership changed. The scales
+    ride out verbatim and the payload is copied, not decoded.
+
+    The round trip is therefore a FIXED POINT rather than array equality:
+    `write(load(write(st)))` reproduces `write(st)` byte for byte, per-array
+    crc32 included. Row order within a bucket carries no physics (D-v2-21 got a
+    bitwise-identical force from a different membership order, which is what
+    the integer paints buy), so array equality against `st` is the wrong
+    invariant and this is the right one.
+
+    IDs are not in the schema. A state carrying them refuses rather than
+    dropping them silently; pass `drop_ids=True` to say the loss is intended.
+    """
+    if st.ids is not None and not drop_ids:
+        raise ValueError(
+            "this state carries ids and the t9-slabs-2 schema has no room for them; "
+            "pass drop_ids=True to write the state without them"
+        )
+    os.makedirs(workdir, exist_ok=True)
+    nb = st.bricks_per_side
+    p3 = st.buckets_per_brick
+    nbb = nb * nb                      # bricks per x-slab; a brick is in exactly one
+    written, n_written = [], 0
+
+    for d in range(nb):
+        lo_brick = d * nbb
+        lo_bucket = lo_brick * p3
+        hi_bucket = lo_bucket + nbb * p3
+        occ_g = st.occupancy[lo_bucket:hi_bucket].astype(np.int64)
+
+        # Every live row of the slab, in (brick, bucket) order. Buckets are
+        # brick-major, so one ascending pass over the slab's occupancy IS brick
+        # order -- no per-brick loop, which at C-gh would be 16,384 iterations
+        # per slab and 2.1e6 per checkpoint.
+        counts = occ_g.reshape(nbb, p3).sum(axis=1)
+        starts = st.brick_start[lo_brick : lo_brick + nbb].astype(np.int64)
+        base = np.concatenate([[0], np.cumsum(counts)[:-1]])
+        slots = np.repeat(starts - base, counts) + np.arange(int(counts.sum()), dtype=np.int64)
+        keys = lo_bucket + np.repeat(np.arange(nbb * p3, dtype=np.int64), occ_g)
+
+        # Fold this slab's arena residents back into their own buckets. They are
+        # few (0.57% at the operating point, D-v2-19 cl.4) so a searchsorted
+        # merge beats re-sorting the slab; `side="right"` puts them after the
+        # live rows of the same bucket, which is arbitrary but DETERMINISTIC,
+        # and determinism is the whole of what the fixed-point gate needs.
+        if st.n_arena:
+            sel = np.nonzero((st.arena_bucket >= lo_bucket) & (st.arena_bucket < hi_bucket))[0]
+            if len(sel):
+                a_keys = st.arena_bucket[sel]
+                order = np.argsort(a_keys, kind="stable")
+                a_keys = a_keys[order]
+                a_slots = st.arena_base + sel[order]
+                pos = np.searchsorted(keys, a_keys, side="right")
+                keys = np.insert(keys, pos, a_keys)
+                slots = np.insert(slots, pos, a_slots)
+
+        occ = np.bincount(keys - lo_bucket, minlength=nbb * p3).astype(np.int64)
+        off = st.off[slots]
+        w = st.w[slots]
+        scale_d = np.asarray(st.vel_scale[lo_brick : lo_brick + nbb], dtype=np.float64)
+        meta = dict(
+            schema=SCHEMA,
+            bx=d,
+            n_rows=int(len(slots)),
+            bucket_lo=int(lo_bucket),
+            brick_lo=int(lo_brick),
+            crc32=dict(
+                occupancy=zlib.crc32(occ.tobytes()),
+                off=zlib.crc32(off.tobytes()),
+                w=zlib.crc32(w.tobytes()),
+                scale=zlib.crc32(scale_d.tobytes()),
+            ),
+        )
+        path = os.path.join(workdir, f"t9_slab_{d:04d}.npz")
+        np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w, scale=scale_d)
+        written.append(os.path.basename(path))
+        n_written += len(slots)
+
+    # Conservation, not a formality: a dropped arena row is a deleted particle
+    # and nothing downstream would raise on it.
+    if n_written != st.n_live:
+        raise RuntimeError(f"wrote {n_written} rows for a state holding {st.n_live} particles")
+
+    manifest = dict(
+        schema=SCHEMA,
+        files=written,
+        n_particles=int(n_written),
+        box_size=float(st.t9.box_size),
+        n_part=int(st.t9.n_part),          # PER SIDE; `n_particles` is the total
+        bucket_cells=int(st.t9.bucket_cells),
+        bricks_per_side=int(nb),
+        source="write_t9_slabs",
+        provenance=provenance or {},
+    )
+    # LAST, and that is the completeness marker `load_slot_state` refuses on.
+    with open(os.path.join(workdir, MANIFEST), "w") as fh:
+        json.dump(manifest, fh, indent=1)
+    return manifest
