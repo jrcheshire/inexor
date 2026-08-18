@@ -63,16 +63,28 @@ free -g | head -2
 
 rc_total=0
 names=(); codes=()
+# `run_leg [-t CODES] NAME CMD...`. CODES is a comma list of NONZERO exit codes
+# THIS leg pre-registers as reportable states rather than failures; anything
+# else nonzero fails the job. Per-leg and not global on purpose: a code that is
+# a known state for one instrument is a real failure for another, and a blanket
+# tolerance would turn a genuine refusal into a silent pass.
+#   rc=2 = the phase probe reporting its own instrument non-neutrality (5s/5t)
+#   rc=3 = the census withholding a verdict (arena unprobed)
+# Job 918684 exited 1 with every leg fine and every criterion readable, because
+# this list was hardcoded to {3} while two legs legitimately read rc=2.
 run_leg() {
+  local tol=""
+  [ "$1" = "-t" ] && { tol="$2"; shift 2; }
   local name="$1"; shift
   echo "=== $name ==="
   local t0=$SECONDS
   "$@"; local rc=$?
   echo "=== $name rc=$rc after $((SECONDS - t0)) s ==="
   names+=("$name"); codes+=("$rc")
-  # rc=3 is an instrument's own verdict-withheld refusal (the census), not a
-  # job failure; everything else nonzero fails the job
-  [ $rc -ne 0 ] && [ $rc -ne 3 ] && rc_total=1
+  local ok=0 c
+  [ $rc -eq 0 ] && ok=1
+  for c in $(echo "$tol" | tr ',' ' '); do [ "$rc" = "$c" ] && ok=1; done
+  [ $ok -eq 0 ] && rc_total=1
   return 0
 }
 
@@ -88,14 +100,15 @@ BIG="--config cgh64 --k 3 --repeats 1 --slack 0.20 --arena-frac 0.20 --eject-ker
 #    phase smoke is the reporting path (rc=2 non-neutrality tolerated there).
 run_leg "smoke-ident-w2" pixi run -e gpu python $IDENT \
   --config cdev8 --k 3 --workers 2 --migrate-pooled
-run_leg "smoke-phase-w4" pixi run -e gpu python $PHASE \
+run_leg -t 2 "smoke-phase-w4" pixi run -e gpu python $PHASE \
   --config cdev8 --k 3 --repeats 1 --arena-frac 0.20 --eject-kernel jax \
   --tile-workers 4 --migrate-pooled --out-suffix _c14_smoke_migpool
 for i in 0 1; do
   rc=${codes[$i]}
   if [ "$i" -eq 1 ] && [ "$rc" -eq 2 ]; then
+    # tolerated by the -t above; do NOT reset rc_total here, that would clear
+    # an earlier leg's real failure along with this leg's known state
     echo "NOTE: ${names[$i]} non-neutral (rc=2); smoke exercises paths. Continuing."
-    rc_total=0
   elif [ "$rc" -ne 0 ]; then
     echo "FATAL: smoke leg ${names[$i]} rc=$rc; not burning SU on cgh64"
     echo "=== LEG SUMMARY ==="
@@ -119,9 +132,9 @@ IDENT_OK=1
 # 3. the perf pair at cgh64 W=16, same commit, same job -- only if the
 #    identity held (perf numbers for a wrong engine rank nothing).
 if [ "$IDENT_OK" -eq 1 ]; then
-  run_leg "cgh64-serial-jax" pixi run -e gpu python $PHASE $BIG \
+  run_leg -t 2 "cgh64-serial-jax" pixi run -e gpu python $PHASE $BIG \
     --tile-workers 16 --out-suffix _c14_serial_jax
-  run_leg "cgh64-migpool-jax" pixi run -e gpu python $PHASE $BIG \
+  run_leg -t 2 "cgh64-migpool-jax" pixi run -e gpu python $PHASE $BIG \
     --tile-workers 16 --migrate-pooled --out-suffix _c14_migpool_jax
 else
   echo "IDENTITY FAILED: skipping the cgh64 perf pair -- the parallel premise"
@@ -131,14 +144,15 @@ fi
 # 4. ride-along: the C13 census confirmation at the production geometry
 #    (serial migrate; independent of the pooled code). rc=3 = verdict
 #    withheld (arena unprobed) -- reportable, not a job failure.
-run_leg "census-cgh64" pixi run -e gpu python $CENSUS \
+run_leg -t 3 "census-cgh64" pixi run -e gpu python $CENSUS \
   --config cgh64 --calls 2 \
   --out runs/v2/m6_c13_insert_census_cgh64.json
 
 echo "=== LEG SUMMARY ==="
 for i in "${!names[@]}"; do echo "  ${names[$i]}: rc=${codes[$i]}"; done
 echo "AGAINST: C9 serial cgh64 W=16 jax: migrate 24.95 s/step, step 63.14 s"
-echo "         (card m6_phase_time_c9_serial_jax); prediction band 4-8 s/step."
+echo "         (card m6_phase_time_c9_w16_jax; _c9_serial_jax is the W=1 card)"
+echo "         prediction band 4-8 s/step."
 echo "READ THE RECEIPTS: migrate_pooled_workers per step (0 serial / W pooled)"
 echo "and migrate_pool.eject_jax_calls_per_step = [32] on pooled jax legs."
 echo "CARDS WRITTEN BY THIS JOB:"

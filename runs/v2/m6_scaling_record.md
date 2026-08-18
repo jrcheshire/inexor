@@ -1447,6 +1447,17 @@ Once-per-run terms split out, as 5m established:
 **supersedes 5r's 43.1 h**, which spliced antares' ratio onto gg's mix and which
 5r flagged as a splice at the time.
 
+> **STATUS 2026-08-18: DO NOT QUOTE 39.99 h AS THE CURRENT REALIZATION.** It is
+> the pre-pooled-migrate figure. C14 (Vista 918684) measured the pooled migrate
+> at 3.78 s/step against 26.03 serial, taking recurring 55.69 -> 34.52 s/step
+> and the realization to **~24.6 h**, with repack still unpooled. 39.99 h
+> remains correct as the serial-migrate baseline and as the base the C-hero
+> pricing (~310 h) was scaled from; both are projections, `cgh64 x 64 x K=40`,
+> and every caveat below stands, including that migrate's term is a FLOOR whose
+> N log N sort has never been measured above cgh64. **No full-scale realization
+> benchmark has ever been run**, so no number in this section is a measured
+> wall at C-gh.
+
 ### The pool memory question is answered, and the OOM was mine
 
 Antares 483 at `--mem=100G`: both arms complete, `migrate` 22.41 -> 20.27 =
@@ -1584,9 +1595,31 @@ parallelizes and that no further serial micro-fix can move much.
 Stages 1-2 as planned: the `insert` disjoint-write census (the code reading
 puts every insert write inside the owning brick's ranges except the ARENA claim
 path, which is order-dependent and goes parent-side to keep the pooled run
-bitwise), then pooling insert+eject in the engine. Prize arithmetic: migrate
-24.95 -> ~4 s and repack -> ~1 s at C5-like efficiency puts the step near
-~38 s and the realization near ~24 h from 40.
+bitwise), then pooling insert+eject in the engine.
+
+**Prize arithmetic, corrected 2026-08-18.** As first written this sentence read
+"migrate 24.95 -> ~4 s and repack -> ~1 s at C5-like efficiency puts the step
+near ~38 s and the realization near ~24 h from 40", and its three numbers do
+not reconcile with each other. The conversion is exact and worth stating once,
+because every projection in this record uses it: 5s's 39.99 h is a recurring
+**55.69 s/step** at cgh64 carried by 64 x K=40, plus `lead_drift` once, so
+
+    1 s/step at cgh64  =  0.711 h at C-gh.
+
+On that factor, migrate 24.95 -> 4 and repack 4.74 -> 1 gives **31.0 s/step =
+22.4 h**, not 38 s and not 24 h. The stray "~38 s" is the number that leaked
+out of here as a "high-20s realization" (38 x 0.711 = 27.4 h); it corresponds
+to migrate landing at ~11 s/step, which was never the claim. Nothing measured
+was wrong -- 5u's findings stand -- but the projection built on them was
+arithmetic, and it was quoted downstream.
+
+**Superseded by measurement (C14, Vista 918684, cards
+`m6_phase_time_c14_{serial,migpool}_jax.json`):** the pooled migrate lands at
+**3.78 s/step** against 26.03 serial in the same job, so recurring goes
+55.69 -> 34.52 s/step and the realization to **~24.6 h**. Repack is not pooled
+yet and is still carrying its 4.74 s/step (3.37 h). See the C14 readout for
+the two pre-registered criteria it missed (the band, low; spill transport,
+high).
 
 ## 6. What is NOT established
 
