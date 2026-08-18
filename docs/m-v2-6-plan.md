@@ -1,16 +1,34 @@
 # M-v2-6 -- capacity: a complete 2048^3 dark-matter mock on one node
 
-**Status:** OPEN. Branch `jc/m-v2-6-capacity`, no PR. The memory removals are
-DONE and production now fits a CPU-only node on the arithmetic floor; **the
-binding constraint has moved to wall**, where it is ~90x off this plan's own
-bar. See the ledger below.
+**Status:** OPEN. Branch `jc/m-v2-6-capacity`, no PR, 121 commits ahead of
+`main`. Memory is SOLVED on the arithmetic floor -- 164.6 GB, 0.69x a gg node --
+and **the binding constraint is wall**. That gap has closed from ~90x to **~5x**
+against this plan's own under-5-h bar: ~24.6 h per realization after the pooled
+migrate. See the ledger below.
 
-**Provenance.** This refreshes the planning session of 2026-08-11, whose original
-lives at `~/.claude/plans/enumerated-foraging-wadler.md` and is superseded by this
-file rather than edited. The design, the rejected alternatives and the gates are
-carried over unchanged; what moved is recorded in "What changed" below. The
-measurements are NOT here -- they live in `runs/v2/m6_peak_record.md` (memory)
-and `runs/v2/m6_scaling_record.md` (time).
+**2048^3 is this milestone's config and it is NOT "production"** (JC,
+2026-08-18). It is the largest N Alex had not yet successfully generated, which
+is what makes it the box where "one node produces it and the reference
+implementation does not produce it at all" is a defensible capability claim: a
+benchmark, not a destination. 4096^3 is the production target if anything is,
+and it fits nothing available (1259 GB against a gb node's 1026 CPU-side). Do
+not let a 2048^3 result read as the goal reached, and do not call it production.
+
+**Every hour figure in this document is ARITHMETIC on a measured phase card**
+(1 s/step at cgh64 = 0.711 h at 2048^3), never a measured realization. No
+full-scale realization has ever been run; JC deferred that benchmark on
+2026-08-18, deferred and not cancelled. See `runs/v2/m6_scaling_record.md` 5s
+for the ladder of superseded figures and which is current.
+
+**Provenance.** Originally a refresh of the 2026-08-11 planning session, whose
+file lives at `~/.claude/plans/enumerated-foraging-wadler.md` and is superseded
+by this one rather than edited. **Refreshed again 2026-08-18**, when it had gone
+four days stale across an entire ladder of executed work and was mis-stating the
+wall gap (~90x, actually ~5x), the writer's gate, and two finished stages as
+owed. Design sections and their rejected alternatives are carried over unchanged;
+status, numbers and gates are current as of that date. The measurements are NOT
+here -- they live in `runs/v2/m6_peak_record.md` (memory) and
+`runs/v2/m6_scaling_record.md` (time).
 
 ## The gate, re-scoped
 
@@ -32,6 +50,11 @@ with JC on 2026-08-11:
 - Completion + memory + wall + SU is the capacity statement; accuracy comes from
   the Stage 3 streaming parity number.
 
+**Every part of that product now EXISTS (Stage 4, 2026-08-18):** the state is
+written, restartable, exportable in a form other codes read, and it computes its
+own P(k) with a z profile. What is left is running it at 2048^3 -- Stage 5 --
+plus the parity number from Stage 3.
+
 The re-scope needs its own ADR (see Stage 6); it is not yet written.
 
 ## Status ledger
@@ -40,30 +63,45 @@ The stage numbers are this document's internal labels and mean nothing outside
 it. The "what" column is the real name of each piece of work; use that when
 talking about it.
 
+**TWO LADDERS RUN UNDER THIS MILESTONE AND THEY COLLIDE ON THE WORD "STAGE".**
+This table is the MEMORY ladder, which is what "Stage 2", "Stage 4" and so on
+mean everywhere below. The WALL ladder -- the week of work that took the step
+from 55.69 to 34.52 s/step -- numbers its own stages 0 to 3 for completely
+different work and has its own section, "The wall ladder", further down. When
+either is named outside this file, name the work and not the number.
+
 | stage | what it actually is | status |
 |---|---|---|
 | 0 | build a tool that measures the engine's total memory, which nothing did | **DONE** + a Stage 0b the plan did not anticipate |
 | 1a | check whether thread count explained deneb beating a GH200 | **DONE, answered: no.** The step is serial |
-| 1b | time the same run on several machines to decide where production goes | **NOT RUN.** Needs a Slurm proposal, and see the note below |
-| 2a | remove the 275 GB velocity array via per-brick scales | **BUILT 2026-08-14** (`8179cec`); accuracy checkpoint owed |
+| 1b | time the same run on several machines to decide where the runs go | **NOT RUN**, and partly OVERTAKEN: memory already forces gg (see below). Needs a Slurm proposal |
+| 2a | remove the 275 GB velocity array via per-brick scales | **DONE 2026-08-14** (`8179cec`); **accuracy checkpoint DISCHARGED**, record 5d |
 | 2b | remove the scratch buffer in the periodic re-layout | **DONE 2026-08-14** (`c647e8e`): 11.1 -> 2.1 B/row measured, 115.4 -> 21.8 GB |
-| 2c | stop building a full-size mesh for every small chunk of particles | open, premise re-verified 2026-08-14 |
+| 2c | stop building a full-size mesh for every small chunk of particles | **DONE.** `paint_subblock`, bitwise; every card carries `coarse_subblock_chunks` |
 | 2d | lower the memory spike while loading ICs from disk | open |
 | 3 | rewrite the correctness check so it needs no 206 GB array | open |
-| 4 | write the output: save state, compute P(k), budget the disk | open |
-| 5 | do the capacity runs | open, gated on 1b + 2 |
+| 4 | write the output: save state, export it, compute P(k), clean up | **DONE (a)-(d), 2026-08-18.** See the Stage 4 section |
+| 5 | do the capacity runs | open, the remaining substantive milestone work |
 | 6 | write the record and the re-scoping ADR | open |
 | P | portability (`inexor.plan`, parameters, running-elsewhere) | **1 of 3 done** |
 
-**THE BINDING CONSTRAINT IS NOW WALL, NOT MEMORY.** Production fits a CPU-only
-node on the arithmetic floor (see the next section), but cgh64 runs at 608.67
-s/step, which extrapolates to ~11 h/step and ~18 days per realization at the
-ratified K=40 -- against this plan's own "under 5 h each" test, a ~90x gap. The
-largest untested lever is that the step is SERIAL (the thread sweep was flat
-from 1 to 32 threads) while tiles and bricks are independent by construction, so
-tens of cores sit idle. That is the same order as the gap and it is a hypothesis,
-not a plan: job 463 is timing the phases, because nothing has, and today has
-twice punished acting on a derivation that had not been measured.
+**THE BINDING CONSTRAINT IS WALL, NOT MEMORY, AND THE GAP IS NOW ~5x.** The
+config fits a CPU-only node on the arithmetic floor (see the memory section);
+the question is time. The 08-14 reading of this paragraph -- 608.67 s/step,
+~18 days per realization, a ~90x gap -- is DEAD, and the hypothesis it named
+turned out to be right:
+
+| reading | recurring s/step at cgh64 | realization at 2048^3 | vs the 5 h bar |
+|---|---|---|---|
+| 08-14, as this plan first read it | 608.67 | ~18 days | ~90x |
+| after the N^(5/3) scan fix (job 459) | 63.14 | ~45 h | ~9x |
+| the clean phase card (record 5s) | 55.69 | 39.99 h | ~8x |
+| **after the pooled migrate (C14, measured)** | **34.52** | **~24.6 h** | **~4.9x** |
+
+The lever was that half of every step ran serially on an idle machine while
+tiles and bricks are independent by construction. That is now measured, not
+hypothesised, and half of it is collected. What remains of it is in the next
+section.
 
 **A wall-clock problem surfaced on 2026-08-14, was attributed, and is FIXED.**
 Job 455 measured cgh64 (512^3) at **2622.6 s/step**, 3.3x past its own
@@ -99,6 +137,61 @@ Discharged along the way, and not to be re-proposed:
   differencing two maxima assumes both were set by the same phase and nothing
   checked it. Do not re-run them and do not quote their numbers.
 
+## The wall ladder (the "idle half")
+
+**This ladder's stage numbers are its own and do not correspond to the memory
+ladder's.** It exists because the milestone's binding constraint moved to wall
+after the memory ladder closed, and it has no home in the 08-11 plan at all.
+
+**The finding it starts from (C11, gg, cards `runs/v2/m6_c11_*.json`):** per
+phase at cgh64 with 16 workers, `migrate` and `repack` run on 3.4 and 3.2 of 144
+cores with the memory system idle, while the tile loop and coarse paint sit
+within ~1.5-2x of the machine's bandwidth ceiling on both sockets. Half the step
+was serial code on an idle machine. **The wall problem and the bandwidth problem
+are different phases**, so they take different fixes.
+
+| stage | what it actually is | status |
+|---|---|---|
+| 0 | learn the real eject kernel's cost with a depth probe | **DONE** (C12): insert is 58-72% of migrate; ~90% of the phase is a volume-INDEPENDENT intercept |
+| 1 | prove insert's per-slab brick writes are disjoint, by census | **DONE** (C13, `c1a915b`): proved; the arena claim is the one shared surface and goes parent-side |
+| 2 | pool eject+insert per slab; parent replays the arena interleave | **DONE** (`cb4e092`), **VERDICT PASSED** (C14, Vista 918684) |
+| 3 | swap `argsort` for a merge in migrate | **DEMOTED, do not build.** It was ~14% of migrate, then ~4% after the radix cast, and pooling took the phase to 3.78 s/step -- 4% of that is ~0.15 s/step |
+| -- | pool `repack` the same way | **OPEN, and it is the remaining rung** |
+
+**C14, measured (cards `m6_phase_time_c14_{serial,migpool}_jax.json`):** identity
+bitwise on all three legs at cluster scale; migrate **26.03 -> 3.78 s/step**,
+6.88x, which BEAT the pre-registered 4-8 s/step band. Two pre-registered criteria
+missed: the band low, and spill transport high at 141.3 MB/step against a
+<100 MB bar. `migrate_pooled` now defaults on as a tri-state.
+
+**What is left in the idle half, and it is now mostly repack.** On the phase card
+migrate + repack were 24.95 + 4.74 = 53% of a 55.69 s step; they are now
+3.78 + 4.74 = **24.7% of a 34.52 s step**, and repack is the LARGER of the two.
+Pooling it at the factor migrate actually achieved puts it near 0.7 s/step and
+the realization near **~21.7 h**. Arithmetic, not measured.
+
+**Open and owed on this ladder:**
+
+- **Repack pooling.** The remaining rung. Same shape as migrate: serial, 3.2 of
+  144 cores, no shared writes proved yet.
+- **The spill-transport miss is UNDISPOSED (JC's call).** 141.3 MB/step is ~6% of
+  particles riding the result queue back for the parent's `_to_arena`; the
+  fraction is roughly N-independent, so ~9 GB/step at 2048^3 and ~72 GB/step at
+  4096^3. That last step is an inference from a rate, not a measurement. It is
+  bounded in memory by the dispatch window (~22 of 256 slabs at 4096^3, so ~6 GB
+  resident, not 72), so it is a time cost inside migrate rather than a fit
+  problem. **The C14 card already records worker busy time separately from the
+  phase wall, so the parent-side transport share is derivable from data in hand,
+  without a new job.**
+- **Two caveats that must travel with the 3.78.** Migrate's term at 2048^3 is a
+  FLOOR -- its sort is N log N and has never been measured above cgh64 -- and the
+  pool's memory footprint at that scale is unmeasured and may cap workers below
+  16.
+- **Re-derive the 4096^3 wall and every SU figure off the pooled base.** The
+  ~310 h and the 13.2 SU/realization on record were derived off the dead 39.99 h
+  baseline. The 4096^3 phase table also carries `repack` at 2.8 h, which sits on
+  an older superseded budget; on the current card it is 3.37 h.
+
 ## The memory arithmetic, and what it says about the target node
 
 `python -m inexor.plan --preset c-gh --cap 5284492`, at the branch head. The
@@ -126,7 +219,7 @@ It took both removals to reach a node:
 | the repack coefficient MEASURED, not derived | 258.2 GB | 2.23x | 1.09x |
 | **the repack rewritten in place (`c647e8e`)** | **164.6 GB** | **1.42x** | **0.69x -- FITS** |
 
-**Production fits a CPU-only node, and that is new.** Two removals did it: the
+**2048^3 fits a CPU-only node, and that is new.** Two removals did it: the
 274.9 GB velocity array, and the repack scratch at 115.4 -> 21.8 GB. The middle
 row is worth keeping -- correcting the repack coefficient from a DERIVED 9 B/row
 to a MEASURED 11.1 made the picture temporarily WORSE, which is what an honest
@@ -162,7 +255,7 @@ and `repack_scratch` are summed as co-resident, which is correct today --
 `pending` is dead after the reconciliation loop but stays REFERENCED until `step`
 returns (`engine.py:764`), which spans `drift_and_migrate`.
 
-## Stage 2a -- the 275 GB term (BUILT 2026-08-14, `8179cec`)
+## Stage 2a -- the 275 GB term (DONE 2026-08-14, `8179cec`)
 
 **Done, gate green (429 passed / 1 skipped, determinism tier 16, lint clean).**
 The measured effect is in the planner: C-gh's lower bound went 511.2 -> 236.3 GB
@@ -187,9 +280,13 @@ brick (4 B, emigrants only) so the insert can take a true max and express
 everything at it in one rounding. `_rescale_w` now refuses out of range instead
 of asserting it cannot happen.
 
-**Still owed:** the accuracy checkpoint below. It can move either way -- scales
-are up to ~2.5x finer, and migrants now see two roundings where one global scale
-gave them one -- so it needs the anchor run rather than an argument.
+**The accuracy checkpoint is DISCHARGED and it IMPROVED** (record 5d, job 463,
+`v2_m3_engine_gate.py --leg accum --config cdev --k 40` at the M-v2-3 gate's own
+knobs): accumulated codec cost **7.125e-4 -> 4.120e-4**, a 1.73x improvement,
+72.8x under D-v2-9's 3e-2 bar. In the predicted direction and inside the
+"within ~2x either way" band pre-registered before the run: finer per-brick
+scales beat the extra rounding a migrant takes at its destination's scale.
+Nowhere near the ~3e-3 point at which the storage decision would have re-opened.
 
 The rest of this section is the design as ratified, kept for its rejected
 alternatives.
@@ -251,10 +348,9 @@ cleaned between jobs anyway.
    share a scale (the degenerate limit).
 2. Force parity unaffected: 0 of 6,291,456 elements at cdev8.
 3. `load(generate) == SlotState.build` bitwise still holds, at the new schema.
-4. **Checkpoint 4:** the re-measured accumulated codec cost against the ratified
-   **7.125e-4 at C-dev K=40** (D-v2-9's bar is 3e-2, a 42x margin). Expectation
-   is an improvement; a regression is a finding. This moves either way, so it is
-   a checkpoint, not a footnote.
+4. ~~**Checkpoint 4:** the re-measured accumulated codec cost against the
+   ratified 7.125e-4 at C-dev K=40.~~ **DISCHARGED, PASSED, improved to
+   4.120e-4** (job 463, record 5d).
 
 **Readout: the laptop, not the cluster.** The 08-11 plan said to re-run Stage 0's
 instrument after each Stage 2 fix. That instrument cannot read this one: at cdev
@@ -285,9 +381,15 @@ sortedness exactly 1.0000, timsort's best case, where radix is ~10x slower.
 Its priority rose with the arithmetic above: 2a alone leaves C-gh at 1.00x a gg
 node, and 2b is what turns that edge into 0.60x.
 
-## Stage 2c -- the coarse paint decomposition
+## Stage 2c -- the coarse paint decomposition (DONE)
 
-**Premise re-verified 2026-08-14 and it has NOT moved.** I expected the masking
+**BUILT and bitwise.** `cfg.paint_subblock` (default on) paints each chunk into
+a coarse sub-block instead of allocating a full mesh per chunk; every phase card
+carries `coarse_subblock_chunks` as the receipt that the path applied, and the
+streamed-vs-monolithic pin in `tests/test_engine.py` is the regression. The
+design and its premise are kept below for the reasoning.
+
+**Premise as re-verified 2026-08-14, before the build.** I expected the masking
 and pad-ladder work to have eroded it; it did not. `engine.py:396-434` allocates
 one persistent `n_coarse^3` int64 accumulator (8.59 GB at C-gh, the term
 `inexor.plan` calls `coarse_accumulator`), and then *per chunk* calls
@@ -343,29 +445,75 @@ While here: `v2_m3_engine_gate.py` writes cards with no `commit`, no
 `provenance`, no `slurm_job_id` -- the same gap that moved a slope +0.32 -> +0.80
 in M-v2-4. Route it through the shared `_write`.
 
-## Stage 4 -- the output stage (dark matter only)
+## Stage 4 -- the output stage, dark matter only (DONE, 2026-08-18)
 
-**(a) The writer.** `save_slot_state` / `write_t9_slabs(st)` as the exact inverse
-of `load_slot_state`, same slab schema (now `t9-slabs-2`), same per-array crc32.
-The evolved state already holds `(occupancy, off, w)` in slot order, so this is
-close to free. **Gate: `load(save(st))` is bitwise `st`.**
+All four parts are built and pushed. The milestone's product is no longer
+blocked on having nowhere to put a realization.
 
-This is also what makes the capacity run **restartable**, which matters
-independently: a multi-hour realization need not fit one wall, and a timeout
-bills the whole wall.
+**(a) The writer -- DONE (`46b0afe`).** `icgen.write_t9_slabs(st)` inverts
+`load_slot_state` on the same `t9-slabs-2` schema with the same per-array crc32,
+so an evolved state and a freshly generated one are indistinguishable on disk.
 
-**(b) The usable summary.** Large-scale P(k) with no full-size array: reuse
-`coarse_delta_streamed` (already yields a 1024^3 f32 delta, 4.3 GB) -> `ooc_fft`
--> the **bin-AVERAGED** oracle comparison from M-v2-5 leg VI. Bin-centre is not
-an option: it failed at 8.7 sigma at exactly 2048^3 mode counts (deterministic
-Jensen term, z = +15 at k ~ 0.2). Store the **z profile**, not just `max|z|` --
-storing only the max is a recorded instrument defect from that session.
+**The gate is a FIXED POINT, not the `load(save(st)) is bitwise st` this plan
+originally wrote.** That criterion is wrong and was superseded with JC's
+ratification: the writer COMPACTS on the way out -- arena residents folded back
+into their bricks, spares dropped -- so `brick_start` and intra-bucket row order
+legitimately move, and D-v2-21 established that order carries no physics. The
+invariant is `write(load(write(st)))` byte-identical to `write(st)`, crc32
+included, plus a particle-level conservation check alongside, because a fixed
+point on its own would be satisfied by a writer that consistently dropped the
+same particles. `vel_scale` is COPIED, never recomputed: `w` is already int16
+against the existing scale.
 
-**(c) Disk accounting, which nothing does today.** `generate_t9_slabs` stages 20
-full 2048^3 f32 files at 34.4 GB each, about **687 GB of scratch**, deletes none,
-and there is no `plan_bytes` analogue for disk and no cleanup of `stage/`. Add a
-disk `plan_bytes` + `require_fits` twin and stage cleanup. **The budget is a
-parameter, never a read of `$SCRATCH`.** House rule: `rmdir`, never `rm -rf`.
+**(b) Checkpoint and resume -- DONE (`2cae161`).** Cadence in STEPS
+(`checkpoint_every`, 0 disables, the `repack_every` idiom), two rolling
+generations, `load_checkpoint` takes the newest COMPLETE one and refuses a
+fingerprint mismatch. Costs 3.6% of one step at 2048^3 and 2.3% at 4096^3.
+**This is what makes 4096^3 possible at all**: ~310 h against a 48 h queue limit.
+The fingerprint covers physics, geometry and every buffer-shape knob plus
+`coeffs` as raw bytes; it deliberately EXCLUDES execution policy, because
+resuming onto a different node with a different worker count is the point.
+Gate: 6 steps straight against 6 interrupted after 3 and resumed, particle for
+particle. Traps worth not re-deriving are in `reference-checkpoint-resume-traps`.
+
+**(c) The portable export -- DONE (`ffe60fe`).** `export.write_particles` streams
+the state to plain float `.npy` through `SlotState.decode_bricks` a brick chunk
+at a time: 206 GB of product at 2048^3 from ~201 MB of peak float memory. This is
+the SECOND writer, and the one that lets anything outside this package read the
+product -- a halo finder or a mock pipeline wants six floats per particle, not
+int8 bucket offsets. Positions are comoving Mpc/h; velocities are the engine's
+native D-time `dx/dD` unless an epoch and cosmology are passed, in which case
+peculiar km/s, with the units named in the header either way. Row order is
+spatial and recovers no Lagrangian index, so a state built with ids exports them.
+`python -m inexor.export <checkpoint_dir> <out_dir>` converts a checkpoint
+without re-running.
+
+**(d) The accuracy statement -- DONE (`0ee0d6c`).** `summary.pk_summary_card`:
+`coarse_delta_streamed` -> `ooc_fft` -> a slab-streamed binned P(k) -> the
+**bin-AVERAGED** oracle from M-v2-5 leg VI -> a z profile. Bin-centre is not an
+option: it failed at 8.7 sigma at exactly these mode counts (deterministic Jensen
+term, z = +15 at k ~ 0.2). The card stores the **z profile**, not `max|z|` --
+storing only the max is a recorded instrument defect from that session -- and
+emits **no verdict at all**, because a scalar over a band reaching past the
+nonlinear scale measures gravity rather than the code. `k_nonlinear` is on the
+card and `band_verdict` computes a number over a band the caller NAMES.
+TSC window deconvolution and shot-noise subtraction are applied per mode and
+reported per bin. Gated by a null: on white noise the pooled z profile is
+standard normal against bars derived from the statistics' own sampling error.
+
+**(e) Staging cleanup -- DONE (`0ee0d6c`).** `generate_t9_slabs` staged 20 full
+f32 arrays -- 34.4 GB each, ~687 GB per run at 2048^3 -- and deleted none. It now
+removes them on success, `keep_stage=True` to keep them. Named files only, then
+`rmdir`, never a recursive delete; the rmdir FAILING on an unexpected file is the
+design. Cleanup runs AFTER the manifest, so a generation that refused mid-flight
+keeps its working set and the reason it failed, and an `OSError` in cleanup is
+recorded rather than raised.
+
+**DROPPED, do not build: the disk `plan_bytes` + `require_fits` twin.** This plan
+called for a disk-budget analogue of the memory planner. JC ruled it out
+2026-08-18: scratch is ~10 PB, there is no budget to model, and anything worth
+keeping would be moved to sirius rather than left there. The purge, not a quota,
+is what threatens a product on scratch. Only the cleanup survived.
 
 ## Stage 5 -- the capacity runs
 
@@ -389,7 +537,7 @@ second (T,b) -- four runs maximum, and deliberately not a matrix.**
   `v4_pricing_record.md`'s 2.4-3.7 h device-only range.
 - **New decision that may change the operating config:** `malloc_trim` at the
   anchor is 15.5% of peak for +1.6% wall, and the trade improves toward
-  production. If ratified it belongs in Stage 5's pre-registration.
+  the full config. If ratified it belongs in Stage 5's pre-registration.
 - **Walls from measurement, generously.** One M-v2-5 job burned 6 h 41 min (84%
   of its wall) producing nothing.
 - **One leg per job**, cheapest first, `set -e` deliberately dropped.
@@ -436,15 +584,22 @@ second (T,b) -- four runs maximum, and deliberately not a matrix.**
 
 ## Verification
 
-- `pixi run test` (428 passed / 1 skipped at the last close) and
-  `pixi run test-det` (16 items -- it silently collected **zero** tests once,
-  after a retirement deleted the marked population). Both are the pre-push gate,
-  with `pixi run lint`.
+- `pixi run test` and `pixi run test-det` (16 items -- it silently collected
+  **zero** tests once, after a retirement deleted the marked population). Both
+  are the pre-push gate, with `pixi run lint`.
+- **GATE DEBT, open:** the suite last ran green at **505 passed / 1 skipped**,
+  which predates the Stage 4 work. **The current tree has never had a broad
+  run.** That is the merge-boundary gate and it is JC's to call. Targeted runs
+  since: `test_export.py` 16, `test_summary.py` 18, `test_icgen.py` 19,
+  `test_diagnostics.py`, all green.
 - New tests, each asserting an identity or a shape rather than a picked
   threshold: per-brick scales reproducing a single-scale run in the degenerate
   limit; the new repack elementwise-identical to the old; the sub-block coarse
   paint bitwise the current streamed paint; the streaming parity leg reproducing
-  the cgh64 card bitwise; `load(save(st))` bitwise.
+  the cgh64 card bitwise; the writer's **fixed point** (write/load/write
+  byte-identical, NOT `load(save(st))` against `st` -- the writer compacts, see
+  Stage 4(a)); the split-run resume, particle for particle; the P(k) card's
+  white-noise null.
 - Each Stage 2 removal measured by `scripts/v2_m6_host_bytes.py` on the laptop,
   not by an RSS peak on a cluster.
 - Cards read only through the comparability-checking readout; pre-provenance
@@ -474,24 +629,45 @@ second (T,b) -- four runs maximum, and deliberately not a matrix.**
 
 ## Open questions
 
-1. **The charter says "one Vista gh node" and the arithmetic says that node
-   cannot hold C-gh** -- state plus resident mesh is 116.5 GB against a 116 GB
-   hard cliff, before any transient and after both large removals. Does M-v2-6's
-   re-scope change the target to a gg node outright, or does the milestone keep
-   gh as a target and take on further removals to reach it?
-2. **Does that change your appetite for Stage 1b?** Its charging comparison was
-   framed as gg-vs-gh at a 3x wall bar. If gh cannot host the run, 1b becomes a
-   gg-vs-Stampede3-x86 question, which is a different job and possibly a cheaper
-   one.
-3. **`malloc_trim` as an operating point** is still your call, now with the
-   anchor number (15.5% of peak for +1.6% wall, improving with tile size). It
-   belongs in Stage 5's pre-registration either way, so a decision before then is
-   enough.
-4. **Schema bump to `t9-slabs-2`** for the per-brick scales: taken as the default
-   here, on the grounds that a silently different meaning is worse than a loud
-   refusal and slabs are cheap to regenerate. Say so if you would rather it stay
-   backward-compatible with a scalar broadcast.
-5. **The second (T,b) point assumes the operating point survives Stage 1b.** If
+1. **The spill-transport miss is undisposed.** C14 measured 141.3 MB/step against
+   a <100 MB bar -- ~6% of particles riding the result queue back for the
+   parent's arena claim. Projected on an N-independent fraction that is ~9 GB
+   per step at 2048^3 and ~72 GB at 4096^3, bounded in memory by the dispatch
+   window to ~6 GB resident. Accept and record, or size the parent-side share
+   before the pooled migrate carries a capacity run? **The C14 card already
+   carries worker busy time separately from the phase wall, so this is derivable
+   from data in hand rather than a new job.**
+2. **Repack pooling before the capacity runs, or after?** It is the remaining
+   rung of the wall ladder, worth ~2.9 h of the ~24.6, and it is the same shape
+   as the migrate pooling that has already been proved bitwise. Doing it first
+   makes the capacity runs cheaper; doing it after gets a product sooner.
+3. **When does the full-scale realization benchmark run?** Deferred 2026-08-18,
+   deferred and not cancelled. Until it does, every hour figure in this document
+   and in the records is arithmetic on a phase card, and the caveats travel with
+   it: migrate's term at 2048^3 is a floor, and the pool's memory footprint there
+   is unmeasured and may cap workers below 16.
+4. **`malloc_trim` as an operating point** is still your call, with the anchor
+   number (15.5% of peak for +1.6% wall, improving with tile size). It belongs in
+   Stage 5's pre-registration either way, so a decision before then is enough.
+5. **Does closing 4096^3's 1.23x belong to this milestone or to M-v2-7?** The
+   production config fits no node available: 1259 GB against a gb node's 1026
+   CPU-side, of which 618 is the state itself and cannot go. Closing it means
+   removing ~36% of everything that is not state. This milestone's charter is
+   2048^3, so on a literal reading it is out of scope -- but nothing else
+   currently owns it.
+6. **The second (T,b) point assumes the operating point survives Stage 1b.** If
    gg's 237 GB is the target, most of the memory pressure that made T=256/b=32
    attractive is gone, and the informative second point may become a *larger*
    tile than T=512.
+
+**Resolved since 08-14, kept so they are not re-asked:**
+
+- *Whether a `gh` node can host 2048^3:* no, and structurally -- state plus
+  resident mesh alone is 116.5 GB against a 116 GB hard cliff. Memory forces gg
+  before SU does, which is why Stage 1b is partly overtaken.
+- *The `t9-slabs-2` schema bump* for per-brick scales: shipped, and the loader
+  refuses a `-1` slab loudly.
+- *Whether to characterize DISCO-DJ multi-node:* out of scope (JC, 2026-08-17).
+  It ships no sharding machinery, so any multi-node run of it is a caller-side
+  construction. The claim this project defends at 2048^3 is **capability, not
+  cost**.
