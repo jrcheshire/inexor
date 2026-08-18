@@ -61,6 +61,69 @@ SCHEMA = "t9-slabs-2"
 MANIFEST = "manifest.json"
 
 
+STAGE_DIR = "stage"
+
+
+def staged_names():
+    """Every intermediate `generate_t9_slabs` writes under `stage/`, derived
+    from the producers rather than listed by hand so the two cannot drift.
+
+    Twenty files, each a full (n, n, n) array: about 687 GB at C-gh, where one
+    of them is 34.4 GB. Nothing consumes them once the manifest is written --
+    they are the streamed generator's working set, spilled to disk precisely so
+    the process never holds them.
+    """
+    from .lpt import _DIAG, _OFFDIAG
+
+    names = ["phi.npy", "delta.npy"]
+    names += [f"psi{o}_{ax}.npy" for o in (1, 2) for ax in range(3)]
+    names += [f"{k}_{ax}.npy" for k in ("u", "v") for ax in range(3)]
+    names += [f"phi_{i}{j}.npy" for i, j in _DIAG + _OFFDIAG]
+    return tuple(names)
+
+
+def cleanup_stage(workdir, missing_ok=True):
+    """Remove the staging intermediates under `workdir/stage` and the directory.
+
+    Named files ONLY, from `staged_names()`, then `os.rmdir` -- never a
+    recursive delete. The rmdir is the point rather than tidiness: it FAILS if
+    anything the generator did not put there is still inside, so a stray file is
+    a loud refusal instead of a silent deletion of someone's data. A run that
+    stages somewhere shared is exactly where a recursive delete stops being
+    recoverable.
+
+    Called last by `generate_t9_slabs`, AFTER the manifest, so an interrupted
+    generation keeps its intermediates for diagnosis: the completeness marker
+    is what licenses the delete. Returns a report -- files removed, bytes
+    reclaimed, and whether the directory went -- for the manifest to carry, so
+    a run can say what it cleaned rather than leaving it to be inferred from an
+    absence.
+    """
+    stage = os.path.join(workdir, STAGE_DIR)
+    report = dict(dir=stage, removed=[], bytes=0, dir_removed=False, existed=os.path.isdir(stage))
+    if not report["existed"]:
+        if missing_ok:
+            return report
+        raise FileNotFoundError(f"no staging directory at {stage}")
+
+    for name in staged_names():
+        path = os.path.join(stage, name)
+        if not os.path.exists(path):
+            continue
+        report["bytes"] += os.path.getsize(path)
+        os.remove(path)
+        report["removed"].append(name)
+
+    try:
+        os.rmdir(stage)
+        report["dir_removed"] = True
+    except OSError as e:
+        # left standing ON PURPOSE, with what is in it, rather than forced
+        report["dir_error"] = str(e)
+        report["left_behind"] = sorted(os.listdir(stage))
+    return report
+
+
 def _stage_spec_to(workdir, name, spec, n, slab):
     """Inverse-transform a spectrum (consuming it) into a StagedArray.
 
@@ -92,6 +155,7 @@ def generate_t9_slabs(
     table=None,
     window=1,
     provenance=None,
+    keep_stage=False,
 ):
     """Generate T9-encoded initial-condition slabs on disk.
 
@@ -99,6 +163,14 @@ def generate_t9_slabs(
     (written LAST -- its absence marks an incomplete generation and the loader
     refuses). Returns the manifest dict. `provenance` (optional dict) is
     stored verbatim in the manifest beside the generator's own fields.
+
+    The twenty staging intermediates under `stage/` are REMOVED on success --
+    687 GB per run at C-gh, and nothing reads them once the manifest exists.
+    They are deleted after the manifest is written, never before: the
+    completeness marker is what licenses the delete, so an interrupted
+    generation keeps its working set for diagnosis. `keep_stage=True` keeps
+    them regardless. What was removed is recorded in the manifest under
+    `stage_cleanup`, because an absence is not evidence of a deletion.
     """
     t9 = T9Layout(box_size, n_part, bucket_cells)
     n, box = int(n_part), float(box_size)
@@ -326,6 +398,21 @@ def generate_t9_slabs(
         mean_phi2=float(mean_phi2),
         provenance=provenance or {},
     )
+    # AFTER the manifest, and the manifest is rewritten to carry the report:
+    # cleaning first would delete the working set of a generation that then
+    # failed to complete, and reporting nothing would leave "was it cleaned?"
+    # answerable only by looking at a directory that may since have been reused.
+    if keep_stage:
+        manifest["stage_cleanup"] = dict(kept=True, reason="keep_stage=True")
+    else:
+        try:
+            manifest["stage_cleanup"] = cleanup_stage(workdir)
+        except OSError as e:
+            # Housekeeping must never cost a completed generation its manifest.
+            # At C-hero this is a multi-hour product and the intermediates are
+            # a disk bill; an unwritable stage directory is the wrong reason to
+            # lose the run. Recorded loudly instead.
+            manifest["stage_cleanup"] = dict(error=str(e), removed=[], bytes=0)
     with open(os.path.join(workdir, MANIFEST), "w") as fh:
         json.dump(manifest, fh, indent=1)
     return manifest

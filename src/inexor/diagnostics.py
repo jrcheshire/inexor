@@ -54,6 +54,27 @@ def cic_window(n_mesh, box_size):
     return wx[:, None, None] * wx[None, :, None] * wz[None, None, :]
 
 
+def tsc_window(n_mesh, box_size):
+    """TSC mass-assignment window W(k) on the rfftn half-grid (float64).
+
+    `W(k) = prod_i sinc^3(k_i / (2 k_nyq))`, the CIC form at exponent 3 -- one
+    power per convolution of the top-hat, and TSC is the quadratic spline. The
+    engine's coarse paint is TSC (`paint_tsc_int`), so this is the window a
+    coarse `delta` carries and `cic_window` is the wrong one for it: at half
+    Nyquist along an axis the two differ by 21%, which is 12 sigma at C-gh mode
+    counts and would read as a code defect.
+
+    Divide a measured particle power by W^2 to deconvolve. Analytic only: this
+    is the plain window correction and NOT interlacing, so it does not remove
+    aliasing, and it is trustworthy well below Nyquist rather than up to it.
+    """
+    k_1d, kz_1d, _ = _k_grid(n_mesh, box_size)
+    knyq = np.pi * n_mesh / box_size
+    wx = np.sinc(k_1d / (2.0 * knyq)) ** 3
+    wz = np.sinc(kz_1d / (2.0 * knyq)) ** 3
+    return wx[:, None, None] * wx[None, :, None] * wz[None, None, :]
+
+
 def _bin_edges(n_mesh, box_size, dk=None, kmin=None, kmax=None):
     kf = 2.0 * np.pi / box_size
     if dk is None:

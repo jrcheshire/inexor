@@ -272,3 +272,91 @@ def test_write_t9_slabs_manifest_is_written_last(tmp_path):
     os.remove(str(tmp_path / icgen.MANIFEST))
     with pytest.raises(FileNotFoundError, match="refusing to load"):
         icgen.load_slot_state(str(tmp_path))
+
+
+# ------------------------------------------------- staging cleanup (M-v2-6 S4)
+
+
+def _generate(tmp_path, **kw):
+    key = jax.random.PRNGKey(11)
+    return icgen.generate_t9_slabs(
+        str(tmp_path), key, N, L, Cosmology(), A_INIT, NB, slab=SLAB, **kw
+    )
+
+
+def test_staged_names_matches_what_the_generator_actually_writes(tmp_path):
+    """The drift guard, and the reason `staged_names` derives the phi_ij list
+    from lpt's own component tuples. A name the cleanup does not know is a
+    34.4 GB file left behind per run at C-gh, and the rmdir turns it into a
+    refusal rather than a leak -- but only if the list is right."""
+    _generate(tmp_path, keep_stage=True)
+    stage = os.path.join(str(tmp_path), icgen.STAGE_DIR)
+    assert set(os.listdir(stage)) == set(icgen.staged_names())
+    assert len(icgen.staged_names()) == 20, "twenty full-size arrays is the 687 GB at C-gh"
+
+
+def test_generation_cleans_its_stage_and_says_so(tmp_path):
+    man = _generate(tmp_path)
+    assert not os.path.isdir(os.path.join(str(tmp_path), icgen.STAGE_DIR))
+    rep = man["stage_cleanup"]
+    assert rep["dir_removed"] is True
+    assert sorted(rep["removed"]) == sorted(icgen.staged_names())
+    assert rep["bytes"] > 0, "an absence is not evidence of a deletion"
+    # the manifest on disk carries it too, not just the returned dict
+    with open(os.path.join(str(tmp_path), icgen.MANIFEST)) as fh:
+        assert json.load(fh)["stage_cleanup"]["dir_removed"] is True
+
+
+def test_keep_stage_keeps_it(tmp_path):
+    man = _generate(tmp_path, keep_stage=True)
+    assert os.path.isdir(os.path.join(str(tmp_path), icgen.STAGE_DIR))
+    assert man["stage_cleanup"] == dict(kept=True, reason="keep_stage=True")
+
+
+def test_cleanup_leaves_a_stray_file_and_the_directory_standing(tmp_path):
+    """Named files only, then rmdir. The rmdir failing is the DESIGN: a file
+    the generator did not put there means someone else is using this directory,
+    and a recursive delete there is not recoverable."""
+    _generate(tmp_path, keep_stage=True)
+    stage = os.path.join(str(tmp_path), icgen.STAGE_DIR)
+    stray = os.path.join(stage, "someone_elses_notes.txt")
+    with open(stray, "w") as fh:
+        fh.write("not mine")
+
+    rep = icgen.cleanup_stage(str(tmp_path))
+    assert rep["dir_removed"] is False
+    assert rep["left_behind"] == ["someone_elses_notes.txt"]
+    assert os.path.exists(stray), "the stray file must survive"
+    assert sorted(rep["removed"]) == sorted(icgen.staged_names())
+
+
+def test_cleanup_is_idempotent_and_refuses_a_missing_dir_when_told_to(tmp_path):
+    _generate(tmp_path)
+    again = icgen.cleanup_stage(str(tmp_path))
+    assert again["existed"] is False and again["removed"] == [] and again["bytes"] == 0
+    with pytest.raises(FileNotFoundError, match="no staging directory"):
+        icgen.cleanup_stage(str(tmp_path), missing_ok=False)
+
+
+def test_the_generation_still_loads_after_its_stage_is_gone(tmp_path):
+    """The cleanup must not touch the product. Deleted intermediates, intact
+    slabs, and the loader's own crc checks confirm it."""
+    man = _generate(tmp_path)
+    st = icgen.load_slot_state(str(tmp_path))
+    assert st.n_particles == man["n_particles"] == N**3
+    st.check()
+
+
+def test_a_failed_generation_keeps_its_working_set(tmp_path):
+    """The completeness marker is what licenses the delete. A generation that
+    refused mid-flight left 687 GB of intermediates at C-gh AND the reason it
+    failed; cleaning those on the way out of an exception would destroy the
+    only diagnostic material a multi-hour run produced."""
+    wild = Cosmology(sigma8=25.0)
+    with pytest.raises(ValueError, match="sliding window"):
+        icgen.generate_t9_slabs(
+            str(tmp_path), jax.random.PRNGKey(0), N, L, wild, 1.0, 8, fdtype=np.float64
+        )
+    stage = os.path.join(str(tmp_path), icgen.STAGE_DIR)
+    assert os.path.isdir(stage) and os.listdir(stage)
+    assert not os.path.exists(os.path.join(str(tmp_path), icgen.MANIFEST))
