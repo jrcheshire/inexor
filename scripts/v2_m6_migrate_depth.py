@@ -426,11 +426,15 @@ def main():
             # Segments are reported first for exactly that reason.
             seg = []
             for i in range(len(nb) - 1):
-                a = float(np.log(tot[i + 1] / tot[i]) / np.log(nb[i + 1] / nb[i]))
+                # NB not `a`: that is the argparse namespace, and rebinding it
+                # here crashed the first job to ever reach the post-scan card
+                # write (918365 -- this loop postdated job 478 and no run since
+                # had passed two configs).
+                alpha_seg = float(np.log(tot[i + 1] / tot[i]) / np.log(nb[i + 1] / nb[i]))
                 seg.append(dict(nb_lo=int(nb[i]), nb_hi=int(nb[i + 1]),
                                 rows_per_brick_lo=float(pairs[i][0]["rows_per_brick"]),
-                                alpha=a,
-                                per_brick_share=float(np.clip(a / 3.0, 0.0, 1.0))))
+                                alpha=alpha_seg,
+                                per_brick_share=float(np.clip(alpha_seg / 3.0, 0.0, 1.0))))
             row["segments"] = seg
             for key in ("eject_s", "insert_s"):
                 y = np.array(row[key], dtype=np.float64)
