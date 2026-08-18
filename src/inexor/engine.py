@@ -66,7 +66,7 @@ from .forces import (
 )
 from .layout import assert_brick_divides_buffer, choose_brick
 from .painting import check_tsc_paint_headroom, paint_tsc_int, paint_tsc_int_subblock
-from .state import drift_and_migrate
+from .state import drift_and_migrate, drift_and_migrate_pooled
 
 __all__ = [
     "EngineConfig", "apply_result", "coarse_delta_streamed", "float_run_bullfrog_sync",
@@ -113,6 +113,8 @@ class EngineConfig:
         paint_subblock=True,
         tile_workers=1,
         worker_affinity=True,
+        migrate_pooled=False,
+        migrate_window=None,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -177,6 +179,14 @@ class EngineConfig:
         # effect stays measurable, not because off is ever an operating point.
         self.tile_workers = int(tile_workers)
         self.worker_affinity = bool(worker_affinity)
+        # Idle-half Stage 2: route `drift_and_migrate` through the SAME pool,
+        # workers writing brick payloads and the parent replaying the arena
+        # interleave (state.drift_and_migrate_pooled). False until the gg
+        # verdict job passes (no-worse-defaults, the eject_kernel precedent).
+        # `migrate_window` bounds the scratch slots in flight; None = sized to
+        # feed the workers (see the driver's docstring for the floor).
+        self.migrate_pooled = bool(migrate_pooled)
+        self.migrate_window = None if migrate_window is None else int(migrate_window)
 
     @property
     def np_coarse_dtype(self):
@@ -391,6 +401,11 @@ class EngineConfig:
             check_tsc_paint_headroom(self.n_total, self.frac_bits)
         if self.tile_workers < 1:
             raise ValueError(f"tile_workers must be >= 1, got {self.tile_workers}")
+        if self.migrate_pooled and self.tile_workers < 2:
+            # a knob that cannot apply must refuse, not silently run serial
+            raise ValueError(
+                f"migrate_pooled needs a pool: tile_workers is {self.tile_workers}"
+            )
         self._refuse_f64_without_x64()
         return True
 
@@ -1073,7 +1088,15 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # a peak comparison against every card on record is still like-for-like.
     ph("reconcile")
 
-    stats = drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel)
+    if pool is not None and cfg.migrate_pooled:
+        stats = drift_and_migrate_pooled(
+            st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window
+        )
+    else:
+        stats = drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel)
+    # the knob's receipt, in BOTH directions: 0 on every serial card, W on
+    # every pooled one (the reach fallback reports 0 through migrate_pool)
+    stats["migrate_pooled_workers"] = int(stats.get("migrate_pool", {}).get("workers", 0))
     ph("migrate")
     # both: `cap` is the SHAPE every buffer took, `cap_true` the max over tiles it
     # was quantized from. Reporting only one of them hides either the padding cost
@@ -1156,7 +1179,13 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None):
     ph("kernel_build")
     try:
         lead, fused = fused_drifts(coeffs)
-        drift_and_migrate(st, lead, kernel=cfg.eject_kernel)  # onto the first midpoint
+        # onto the first midpoint; pooled under the same knob as the per-step
+        # migrate (5j: this ONE call was mistaken for a per-step phase once)
+        if pool is not None and cfg.migrate_pooled:
+            drift_and_migrate_pooled(st, lead, pool, kernel=cfg.eject_kernel,
+                                     window=cfg.migrate_window)
+        else:
+            drift_and_migrate(st, lead, kernel=cfg.eject_kernel)
         ph("lead_drift")
         out = []
         # both buffer shapes are carried ACROSS steps and only ever grow, so the

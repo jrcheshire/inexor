@@ -147,3 +147,156 @@ def test_the_pool_survives_and_restores_state_ownership():
     # the rebound arrays end to end, and check() raises on corruption
     s2.repack(brick_slack=0.10)
     s2.check()
+
+
+# ---------------------------------------------------------------------------
+# the pooled migrate (idle-half Stage 2): drift_and_migrate_pooled vs serial
+# ---------------------------------------------------------------------------
+
+C_DRIFT = 1.0  # sized so brick_reach == 1 at this geometry (asserted in-test)
+
+
+def _mig_state(seed=3, build_slack=0.10, arena_frac=0.05, with_ids=True):
+    cfg = _cfg(tile_workers=2)
+    x = _positions(seed)
+    v = np.random.default_rng(seed + 1).normal(scale=0.5, size=x.shape)
+    t9 = T9Layout(box_size=L_BOX, n_part=N_PART, bucket_cells=2)
+    st = state.SlotState.build(
+        x, v, t9, N_FINE // cfg.n_brick, brick_slack=build_slack,
+        arena_frac=arena_frac, with_ids=with_ids,
+    )
+    return st, cfg
+
+
+def _pooled_vs_serial(st_pool, st_ser, cfg, kernel, window=6):
+    """Run the two arms and return their stats dicts."""
+    from inexor.executor import TilePool
+
+    pool = TilePool(st_pool, cfg)
+    try:
+        out_p = state.drift_and_migrate_pooled(st_pool, C_DRIFT, pool, kernel=kernel, window=window)
+    finally:
+        pool.close()
+    out_s = state.drift_and_migrate(st_ser, C_DRIFT, kernel=kernel)
+    return out_p, out_s
+
+
+@pytest.mark.parametrize("kernel", ["numpy", "jax"])
+def test_the_pooled_migrate_is_bitwise_the_serial_one(kernel):
+    """The whole contract at W=2: every state array (ids included) and the
+    ENTIRE stats dict equal key for key, with a window smaller than nb so slot
+    reuse is actually exercised, and an anti-vacuity guard that particles
+    really crossed bricks (the nb=2 trap: at this geometry nb=8 and reach 1,
+    so the reach window does NOT cover every slab)."""
+    import copy
+
+    st_p, cfg = _mig_state()
+    st_s = copy.deepcopy(st_p)
+    out_p, out_s = _pooled_vs_serial(st_p, st_s, cfg, kernel)
+    mp = out_p.pop("migrate_pool")
+    assert mp["workers"] == 2 and mp["window"] == 6
+    # the compiled-kernel receipt, summed from the workers: nb calls on the
+    # jax arm, 0 on numpy (the parent's own counter cannot see workers)
+    want_calls = st_s.bricks_per_side if kernel == "jax" else 0
+    assert mp["eject_jax_calls"] == want_calls
+    assert out_p == out_s
+    assert out_s["brick_reach"] == 1, "C_DRIFT no longer gives reach 1 here"
+    assert 2 * out_s["brick_reach"] + 1 < st_s.bricks_per_side
+    assert out_s["brick_reach_realized"] >= 1, "no particle crossed a brick"
+    _assert_states_identical(st_s, st_p)
+
+
+def test_pooled_migrate_window_floor_refuses():
+    """A window below the deadlock floor must refuse loudly, before any task
+    is dispatched (a knob that cannot apply must not silently move)."""
+    import copy
+
+    st_p, cfg = _mig_state()
+    st_s = copy.deepcopy(st_p)
+    with pytest.raises(ValueError, match="deadlock floor"):
+        # the check precedes every pool interaction, so a stub suffices
+        state.drift_and_migrate_pooled(st_p, C_DRIFT, pool=None, window=2)
+    del st_s
+
+
+@pytest.mark.parametrize("kernel", ["numpy", "jax"])
+def test_the_pooled_migrate_identity_with_a_resident_arena(kernel):
+    """Both shared-surface paths provably exercised (the C13 arena_probed
+    lesson): a zero-slack build overflows into the arena on a serial priming
+    pass, so the pooled pass must (a) replay RELEASES of resident rows and
+    (b) replay CLAIMS for fresh spills -- both guarded non-vacuous."""
+    import copy
+
+    st_p, cfg = _mig_state(seed=5, build_slack=0.0, arena_frac=0.20)
+    st_s = copy.deepcopy(st_p)
+    state.drift_and_migrate(st_p, C_DRIFT, kernel=kernel)
+    state.drift_and_migrate(st_s, C_DRIFT, kernel=kernel)
+    assert (np.asarray(st_p.arena_bucket) >= 0).any(), (
+        "the priming pass never populated the arena: the release replay is "
+        "not exercised and this leg needs a different configuration"
+    )
+    out_p, out_s = _pooled_vs_serial(st_p, st_s, cfg, kernel)
+    assert out_s["n_arena_overflow"] > 0, (
+        "the pooled pass never spilled: the claim replay is not exercised"
+    )
+    mp = out_p.pop("migrate_pool")
+    assert mp["spill_rows"] == out_s["n_arena_overflow"]
+    assert out_p == out_s
+    _assert_states_identical(st_s, st_p)
+
+
+def test_the_pooled_migrate_without_ids():
+    """A state built with_ids=False: the scratch drops the ids column and the
+    facade binds None, end to end."""
+    import copy
+
+    st_p, cfg = _mig_state(seed=7, with_ids=False)
+    st_s = copy.deepcopy(st_p)
+    out_p, out_s = _pooled_vs_serial(st_p, st_s, cfg, "numpy")
+    out_p.pop("migrate_pool")
+    assert out_p == out_s
+    for f in FIELDS:
+        a, b = np.asarray(getattr(st_s, f)), np.asarray(getattr(st_p, f))
+        assert int((a != b).sum()) == 0, f"{f} diverged"
+    assert st_p.ids is None and st_s.ids is None
+
+
+def test_migrate_pooled_knob_refuses_without_a_pool():
+    """A knob that cannot apply must refuse at validate(), not silently run
+    the serial path under a pooled-looking config."""
+    with pytest.raises(ValueError, match="needs a pool"):
+        _cfg(tile_workers=1, migrate_pooled=True).validate()
+
+
+def test_the_pooled_migrate_engine_run_is_bitwise_the_serial_one():
+    """The knob end to end: a whole K=3 run with repack every step, lead-drift
+    routing, kick/migrate epoch alternation on one pool, and the shm ids
+    copy-back -- against the plain serial run. Receipts in both directions."""
+    s1, out1 = _run(1)
+    s2, out2 = _run(2, migrate_pooled=True)
+    _assert_states_identical(s1, s2)
+    assert [o["cap"] for o in out1] == [o["cap"] for o in out2]
+    assert all(o["migrate_pooled_workers"] == 0 for o in out1)
+    assert all(o["migrate_pooled_workers"] == 2 for o in out2), (
+        "the pooled migrate did not apply on every step (a 0 here can also "
+        "mean the reach fallback fired at this geometry)"
+    )
+
+
+def test_pooled_migrate_arena_full_refuses():
+    """D-007: when the arena cannot absorb a spill, BOTH arms refuse with the
+    same ValueError; the pooled raise comes from the parent's claim replay."""
+    import copy
+
+    from inexor.executor import TilePool
+
+    st_p, cfg = _mig_state(seed=9, build_slack=0.0, arena_frac=0.002)
+    st_s = copy.deepcopy(st_p)
+    with pytest.raises(ValueError, match="does not clamp"):
+        state.drift_and_migrate(st_s, C_DRIFT)
+    pool = TilePool(st_p, cfg)
+    try:
+        with pytest.raises(ValueError, match="does not clamp"):
+            state.drift_and_migrate_pooled(st_p, C_DRIFT, pool, window=6)
+    finally:
+        pool.close()

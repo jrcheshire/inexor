@@ -38,6 +38,7 @@ measured or asserted rather than assumed:
 
 import multiprocessing as mp
 import os
+import queue
 import time
 from multiprocessing import shared_memory
 
@@ -47,8 +48,17 @@ __all__ = ["SHM_FIELDS", "TilePool"]
 
 # Every array field of SlotState the step reads or writes. `ids` is absent on
 # purpose: the tile loop never touches ids, so they stay parent-side and the
-# executor-identity gate proves they evolve identically.
+# executor-identity gate proves they evolve identically. The POOLED MIGRATE
+# does touch ids (eject reads them, insert writes them), so a pool built on a
+# state that carries ids shares them too -- that is the per-instance `_fields`
+# list, not this constant, which keeps its meaning (and its script consumers).
 SHM_FIELDS = ("off", "w", "occupancy", "brick_start", "vel_scale", "arena_bucket")
+
+# The migrate scratch (`stage_migrate`): one rolling window of K slab slots,
+# each holding a slab's ejected rows as keep-prefix + emig-suffix in the eject
+# output order (global brick-major -- ORDER IS CORRECTNESS, `_insert_slab`
+# walks it). `mig_scales` is the pass-start vel_scale snapshot: it rides shm
+# because the header is pickled per task and the snapshot is 8 B x n_bricks.
 
 _G = {}
 
@@ -66,7 +76,7 @@ def _rss_mb():
     return -1.0
 
 
-def _worker_init(shm_names, shapes, dtypes, small, fn_args, x64, core_sets, rank_counter):
+def _worker_init(shm_names, shapes, dtypes, fields, small, fn_args, x64, core_sets, rank_counter):
     """Pin affinity, then attach shm views and build the jitted tile program.
 
     `x64` replicates the PARENT's jax_enable_x64 into the worker -- the
@@ -86,7 +96,7 @@ def _worker_init(shm_names, shapes, dtypes, small, fn_args, x64, core_sets, rank
     from inexor.forces import make_tile_force_fn
 
     views, segs = {}, []
-    for name in SHM_FIELDS:
+    for name in fields:
         seg = shared_memory.SharedMemory(name=shm_names[name])
         segs.append(seg)
         views[name] = np.ndarray(shapes[name], dtype=dtypes[name], buffer=seg.buf)
@@ -117,10 +127,123 @@ def _ensure_facade(C):
             brick_start=v["brick_start"], occupancy=v["occupancy"],
             off=v["off"], w=v["w"], vel_scale=v["vel_scale"],
             arena_base=C["arena_base"], arena_bucket=v["arena_bucket"],
-            n_particles=small["n_particles"], ids=None,
+            n_particles=small["n_particles"], ids=v.get("ids"),
         )
         _G["step"] = C["step"]
     return _G["st"]
+
+
+def _ensure_scratch(M):
+    """Attach the migrate scratch segments, re-attached when they are rebuilt.
+
+    Keyed on `mig_id`, which the parent bumps only when a segment is recreated
+    (the slot window or the slab capacity grew) -- names are stable otherwise,
+    so the common pass re-uses the open handles."""
+    if _G.get("mig_id") != M["mig_id"]:
+        for seg in _G.get("mig_segs", ()):
+            seg.close()
+        views, segs = {}, []
+        for name in M["mig_names"]:
+            seg = shared_memory.SharedMemory(name=M["mig_names"][name])
+            segs.append(seg)
+            views[name] = np.ndarray(
+                M["mig_shapes"][name], dtype=M["mig_dtypes"][name], buffer=seg.buf
+            )
+        _G["mig"] = views
+        _G["mig_segs"] = segs
+        _G["mig_id"] = M["mig_id"]
+    return _G["mig"]
+
+
+def _worker_migrate_eject(arg):
+    """Eject one slab into its scratch slot. NO shared bookkeeping is touched:
+    `release_arena=False` leaves the arena free list to the parent's serial
+    replay, and the slot's keep-prefix + emig-suffix layout preserves the eject
+    output order that `_insert_slab` depends on."""
+    s, slot, M = arg
+    st = _ensure_facade(M)
+    scr = _ensure_scratch(M)
+    from inexor import eject_jax
+
+    t0 = time.perf_counter()
+    calls0 = eject_jax.CALLS
+    keep, emig = st._eject_slab(
+        s, M["c_drift"], scr["mig_scales"], kernel=M["kernel"], release_arena=False
+    )
+    nk, ne = len(keep["dest"]), len(emig["dest"])
+    cap = scr["mig_dest"].shape[1]
+    if nk + ne > cap:
+        raise ValueError(
+            f"slab {s} ejected {nk + ne} rows against a scratch slot of {cap} -- "
+            "the parent sized the window from a stale occupancy"
+        )
+    scr["mig_dest"][slot, :nk] = keep["dest"]
+    scr["mig_dest"][slot, nk : nk + ne] = emig["dest"]
+    scr["mig_off"][slot, :nk] = keep["off"]
+    scr["mig_off"][slot, nk : nk + ne] = emig["off"]
+    scr["mig_w"][slot, :nk] = keep["w"]
+    scr["mig_w"][slot, nk : nk + ne] = emig["w"]
+    scr["mig_src"][slot, nk : nk + ne] = emig["src"]
+    if M["has_ids"]:
+        scr["mig_ids"][slot, :nk] = keep["ids"]
+        scr["mig_ids"][slot, nk : nk + ne] = emig["ids"]
+    rr = 0
+    if ne:
+        nb = st.bricks_per_side
+        d_slab = emig["dest"] // (st.buckets_per_brick * nb * nb)
+        disp = (d_slab - s + nb // 2) % nb - nb // 2
+        rr = int(np.abs(disp).max())
+    return dict(
+        kind="eject", s=int(s), slot=int(slot), n_keep=nk, n_emig=ne,
+        realized_reach=rr, busy_s=time.perf_counter() - t0, worker=os.getpid(),
+        # the compiled-kernel receipt travels WITH the result: the parent's own
+        # eject_jax.CALLS cannot see a worker's, so a pooled card reading the
+        # parent counter would always say 0 and look like a broken instrument
+        eject_jax_calls=eject_jax.CALLS - calls0,
+    )
+
+
+def _worker_migrate_insert(arg):
+    """Insert one destination slab from scratch views. Brick payloads land in
+    shm directly (the C13-censused disjoint writes); arena SPILLS come back as
+    rows for the parent to claim at this brick's serial point, because slot
+    assignment is lowest-free-first and therefore order-dependent."""
+    d, slot_map, M = arg
+    st = _ensure_facade(M)
+    scr = _ensure_scratch(M)
+    t0 = time.perf_counter()
+    has_ids = M["has_ids"]
+    staged, emig = {}, {}
+    for src, slot, nk, ne in slot_map:
+        if src == d:
+            staged[d] = dict(
+                dest=scr["mig_dest"][slot, :nk],
+                off=scr["mig_off"][slot, :nk],
+                w=scr["mig_w"][slot, :nk],
+                ids=scr["mig_ids"][slot, :nk] if has_ids else None,
+            )
+        emig[src] = dict(
+            dest=scr["mig_dest"][slot, nk : nk + ne],
+            off=scr["mig_off"][slot, nk : nk + ne],
+            w=scr["mig_w"][slot, nk : nk + ne],
+            ids=scr["mig_ids"][slot, nk : nk + ne] if has_ids else None,
+            src=scr["mig_src"][slot, nk : nk + ne],
+        )
+    r = int(M["reach_r"])
+    consumed = {src: 0 for src, _, _, _ in slot_map}
+    spills = []
+
+    def sink(b, dest, off, w, ids):
+        spills.append((int(b), dest, off, w, ids))
+
+    n_over = st._insert_slab(
+        d, staged, emig, reach=range(-r, r + 1), consumed=consumed,
+        scales=scr["mig_scales"], spill_sink=sink,
+    )
+    return dict(
+        kind="insert", d=int(d), n_over=int(n_over), consumed=consumed,
+        spills=spills, busy_s=time.perf_counter() - t0, worker=os.getpid(),
+    )
 
 
 def _worker_task(arg):
@@ -199,7 +322,17 @@ class TilePool:
         self._C = None
         self._segs = []
         self._names, self._shapes, self._dtypes, self._views = {}, {}, {}, {}
-        for f in SHM_FIELDS:
+        # ids join the shared set only when the state carries them: the tile
+        # loop never touches ids, but the pooled migrate reads them at eject
+        # and writes them at insert, and a facade with `ids=None` would strand
+        # the parent's column silently.
+        self._fields = SHM_FIELDS + (("ids",) if st.ids is not None else ())
+        self._mig_segs = {}
+        self._mig_views = {}
+        self._mig_shape = None
+        self._mig_id = 0
+        self._M = None
+        for f in self._fields:
             view = self._share(f, np.asarray(getattr(st, f)))
             setattr(st, f, view)
         # the parent's cached brick->arena index maps into the OLD array;
@@ -233,8 +366,9 @@ class TilePool:
         try:
             self._pool = ctx.Pool(
                 self.workers, initializer=_worker_init,
-                initargs=(self._names, self._shapes, self._dtypes, small, fn_args,
-                          bool(jax.config.jax_enable_x64), core_sets, rank_counter),
+                initargs=(self._names, self._shapes, self._dtypes, self._fields,
+                          small, fn_args, bool(jax.config.jax_enable_x64),
+                          core_sets, rank_counter),
             )
         finally:
             for k, v in saved.items():
@@ -296,6 +430,83 @@ class TilePool:
             _worker_coarse_task, [(gi, b, H) for gi, b in tasks]
         )
 
+    def _dispose_scratch(self):
+        for seg in self._mig_segs.values():
+            seg.close()
+            try:
+                seg.unlink()
+            except FileNotFoundError:
+                pass
+        self._mig_segs = {}
+        self._mig_views = {}
+        self._mig_shape = None
+
+    def stage_migrate(self, c_drift, kernel, r, slot_rows, window):
+        """Publish one migrate pass: scratch window, scales snapshot, header.
+
+        Scratch is sized PER PASS (`repack` moves `brick_start`, so slab
+        capacities change between steps) and recreated only when the
+        requirement grows; `mig_id` tells workers when to re-attach. The
+        `vel_scale` snapshot is written here, before any task is dispatched --
+        inserts rewrite the live array while later ejects must decode at
+        pre-pass scales, exactly the serial pass's copy at state.py's
+        `drift_and_migrate`."""
+        has_ids = self.st.ids is not None
+        K, R = int(window), int(slot_rows)
+        n_bricks = int(np.atleast_1d(self.st.vel_scale).shape[0])
+        cur = self._mig_shape
+        if cur is None or cur[0] < K or cur[1] < R or (has_ids and "mig_ids" not in self._mig_views):
+            K = max(K, 0 if cur is None else cur[0])
+            R = max(R, 0 if cur is None else cur[1])
+            self._dispose_scratch()
+            spec = dict(
+                mig_dest=((K, R), np.int64), mig_off=((K, R, 3), np.uint8),
+                mig_w=((K, R, 3), np.int16), mig_src=((K, R), np.int32),
+                mig_scales=((n_bricks,), np.float64),
+            )
+            if has_ids:
+                spec["mig_ids"] = ((K, R), np.int32)
+            for name, (shape, dtype) in spec.items():
+                nbytes = max(int(np.dtype(dtype).itemsize * np.prod(shape, dtype=np.int64)), 1)
+                seg = shared_memory.SharedMemory(create=True, size=nbytes)
+                self._mig_segs[name] = seg
+                self._mig_views[name] = np.ndarray(shape, dtype=dtype, buffer=seg.buf)
+            self._mig_shape = (K, R)
+            self._mig_id += 1
+        self._mig_views["mig_scales"][...] = np.asarray(self.st.vel_scale, dtype=np.float64)
+        self._step += 1
+        self._M = dict(
+            step=self._step, arena_base=int(self.st.arena_base),
+            c_drift=float(c_drift), kernel=str(kernel), reach_r=int(r),
+            has_ids=has_ids, mig_id=self._mig_id,
+            mig_names={k: s.name for k, s in self._mig_segs.items()},
+            mig_shapes={k: v.shape for k, v in self._mig_views.items()},
+            mig_dtypes={k: str(v.dtype) for k, v in self._mig_views.items()},
+        )
+        self._mig_q = queue.Queue()
+        return self._mig_shape
+
+    def submit_eject(self, s, slot):
+        self._pool.apply_async(
+            _worker_migrate_eject, ((int(s), int(slot), self._M),),
+            callback=self._mig_q.put, error_callback=self._mig_q.put,
+        )
+
+    def submit_insert(self, d, slot_map):
+        self._pool.apply_async(
+            _worker_migrate_insert, ((int(d), list(slot_map), self._M),),
+            callback=self._mig_q.put, error_callback=self._mig_q.put,
+        )
+
+    def next_migrate_result(self):
+        """Blocking arrival-order get; a worker exception is re-raised HERE, in
+        the driver's loop, so a failed pass dies loudly instead of hanging the
+        backpressure window."""
+        item = self._mig_q.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
     def close(self):
         if getattr(self, "_pool", None) is not None:
             self._pool.close()
@@ -303,11 +514,12 @@ class TilePool:
             self._pool = None
         # give the caller's state regular memory back BEFORE unlinking, or the
         # arrays would be views into freed segments
-        for f in SHM_FIELDS:
+        for f in self._fields:
             cur = getattr(self.st, f, None)
             if cur is not None:
                 setattr(self.st, f, np.array(cur, copy=True))
         self.st._invalidate_arena_index()
+        self._dispose_scratch()
         for seg in self._segs:
             seg.close()
             try:

@@ -561,6 +561,209 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy"):
                 brick_reach_realized=realized_reach, peak_staged_slabs=peak_staged)
 
 
+def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None, max_staged_slabs=None):
+    """`drift_and_migrate` on the worker pool, BITWISE the serial pass.
+
+    The division of labour the C13 census licenses: workers eject and insert
+    whole slabs, writing brick payloads (off/w/ids/occupancy/vel_scale)
+    straight into shared memory -- those writes are disjoint per brick and
+    bricks partition into slabs -- while every ORDER-DEPENDENT arena mutation
+    stays out of the workers entirely. Ejects run with `release_arena=False`
+    and inserts hand their overflow rows back through `spill_sink`, so nothing
+    writes the arena until every task has returned; the parent then re-runs
+    the serial schedule's release/claim interleave (`_release_brick_arena` +
+    `_to_arena`, the production claim path) at end of pass. Nothing in a pass
+    reads an arena row the pass mutates before that row's own schedule point
+    -- claims tag only already-inserted slabs' bricks, releases only the
+    releasing slab's own rows -- so deferring the whole sequence is invisible
+    and the free list every claim is ordered against evolves exactly as the
+    serial pass's.
+
+    The same replay walks the serial loop's bookkeeping symbolically (staged
+    and emig sets, consumption census, peak staging), so the returned stats
+    dict is equal KEY FOR KEY to the serial one; the pool's own numbers ride
+    a separate `migrate_pool` entry.
+
+    Failure semantics vs serial, accepted and deliberate: an arena-full
+    refusal (D-007) raises from the same `_to_arena` line but at replay time
+    rather than mid-pass, and the consumption census names counts without the
+    displacement histogram when the scratch slot has been reused -- both arms
+    leave invalid state on either path. A worker exception re-raises in the
+    dispatch loop.
+
+    `window` bounds the scratch slots in flight. The floor is 4r+2: the wrap
+    pins ~2r slots for the whole pass and the sliding eject->insert span
+    holds 2r+2 more, below which the dispatch loop cannot free a slot and
+    would deadlock; the default adds the worker count so the pipeline can
+    actually feed W workers.
+    """
+    nb = st.bricks_per_side
+    p3 = st.buckets_per_brick
+    n_before = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    scales = np.array(st.vel_scale, dtype=np.float64, copy=True)
+    r_raw = brick_reach(st, c_drift, scales)
+    r = min(r_raw, nb // 2)
+    reach = range(-r, r + 1)
+    if 2 * r + 1 >= nb:
+        # the schedule is all-to-all: every slab reaches every other, the
+        # window would be the whole state, and the serial path already handles
+        # exactly this. Fall back rather than refuse -- correctness is not the
+        # caller's choice -- and say so on the stats.
+        out = drift_and_migrate(st, c_drift, max_staged_slabs=max_staged_slabs, kernel=kernel)
+        out["migrate_pool"] = dict(workers=0, fallback="all-to-all reach")
+        return out
+    k_min = min(nb, 4 * r + 2)
+    if window is not None and int(window) < k_min:
+        raise ValueError(
+            f"migrate window {window} is below the deadlock floor {k_min} "
+            f"(reach {r}: the wrap pins ~{2 * r} slots and the sliding span "
+            f"holds {2 * r + 2})"
+        )
+    K = min(nb, int(window) if window is not None else int(pool.workers) + 4 * r + 2)
+
+    # worst-case eject rows per slab = live rows + arena residents, both from
+    # the pre-pass state the workers will read
+    occ_slab = st.occupancy.astype(np.int64).reshape(nb, -1).sum(axis=1)
+    arena_slab = np.zeros(nb, dtype=np.int64)
+    if st.n_arena:
+        keys = st.arena_bucket[st.arena_bucket >= 0]
+        if len(keys):
+            arena_slab = np.bincount((keys // p3) // (nb * nb), minlength=nb)
+    slot_rows = int((occ_slab + arena_slab).max())
+    pool.stage_migrate(c_drift, kernel, r, slot_rows, K)
+
+    # THE DISPATCH LOOP. Backpressure is the free-slot list: an eject may only
+    # launch into a free slot, and a slab's slot frees once every destination
+    # its emig can feed has been inserted -- the serial release condition.
+    free_slots = list(range(K))
+    slot_of = {}
+    ejected = {}  # s -> (slot, n_keep, n_emig)
+    rr_by_slab = {}
+    insert_res = {}
+    dispatched = set()
+    eject_busy = insert_busy = 0.0
+    eject_jax_calls = 0
+    next_eject = 0
+    while len(insert_res) < nb:
+        while next_eject < nb and free_slots:
+            slot = free_slots.pop()
+            slot_of[next_eject] = slot
+            pool.submit_eject(next_eject, slot)
+            next_eject += 1
+        res = pool.next_migrate_result()
+        if res["kind"] == "eject":
+            s = res["s"]
+            ejected[s] = (res["slot"], res["n_keep"], res["n_emig"])
+            rr_by_slab[s] = int(res["realized_reach"])
+            eject_busy += res["busy_s"]
+            eject_jax_calls += int(res.get("eject_jax_calls", 0))
+            for d in range(nb):
+                if d in dispatched:
+                    continue
+                srcs = sorted({(d + o) % nb for o in reach})
+                if all(sv in ejected for sv in srcs):
+                    pool.submit_insert(d, [(sv,) + ejected[sv] for sv in srcs])
+                    dispatched.add(d)
+        else:
+            insert_res[res["d"]] = res
+            insert_busy += res["busy_s"]
+            for s2 in list(slot_of):
+                if all(((s2 + o) % nb) in insert_res for o in reach):
+                    free_slots.append(slot_of.pop(s2))
+    assert len(ejected) == nb, f"{nb - len(ejected)} slabs were never ejected"
+
+    # THE REPLAY: the serial pass's arena interleave and bookkeeping, re-run
+    # exactly. `_release_brick_arena` at each slab's eject point, `_to_arena`
+    # at each destination's insert point (spilled bricks arrive ascending from
+    # `_insert_slab`'s own loop), and the census/peak accounting at the same
+    # schedule points the serial loop runs them.
+    staged_sym, emig_sym, inserted = set(), set(), set()
+    consumed = {}
+    n_over, peak_staged, realized_reach = 0, 0, 0
+    spill_rows = spill_bytes = 0
+    for s in range(nb):
+        lo_b, hi_b = st.slab_bricks(s)
+        for b in range(lo_b, hi_b):
+            st._release_brick_arena(b)
+        staged_sym.add(s)
+        emig_sym.add(s)
+        consumed[s] = 0
+        realized_reach = max(realized_reach, rr_by_slab[s])
+        for d in range(nb):
+            if d in inserted:
+                continue
+            if all(((d + o) % nb) in emig_sym for o in reach):
+                res = insert_res[d]
+                for src, c in res["consumed"].items():
+                    consumed[src] += int(c)
+                for _b, dest_r, off_r, w_r, ids_r in res["spills"]:
+                    spill_rows += len(dest_r)
+                    spill_bytes += dest_r.nbytes + off_r.nbytes + w_r.nbytes
+                    spill_bytes += 0 if ids_r is None else ids_r.nbytes
+                    st._to_arena(dest_r, off_r, w_r, ids_r)
+                n_over += int(res["n_over"])
+                inserted.add(d)
+        for s2 in list(staged_sym):
+            if s2 in inserted:
+                staged_sym.discard(s2)
+        for s2 in list(emig_sym):
+            if all(((s2 + o) % nb) in inserted for o in reach):
+                n_rows = ejected[s2][2]
+                if consumed[s2] != n_rows:
+                    raise AssertionError(
+                        f"releasing emig slab {s2} with {n_rows - consumed[s2]} of "
+                        f"{n_rows} rows unconsumed (reach {r}, consumption offsets "
+                        f"{sorted({int(o) for o in reach})}). D-007 forbids "
+                        "dropping; an unconsumed emigrant is a particle about to "
+                        "be destroyed. (Pooled pass: the displacement histogram "
+                        "the serial census prints needs rows whose scratch slot "
+                        "may be reused -- re-run serial for the full census.)"
+                    )
+                emig_sym.discard(s2)
+        peak_staged = max(peak_staged, len(staged_sym))
+        if max_staged_slabs is not None and peak_staged > int(max_staged_slabs):
+            raise ValueError(
+                f"the migration is holding {peak_staged} slabs against a budget of "
+                f"{max_staged_slabs}. The drift reaches {r_raw} bricks on a "
+                f"{nb}-brick grid, so {2 * r + 1} slabs must be in flight.\n"
+                f"  c_drift={c_drift:.6g}, max vel_scale={float(np.max(scales)):.6g}, "
+                f"max |dx| = {abs(float(c_drift)) * float(np.max(scales)) * INT16_MAX:.6g} against a "
+                f"brick of {float(st.t9.box_size) / nb:.6g}.\n"
+                "  Reduce the step size, use a coarser brick, or raise the budget "
+                "deliberately -- staging is bounded by (2 * reach + 1) slabs, so "
+                "this is a real memory cost and not a formality."
+            )
+    if len(inserted) != nb:
+        raise AssertionError(f"{nb - len(inserted)} slabs were never written back")
+    n_after = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    if n_after != n_before:
+        raise ValueError(
+            f"the migration lost {n_before - n_after} particles ({n_before} -> "
+            f"{n_after} against {st.n_particles} stored). D-007 forbids dropping, "
+            "so this is corruption, not imprecision.\n"
+            f"  {len(inserted)} of {nb} slabs inserted, arena {st.arena_used}/"
+            f"{st.n_arena} (pooled pass)\n"
+            "  LEADING CAUSE: the slab schedule releases a staged row once its "
+            "destination is written, which assumes a particle moves at most ONE "
+            "brick per axis per step. A larger drift breaks it -- reduce the "
+            "step size, or generalize the staging to the realized displacement."
+        )
+    row_b = 8 + 3 + 6 + 4 + (4 if st.ids is not None else 0)
+    return dict(n_arena_overflow=n_over, arena_used=st.arena_used,
+                vel_scale=float(np.max(st.vel_scale)),
+                vel_scale_min=float(np.min(st.vel_scale)),
+                n_migrated_checked=n_after, brick_reach=r, brick_reach_raw=r_raw,
+                brick_reach_realized=realized_reach, peak_staged_slabs=peak_staged,
+                migrate_pool=dict(workers=int(pool.workers), window=K,
+                                  slot_rows=slot_rows,
+                                  scratch_mb=K * slot_rows * row_b / 1e6,
+                                  spill_rows=spill_rows, spill_bytes=spill_bytes,
+                                  eject_busy_s=eject_busy, insert_busy_s=insert_busy,
+                                  # the compiled-kernel receipt, summed from the
+                                  # workers (the parent's counter cannot see them)
+                                  eject_jax_calls=eject_jax_calls))
+
+
 # ===========================================================================
 # the container
 # ===========================================================================
@@ -1038,7 +1241,7 @@ class SlotState:
         nb = self.bricks_per_side
         return int(bx) * nb * nb, (int(bx) + 1) * nb * nb
 
-    def _eject_slab_jax(self, bx, c_drift, scales):
+    def _eject_slab_jax(self, bx, c_drift, scales, release_arena=True):
         """`_eject_slab` with the drift and the partition compiled.
 
         Same contract, same return value, same mutations, and gated elementwise
@@ -1083,8 +1286,11 @@ class SlotState:
                 continue
             # the release, identical to the numpy path INCLUDING the surgical
             # index drop (5g: invalidating the whole index was 51% of an
-            # arena-occupied migrate)
-            if len(a):
+            # arena-occupied migrate). `release_arena=False` skips it for a
+            # pooled worker, whose parent replays the release in serial order
+            # (`_release_brick_arena`) -- a worker that released here would
+            # change the free list other claims are ordered against.
+            if release_arena and len(a):
                 self.arena_bucket[a - self.arena_base] = -1
                 if self._arena_by_brick is not None:
                     self._arena_by_brick.pop(int(b), None)
@@ -1113,7 +1319,7 @@ class SlotState:
                     src=src_out[n_keep:].astype(np.int32))
         return keep, emig
 
-    def _eject_slab(self, bx, c_drift, scales, kernel="numpy"):
+    def _eject_slab(self, bx, c_drift, scales, kernel="numpy", release_arena=True):
         """Drift one slab's particles and split them into keepers and leavers.
 
         Reads the state; writes NOTHING back. That phase separation is what makes
@@ -1129,7 +1335,7 @@ class SlotState:
         change to those lines (umbrella `ab_arms_sharing_code_are_policy_blind`).
         """
         if kernel == "jax":
-            return self._eject_slab_jax(bx, c_drift, scales)
+            return self._eject_slab_jax(bx, c_drift, scales, release_arena=release_arena)
         if kernel != "numpy":
             raise ValueError(f"unknown eject kernel {kernel!r}; expected 'numpy' or 'jax'")
         lo_b, hi_b = self.slab_bricks(bx)
@@ -1148,7 +1354,9 @@ class SlotState:
             # freed once its brick has been ejected, so a concurrent `_to_arena`
             # cannot claim a row that still holds live state.
             a_free = self.arena_slots_of_brick(b)
-            if len(a_free):
+            # `release_arena=False`: a pooled worker must leave the free list
+            # untouched -- the parent replays this release in serial order.
+            if release_arena and len(a_free):
                 self.arena_bucket[a_free - self.arena_base] = -1
                 # Releasing brick b's rows changes the index by EXACTLY one key,
                 # so drop that key instead of invalidating the whole cache. The
@@ -1196,7 +1404,9 @@ class SlotState:
             _cat(e_dest, e_off, e_w, e_id, src=e_src),
         )
 
-    def _insert_slab(self, bx, staged, emig, reach=(-1, 0, 1), consumed=None, scales=None):
+    def _insert_slab(
+        self, bx, staged, emig, reach=(-1, 0, 1), consumed=None, scales=None, spill_sink=None
+    ):
         """Write one slab's bricks back: keepers + immigrants + arena residents.
 
         Every brick's final membership passes through an O(brick) buffer here, so
@@ -1291,10 +1501,10 @@ class SlotState:
                         imm["ids"][sel_i] if has_i else np.empty(0, np.int32),
                     ]
                 )
-            n_over += self._write_brick(b, dest, off, w, ids)
+            n_over += self._write_brick(b, dest, off, w, ids, spill_sink=spill_sink)
         return n_over
 
-    def _write_brick(self, b, dest, off, w, ids=None):
+    def _write_brick(self, b, dest, off, w, ids=None, spill_sink=None):
         """Counting-sort one brick's members by bucket and write the run.
 
         Re-bucketing is a PERMUTATION, not the monotone rearrangement `repack`
@@ -1314,9 +1524,17 @@ class SlotState:
             keep_n = cap
             spill = order[keep_n:]
             n_over = len(spill)
-            self._to_arena(
-                dest[spill], off[spill], w[spill], None if ids is None else ids[spill]
-            )
+            # `spill_sink`: a pooled worker must not claim -- slot assignment is
+            # order-dependent (lowest-free-first), so the rows go back to the
+            # parent, which claims via `_to_arena` at this brick's serial point.
+            if spill_sink is None:
+                self._to_arena(
+                    dest[spill], off[spill], w[spill], None if ids is None else ids[spill]
+                )
+            else:
+                spill_sink(
+                    b, dest[spill], off[spill], w[spill], None if ids is None else ids[spill]
+                )
             order = order[:keep_n]
             within, dest, off, w = within[order], dest[order], off[order], w[order]
             if ids is not None:
@@ -1374,6 +1592,24 @@ class SlotState:
         self.w[self.arena_base + a] = w
         if ids is not None:
             self.ids[self.arena_base + a] = ids
+
+    def _release_brick_arena(self, b):
+        """Release brick b's arena rows without ejecting it.
+
+        The third copy of the eject-side release, and the duplication is as
+        deliberate as the other two (`_eject_slab` / `_eject_slab_jax` carry it
+        "line for line" because a divergence there is a lost particle). This
+        one exists for the pooled migrate's parent-side replay: workers eject
+        with `release_arena=False`, and the parent re-runs each slab's release
+        at its serial schedule point so the free list every `_to_arena` claim
+        is ordered against evolves exactly as the serial pass's.
+        """
+        a_free = self.arena_slots_of_brick(b)
+        if len(a_free):
+            self.arena_bucket[a_free - self.arena_base] = -1
+            if self._arena_by_brick is not None:
+                self._arena_by_brick.pop(int(b), None)
+            self._arena_free = None
 
     def _repack_reference(self, brick_slack=0.10):
         """The out-of-place repack, KEPT AS THE IDENTITY ORACLE for `repack`.
