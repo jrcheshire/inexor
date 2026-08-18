@@ -1,5 +1,7 @@
 """The v2 engine core: BullFrog PM on T9 state in slot order (M-v2-3, S5)."""
 
+import os
+
 import numpy as np
 import pytest
 
@@ -711,3 +713,128 @@ def test_the_subblock_containment_guard_fires_on_a_wrong_cuboid():
     engine._assert_stencil_contained(
         x_ok, cell, np.array([5, 5, 5]), np.array([7, 7, 7]), N_COARSE
     )
+
+
+# --------------------------------------------------------------------------
+# M-v2-6 Stage 4(b): checkpoint and resume
+
+
+def _ck_state(cfg, seed=0):
+    _, _, st = _state(cfg, seed=seed)
+    return st
+
+
+def _rows(st):
+    """Container content with allocation layout and intra-bucket order divided
+    out -- the normal form the writer's round-trip gate uses. Raw array
+    equality is the wrong invariant: a reloaded state's `brick_start` comes
+    from `_alloc_geometry`, not from the run that produced it."""
+    out = []
+    for b in range(st.n_bricks):
+        slots = st.brick_member_slots(b)
+        live = st.brick_live_count(b)
+        keys = np.concatenate([
+            st.bucket_flat_of_live_slots(b),
+            st.arena_bucket[slots[live:] - st.arena_base],
+        ])
+        out.append(np.column_stack([keys, st.off[slots], st.w[slots]]).astype(np.int64))
+    r = np.concatenate(out)
+    return r[np.lexsort(r.T[::-1])]
+
+
+def _coeffs(k=6):
+    return bullfrog_float_coeffs(bullfrog_table(a_grid(0.1, 1.0, k, "log"), Cosmology()))
+
+
+def test_resumed_run_is_bitwise_the_uninterrupted_one(tmp_path):
+    """THE Stage 4(b) gate: six steps straight through, against six steps
+    interrupted after the third and resumed from disk, particle for particle.
+
+    NB the interrupted arm runs the FULL schedule and stops, rather than
+    running a truncated one. `fused_drifts` fuses the trailing half-drift of
+    each step with the leading half of the next, so a run over `coeffs[:3]` is
+    a different trajectory, not the first half of this one.
+
+    What this gate CATCHES: the lead drift being reapplied on resume, which
+    would move the whole box an extra half step (mutation-checked, fails).
+
+    What it does NOT catch, stated because the docstring claimed otherwise
+    first: `cap_shape` / `pad_shape` not being restored. Both are flat at this
+    geometry (5161 at every step), so re-laddering from zero reaches the same
+    value and the mutation is vacuous. Measured separately rather than assumed
+    -- quadrupling both shapes on resume moves 0 of ~229k rows, since the
+    padded rows are masked -- so on arm64 CPU at this scale the restore is a
+    compile-count choice, not a correctness one. A GPU arm, where XLA
+    reassociates by shape, is not covered by that measurement."""
+    co = _coeffs(6)
+    ref = _ck_state(_cfg())
+    engine.run(ref, _cfg(), co)
+
+    # the interrupted arm: same schedule, checkpoints at steps 3 and 6
+    d = str(tmp_path / "ck")
+    cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=3)
+    st = _ck_state(cfg_c)
+    out = engine.run(st, cfg_c, co)
+    assert [o["checkpoint"] is not None for o in out] == [False, False, True] * 2
+
+    # drop the newer generation's manifest: what an interrupted write leaves,
+    # and what makes step 3 the newest COMPLETE checkpoint
+    os.remove(os.path.join(d, "gen1", "manifest.json"))
+    st_r, resume = engine.load_checkpoint(d, _cfg(), co, arena_frac=0.05)
+    assert int(resume["step"]) == 3, "fell back to the wrong generation"
+
+    engine.run(st_r, _cfg(), co, resume=resume)
+    np.testing.assert_array_equal(_rows(ref), _rows(st_r))
+
+
+def test_load_checkpoint_refuses_a_foreign_run(tmp_path):
+    """A resume under a different geometry or a different schedule does not
+    fail loudly on its own -- it produces a run that is half one thing and half
+    another. The fingerprint covers `coeffs` as bytes, so the cosmology, the
+    a-grid and K are all in it."""
+    d = str(tmp_path / "ck")
+    cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=1)
+    engine.run(_ck_state(cfg_c), cfg_c, _coeffs(4))
+
+    with pytest.raises(ValueError, match="different configuration or schedule"):
+        engine.load_checkpoint(d, _cfg(), _coeffs(5))          # different schedule
+    with pytest.raises(ValueError, match="different configuration or schedule"):
+        engine.load_checkpoint(d, _cfg(frac_bits=11), _coeffs(4))   # different geometry
+    # execution policy is deliberately NOT fingerprinted: resuming onto another
+    # node with a different worker count is the point of having checkpoints
+    engine.load_checkpoint(d, _cfg(tile_workers=2, eject_kernel="numpy"), _coeffs(4),
+                           arena_frac=0.05)
+
+
+def test_checkpointing_is_off_without_a_directory_and_disablable_with_zero(tmp_path):
+    """`checkpoint_every=0` is the off switch, the `repack_every` idiom. With no
+    directory the machinery is inert rather than a refusal, because the default
+    config has none and every single-process caller would otherwise raise -- so
+    the RECEIPT is what proves it applied."""
+    co = _coeffs(3)
+    out = engine.run(_ck_state(_cfg()), _cfg(), co)
+    assert all(o["checkpoint"] is None for o in out)
+
+    d = str(tmp_path / "off")
+    cfg0 = _cfg(checkpoint_dir=d, checkpoint_every=0)
+    out0 = engine.run(_ck_state(cfg0), cfg0, co)
+    assert all(o["checkpoint"] is None for o in out0)
+    assert not os.path.exists(d)
+
+
+def test_checkpointing_refuses_a_state_carrying_ids(tmp_path):
+    """The schema has no ids, and a checkpoint that dropped them would make the
+    restart non-reproducible for anything id-dependent. It has to refuse before
+    the first step, not 37 minutes into it."""
+    cfg_c = _cfg(checkpoint_dir=str(tmp_path / "ck"), checkpoint_every=1)
+    st = _ck_state(cfg_c, seed=1)
+    st.ids = np.arange(len(st.off), dtype=np.int64)
+    with pytest.raises(ValueError, match="carries ids"):
+        engine.run(st, cfg_c, _coeffs(2))
+
+
+def test_load_checkpoint_refuses_when_nothing_is_complete(tmp_path):
+    d = str(tmp_path / "empty")
+    os.makedirs(os.path.join(d, "gen0"))
+    with pytest.raises(FileNotFoundError, match="no complete inexor checkpoint"):
+        engine.load_checkpoint(d, _cfg(), _coeffs(2))

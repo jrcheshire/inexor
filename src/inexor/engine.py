@@ -45,6 +45,9 @@ global `(n,3)` f64 arrays that would otherwise appear are 206 GB each at C-gh,
 and deleting them is what makes that configuration runnable.
 """
 
+import hashlib
+import json
+import os
 import time
 
 import numpy as np
@@ -69,8 +72,8 @@ from .painting import check_tsc_paint_headroom, paint_tsc_int, paint_tsc_int_sub
 from .state import drift_and_migrate, drift_and_migrate_pooled
 
 __all__ = [
-    "EngineConfig", "apply_result", "coarse_delta_streamed", "float_run_bullfrog_sync",
-    "run", "step", "tile_task",
+    "EngineConfig", "apply_result", "checkpoint_fingerprint", "coarse_delta_streamed",
+    "float_run_bullfrog_sync", "load_checkpoint", "run", "step", "tile_task",
 ]
 
 
@@ -115,6 +118,8 @@ class EngineConfig:
         worker_affinity=True,
         migrate_pooled=None,
         migrate_window=None,
+        checkpoint_dir=None,
+        checkpoint_every=1,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -199,6 +204,18 @@ class EngineConfig:
         # feed the workers (see the driver's docstring for the floor).
         self.migrate_pooled = None if migrate_pooled is None else bool(migrate_pooled)
         self.migrate_window = None if migrate_window is None else int(migrate_window)
+        # M-v2-6 Stage 4(b): checkpoint after every `checkpoint_every` steps into
+        # `checkpoint_dir`, alternating two generations. Cadence is in STEPS and
+        # never in wall-clock, because at production scale one step is 37 min at
+        # C-gh and 7.75 h at C-hero, so a step IS the granularity -- there is no
+        # coherent state between two of them to write (positions sit at
+        # midpoints, velocities at boundaries). 0 disables, the `repack_every`
+        # idiom. Checkpointing is inert without a directory rather than a
+        # refusal, because the default config has no directory and every
+        # single-process caller would otherwise start raising; the receipt in
+        # the per-step stats is what proves it applied.
+        self.checkpoint_dir = None if checkpoint_dir is None else str(checkpoint_dir)
+        self.checkpoint_every = int(checkpoint_every)
 
     @property
     def np_coarse_dtype(self):
@@ -1158,7 +1175,117 @@ def fused_drifts(coeffs):
     return float(h[0]), np.concatenate([h[:-1] + h[1:], h[-1:]])
 
 
-def run(st, cfg, coeffs, collect=None, census=False, phase=None):
+
+# ------------------------------------------------------------- checkpoints
+
+# The config fields a resumed run must match. Deliberately NOT every attribute:
+# these are the ones that move numbers, either as physics/geometry or as a
+# BUFFER SHAPE, and a shape belongs here because XLA reassociates by shape and
+# a padded reduction can move bits (the pad-and-mask lesson). Excluded on
+# purpose, with the reason each is safe to change across a resume:
+#   tile_workers, worker_affinity, migrate_pooled, migrate_window -- execution
+#     policy; the pooled migrate is bitwise the serial one (C14) and W is
+#     exactly the thing you want to change when resuming onto another node.
+#   eject_kernel -- both kernels are bitwise on arm64/x86/CUDA (record 5s).
+#   repack_every, chunk_bricks, brick_slack -- move the LAYOUT, and the layout
+#     carries no physics: both paints are integer and so order-independent
+#     (D-v2-21), which is also why this checkpoint does not preserve
+#     allocation geometry at all.
+#   checkpoint_dir, checkpoint_every -- the mechanism itself.
+_FINGERPRINTED = (
+    "box_size", "n_part", "n_fine", "n_coarse", "n_tile", "b_fine", "alpha",
+    "paint_short", "paint_long", "frac_bits", "coarse_dtype", "fine_dtype",
+    "cap_rungs", "pad_ladder", "paint_subblock",
+)
+
+
+def checkpoint_fingerprint(cfg, coeffs):
+    """What a resume must match. Covers the schedule too: `coeffs` is hashed as
+    bytes, so the cosmology, the a-grid and K are all in here without the
+    checkpoint having to name them or the caller having to pass a cosmology."""
+    h = hashlib.sha256()
+    h.update(json.dumps({k: getattr(cfg, k) for k in _FINGERPRINTED}, sort_keys=True).encode())
+    h.update(np.ascontiguousarray(coeffs, dtype=np.float64).tobytes())
+    return h.hexdigest()
+
+
+def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen):
+    """One generation of a rolling pair. Returns the directory, which is the
+    receipt: a run that believed it was checkpointing and was not has `None`
+    on every step."""
+    from . import icgen
+
+    d = os.path.join(cfg.checkpoint_dir, f"gen{gen}")
+    icgen.write_t9_slabs(st, d, provenance=dict(
+        kind="inexor-checkpoint",
+        step=int(step),
+        n_steps=int(len(coeffs)),
+        cap_shape=int(cap_shape),
+        pad_shape=int(pad_shape),
+        n_arena=int(st.n_arena),
+        fingerprint=checkpoint_fingerprint(cfg, coeffs),
+    ))
+    return d
+
+
+def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=0.10,
+                    arena_frac=None):
+    """Newest complete checkpoint under `checkpoint_dir` -> `(st, resume)`.
+
+    Picks by the recorded step rather than by mtime, and only among generations
+    whose manifest is present -- the manifest is removed before a rewrite and
+    written last, so a torn generation is invisible here and the older one
+    survives. That is the whole reason there are two.
+
+    Refuses a fingerprint mismatch. Resuming a state under a different geometry
+    or a different schedule would not fail, it would produce a run that is half
+    one thing and half another, and nothing downstream could see it.
+
+    Capacity is the caller's to choose and is not restored from the file: this
+    format stores membership, not allocation. `brick_slack` defaults to the
+    config's and `arena_frac` to whatever the checkpoint recorded, which
+    reproduces a comparable container without claiming to reproduce the same one.
+    """
+    from . import icgen
+
+    best = None
+    for gen in (0, 1):
+        d = os.path.join(checkpoint_dir, f"gen{gen}")
+        mpath = os.path.join(d, icgen.MANIFEST)
+        if not os.path.exists(mpath):
+            continue
+        with open(mpath) as fh:
+            man = json.load(fh)
+        prov = man.get("provenance", {})
+        if prov.get("kind") != "inexor-checkpoint":
+            continue
+        if best is None or int(prov["step"]) > int(best[1]["step"]):
+            best = (d, prov, man)
+    if best is None:
+        raise FileNotFoundError(
+            f"no complete inexor checkpoint under {checkpoint_dir}: either nothing ran, or "
+            "every generation was interrupted mid-write (the manifest is removed first and "
+            "written last, so a torn generation is deliberately unloadable)"
+        )
+    d, prov, man = best
+    want = checkpoint_fingerprint(cfg, coeffs)
+    if prov.get("fingerprint") != want:
+        raise ValueError(
+            f"{d} was written under a different configuration or schedule "
+            f"(fingerprint {prov.get('fingerprint')} != {want}); resuming would splice two "
+            "different runs together and nothing downstream would notice"
+        )
+    if arena_frac is None:
+        arena_frac = int(prov["n_arena"]) / max(1, int(man["n_particles"]))
+    st = icgen.load_slot_state(
+        d,
+        brick_slack=cfg.brick_slack if brick_slack is None else brick_slack,
+        alloc_margin=alloc_margin,
+        arena_frac=arena_frac,
+    )
+    return st, dict(prov)
+
+def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None):
     """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`.
 
     `phase` is forwarded to `step`; see its docstring. The boundaries `run`
@@ -1167,6 +1294,15 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None):
     """
     cfg.validate()
     ph = phase if phase is not None else _no_phase
+    ckpt_on = bool(cfg.checkpoint_dir) and cfg.checkpoint_every > 0
+    if ckpt_on and st.ids is not None:
+        # fail here, not 37 minutes into the first step: the slab schema has no
+        # ids and a checkpoint that dropped them would make the restart
+        # non-reproducible for anything id-dependent
+        raise ValueError(
+            "checkpointing a state that carries ids: the t9-slabs-2 schema has no room "
+            "for them, so the resumed run would silently lose particle identity"
+        )
     pool = None
     if cfg.tile_workers > 1:
         # the pool's workers each build their own kernels + jitted program, so
@@ -1194,12 +1330,17 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None):
     try:
         lead, fused = fused_drifts(coeffs)
         # onto the first midpoint; pooled under the same knob as the per-step
-        # migrate (5j: this ONE call was mistaken for a per-step phase once)
-        if pool is not None and cfg.migrate_pooled is not False:
-            drift_and_migrate_pooled(st, lead, pool, kernel=cfg.eject_kernel,
-                                     window=cfg.migrate_window)
-        else:
-            drift_and_migrate(st, lead, kernel=cfg.eject_kernel)
+        # migrate (5j: this ONE call was mistaken for a per-step phase once).
+        # SKIPPED on a resume -- the checkpointed state is already past it, and
+        # applying it twice would drift the whole box by an extra half step.
+        # The phase boundary still fires so a resumed run's phase table keeps
+        # the same shape as an uninterrupted one (the `reconcile` precedent).
+        if resume is None:
+            if pool is not None and cfg.migrate_pooled is not False:
+                drift_and_migrate_pooled(st, lead, pool, kernel=cfg.eject_kernel,
+                                         window=cfg.migrate_window)
+            else:
+                drift_and_migrate(st, lead, kernel=cfg.eject_kernel)
         ph("lead_drift")
         out = []
         # both buffer shapes are carried ACROSS steps and only ever grow, so the
@@ -1207,7 +1348,22 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None):
         # Stage 0, `coarse_pad` from Stage 0b, which measured it still churning
         cap_shape = 0
         pad_shape = 0
-        for k in range(len(fused)):
+        k0 = 0
+        if resume is not None:
+            # Both shapes are RESTORED rather than re-laddered from zero, so a
+            # resumed run keeps the "few shapes per run" property instead of
+            # paying a fresh compile. This is a COMPILE-COUNT choice and not a
+            # correctness one: measured 2026-08-18 at cdev scale on arm64 CPU,
+            # quadrupling both shapes on resume moves nothing (0 of ~229k rows
+            # on `off` and `w`), because the padded rows are masked. The
+            # split-run gate therefore cannot see this and does not claim to;
+            # what it does catch is the lead drift being reapplied. Not
+            # generalized to GPU, where XLA reassociates by shape.
+            k0 = int(resume["step"])
+            cap_shape = int(resume["cap_shape"])
+            pad_shape = int(resume["pad_shape"])
+        n_ckpt = 0
+        for k in range(k0, len(fused)):
             stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
                          census=census, cap_shape=cap_shape, pad_shape=pad_shape,
                          phase=phase, tile_force=tile_force, pool=pool)
@@ -1216,6 +1372,16 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None):
             if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
                 stats["repack"] = st.repack(brick_slack=cfg.brick_slack)
                 ph("repack")
+            # AFTER the repack, so the checkpoint is the step's settled state.
+            # The receipt goes on every step in both directions, `None` when
+            # checkpointing is off: a knob must prove it applied.
+            stats["checkpoint"] = None
+            if ckpt_on and (k + 1) % cfg.checkpoint_every == 0:
+                stats["checkpoint"] = _write_checkpoint(
+                    st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2
+                )
+                n_ckpt += 1
+                ph("checkpoint")
             out.append(stats)
         return out
     finally:

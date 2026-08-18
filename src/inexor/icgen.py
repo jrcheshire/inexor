@@ -459,6 +459,14 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False):
             "pass drop_ids=True to write the state without them"
         )
     os.makedirs(workdir, exist_ok=True)
+    # FIRST, before a single slab moves. Writing into a directory that already
+    # holds a checkpoint would otherwise leave the OLD manifest standing over a
+    # half-replaced set of slabs, and that mixture loads clean: every slab's
+    # crc32 lives in its own file and so agrees with whichever generation wrote
+    # it. Removing the manifest up front makes a torn write refuse instead.
+    mpath = os.path.join(workdir, MANIFEST)
+    if os.path.exists(mpath):
+        os.remove(mpath)
     nb = st.bricks_per_side
     p3 = st.buckets_per_brick
     nbb = nb * nb                      # bricks per x-slab; a brick is in exactly one
@@ -535,6 +543,6 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False):
         provenance=provenance or {},
     )
     # LAST, and that is the completeness marker `load_slot_state` refuses on.
-    with open(os.path.join(workdir, MANIFEST), "w") as fh:
+    with open(mpath, "w") as fh:
         json.dump(manifest, fh, indent=1)
     return manifest

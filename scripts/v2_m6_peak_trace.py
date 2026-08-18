@@ -123,7 +123,7 @@ GATE_SIGMA = 2.0
 PHASES = (
     "kernel_build", "lead_drift", "coarse_paint", "coarse_solve", "membership",
     "tile_decode", "tile_short", "tile_long", "tile_reduce",
-    "tile_loop_end", "reconcile", "migrate", "repack",
+    "tile_loop_end", "reconcile", "migrate", "repack", "checkpoint",
 )
 
 
