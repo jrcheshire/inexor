@@ -206,8 +206,8 @@ class EngineConfig:
         self.migrate_window = None if migrate_window is None else int(migrate_window)
         # M-v2-6 Stage 4(b): checkpoint after every `checkpoint_every` steps into
         # `checkpoint_dir`, alternating two generations. Cadence is in STEPS and
-        # never in wall-clock, because at production scale one step is 37 min at
-        # C-gh and 7.75 h at C-hero, so a step IS the granularity -- there is no
+        # never in wall-clock, because at full scale one step is 37 min at 2048^3
+        # and 7.75 h at 4096^3, so a step IS the granularity -- there is no
         # coherent state between two of them to write (positions sit at
         # midpoints, velocities at boundaries). 0 disables, the `repack_every`
         # idiom. Checkpointing is inert without a directory rather than a

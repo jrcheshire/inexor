@@ -258,7 +258,7 @@ def pk_summary_card(
         n_edges = 64 if edges is None else len(np.asarray(edges)) - 1
         raise ValueError(
             f"no bin reached min_weight={min_weight} modes at n_coarse={n}: "
-            f"{n_edges} bins over [0, k_Nyquist/2] is sized for a production mesh. "
+            f"{n_edges} bins over [0, k_Nyquist/2] is sized for a full-scale coarse mesh. "
             "Widen the bins (`edges`) or lower `min_weight` -- an empty card is not a card."
         )
 
