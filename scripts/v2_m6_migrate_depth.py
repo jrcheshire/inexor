@@ -133,16 +133,33 @@ def _build(n_part, nb, box, seed=SEED, brick_slack=0.10, arena_frac=0.20):
                                  arena_frac=arena_frac)
 
 
-def _timed_migrate(st, c_drift):
+def _eject_jax_calls():
+    """The compiled path's cumulative call count, 0 if never imported.
+
+    The phase probe's receipt, verbatim: a jax leg whose count stays 0 measured
+    nothing (its own default once shadowed the library's, and the suite stayed
+    green through it)."""
+    mod = sys.modules.get("inexor.eject_jax")
+    return int(getattr(mod, "CALLS", 0)) if mod is not None else 0
+
+
+def _timed_migrate(st, c_drift, kernel=None):
     """One `drift_and_migrate` with eject/insert timed and MIGRANTS counted.
 
     Same class-level wrap as `v2_m6_insert_scaling._timed_migrate`; extended
     here (rather than imported) because the emigrant count only exists inside
     the eject return values, which that wrapper discards.
+
+    `kernel=None` omits the argument, so the callee's own default (numpy)
+    applies and every pre-existing card stays comparable. The dispatch nests
+    INSIDE `_eject_slab` (state.py:1132), so the class-level wrap times both
+    kernels through the one seam; `eject_jax_calls` on the result is the
+    receipt that the requested kernel actually ran.
     """
     cls = type(st)
     orig_e, orig_i = cls._eject_slab, cls._insert_slab
     acc = {"eject_s": 0.0, "insert_s": 0.0, "n_emig": 0}
+    jax_calls_0 = _eject_jax_calls()
 
     def eject(self, *a, **k):
         t0 = time.perf_counter()
@@ -162,17 +179,20 @@ def _timed_migrate(st, c_drift):
     cls._eject_slab, cls._insert_slab = eject, insert
     try:
         t0 = time.perf_counter()
-        stats = state.drift_and_migrate(st, c_drift)
+        stats = state.drift_and_migrate(
+            st, c_drift, **({} if kernel is None else {"kernel": kernel}))
         acc["total_s"] = time.perf_counter() - t0
     finally:
         cls._eject_slab, cls._insert_slab = orig_e, orig_i
+    acc["eject_jax_calls"] = _eject_jax_calls() - jax_calls_0
     for k in ("brick_reach", "brick_reach_realized", "peak_staged_slabs",
               "arena_used", "n_arena_overflow"):
         acc[k] = int(stats[k])
     return acc
 
 
-def run_config(name, cfg, brick_slack=0.10, arena_frac=0.20, calls=1):
+def run_config(name, cfg, brick_slack=0.10, arena_frac=0.20, calls=1,
+               eject_kernel=None):
     print(f"== {name}: n_part={cfg['n_part']} nb={cfg['nb']} box={cfg['box']} "
           f"slack={brick_slack} arena={arena_frac} calls={calls}")
     extent = cfg["box"] / cfg["nb"]
@@ -196,10 +216,10 @@ def run_config(name, cfg, brick_slack=0.10, arena_frac=0.20, calls=1):
             chain_t, chain_a = [], []
             try:
                 for _ in range(int(calls) - 1):
-                    warm = _timed_migrate(st, f * c1)
+                    warm = _timed_migrate(st, f * c1, kernel=eject_kernel)
                     chain_t.append(warm["total_s"])
                     chain_a.append(warm["arena_used"])
-                r_last = _timed_migrate(st, f * c1)
+                r_last = _timed_migrate(st, f * c1, kernel=eject_kernel)
             except (RuntimeError, ValueError) as exc:
                 # the D-007 arena/capacity refusal: a REFUSED rung is a marked
                 # row, not a lost card -- slack-0 arms push migrant volumes the
@@ -228,6 +248,7 @@ def run_config(name, cfg, brick_slack=0.10, arena_frac=0.20, calls=1):
             peak_staged_slabs=reps[-1]["peak_staged_slabs"],
             arena_used=reps[-1]["arena_used"],
             n_arena_overflow=reps[-1]["n_arena_overflow"],
+            eject_jax_calls=int(reps[-1]["eject_jax_calls"]),
         )
         r["void"] = r["brick_reach"] != target
         rungs.append(r)
@@ -241,6 +262,7 @@ def run_config(name, cfg, brick_slack=0.10, arena_frac=0.20, calls=1):
     out = dict(config=name, **{k: cfg[k] for k in ("n_part", "nb", "box", "repeats")},
                n_particles=cfg["n_part"] ** 3, brick_slack=brick_slack,
                arena_frac=arena_frac, calls=calls,
+               eject_kernel_requested=eject_kernel,
                n_bricks=int(cfg["nb"]) ** 3,
                rows_per_brick=cfg["n_part"] ** 3 / float(cfg["nb"]) ** 3,
                rungs=rungs)
@@ -299,8 +321,21 @@ def main():
                     help="cProfile one migrate at the deepest rung and print "
                          "the top N by cumulative time. RANKING only -- the "
                          "profiler's own overhead makes the seconds unusable.")
+    ap.add_argument("--eject-kernel", default=None, choices=("numpy", "jax"),
+                    help="`migrate`'s row kernel. Default None = the callee's "
+                         "own default (numpy), so every pre-existing card stays "
+                         "comparable. Each rung carries eject_jax_calls as the "
+                         "receipt: a jax rung reading 0 measured nothing.")
     ap.add_argument("--out", default=os.path.join("runs", "v2", "m6_migrate_depth.json"))
     a = ap.parse_args()
+
+    if a.eject_kernel == "jax":
+        # callers opt in; library code never toggles it (repo convention). The
+        # compiled eject REFUSES without x64 (int64 lattice index would narrow),
+        # which is how the omission announced itself here.
+        import jax
+
+        jax.config.update("jax_enable_x64", True)
 
     # card written after EVERY config, so a death in a late rung cannot lose a
     # finished config's rungs (the raw-series-survive-a-wrong-reduction rule)
@@ -308,7 +343,8 @@ def main():
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     for name in a.config:
         results.append(run_config(name, CONFIGS[name], brick_slack=a.brick_slack,
-                                  arena_frac=a.arena_frac, calls=a.calls))
+                                  arena_frac=a.arena_frac, calls=a.calls,
+                                  eject_kernel=a.eject_kernel))
         with open(a.out, "w") as fh:
             json.dump(dict(results=results, partial=(len(results) < len(a.config))),
                       fh, indent=1)
@@ -467,7 +503,9 @@ def main():
                         brick_slack=a.brick_slack, arena_frac=a.arena_frac)
             pr = cProfile.Profile()
             pr.enable()
-            state.drift_and_migrate(st, deep["c_drift"])
+            state.drift_and_migrate(
+                st, deep["c_drift"],
+                **({} if a.eject_kernel is None else {"kernel": a.eject_kernel}))
             pr.disable()
             pstats.Stats(pr).sort_stats("cumulative").print_stats(int(a.profile))
 
