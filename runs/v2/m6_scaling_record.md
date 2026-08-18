@@ -1473,6 +1473,121 @@ footprint of the compiled path remains unmeasured**, bounded only by "more than
 - **The radix fix at the engine on gg.** Both arms carry it, as on antares.
 - **The parent's memory cost**, per above.
 
+## 5t. Vista 918169 -- C11: what the HARDWARE does during a step, and it is two different problems
+
+**One gg job, ~30 min, ~0.17 SU. Seven legs rc=0, two rc=2 (instrument
+non-neutrality, pre-registered as a reportable state), one rc=137 (the membind0
+arm, OOM-killed -- itself a finding). Instrument: `scripts/v2_m6_c11_hw_util.py`
+(a /proc sidecar sampler + one pinned triad CANARY per socket whose slowdown
+against its own in-job idle baseline is a measured bandwidth-contention signal)
+joined to wall-clock phase boundary timestamps. Cards
+`runs/v2/m6_c11_*.json`.**
+
+### The verdict: half the step runs on an idle machine, the other half is near the bandwidth ceiling
+
+Per phase at cgh64 W=16 (canaries account for 2.0 of the busy cores, measured
+in the baseline window):
+
+| phase | s/step | busy cores /144 | canary loss s0/s1 | reading |
+|---|---|---|---|---|
+| migrate | ~26.6 | 3.4 | -4% / +5% | serial code, idle machine |
+| tile loop | ~20.7 | 37.9 (19+19) | 39% / 41% | bandwidth-loaded, BOTH sockets |
+| coarse_paint | ~5.6 | 41.9 (21+21) | 38% / 39% | bandwidth-loaded, both sockets |
+| repack | ~4.9 | 3.2 | ~0% | serial, idle |
+| lead_drift | 22 s/run | 4.3 | -5% / +6% | serial, idle; amortizes at K=40 |
+
+Same-job ceilings (`stream` legs, triad convention): **39.5 GB/s one core, 479
+GB/s one socket, 951 GB/s both, 299 GB/s cross-NUMA; 16 pure streamers on one
+socket already reach 349 GB/s.** So the tile/paint phases sit within roughly
+1.5-2x of saturation -- consistent with W=32 having bought 1.2% (5j) -- while
+migrate+repack (~47% of the step) leave 142 cores and a full socket's bandwidth
+unused. **The wall problem and the bandwidth problem are different phases.**
+
+### Pre-registrations
+
+- (a) **HELD, both halves**: tile-loop canary loss >=20% on at least one socket
+  (measured ~40% on both); migrate <10% contention AND <=4 busy cores.
+- (b) **HELD**: disk+Lustre during stepping = 25 MB total against a <100 MB
+  bar; iowait <=0.4 cores everywhere. Scratch rates measured 0.96 write / 1.76
+  read GB/s (matches the M-v2-5 staging numbers).
+- (c) **MISSED, rc=2**: instrument overhead +6.38 s on a 191.8 s control =
+  3.3% against the 2% bound. The canaries add ~78 GB/s of probe traffic, so
+  the contention percentages are mildly self-inflated and phase walls read ~3%
+  high. Directional conclusions (40% vs 0%) are unaffected; do not quote the
+  walls in this section as clean phase times -- 5s owns those.
+- (d) **MISSED, informatively: the membind0 arm was OOM-KILLED 323 s in.**
+  Strictly binding the W=16 cgh64 run to socket 0's ~118 GB does not run at
+  all, so single-socket residency is not an option at this scale and the NUMA
+  question closes the strong way: workers already split evenly (19/19 busy),
+  both sockets contend equally, placement is already balanced.
+
+### Not established
+
+- The tile loop's actual achieved GB/s (the canary bounds it; a derived-bytes
+  pass over the phase would pin the fraction of 2x479).
+- Any of this at C-gh proper -- every number is cgh64.
+
+## 5u. Vista 918365 + 918379 -- C12 = idle-half Stage 0: `insert` dominates, and the INTERCEPT is the phase
+
+**918365 died in its smoke leg after 8 s (~0 SU): the nb-scan segment loop
+shadowed the argparse namespace (`a = float(...)`), a line that postdated job
+478 and had never executed on a multi-config invocation -- the 447/448 class,
+caught by the smoke gate exactly as designed. Fixed (`8ac4ace`), resubmitted.
+918379: four legs, all rc=0, ~35 min, ~0.2 SU. Probe change (`e114bca`): the
+depth probe called `drift_and_migrate` bare and so measured the NUMPY eject on
+current code; it now takes `--eject-kernel` (default None = the callee's
+default, old cards stay comparable) with a per-rung `eject_jax_calls` receipt.
+Receipts read 32 (= nb) on every jax rung. Cards
+`runs/v2/m6_migrate_depth_c12_*.json`.**
+
+### The reproduction gate PASSES on the production configuration
+
+Probe 29.49 s vs the engine's own gg serial migrate 24.77 s/step (5s card,
+eject=jax) = **1.19x against the 2.0x bar**. First time the gate has run with
+kernel-matched arms on the production machine.
+
+### The split, with the production kernel, on the production machine
+
+| f | emig | eject_s | insert_s | insert share |
+|---|---|---|---|---|
+| 0.30 | 15.3M | 8.29 | 11.64 | 0.58 |
+| 0.95 | 44.3M | 8.28 | 13.72 | 0.62 |
+| 2.85 | 100.5M | 8.18 | 20.63 | 0.72 |
+
+**Pre-registration (a) HELD: insert >= 0.55 everywhere.** `eject` is FLAT
+across a 6.6x migrant range (it drifts all 134M particles regardless); insert
+carries the volume.
+
+### The structural finding: the intercept is the phase
+
+Volume law: **0.06 s/Mrow on a 19.7 s intercept** (5l, pre-radix numpy path:
+0.12 s/Mrow on 21.45 s). The radix + compiled-eject work halved the per-migrant
+slope and barely moved the intercept -- so at engine-like drift ~90% of migrate
+is volume-INDEPENDENT per-particle work: eject re-drifts everyone (8.3 s),
+insert rewrites every keeper (~11-12 s floor). Migrate is structurally
+"re-encode the whole state, serially, every step" -- the shape that
+parallelizes and that no further serial micro-fix can move much.
+
+### Demotions and confirmations
+
+- **argsort is ~4% of migrate now** (1.2 of 30.8 profiler-seconds), down from
+  5l's ~14% -- `_stable_order`'s radix cast already collected most of it. The
+  argsort->merge swap is demoted to opportunistic (~1 s/step).
+- **Depth stays free**: reach 2/3 at 1.07x/1.15x of the volume law.
+- Profile ranking of insert internals (profiler-inflated, ranking only):
+  `_write_brick` body, `bucket_ijk` key math, `_group_by_brick`, `_rescale_w`
+  (229k `np.max` calls for per-brick scales), `_cat_dicts`. All per-row costs
+  inside per-brick calls; 5l's 2% per-brick share at 4,096 rows/brick stands.
+
+### What it opens
+
+Stages 1-2 as planned: the `insert` disjoint-write census (the code reading
+puts every insert write inside the owning brick's ranges except the ARENA claim
+path, which is order-dependent and goes parent-side to keep the pooled run
+bitwise), then pooling insert+eject in the engine. Prize arithmetic: migrate
+24.95 -> ~4 s and repack -> ~1 s at C5-like efficiency puts the step near
+~38 s and the realization near ~24 h from 40.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The

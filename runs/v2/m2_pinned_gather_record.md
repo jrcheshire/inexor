@@ -1,4 +1,4 @@
-# Is the pinned host gather an ffi build item? Partly, and the 18x needs re-deriving
+# Is the pinned host gather an ffi build item? RESOLVED 2026-08-17: no -- worth 1.06-1.15x on the production fabric (see the gh section at the end)
 
 **Measurement record, not a verdict.** deneb job 398 (RTX 3050, jax 0.10.2,
 branch `jc/v2-force-promote` @ `e462d94`), two legs, ~2 minutes. Cards:
@@ -83,3 +83,53 @@ Two deneb jobs, ~4 minutes total, zero SU. Job 397 died on my own bug
 (`jax.device_put` to a bare device is rejected when the source carries a memory
 kind) and its sbatch guard did the right thing: zero cards written -> `FATAL` ->
 exit 1, rather than a green row over nothing.
+
+---
+
+## The gh leg (Vista 918320, 2026-08-17): the ffi item is DEPRIORITIZED by measurement
+
+**One gh job (GH200, node c608-062, commit `a863b3c`,
+`scripts/v2_m2_pinned_gather_gh_vista.sbatch`), same two legs, rc=0, ~0.05 SU.
+Cards `m2_pinned_gather_gh_{brickspan,longrun}.json`. This is the
+"C-gh-relevant number" item 4 above owed, and it settles items 3 and 4.**
+
+| leg (gh) | payload | gather | H2D pageable | host->pinned | pinned->device | total pageable | total pinned |
+|---|---|---|---|---|---|---|---|
+| 512 x 4096 | f64 50.3 MB | 18.0 ms | 3.5 ms | 6.4 ms | 0.2 ms | **21.5** | **24.7** |
+| 512 x 4096 | T9 18.9 MB | 15.9 ms | 1.2 ms | 2.3 ms | 0.2 ms | **17.1** | **18.3** |
+| 32 x 65536 | f64 50.3 MB | 18.3 ms | 3.6 ms | 6.5 ms | 0.2 ms | **21.8** | **25.0** |
+| 32 x 65536 | T9 18.9 MB | 15.9 ms | 1.2 ms | 2.3 ms | 0.2 ms | **17.1** | **18.4** |
+
+Against the three pre-registrations in the sbatch header:
+
+- **(a) HELD, in the strong form.** pinned->device runs 213-215 GB/s at f64
+  (the clause-6 class), and on an ffi path (gather-into-pinned + transfer) the
+  gather is ~99% of staging.
+- **(b) MISSED: the pinned path is STILL net slower on NVLink-C2C** (24.7 vs
+  21.5 ms). The PCIe-specific mechanism predicted a sign flip; the actual
+  mechanism is fabric-independent -- the driver's own pageable H2D is already
+  decent here (14.4 GB/s) while the explicit host->pinned copy crawls at 7.8
+  GB/s. The deneb section's "at a 15x fabric the sign flips" arithmetic was
+  wrong because it assumed the pageable path stayed PCIe-slow.
+- **(c) RESOLVED, below both figures: what the ffi would delete is worth
+  1.15x at f64 and 1.06x at T9** (3.3 of 21.5 ms / 1.0 of 17.1 ms). The
+  6.9x/18x on clause 6's books must have been measured against the `per_run`
+  strawman (0.4 GB/s in 896408), not against the assembled-pageable path
+  anything real would ship. **Do not quote 6.9x or 18x again.**
+
+**The Grace gather is SLOWER than x86**: 2.80 vs deneb's 3.95 GB/s at f64,
+1.19 vs 1.71 at T9 -- the same arm64-per-core pattern as the eject-kernel
+ratio (5s). The gather remains per-row bound (2.66x fewer T9 bytes, 1.13x
+less time).
+
+**What replaces the ffi item: parallelize the gather.** It is single-threaded
+and embarrassingly parallel over the 512 brick runs; pool workers at even
+modest efficiency put staging at tens of GB/s, which no transfer-path
+engineering can. Same machinery, same idle cores, as the idle-half plan
+(m6_scaling_record 5t/5u) -- the device lane's entry ticket is pooled gather +
+double-buffering, not an extension.
+
+**ADR note:** D-v2-16 clause 6's 6.9x/18x figures do not survive this
+measurement. Whether that gets a superseding ADR entry or a Status pointer is
+JC's call (the D-v2-10/G6 supersede-not-edit precedent); this record is the
+citable measurement either way.
