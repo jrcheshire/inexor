@@ -149,7 +149,12 @@ def _build(cfg_name, slack, arena_frac, tile=None, buf=32, tile_workers=1,
         n_tile=g["tile"], b_fine=g["buf"], alpha=m3.ALPHA, brick_slack=slack,
         tile_workers=tile_workers, paint_subblock=paint_subblock,
         **({} if eject_kernel is None else {"eject_kernel": eject_kernel}),
-        **({"migrate_pooled": True} if migrate_pooled else {}),
+        # NAME the schedule in both directions. Since the C14 flip the default
+        # is auto = pooled wherever a pool exists, so omitting the knob here
+        # would make the SERIAL arm run pooled and report itself as serial --
+        # every future serial-vs-pooled A/B would then compare pooled against
+        # pooled and pass because it could no longer fail.
+        migrate_pooled=bool(migrate_pooled),
     )
     ec.validate()
     global _RESOLVED_EJECT

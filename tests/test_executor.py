@@ -263,9 +263,33 @@ def test_the_pooled_migrate_without_ids():
 
 def test_migrate_pooled_knob_refuses_without_a_pool():
     """A knob that cannot apply must refuse at validate(), not silently run
-    the serial path under a pooled-looking config."""
+    the serial path under a pooled-looking config. EXPLICIT True only: the
+    None default is auto and falls back to serial by design."""
     with pytest.raises(ValueError, match="needs a pool"):
         _cfg(tile_workers=1, migrate_pooled=True).validate()
+
+
+def test_migrate_pooled_auto_default_validates_without_a_pool():
+    """The counterpart to the refusal above: the default must NOT refuse at
+    tile_workers=1, or every single-process config in the package breaks."""
+    assert _cfg(tile_workers=1).validate()
+
+
+def test_migrate_pooled_auto_default_pools_and_is_bitwise_the_serial_arm():
+    """The C14 default flip (Vista 918684). An unnamed knob now POOLS wherever
+    a pool exists, and False is the only way back to the serial arm. Both
+    directions carry a receipt, and the two arms must still be bitwise: a
+    default that moved the answer would be a regression, not a speedup."""
+    s_auto, out_auto = _run(2)
+    s_ser, out_ser = _run(2, migrate_pooled=False)
+    _assert_states_identical(s_ser, s_auto)
+    assert all(o["migrate_pooled_workers"] == 2 for o in out_auto), (
+        "the auto default did not pool at tile_workers=2 -- the flip is inert"
+    )
+    assert all(o["migrate_pooled_workers"] == 0 for o in out_ser), (
+        "migrate_pooled=False did not force the serial path -- the A/B "
+        "baseline arm is unreachable and every serial reference is void"
+    )
 
 
 def test_the_pooled_migrate_engine_run_is_bitwise_the_serial_one():

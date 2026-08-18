@@ -113,7 +113,7 @@ class EngineConfig:
         paint_subblock=True,
         tile_workers=1,
         worker_affinity=True,
-        migrate_pooled=False,
+        migrate_pooled=None,
         migrate_window=None,
     ):
         self.box_size = float(box_size)
@@ -181,11 +181,23 @@ class EngineConfig:
         self.worker_affinity = bool(worker_affinity)
         # Idle-half Stage 2: route `drift_and_migrate` through the SAME pool,
         # workers writing brick payloads and the parent replaying the arena
-        # interleave (state.drift_and_migrate_pooled). False until the gg
-        # verdict job passes (no-worse-defaults, the eject_kernel precedent).
+        # interleave (state.drift_and_migrate_pooled). TRI-STATE, because the
+        # verdict (C14, Vista 918684: bitwise on three legs, migrate 26.03 ->
+        # 3.78 s/step at cgh64 W=16) licenses pooling by default but
+        # `tile_workers` defaults to 1, and a bare True would make every
+        # single-process EngineConfig refuse at validate():
+        #   None  = AUTO, the default -- pooled wherever a pool exists, serial
+        #           where one does not. No config has to name the knob to get
+        #           the verdict's win.
+        #   True  = REQUIRE a pool; still refuses at validate() without one, so
+        #           an explicit request that cannot apply is never silently
+        #           downgraded to serial.
+        #   False = force serial even with a pool. This is the A/B baseline arm
+        #           and every serial reference MUST name it rather than lean on
+        #           the default, which no longer means serial.
         # `migrate_window` bounds the scratch slots in flight; None = sized to
         # feed the workers (see the driver's docstring for the floor).
-        self.migrate_pooled = bool(migrate_pooled)
+        self.migrate_pooled = None if migrate_pooled is None else bool(migrate_pooled)
         self.migrate_window = None if migrate_window is None else int(migrate_window)
 
     @property
@@ -401,8 +413,10 @@ class EngineConfig:
             check_tsc_paint_headroom(self.n_total, self.frac_bits)
         if self.tile_workers < 1:
             raise ValueError(f"tile_workers must be >= 1, got {self.tile_workers}")
-        if self.migrate_pooled and self.tile_workers < 2:
-            # a knob that cannot apply must refuse, not silently run serial
+        if self.migrate_pooled is True and self.tile_workers < 2:
+            # a knob that cannot apply must refuse, not silently run serial.
+            # `is True` and not truthiness: None is AUTO and falls back to
+            # serial by design, an EXPLICIT True cannot.
             raise ValueError(
                 f"migrate_pooled needs a pool: tile_workers is {self.tile_workers}"
             )
@@ -1088,7 +1102,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # a peak comparison against every card on record is still like-for-like.
     ph("reconcile")
 
-    if pool is not None and cfg.migrate_pooled:
+    if pool is not None and cfg.migrate_pooled is not False:
         stats = drift_and_migrate_pooled(
             st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window
         )
@@ -1181,7 +1195,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None):
         lead, fused = fused_drifts(coeffs)
         # onto the first midpoint; pooled under the same knob as the per-step
         # migrate (5j: this ONE call was mistaken for a per-step phase once)
-        if pool is not None and cfg.migrate_pooled:
+        if pool is not None and cfg.migrate_pooled is not False:
             drift_and_migrate_pooled(st, lead, pool, kernel=cfg.eject_kernel,
                                      window=cfg.migrate_window)
         else:
