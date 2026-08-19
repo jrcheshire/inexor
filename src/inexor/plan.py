@@ -49,18 +49,86 @@ PRESETS = {
 
 GB = 1e9
 
+# The knobs the PRODUCTION path runs, in one place, because the alternative
+# is what happened: `EngineConfig` defaults coarse_dtype to float64 for the
+# benefit of the f64 reference arms, `v2_m6_realization.py` did not override
+# it, and this planner defaulted to float32 -- so the table said FITS while
+# pricing a configuration nobody was running, and the miss (12.885 GB of
+# shared memory) took three separate rediscoveries and a dead job to find.
+#
+# Anything here is a RATIFIED choice with a decision behind it. The gate
+# oracles deliberately do NOT use this: their whole job is to vary these.
+RATIFIED = dict(
+    coarse_dtype="float32",   # D-v2-22 / M-v2-4: 1.83x peak host, 1e-5 error
+    fine_dtype="float64",     # unchanged by M-v2-4; the fine arm stays f64
+    alpha=1.0,                # r_s / coarse_cell, the ratified kernel
+)
+BUCKET_CELLS = 2              # D-v2-20's layout
+
+
+def engine_config(preset, **overrides):
+    """The `EngineConfig` the production driver builds, from ONE definition.
+
+    Both `inexor.plan` and `scripts/v2_m6_realization.py` go through this, so
+    a planner verdict is about the run that will actually happen. Overrides
+    are for the driver's per-invocation knobs (workers, slack, checkpointing),
+    not for quietly reinstating a default this dict exists to pin.
+    """
+    from .engine import EngineConfig
+
+    g = PRESETS[preset] if isinstance(preset, str) else dict(preset)
+    kw = dict(
+        box_size=g["box"], n_part=g["n_part"], n_fine=g["n_fine"],
+        n_coarse=g["n_coarse"], n_tile=g["tile"], b_fine=g["buf"],
+        **RATIFIED,
+    )
+    kw.update(overrides)
+    return EngineConfig(**kw)
+
 
 def _fmt(b):
     return f"{b / GB:10.3f} GB"
 
 
-def _table(title, terms, total_label="total"):
+def _table(title, terms, total_label="total", reduce=sum):
     print(f"\n{title}")
     width = max(len(k) for k in terms) if terms else 1
     for k, v in sorted(terms.items(), key=lambda kv: -kv[1]):
         print(f"  {k:<{width}}  {_fmt(v)}")
     print(f"  {'-' * width}  {'-' * 13}")
-    print(f"  {total_label:<{width}}  {_fmt(sum(terms.values()))}")
+    print(f"  {total_label:<{width}}  {_fmt(reduce(terms.values()))}")
+
+
+def load_stages(*, n, n_rows, n_buckets, index_itemsize, n_arena, n_bricks,
+                n_slabs, shared):
+    """Peak resident bytes at each stage of `icgen.load_slot_state`.
+
+    THE LOAD PATH WAS IN NO TABLE, and it is where two jobs died. It is also
+    the stage where `shared` changes the answer completely: with an allocator
+    the payload is written straight into the segments the pool will use and
+    the state exists ONCE; without one it is built privately and copied,
+    which is 2x at the moment of copying.
+
+    A slab is one x-slice of bricks, so its payload is n/n_slabs rows of the
+    9 B T9 record plus its share of the index.
+    """
+    slab = n // max(n_slabs, 1) * 9 + n_buckets // max(n_slabs, 1) * 8
+    occ64 = n_buckets * 8            # the int64 accumulator, both passes
+    payload = n_rows * 9             # off + w
+    index = n_buckets * index_itemsize
+    stages = {
+        "pass 1 (index, one slab live)": occ64 + slab,
+        "allocate off/w": occ64 + payload,
+        "pass 2 (payload, one slab live)": occ64 + payload + slab,
+        # `_to_index` makes the uint32 beside the int64, and a shared build
+        # copies that into a segment before the int64 goes away
+        "build SlotState": occ64 + payload + index * (2 if shared else 1),
+    }
+    if not shared:
+        # TilePool then copies every field into segments, one at a time
+        stages["adopt into the pool"] = payload + index + n_arena * 8 + max(
+            n_rows * 6, n_rows * 3)
+    return stages
 
 
 def build(args):
@@ -129,7 +197,10 @@ def main(argv=None):
                     help="/dev/shm budget, for the pooled (tile_workers>1) lane. "
                          "Vista gg measures 127.6. Kernel default is half of RAM.")
     ap.add_argument("--workers", type=int, default=None,
-                    help="tile_workers, for the shm table's migrate scratch term")
+                    help="tile_workers. >1 (or unset) means the pooled lane: the "
+                         "loader writes into shared memory and the state exists once")
+    ap.add_argument("--slabs", type=int, default=128,
+                    help="T9 slab files the ICs were written as (c-gh: 128)")
     ap.add_argument("--disk-gb", type=float, default=None, help="scratch budget for IC staging")
     args = ap.parse_args(argv)
 
@@ -217,6 +288,18 @@ def main(argv=None):
                   "RAM, and it bound the c-gh run that the host\n  line called "
                   "a fit. `df -B1 /dev/shm` on the node you will run on.")
 
+    # ---- the load path, which is where two jobs actually died
+    idx_itemsize = t9.index_bytes() // max(t9.n_buckets_side**3, 1)
+    ld = load_stages(
+        n=n, n_rows=rows + arena, n_buckets=t9.n_buckets_side**3,
+        index_itemsize=max(idx_itemsize, 1), n_arena=arena,
+        n_bricks=ec.n_brick and (args.n_fine // ec.n_brick) ** 3,
+        n_slabs=args.slabs, shared=(args.workers is None or args.workers > 1),
+    )
+    _table("LOADING THE STATE, peak resident at each stage", ld,
+           total_label="PEAK (max, not sum)", reduce=max)
+    print("  the total line above is a MAX: these stages do not coexist")
+
     # ---- IC stage
     try:
         from .ooc_fft import plan_bytes
@@ -231,6 +314,7 @@ def main(argv=None):
     print("\nBINDING TERMS")
     peak_est = sum(state.values()) + sum(resident.values()) + max(transient.values()) \
         + sum(step.values())
+    load_peak = max(ld.values())
     # TRANSIENTS ARE CANDIDATES. They were excluded here, so the line could not
     # name a transient however large -- at cdev it reported `tile_kernels` (0.791
     # GB) while `tile_workspace` (1.443) was bigger and the phase MEASURED to set
@@ -241,6 +325,8 @@ def main(argv=None):
                   + [(f"{k} (transient)", v) for k, v in transient.items()],
                   key=lambda kv: kv[1])
     print(f"  a lower bound on the run's peak: {_fmt(peak_est)}")
+    print(f"  the LOAD stage peaks at:          {_fmt(load_peak)}"
+          f"   {'<- BINDING' if load_peak > peak_est else ''}")
     print(f"  largest single term: {biggest[0]} at {_fmt(biggest[1])}")
     if "tile_buffers" not in step:
         print("  NB `tile_buffers` is NOT in the total above: it needs a measured "

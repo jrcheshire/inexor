@@ -357,3 +357,55 @@ def test_the_in_place_reference_would_make_the_repack_scratch_worse():
     # 3.55x worse than the out-of-place form it would have replaced; against
     # the in-place form actually written it is ~19x worse.
     assert reference_would_be / current > 15.0
+
+
+def test_the_load_model_matches_what_the_loader_actually_allocates(tmp_path):
+    """The planner's load stages, against the real loader at a small config.
+
+    A model nothing checks is a model that drifts, and this one now carries
+    the verdict for a 2048^3 run: `load_stages` said 134.7 GB where two jobs
+    had already died with nothing in any table naming that path. Held here
+    against the bytes the loader really asks for.
+    """
+    import numpy as np
+
+    from inexor import icgen, state
+    from inexor.codec import T9Layout
+    from inexor.executor import SharedAllocator
+    from inexor.plan import engine_config, load_stages
+
+    n_part, box, nb = 64, 32.0, 4
+    engine_config(dict(n_part=n_part, box=box, n_fine=128, n_coarse=32,
+                       tile=32, buf=8))  # the shared path must accept this geometry
+    rng = np.random.default_rng(0)
+    g = (np.arange(n_part) + 0.5) * (box / n_part)
+    q = np.stack(np.meshgrid(g, g, g, indexing="ij"), axis=-1).reshape(-1, 3)
+    x = np.mod(q + rng.normal(scale=0.2 * box / n_part, size=q.shape), box)
+    v = rng.normal(scale=0.5, size=x.shape)
+    t9 = T9Layout(box_size=box, n_part=n_part, bucket_cells=2)
+    st = state.SlotState.build(x, v, t9, nb, brick_slack=0.20, arena_frac=0.20)
+    icgen.write_t9_slabs(st, str(tmp_path))
+    n_slabs = len(icgen.load_manifest(str(tmp_path))["files"]) \
+        if hasattr(icgen, "load_manifest") else nb
+
+    alloc = SharedAllocator()
+    try:
+        got = icgen.load_slot_state(str(tmp_path), brick_slack=0.20,
+                                    arena_frac=0.20, alloc=alloc)
+        # what the loader REALLY put in shared memory
+        measured = alloc.bytes_held()
+        n_rows = got.off.shape[0]
+        n_buckets = t9.n_buckets_side**3
+        idx = np.dtype(got.occupancy.dtype).itemsize
+        modelled = load_stages(
+            n=n_part**3, n_rows=n_rows, n_buckets=n_buckets, index_itemsize=idx,
+            n_arena=got.arena_bucket.shape[0], n_bricks=nb**3, n_slabs=n_slabs,
+            shared=True)
+        # the payload + index the model says the segments must hold
+        want = n_rows * 9 + n_buckets * idx + got.arena_bucket.nbytes
+        assert measured == pytest.approx(want, rel=0.02), (
+            f"the allocator holds {measured} B where the model wants {want} B")
+        # and the model's peak stage must exceed what is actually resident
+        assert max(modelled.values()) >= measured
+    finally:
+        alloc.close()

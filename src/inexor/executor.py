@@ -385,10 +385,12 @@ class _Seg:
     saw the child's write back.
     """
 
-    __slots__ = ("kind", "buf", "handle", "_fd", "_shm")
+    __slots__ = ("kind", "buf", "handle", "nbytes", "_fd", "_shm")
 
     def __init__(self, kind, buf, handle, fd=None, shm=None):
         self.kind, self.buf, self.handle = kind, buf, handle
+        # recorded, not probed: a released memoryview raises on len()
+        self.nbytes = int(handle[-1])
         self._fd, self._shm = fd, shm
 
     def close(self):
@@ -510,8 +512,7 @@ class SharedAllocator:
         return None if hit is None or hit[1] is not arr else hit[0]
 
     def bytes_held(self):
-        return sum(s.buf.size() if hasattr(s.buf, "size") else len(s.buf)
-                   for s in self._segs)
+        return sum(s.nbytes for s in self._segs)
 
     def close(self):
         for seg in self._segs:
@@ -785,6 +786,7 @@ class TilePool:
         self._step = 0
         self._C = None
         self._segs = []
+        self._adopted = []
         self._names, self._shapes, self._dtypes, self._views = {}, {}, {}, {}
         # ids join the shared set only when the state carries them: the tile
         # loop never touches ids, but the pooled migrate reads them at eject
@@ -888,8 +890,13 @@ class TilePool:
         """Register an array the allocator already put in shared memory.
 
         The zero-copy path. `st` is not rebound because the array it holds IS
-        the shared view."""
-        self._segs.append(seg)
+        the shared view.
+
+        Deliberately NOT added to `self._segs`: that list is what `close()`
+        closes and unlinks, and these segments belong to the allocator. The
+        pool freeing them would pull the state out from under a caller that
+        is still using it -- and a segmented run resumes into exactly that."""
+        self._adopted.append(seg)
         self._names[key], self._shapes[key], self._dtypes[key] = (
             seg.handle, tuple(arr.shape), str(arr.dtype))
         self._views[key] = arr

@@ -120,29 +120,24 @@ def _cosmo():
 
 
 def _engine_config(g, args, checkpoint_dir):
-    from inexor import engine
+    """The production config, from `inexor.plan.engine_config`.
 
-    ec = engine.EngineConfig(
-        box_size=g["L"], n_part=g["n_part"], n_fine=g["n_fine"],
-        n_coarse=g["n_coarse"], n_tile=g["tile"], b_fine=g["buf"], alpha=m3.ALPHA,
+    ONE definition, shared with the planner. It used to be built here from
+    scratch, which is how the driver ended up running an f64 coarse mesh that
+    M-v2-4 had rejected while the planner priced f32 and said FITS.
+    """
+    from inexor.plan import engine_config
+
+    ec = engine_config(
+        dict(n_part=g["n_part"], box=g["L"], n_fine=g["n_fine"],
+             n_coarse=g["n_coarse"], tile=g["tile"], buf=g["buf"]),
         brick_slack=args.slack, tile_workers=args.tile_workers,
-        # EXPLICIT, and it has to be: `EngineConfig` defaults coarse_dtype to
-        # float64, so omitting it here ran the milestone's own deliverable on
-        # the configuration M-v2-4 measured and REJECTED. D-v2-22 adopted f32
-        # for the coarse force mesh -- 1.83x peak host at n_coarse=1024, for
-        # an error of 1e-5 where the mesh itself costs 1e-2. At c-gh the two
-        # differ by 12.885 GB of shared memory (25.770 vs 12.885), and
-        # `inexor.plan` has defaulted to float32 the whole time, so the
-        # planner and this driver were pricing different runs. Found three
-        # times from three directions before it was written down; the print
-        # below is so the next reader sees it without re-deriving it.
-        coarse_dtype="float32",
+        checkpoint_dir=checkpoint_dir, checkpoint_every=args.checkpoint_every,
         # AUTO by default, never True: C14 made the library default a tri-state
         # precisely because a hard True refuses when no pool exists, and this
         # driver must not turn a serial smoke run into a refusal.
         **({} if args.migrate_pooled is None else
            {"migrate_pooled": args.migrate_pooled}),
-        checkpoint_dir=checkpoint_dir, checkpoint_every=args.checkpoint_every,
         **({} if args.eject_kernel is None else {"eject_kernel": args.eject_kernel}),
     )
     ec.validate()
@@ -292,7 +287,7 @@ def cmd_run(args):
     stats = []
     t0 = time.perf_counter()
     out = engine.run(st, ec, co, phase=ph, resume=resume, stop_at=stop,
-                     collect=stats.append)
+                     collect=stats.append, allocator=allocator)
     wall = time.perf_counter() - t0
     peak = _maxrss_bytes()
 

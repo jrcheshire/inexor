@@ -688,3 +688,44 @@ def test_the_loader_fills_shared_memory_and_is_otherwise_unchanged(tmp_path):
         assert plain.arena_base == shared.arena_base
     finally:
         alloc.close()
+
+
+def test_engine_run_carries_the_allocator_all_the_way_to_the_pool(tmp_path):
+    """END TO END, because the unit test above passed while the run OOMed.
+
+    `test_a_preshared_state_is_adopted_without_a_second_copy` builds the pool
+    directly, so it could not see that `v2_m6_realization.py` was calling
+    `engine.run` WITHOUT the allocator -- an edit that silently did not apply.
+    The state then went into shared memory once in the loader and again in
+    the pool, Shmem went 110 -> 217.8 GB in thirty seconds, and job 922819
+    was OOM-killed. The hand-off is the thing that has to be tested.
+    """
+    from inexor import icgen
+    from inexor.executor import SharedAllocator
+    from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
+
+    cfg = _cfg(tile_workers=2)
+    x = _positions(5)
+    v = np.random.default_rng(6).normal(scale=0.5, size=x.shape)
+    t9 = T9Layout(box_size=L_BOX, n_part=N_PART, bucket_cells=2)
+    seed_st = state.SlotState.build(x, v, t9, N_FINE // cfg.n_brick,
+                                    brick_slack=0.20, arena_frac=0.20)
+    icgen.write_t9_slabs(seed_st, str(tmp_path))
+
+    alloc = SharedAllocator()
+    try:
+        st = icgen.load_slot_state(str(tmp_path), brick_slack=0.20,
+                                   arena_frac=0.20, alloc=alloc)
+        held_after_load = alloc.bytes_held()
+        a = a_grid(0.1, 1.0, 3, "log")
+        co = bullfrog_float_coeffs(bullfrog_table(a, Cosmology()))
+        engine.run(st, cfg, co, allocator=alloc)
+        # the pool must not have put the state in shared memory a SECOND time
+        state_bytes = sum(np.asarray(getattr(st, f)).nbytes for f in FIELDS)
+        assert alloc.bytes_held() == held_after_load, (
+            "the allocator grew during the run: the pool re-shared the state, "
+            "which is the 2x that OOM-killed 922819"
+        )
+        assert held_after_load >= state_bytes * 0.99
+    finally:
+        alloc.close()
