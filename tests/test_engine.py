@@ -838,3 +838,59 @@ def test_load_checkpoint_refuses_when_nothing_is_complete(tmp_path):
     os.makedirs(os.path.join(d, "gen0"))
     with pytest.raises(FileNotFoundError, match="no complete inexor checkpoint"):
         engine.load_checkpoint(d, _cfg(), _coeffs(2))
+
+
+def test_a_run_split_into_segments_is_bitwise_the_uninterrupted_one(tmp_path):
+    """`stop_at` + `resume` as a real segmented run, which is how a realization
+    whose wall exceeds a queue limit has to be executed.
+
+    Stronger than the gate above, which simulates the interruption by deleting a
+    manifest after running the whole schedule. This one actually stops: three
+    segments of two steps, each a separate `engine.run` reading the previous
+    segment's checkpoint off disk, against six steps straight through.
+
+    The trajectory is the load-bearing part. Each segment is handed the FULL
+    coefficient list and told where to stop, never a truncated one, because
+    `fused_drifts` makes `coeffs[:n]` a different trajectory rather than a
+    prefix -- so a segmented run that composed only approximately would show up
+    here as a payload difference, not a rounding one.
+    """
+    co = _coeffs(6)
+    ref = _ck_state(_cfg())
+    engine.run(ref, _cfg(), co)
+
+    d = str(tmp_path / "seg")
+    cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=2)
+    st = _ck_state(cfg_c)
+    out = engine.run(st, cfg_c, co, stop_at=2)
+    assert len(out) == 2, "the first segment did not stop where it was told"
+    assert out[-1]["checkpoint"] is not None, "segment ended without a checkpoint"
+    del st
+
+    for stop in (4, 6):
+        st_r, resume = engine.load_checkpoint(d, cfg_c, co, arena_frac=0.05)
+        assert int(resume["step"]) == stop - 2, (
+            f"resumed at step {resume['step']}, expected {stop - 2}"
+        )
+        out = engine.run(st_r, cfg_c, co, resume=resume, stop_at=stop)
+        assert len(out) == 2, "a middle segment did not advance exactly two steps"
+        last = st_r
+
+    np.testing.assert_array_equal(_rows(ref), _rows(last))
+
+
+def test_stop_at_refuses_to_discard_a_segments_work(tmp_path):
+    """Stopping off a checkpoint boundary loses everything since the last one.
+
+    The refusal matters more than it looks: the caller is a batch script that
+    reads exit 0 as "this segment is done, submit the next one", so a silent
+    partial segment would be resumed from the wrong step and the run would
+    quietly repeat work or, worse, look finished."""
+    co = _coeffs(6)
+    d = str(tmp_path / "seg")
+    cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=2)
+    st = _ck_state(cfg_c)
+    with pytest.raises(ValueError, match="not a multiple of checkpoint_every"):
+        engine.run(st, cfg_c, co, stop_at=3)
+    with pytest.raises(ValueError, match="advance nothing"):
+        engine.run(st, cfg_c, co, stop_at=0)

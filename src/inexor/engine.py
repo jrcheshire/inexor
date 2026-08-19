@@ -1285,12 +1285,30 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
     )
     return st, dict(prov)
 
-def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None):
+def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
+        stop_at=None):
     """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`.
 
     `phase` is forwarded to `step`; see its docstring. The boundaries `run`
     itself adds are the lead drift and the repack, so that every allocation in
     the run falls inside exactly one named phase and the phases sum to the run.
+
+    **`stop_at` runs a SEGMENT of the schedule**, stopping before absolute step
+    `stop_at`, and it is the other half of `resume`. Together they let one
+    schedule cross job boundaries, which a realization at full scale needs: the
+    projected wall is order a day and a queue's limit is not negotiable.
+
+    It is deliberately NOT "run the first n steps of a shorter schedule".
+    `fused_drifts` fuses each step's trailing half-drift with the next step's
+    leading half, so a run over `coeffs[:n]` is a DIFFERENT trajectory rather
+    than a prefix of this one. `stop_at` takes the full `coeffs` and stops, so
+    the segments compose back into the uninterrupted run bitwise -- which is
+    what `test_a_run_split_into_segments_is_bitwise_the_uninterrupted_one`
+    asserts particle for particle.
+
+    Stopping somewhere a checkpoint was not written throws that segment's work
+    away, and doing so silently is the failure this refuses: with checkpointing
+    on, `stop_at` must land on a checkpoint boundary.
     """
     cfg.validate()
     ph = phase if phase is not None else _no_phase
@@ -1362,8 +1380,24 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None):
             k0 = int(resume["step"])
             cap_shape = int(resume["cap_shape"])
             pad_shape = int(resume["pad_shape"])
+        k_end = len(fused)
+        if stop_at is not None:
+            k_end = min(k_end, int(stop_at))
+            if k_end <= k0:
+                raise ValueError(
+                    f"stop_at={stop_at} against a run starting at step {k0}: this segment "
+                    "would advance nothing, and a no-op that returns cleanly reads as a "
+                    "completed segment to whatever submits the next one."
+                )
+            if ckpt_on and k_end % cfg.checkpoint_every:
+                raise ValueError(
+                    f"stop_at={k_end} is not a multiple of checkpoint_every="
+                    f"{cfg.checkpoint_every}, so the segment would stop "
+                    f"{k_end % cfg.checkpoint_every} step(s) past its last checkpoint and "
+                    "throw that work away. Move the stop onto a checkpoint boundary."
+                )
         n_ckpt = 0
-        for k in range(k0, len(fused)):
+        for k in range(k0, k_end):
             stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
                          census=census, cap_shape=cap_shape, pad_shape=pad_shape,
                          phase=phase, tile_force=tile_force, pool=pool)
