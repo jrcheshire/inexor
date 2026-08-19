@@ -44,7 +44,20 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
-__all__ = ["SHM_FIELDS", "TilePool"]
+__all__ = ["SHM_FIELDS", "TilePool", "shm_capacity", "shm_terms", "SHM_DIR"]
+
+# POSIX shared memory lives on a tmpfs, and its size is a SEPARATE budget from
+# host RAM -- the kernel default is half of it. `inexor.plan` priced the run
+# against the node's RAM and said FITS at 0.74x while the pool's share alone
+# was 1.16x of the tmpfs, because no table had ever named this budget. Vista
+# 920910 found it the expensive way: the 2048^3 ICs generated fine (rc=0, 90
+# min) and stepping took a SIGBUS 196 s later, inside pool construction,
+# having asked for 148.5 GB of a measured 127.6 GB /dev/shm (job 922332).
+#
+# The failure mode is why it has to be checked UP FRONT: `SharedMemory` sizes
+# lazily, so `create=True` succeeds for a segment the tmpfs cannot back and
+# the process dies on first TOUCH, with a bus error and no traceback.
+SHM_DIR = "/dev/shm"
 
 # Every array field of SlotState the step reads or writes. `ids` is absent on
 # purpose: the tile loop never touches ids, so they stay parent-side and the
@@ -59,6 +72,105 @@ SHM_FIELDS = ("off", "w", "occupancy", "brick_start", "vel_scale", "arena_bucket
 # output order (global brick-major -- ORDER IS CORRECTNESS, `_insert_slab`
 # walks it). `mig_scales` is the pass-start vel_scale snapshot: it rides shm
 # because the header is pickled per task and the snapshot is 8 B x n_bricks.
+
+# Bytes per (K, R) entry of the migrate scratch: int64 dest + 3 x uint8 off +
+# 3 x int16 w + int32 src. `mig_scales` is n_bricks, not K x R, so it is
+# priced separately; `mig_ids` adds 4 when the state carries ids.
+MIG_BYTES_PER_ENTRY = 8 + 3 * 1 + 3 * 2 + 4
+MIG_IDS_BYTES_PER_ENTRY = 4
+
+
+def shm_capacity(path=SHM_DIR):
+    """(total, available) bytes of the tmpfs backing POSIX shared memory.
+
+    `f_bavail`, not `f_bfree`: the unprivileged figure is the one this process
+    can actually get, and a run that dies for want of the root reserve dies
+    just as hard. Returns (None, None) where there is no such mount, which is
+    every non-Linux developer machine -- the caller then cannot check, and
+    says so rather than inventing a budget.
+    """
+    try:
+        s = os.statvfs(path)
+    except (OSError, AttributeError):
+        return None, None
+    return s.f_blocks * s.f_frsize, s.f_bavail * s.f_frsize
+
+
+def shm_terms(*, n_rows, index_bytes, n_arena, n_bricks, n_coarse,
+              coarse_itemsize, has_ids=False, mig_window=None, mig_rows=None):
+    """The model of what `TilePool` puts in shared memory, term by term.
+
+    Geometry in, bytes out, so `inexor.plan` can price a configuration that
+    has never been built. The pool itself does NOT use this: it measures its
+    own arrays (`_shm_demand`), because a model standing between the check
+    and the allocation is a model that can be wrong in the direction that
+    matters. `test_executor.py` holds the two against each other.
+    """
+    t = {
+        "off (n_rows,3) uint8": n_rows * 3 * 1,
+        "w (n_rows,3) int16": n_rows * 3 * 2,
+        "occupancy (the bucket index)": index_bytes,
+        "arena_bucket": n_arena * 8,
+        "brick_start": (n_bricks + 1) * 8,
+        "vel_scale": n_bricks * 8,
+        "coarse force g0,g1,g2": 3 * n_coarse**3 * coarse_itemsize,
+    }
+    if has_ids:
+        t["ids (n_rows,) int32"] = n_rows * 4
+    if mig_window and mig_rows:
+        per = MIG_BYTES_PER_ENTRY + (MIG_IDS_BYTES_PER_ENTRY if has_ids else 0)
+        t["migrate scratch (K x R)"] = mig_window * mig_rows * per
+        t["migrate scratch (scales)"] = n_bricks * 8
+    return t
+
+
+def _fmt_gb(b):
+    return f"{b / 1e9:.3f} GB"
+
+
+def check_shm_budget(terms, path=SHM_DIR, headroom=1.0):
+    """Refuse now, with a table, rather than take a bus error on first touch.
+
+    `headroom` is a MULTIPLIER on the demand, not a subtracted constant: the
+    thing left out of `terms` (the migrate scratch, when the caller prices
+    only construction) scales with the run, not with the machine.
+
+    Returns the (demand, available) pair when it fits, so a caller can record
+    what it was standing on. Raises `MemoryError` when it does not, and does
+    nothing at all where the tmpfs cannot be read -- an absent check must not
+    read as a passed one, so it says which of the two happened.
+    """
+    demand = sum(terms.values())
+    total, avail = shm_capacity(path)
+    if total is None:
+        return demand, None
+    if demand * headroom <= avail:
+        return demand, avail
+    width = max(len(k) for k in terms)
+    table = "\n".join(
+        f"    {k:<{width}}  {_fmt_gb(v):>12}"
+        for k, v in sorted(terms.items(), key=lambda kv: -kv[1])
+    )
+    raise MemoryError(
+        f"the pool's shared memory does not fit {path}.\n"
+        f"{table}\n"
+        f"    {'-' * width}  {'-' * 12}\n"
+        f"    {'demand':<{width}}  {_fmt_gb(demand):>12}"
+        + (f"  (x{headroom:g} headroom = {_fmt_gb(demand * headroom)})"
+           if headroom != 1.0 else "")
+        + f"\n    {'available':<{width}}  {_fmt_gb(avail):>12}"
+        f"\n    {'total':<{width}}  {_fmt_gb(total):>12}\n"
+        f"  POSIX shared memory is a tmpfs and its size is a SEPARATE budget "
+        f"from host RAM,\n  by default half of it -- so a configuration that "
+        f"fits the node's memory can still\n  fail here. `SharedMemory` sizes "
+        f"lazily, so without this check the run allocates\n  cleanly and takes "
+        f"a SIGBUS on first touch, with no traceback (Vista 920910).\n"
+        f"  Levers, largest first: `arena_frac` and `brick_slack` both add rows "
+        f"to off/w;\n  `arena_frac` also sets `arena_bucket` outright. "
+        f"`python -m inexor.plan --shm-gb` prices\n  a configuration before it "
+        f"is run."
+    )
+
 
 _G = {}
 
@@ -332,13 +444,30 @@ class TilePool:
         self._mig_shape = None
         self._mig_id = 0
         self._M = None
+        n = int(cfg.n_coarse)
+        # BEFORE the first `SharedMemory(create=True)`, because after it the
+        # failure is a bus error on touch rather than an exception. Measured
+        # from the arrays themselves, not modelled: this is the check, and a
+        # check that prices something other than what it is about to allocate
+        # is the shape of a gate that cannot fail.
+        self._shm_demand = {
+            f: int(np.asarray(getattr(st, f)).nbytes) for f in self._fields
+        }
+        self._shm_demand["coarse force g0,g1,g2"] = int(
+            3 * n**3 * np.dtype(cfg.np_coarse_dtype).itemsize
+        )
+        # The migrate scratch is staged per step and its (K, R) is not known
+        # until the first `stage_migrate`, so it cannot be measured here. It
+        # is real all the same, so the construction demand is held to a
+        # margin rather than to the bare ceiling.
+        self._shm_headroom = 1.10 if cfg.tile_workers > 1 else 1.0
+        check_shm_budget(self._shm_demand, headroom=self._shm_headroom)
         for f in self._fields:
             view = self._share(f, np.asarray(getattr(st, f)))
             setattr(st, f, view)
         # the parent's cached brick->arena index maps into the OLD array;
         # values are equal but the invariant is identity, so rebuild lazily
         st._invalidate_arena_index()
-        n = int(cfg.n_coarse)
         for i in range(3):
             self._share(f"g{i}", shape=(n, n, n), dtype=cfg.np_coarse_dtype)
         fn_args = dict(

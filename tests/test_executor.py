@@ -324,3 +324,104 @@ def test_pooled_migrate_arena_full_refuses():
             state.drift_and_migrate_pooled(st_p, C_DRIFT, pool, window=6)
     finally:
         pool.close()
+
+
+# --------------------------------------------------------------- shm budget
+# Vista 920910 generated the 2048^3 ICs and then took a SIGBUS 196 s into
+# stepping, inside `TilePool.__init__`, having asked for 148.5 GB of a
+# measured 127.6 GB /dev/shm (job 922332). `SharedMemory` sizes lazily, so
+# `create=True` succeeds for a segment the tmpfs cannot back and the process
+# dies on first TOUCH with no traceback. These are the tests for the check
+# that turns that into a refusal.
+
+
+def test_the_shm_model_reproduces_what_the_pool_actually_allocates():
+    """The model and the allocation are two implementations of one formula.
+
+    `inexor.plan` prices a configuration nobody has built, so it cannot use
+    the pool's own measurement; that is exactly how a planner and a runtime
+    drift apart. This holds them together at a geometry where both are real.
+    """
+    from inexor.executor import TilePool, shm_terms
+
+    cfg = _cfg(tile_workers=2)
+    x = _positions(0)
+    v = np.random.default_rng(1).normal(scale=0.5, size=x.shape)
+    t9 = T9Layout(box_size=L_BOX, n_part=N_PART, bucket_cells=2)
+    st = state.SlotState.build(
+        x, v, t9, N_FINE // cfg.n_brick, brick_slack=0.10,
+        arena_frac=0.05, with_ids=False,
+    )
+    pool = TilePool(st, cfg)
+    try:
+        measured = pool._shm_demand
+    finally:
+        pool.close()
+
+    modelled = shm_terms(
+        n_rows=st.off.shape[0], index_bytes=st.occupancy.nbytes,
+        n_arena=st.arena_bucket.shape[0], n_bricks=st.vel_scale.shape[0],
+        n_coarse=cfg.n_coarse,
+        coarse_itemsize=np.dtype(cfg.np_coarse_dtype).itemsize,
+    )
+    assert sum(modelled.values()) == sum(measured.values()), (
+        f"model {sum(modelled.values())} B against the pool's actual "
+        f"{sum(measured.values())} B\n  model:    {modelled}\n  measured: {measured}"
+    )
+
+
+def test_the_shm_check_refuses_a_demand_that_cannot_fit(tmp_path):
+    """And the refusal NAMES the terms, because the levers are among them."""
+    from inexor.executor import check_shm_budget
+
+    huge = {"w (n_rows,3) int16": 8 * 10**18, "vel_scale": 17}
+    with pytest.raises(MemoryError) as e:
+        check_shm_budget(huge, path=str(tmp_path))
+    msg = str(e.value)
+    assert "w (n_rows,3) int16" in msg
+    assert "arena_frac" in msg, "the refusal must name the lever, not just the miss"
+    # ordered by size: the binding term is the one a reader acts on
+    assert msg.index("w (n_rows,3) int16") < msg.index("vel_scale")
+
+
+def test_a_missing_tmpfs_reports_that_it_could_not_check(tmp_path):
+    """An absent check must not read as a passed one.
+
+    macOS has no /dev/shm, so every developer machine takes this path -- and
+    a silent return there would mean the guard's tests pass locally while the
+    guard is inert on the one platform that has the problem.
+    """
+    from inexor.executor import check_shm_budget, shm_capacity
+
+    assert shm_capacity(str(tmp_path / "nope")) == (None, None)
+    demand, avail = check_shm_budget({"x": 8 * 10**18}, path=str(tmp_path / "nope"))
+    assert demand == 8 * 10**18
+    assert avail is None, "unknown capacity must be None, never a number"
+
+
+def test_the_pilot_configuration_would_now_be_refused():
+    """The regression: the exact geometry that took the bus error.
+
+    Numbers are the pilot's own invocation (`--slack 0.20 --arena-frac 0.20`,
+    alloc_margin 0.10, 16 workers) against the gg node's MEASURED /dev/shm.
+    If a change to the layout brings c-gh under that ceiling this test fails,
+    which is the right time to re-read it.
+    """
+    from inexor.executor import shm_terms
+
+    n = 2048**3
+    n_bricks = 128**3
+    per_brick = n // n_bricks
+    spare = -(-int(per_brick * 20) // 100)  # ceil(per_brick * 0.20)
+    n_alloc = -(-(per_brick + spare) * n_bricks * 11 // 10)
+    n_arena = n // 5
+    terms = shm_terms(
+        n_rows=n_alloc + n_arena, index_bytes=1024**3 * 4, n_arena=n_arena,
+        n_bricks=n_bricks, n_coarse=1024, coarse_itemsize=4,
+    )
+    gg_shm = 249116032 * 1024 // 2  # measured, Vista job 922332
+    demand = sum(terms.values())
+    assert demand / 1e9 == pytest.approx(148.5, abs=0.5)
+    assert demand > gg_shm, (
+        f"c-gh asks {demand / 1e9:.1f} GB of a {gg_shm / 1e9:.1f} GB tmpfs"
+    )

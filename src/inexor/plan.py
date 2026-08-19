@@ -98,7 +98,10 @@ def main(argv=None):
     ap.add_argument("--bucket-cells", type=int, default=2)
     ap.add_argument("--slack", type=float, default=0.10, help="per-brick spare fraction")
     ap.add_argument("--alloc-margin", type=float, default=0.10)
-    ap.add_argument("--arena-frac", type=float, default=0.01)
+    ap.add_argument("--arena-frac", type=float, default=0.01,
+                    help="arena rows as a fraction of N. NOTE the default is "
+                         "`SlotState.build`'s, but `scripts/v2_m6_realization.py` "
+                         "runs 0.20, which is 28 GB of shared memory at c-gh.")
     # No default, and deliberately not derived: geometry alone UNDERSTATES it.
     # `cap` is the max over tiles of the padded per-tile row count, so it carries
     # (P/T)^3 x N/tiles, the geometric ladder's <=26.0%, AND the clustering spread
@@ -116,6 +119,17 @@ def main(argv=None):
                     help="host RAM budget. A property of YOUR machine: Vista gh "
                          "~116 (a hard cliff), Vista gg 237, S3 h100 ~1007.")
     ap.add_argument("--device-gb", type=float, default=None, help="accelerator HBM budget")
+    # A SEPARATE budget, and the reason this argument exists at all: the pool
+    # holds the state in POSIX shared memory, which is a tmpfs sized by default
+    # at HALF the node's RAM. This table said "FITS (0.74x)" for the c-gh run
+    # that then died in pool construction (Vista 920910), because the host
+    # total it checked was never the budget that bound. Read your node's with
+    # `df -B1 /dev/shm`; a Vista gg node measures 127.6 GB (job 922332).
+    ap.add_argument("--shm-gb", type=float, default=None,
+                    help="/dev/shm budget, for the pooled (tile_workers>1) lane. "
+                         "Vista gg measures 127.6. Kernel default is half of RAM.")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="tile_workers, for the shm table's migrate scratch term")
     ap.add_argument("--disk-gb", type=float, default=None, help="scratch budget for IC staging")
     args = ap.parse_args(argv)
 
@@ -145,6 +159,12 @@ def main(argv=None):
         "t9_payload (9 B/p)": n * 9,
         "slack + alloc_margin": (rows - n) * 9,
         "bucket_index": t9.index_bytes(),
+        # The arena is n_arena EXTRA ROWS of off/w (`state.SlotState`: off is
+        # (n_alloc + n_arena, 3)), and this table priced only `arena_bucket`,
+        # its int64 side. At the realization's `--arena-frac 0.20` that is
+        # 15.5 GB of payload the total did not carry -- the omitted-term fault
+        # this module's docstring is about, in this module.
+        "arena rows in off/w": arena * 9,
         "arena_bucket": arena * 8,
         "brick_start": (ec.n_brick and (args.n_fine // ec.n_brick) ** 3 + 1) * 8,
         # THE ARRAY THAT REPLACED `kick_pending`. One f64 per brick, resident,
@@ -171,6 +191,31 @@ def main(argv=None):
 
     step = ec.step_bytes(n, n_rows=rows, cap=args.cap)
     _table("PER-STEP HOST TERMS THAT SCALE WITH PARTICLES", step)
+
+    # ---- the sub-budget, for the pooled lane only
+    if args.workers is None or args.workers > 1:
+        from .executor import shm_terms
+
+        shm = shm_terms(
+            n_rows=rows + arena, index_bytes=t9.index_bytes(), n_arena=arena,
+            n_bricks=ec.n_brick and (args.n_fine // ec.n_brick) ** 3,
+            n_coarse=args.n_coarse,
+            coarse_itemsize=np.dtype(args.coarse_dtype).itemsize,
+        )
+        _table("SHARED MEMORY (/dev/shm), the pooled lane's sub-budget", shm)
+        print("  the migrate scratch is staged per step at a (K, R) this table "
+              "cannot know;\n  `TilePool` holds construction to a 1.10x margin "
+              "for it")
+        if args.shm_gb is not None:
+            sb = args.shm_gb * GB
+            r = sum(shm.values()) / sb
+            print(f"  against --shm-gb {args.shm_gb}: "
+                  f"{'FITS' if r < 1.0 else 'DOES NOT FIT'} ({r:.2f}x the budget)")
+        else:
+            print("  no --shm-gb given, so no verdict. This is NOT the host "
+                  "budget above: it is a\n  tmpfs, by default half the node's "
+                  "RAM, and it bound the c-gh run that the host\n  line called "
+                  "a fit. `df -B1 /dev/shm` on the node you will run on.")
 
     # ---- IC stage
     try:
