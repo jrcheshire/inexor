@@ -8,6 +8,8 @@ repack copy-back, worker-side arena decode. The cluster legs repeat the same
 identity at cdev8/cdev scale.
 """
 
+import os
+
 import numpy as np
 import pytest
 
@@ -425,3 +427,102 @@ def test_the_pilot_configuration_would_now_be_refused():
     assert demand > gg_shm, (
         f"c-gh asks {demand / 1e9:.1f} GB of a {gg_shm / 1e9:.1f} GB tmpfs"
     )
+
+
+# ------------------------------------------------------------ the backing store
+# The pool's shared arrays sit on `memfd` where the kernel has it and POSIX
+# `/dev/shm` otherwise. The two are the same pages; the difference is that
+# `/dev/shm` is a mount with a size cap and memfd is not, which is the whole
+# reason c-gh fits. The platform picks, so WITHOUT the env override neither
+# machine can exercise both paths: this suite would only ever see posix and
+# the cluster only ever memfd.
+
+BACKENDS = ["posix"] + (["memfd"] if hasattr(os, "memfd_create") else [])
+
+
+def _child_reads(handle, nbytes):
+    """Run in a SPAWNED interpreter: no fork, no inherited descriptors."""
+    from inexor.executor import open_segment
+
+    seg = open_segment(handle)
+    got = bytes(seg.buf[:8]), bytes(seg.buf[nbytes - 8:nbytes])
+    seg.buf[8:16] = b"CHILDWRT"
+    seg.close()
+    return got
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_spawned_process_maps_the_same_pages(backend):
+    """Both directions, because a one-way check passes on a private copy."""
+    import multiprocessing as mp
+
+    from inexor.executor import create_segment
+
+    n = 1 << 20
+    seg = create_segment(n, "roundtrip", backend=backend)
+    try:
+        seg.buf[:8] = b"PARENT!!"
+        seg.buf[n - 8:n] = b"THEBTAIL"
+        with mp.get_context("spawn").Pool(1) as pool:
+            head, tail = pool.apply(_child_reads, (seg.handle, n))
+        assert head == b"PARENT!!", "child did not see the parent's write"
+        assert tail == b"THEBTAIL", "child's mapping is short"
+        assert bytes(seg.buf[8:16]) == b"CHILDWRT", (
+            "parent did not see the child's write: this is a COPY, not a shared "
+            "mapping, and every bitwise identity gate above would still pass"
+        )
+    finally:
+        seg.close()
+        seg.unlink()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_the_backend_override_is_what_it_says(backend, monkeypatch):
+    from inexor.executor import create_segment, shm_backend
+
+    monkeypatch.setenv("INEXOR_SHM_BACKEND", backend)
+    assert shm_backend() == backend
+    seg = create_segment(1 << 16, "kind")
+    try:
+        assert seg.kind == backend
+        assert seg.handle[0] == backend
+    finally:
+        seg.close()
+        seg.unlink()
+
+
+def test_a_bad_backend_override_refuses():
+    from inexor.executor import shm_backend
+
+    os.environ["INEXOR_SHM_BACKEND"] = "tmpfs"
+    try:
+        with pytest.raises(ValueError, match="expected 'memfd' or 'posix'"):
+            shm_backend()
+    finally:
+        del os.environ["INEXOR_SHM_BACKEND"]
+
+
+@pytest.mark.skipif(hasattr(os, "memfd_create"), reason="needs a kernel without memfd")
+def test_memfd_is_not_silently_downgraded():
+    """Asking for memfd where there is none must fail loudly.
+
+    Falling back would put the c-gh run back on the capped mount and it would
+    die exactly as 920910 did, having been told it was on the new path.
+    """
+    from inexor.executor import shm_backend
+
+    os.environ["INEXOR_SHM_BACKEND"] = "memfd"
+    try:
+        with pytest.raises(ValueError, match="no memfd_create"):
+            shm_backend()
+    finally:
+        del os.environ["INEXOR_SHM_BACKEND"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_the_pool_is_bitwise_the_serial_loop_on_either_backend(backend, monkeypatch):
+    """The identity gate, re-run against the backing store it is standing on."""
+    monkeypatch.setenv("INEXOR_SHM_BACKEND", backend)
+    s_serial, _ = _run(1)
+    s_pool, _ = _run(4)
+    _assert_states_identical(s_serial, s_pool)

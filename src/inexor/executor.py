@@ -36,6 +36,7 @@ measured or asserted rather than assumed:
   if a readout's idle numbers implicate pickling.
 """
 
+import mmap
 import multiprocessing as mp
 import os
 import queue
@@ -44,7 +45,8 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
-__all__ = ["SHM_FIELDS", "TilePool", "shm_capacity", "shm_terms", "SHM_DIR"]
+__all__ = ["SHM_FIELDS", "TilePool", "shm_backend", "shm_capacity", "shm_terms",
+           "preflight_shared_memory", "create_segment", "open_segment", "SHM_DIR"]
 
 # POSIX shared memory lives on a tmpfs, and its size is a SEPARATE budget from
 # host RAM -- the kernel default is half of it. `inexor.plan` priced the run
@@ -172,6 +174,168 @@ def check_shm_budget(terms, path=SHM_DIR, headroom=1.0):
     )
 
 
+def available_ram():
+    """`MemAvailable` in bytes, or None where /proc/meminfo is not readable.
+
+    The budget for the `memfd` path. Not `MemFree`: page cache is reclaimable
+    and counting it as spoken-for would refuse runs that fit.
+    """
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def preflight_shared_memory(terms, backend=None, headroom=1.0):
+    """Check the demand against whichever budget the backend actually has.
+
+    THE TWO BACKENDS HAVE DIFFERENT CEILINGS, and using the wrong one is how
+    this check would become decoration: `/dev/shm` is a hard tmpfs cap that
+    `memfd` is exempt from, while `memfd` is bounded by RAM, which `/dev/shm`
+    charges against as well but is not the first thing it hits. Returns
+    (demand, budget, what) so a caller can record what it stood on; `what` is
+    None when nothing could be read, because an absent check must not be
+    recorded as a passed one.
+    """
+    backend = backend or shm_backend()
+    demand = sum(terms.values())
+    if backend == "posix":
+        d, avail = check_shm_budget(terms, headroom=headroom)
+        return d, avail, (None if avail is None else "/dev/shm")
+    avail = available_ram()
+    if avail is None:
+        return demand, None, None
+    if demand * headroom > avail:
+        width = max(len(k) for k in terms)
+        table = "\n".join(
+            f"    {k:<{width}}  {_fmt_gb(v):>12}"
+            for k, v in sorted(terms.items(), key=lambda kv: -kv[1])
+        )
+        raise MemoryError(
+            f"the pool's shared memory does not fit available RAM.\n{table}\n"
+            f"    {'-' * width}  {'-' * 12}\n"
+            f"    {'demand':<{width}}  {_fmt_gb(demand):>12}\n"
+            f"    {'MemAvailable':<{width}}  {_fmt_gb(avail):>12}\n"
+            f"  These are memfd pages, so they are RAM and nothing else -- this "
+            f"is a real\n  shortage, not the /dev/shm cap that stopped 920910. "
+            f"Levers, largest first:\n  `arena_frac` and `brick_slack` both add "
+            f"rows to off/w; `arena_frac` also sets\n  `arena_bucket` outright."
+        )
+    return demand, avail, "MemAvailable"
+
+
+def shm_backend():
+    """`memfd` where the kernel has it, `posix` otherwise.
+
+    **`memfd` is the reason the c-gh run fits at all.** Both mechanisms hand
+    out the same thing -- anonymous RAM-backed shared pages, no device, no
+    I/O -- but `shm_open` puts them on the `/dev/shm` mount, whose size is
+    capped (half of RAM by default: 127.55 GB on a Vista gg node), while
+    `memfd_create` uses the kernel's internal shm mount, which has no size
+    limit at all. MEASURED on Vista: 2.147 GB of memfd raised `Shmem` by
+    2.139 GB (1.00x, so it really is those pages) and moved `/dev/shm` used
+    by 0.000. The state was never too big for the node; it was too big for
+    one doorway.
+
+    `posix` remains for every machine without `memfd_create`, which is every
+    macOS developer box, so the local suite exercises the fallback and the
+    cluster exercises the production path. The `/dev/shm` budget check
+    applies to that path ONLY -- see `check_shm_budget`.
+
+    `INEXOR_SHM_BACKEND` forces one. It exists because the choice is
+    otherwise made by the platform, which means the memfd path CANNOT be
+    exercised where this is developed and the posix path cannot be exercised
+    where it runs -- a gate neither machine can fail. It is also the escape
+    hatch if a node turns out not to expose `/proc/<pid>/fd` to a job.
+    """
+    forced = os.environ.get("INEXOR_SHM_BACKEND")
+    if forced:
+        if forced not in ("memfd", "posix"):
+            raise ValueError(
+                f"INEXOR_SHM_BACKEND={forced!r}; expected 'memfd' or 'posix'"
+            )
+        if forced == "memfd" and not hasattr(os, "memfd_create"):
+            raise ValueError(
+                "INEXOR_SHM_BACKEND=memfd but this kernel has no memfd_create"
+            )
+        return forced
+    return "memfd" if hasattr(os, "memfd_create") else "posix"
+
+
+class _Seg:
+    """One shared mapping: created by the parent, opened by each worker.
+
+    The handle is what crosses the process boundary. For `posix` it is the
+    segment's name, as before. For `memfd` it is `(pid, fd)`, because the
+    object HAS no name -- a worker reaches it through `/proc/<pid>/fd/<n>`,
+    which is a second reference to the same file, not a copy. Verified with a
+    spawned interpreter: the child read what the parent wrote and the parent
+    saw the child's write back.
+    """
+
+    __slots__ = ("kind", "buf", "handle", "_fd", "_shm")
+
+    def __init__(self, kind, buf, handle, fd=None, shm=None):
+        self.kind, self.buf, self.handle = kind, buf, handle
+        self._fd, self._shm = fd, shm
+
+    def close(self):
+        if self.kind == "memfd":
+            self.buf.close()
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
+        else:
+            self._shm.close()
+
+    def unlink(self):
+        """No-op for memfd: it is ANONYMOUS, so it dies with its last
+        reference and there is no name left behind to remove. 920910 leaked
+        six `/dev/shm` segments on the way down; this kind cannot."""
+        if self.kind == "posix":
+            self._shm.unlink()
+
+
+def create_segment(nbytes, tag, backend=None):
+    """Parent side. `nbytes` is the mapped length; `tag` is for `/proc` only."""
+    backend = backend or shm_backend()
+    if backend == "memfd":
+        fd = os.memfd_create(f"inexor-{tag}", 0)
+        try:
+            os.ftruncate(fd, nbytes)
+            buf = mmap.mmap(fd, nbytes, mmap.MAP_SHARED,
+                            mmap.PROT_READ | mmap.PROT_WRITE)
+        except BaseException:
+            os.close(fd)
+            raise
+        return _Seg("memfd", buf, ("memfd", os.getpid(), fd, nbytes), fd=fd)
+    shm = shared_memory.SharedMemory(create=True, size=nbytes)
+    return _Seg("posix", shm.buf, ("posix", shm.name, nbytes), shm=shm)
+
+
+def open_segment(handle):
+    """Worker side. Takes what `_Seg.handle` produced, gives back a mapping."""
+    kind = handle[0]
+    if kind == "memfd":
+        _, pid, fd, nbytes = handle
+        # a NEW descriptor onto the same object; the mapping outlives it, and
+        # holding it open would pin a descriptor per worker per segment
+        dup = os.open(f"/proc/{pid}/fd/{fd}", os.O_RDWR)
+        try:
+            buf = mmap.mmap(dup, nbytes, mmap.MAP_SHARED,
+                            mmap.PROT_READ | mmap.PROT_WRITE)
+        finally:
+            os.close(dup)
+        return _Seg("memfd", buf, handle)
+    _, name, _nbytes = handle
+    shm = shared_memory.SharedMemory(name=name)
+    return _Seg("posix", shm.buf, handle, shm=shm)
+
+
 _G = {}
 
 
@@ -188,7 +352,8 @@ def _rss_mb():
     return -1.0
 
 
-def _worker_init(shm_names, shapes, dtypes, fields, small, fn_args, x64, core_sets, rank_counter):
+def _worker_init(shm_handles, shapes, dtypes, fields, small, fn_args, x64,
+                 core_sets, rank_counter):
     """Pin affinity, then attach shm views and build the jitted tile program.
 
     `x64` replicates the PARENT's jax_enable_x64 into the worker -- the
@@ -209,12 +374,12 @@ def _worker_init(shm_names, shapes, dtypes, fields, small, fn_args, x64, core_se
 
     views, segs = {}, []
     for name in fields:
-        seg = shared_memory.SharedMemory(name=shm_names[name])
+        seg = open_segment(shm_handles[name])
         segs.append(seg)
         views[name] = np.ndarray(shapes[name], dtype=dtypes[name], buffer=seg.buf)
     g_coarse = []
     for i in range(3):
-        seg = shared_memory.SharedMemory(name=shm_names[f"g{i}"])
+        seg = open_segment(shm_handles[f"g{i}"])
         segs.append(seg)
         g_coarse.append(np.ndarray(shapes[f"g{i}"], dtype=dtypes[f"g{i}"], buffer=seg.buf))
     one_tile, _ = make_tile_force_fn(**fn_args)
@@ -255,8 +420,8 @@ def _ensure_scratch(M):
         for seg in _G.get("mig_segs", ()):
             seg.close()
         views, segs = {}, []
-        for name in M["mig_names"]:
-            seg = shared_memory.SharedMemory(name=M["mig_names"][name])
+        for name in M["mig_handles"]:
+            seg = open_segment(M["mig_handles"][name])
             segs.append(seg)
             views[name] = np.ndarray(
                 M["mig_shapes"][name], dtype=M["mig_dtypes"][name], buffer=seg.buf
@@ -461,7 +626,10 @@ class TilePool:
         # is real all the same, so the construction demand is held to a
         # margin rather than to the bare ceiling.
         self._shm_headroom = 1.10 if cfg.tile_workers > 1 else 1.0
-        check_shm_budget(self._shm_demand, headroom=self._shm_headroom)
+        self._shm_backend = shm_backend()
+        self._shm_receipt = preflight_shared_memory(
+            self._shm_demand, backend=self._shm_backend, headroom=self._shm_headroom
+        )
         for f in self._fields:
             view = self._share(f, np.asarray(getattr(st, f)))
             setattr(st, f, view)
@@ -510,13 +678,13 @@ class TilePool:
         if arr is not None:
             shape, dtype = arr.shape, arr.dtype
         nbytes = max(int(np.dtype(dtype).itemsize * np.prod(shape, dtype=np.int64)), 1)
-        seg = shared_memory.SharedMemory(create=True, size=nbytes)
+        seg = create_segment(nbytes, key)
         view = np.ndarray(shape, dtype=dtype, buffer=seg.buf)
         if arr is not None:
             view[...] = arr
         self._segs.append(seg)
         self._names[key], self._shapes[key], self._dtypes[key] = (
-            seg.name, tuple(shape), str(np.dtype(dtype)))
+            seg.handle, tuple(shape), str(np.dtype(dtype)))
         self._views[key] = view
         return view
 
@@ -597,7 +765,7 @@ class TilePool:
                 spec["mig_ids"] = ((K, R), np.int32)
             for name, (shape, dtype) in spec.items():
                 nbytes = max(int(np.dtype(dtype).itemsize * np.prod(shape, dtype=np.int64)), 1)
-                seg = shared_memory.SharedMemory(create=True, size=nbytes)
+                seg = create_segment(nbytes, name)
                 self._mig_segs[name] = seg
                 self._mig_views[name] = np.ndarray(shape, dtype=dtype, buffer=seg.buf)
             self._mig_shape = (K, R)
@@ -608,7 +776,7 @@ class TilePool:
             step=self._step, arena_base=int(self.st.arena_base),
             c_drift=float(c_drift), kernel=str(kernel), reach_r=int(r),
             has_ids=has_ids, mig_id=self._mig_id,
-            mig_names={k: s.name for k, s in self._mig_segs.items()},
+            mig_handles={k: s.handle for k, s in self._mig_segs.items()},
             mig_shapes={k: v.shape for k, v in self._mig_views.items()},
             mig_dtypes={k: str(v.dtype) for k, v in self._mig_views.items()},
         )
