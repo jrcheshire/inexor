@@ -437,7 +437,14 @@ def test_the_pilot_configuration_would_now_be_refused():
 # machine can exercise both paths: this suite would only ever see posix and
 # the cluster only ever memfd.
 
-BACKENDS = ["posix"] + (["memfd"] if hasattr(os, "memfd_create") else [])
+from inexor.executor import has_memfd  # noqa: E402
+
+# has_memfd() PROBES; it does not read an attribute. Job 922557 passed this
+# whole file 24/24 while exercising posix only, because conda-forge's Python
+# 3.14 has no `os.memfd_create` even where the kernel does, and the parametrise
+# list silently collapsed to one entry. A gate that quietly stops covering the
+# path it exists for is worse than no gate.
+BACKENDS = ["posix"] + (["memfd"] if has_memfd() else [])
 
 
 def _child_reads(handle, nbytes):
@@ -502,7 +509,7 @@ def test_a_bad_backend_override_refuses():
         del os.environ["INEXOR_SHM_BACKEND"]
 
 
-@pytest.mark.skipif(hasattr(os, "memfd_create"), reason="needs a kernel without memfd")
+@pytest.mark.skipif(has_memfd(), reason="needs a machine without memfd")
 def test_memfd_is_not_silently_downgraded():
     """Asking for memfd where there is none must fail loudly.
 
@@ -513,7 +520,7 @@ def test_memfd_is_not_silently_downgraded():
 
     os.environ["INEXOR_SHM_BACKEND"] = "memfd"
     try:
-        with pytest.raises(ValueError, match="no memfd_create"):
+        with pytest.raises(ValueError, match="cannot create one"):
             shm_backend()
     finally:
         del os.environ["INEXOR_SHM_BACKEND"]
@@ -526,3 +533,29 @@ def test_the_pool_is_bitwise_the_serial_loop_on_either_backend(backend, monkeypa
     s_serial, _ = _run(1)
     s_pool, _ = _run(4)
     _assert_states_identical(s_serial, s_pool)
+
+
+def test_memfd_is_detected_by_probe_not_by_attribute():
+    """The regression for job 922557.
+
+    `os.memfd_create` is gated on CPython's BUILD sysroot, so conda-forge
+    ships without it on a kernel that has the syscall -- the gpu env's Python
+    3.14.6 says no while the system 3.9 on the same node says yes. Anything
+    that reads the attribute to decide is deciding on the wrong question.
+    """
+    from inexor import executor
+
+    if not has_memfd():
+        pytest.skip("no memfd here either way")
+    if not hasattr(os, "memfd_create"):
+        # the interesting platform: capability present, attribute absent
+        assert executor.shm_backend() == "memfd", (
+            "has_memfd() is True but the backend chose posix, which is exactly "
+            "the silent downgrade that put 922557 back on the capped mount"
+        )
+    seg = executor.create_segment(1 << 16, "probe", backend="memfd")
+    try:
+        assert seg.kind == "memfd"
+    finally:
+        seg.close()
+        seg.unlink()

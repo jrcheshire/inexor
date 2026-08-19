@@ -45,8 +45,9 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
-__all__ = ["SHM_FIELDS", "TilePool", "shm_backend", "shm_capacity", "shm_terms",
-           "preflight_shared_memory", "create_segment", "open_segment", "SHM_DIR"]
+__all__ = ["SHM_FIELDS", "TilePool", "shm_backend", "has_memfd", "shm_capacity",
+           "shm_terms", "preflight_shared_memory", "create_segment", "open_segment",
+           "SHM_DIR"]
 
 # POSIX shared memory lives on a tmpfs, and its size is a SEPARATE budget from
 # host RAM -- the kernel default is half of it. `inexor.plan` priced the run
@@ -174,6 +175,74 @@ def check_shm_budget(terms, path=SHM_DIR, headroom=1.0):
     )
 
 
+_MEMFD_FN = None
+
+
+def _memfd_fn():
+    """`memfd_create`, from wherever this interpreter can reach it.
+
+    **`hasattr(os, "memfd_create")` IS NOT THE CAPABILITY.** CPython gates
+    that attribute on a configure-time check against the BUILD sysroot, and
+    conda-forge builds against an old one: the gpu env's Python 3.14.6 has no
+    `os.memfd_create` while the system Python 3.9 on the same Vista node
+    does, and the kernel has had the syscall throughout. Trusting the
+    attribute silently put job 922557 back on the capped mount after the
+    whole point of the change was to leave it.
+
+    The runtime libc has the symbol regardless, so go through it. Cached
+    because the miss path is a `CDLL` load. Returns None where there really
+    is no memfd, which is macOS.
+    """
+    global _MEMFD_FN
+    if _MEMFD_FN is None:
+        if hasattr(os, "memfd_create"):
+            _MEMFD_FN = os.memfd_create
+        else:
+            try:
+                import ctypes
+
+                libc = ctypes.CDLL(None, use_errno=True)
+                raw = libc.memfd_create
+                raw.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+                raw.restype = ctypes.c_int
+            except (OSError, AttributeError):
+                _MEMFD_FN = False
+            else:
+                def _call(name, flags=0, _raw=raw, _ct=ctypes):
+                    fd = _raw(name.encode(), flags)
+                    if fd < 0:
+                        err = _ct.get_errno()
+                        raise OSError(err, os.strerror(err), "memfd_create")
+                    return fd
+                _MEMFD_FN = _call
+    return _MEMFD_FN or None
+
+
+_HAS_MEMFD = None
+
+
+def has_memfd():
+    """Whether this process can actually create a memfd, by CREATING one.
+
+    A probe, not an attribute test, for the reason above: the attribute lied
+    on the exact machine this runs on. One syscall, cached.
+    """
+    global _HAS_MEMFD
+    if _HAS_MEMFD is None:
+        fn = _memfd_fn()
+        if fn is None:
+            _HAS_MEMFD = False
+        else:
+            try:
+                fd = fn("inexor-probe", 0)
+            except (OSError, ValueError):
+                _HAS_MEMFD = False
+            else:
+                os.close(fd)
+                _HAS_MEMFD = True
+    return _HAS_MEMFD
+
+
 def available_ram():
     """`MemAvailable` in bytes, or None where /proc/meminfo is not readable.
 
@@ -258,12 +327,12 @@ def shm_backend():
             raise ValueError(
                 f"INEXOR_SHM_BACKEND={forced!r}; expected 'memfd' or 'posix'"
             )
-        if forced == "memfd" and not hasattr(os, "memfd_create"):
+        if forced == "memfd" and not has_memfd():
             raise ValueError(
-                "INEXOR_SHM_BACKEND=memfd but this kernel has no memfd_create"
+                "INEXOR_SHM_BACKEND=memfd but this process cannot create one"
             )
         return forced
-    return "memfd" if hasattr(os, "memfd_create") else "posix"
+    return "memfd" if has_memfd() else "posix"
 
 
 class _Seg:
@@ -304,7 +373,7 @@ def create_segment(nbytes, tag, backend=None):
     """Parent side. `nbytes` is the mapped length; `tag` is for `/proc` only."""
     backend = backend or shm_backend()
     if backend == "memfd":
-        fd = os.memfd_create(f"inexor-{tag}", 0)
+        fd = _memfd_fn()(f"inexor-{tag}", 0)
         try:
             os.ftruncate(fd, nbytes)
             buf = mmap.mmap(fd, nbytes, mmap.MAP_SHARED,

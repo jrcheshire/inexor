@@ -37,6 +37,9 @@
 #   a. LEG 1 MUST PASS or nothing else runs. `test_executor.py` on this node
 #      covers both backends (the env override exists so both run where both
 #      exist), including the bitwise pool-vs-serial identity on memfd.
+#      EXPECT 27 passed, 1 skipped. 24/1 means the parametrise list collapsed
+#      to posix and the memfd path went untested -- that is what 922557 did,
+#      and it is why the backend assertion above leg 1 now exists.
 #   b. TOTAL HOST under 200 GB of the node's 237 during stepping, where TOTAL
 #      is parent peak PLUS the pool's workers. READ `total_rss_bytes`, NOT
 #      `peak_rss_bytes` -- ru_maxrss cannot see other processes, and at cdev8
@@ -69,8 +72,28 @@ echo "=== $(hostname): $(nproc) cores, commit $(git rev-parse --short HEAD) ==="
 free -g | head -2
 echo "--- the budget that bound 920910, and the one that replaces it ---"
 df -h /dev/shm | tail -1
-python3 -c "print('memfd_create:', hasattr(__import__('os'), 'memfd_create'))"
 df -h "$SCRATCH" | tail -1
+
+# THE BACKEND ASSERTION. 922557 passed its identity gate 24/24 and then ran
+# the 2048^3 leg on /dev/shm anyway, because `os.memfd_create` is absent from
+# conda-forge's CPython (gated on the BUILD sysroot) even though the kernel
+# has the syscall and the system python3 exposes it. Nothing in that job ever
+# stated which backend it was on, so a green gate and a wrong backend looked
+# identical. It does not run on assumption again: this asks the SAME code the
+# engine will ask, in the SAME interpreter, and stops here if the answer is
+# not memfd.
+pixi run -e gpu python -c "
+from inexor.executor import shm_backend, has_memfd
+import os
+b = shm_backend()
+print('os.memfd_create attribute :', hasattr(os, 'memfd_create'))
+print('has_memfd() probe         :', has_memfd())
+print('backend in force          :', b)
+assert b == 'memfd', (
+    'refusing to run 2048^3 on the ' + b + ' backend: that is the capped '
+    '/dev/shm mount, it holds 127.55 GB, and this configuration needs 148.5'
+)
+" || { echo "FATAL: not on the memfd backend; see above. Nothing else runs."; exit 1; }
 
 W="$SCRATCH/inexor_runs/c-gh-r0"
 RLZ="scripts/v2_m6_realization.py"
