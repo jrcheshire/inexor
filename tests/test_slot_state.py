@@ -790,3 +790,41 @@ def test_the_arena_caches_are_pure_and_match_a_rebuild_under_migration():
                 st_a._arena_free, np.nonzero(st_a.arena_bucket < 0)[0]
             )
         st_a.check()
+
+
+def test_the_repack_fast_path_and_the_merge_path_BOTH_fire_and_agree():
+    """The fast path (no arena residents -> no permutation) is a branch, and a
+    branch that never runs is not tested by a green suite.
+
+    C15 measured 89-96% of occupied bricks carrying no residents on the engine's
+    clustered state, which is what makes the branch worth having; here the point
+    is only that BOTH sides run in one call and the result is still elementwise
+    the out-of-place reference. Asserted on the counters the function reports,
+    so a future change that routes every brick one way fails here rather than
+    quietly costing 26x.
+    """
+    a, b = _repack_pair(51, drifts=(0.4,), brick_slack=0.0)
+    assert a.arena_used > 0, "fixture never spilled; the merge path is untested"
+    r = a.repack()
+    b._repack_reference()
+    assert r["bricks_fast"] > 0, "no brick took the fast path; the branch is dead"
+    assert r["bricks_merged"] > 0, "no brick took the merge path; the fixture is vacuous"
+    assert np.array_equal(a.off, b.off), "position payload differs"
+    assert np.array_equal(a.w, b.w), "velocity payload differs"
+    assert np.array_equal(a.ids, b.ids), "ids differ: rows permuted within a bucket"
+    assert np.array_equal(a.occupancy, b.occupancy)
+    assert np.array_equal(a.brick_start, b.brick_start)
+    assert a.arena_base == b.arena_base
+    assert a.check() is True
+
+
+def test_the_repack_fast_path_counts_every_occupied_brick_when_the_arena_is_empty():
+    """The boundary case the counters exist to make visible: a freshly built
+    state has an empty arena, so every occupied brick must take the fast path
+    and none may take the merge. If this ever reports merges, the arena is being
+    populated somewhere it should not be."""
+    a, _ = _repack_pair(53, drifts=())
+    assert a.arena_used == 0, "fixture spilled; this case is about an EMPTY arena"
+    r = a.repack()
+    assert r["bricks_merged"] == 0, "a merge ran with no arena residents to merge"
+    assert r["bricks_fast"] > 0, "no brick was repacked at all"

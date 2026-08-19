@@ -1727,6 +1727,19 @@ class SlotState:
         brick's unread rows. They are merged in pass B instead, where the
         destination already has room for them.
 
+        **Pass B has a fast path, and it is the common one.** A brick with no
+        arena residents to merge needs no permutation at all: its main run is
+        already in bucket order, so the sort is the identity and the re-count
+        returns the occupancy it was built from. Those bricks move as blocks,
+        the way pass A moves them. C15 measured why this is worth a branch:
+        pass B cost 26x pass A over the same rows at cdev, a third of that in
+        building `within` and `order` and the rest in the gather they drive,
+        while 89-96% of occupied bricks carried no residents on the engine's own
+        clustered state across five steps -- spill concentrates in the few
+        bricks that collapse instead of dusting across all of them. The
+        `bricks_fast` / `bricks_merged` counters in the return value are the
+        receipt that the split is still where the measurement put it.
+
         **Scratch is one brick plus the live arena**, and both are reported. The
         arena lift is O(arena_used) rather than O(brick) -- 0.77 GB at C-gh at
         the default 1% arena against the 115 GB this replaces -- and it is
@@ -1787,41 +1800,58 @@ class SlotState:
         # ---- pass B: expand rightward, merging the arena residents back in
         new_occ = np.zeros(self.n_buckets, dtype=np.int64)
         bucket_ids = np.arange(p3, dtype=np.int64)
+        n_fast = n_merge = 0
         for b in range(self.n_bricks - 1, -1, -1):
             m = int(run_counts[b])
             k = int(a_edge[b + 1] - a_edge[b])
             if m + k == 0:
                 continue
             mp, ns = int(main_pos[b]), int(new_start[b])
-            # the main rows' buckets are DERIVED from occupancy, never read back
-            # off the array, so pass A moving them cannot desynchronize this
-            within = np.repeat(bucket_ids, occ_b := np.asarray(
-                self.occupancy[b * p3 : (b + 1) * p3], dtype=np.int64))
-            del occ_b
-            if k:
-                within = np.concatenate([within, a_bucket[a_edge[b] : a_edge[b + 1]] - b * p3])
-            # STABLE, and over the concatenation main-then-arena: that is the
-            # exact order `_repack_reference` produces, and the identity gate
-            # compares against it elementwise.
-            order = _stable_order(within, p3)
-            cat_off = self.off[mp : mp + m]
-            cat_w = self.w[mp : mp + m]
-            if k:
-                cat_off = np.concatenate([cat_off, a_off[a_edge[b] : a_edge[b + 1]]])
-                cat_w = np.concatenate([cat_w, a_w[a_edge[b] : a_edge[b + 1]]])
+            if k == 0:
+                # A BRICK WITH NO ARENA RESIDENTS NEEDS NO PERMUTATION. `within`
+                # is `np.repeat` over the brick's own occupancy and so is already
+                # ascending, which makes `_stable_order` the identity and
+                # `bincount` return the occupancy slice it was built from. Both
+                # are dead work, and so is the gather: the block moves unchanged,
+                # exactly the way pass A moves it. `.copy()` for the same reason
+                # pass A needs one -- `ns >= mp`, so source and destination
+                # overlap and slice assignment gives no ordering guarantee.
+                n_fast += 1
+                buf_off = self.off[mp : mp + m].copy()
+                buf_w = self.w[mp : mp + m].copy()
+                scratch = max(scratch, buf_off.nbytes + buf_w.nbytes)
+                self.off[ns : ns + m] = buf_off
+                self.w[ns : ns + m] = buf_w
+                if self.ids is not None:
+                    self.ids[ns : ns + m] = self.ids[mp : mp + m].copy()
+                new_occ[b * p3 : (b + 1) * p3] = self.occupancy[b * p3 : (b + 1) * p3]
             else:
-                cat_off, cat_w = cat_off.copy(), cat_w.copy()
-            scratch = max(scratch, cat_off.nbytes + cat_w.nbytes + within.nbytes + order.nbytes)
-            self.off[ns : ns + m + k] = cat_off[order]
-            self.w[ns : ns + m + k] = cat_w[order]
-            if self.ids is not None:
-                cat_i = self.ids[mp : mp + m]
-                if k:
-                    cat_i = np.concatenate([cat_i, a_ids[a_edge[b] : a_edge[b + 1]]])
-                else:
-                    cat_i = cat_i.copy()
-                self.ids[ns : ns + m + k] = cat_i[order]
-            new_occ[b * p3 : (b + 1) * p3] = np.bincount(within[order], minlength=p3)
+                n_merge += 1
+                # the main rows' buckets are DERIVED from occupancy, never read
+                # back off the array, so pass A moving them cannot desynchronize
+                # this
+                within = np.repeat(bucket_ids, occ_b := np.asarray(
+                    self.occupancy[b * p3 : (b + 1) * p3], dtype=np.int64))
+                del occ_b
+                within = np.concatenate(
+                    [within, a_bucket[a_edge[b] : a_edge[b + 1]] - b * p3])
+                # STABLE, and over the concatenation main-then-arena: that is the
+                # exact order `_repack_reference` produces, and the identity gate
+                # compares against it elementwise.
+                order = _stable_order(within, p3)
+                cat_off = np.concatenate(
+                    [self.off[mp : mp + m], a_off[a_edge[b] : a_edge[b + 1]]])
+                cat_w = np.concatenate(
+                    [self.w[mp : mp + m], a_w[a_edge[b] : a_edge[b + 1]]])
+                scratch = max(
+                    scratch, cat_off.nbytes + cat_w.nbytes + within.nbytes + order.nbytes)
+                self.off[ns : ns + m + k] = cat_off[order]
+                self.w[ns : ns + m + k] = cat_w[order]
+                if self.ids is not None:
+                    cat_i = np.concatenate(
+                        [self.ids[mp : mp + m], a_ids[a_edge[b] : a_edge[b + 1]]])
+                    self.ids[ns : ns + m + k] = cat_i[order]
+                new_occ[b * p3 : (b + 1) * p3] = np.bincount(within[order], minlength=p3)
             # ZERO THE SPARE. The out-of-place form allocates `zeros_like` and
             # writes only live rows, so every non-live byte is 0 (ids -1). Left
             # alone, an in-place repack would carry stale payload in the gaps --
@@ -1860,6 +1890,13 @@ class SlotState:
             # EVERYTHING transient, not just the largest buffer. The figure this
             # function replaces omitted three O(N) arrays and read as a constant.
             scratch_bytes=int(scratch),
+            # THE FAST PATH'S RECEIPT. Without it a change to the arena's
+            # behaviour could route every brick through the merge and nothing
+            # would say so -- the timing would drift and the tests would stay
+            # green. It is also the per-step arena-concentration measurement C15
+            # had to build a whole instrument to take.
+            bricks_fast=int(n_fast),
+            bricks_merged=int(n_merge),
         )
 
     def _bucket_flat_of_slots(self, brick_flat, slots):
