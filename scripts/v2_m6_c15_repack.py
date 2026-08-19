@@ -662,15 +662,27 @@ def run_engine(cfg_name, k, slack, arena_frac, repeats, skip_oracle, out_path,
         gate = None
         if not steps:
             gate = _gate(self, brick_slack, skip_oracle, real_fn=real_repack)
-        # the baseline runs on a COPY, so the engine still advances down the
-        # shipped path and the A/B does not change the trajectory it measures
+        # BOTH ARMS RUN ON A FRESH DEEPCOPY, and the engine is then advanced by
+        # the real shipped function. Job 920645 timed the baseline on a copy and
+        # the fast arm on the engine's own state, which is not one comparison:
+        # a deepcopy is freshly allocated and first-touched by this thread, while
+        # the engine's arrays are adopted into shared memory by the tile pool and
+        # carry whatever placement that gave them. That difference sits entirely
+        # on the baseline's side of the ratio, and it is the likeliest reason
+        # that job's baseline read 15% under the phase card it should reproduce.
+        # Timing both arms on the same kind of memory costs one extra copy per
+        # step and removes the confound instead of arguing about its sign.
         s_base = copy.deepcopy(self)
         _, T_base = _repack_timed(s_base, brick_slack=brick_slack, fast_path=False)
         del s_base
-        res, T = _repack_timed(self, brick_slack=brick_slack, fast_path=True)
+        s_fast = copy.deepcopy(self)
+        _, T = _repack_timed(s_fast, brick_slack=brick_slack, fast_path=True)
+        del s_fast
         steps.append(dict(step=len(steps), census=cen, timings=T, baseline=T_base,
                           gate=gate))
-        return res
+        # the engine advances on the SHIPPED function, so the trajectory this
+        # instrument measures is the one the engine would have taken unobserved
+        return real_repack(self, brick_slack=brick_slack)
 
     cls.repack = hooked
     try:
