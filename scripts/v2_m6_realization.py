@@ -241,11 +241,21 @@ def cmd_run(args):
     os.makedirs(d, exist_ok=True)
     ec = _engine_config(g, args, d)
 
+    # THE STATE IS BUILT STRAIGHT INTO SHARED MEMORY, so it exists once
+    # rather than twice. Before this the loader made ~135 GB of private
+    # arrays at c-gh and TilePool copied them into another ~135 GB; job
+    # 922723 was OOM-killed doing exactly that. Serial runs get no allocator
+    # and no pool, and behave as they always did.
+    from inexor.executor import SharedAllocator, malloc_trim
+
+    allocator = SharedAllocator() if ec.tile_workers > 1 else None
+
     have = _newest_checkpoint_step(args)
     resume = None
     t_load = time.perf_counter()
     if have is not None:
-        st, resume = engine.load_checkpoint(d, ec, co, arena_frac=args.arena_frac)
+        st, resume = engine.load_checkpoint(d, ec, co, arena_frac=args.arena_frac,
+                                            alloc=allocator)
         src = f"checkpoint at step {int(resume['step'])}"
         if int(resume["step"]) >= K_STEPS:
             print(f"  NOTHING TO DO: the checkpoint is already at step "
@@ -254,10 +264,14 @@ def cmd_run(args):
     else:
         st = icgen.load_slot_state(
             args.workdir, brick_slack=args.slack, alloc_margin=args.alloc_margin,
-            arena_frac=args.arena_frac,
+            arena_frac=args.arena_frac, alloc=allocator,
         )
         src = "the ICs (step 0)"
     t_load = time.perf_counter() - t_load
+    # glibc keeps freed arenas, and the pool's segments are fresh kernel pages
+    # that cannot be served from them, so the loader's transients and the
+    # pool's demand STACK unless this is called. Reported, not assumed.
+    trimmed = malloc_trim()
 
     k0 = 0 if resume is None else int(resume["step"])
     stop = args.stop_at if args.stop_at else K_STEPS
@@ -270,6 +284,9 @@ def cmd_run(args):
     # kept being re-found rather than read
     print(f"  coarse={ec.coarse_dtype} fine={ec.fine_dtype} "
           f"arena_frac={args.arena_frac} alloc_margin={args.alloc_margin}")
+    print(f"  state in shared memory: "
+          f"{'yes, %.1f GB' % (allocator.bytes_held() / 1e9) if allocator else 'no (serial)'}"
+          f"; malloc_trim={trimmed}")
 
     ph = PhaseTimer()
     stats = []

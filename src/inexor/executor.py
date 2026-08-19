@@ -444,6 +444,85 @@ def open_segment(handle):
     return _Seg("posix", shm.buf, handle, shm=shm)
 
 
+def malloc_trim():
+    """Hand glibc's retained free arenas back to the OS. True if it did work.
+
+    `free()` does not shrink the process. After the slab loader releases ~86
+    GB of per-slab payload the allocator keeps those arenas, and the pool's
+    segments are FRESH KERNEL PAGES that cannot be served from them -- so the
+    two costs stack instead of cancelling. Job 922723 was OOM-killed 41 s into
+    pool construction with exactly that shape.
+
+    Not a no-op by assumption: it reports whether the call happened, so a
+    caller can record "trimmed" rather than infer it. glibc only; returns
+    False on macOS, where the allocator is different and this question does
+    not arise.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None)
+        libc.malloc_trim.argtypes = [ctypes.c_size_t]
+        libc.malloc_trim.restype = ctypes.c_int
+    except (OSError, AttributeError):
+        return False
+    libc.malloc_trim(0)
+    return True
+
+
+class SharedAllocator:
+    """Hands out ndarray views backed by shared segments, so a producer can
+    write the state STRAIGHT into the memory the workers will read.
+
+    **This is what stops the state existing twice.** Before it, the loader
+    built ~135 GB of private arrays and `TilePool` then copied them into
+    another ~135 GB of segments, so a node had to hold both at once; at c-gh
+    on a 255 GB box, with the loader's own peak on top, it did not.
+
+    The registry is by `id()` of the view, which is sound only because the
+    allocator OWNS those buffers and keeps them alive for its lifetime -- an
+    id is reusable once its object dies, and none of these die early.
+    """
+
+    def __init__(self, backend=None):
+        self.backend = backend or shm_backend()
+        self._segs = []
+        self._by_id = {}
+
+    def empty(self, shape, dtype, tag="alloc"):
+        dtype = np.dtype(dtype)
+        nbytes = max(int(dtype.itemsize * np.prod(shape, dtype=np.int64)), 1)
+        seg = create_segment(nbytes, tag, backend=self.backend)
+        view = np.ndarray(shape, dtype=dtype, buffer=seg.buf)
+        self._segs.append(seg)
+        self._by_id[id(view)] = (seg, view)
+        return view
+
+    def zeros(self, shape, dtype, tag="alloc"):
+        view = self.empty(shape, dtype, tag)
+        view[...] = 0
+        return view
+
+    def segment_of(self, arr):
+        """The segment backing `arr`, or None if this allocator did not make
+        it. Identity, not equality: a copy of a shared array is not shared."""
+        hit = self._by_id.get(id(arr))
+        return None if hit is None or hit[1] is not arr else hit[0]
+
+    def bytes_held(self):
+        return sum(s.buf.size() if hasattr(s.buf, "size") else len(s.buf)
+                   for s in self._segs)
+
+    def close(self):
+        for seg in self._segs:
+            seg.close()
+            try:
+                seg.unlink()
+            except FileNotFoundError:
+                pass
+        self._segs, self._by_id = [], {}
+
+
 _G = {}
 
 
@@ -689,7 +768,7 @@ class TilePool:
     the state object outlives the pool either way.
     """
 
-    def __init__(self, st, cfg):
+    def __init__(self, st, cfg, allocator=None):
         import jax
 
         if jax.default_backend() != "cpu":
@@ -723,8 +802,19 @@ class TilePool:
         # from the arrays themselves, not modelled: this is the check, and a
         # check that prices something other than what it is about to allocate
         # is the shape of a gate that cannot fail.
+        # Arrays the allocator already made are ALREADY in shared memory: the
+        # loader wrote them there. They cost nothing to adopt and must not be
+        # priced as if they did, or the check refuses a run whose whole point
+        # was to avoid the second copy.
+        self._alloc = allocator
+        self._preshared = {
+            f for f in self._fields
+            if allocator is not None
+            and allocator.segment_of(np.asarray(getattr(st, f))) is not None
+        }
         self._shm_demand = {
-            f: int(np.asarray(getattr(st, f)).nbytes) for f in self._fields
+            f: int(np.asarray(getattr(st, f)).nbytes)
+            for f in self._fields if f not in self._preshared
         }
         self._shm_demand["coarse force g0,g1,g2"] = int(
             3 * n**3 * np.dtype(cfg.np_coarse_dtype).itemsize
@@ -741,9 +831,16 @@ class TilePool:
         # path -- see `adoption_peak`.
         self._shm_receipt = preflight_shared_memory(
             self._shm_demand, backend=self._shm_backend,
-            headroom=self._shm_headroom, adopted=set(self._fields),
+            headroom=self._shm_headroom,
+            adopted=set(self._fields) - self._preshared,
         )
         for f in self._fields:
+            arr = np.asarray(getattr(st, f))
+            seg = None if self._alloc is None else self._alloc.segment_of(arr)
+            if seg is not None:
+                # already in shared memory; register its handle and DO NOT copy
+                self._adopt(f, seg, arr)
+                continue
             view = self._share(f, np.asarray(getattr(st, f)))
             setattr(st, f, view)
         # the parent's cached brick->arena index maps into the OLD array;
@@ -786,6 +883,17 @@ class TilePool:
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+    def _adopt(self, key, seg, arr):
+        """Register an array the allocator already put in shared memory.
+
+        The zero-copy path. `st` is not rebound because the array it holds IS
+        the shared view."""
+        self._segs.append(seg)
+        self._names[key], self._shapes[key], self._dtypes[key] = (
+            seg.handle, tuple(arr.shape), str(arr.dtype))
+        self._views[key] = arr
+        return arr
 
     def _share(self, key, arr=None, shape=None, dtype=None):
         if arr is not None:

@@ -418,12 +418,27 @@ def generate_t9_slabs(
     return manifest
 
 
+def _shared_like(arr, alloc, tag):
+    """Move a small array into shared memory if there is an allocator.
+
+    These are the fields that are cheap to copy but must still be SHARED, so
+    they are built normally and moved. Only `off`/`w` are large enough that
+    the copy itself matters, and those are written in place by the caller.
+    """
+    if alloc is None:
+        return arr
+    view = alloc.empty(arr.shape, arr.dtype, tag)
+    view[...] = arr
+    return view
+
+
 def load_slot_state(
     workdir,
     brick_slack=0.10,
     alloc_margin=0.10,
     arena_frac=0.01,
     index_dtype=DEFAULT_INDEX_DTYPE,
+    alloc=None,
 ):
     """Reassemble a host-resident SlotState from T9 slabs on disk.
 
@@ -449,11 +464,13 @@ def load_slot_state(
     n_bricks = nb**3
     n = int(man["n_particles"])
 
-    slabs = []
-    occupancy = np.empty(n_bricks * per3, dtype=np.int64)
-    # one scale per brick, reassembled from the slabs that own them
-    vel_scale = np.ones(n_bricks, dtype=np.float64)
-    for fname in man["files"]:
+    # TWO PASSES, and the second re-reads the files ON PURPOSE. Holding every
+    # slab's payload to place it later costs the WHOLE particle set a second
+    # time -- 85.9 GB at 2048^3, live at the same moment as the 117.5 GB of
+    # destination arrays, for a loader peak of ~216 GB on a 255 GB node. The
+    # re-read is ~81 GB off Lustre against 135 GB of resident payload, and it
+    # is the cheaper side of that trade by a wide margin.
+    def _slab(fname):
         with np.load(os.path.join(workdir, fname)) as z:
             meta = json.loads(str(z["meta"]))
             occ, off, w, sc = z["occupancy"], z["off"], z["w"], z["scale"]
@@ -464,19 +481,34 @@ def load_slot_state(
                     f"{fname}:{name} crc mismatch ({crc} != {meta['crc32'][name]}); "
                     "the slab file is corrupt, refusing to load"
                 )
-        d = int(meta["bx"])
+        return int(meta["bx"]), off, w, occ, sc
+
+    # pass 1: the index only. off/w are dropped at the end of each iteration.
+    occupancy = np.empty(n_bricks * per3, dtype=np.int64)
+    # one scale per brick, reassembled from the slabs that own them
+    vel_scale = np.ones(n_bricks, dtype=np.float64)
+    for fname in man["files"]:
+        d, _off, _w, occ, sc = _slab(fname)
         occupancy[d * nb * nb * per3 : (d + 1) * nb * nb * per3] = occ
         vel_scale[d * nb * nb : (d + 1) * nb * nb] = sc
-        slabs.append((d, off, w, occ))
+        del _off, _w
 
     brick_counts = occupancy.reshape(n_bricks, per3).sum(axis=1)
     _, brick_start, n_alloc, n_arena = _alloc_geometry(
         brick_counts, n, brick_slack, alloc_margin, arena_frac
     )
     n_rows = n_alloc + n_arena
-    off_all = np.zeros((n_rows, 3), dtype=np.uint8)
-    w_all = np.zeros((n_rows, 3), dtype=np.int16)
-    for d, off, w, occ in slabs:
+    # `alloc` puts the payload straight into shared memory, so `TilePool`
+    # adopts it without a second copy. Without one this is np.zeros and the
+    # behaviour is exactly what it was.
+    _zeros = (lambda shape, dtype, tag: np.zeros(shape, dtype=dtype)) if alloc is None \
+        else alloc.zeros
+    off_all = _zeros((n_rows, 3), np.uint8, "off")
+    w_all = _zeros((n_rows, 3), np.int16, "w")
+
+    # pass 2: place the payload, one slab live at a time
+    for fname in man["files"]:
+        d, off, w, _occ, _sc = _slab(fname)
         row = 0
         for b in range(d * nb * nb, (d + 1) * nb * nb):
             cnt = int(brick_counts[b])
@@ -485,17 +517,20 @@ def load_slot_state(
             row += cnt
         if row != len(off):
             raise ValueError(f"slab bx={d}: placed {row} rows of {len(off)}")
+        del off, w, _occ
 
     st = SlotState(
         t9=t9,
         bricks_per_side=nb,
-        brick_start=brick_start,
-        occupancy=_to_index(occupancy, index_dtype, "initial"),
+        brick_start=_shared_like(brick_start, alloc, "brick_start"),
+        occupancy=_shared_like(_to_index(occupancy, index_dtype, "initial"),
+                               alloc, "occupancy"),
         off=off_all,
         w=w_all,
-        vel_scale=vel_scale,
+        vel_scale=_shared_like(vel_scale, alloc, "vel_scale"),
         arena_base=n_alloc,
-        arena_bucket=np.full(n_arena, -1, dtype=np.int64),
+        arena_bucket=_shared_like(
+            np.full(n_arena, -1, dtype=np.int64), alloc, "arena_bucket"),
         n_particles=n,
         ids=None,
     )

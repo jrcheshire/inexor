@@ -619,3 +619,72 @@ def test_posix_is_still_checked_on_the_total(monkeypatch):
     with pytest.raises(MemoryError, match="does not fit /dev/shm"):
         executor.preflight_shared_memory(terms, backend="posix",
                                          adopted={"w", "off"})
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_preshared_state_is_adopted_without_a_second_copy(backend, monkeypatch):
+    """The state must exist ONCE. Job 922723 died because it existed twice.
+
+    Identity, not equality: if the pool copied, `st.off` would be a different
+    object afterwards and the peak would be twice the state. Equality would
+    pass on a copy, which is exactly the failure being excluded.
+    """
+    monkeypatch.setenv("INEXOR_SHM_BACKEND", backend)
+    from inexor.executor import SharedAllocator, TilePool
+
+    cfg = _cfg(tile_workers=2)
+    x = _positions(0)
+    v = np.random.default_rng(1).normal(scale=0.5, size=x.shape)
+    t9 = T9Layout(box_size=L_BOX, n_part=N_PART, bucket_cells=2)
+    st = state.SlotState.build(x, v, t9, N_FINE // cfg.n_brick, brick_slack=0.10,
+                               arena_frac=0.05)
+    alloc = SharedAllocator()
+    try:
+        # put the payload where the loader would have put it
+        for f in FIELDS:
+            a = np.asarray(getattr(st, f))
+            view = alloc.empty(a.shape, a.dtype, f)
+            view[...] = a
+            setattr(st, f, view)
+        before = {f: id(np.asarray(getattr(st, f))) for f in FIELDS}
+        pool = TilePool(st, cfg, allocator=alloc)
+        try:
+            after = {f: id(np.asarray(getattr(st, f))) for f in FIELDS}
+            assert before == after, "the pool copied an array that was already shared"
+            assert pool._preshared == set(FIELDS)
+            # only the coarse meshes are charged
+            assert set(pool._shm_demand) == {"coarse force g0,g1,g2"}
+        finally:
+            pool.close()
+    finally:
+        alloc.close()
+
+
+def test_the_loader_fills_shared_memory_and_is_otherwise_unchanged(tmp_path):
+    """Same state, whichever allocator: the shared path is a placement
+    change, not a numerical one."""
+    from inexor import icgen
+    from inexor.executor import SharedAllocator
+
+    cfg = _cfg(tile_workers=1)
+    x = _positions(2)
+    v = np.random.default_rng(3).normal(scale=0.5, size=x.shape)
+    t9 = T9Layout(box_size=L_BOX, n_part=N_PART, bucket_cells=2)
+    st = state.SlotState.build(x, v, t9, N_FINE // cfg.n_brick, brick_slack=0.10,
+                               arena_frac=0.05)
+    icgen.write_t9_slabs(st, str(tmp_path))
+
+    plain = icgen.load_slot_state(str(tmp_path), brick_slack=0.10, arena_frac=0.05)
+    alloc = SharedAllocator()
+    try:
+        shared = icgen.load_slot_state(str(tmp_path), brick_slack=0.10,
+                                       arena_frac=0.05, alloc=alloc)
+        for f in FIELDS:
+            a, b = np.asarray(getattr(plain, f)), np.asarray(getattr(shared, f))
+            assert a.dtype == b.dtype and a.shape == b.shape, f
+            assert int((a != b).sum()) == 0, f"{f} differs between the two loaders"
+            assert alloc.segment_of(b) is not None, f"{f} is not in shared memory"
+        assert alloc.segment_of(np.asarray(getattr(plain, "off"))) is None
+        assert plain.arena_base == shared.arena_base
+    finally:
+        alloc.close()

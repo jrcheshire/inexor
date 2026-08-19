@@ -1229,7 +1229,7 @@ def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen):
 
 
 def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=0.10,
-                    arena_frac=None):
+                    arena_frac=None, alloc=None):
     """Newest complete checkpoint under `checkpoint_dir` -> `(st, resume)`.
 
     Picks by the recorded step rather than by mtime, and only among generations
@@ -1282,11 +1282,12 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
         brick_slack=cfg.brick_slack if brick_slack is None else brick_slack,
         alloc_margin=alloc_margin,
         arena_frac=arena_frac,
+        alloc=alloc,
     )
     return st, dict(prov)
 
 def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
-        stop_at=None):
+        stop_at=None, allocator=None):
     """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`.
 
     `phase` is forwarded to `step`; see its docstring. The boundaries `run`
@@ -1328,7 +1329,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         # `tile_geom` without the kernel triple's memory or the trace
         from .executor import TilePool
 
-        pool = TilePool(st, cfg)
+        pool = TilePool(st, cfg, allocator=allocator)
         tile_force = (None, tile_geom(
             cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine,
             paint=cfg.paint_short, frac_bits=cfg.frac_bits, fdtype=cfg.np_fine_dtype,
