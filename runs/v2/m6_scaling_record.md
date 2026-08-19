@@ -1710,6 +1710,131 @@ answer.**
 cost actually follows. One counter. Worth adding when the spill code is next
 open, which is repack pooling.
 
+## 5w. Vista 920645 -- C15: `repack` was never a parallelism problem, and it is now 4.85x faster serial
+
+**The plan this replaced.** C14 left `repack` as the last phase running serial on
+an idle machine (4.74 s/step at cgh64, 3.2 busy cores of 144, ~0% canary loss,
+5t) and the named next move was to pool it, worth ~2.9 h at C5-like efficiency.
+**That target was the wrong order of magnitude and the pool was never built.**
+
+**The arithmetic that stopped it.** `repack` moves every live row twice, once
+left to compact and once right to expand. At cgh64 that is 134.2M rows x 9 B x 4
+= ~4.8 GB. C11 measured 39.5 GB/s single core on this machine, so the phase's own
+single-thread floor is order 0.12 s against 4.74 measured -- **~40x, where a
+16-worker pool can buy at most 16x.** Same shape as C6 found in `migrate`: a
+phase called "irreducible row work" that was passes and temporaries.
+
+### The decomposition, and the census nobody had taken
+
+`scripts/v2_m6_c15_repack.py` transcribes `repack` with per-section timers,
+gates the transcription bitwise against the real function, and runs the engine
+so the state it measures is the clustered one the engine actually produces.
+Two findings, at cdev first and confirmed at cgh64:
+
+- **Pass B costs 19-26x pass A over the SAME rows.** Pass A block-moves them;
+  pass B builds `within` and `order` (one int64 per row each, 64 KB against
+  37 KB of payload at 4096 rows/brick) and gathers through them.
+- **88.7-96.2% of occupied bricks carry NO arena residents when repack runs.**
+  Spill concentrates in the few bricks that are collapsing rather than dusting
+  across all of them.
+
+That second number did not exist before. **5v's 8.31M spill rows are arena
+CLAIMS across a whole migrate pass, not residency at the end of one** --
+`_release_arena_of_brick` frees a brick's slots as that brick is rewritten, so
+the arena is a revolving door within the pass, and the default arena is 1% of
+particles which bounds residency far below the claim count. Any reading of 5v
+that treats 6% as "6% of bricks are dirty at repack time" is wrong.
+
+### What was built (`state.py`, three changes, all measured before writing)
+
+1. **A brick with no arena residents skips the permutation entirely.** Its main
+   run is already in bucket order, so the sort is the identity and the re-count
+   returns the occupancy it was built from. Those bricks move as blocks.
+2. **The block moves dropped their explicit `.copy()`.** numpy has copied before
+   writing an overlapping slice assignment since 1.13 and skips it when the
+   ranges are disjoint, which is the common case: 0.96 us against 0.50 per
+   4096-row brick. Pass A halved.
+3. **The merge path gathers with `np.take(..., axis=0, out=...)`** instead of
+   advanced indexing: 11.11 -> 4.96 ns/row, because indexing an (n, 3) array
+   runs a strided inner loop per row.
+
+**CROSS-BRICK BATCHING WAS MEASURED AND REJECTED.** Building a chunk buffer with
+`np.concatenate` over ~256 bricks and writing it once ran **0.62 ns/row against
+the per-brick loop's 0.53**. The per-brick cost is already dominated by the copy
+rather than by interpreter dispatch, and the chunk form adds a whole extra round
+trip through memory. Recorded here and in the docstring so it is not proposed a
+third time.
+
+### The leg: cgh64, 32,768 bricks, k=6, slack 0.20, W=16, pooled migrate, jax eject
+
+| step | arena residents | % particles | arena-free bricks | baseline s | new s | speedup |
+|---|---|---|---|---|---|---|
+| 0 | 467,424 | 0.35 | 96.2% | 3.915 | 0.645 | 6.07x |
+| 1 | 647,283 | 0.48 | 96.1% | 3.969 | 0.666 | 5.96x |
+| 2 | 2,178,811 | 1.62 | 92.5% | 3.824 | 0.854 | 4.48x |
+| 3 | 4,624,798 | 3.45 | 89.8% | 4.148 | 1.075 | 3.86x |
+| 4 | 6,434,846 | 4.79 | 88.7% | 4.269 | 1.202 | 3.55x |
+| 5 | 2,024,644 | 1.51 | 95.4% | 4.103 | 0.784 | 5.23x |
+
+**MEDIAN 4.85x, median 4.04 -> 0.82 s/step.** The payoff tracks arena residency
+inversely and that is the mechanism working as described, not scatter. Pass A is
+flat at 0.13 s; every step's variation is pass B.
+
+**All four gates held**, and three of them had never run at this brick count:
+both arms bitwise against `SlotState.repack` (off, w, ids, occupancy,
+brick_start, arena_bucket, arena_base, slots_used all n_diff 0); `repack`
+elementwise against `_repack_reference`, the out-of-place oracle kept in the
+module for exactly this; and the arms SEPARATED -- fast path taken 31,508 times
+in the new arm and **0 in the baseline**, without which the A/B would have
+compared the new code with itself.
+
+**Pre-registrations:** (a) arena concentration transfers, band 80-98% -- **HELD**
+at 88.7-96.2%; (b) median >= 4x -- **HELD** at 4.85x; (c) bitwise at 32,768
+bricks -- **HELD**; (d) baseline within 20% of the 4.74 card -- **HELD, but at
+15% it is the loose one**, see below. (3) from the laptop pre-registration,
+"index machinery >= 40% of pass B", **MISSED** at 27-32% across all three
+configs: it is real but the gather is the larger half.
+
+**Cost:** 5 min 24 s wall against a 1.5 h request, ~0.03 SU.
+
+### What this does NOT establish
+
+- **The instrument timed the two arms on different memory, and it biases the
+  ratio DOWN.** The baseline ran on a fresh deepcopy (allocated and first-touched
+  by the timing thread) and the new arm on the engine's own arrays (adopted into
+  shared memory by the tile pool). On a machine whose sockets are 479 GB/s within
+  and 299 across (C11) that is not nothing, and it is the likeliest reason the
+  baseline read 4.04 against the card's 4.74. **Fixed after the fact** (both arms
+  now run on a copy, the engine advances on the real function); re-measured on
+  the laptop it moves ~4% (cdev 5.63 -> 5.43x, cdev8 pooled 3.16 -> 3.04x), but
+  the laptop has uniform memory and CANNOT bound it on Vista. **So the true
+  factor is bracketed 4.85x (attribute none of the gap) to 5.70x (attribute all
+  of it), and it has not been re-run.** Nothing downstream changes anywhere in
+  that bracket.
+- **Why the baseline read 15% under the card is not attributed.** Candidates
+  besides the above: k=6 here against the card's k=3, so a different a-grid and a
+  different clustering history; and the phase timer measures a boundary-to-
+  boundary interval where this measures the call.
+- **No realization was run.** The hour figures below are arithmetic on a phase
+  card at the standing conversion (1 s/step at cgh64 = 0.711 h at 2048^3), as
+  every hour figure in this record is.
+- **Nothing about C-hero.** 4096^3 has 16.8M bricks at the same rows/brick; the
+  fast-path share depends on clustering at that volume and is unmeasured.
+
+### What it does to the projection (ARITHMETIC, not a run)
+
+Carrying the measured ratio onto the card's 4.74 gives **0.98 s/step**, so
+recurring 34.52 -> **30.76 s/step** and the 2048^3 realization **24.6 -> ~21.9 h**.
+That is essentially the whole 2.9 h the repack pool was scoped to deliver,
+single-threaded, with no shared memory, no worker plumbing and no new bitwise
+obligation.
+
+**Repack pooling is now worth about 0.5 h, not 2.9.** At C5-like efficiency on a
+0.98 s phase it would return ~0.73 s/step. It is no longer the ranked next item,
+and the idle half is closed as a wall lever: after this, migrate is 3.78 s and
+repack 0.98 of a 30.76 s step, so ~85% of the step is the tile loop and the
+coarse paint, both already within 1.5-2x of the bandwidth ceiling (5t).
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
