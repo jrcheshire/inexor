@@ -475,8 +475,68 @@ def _global_delta_and_kernels(
     return delta, kers, max_applied
 
 
+def coarse_kernel_parts(n_mesh, box_size, which, r_s=None, match=None, clip=None,
+                        fdtype=np.float64):
+    """The REAL half-grids the coarse solve needs, built ONCE per run.
+
+    **Everything here is a function of geometry alone** -- shape, cell, `r_s`,
+    the match pair -- so nothing in it changes between steps, and until M-v2-6
+    the engine rebuilt all of it every step inside `coarse_force_meshes`. The
+    fine arm already learned this: `engine.run` hoists `make_tile_force_fn` to
+    once per run because the per-step rebuild re-traces the same program and
+    rebuilds the same kernel triple. The coarse arm simply never got the same
+    treatment, and at C-gh it is the more expensive of the two by 80x.
+
+    What it buys, MEASURED (bytes per half-grid element, flat to 0.2% over a
+    7.9x range in `half` at n_coarse 128/192/256):
+
+        as shipped before M-v2-6   60.01 B/half EVERY step
+        parts + streamed solve     16.01 B/half every step, 8.00 held
+
+    which at C-gh (`half` = 537,919,488) is **32.28 GB per step against 8.61 GB
+    per step plus 4.30 GB resident**. That mattered because the coarse solve is
+    where the 2048^3 pilot died: Vista 923139 lost ~79 GB of MemAvailable inside
+    one phase of step 1, against a planner that priced the whole per-step mesh
+    transient at 12.9 GB by charging only its largest single term.
+
+    **Only the REAL half-grids are kept.** The complex kernels are 24 B/half and
+    are formed one component at a time inside the solve, where each is freed
+    before the next exists. `pref` and the match factor are 4 B/half each at
+    f32, and the `ik_j` are low-rank broadcasts ((nx,1,1) etc.) that cost
+    nothing -- which is the whole reason this split is worth making.
+
+    The match factor is kept SEPARATE from `pref` rather than folded into it,
+    and that is deliberate: folding gives `(pref * mf) * ik` where the shipped
+    expression is `(pref * ik) * mf`, which is one reassociation and so not
+    bitwise. It would save a further 4 B/half and it is not worth re-opening
+    D-v2-16 clause 7 for.
+
+    The build peak is 28 B/half (the f64 island plus `pref`) and it is paid once
+    per run, before any force mesh exists.
+    """
+    fdtype = field_dtype(fdtype)
+    shape = (int(n_mesh),) * 3
+    cell = box_size / n_mesh
+    ikx, iky, ikz, k2_true, k2_safe = kernel_grids(shape, cell, np.float64)
+    fac = split_factor(k2_true, 0.0 if r_s is None else r_s, which)
+    pref = (fac / k2_safe).astype(fdtype, copy=False)
+    # the f64 island is dead the moment `pref` exists, and at C-gh it is 12.9 GB
+    # of it; holding it to the end of the function would keep the build peak at
+    # the whole run's peak for no reason
+    del k2_true, k2_safe, fac
+    mf = None
+    if match is not None:
+        # cast for the same reason as in `_global_delta_and_kernels`: an f64
+        # match factor would promote a complex64 kernel back to complex128
+        m, _ = cic_match_factor(shape, match[0], match[1], clip=clip)
+        mf = m.astype(fdtype, copy=False)
+        del m
+    return dict(iks=(ikx, iky, ikz), pref=pref, mf=mf,
+                fdtype=fdtype, n_mesh=int(n_mesh), which=which)
+
+
 def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None,
-                        fdtype=None):
+                        fdtype=None, parts=None, out=None):
     """The three long-range force meshes from an ALREADY-PAINTED delta.
 
     `force_global` paints from every position AND gathers at every position,
@@ -498,6 +558,19 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
     pair makes that unrepresentable instead of merely unlikely. Casting the
     delta to match would be the friendly alternative and is exactly wrong -- it
     would hide the caller's error.
+
+    `parts`, if given, is a `coarse_kernel_parts` dict built once per run; when
+    it is None this builds one per call, which is what every caller did before
+    M-v2-6. `out`, if given, is three preallocated meshes the components are
+    written into -- the pool's shared-memory views, so the solve lands where the
+    workers already read and the copy `TilePool.stage_step` used to make stops
+    existing. Both default to the old behaviour and neither changes a value.
+
+    **The three force meshes never coexist as jax arrays.** They used to: the
+    old form returned a list comprehension of jax arrays and the engine then
+    built a numpy copy of each, and because a comprehension rebinds only after
+    it completes, that is six full meshes live at once -- 25.8 GB at C-gh. One
+    component at a time is 8.6.
     """
     fdtype = field_dtype(delta.dtype if fdtype is None else fdtype)
     if np.dtype(delta.dtype) != fdtype:
@@ -508,16 +581,38 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
             "reads as a working f32 arm that is silently costing f64 memory. Narrow the "
             "delta at its decode, or pass the dtype it already has."
         )
-    cell = box_size / n_mesh
-    kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s, fdtype=fdtype)
-    if match is not None:
-        mf, _ = cic_match_factor((n_mesh,) * 3, match[0], match[1], clip=clip)
-        # cast for the same reason as in `_global_delta_and_kernels`: an f64
-        # match factor would promote a complex64 kernel back to complex128
-        kers = tuple(k * mf.astype(fdtype, copy=False) for k in kers)
+    if parts is None:
+        parts = coarse_kernel_parts(n_mesh, box_size, which, r_s=r_s, match=match,
+                                    clip=clip, fdtype=fdtype)
+    elif parts["n_mesh"] != int(n_mesh) or parts["fdtype"] != fdtype:
+        # a cached build outliving the geometry it was built for is silent
+        # corruption, not a crash: the shapes broadcast where n_mesh matches by
+        # accident and the dtype merely promotes
+        raise ValueError(
+            f"coarse_force_meshes: parts were built for n_mesh={parts['n_mesh']} at "
+            f"{parts['fdtype'].name} but this call is n_mesh={int(n_mesh)} at "
+            f"{fdtype.name}. The kernel build is geometry, so a mismatch means the "
+            "cache outlived the configuration it belongs to."
+        )
+    cdtype = np.complex128 if fdtype == np.dtype(np.float64) else np.complex64
+    if out is None:
+        out = [np.empty((int(n_mesh),) * 3, dtype=fdtype) for _ in range(3)]
     dk = jnp.fft.rfftn(delta)
-    # sequential per-component solves: never three force meshes at once
-    return [jnp.fft.irfftn(dk * jnp.asarray(k), s=(n_mesh,) * 3) for k in kers]
+    # SEQUENTIAL PER-COMPONENT SOLVES, and now the comment is true of the
+    # outputs as well as of the transforms. `k` is formed, used and dropped
+    # inside one iteration, so the peak carries one complex kernel rather than
+    # three; the expression is `(pref * ik) * mf` exactly as before, which is
+    # what keeps this bitwise (`tests/test_forces.py` pins it at three
+    # geometries against a build-all-three reference).
+    for i in range(3):
+        k = parts["pref"] * parts["iks"][i].astype(cdtype, copy=False)
+        if parts["mf"] is not None:
+            k = k * parts["mf"]
+        g = jnp.fft.irfftn(dk * jnp.asarray(k), s=(int(n_mesh),) * 3)
+        del k
+        out[i][...] = np.asarray(g)
+        del g
+    return out
 
 
 def owning_tile(positions, cell, n_tile, n_fine):

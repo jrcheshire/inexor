@@ -2,6 +2,8 @@
 the uniform grid, paint-path agreement, and the shared-object cache contract
 (architecture Sec. 5: step_fwd/step_rev must receive the SAME force object)."""
 
+import pytest
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -65,3 +67,133 @@ def test_force_fn_cache_identity():
     assert f1 is f2
     f3 = make_force_fn(BoxConfig(n_mesh=16, box_size=L), paint="int")
     assert f3 is not f1
+
+
+# ============================================ the hoisted coarse kernel build
+
+
+def _reference_coarse_solve(delta, n, box, r_s, match, fdtype):
+    """The pre-M-v2-6 shape, kept here as the oracle it now has to match.
+
+    Build all three complex kernels, match them all, then solve into a list --
+    which is exactly what `coarse_force_meshes` did before the build was hoisted
+    out of the step and the solve was made one component at a time. The change
+    is a reassociation of WHEN, never of what is multiplied by what, so this
+    must agree bitwise and not merely to a tolerance.
+    """
+    from inexor.forces import cic_match_factor, split_kernels
+
+    kers = split_kernels((n,) * 3, box / n, "long", r_s=r_s, fdtype=fdtype)
+    mf, _ = cic_match_factor((n,) * 3, match[0], match[1], clip=None)
+    kers = tuple(k * mf.astype(fdtype, copy=False) for k in kers)
+    dk = jnp.fft.rfftn(jnp.asarray(delta))
+    return [np.asarray(jnp.fft.irfftn(dk * jnp.asarray(k), s=(n,) * 3)) for k in kers]
+
+
+@pytest.fixture
+def x64():
+    """f64 arms need the caller's opt-in; library code never toggles it."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    yield
+    jax.config.update("jax_enable_x64", prev)
+
+
+@pytest.mark.parametrize("n", [16, 24, 32])
+@pytest.mark.parametrize("fdtype", [np.float32, np.float64])
+def test_the_hoisted_coarse_build_is_bitwise_the_build_it_replaced(n, fdtype, x64):
+    """M-v2-6: the whole point is that this saves memory and changes NOTHING.
+
+    `coarse_kernel_parts` keeps only the real half-grids and the complex kernel
+    is formed inside the solve, one component at a time. That reorders
+    allocation, not arithmetic: the expression is still `(pref * ik) * mf`, and
+    folding the match into `pref` -- which would save another 4 B per half-grid
+    element -- is exactly the reassociation this refuses to make.
+    """
+    from inexor.forces import coarse_force_meshes, coarse_kernel_parts
+
+    fdtype = np.dtype(fdtype)
+    box = float(n)
+    r_s = 2.0 * box / n
+    match = (box / n, box / (4 * n))
+    rng = np.random.default_rng(11)
+    delta = (rng.standard_normal((n, n, n)) * 1e-3).astype(fdtype)
+
+    want = _reference_coarse_solve(delta, n, box, r_s, match, fdtype)
+    parts = coarse_kernel_parts(n, box, "long", r_s=r_s, match=match, fdtype=fdtype)
+    got = coarse_force_meshes(jnp.asarray(delta), n, box, "long", r_s=r_s,
+                              match=match, fdtype=fdtype, parts=parts)
+    for i, (a, b) in enumerate(zip(want, got)):
+        assert np.array_equal(a, b), (
+            f"component {i} at n={n}/{fdtype.name} is not bitwise the pre-hoist "
+            f"build: max|d| = {np.abs(a - b).max():.3e}"
+        )
+
+
+def test_the_hoisted_build_and_the_per_call_build_agree():
+    """`parts=None` must reach the same numbers as a hoisted build, or a
+    standalone `step` and a `run` would not be the same engine."""
+    from inexor.forces import coarse_force_meshes, coarse_kernel_parts
+
+    n, box = 24, 24.0
+    r_s, match = 2.0, (1.0, 0.25)
+    rng = np.random.default_rng(3)
+    delta = (rng.standard_normal((n, n, n)) * 1e-3).astype(np.float32)
+    dj = jnp.asarray(delta)
+    a = coarse_force_meshes(dj, n, box, "long", r_s=r_s, match=match,
+                            fdtype=np.float32)
+    parts = coarse_kernel_parts(n, box, "long", r_s=r_s, match=match,
+                               fdtype=np.float32)
+    b = coarse_force_meshes(dj, n, box, "long", r_s=r_s, match=match,
+                            fdtype=np.float32, parts=parts)
+    for x, y in zip(a, b):
+        assert np.array_equal(x, y)
+
+
+def test_parts_refuse_a_geometry_they_were_not_built_for():
+    """A cached build outliving its configuration is silent corruption: the
+    dtype merely promotes and the shapes broadcast wherever they happen to
+    match. It has to refuse, not coerce."""
+    from inexor.forces import coarse_force_meshes, coarse_kernel_parts
+
+    parts = coarse_kernel_parts(16, 16.0, "long", r_s=2.0, fdtype=np.float32)
+    delta = np.zeros((24, 24, 24), dtype=np.float32)
+    with pytest.raises(ValueError, match="cache outlived the configuration"):
+        coarse_force_meshes(jnp.asarray(delta), 24, 24.0, "long", r_s=2.0,
+                            fdtype=np.float32, parts=parts)
+
+
+def test_the_solve_writes_into_the_buffers_it_is_given():
+    """`out=` is how the engine puts the solve straight into the pool's shm
+    views. The identity matters, not just the values: `stage_step` skips its
+    copy on `a is buf`, so a solve that quietly allocated its own would cost
+    the copy back AND leave the workers reading a stale mesh."""
+    from inexor.forces import coarse_force_meshes
+
+    n, box = 16, 16.0
+    rng = np.random.default_rng(5)
+    delta = (rng.standard_normal((n, n, n)) * 1e-3).astype(np.float32)
+    sinks = [np.zeros((n, n, n), dtype=np.float32) for _ in range(3)]
+    got = coarse_force_meshes(jnp.asarray(delta), n, box, "long", r_s=2.0,
+                              match=(1.0, 0.25), fdtype=np.float32, out=sinks)
+    assert all(g is s for g, s in zip(got, sinks))
+    assert any(np.any(s != 0) for s in sinks)
+
+
+def test_the_parts_hold_only_real_half_grids():
+    """The saving IS this: three complex kernels are 24 B per half-grid element
+    and the two real grids kept in their place are 8. If a complex array ever
+    ends up in `parts`, the hoist has silently become a 3x cost."""
+    from inexor.forces import coarse_kernel_parts
+
+    n = 32
+    parts = coarse_kernel_parts(n, 32.0, "long", r_s=2.0, match=(1.0, 0.25),
+                                fdtype=np.float32)
+    half = n * n * (n // 2 + 1)
+    kept = parts["pref"].nbytes + parts["mf"].nbytes
+    assert not np.iscomplexobj(parts["pref"]) and not np.iscomplexobj(parts["mf"])
+    assert kept == 8 * half, f"{kept / half:.2f} B/half held, expected 8.00"
+    # the ik grids are low-rank broadcasts and must stay that way, or the hoist
+    # would keep three more full grids without anyone noticing
+    for a in parts["iks"]:
+        assert a.size <= n, f"ik grid is full-rank ({a.size} elements)"

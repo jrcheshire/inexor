@@ -957,6 +957,17 @@ class TilePool:
         self._views[key] = view
         return view
 
+    def g_views(self):
+        """The three coarse-force shm views, for a caller that can solve INTO them.
+
+        `TilePool` allocates these at construction and the workers read them
+        every tile, so a caller that writes its solve straight here saves the
+        whole parent-side triple: `stage_step` then finds `a is buf` and copies
+        nothing. At C-gh that is 12.9 GB of the 25.8 the old jax-list-then-numpy
+        -copy shape carried. Returned as a list in component order.
+        """
+        return [self._views[f"g{i}"] for i in range(3)]
+
     def stage_step(self, g_coarse, C):
         """Publish this step's coarse force meshes and per-step header."""
         for i, g in enumerate(g_coarse):
@@ -968,7 +979,13 @@ class TilePool:
                     f"pool's {buf.shape}/{buf.dtype} -- the mesh geometry moved "
                     "under a live pool"
                 )
-            buf[...] = a
+            # `is`, not `==`: a caller that solved into `g_views()` has already
+            # written the segment, and `buf[...] = buf` would be a full
+            # self-copy of a 4.3 GB mesh for nothing. Identity is the right test
+            # because it is exactly the question being asked -- did this array
+            # come from here.
+            if a is not buf:
+                buf[...] = a
         self._step += 1
         self._C = dict(C, step=self._step, arena_base=int(self.st.arena_base))
 

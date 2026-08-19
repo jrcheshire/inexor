@@ -14,8 +14,10 @@ against anything.
 import numpy as np
 import pytest
 
+from inexor import engine
 from inexor.engine import EngineConfig
 from inexor.forces import padded_size
+from inexor.plan import GB as GB_
 from inexor.plan import PRESETS, main
 
 
@@ -134,11 +136,17 @@ def test_both_arms_count_the_prefactor():
     assert m["coarse_kernel_pref"] > 0 and m["tile_kernel_pref"] > 0
 
 
-def test_the_coarse_force_copy_is_counted_because_both_copies_are_live():
-    """`g_coarse = [np.asarray(g) for g in g_coarse]` rebinds after the
-    comprehension, so the jax originals survive their numpy copies' creation."""
+def test_the_coarse_force_copy_is_one_component_not_three():
+    """It used to be three, and that was the bug rather than the accounting.
+
+    `g_coarse = [np.asarray(g) for g in g_coarse]` rebinds only after the
+    comprehension, so the three jax meshes survived their three numpy copies'
+    creation -- six live at once, 25.8 GB at C-gh. M-v2-6 made
+    `coarse_force_meshes` solve one component at a time straight into the
+    caller's buffers, so the transient is ONE mesh and the pool's own copy
+    stopped existing with it."""
     m = _ec("cdev").mesh_bytes()
-    assert m["coarse_force_copy_transient"] == m["coarse_force_resident"]
+    assert m["coarse_force_copy_transient"] * 3 == m["coarse_force_resident"]
 
 
 def test_migration_staging_is_n_to_the_two_thirds_not_n():
@@ -199,7 +207,7 @@ def test_the_binding_term_at_c_gh_is_now_the_state_itself(capsys):
     simulation itself, so any further reduction is a codec question rather than
     an accounting one.
 
-    C-gh still does not fit a `gh` host (1.42x, from 4.41x at the start of
+    C-gh still does not fit a `gh` host (1.70x, from 4.41x at the start of
     M-v2-6), and that gap is now structural: state plus resident mesh alone
     clears 116 GB. The `gg` test below is the one that changed."""
     main(["--preset", "c-gh", "--host-gb", "116", "--cap", "5284492"])
@@ -207,7 +215,7 @@ def test_the_binding_term_at_c_gh_is_now_the_state_itself(capsys):
     assert "largest single term: t9_payload" in out
     assert "DOES NOT FIT" in out
     ratio = float(out.split("DOES NOT FIT (")[1].split("x")[0])
-    assert 1.2 < ratio < 1.7, f"expected ~1.42x a gh host, got {ratio}"
+    assert 1.4 < ratio < 2.0, f"expected ~1.70x a gh host, got {ratio}"
 
 
 def test_c_gh_now_fits_a_cpu_only_node_with_margin(capsys):
@@ -215,19 +223,24 @@ def test_c_gh_now_fits_a_cpu_only_node_with_margin(capsys):
 
     At the start of M-v2-6 the lower bound was 511.2 GB, 2.16x even a 237 GB
     `gg` node. Deleting `kick_pending` (274.9 GB) and rewriting the repack in
-    place (115.4 -> 21.8) puts it at 164.6, which is 0.69x. Pinned because the
-    margin is what makes a capacity run proposable at all, and because a
-    regression in either term would silently take it away.
+    place (115.4 -> 21.8) brought it to 164.6.
 
-    It is still a LOWER BOUND, and one measured to read ~1.9x low at cdev, so
-    fitting on paper is not the same as fitting. That is what the capacity run
-    is for."""
+    It reads 197.2 now and that is a CORRECTION, not a regression. 164.6 came
+    from charging the single largest transient and summing the per-step host
+    terms; this charges every phase inside a step, which is the model that
+    would have refused the run that OOM-killed. The engine change went the other
+    way at the same time -- hoisting the coarse kernel build took 23.7 GB off
+    the solve -- so the number would be worse still without it.
+
+    Pinned because the margin is what makes a capacity run proposable at all,
+    and it is now thin: still a LOWER BOUND, one measured to read ~1.9x low at
+    cdev, so fitting on paper is not the same as fitting."""
     main(["--preset", "c-gh", "--host-gb", "237", "--cap", "5284492"])
     out = capsys.readouterr().out
     assert "FITS" in out and "DOES NOT FIT" not in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    assert est == pytest.approx(164.6, abs=1.0)
-    assert est < 237.0 * 0.8, "the margin is thinner than the bound's own known error"
+    assert est == pytest.approx(197.2, abs=1.0)
+    assert est < 237.0, "the bound no longer fits the node it was sized for"
 
 
 def test_removing_the_repack_scratch_too_would_still_not_reach_a_gh_host(capsys):
@@ -264,17 +277,20 @@ def test_an_absent_cap_names_the_omission_instead_of_dropping_it(capsys):
 
 
 def test_the_estimate_is_a_lower_bound_and_says_so(capsys):
-    """Still a floor, and still known-soft: 3.982 GB against job 446's measured
-    7.461 at cdev, so 1.87x low where it has been checked. It was 3.783 (1.97x)
-    before the M-v2-6 terms went in -- the corrections close some of the gap and
-    are not claimed to close all of it, which is why the wording stays."""
+    """Still a floor, and still known-soft: 3.396 GB against job 446's measured
+    7.461 at cdev, so 2.20x low where it has been checked. The ladder is
+    3.783 -> 3.305 -> 3.396: the M-v2-6 terms and then the phase model move it
+    in both directions and neither is claimed to close the gap, which is why
+    the wording stays. What the phase model DID fix is the shape of the error
+    at C-gh, where the old form under-charged the coarse solve by 3x."""
     main(["--preset", "cdev", "--host-gb", "124", "--cap", "5284492"])
     out = capsys.readouterr().out
     assert "LOWER BOUND" in out and "not a measurement" in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
     # 3.445 (derived 9 B/row) -> 3.488 (measured 11.1, out of place) -> 3.305
-    # (measured 2.1, in place). scripts/v2_m6_repack_bytes.py.
-    assert est == pytest.approx(3.305, abs=0.01)
+    # (measured 2.1, in place) -> 3.396 (phases summed within a step).
+    # scripts/v2_m6_repack_bytes.py.
+    assert est == pytest.approx(3.396, abs=0.01)
     assert est < 7.461, "the bound must sit under the measured peak it bounds"
 
 
@@ -409,3 +425,65 @@ def test_the_load_model_matches_what_the_loader_actually_allocates(tmp_path):
         assert max(modelled.values()) >= measured
     finally:
         alloc.close()
+
+
+def test_the_phase_model_would_have_refused_the_run_that_died():
+    """The gate this module did not have, written against the job that needed it.
+
+    Vista 923139 OOM-killed inside the coarse solve of step 1 while the planner
+    said FITS at 0.75x. Three accounting faults, all fixed: the bound charged
+    the largest SINGLE transient (12.9 GB of a 56 GB mesh total) instead of
+    everything a phase holds at once; `cic_match_factor` -- called on every
+    coarse solve, since the engine always passes `match` -- was in NO table; and
+    the solve's transform workspace counted one complex half-grid where `dk`,
+    the device copy of the kernel and their product are three.
+
+    Reconstructing the pre-M-v2-6 solve from the terms that remain gives 68.8 GB
+    against the ~79 GB the node actually lost, which is the model landing within
+    13% of a measurement it had been missing by 5x. Carried through the phase
+    sum it clears a 237 GB gg node, so the corrected planner refuses the run
+    that died. That is the property worth pinning: not the number, the verdict.
+    """
+    ec = _ec("c-gh")
+    m = ec.mesh_bytes()
+    # the old shape: three complex kernels built per step and matched, so a
+    # SECOND triple, the f64 island rebuilt every step, and three force meshes
+    # copied out at once because the comprehension rebinds only at the end
+    old_solve = (3 * m["coarse_kernels"]                 # six half-grids, not two
+                 + m["coarse_kernel_build_f64"]
+                 + m["coarse_kernel_pref"] + m["coarse_match_factor"]
+                 + m["coarse_fft_workspace"]
+                 + 3 * m["coarse_force_copy_transient"])
+    assert old_solve / GB_ == pytest.approx(68.8, abs=1.0), (
+        f"the pre-M-v2-6 solve reconstructs to {old_solve / GB_:.1f} GB; if this "
+        "moved, the reconstruction is stale and the comparison is against nothing"
+    )
+    assert old_solve / GB_ < 79.0, (
+        "the model must stay UNDER the measured 79 GB: it cannot see XLA's "
+        "intra-jit scratch or glibc's retention, and a bound that claims to is "
+        "no longer a bound"
+    )
+
+    resident = sum(v for k, v in m.items() if engine.MESH_PHASE[k] == "resident")
+    step = ec.step_bytes(ec.n_total, cap=5284492)
+    in_step = {"coarse_solve": old_solve}
+    for src, phase_of in ((m, engine.MESH_PHASE), (step, engine.STEP_PHASE)):
+        for k, v in src.items():
+            p = phase_of[k]
+            for one in (p,) if isinstance(p, str) else p:
+                if one in ("resident", "coarse_solve") or one in engine.ONCE_PER_RUN_PHASES:
+                    continue
+                in_step[one] = in_step.get(one, 0) + v
+    # the state figure is the c-gh table's own, at the pilot's arena_frac
+    old_peak = 112.476 * GB_ + resident + sum(in_step.values()) + 8 * 1.12 * GB_
+    assert old_peak / GB_ > 237.0, (
+        f"the run that OOM-killed reconstructs to {old_peak / GB_:.1f} GB, which "
+        "fits a gg node -- so the corrected model would have passed it too"
+    )
+
+    new_solve = sum(v for k, v in m.items()
+                    if engine.MESH_PHASE[k] == "coarse_solve")
+    assert new_solve < old_solve / 2, (
+        f"the hoisted build takes the solve from {old_solve / GB_:.1f} to "
+        f"{new_solve / GB_:.1f} GB; the numpy half of that was measured at 23.7"
+    )

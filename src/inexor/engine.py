@@ -58,6 +58,7 @@ from .forces import (
     COARSE_HALO,
     capacity_shape,
     coarse_force_meshes,
+    coarse_kernel_parts,
     owned_mask_from_bricks,
     coarse_subblock_origin_extent,
     gather_coarse_subblock,
@@ -88,6 +89,60 @@ def _dtype_name(x, what):
     if dt not in (np.dtype(np.float32), np.dtype(np.float64)):
         raise ValueError(f"{what} must be float32 or float64, got {dt.name}")
     return dt.name
+
+
+# WHICH PHASE EACH BUDGET TERM IS CHARGED TO, so a caller can add up what is
+# actually live at once instead of assuming one transient at a time.
+#
+# That assumption is why `inexor.plan` said FITS twice for a run that did not.
+# It took the LARGEST SINGLE mesh transient -- 12.9 GB of a 56 GB total at C-gh
+# -- and the terms it was choosing between are not alternatives: the coarse
+# solve holds its kernels, its transform workspace and its output copy at the
+# same moment, which is the phase Vista 923139 died in.
+#
+# `resident` means live for the whole run and charged unconditionally. Every
+# other value names a phase, or a TUPLE of phases for a term that spans more
+# than one; terms sharing a phase are summed, and the phases are maxed over,
+# because they genuinely do not overlap -- the tile loop cannot run while the
+# coarse solve is running, and the phase boundary hook in `step` is what makes
+# that checkable rather than asserted.
+MESH_PHASE = {
+    "coarse_kernel_build_f64": "kernel_build",
+    "coarse_kernel_pref": "resident",
+    "coarse_match_factor": "resident",
+    "coarse_accumulator": "coarse_paint",
+    "coarse_decode_slab": "coarse_paint",
+    "coarse_kernels": "coarse_solve",
+    "coarse_fft_workspace": "coarse_solve",
+    "coarse_force_copy_transient": "coarse_solve",
+    # BOTH, and it is not resident: the decode allocates it inside the paint and
+    # `step` drops the host name as soon as the jax copy exists, so it spans the
+    # paint and the solve and then goes. It used to stay bound through the whole
+    # tile loop, which is what made "resident" the right label before M-v2-6.
+    "coarse_delta": ("coarse_paint", "coarse_solve"),
+    "coarse_force_resident": "resident",
+    "tile_kernels": "resident",
+    "tile_kernel_build_f64": "kernel_build",
+    "tile_kernel_pref": "kernel_build",
+    "tile_workspace": "tile_loop",
+}
+
+STEP_PHASE = {
+    "kick_pending": "tile_loop",
+    "repack_scratch": "repack",
+    "migrate_staging": "migrate",
+    "tile_buffers": "tile_loop",
+}
+
+# Phases that run ONCE per run rather than once per step. Everything else is
+# inside the step loop, and a budget must add those up rather than take the
+# largest, because glibc does not hand freed arenas back between them: this
+# project measured `malloc_trim` recovering 12-41% of a run's peak, which is
+# exactly the retention that makes a step's phases accumulate into its
+# high-water instead of alternating. Taking the max across a step's phases
+# would be the tidier model and it would have made the c-gh bound SMALLER,
+# which is the direction every wrong call here has already gone.
+ONCE_PER_RUN_PHASES = frozenset({"kernel_build"})
 
 
 class EngineConfig:
@@ -282,21 +337,48 @@ class EngineConfig:
             coarse_accumulator=cells * 8,          # int64 host, dtype-independent
             coarse_decode_slab=slab * nc * nc * 8,  # one f64 slab (M-v2-4)
             coarse_kernel_build_f64=3 * half * 8,   # k2_true/k2_safe/fac, the island
-            coarse_kernels=3 * half * 2 * cw,
-            coarse_fft_workspace=half * 2 * cw,
-            # `pref = (fac / k2_safe).astype(fdtype)` is a fourth full half-grid
-            # and was in neither arm's accounting (`forces.split_kernels`).
+            # ONE component at a time, matched: `k = pref * ik` and `k * mf` are
+            # live together and nothing else is. It was three components at once
+            # until M-v2-6 hoisted the build out of the step; the whole group
+            # then measured 60.01 B per half-grid element per step against the
+            # 16.01 it costs now (flat to 0.2% over 7.9x in `half`, n_coarse
+            # 128/192/256), and that 44 B/half is 23.7 GB per step at C-gh.
+            coarse_kernels=2 * half * 2 * cw,
+            # THREE complex half-grids, not one, and this is a DERIVATION rather
+            # than a measurement: `dk`, the device copy `jnp.asarray(k)` makes of
+            # the host kernel, and their product, all live while `irfftn` runs.
+            # It is an upper bound on the group -- XLA is free to fuse the
+            # multiply into the transform, and nothing in-process can see
+            # whether it did (`v2_m6_host_bytes.py` is blind to jax buffers and
+            # `memory_stats()` is None on CPU). Modelled high on purpose: this
+            # is a budget, and the failure that costs a node is the one where a
+            # term was left out.
+            coarse_fft_workspace=3 * half * 2 * cw,
+            # --- coarse, RESIDENT for the whole run: what the once-per-run
+            # build leaves behind (`forces.coarse_kernel_parts`). Both are real
+            # half-grids at the coarse dtype; the complex kernels are not kept.
+            # `pref = (fac / k2_safe).astype(fdtype)` was in neither arm's
+            # accounting until M-v2-6, and the match factor was in NO table at
+            # all -- `cic_match_factor` is called on every coarse solve and the
+            # engine always passes `match`, so it was 4.30 GB of C-gh that no
+            # budget had ever named.
             coarse_kernel_pref=half * cw,
+            coarse_match_factor=half * cw,
             # --- coarse, resident through the tile loop
             coarse_delta=cells * cw,
             coarse_force_resident=3 * cells * cw,
-            # `g_coarse = [np.asarray(g) for g in g_coarse]` rebinds only after
-            # the comprehension completes, so the jax originals and their numpy
-            # copies are live TOGETHER. M-v2-6 measured `coarse_solve` at 14.19 MB
-            # (cdev8) and 110.89 (cdev) against 6.29 and 50.33 for one copy; the
-            # coarse_div arm moved it 7.3x for an 8x change in cells, which is
-            # what identifies this as a cells term rather than a particle one.
-            coarse_force_copy_transient=3 * cells * cw,
+            # ONE component, not three. The old form returned a list
+            # comprehension of jax meshes and the engine then built a numpy copy
+            # of each; a comprehension rebinds only after it completes, so all
+            # six were live together -- 25.8 GB at C-gh. `coarse_force_meshes`
+            # now solves one component at a time straight into the caller's
+            # buffers (the pool's shm views), so the transient is one mesh and
+            # the pool's own copy disappears with it. M-v2-6 measured
+            # `coarse_solve` at 14.19 MB (cdev8) and 110.89 (cdev) against 6.29
+            # and 50.33 for one copy; the coarse_div arm moved it 7.3x for an 8x
+            # change in cells, which is what identifies this as a cells term
+            # rather than a particle one.
+            coarse_force_copy_transient=cells * cw,
             # --- fine, resident through the tile loop
             tile_kernels=3 * phalf * 2 * fw,
             # THE BUILD, which the tile arm never counted though the coarse arm
@@ -949,7 +1031,7 @@ def apply_result(st, res):
 
 
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
-         phase=None, tile_force=None, pool=None):
+         phase=None, tile_force=None, pool=None, coarse_parts=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1 and
@@ -964,6 +1046,13 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     per-step rebuild re-traces and re-compiles the same program every step
     (~1.5 s/step, constant -- canary C0). Standalone calls omit it and build
     their own, unchanged.
+
+    `coarse_parts` is the same arrangement for the LONG arm and it was owed for
+    longer: `forces.coarse_kernel_parts` is a function of geometry alone, `run`
+    builds it once, and before M-v2-6 the whole thing was rebuilt every step
+    inside the solve at 60.01 B per half-grid element -- 32.28 GB per step at
+    C-gh, measured, against the 12.9 the planner charged. Standalone calls omit
+    it and build their own, unchanged.
 
     `pool`, if given, is a live `executor.TilePool`: the tile loop dispatches
     `tile_task` over its workers and applies results in arrival order, instead
@@ -999,18 +1088,36 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     delta = coarse_delta_streamed(st, cfg, stats=mesh_stats, census=census,
                                   pad_shape=pad_shape, pool=pool)
     ph("coarse_paint")
+    # HAND THE FIELD OVER AND LET GO OF IT. `delta` is a full coarse mesh (4.3 GB
+    # at C-gh) and the solve reads only the jax copy, so holding the numpy name
+    # bound through the solve keeps a dead mesh alive across the phase where the
+    # peak is. Costs nothing when the jax copy aliases the host buffer.
+    dj = jnp.asarray(delta)
+    # read the REALIZED dtype off the decoded field before letting go of it: the
+    # receipt at the end of the step is the check that the coarse knob applied,
+    # and it has to come from the array the paint produced. The force meshes
+    # cannot serve -- with `out=` they are the pool's preallocated views, whose
+    # dtype comes from the config, so a receipt read there would echo what it
+    # was told, which is exactly the failure this milestone exists to catch.
+    coarse_dtype_seen = np.dtype(delta.dtype).name
+    del delta
     # `coarse_force_meshes` infers from delta.dtype and REFUSES a mismatch, so
-    # the dtype cannot silently disagree with what the config asked for
+    # the dtype cannot silently disagree with what the config asked for.
+    # `out=` is the pool's own shm views: the workers read them anyway, so
+    # solving into them removes the parent-side triple AND the copy stage_step
+    # would otherwise make.
     g_coarse = coarse_force_meshes(
-        jnp.asarray(delta),
+        dj,
         cfg.n_coarse,
         cfg.box_size,
         "long",
         r_s=cfg.r_s,
         match=(cfg.coarse_cell, cfg.fine_cell),
         fdtype=cfg.np_coarse_dtype,
+        parts=coarse_parts,
+        out=None if pool is None else pool.g_views(),
     )
-    g_coarse = [np.asarray(g) for g in g_coarse]
+    del dj
     ph("coarse_solve")
 
     # --- membership, and the capacity one jitted program needs
@@ -1165,7 +1272,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # config: a receipt that repeats what it was told cannot catch a knob that
     # did not apply, which is the whole failure mode this milestone is built
     # against
-    stats["coarse_dtype"] = np.dtype(delta.dtype).name
+    stats["coarse_dtype"] = coarse_dtype_seen
     stats["fine_dtype"] = str(geom["fdtype"])
     stats.update(mesh_stats)
     stats["repack"] = None
@@ -1356,6 +1463,14 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             r_s=cfg.r_s, paint=cfg.paint_short, frac_bits=cfg.frac_bits,
             fdtype=cfg.np_fine_dtype,
         )
+    # The LONG arm's build, hoisted for the same reason and paid at the same
+    # boundary. Geometry only, so one build serves every step; it is 4.30 GB
+    # resident at C-gh against 23.7 GB of per-step transient it removes, and the
+    # build's own 28 B/half peak lands here, before any force mesh exists.
+    coarse_parts = coarse_kernel_parts(
+        cfg.n_coarse, cfg.box_size, "long", r_s=cfg.r_s,
+        match=(cfg.coarse_cell, cfg.fine_cell), fdtype=cfg.np_coarse_dtype,
+    )
     ph("kernel_build")
     try:
         lead, fused = fused_drifts(coeffs)
@@ -1412,7 +1527,8 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         for k in range(k0, k_end):
             stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
                          census=census, cap_shape=cap_shape, pad_shape=pad_shape,
-                         phase=phase, tile_force=tile_force, pool=pool)
+                         phase=phase, tile_force=tile_force, pool=pool,
+                         coarse_parts=coarse_parts)
             cap_shape = int(stats["cap"])
             pad_shape = int(stats["coarse_pad"])
             if cfg.repack_every and (k + 1) % cfg.repack_every == 0:

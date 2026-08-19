@@ -49,6 +49,17 @@ PRESETS = {
 
 GB = 1e9
 
+# One pool worker's own footprint, MEASURED: Vista gg, 8 workers, 9.0 GB total
+# read from /proc/<pid>/statm after a barrier task proved `_worker_init` had
+# finished. Mostly the interpreter plus jax; the state itself is shared and is
+# already in the tables above, so this is what each worker adds on top.
+#
+# It is a floor twice over -- taken at pool startup before any tile has been
+# forced, and only ever at W=8 -- and it is in this module rather than in
+# `executor` because it is a property of a machine, not of the code. See
+# `docs/running-elsewhere.md` on why nothing in the package knows a node size.
+WORKER_STARTUP_BYTES = 1.12 * GB
+
 # The knobs the PRODUCTION path runs, in one place, because the alternative
 # is what happened: `EngineConfig` defaults coarse_dtype to float64 for the
 # benefit of the f64 reference arms, `v2_m6_realization.py` did not override
@@ -249,19 +260,40 @@ def main(argv=None):
     print(f"  {'':<20}  {sum(state.values()) / n:6.2f} B/p")
 
     mesh = ec.mesh_bytes()
-    # `tile_kernel_build_f64`/`tile_kernel_pref` are TRANSIENT: they are live only
-    # while `split_kernels` runs, and it runs inside the `membership` phase every
-    # step because `make_tile_force_fn` is not cached. They still set the peak
-    # there -- M-v2-6 measured that phase as the largest single term at both cdev8
-    # and cdev -- so classifying them as transient is about WHEN, not whether.
-    resident = {k: v for k, v in mesh.items() if k in (
-        "coarse_delta", "coarse_force_resident", "tile_kernels")}
+    # The split is `engine.MESH_PHASE`'s, not this module's: a term's phase is a
+    # property of the code that allocates it, so the accounting and the engine
+    # cannot drift apart the way they did over `coarse_dtype`.
+    from .engine import MESH_PHASE, STEP_PHASE
+
+    resident = {k: v for k, v in mesh.items() if MESH_PHASE[k] == "resident"}
     transient = {k: v for k, v in mesh.items() if k not in resident}
     _table("MESH, resident through the tile loop", resident)
     _table("MESH, transient (peak while that phase runs)", transient)
 
     step = ec.step_bytes(n, n_rows=rows, cap=args.cap)
     _table("PER-STEP HOST TERMS THAT SCALE WITH PARTICLES", step)
+
+    # PHASES, which is the line the C-gh budget was missing. Summing every
+    # transient overstates (the tile loop does not run during the coarse solve);
+    # taking the largest single one understates, and understated is how a run
+    # that does not fit gets a FITS. Terms in a phase are co-resident by
+    # construction, so sum within and max across.
+    phases = {}
+    for src, phase_of in ((mesh, MESH_PHASE), (step, STEP_PHASE)):
+        for k, v in src.items():
+            p = phase_of[k]
+            # a term may name several phases: it is charged to each, because
+            # what a phase's line answers is "how much is live while this runs"
+            for one in (p,) if isinstance(p, str) else p:
+                if one != "resident":
+                    phases[one] = phases.get(one, 0) + v
+    _table("BY PHASE (transients summed within, because they ARE co-resident)",
+           phases, total_label="sum of the in-step phases", reduce=sum)
+    print("  the total is a SUM over the phases INSIDE a step and excludes "
+          "kernel_build,\n  which runs once before the loop. Summing rather than "
+          "maxing is deliberate:\n  glibc does not return freed arenas between "
+          "phases, so a step's high-water\n  accumulates -- `malloc_trim` recovered "
+          "12-41% of a run's peak here.")
 
     # ---- the sub-budget, for the pooled lane only
     if args.workers is None or args.workers > 1:
@@ -312,8 +344,30 @@ def main(argv=None):
 
     # ---- the verdict, with the binding term NAMED
     print("\nBINDING TERMS")
-    peak_est = sum(state.values()) + sum(resident.values()) + max(transient.values()) \
-        + sum(step.values())
+    # THE WORST PHASE, not the largest single transient. The old form was
+    #     sum(state) + sum(resident) + max(transient) + sum(step)
+    # which charged 12.9 GB of a 56 GB C-gh mesh transient while summing the
+    # per-step host terms as though repack and migrate ran at the same instant.
+    # It said FITS (0.75x) for the run that OOM-killed in its coarse solve, and
+    # the phase it under-charged is the one that died: Vista 923139 lost ~79 GB
+    # of MemAvailable inside it, against 12.9 charged.
+    from .engine import ONCE_PER_RUN_PHASES
+
+    in_step = sum(v for k, v in phases.items() if k not in ONCE_PER_RUN_PHASES)
+    once = max((v for k, v in phases.items() if k in ONCE_PER_RUN_PHASES),
+               default=0)
+    worst_phase = max(in_step, once)
+    # THE WORKERS ARE PROCESSES AND THIS TABLE ONLY EVER PRICED ONE. Measured
+    # 1.12 GB each on a Vista gg node (8 workers, 9.0 GB total, read from
+    # /proc/<pid>/statm AFTER a barrier task -- `ctx.Pool()` returns before
+    # `_worker_init` has imported jax, and the first version of that probe
+    # reported 0.01 GB each and then watched them grow). It is a FLOOR: the
+    # reading is at pool startup, before any tile has been forced, and it is the
+    # measurement this budget most needs repeating at W=16.
+    n_workers = 0 if args.workers is None else max(0, int(args.workers))
+    workers_b = int(n_workers * WORKER_STARTUP_BYTES) if n_workers > 1 else 0
+    peak_est = (sum(state.values()) + sum(resident.values()) + worst_phase
+                + workers_b)
     load_peak = max(ld.values())
     # TRANSIENTS ARE CANDIDATES. They were excluded here, so the line could not
     # name a transient however large -- at cdev it reported `tile_kernels` (0.791
@@ -324,6 +378,9 @@ def main(argv=None):
     biggest = max(list(state.items()) + list(resident.items()) + list(step.items())
                   + [(f"{k} (transient)", v) for k, v in transient.items()],
                   key=lambda kv: kv[1])
+    if workers_b:
+        print(f"  {n_workers} pool workers at {_fmt(WORKER_STARTUP_BYTES)} each "
+              f"(measured, gg): {_fmt(workers_b)}")
     print(f"  a lower bound on the run's peak: {_fmt(peak_est)}")
     print(f"  the LOAD stage peaks at:          {_fmt(load_peak)}"
           f"   {'<- BINDING' if load_peak > peak_est else ''}")
@@ -346,8 +403,12 @@ def main(argv=None):
         print(f"  device-resident mesh against --device-gb {args.device_gb}: "
               f"{dev / (args.device_gb * GB):.2f}x")
     print("\n  NB this is a LOWER BOUND from arithmetic, not a measurement. It "
-          "assumes\n  one transient peaks at a time, and the engine's true peak has "
-          "been measured\n  at development scale only. Treat it as a sizing floor.")
+          "charges every\n  in-step phase, not the largest single term -- the largest-"
+          "term form is what\n  called the c-gh run a fit twice. What it still cannot "
+          "see is XLA's intra-jit\n  scratch, which is invisible to tracemalloc, to "
+          "`live_arrays` and to\n  `memory_stats()` alike on CPU. Vista 923139 lost "
+          "~79 GB inside a phase this\n  prices at 30, so treat it as a sizing floor "
+          "and never as a peak.")
     return 0
 
 
