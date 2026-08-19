@@ -44,17 +44,42 @@
 #      (A hardcoded expected count was the first version of this and it went
 #      stale within the hour -- a gate that drifts every time a test is added
 #      is noise, and noise is how 922557's 24/24 got waved through.)
-#   b. TOTAL HOST under 200 GB of the node's 237 during stepping, where TOTAL
-#      is parent peak PLUS the pool's workers. READ `total_rss_bytes`, NOT
-#      `peak_rss_bytes` -- ru_maxrss cannot see other processes, and at cdev8
-#      the workers held 21x the parent. Above 200 GB, LEG 2 (the 30 h run) IS
-#      NOT SUBMITTED until the term is found. This is the gate, not a reading.
+#   b. THE NODE ABSORBS THE RUN WITH ONE PHASE TO SPARE:
 #
-#      NOTE, and it is owed an answer either way: `inexor.plan` puts the
-#      arithmetic LOWER BOUND at 203.0 GB at --arena-frac 0.20, which is
-#      already above this gate (175 GB at 0.01). JC's call was to try 0.20 and
-#      dial it down if it gives trouble. If (b) fails, arena_frac is the first
-#      lever, not a mystery.
+#          total_rss_bytes + max(per-phase OWN increment)  <=  MemTotal
+#
+#      Both terms come from THIS RUN'S OWN CARD, which is what makes it a
+#      derivation rather than a number someone liked. TOTAL is parent peak plus
+#      the pool's workers -- read `total_rss_bytes`, never `peak_rss_bytes`,
+#      since ru_maxrss cannot see other processes and at cdev8 the workers held
+#      21x the parent.
+#
+#      WHY ONE PHASE IS THE RIGHT MARGIN, and why 35 more steps need no more
+#      than that. antares 452 measured the peak as NOT growing with K: the
+#      apparent K-growth was a warm-up that saturates, and both buffer-shape
+#      ladders (`cap` from Stage 0, `coarse_pad` from Stage 0b) are monotone
+#      and settle within the first steps. So step 40 holds no term step 5 does
+#      not, and the headroom the rest of the run needs is against scatter, not
+#      against growth. One phase's own allocation is a strictly conservative
+#      stand-in for that scatter, which was measured at 44 MB (cdev8) and 282
+#      MB (cdev) -- five orders under a phase here.
+#
+#      REPLACES a flat 200 GB bar, retired here. That number was set when
+#      `inexor.plan` read 164.6 GB for this configuration; the corrected
+#      accounting reads 218.7 at these knobs, so the old bar would have refused
+#      a run that completes inside the node -- a gate that fails on a pass is
+#      worse than no gate. Nothing about the machine changed, only the
+#      arithmetic that had been wrong about it.
+#
+#      If (b) fails, arena_frac is the first lever and it is NAMED, not a
+#      mystery: it sets capacity and costs ~15 GB of resident state per 0.10.
+#
+#   b2. THE ARENA IS NOT NEAR REFUSAL: `arena_peak_rows` reported against
+#      `n_arena`. Not a leg-2 blocker on its own -- a full arena REFUSES rather
+#      than corrupting, so it costs a job and never an answer -- but it has
+#      NEVER BEEN READ, no run having survived to print it, and it is what sets
+#      how far arena_frac can come down. Same saturation argument as (b): if it
+#      is flat over five steps it is the run's value.
 #   c. s_per_step against the 1971 s projection, and `projected_full_run_h`,
 #      which REPLACES the ~21.9 h arithmetic. No realization wall in this
 #      project has ever been measured; this is the first.
@@ -257,6 +282,65 @@ trap 'kill $SAMPLER 2>/dev/null' EXIT
 run_leg "cgh-run-5" pixi run -e gpu python $RLZ run --config c-gh --workdir "$W" \
   --tile-workers 8 --checkpoint-every 5 --stop-at 5 --arena-frac 0.10 \
   --phase-instrument peak
+
+# 3b. CRITERION (b), EVALUATED HERE rather than left for a human to compute
+#     off the card. A gate nobody runs is a note, and this milestone's habit is
+#     that a carefully written criterion reads as evidence something checked it.
+#     Every lookup below is a .get with a default and the verdict says which
+#     key was missing if one is -- jobs 447 and 448 died on a `print` reaching
+#     for a key that was not there, and the failure path of a gate must not be
+#     the thing that ends the job.
+if [ "${RC[cgh-run-5]}" -eq 0 ]; then
+  run_leg "criterion-b" pixi run -e gpu python -c "
+import json, glob, sys
+f = sorted(glob.glob('$W/realization_run_*.json'))
+if not f:
+    print('CRITERION (b): NO CARD -- cannot evaluate'); sys.exit(1)
+c = json.load(open(f[-1]))
+missing = [k for k in ('total_rss_bytes', 'phase') if k not in c]
+if missing:
+    print('CRITERION (b): card is missing', missing, '-- cannot evaluate')
+    sys.exit(1)
+if c.get('phase_instrument') != 'peak':
+    print('CRITERION (b): the card was written by the', c.get('phase_instrument'),
+          'instrument, which reports seconds. The margin term needs per-phase'
+          ' high-water; refusing to evaluate against a zero it would read as'
+          ' headroom.')
+    sys.exit(1)
+memtotal = 0
+try:
+    for line in open('/proc/meminfo'):
+        if line.startswith('MemTotal:'):
+            memtotal = int(line.split()[1]) * 1024
+except OSError as exc:
+    print('CRITERION (b): cannot read /proc/meminfo (%s)' % exc)
+# kibibytes, so *1024 -- the sampler above got this wrong for the whole of
+# this milestone and read 7.4% low
+total = float(c['total_rss_bytes'])
+ph = c['phase'].get('phases', {})
+owns = {k: v.get('delta', 0) for k, v in ph.items()}
+worst = max(owns.values(), default=0)
+worst_name = max(owns, key=owns.get) if owns else '(none)'
+print('CRITERION (b): the node absorbs the run with one phase to spare')
+print('  MemTotal                 %8.1f GB' % (memtotal / 1e9))
+print('  total_rss_bytes          %8.1f GB  (parent peak + workers)' % (total / 1e9))
+print('  largest phase own        %8.1f GB  (%s)' % (worst / 1e9, worst_name))
+print('  total + one phase        %8.1f GB' % ((total + worst) / 1e9))
+ok = memtotal > 0 and (total + worst) <= memtotal
+print('  VERDICT:', 'PASS' if ok else 'FAIL',
+      '-- leg 2 is' + ('' if ok else ' NOT') + ' proposable on memory')
+a, na = c.get('arena_peak_rows', 0), c.get('n_arena', 0)
+if na:
+    print('CRITERION (b2): arena peak %d of %d rows = %.1f%% of capacity'
+          % (a, na, 100.0 * a / na))
+    if a == 0:
+        print('  NB zero: either nothing reached the arena, or arena_used never'
+              ' surfaced. Check the per-step stats before believing it.')
+else:
+    print('CRITERION (b2): n_arena absent from the card -- not evaluated')
+sys.exit(0 if ok else 1)
+"
+fi
 
 # 4. Export and card at step 5: PATH TESTS at scale, not science. The state is
 #    five steps into a forty-step schedule and --allow-partial says so.
