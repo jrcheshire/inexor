@@ -6,11 +6,14 @@
 #SBATCH -t 01:30:00
 #SBATCH -A JPL-SPHEREx
 #SBATCH -o m6-c15-repack-%j.log
-# C15 = does the repack fast path transfer from the laptop to the production
+# C15 = does the repack rewrite transfer from the laptop to the production
 # geometry? The laptop measured, on the ENGINE's own clustered state at cdev:
 # 89-96% of occupied bricks carry no arena residents, the pre-C15 pass B cost
-# 26x pass A over the same rows, and skipping the permutation for arena-free
-# bricks bought a MEDIAN 3.66x on the phase, bitwise identical output.
+# 26x pass A over the same rows, and three changes bought a MEDIAN 5.63x on the
+# phase (3.52-5.97x, tracking arena residency) with bitwise identical output --
+# skipping the permutation entirely for arena-free bricks, dropping explicit
+# copies that numpy already makes only when the ranges overlap, and replacing
+# advanced indexing with `np.take` on the merge path.
 #
 # cgh64 has 32,768 bricks against cdev's 4,096 at the same 4096 rows/brick, and
 # 64x the volume of structure. The laptop number bounds NOTHING here in either
@@ -23,8 +26,10 @@
 #      across bricks at scale instead of concentrating, the fast path is rarer
 #      than the laptop says, and the payoff shrinks with it. That is the
 #      informative miss, not a failure.
-#   b. MEDIAN SPEEDUP >= 2.5x over the k=6 steps. Below 1.5x the fast path does
-#      not transfer and repack pooling goes back on the table as the main lever.
+#   b. MEDIAN SPEEDUP >= 4x over the k=6 steps. That is a real prediction off
+#      the laptop's 5.63x, discounted for the 8x brick count, NOT a bar picked
+#      low enough to pass. Below 2x the rewrite does not transfer and repack
+#      pooling goes back on the table as the main lever.
 #   c. THE BITWISE GATE HOLDS AT 32,768 BRICKS. It has run at 512 and 4,096
 #      only. A miss here is a state-container defect and outranks every timing.
 #   d. THE BASELINE IS THE PHASE THE CARD MEASURED: baseline repack within 20%
@@ -115,8 +120,9 @@ for i in "${!names[@]}"; do echo "  ${names[$i]}: rc=${codes[$i]}"; done
 echo "AGAINST: C14 cgh64 W=16 jax pooled: repack 4.74 s/step, step 34.52 s"
 echo "         (card m6_phase_time_c14_migpool_jax). Criterion (d) is that the"
 echo "         BASELINE arm reproduces 4.74 within 20%."
-echo "LAPTOP REFERENCE (cdev, 5 engine steps): 89-96% arena-free, median 3.66x,"
-echo "         baseline pass B 26x pass A, fast path still 15-25x above floor."
+echo "LAPTOP REFERENCE (cdev, 5 engine steps): 89-96% arena-free, median 5.63x"
+echo "         (3.52-5.97), baseline pass B 26x pass A, rewritten phase still"
+echo "         9.9-17.6x above the single-core floor."
 echo "READ THE RECEIPT: 'fast path taken N / 0 times in fast / baseline'."
 echo "CARDS WRITTEN BY THIS JOB:"
 ls -1 runs/v2/m6_c15_repack_engine_cdev8.json \

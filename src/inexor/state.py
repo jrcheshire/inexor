@@ -1740,6 +1740,22 @@ class SlotState:
         `bricks_fast` / `bricks_merged` counters in the return value are the
         receipt that the split is still where the measurement put it.
 
+        Two smaller changes ride with it, both measured on the shapes this phase
+        actually sees rather than argued: the block moves dropped their explicit
+        `.copy()` (numpy allocates the temporary itself, and only when the ranges
+        really overlap -- 0.96 us against 0.50 per brick), and the merge path
+        gathers with `np.take(..., axis=0, out=...)` instead of advanced indexing
+        (11.11 -> 4.96 ns/row, because indexing an (n, 3) array runs a strided
+        inner loop per row). Together with the fast path: MEDIAN 5.63x at cdev
+        over five engine steps, 3.52-5.97x.
+
+        **Cross-brick batching was measured and REJECTED, so it is not tried
+        again.** Building a chunk buffer with `np.concatenate` over ~256 bricks
+        and writing it in one assignment ran 0.62 ns/row against the per-brick
+        loop's 0.53, because the per-brick cost here is already dominated by the
+        copy itself rather than by interpreter overhead, and the chunk form adds
+        a whole extra round trip through memory. The loop stays.
+
         **Scratch is one brick plus the live arena**, and both are reported. The
         arena lift is O(arena_used) rather than O(brick) -- 0.77 GB at C-gh at
         the default 1% arena against the 115 GB this replaces -- and it is
@@ -1768,6 +1784,11 @@ class SlotState:
             )
 
         scratch = 0
+        # payload bytes in one row, ids included when the state carries them --
+        # the figure the block moves below are charged against
+        row_bytes = 3 * self.off.itemsize + 3 * self.w.itemsize
+        if self.ids is not None:
+            row_bytes += self.ids.itemsize
         # ---- lift the live arena rows out, grouped by brick, before anything moves
         a_rows = self.arena_base + arena_live
         a_bucket = self.arena_bucket[arena_live]
@@ -1787,15 +1808,20 @@ class SlotState:
             src, dst = int(self.brick_start[b]), int(main_pos[b])
             if m == 0 or src == dst:
                 continue
-            # `.copy()` because source and destination overlap and numpy's slice
-            # assignment gives no ordering guarantee across an overlap.
-            buf_off = self.off[src : src + m].copy()
-            buf_w = self.w[src : src + m].copy()
-            scratch = max(scratch, buf_off.nbytes + buf_w.nbytes)
-            self.off[dst : dst + m] = buf_off
-            self.w[dst : dst + m] = buf_w
+            # NO EXPLICIT `.copy()`, and that is a measured change rather than a
+            # tidy-up. Source and destination overlap whenever a brick moves less
+            # than its own length, but numpy has allocated its own temporary for
+            # an overlapping assignment since 1.13 -- and only when the ranges
+            # ACTUALLY overlap. The explicit copy paid for the temporary every
+            # time: 0.96 us against 0.50 per 4096-row brick when the ranges are
+            # disjoint, which is the common case here. The library behaviour this
+            # leans on is pinned by
+            # `test_an_overlapping_slice_assignment_copies_before_it_writes`.
+            scratch = max(scratch, m * row_bytes)
+            self.off[dst : dst + m] = self.off[src : src + m]
+            self.w[dst : dst + m] = self.w[src : src + m]
             if self.ids is not None:
-                self.ids[dst : dst + m] = self.ids[src : src + m].copy()
+                self.ids[dst : dst + m] = self.ids[src : src + m]
 
         # ---- pass B: expand rightward, merging the arena residents back in
         new_occ = np.zeros(self.n_buckets, dtype=np.int64)
@@ -1817,13 +1843,11 @@ class SlotState:
                 # pass A needs one -- `ns >= mp`, so source and destination
                 # overlap and slice assignment gives no ordering guarantee.
                 n_fast += 1
-                buf_off = self.off[mp : mp + m].copy()
-                buf_w = self.w[mp : mp + m].copy()
-                scratch = max(scratch, buf_off.nbytes + buf_w.nbytes)
-                self.off[ns : ns + m] = buf_off
-                self.w[ns : ns + m] = buf_w
+                scratch = max(scratch, m * row_bytes)
+                self.off[ns : ns + m] = self.off[mp : mp + m]
+                self.w[ns : ns + m] = self.w[mp : mp + m]
                 if self.ids is not None:
-                    self.ids[ns : ns + m] = self.ids[mp : mp + m].copy()
+                    self.ids[ns : ns + m] = self.ids[mp : mp + m]
                 new_occ[b * p3 : (b + 1) * p3] = self.occupancy[b * p3 : (b + 1) * p3]
             else:
                 n_merge += 1
@@ -1845,12 +1869,18 @@ class SlotState:
                     [self.w[mp : mp + m], a_w[a_edge[b] : a_edge[b + 1]]])
                 scratch = max(
                     scratch, cat_off.nbytes + cat_w.nbytes + within.nbytes + order.nbytes)
-                self.off[ns : ns + m + k] = cat_off[order]
-                self.w[ns : ns + m + k] = cat_w[order]
+                # `np.take` rather than `cat_off[order]`, and `out=` rather than
+                # a temporary: advanced indexing on an (n, 3) array runs a
+                # strided inner loop per row, where take's axis-0 path does not.
+                # Measured 11.11 -> 4.96 ns/row on the 4566-row merge brick this
+                # phase actually sees, and the `out=` form drops the second
+                # buffer that a gather-then-assign would allocate.
+                np.take(cat_off, order, axis=0, out=self.off[ns : ns + m + k])
+                np.take(cat_w, order, axis=0, out=self.w[ns : ns + m + k])
                 if self.ids is not None:
                     cat_i = np.concatenate(
                         [self.ids[mp : mp + m], a_ids[a_edge[b] : a_edge[b + 1]]])
-                    self.ids[ns : ns + m + k] = cat_i[order]
+                    np.take(cat_i, order, axis=0, out=self.ids[ns : ns + m + k])
                 new_occ[b * p3 : (b + 1) * p3] = np.bincount(within[order], minlength=p3)
             # ZERO THE SPARE. The out-of-place form allocates `zeros_like` and
             # writes only live rows, so every non-live byte is 0 (ids -1). Left

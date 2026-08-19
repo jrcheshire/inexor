@@ -181,6 +181,9 @@ def _repack_timed(self, brick_slack=0.10, fast_path=True):
     T["prologue"] = time.perf_counter() - t_start
 
     scratch = 0
+    row_bytes = 3 * self.off.itemsize + 3 * self.w.itemsize
+    if self.ids is not None:
+        row_bytes += self.ids.itemsize
     t0 = time.perf_counter()
     a_rows = self.arena_base + arena_live
     a_bucket = self.arena_bucket[arena_live]
@@ -204,13 +207,20 @@ def _repack_timed(self, brick_slack=0.10, fast_path=True):
         if m == 0 or src == dst:
             continue
         n_moved_a += 1
-        buf_off = self.off[src : src + m].copy()
-        buf_w = self.w[src : src + m].copy()
-        scratch = max(scratch, buf_off.nbytes + buf_w.nbytes)
-        self.off[dst : dst + m] = buf_off
-        self.w[dst : dst + m] = buf_w
-        if self.ids is not None:
-            self.ids[dst : dst + m] = self.ids[src : src + m].copy()
+        if fast_path:
+            scratch = max(scratch, m * row_bytes)
+            self.off[dst : dst + m] = self.off[src : src + m]
+            self.w[dst : dst + m] = self.w[src : src + m]
+            if self.ids is not None:
+                self.ids[dst : dst + m] = self.ids[src : src + m]
+        else:
+            buf_off = self.off[src : src + m].copy()
+            buf_w = self.w[src : src + m].copy()
+            scratch = max(scratch, buf_off.nbytes + buf_w.nbytes)
+            self.off[dst : dst + m] = buf_off
+            self.w[dst : dst + m] = buf_w
+            if self.ids is not None:
+                self.ids[dst : dst + m] = self.ids[src : src + m].copy()
     T["pass_a"] = time.perf_counter() - t0
 
     # ---- pass B
@@ -228,13 +238,11 @@ def _repack_timed(self, brick_slack=0.10, fast_path=True):
         if k == 0 and fast_path:
             n_fast += 1
             t0 = time.perf_counter()
-            buf_off = self.off[mp : mp + m].copy()
-            buf_w = self.w[mp : mp + m].copy()
-            scratch = max(scratch, buf_off.nbytes + buf_w.nbytes)
-            self.off[ns : ns + m] = buf_off
-            self.w[ns : ns + m] = buf_w
+            scratch = max(scratch, m * row_bytes)
+            self.off[ns : ns + m] = self.off[mp : mp + m]
+            self.w[ns : ns + m] = self.w[mp : mp + m]
             if self.ids is not None:
-                self.ids[ns : ns + m] = self.ids[mp : mp + m].copy()
+                self.ids[ns : ns + m] = self.ids[mp : mp + m]
             t1 = time.perf_counter()
             new_occ[b * p3 : (b + 1) * p3] = self.occupancy[b * p3 : (b + 1) * p3]
             t2 = time.perf_counter()
@@ -260,15 +268,22 @@ def _repack_timed(self, brick_slack=0.10, fast_path=True):
                 cat_off, cat_w = cat_off.copy(), cat_w.copy()
             scratch = max(
                 scratch, cat_off.nbytes + cat_w.nbytes + within.nbytes + order.nbytes)
-            self.off[ns : ns + m + k] = cat_off[order]
-            self.w[ns : ns + m + k] = cat_w[order]
+            if fast_path:
+                np.take(cat_off, order, axis=0, out=self.off[ns : ns + m + k])
+                np.take(cat_w, order, axis=0, out=self.w[ns : ns + m + k])
+            else:
+                self.off[ns : ns + m + k] = cat_off[order]
+                self.w[ns : ns + m + k] = cat_w[order]
             if self.ids is not None:
                 cat_i = self.ids[mp : mp + m]
                 if k:
                     cat_i = np.concatenate([cat_i, a_ids[a_edge[b] : a_edge[b + 1]]])
                 else:
                     cat_i = cat_i.copy()
-                self.ids[ns : ns + m + k] = cat_i[order]
+                if fast_path:
+                    np.take(cat_i, order, axis=0, out=self.ids[ns : ns + m + k])
+                else:
+                    self.ids[ns : ns + m + k] = cat_i[order]
             t2 = time.perf_counter()
 
             new_occ[b * p3 : (b + 1) * p3] = np.bincount(within[order], minlength=p3)

@@ -828,3 +828,30 @@ def test_the_repack_fast_path_counts_every_occupied_brick_when_the_arena_is_empt
     r = a.repack()
     assert r["bricks_merged"] == 0, "a merge ran with no arena residents to merge"
     assert r["bricks_fast"] > 0, "no brick was repacked at all"
+
+
+def test_an_overlapping_slice_assignment_copies_before_it_writes():
+    """`repack`'s block moves dropped their explicit `.copy()` and lean on numpy
+    to allocate a temporary when the source and destination ranges overlap.
+
+    That is library behaviour, not language semantics, and it is load-bearing:
+    without it a brick that moves less than its own length would read rows it
+    had already overwritten and the payload would be silently corrupted in a way
+    no conservation count could see -- the particle count would be right and the
+    velocities would be wrong. Pinned here in both directions rather than
+    assumed, so a numpy change that withdrew it fails one small test instead of
+    quietly rewriting the state.
+    """
+    base = (np.arange(20000, dtype=np.int16).reshape(-1, 1)
+            * np.ones((1, 3), dtype=np.int16))
+    src, m = 5000, 3000
+    for dst, tag in ((src - 1000, "leftward, as pass A moves"),
+                     (src + 1000, "rightward, as pass B moves")):
+        a = np.ascontiguousarray(base)
+        b = np.ascontiguousarray(base)
+        a[dst:dst + m] = a[src:src + m]
+        b[dst:dst + m] = b[src:src + m].copy()
+        assert np.array_equal(a, b), (
+            f"numpy did not copy before writing an overlapping range ({tag}); "
+            "`repack`'s block moves must go back to an explicit .copy()"
+        )
