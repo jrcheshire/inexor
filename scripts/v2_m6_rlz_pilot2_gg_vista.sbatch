@@ -58,8 +58,17 @@
 #   c. s_per_step against the 1971 s projection, and `projected_full_run_h`,
 #      which REPLACES the ~21.9 h arithmetic. No realization wall in this
 #      project has ever been measured; this is the first.
-#   d. `migrate_pooled_workers` = 16 and the repack fast-path share at 2.1M
+#   d. `migrate_pooled_workers` = 8 and the repack fast-path share at 2.1M
 #      bricks, both of which C15 measured only at cgh64.
+#
+# W=8, NOT 16, and this is a measurement not a guess. 922905 got the state
+# into shared memory correctly -- Shmem flat at 110.2 GB through the load,
+# 127.0 GB once the coarse meshes went in, exactly as priced -- and was then
+# killed in the NINETEEN SECONDS the 16 workers took to spawn, MemAvailable
+# 74.1 -> 0.0 GB. That is ~4.6 GB per worker, a term the threads file had
+# already flagged as unmeasured and a possible cap on W. Eight should need
+# ~37 GB of the ~74 available. The pool now prints its workers' summed RSS
+# the moment they exist, so the next choice of W comes off a number.
 #
 # TWO THINGS CHANGED SINCE 922682, which refused rather than ran:
 #   - the coarse force mesh is f32, which D-v2-22 adopted and this driver had
@@ -174,16 +183,16 @@ trap 'kill $SAMPLER 2>/dev/null' EXIT
 #    as 920910 so the comparison is clean -- the backing store is the only
 #    thing that changed.
 run_leg "cgh-run-5" pixi run -e gpu python $RLZ run --config c-gh --workdir "$W" \
-  --tile-workers 16 --checkpoint-every 5 --stop-at 5
+  --tile-workers 8 --checkpoint-every 5 --stop-at 5
 
 # 4. Export and card at step 5: PATH TESTS at scale, not science. The state is
 #    five steps into a forty-step schedule and --allow-partial says so.
 if [ "${codes[1]}" -eq 0 ]; then
   run_leg "cgh-export-partial" pixi run -e gpu python $RLZ export --config c-gh \
-    --workdir "$W" --tile-workers 16 --allow-partial \
+    --workdir "$W" --tile-workers 8 --allow-partial \
     --export-dir "$W/export_pilot"
   run_leg "cgh-card-partial" pixi run -e gpu python $RLZ card --config c-gh \
-    --workdir "$W" --tile-workers 16
+    --workdir "$W" --tile-workers 8
 else
   echo "STEPPING FAILED: skipping export and card -- they would describe a state"
   echo "the engine did not finish producing."
@@ -209,3 +218,9 @@ echo "     migrate_pooled_workers = 16, and the repack fast share at 2.1M bricks
 echo "  $W/realization_export.json and realization_pk.json -> the paths at scale."
 echo "LEG 2 (scripts/v2_m6_rlz_run_gg_vista.sbatch, 30 h, ~6.6 SU) IS NOT"
 echo "AUTOMATIC: submit it only after criterion (b) is read and passed."
+
+# THE JOB'S EXIT CODE MUST MEAN SOMETHING. `run_leg` swallows per-leg codes
+# on purpose so the summary always prints, but the script then exited 0 no
+# matter what -- 922905 reported COMPLETED 0:0 with its stepping leg killed,
+# and that is how a dead run gets read as a live one.
+exit $rc_total

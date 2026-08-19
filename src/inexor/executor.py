@@ -527,6 +527,29 @@ class SharedAllocator:
 _G = {}
 
 
+def worker_rss_bytes(pool):
+    """Summed RSS of a Pool's worker processes, read from /proc.
+
+    THE PARENT CANNOT SEE THEM ANY OTHER WAY -- `ru_maxrss` is per-process,
+    and at cdev8 the workers held 21x the parent. The existing path rides
+    `rss_mb` back on tile results, which is a step too late: job 922905 died
+    in the nineteen seconds between the workers spawning and the first tile,
+    with MemAvailable going 74.1 -> 0.0 GB. Reading /proc needs no dispatch,
+    so it works before any task has run.
+
+    Returns (n_workers, total_bytes), or (n, None) off Linux.
+    """
+    procs = [p for p in getattr(pool, "_pool", []) if p.pid]
+    total = 0
+    for proc in procs:
+        try:
+            with open(f"/proc/{proc.pid}/statm") as fh:
+                total += int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, IndexError, ValueError):
+            return len(procs), None
+    return len(procs), total
+
+
 def _rss_mb():
     try:
         with open("/proc/self/status") as fh:
@@ -885,6 +908,13 @@ class TilePool:
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+        if os.environ.get("INEXOR_LOAD_TRACE"):
+            n, tot = worker_rss_bytes(self._pool)
+            avail = available_ram()
+            rss = ("RSS unreadable" if tot is None else
+                   f"RSS {tot / 1e9:.1f} GB ({tot / 1e9 / max(n, 1):.2f} GB each)")
+            mem = "" if avail is None else f"  MemAvailable {avail / 1e9:.1f} GB"
+            print(f"  [pool] {n} workers up, {rss}{mem}", flush=True)
 
     def _adopt(self, key, seg, arr):
         """Register an array the allocator already put in shared memory.
