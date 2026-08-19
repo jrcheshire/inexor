@@ -1621,6 +1621,95 @@ yet and is still carrying its 4.74 s/step (3.37 h). See the C14 readout for
 the two pre-registered criteria it missed (the band, low; spill transport,
 high).
 
+## 5v. Vista 918684 -- C14: the pooled migrate PASSES bitwise at 6.88x, and the spill bar was on the wrong quantity
+
+**One gg job, 3 h wall, ~0.4 SU. Job rc=1, and the rc was the SBATCH's own
+bookkeeping, not a leg:** `run_leg` whitelisted rc=3 (census verdict-withheld)
+but not rc=2 (a phase probe reporting its own non-neutrality), and two legs read
+rc=2. Fixed per-leg (`run_leg [-t CODES]`) plus the smoke handler's `rc_total=0`,
+which reset the whole accumulator rather than one leg. Cards
+`runs/v2/m6_phase_time_c14_{serial,migpool}_jax.json`,
+`m6_w2_identity_*_migpool.json`, `m6_c13_insert_census_cgh64.json`; log
+`m6-c14-migpool-918684.log` in the Vista checkout.
+
+### The verdict
+
+**Identity PASSED all three legs** -- cdev W=4, cdev8 arena-saturated W=4, smoke
+W=2: `n_diff=0` on all six arrays including ids, cap ladder and `arena_base`
+equal, receipts `migrate_pooled_workers` [16]/[0] and worker-summed
+`eject_jax_calls_per_step` = [32] = nb. The pooled pass is the serial pass to
+the last bit, which is what the whole guarded-seam design was for.
+
+| pre-registered criterion | result |
+|---|---|
+| migrate lands in 4-8 s/step | **26.03 -> 3.78 s/step (6.88x)** -- MISSED, LOW |
+| spill < 100 MB/step | **141.3 MB/step** -- MISSED, HIGH |
+| scratch << 15.5 GB | 2.36 GB -- passed |
+| census at the run's own geometry | `arena_probed:true`, 32 slabs, 0 violations |
+
+The serial arm re-landed within 4.3% of the C9 W=16 anchor and the untouched
+phases within 1% serial-to-pooled, so the comparison is a like-for-like one
+inside a single job. **`migrate_pooled` now defaults on** (`c9762a5`), as a
+TRI-STATE rather than a bool: None=auto, True=require a pool and refuse without
+one, False=force serial. A bare `True` would make 22 of 23 `EngineConfig` sites
+refuse at `validate()`, and `v2_m6_phase_time.py` built its serial arm by
+OMITTING the knob, which under a truthy default would have run pooled and
+reported itself serial.
+
+**What it does to the projection:** recurring 55.69 -> **34.52 s/step**, so the
+realization goes 39.99 -> **~24.6 h**, repack still unpooled. Every figure there
+is arithmetic on this card at the exact conversion (1 s/step at cgh64 = 0.711 h
+at 2048^3); no realization has been run.
+
+### The spill miss, measured and DISPOSED: accept and record
+
+`spill_bytes` resets per pooled pass (`state.py:683`), so 141.3 MB is per step.
+It is genuine inter-process payload: worker overflow rows riding the result
+queue back for the parent's `_to_arena`, at 8.31M rows = ~6% of particles at
+slack 0.20, 17 B/row. Brick payloads go straight to shm (the C13-censused
+disjoint writes), so **the spill list is the only bulk payload on that queue**.
+
+**The bar was on bytes, and bytes were a proxy for time. Measured directly, the
+time is fine.** The payload is not one buffer, it is a list of per-brick tuples
+-- up to one entry per brick, so at most 1024 entries per slab at cgh64 -- of
+~253 rows each, i.e. ~4 KB arrays. The cost is therefore per-OBJECT, not
+per-byte. Measured on the M4 through a real spawn `Pool`, A/B'd against a worker
+that builds the identical payload and returns a scalar, so the difference is
+transport with creation held in both arms:
+
+| spill entries/slab | transport | per step | of the 3.78 s migrate |
+|---|---|---|---|
+| **1024 (every brick -- the CAP, not an estimate)** | 5.57 ms | **0.178 s** | **4.7%** |
+| 512 | 3.63 ms | 0.116 s | 3.1% |
+| 256 | 2.51 ms | 0.080 s | 2.1% |
+
+The top row is an upper bound that cannot be exceeded: `_insert_slab` calls the
+sink at most once per brick. So the transport is **<=4.7% of migrate and <=0.5%
+of the step**, and pickling the same bytes flat instead measures 7.1x cheaper --
+recovering 4% of a phase that is now 11% of the step, which is not worth
+building.
+
+**It does not grow with scale.** Brick count, row count and rows-per-entry all
+scale with N exactly as the phase does, so the ~72 GB/step the byte figure
+projects to 4096^3 is the same 4.7% of a migrate that also scaled by 8. The byte
+count sounds alarming and carries no information the fraction does not.
+
+**Caveats, both real.** (1) The transport is measured on the M4 while the 3.78 s
+is Grace: the percentage mixes machines, and both arms move together, so trust
+the shape within about a factor of two and not better. (2) **What drives the 6%
+overflow is NOT established.** A local sweep of `brick_slack` x drift produced
+0.85% of particles at slack 0.02 falling to **zero at the 0.20 production
+setting**, against 6% measured here. The difference is almost certainly
+gravitational clustering: the sweep's field is a perturbed lattice with no
+structure, so brick occupancy stays near-uniform and 20% slack covers it. **That
+sweep does not transfer and is recorded so it is not re-run expecting an
+answer.**
+
+**Instrument gap, cheap, owed:** the card records `spill_rows` and
+`spill_bytes` and NOT the spill ENTRY count, which is the quantity the transport
+cost actually follows. One counter. Worth adding when the spill code is next
+open, which is repack pooling.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
@@ -1697,6 +1786,12 @@ high).
    per-row work. **What it opens: does migrate parallelize, or is it
    bandwidth-bound like `tile_long`?** That is now the question deciding
    whether the 23.3 h is reducible at all, and it is a W5 input.
+10b. ~~**Read out C14 and dispose of the spill miss.**~~ **DONE, section 5v.**
+   Pooled migrate 26.03 -> 3.78 s/step bitwise; spill ACCEPTED, measured at
+   <=4.7% of the phase against a bar that was on bytes rather than on time.
+   Owed out of it: the spill ENTRY count on the card (one counter), and the
+   driver of the 6% overflow fraction, which a local slack sweep could NOT
+   reproduce because it has no clustering.
 11. **The pool's incremental memory footprint**, which 5j could not measure:
    per-worker `VmHWM` double-counts the shm state, and cgh64's state is 1/64 of
    C-gh's. W may be memory-capped below 16 at C-gh. A W5 input.

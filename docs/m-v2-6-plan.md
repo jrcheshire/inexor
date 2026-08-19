@@ -174,15 +174,17 @@ the realization near **~21.7 h**. Arithmetic, not measured.
 
 - **Repack pooling.** The remaining rung. Same shape as migrate: serial, 3.2 of
   144 cores, no shared writes proved yet.
-- **The spill-transport miss is UNDISPOSED (JC's call).** 141.3 MB/step is ~6% of
-  particles riding the result queue back for the parent's `_to_arena`; the
-  fraction is roughly N-independent, so ~9 GB/step at 2048^3 and ~72 GB/step at
-  4096^3. That last step is an inference from a rate, not a measurement. It is
-  bounded in memory by the dispatch window (~22 of 256 slabs at 4096^3, so ~6 GB
-  resident, not 72), so it is a time cost inside migrate rather than a fit
-  problem. **The C14 card already records worker busy time separately from the
-  phase wall, so the parent-side transport share is derivable from data in hand,
-  without a new job.**
+- ~~The spill-transport miss.~~ **DISPOSED 2026-08-18: ACCEPTED, record 5v.**
+  The <100 MB/step bar was on bytes, and bytes were a proxy for time. Measured:
+  the payload is up to one small array-tuple per brick, so the cost is per-OBJECT
+  and the transport is **<=4.7% of the migrate phase and <=0.5% of the step** --
+  an upper bound, since the sink fires at most once per brick. It does not grow
+  with scale: entries, rows and rows-per-entry all follow N exactly as the phase
+  does, so the ~72 GB/step the byte figure projects to 4096^3 is the same 4.7%.
+  Still owed out of it, both cheap: the spill ENTRY count on the card (one
+  counter -- the card records rows and bytes, neither of which is what the cost
+  follows), and the driver of the 6% overflow fraction, which a local slack sweep
+  could NOT reproduce because its field has no clustering.
 - **Two caveats that must travel with the 3.78.** Migrate's term at 2048^3 is a
   FLOOR -- its sort is N log N and has never been measured above cgh64 -- and the
   pool's memory footprint at that scale is unmeasured and may cap workers below
@@ -629,39 +631,33 @@ second (T,b) -- four runs maximum, and deliberately not a matrix.**
 
 ## Open questions
 
-1. **The spill-transport miss is undisposed.** C14 measured 141.3 MB/step against
-   a <100 MB bar -- ~6% of particles riding the result queue back for the
-   parent's arena claim. Projected on an N-independent fraction that is ~9 GB
-   per step at 2048^3 and ~72 GB at 4096^3, bounded in memory by the dispatch
-   window to ~6 GB resident. Accept and record, or size the parent-side share
-   before the pooled migrate carries a capacity run? **The C14 card already
-   carries worker busy time separately from the phase wall, so this is derivable
-   from data in hand rather than a new job.**
-2. **Repack pooling before the capacity runs, or after?** It is the remaining
+1. **Repack pooling before the capacity runs, or after?** It is the remaining
    rung of the wall ladder, worth ~2.9 h of the ~24.6, and it is the same shape
    as the migrate pooling that has already been proved bitwise. Doing it first
    makes the capacity runs cheaper; doing it after gets a product sooner.
-3. **When does the full-scale realization benchmark run?** Deferred 2026-08-18,
+2. **When does the full-scale realization benchmark run?** Deferred 2026-08-18,
    deferred and not cancelled. Until it does, every hour figure in this document
    and in the records is arithmetic on a phase card, and the caveats travel with
    it: migrate's term at 2048^3 is a floor, and the pool's memory footprint there
    is unmeasured and may cap workers below 16.
-4. **`malloc_trim` as an operating point** is still your call, with the anchor
+3. **`malloc_trim` as an operating point** is still your call, with the anchor
    number (15.5% of peak for +1.6% wall, improving with tile size). It belongs in
    Stage 5's pre-registration either way, so a decision before then is enough.
-5. **Does closing 4096^3's 1.23x belong to this milestone or to M-v2-7?** The
+4. **Does closing 4096^3's 1.23x belong to this milestone or to M-v2-7?** The
    production config fits no node available: 1259 GB against a gb node's 1026
    CPU-side, of which 618 is the state itself and cannot go. Closing it means
    removing ~36% of everything that is not state. This milestone's charter is
    2048^3, so on a literal reading it is out of scope -- but nothing else
    currently owns it.
-6. **The second (T,b) point assumes the operating point survives Stage 1b.** If
+5. **The second (T,b) point assumes the operating point survives Stage 1b.** If
    gg's 237 GB is the target, most of the memory pressure that made T=256/b=32
    attractive is gone, and the informative second point may become a *larger*
    tile than T=512.
 
 **Resolved since 08-14, kept so they are not re-asked:**
 
+- *The spill-transport miss:* ACCEPTED (record 5v). The bar was on bytes; the
+  time is <=4.7% of the phase and does not grow with scale.
 - *Whether a `gh` node can host 2048^3:* no, and structurally -- state plus
   resident mesh alone is 116.5 GB against a 116 GB hard cliff. Memory forces gg
   before SU does, which is why Stage 1b is partly overtaken.
