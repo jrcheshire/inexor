@@ -310,6 +310,11 @@ def cmd_run(args):
     # actually holding, which is the one number deciding whether the full run
     # fits -- so the workers' own RSS is summed in and the total is what the
     # memory criterion is read against.
+    arena_peak = max((d.get("arena_used", 0) for d in stats), default=0)
+    if arena_peak:
+        print(f"  arena peak residency: {arena_peak:,} rows "
+              f"({100 * arena_peak / max(st.n_arena, 1):.1f}% of the arena, "
+              f"{100 * arena_peak / max(st.n_particles, 1):.2f}% of particles)")
     w_rss = 0.0
     last = stats[-1] if stats else {}
     pool_rss = (last.get("pool") or {}).get("rss_mb") or {}
@@ -338,6 +343,7 @@ def cmd_run(args):
         phase=rep, per_step_stats=stats, a_steps=list(map(float, a_steps)),
         projected_full_run_h=per_step * K_STEPS / 3600.0,
         worker_rss_bytes=w_rss, total_rss_bytes=peak + w_rss,
+        arena_peak_rows=arena_peak, n_arena=int(st.n_arena),
         migrate_pooled_workers=last.get("migrate_pooled_workers"),
     ), tag=f"_{k0:02d}_{k0 + n:02d}")
     return 0

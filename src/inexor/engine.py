@@ -1128,6 +1128,17 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # the knob's receipt, in BOTH directions: 0 on every serial card, W on
     # every pooled one (the reach fallback reports 0 through migrate_pool)
     stats["migrate_pooled_workers"] = int(stats.get("migrate_pool", {}).get("workers", 0))
+    # PEAK ARENA RESIDENCY, so `arena_frac` stops being chosen by argument.
+    # The 6% on record is CLAIMS across a migrate pass, not residency: the
+    # arena is a revolving door (`_release_arena_of_brick` frees slots as
+    # bricks are rewritten) and C15 found 88.7-96.2% of occupied bricks with
+    # no residents at all. What that makes the true peak has never been
+    # measured, and it is what sets how small the arena can safely be.
+    for _k in ("migrate", "migrate_pool"):
+        _u = (stats.get(_k) or {}).get("arena_used")
+        if _u is not None:
+            stats["arena_used"] = int(_u)
+            break
     ph("migrate")
     # both: `cap` is the SHAPE every buffer took, `cap_true` the max over tiles it
     # was quantized from. Reporting only one of them hides either the padding cost

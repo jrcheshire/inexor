@@ -61,6 +61,16 @@
 #   d. `migrate_pooled_workers` = 8 and the repack fast-path share at 2.1M
 #      bricks, both of which C15 measured only at cgh64.
 #
+# arena_frac 0.10, NOT the driver default 0.20. It sets the arena's CAPACITY,
+# not its occupancy -- what lands there is driven by `brick_slack` -- so this
+# is ~15 GB off the resident state for no expected runtime cost, and if
+# anything a cheaper O(n_arena) free-list scan. The risk is capacity, not
+# correctness: a full arena REFUSES (there is a gate and a test), so too small
+# costs a job and not a wrong answer. The 6% on record is CLAIMS across a
+# migrate pass rather than simultaneous residency, and C15 found 88.7-96.2%
+# of occupied bricks holding no residents at all, so the true peak is well
+# under it -- but has never been measured. This run reports it.
+#
 # W=8, NOT 16, and this is a measurement not a guess. 922905 got the state
 # into shared memory correctly -- Shmem flat at 110.2 GB through the load,
 # 127.0 GB once the coarse meshes went in, exactly as priced -- and was then
@@ -183,7 +193,7 @@ trap 'kill $SAMPLER 2>/dev/null' EXIT
 #    as 920910 so the comparison is clean -- the backing store is the only
 #    thing that changed.
 run_leg "cgh-run-5" pixi run -e gpu python $RLZ run --config c-gh --workdir "$W" \
-  --tile-workers 8 --checkpoint-every 5 --stop-at 5
+  --tile-workers 8 --checkpoint-every 5 --stop-at 5 --arena-frac 0.10
 
 # 4. Export and card at step 5: PATH TESTS at scale, not science. The state is
 #    five steps into a forty-step schedule and --allow-partial says so.

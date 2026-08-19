@@ -734,6 +734,11 @@ def _worker_migrate_insert(arg):
     )
 
 
+def _worker_alive(_):
+    """A no-op whose only job is to prove the initializer finished."""
+    return os.getpid()
+
+
 def _worker_task(arg):
     """One tile of the kick; the writes ride back for the parent to apply."""
     t, bricks, C = arg
@@ -909,6 +914,12 @@ class TilePool:
                 else:
                     os.environ[k] = v
         if os.environ.get("INEXOR_LOAD_TRACE"):
+            # AFTER A BARRIER. `ctx.Pool()` returns when the processes exist,
+            # not when `_worker_init` has finished importing jax and building
+            # kernels, so reading /proc here measured newborn processes: job
+            # 922991 reported 0.01 GB per worker and then died as they grew.
+            # A dispatched task cannot run until the initializer has returned.
+            self._pool.map(_worker_alive, range(4 * self.workers))
             n, tot = worker_rss_bytes(self._pool)
             avail = available_ram()
             rss = ("RSS unreadable" if tot is None else
