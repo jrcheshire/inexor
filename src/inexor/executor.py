@@ -259,16 +259,47 @@ def available_ram():
     return None
 
 
-def preflight_shared_memory(terms, backend=None, headroom=1.0):
+def adoption_peak(terms, adopted=()):
+    """Bytes this process must find ON TOP of what it already holds.
+
+    **The demand is not the cost, and job 922682 was refused for the
+    difference.** The state arrays already exist in the parent when the pool
+    is built: `_share` copies each into a segment and rebinds `st`, dropping
+    the last reference to the private array, so an ADOPTED field releases its
+    own bytes as it is copied and nets to zero. Only two things are new --
+    the one field duplicated while its copy is in progress, and the segments
+    with no private counterpart (the coarse meshes).
+
+    So the peak above baseline is `max(largest adopted field, sum of fresh)`,
+    not `sum(everything)`. At c-gh that is the difference between 78.3 GB and
+    161.4 GB, and the second number refused a run the node could hold.
+
+    This is a MODEL of the release, and it is the one assumption here worth
+    naming: it holds only while nothing outside `st` still references those
+    arrays. `TilePool` is constructed before the step loop for exactly that
+    reason.
+    """
+    fresh = {k: v for k, v in terms.items() if k not in adopted}
+    biggest_adopted = max((v for k, v in terms.items() if k in adopted), default=0)
+    return max(biggest_adopted, sum(fresh.values()))
+
+
+def preflight_shared_memory(terms, backend=None, headroom=1.0, adopted=()):
     """Check the demand against whichever budget the backend actually has.
 
     THE TWO BACKENDS HAVE DIFFERENT CEILINGS, and using the wrong one is how
     this check would become decoration: `/dev/shm` is a hard tmpfs cap that
     `memfd` is exempt from, while `memfd` is bounded by RAM, which `/dev/shm`
-    charges against as well but is not the first thing it hits. Returns
-    (demand, budget, what) so a caller can record what it stood on; `what` is
-    None when nothing could be read, because an absent check must not be
-    recorded as a passed one.
+    charges against as well but is not the first thing it hits.
+
+    They also differ in what ADOPTION buys. The tmpfs must hold every segment
+    at once no matter what the parent is holding, so posix is checked on the
+    total. RAM is not: an adopted field frees its private copy as it goes, so
+    memfd is checked on `adoption_peak`.
+
+    Returns (demand, budget, what) so a caller can record what it stood on;
+    `what` is None when nothing could be read, because an absent check must
+    not be recorded as a passed one.
     """
     backend = backend or shm_backend()
     demand = sum(terms.values())
@@ -278,21 +309,29 @@ def preflight_shared_memory(terms, backend=None, headroom=1.0):
     avail = available_ram()
     if avail is None:
         return demand, None, None
-    if demand * headroom > avail:
+    need = adoption_peak(terms, adopted)
+    if need * headroom > avail:
         width = max(len(k) for k in terms)
         table = "\n".join(
             f"    {k:<{width}}  {_fmt_gb(v):>12}"
+            f"{'  (adopted, frees its own)' if k in adopted else ''}"
             for k, v in sorted(terms.items(), key=lambda kv: -kv[1])
         )
         raise MemoryError(
             f"the pool's shared memory does not fit available RAM.\n{table}\n"
             f"    {'-' * width}  {'-' * 12}\n"
-            f"    {'demand':<{width}}  {_fmt_gb(demand):>12}\n"
+            f"    {'demand (total)':<{width}}  {_fmt_gb(demand):>12}\n"
+            f"    {'peak ABOVE baseline':<{width}}  {_fmt_gb(need):>12}"
+            f"  <- what is checked\n"
             f"    {'MemAvailable':<{width}}  {_fmt_gb(avail):>12}\n"
-            f"  These are memfd pages, so they are RAM and nothing else -- this "
-            f"is a real\n  shortage, not the /dev/shm cap that stopped 920910. "
-            f"Levers, largest first:\n  `arena_frac` and `brick_slack` both add "
-            f"rows to off/w; `arena_frac` also sets\n  `arena_bucket` outright."
+            f"  An adopted field releases its private copy as it is copied, so "
+            f"the total is\n  NOT the cost: the peak is the largest single "
+            f"adopted field, or the sum of the\n  fresh segments, whichever is "
+            f"bigger. These are memfd pages, so this is a real\n  RAM shortage "
+            f"and not the /dev/shm cap that stopped 920910. Levers, largest\n"
+            f"  first: `arena_frac` and `brick_slack` both add rows to off/w, "
+            f"and `arena_frac`\n  also sets `arena_bucket` outright; "
+            f"`coarse_dtype` halves the mesh segments."
         )
     return demand, avail, "MemAvailable"
 
@@ -696,8 +735,13 @@ class TilePool:
         # margin rather than to the bare ceiling.
         self._shm_headroom = 1.10 if cfg.tile_workers > 1 else 1.0
         self._shm_backend = shm_backend()
+        # `self._fields` are ADOPTED: they exist in the parent right now and
+        # each releases its private copy as `_share` rebinds it. The coarse
+        # meshes are fresh. That distinction is the whole check on the memfd
+        # path -- see `adoption_peak`.
         self._shm_receipt = preflight_shared_memory(
-            self._shm_demand, backend=self._shm_backend, headroom=self._shm_headroom
+            self._shm_demand, backend=self._shm_backend,
+            headroom=self._shm_headroom, adopted=set(self._fields),
         )
         for f in self._fields:
             view = self._share(f, np.asarray(getattr(st, f)))

@@ -13,9 +13,10 @@
 #
 # WHY THE FIRST ONE DIED. `TilePool` adopts the whole SlotState plus the three
 # coarse force meshes into shared memory. At this run's own knobs (--slack 0.20
-# --arena-frac 0.20, alloc_margin 0.10) that is 148.5 GB, against a /dev/shm
+# --arena-frac 0.20, alloc_margin 0.10) that is 161.4 GB, against a /dev/shm
 # measured at 127.55 GB (job 922332) -- exactly half of RAM, the kernel
-# default. It overflowed IN CONSTRUCTION, 20.9 GB over, before step 1; the
+# default. (161.4 and not the 148.5 first quoted: the coarse meshes were
+# running f64 because the driver never set the dtype, which is fixed now.) It overflowed IN CONSTRUCTION, 20.9 GB over, before step 1; the
 # migrate scratch was never staged. `SharedMemory` sizes lazily, so the
 # segments were created cleanly and the process took a SIGBUS on first touch,
 # which is why the log has a bus error and no traceback.
@@ -37,9 +38,12 @@
 #   a. LEG 1 MUST PASS or nothing else runs. `test_executor.py` on this node
 #      covers both backends (the env override exists so both run where both
 #      exist), including the bitwise pool-vs-serial identity on memfd.
-#      EXPECT 27 passed, 1 skipped. 24/1 means the parametrise list collapsed
-#      to posix and the memfd path went untested -- that is what 922557 did,
-#      and it is why the backend assertion above leg 1 now exists.
+#      COVERAGE IS GUARANTEED BY THE BACKEND ASSERTION ABOVE, not by a count.
+#      `BACKENDS` in the suite is derived from the same `has_memfd()` probe
+#      the assertion checks, so memfd params run iff that assertion passed.
+#      (A hardcoded expected count was the first version of this and it went
+#      stale within the hour -- a gate that drifts every time a test is added
+#      is noise, and noise is how 922557's 24/24 got waved through.)
 #   b. TOTAL HOST under 200 GB of the node's 237 during stepping, where TOTAL
 #      is parent peak PLUS the pool's workers. READ `total_rss_bytes`, NOT
 #      `peak_rss_bytes` -- ru_maxrss cannot see other processes, and at cdev8
@@ -56,6 +60,16 @@
 #      project has ever been measured; this is the first.
 #   d. `migrate_pooled_workers` = 16 and the repack fast-path share at 2.1M
 #      bricks, both of which C15 measured only at cgh64.
+#
+# TWO THINGS CHANGED SINCE 922682, which refused rather than ran:
+#   - the coarse force mesh is f32, which D-v2-22 adopted and this driver had
+#     silently not been applying (25.770 -> 12.885 GB).
+#   - the memfd preflight checks the peak ABOVE BASELINE, not the total.
+#     Adopted fields already exist in the parent and release their private
+#     copies as they are copied, so the cost is the largest single field
+#     (78.3 GB) or the fresh segments (12.9 GB), whichever is bigger -- not
+#     their 148.5 GB sum. 922682 was refused on the sum against 128.5 GB of
+#     MemAvailable, which was the wrong comparison and my error.
 #
 # Cost: 6 h wall at most, 1 gg node, ~2 SU of the 9,072 (expiring 2026-11-30).
 # The wall is generous on purpose -- a timeout bills the whole request, but 5

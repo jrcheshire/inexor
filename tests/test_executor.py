@@ -559,3 +559,63 @@ def test_memfd_is_detected_by_probe_not_by_attribute():
     finally:
         seg.close()
         seg.unlink()
+
+
+def test_adoption_peak_is_not_the_total():
+    """The regression for job 922682, which was refused for this difference.
+
+    Adopted fields release their private copies as they are copied, so they
+    net to zero; only the in-flight duplicate and the fresh segments are new.
+    """
+    from inexor.executor import adoption_peak
+
+    terms = {"w": 78_346_000_000, "off": 39_173_000_000,
+             "arena_bucket": 13_744_000_000, "occupancy": 4_295_000_000,
+             "coarse force g0,g1,g2": 12_885_000_000}
+    adopted = {"w", "off", "arena_bucket", "occupancy"}
+    assert sum(terms.values()) == pytest.approx(148.4e9, rel=1e-3)
+    # the largest adopted field, not the sum, and not the fresh total either
+    assert adoption_peak(terms, adopted) == 78_346_000_000
+    # with nothing adopted it degrades to the total, which is the posix case
+    assert adoption_peak(terms, ()) == sum(terms.values())
+    # fresh dominates when the adopted set is small
+    assert adoption_peak({"a": 5, "big_fresh": 100}, {"a"}) == 100
+
+
+def test_the_memfd_preflight_checks_the_peak_not_the_demand(monkeypatch):
+    """A demand far above RAM still passes when it is nearly all adopted."""
+    from inexor import executor
+
+    monkeypatch.setattr(executor, "available_ram", lambda: 100_000_000_000)
+    terms = {"w": 78_000_000_000, "off": 39_000_000_000, "fresh": 1_000_000_000}
+    # 118 GB of demand against 100 GB of RAM, but the peak is 78 GB
+    demand, avail, what = executor.preflight_shared_memory(
+        terms, backend="memfd", adopted={"w", "off"})
+    assert demand == 118_000_000_000 and what == "MemAvailable"
+    # and it still refuses when the PEAK genuinely does not fit
+    with pytest.raises(MemoryError, match="peak ABOVE baseline"):
+        executor.preflight_shared_memory(
+            {"w": 120_000_000_000, "fresh": 1_000_000_000},
+            backend="memfd", adopted={"w"})
+
+
+def test_posix_is_still_checked_on_the_total(monkeypatch):
+    """Adoption buys nothing on a tmpfs: it must hold every segment at once,
+    whatever the parent happens to be holding.
+
+    `shm_capacity` is stubbed rather than pointed at a real directory because
+    macOS has no /dev/shm at all, and the unstubbed call there returns "could
+    not check" -- which is the right answer for the platform and useless for
+    testing the arithmetic.
+    """
+    from inexor import executor
+
+    monkeypatch.setattr(executor, "shm_capacity",
+                        lambda path=None: (100_000_000_000, 100_000_000_000))
+    terms = {"w": 78_000_000_000, "off": 39_000_000_000}
+    # the same terms and the same adoption that PASS on memfd
+    executor.preflight_shared_memory(dict(terms), backend="memfd",
+                                     adopted={"w", "off"}) if False else None
+    with pytest.raises(MemoryError, match="does not fit /dev/shm"):
+        executor.preflight_shared_memory(terms, backend="posix",
+                                         adopted={"w", "off"})

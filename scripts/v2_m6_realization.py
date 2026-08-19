@@ -126,6 +126,17 @@ def _engine_config(g, args, checkpoint_dir):
         box_size=g["L"], n_part=g["n_part"], n_fine=g["n_fine"],
         n_coarse=g["n_coarse"], n_tile=g["tile"], b_fine=g["buf"], alpha=m3.ALPHA,
         brick_slack=args.slack, tile_workers=args.tile_workers,
+        # EXPLICIT, and it has to be: `EngineConfig` defaults coarse_dtype to
+        # float64, so omitting it here ran the milestone's own deliverable on
+        # the configuration M-v2-4 measured and REJECTED. D-v2-22 adopted f32
+        # for the coarse force mesh -- 1.83x peak host at n_coarse=1024, for
+        # an error of 1e-5 where the mesh itself costs 1e-2. At c-gh the two
+        # differ by 12.885 GB of shared memory (25.770 vs 12.885), and
+        # `inexor.plan` has defaulted to float32 the whole time, so the
+        # planner and this driver were pricing different runs. Found three
+        # times from three directions before it was written down; the print
+        # below is so the next reader sees it without re-deriving it.
+        coarse_dtype="float32",
         # AUTO by default, never True: C14 made the library default a tri-state
         # precisely because a hard True refuses when no pool exists, and this
         # driver must not turn a serial smoke run into a refusal.
@@ -255,6 +266,10 @@ def cmd_run(args):
           f"{st.off.shape[0]:,} rows; load {t_load:.1f} s")
     print(f"  W={ec.tile_workers} pooled_migrate={ec.migrate_pooled} "
           f"eject={ec.eject_kernel} slack={args.slack} ckpt_every={args.checkpoint_every}")
+    # the dtypes were in no log line, which is most of why the f64 coarse mesh
+    # kept being re-found rather than read
+    print(f"  coarse={ec.coarse_dtype} fine={ec.fine_dtype} "
+          f"arena_frac={args.arena_frac} alloc_margin={args.alloc_margin}")
 
     ph = PhaseTimer()
     stats = []
