@@ -72,11 +72,71 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 import v2_m3_engine_gate as m3  # noqa: E402
 from inexor.plan import PRESETS  # noqa: E402
 from v2_m6_engine_peak import _maxrss_bytes, _require_cpu  # noqa: E402
+from v2_m6_peak_trace import PhaseTracer  # noqa: E402
 from v2_m6_phase_time import PhaseTimer  # noqa: E402
 
 # The generator dtype the M-v2-5 record measured the production path at.
 GEN_FDTYPE = np.float32
 K_STEPS = 40
+
+
+def _require_linux_for_peaks():
+    """Per-phase high-water needs procfs; there is no macOS equivalent.
+
+    Checked by READING the files rather than by testing `sys.platform`, for the
+    same reason `executor.has_memfd()` probes instead of consulting an
+    attribute: the platform name is a proxy for the capability and this
+    milestone has already shipped one gate that trusted the proxy and was wrong
+    (`hasattr(os, "memfd_create")` is False on the conda-forge interpreter that
+    can memfd perfectly well). Here the capability is the file.
+    """
+    for path in ("/proc/self/status", "/proc/self/clear_refs"):
+        if not os.path.exists(path):
+            raise SystemExit(
+                f"FATAL: --phase-instrument peak needs {path}, which this "
+                f"system ({sys.platform}) does not have. Per-phase high-water "
+                "marks are Linux-only; use --phase-instrument time here and "
+                "take the peaks on the cluster."
+            )
+
+
+def _print_phase_card(rep, instrument):
+    """The phase card, in the units the instrument that produced it reports.
+
+    A FUNCTION rather than inline in `cmd_run` so the node can exercise it in a
+    second before spending forty minutes reaching it. This milestone has lost
+    two cluster jobs on a `print` -- 447 on a key belonging to another arm's
+    worker, 448 on one renamed out from under it -- and a reporting path that
+    only ever runs after the expensive part is untested code by construction.
+
+    **The peak numbers are the PARENT ONLY.** `VmHWM` is one process's, and the
+    pool's workers are others; their RSS is summed separately in the `memory:`
+    line above. A phase peak here is not a node total and must not be read as
+    one.
+    """
+    if instrument != "peak":
+        print("  phase card (s over this segment):")
+        for k, v in list(rep["per_phase"].items()):
+            if v > 0:
+                print(f"     {k:<16s} {v:9.2f}  {100 * rep['per_phase_frac'][k]:5.1f}%")
+        return
+    # PEAK and OWN both, because they answer different questions and this
+    # milestone has confused them before: `peak` is the absolute RSS reached
+    # while the phase ran, which is what a host ceiling cares against; `own` is
+    # that minus the RSS the phase started from, i.e. what the phase itself
+    # allocated. A large peak with a near-zero own is a phase running inside
+    # someone else's residency, and differencing two maxima cannot tell those
+    # apart -- which is precisely how M-v2-6 Stage 0's gates became unreadable.
+    print("  phase card (GB high-water over this segment, PARENT PROCESS ONLY):")
+    rows = sorted(rep["phases"].items(), key=lambda kv: -kv[1]["peak"])
+    for k, v in rows:
+        if v["peak"] > 0:
+            print(f"     {k:<16s} peak {v['peak'] / 1e9:8.2f}  "
+                  f"own {v['delta'] / 1e9:8.2f}  x{v['visits']}")
+    print(f"     {'RUN PEAK':<16s} peak {rep['run_peak'] / 1e9:8.2f}"
+          "   accumulated across boundaries, NOT ru_maxrss")
+    if rep.get("unknown_phases"):
+        print(f"     unknown boundaries: {rep['unknown_phases']}")
 
 
 def _geom(cfg_name):
@@ -283,13 +343,39 @@ def cmd_run(args):
           f"{'yes, %.1f GB' % (allocator.bytes_held() / 1e9) if allocator else 'no (serial)'}"
           f"; malloc_trim={trimmed}")
 
-    ph = PhaseTimer()
+    # ONE phase callback, so the two instruments are exclusive rather than
+    # composed, and that is deliberate: `PhaseTracer` writes /proc/self/clear_refs
+    # at every boundary and the reset costs wall, which is the whole reason
+    # `v2_m6_phase_time.py` exists as a separate probe. Running both would give a
+    # phase card whose seconds describe the instrument.
+    #
+    # `--phase-instrument peak` is what answers the question this milestone is
+    # stuck on. Nothing has ever taken a per-phase high-water at c-gh: 923139
+    # died inside the coarse solve and all we have is a 10 s system sampler,
+    # against which `inexor.plan` under-charged that phase by 5x. In pool mode
+    # the intra-tile boundaries do not fire, so this is ~7 clear_refs per step
+    # against a step measured in minutes.
+    if args.phase_instrument == "peak":
+        # REFUSE NOW, not at the first boundary. `PhaseTracer` needs
+        # /proc/self/clear_refs, which macOS does not have, and the first
+        # boundary is on the far side of a load measured in minutes -- so
+        # without this the failure mode is "the job died after the expensive
+        # part, on the instrument".
+        _require_linux_for_peaks()
+        ph = PhaseTracer(trim="off")
+    else:
+        ph = PhaseTimer()
     stats = []
     t0 = time.perf_counter()
     out = engine.run(st, ec, co, phase=ph, resume=resume, stop_at=stop,
                      collect=stats.append, allocator=allocator)
     wall = time.perf_counter() - t0
-    peak = _maxrss_bytes()
+    # `clear_refs` RESETS ru_maxrss ALONG WITH VmHWM -- both read the kernel's
+    # one `mm->hiwater_rss` -- so after a traced run `_maxrss_bytes()` reports
+    # the peak since the last boundary, not the run's. `PhaseTracer` accumulates
+    # `run_peak` across boundaries for exactly this reason; taking it from there
+    # is not a preference, it is the only correct source under tracing.
+    peak = ph.run_peak if args.phase_instrument == "peak" else _maxrss_bytes()
 
     n = len(out)
     per_step = wall / max(n, 1)
@@ -326,10 +412,7 @@ def cmd_run(args):
           f"tile_workers={last.get('tile_workers')} "
           f"coarse_pooled_workers={last.get('coarse_pooled_workers')}")
     rep = ph.report()
-    print("  phase card (s over this segment):")
-    for k, v in list(rep["per_phase"].items()):
-        if v > 0:
-            print(f"     {k:<16s} {v:9.2f}  {100 * rep['per_phase_frac'][k]:5.1f}%")
+    _print_phase_card(rep, args.phase_instrument)
 
     if n == 0:
         print("  REFUSING: the segment advanced no steps.")
@@ -340,6 +423,12 @@ def cmd_run(args):
         tile_workers=ec.tile_workers, migrate_pooled=bool(ec.migrate_pooled),
         eject_kernel=str(ec.eject_kernel), brick_slack=args.slack,
         arena_frac=args.arena_frac, checkpoint_every=args.checkpoint_every,
+        # WHICH instrument produced `phase`, on the card rather than inferable
+        # from its shape: the two reports carry different keys and different
+        # units, and a reader that guesses wrong reads seconds as gigabytes.
+        # It also records that `peak_rss_bytes` came from `PhaseTracer.run_peak`
+        # rather than ru_maxrss, which clear_refs would have made meaningless.
+        phase_instrument=args.phase_instrument,
         phase=rep, per_step_stats=stats, a_steps=list(map(float, a_steps)),
         projected_full_run_h=per_step * K_STEPS / 3600.0,
         worker_rss_bytes=w_rss, total_rss_bytes=peak + w_rss,
@@ -471,6 +560,12 @@ def main():
     ap.add_argument("--migrate-pooled", action="store_true", default=None)
     ap.add_argument("--serial-migrate", dest="migrate_pooled", action="store_false")
     ap.add_argument("--eject-kernel", default="jax", choices=("numpy", "jax"))
+    ap.add_argument("--phase-instrument", default="time", choices=("time", "peak"),
+                    help="what the phase hook measures. 'time' is the phase card "
+                         "(PhaseTimer); 'peak' takes a per-phase HIGH-WATER "
+                         "(PhaseTracer, Linux only) and costs wall at every "
+                         "boundary, so the two are exclusive and a run reports "
+                         "one or the other, never both")
     ap.add_argument("--checkpoint-every", type=int, default=5)
     ap.add_argument("--stop-at", type=int, default=None,
                     help="absolute step to stop before; must be a checkpoint boundary")

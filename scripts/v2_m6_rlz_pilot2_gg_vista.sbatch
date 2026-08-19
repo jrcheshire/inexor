@@ -60,6 +60,24 @@
 #      project has ever been measured; this is the first.
 #   d. `migrate_pooled_workers` = 8 and the repack fast-path share at 2.1M
 #      bricks, both of which C15 measured only at cgh64.
+#   e. THE PER-PHASE HIGH-WATER, which is the number this attempt exists for
+#      and which has never been taken at this scale. `--phase-instrument peak`
+#      swaps the phase card from seconds to a `VmHWM` per phase, reset at each
+#      boundary, so the answer to "which phase holds the peak" is measured
+#      rather than modelled. `inexor.plan` prices the coarse solve at 30.1 GB
+#      and 923139's 10 s sampler suggests ~79; whichever way that lands, the
+#      budget stops being an argument. NOTE the card is PARENT ONLY -- VmHWM is
+#      one process's -- so read it beside the workers' summed RSS, not instead.
+#      Taking peaks costs wall at every boundary, so THIS RUN'S s_per_step is
+#      an upper bound and criterion (c) is owed a `--phase-instrument time`
+#      run before any wall figure from it is quoted.
+#
+# TENSION IN (b), FLAGGED NOT RESOLVED: the 200 GB gate was set when the bound
+# read 164.6 GB. The corrected accounting puts this configuration at 218.7 GB
+# of lower bound at these very knobs, so (b) as written would refuse a run that
+# completes inside a 237 GB node. Either the gate moves or the configuration
+# does, and that is JC's call, not this script's -- it is left at 200 so the
+# question surfaces as a refusal rather than being quietly rewritten.
 #
 # arena_frac 0.10, NOT the driver default 0.20. It sets the arena's CAPACITY,
 # not its occupancy -- what lands there is driven by `brick_slack` -- so this
@@ -138,13 +156,19 @@ RLZ="scripts/v2_m6_realization.py"
 
 rc_total=0
 names=(); codes=()
+# BY NAME, not by position. The gates below used codes[N] and inserting a leg
+# silently renumbered every one of them -- the export gate would have read the
+# smoke leg's rc and published a partial state as though stepping had passed.
+# A subscript that has to be re-derived every time the script changes is the
+# same shape as the `$?`-capturing bug that made 922905 report COMPLETED 0:0.
+declare -A RC
 run_leg() {
   local name="$1"; shift
   echo "=== $name ==="
   local t0=$SECONDS
   "$@"; local rc=$?
   echo "=== $name rc=$rc after $((SECONDS - t0)) s ==="
-  names+=("$name"); codes+=("$rc")
+  names+=("$name"); codes+=("$rc"); RC["$name"]=$rc
   [ $rc -ne 0 ] && rc_total=1
   return 0
 }
@@ -154,10 +178,38 @@ run_leg() {
 #    see posix, so a green laptop says nothing about the arrays this job maps.
 run_leg "identity-both-backends" \
   pixi run -e gpu python -m pytest tests/test_executor.py -q
-if [ "${codes[0]}" -ne 0 ]; then
+if [ "${RC[identity-both-backends]}" -ne 0 ]; then
   echo "FATAL: the executor identity gate failed on this node. The pool is not"
   echo "bitwise the serial loop on the backing store it would have run on, and"
   echo "no 2048^3 result from it would mean anything. Nothing else runs."
+  exit 1
+fi
+
+# 1b. THE REPORTING PATH, exercised before the expensive leg rather than after
+#     it. `--phase-instrument peak` is new and its first execution anywhere is
+#     this job: it needs /proc/self/clear_refs, which the laptop does not have,
+#     so no local smoke could reach it. This milestone has already lost two
+#     cluster jobs on a `print` (447 on another arm's key, 448 on a renamed
+#     one), and a card that only runs after forty minutes of stepping is
+#     untested code by construction. Two seconds here buys that.
+run_leg "peak-card-smoke" pixi run -e gpu python -c "
+import sys; sys.path.insert(0, 'scripts')
+import v2_m6_realization as R
+from v2_m6_peak_trace import PhaseTracer
+R._require_linux_for_peaks()
+t = PhaseTracer(trim='off')
+for name in ('kernel_build', 'lead_drift', 'coarse_paint', 'coarse_solve',
+             'membership', 'tile_loop_end', 'reconcile', 'migrate', 'repack'):
+    t(name)
+rep = t.report()
+R._print_phase_card(rep, 'peak')
+assert rep['run_peak'] > 0, 'PhaseTracer read a zero run peak'
+assert not rep['unknown_phases'], rep['unknown_phases']
+print('peak instrument OK; VmHWM readable and clear_refs writable')
+"
+if [ "${RC[peak-card-smoke]}" -ne 0 ]; then
+  echo "FATAL: the per-phase peak instrument does not work on this node, and"
+  echo "the whole point of this job is the number it produces. Nothing else runs."
   exit 1
 fi
 
@@ -180,11 +232,21 @@ print('  wall %.1f min, peak %.1f GB, %d slabs' % (
 # A /proc sampler for the stepping leg. Node-local, killed with the leg, and
 # the only way to see WHICH term is growing when the OOM killer arrives -- it
 # leaves nothing in the job log. Same idea as C11's sidecar.
+#
+# UNITS: /proc/meminfo is in KIBIBYTES, so GB is $2*1024/1e9 and dividing by
+# 1048576 gives GiB. This printed GiB labelled GB and every reading it has ever
+# produced was 7.4% low -- which is the whole of the "driver says 135.6, the
+# trace says 110.9" discrepancy that stood as an open thread: 121.0 GB and
+# 112.7 GiB are the same number. `MemTotal` is the tell, 237.6 GiB = 255.1 GB.
+#
+# 2 s, not 10: 923139's whole failure happened inside one 10 s window, so the
+# shape of the spike -- which term, in which order -- was unreadable. The awk
+# is free next to a step measured in minutes.
 ( while true; do
-    awk '/^(MemTotal|MemAvailable|Shmem|Cached):/ {printf "%s=%.1fGB ", $1, $2/1048576}' \
+    awk '/^(MemTotal|MemAvailable|Shmem|Cached):/ {printf "%s=%.2fGB ", $1, $2*1024/1e9}' \
       /proc/meminfo
     echo "t=${SECONDS}s"
-    sleep 10
+    sleep 2
   done ) > mem-trace-$SLURM_JOB_ID.log 2>&1 &
 SAMPLER=$!
 trap 'kill $SAMPLER 2>/dev/null' EXIT
@@ -193,11 +255,12 @@ trap 'kill $SAMPLER 2>/dev/null' EXIT
 #    as 920910 so the comparison is clean -- the backing store is the only
 #    thing that changed.
 run_leg "cgh-run-5" pixi run -e gpu python $RLZ run --config c-gh --workdir "$W" \
-  --tile-workers 8 --checkpoint-every 5 --stop-at 5 --arena-frac 0.10
+  --tile-workers 8 --checkpoint-every 5 --stop-at 5 --arena-frac 0.10 \
+  --phase-instrument peak
 
 # 4. Export and card at step 5: PATH TESTS at scale, not science. The state is
 #    five steps into a forty-step schedule and --allow-partial says so.
-if [ "${codes[1]}" -eq 0 ]; then
+if [ "${RC[cgh-run-5]}" -eq 0 ]; then
   run_leg "cgh-export-partial" pixi run -e gpu python $RLZ export --config c-gh \
     --workdir "$W" --tile-workers 8 --allow-partial \
     --export-dir "$W/export_pilot"
