@@ -79,6 +79,11 @@ export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
 cd "$SCRATCH/src/inexor" 2>/dev/null || cd "$HOME/src/inexor" || {
   echo "FATAL: no inexor checkout"; exit 1; }
+# Every failure so far has been diagnosed from a partial log, and 922790
+# printed NOTHING because python block-buffers stdout to a file and was
+# SIGKILLed with the buffer unflushed. Unbuffered from here.
+export PYTHONUNBUFFERED=1
+export INEXOR_LOAD_TRACE=1
 export JAX_PLATFORMS=cpu
 export CONDA_OVERRIDE_CUDA=12.0
 
@@ -153,6 +158,18 @@ print('  ICs from commit', m['commit'], 'at', m['when'])
 print('  wall %.1f min, peak %.1f GB, %d slabs' % (
     m['wall_s']/60, m['peak_rss_bytes']/1e9, len(m['manifest']['files'])))"
 
+# A /proc sampler for the stepping leg. Node-local, killed with the leg, and
+# the only way to see WHICH term is growing when the OOM killer arrives -- it
+# leaves nothing in the job log. Same idea as C11's sidecar.
+( while true; do
+    awk '/^(MemTotal|MemAvailable|Shmem|Cached):/ {printf "%s=%.1fGB ", $1, $2/1048576}' \
+      /proc/meminfo
+    echo "t=${SECONDS}s"
+    sleep 10
+  done ) > mem-trace-$SLURM_JOB_ID.log 2>&1 &
+SAMPLER=$!
+trap 'kill $SAMPLER 2>/dev/null' EXIT
+
 # 3. FIVE STEPS: the leg that took the bus error, re-run on memfd. Same knobs
 #    as 920910 so the comparison is clean -- the backing store is the only
 #    thing that changed.
@@ -171,6 +188,10 @@ else
   echo "STEPPING FAILED: skipping export and card -- they would describe a state"
   echo "the engine did not finish producing."
 fi
+
+kill $SAMPLER 2>/dev/null
+echo "=== MEMORY TRACE (last 20 samples) ==="
+tail -20 mem-trace-$SLURM_JOB_ID.log
 
 echo "=== LEG SUMMARY ==="
 for j in "${!names[@]}"; do echo "  ${names[$j]}: rc=${codes[$j]}"; done

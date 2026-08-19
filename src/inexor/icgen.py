@@ -483,15 +483,33 @@ def load_slot_state(
                 )
         return int(meta["bx"]), off, w, occ, sc
 
+    _trace = os.environ.get("INEXOR_LOAD_TRACE")
+
+    def _say(msg):
+        if not _trace:
+            return
+        try:
+            with open("/proc/meminfo") as fh:
+                mi = {k: int(v.split()[0]) * 1024 for k, v in
+                      (ln.split(":", 1) for ln in fh)}
+            extra = (f"  MemAvailable {mi['MemAvailable']/1e9:.1f} GB, "
+                     f"Shmem {mi['Shmem']/1e9:.1f} GB")
+        except (OSError, KeyError, ValueError):
+            extra = ""
+        print(f"  [load] {msg}{extra}", flush=True)
+
     # pass 1: the index only. off/w are dropped at the end of each iteration.
+    _say(f"pass 1 of 2 over {len(man['files'])} slabs (index only)")
     occupancy = np.empty(n_bricks * per3, dtype=np.int64)
     # one scale per brick, reassembled from the slabs that own them
     vel_scale = np.ones(n_bricks, dtype=np.float64)
-    for fname in man["files"]:
+    for _i, fname in enumerate(man["files"]):
         d, _off, _w, occ, sc = _slab(fname)
         occupancy[d * nb * nb * per3 : (d + 1) * nb * nb * per3] = occ
         vel_scale[d * nb * nb : (d + 1) * nb * nb] = sc
         del _off, _w
+        if _i % 32 == 31:
+            _say(f"pass 1: {_i + 1}/{len(man['files'])} slabs")
 
     brick_counts = occupancy.reshape(n_bricks, per3).sum(axis=1)
     _, brick_start, n_alloc, n_arena = _alloc_geometry(
@@ -503,11 +521,14 @@ def load_slot_state(
     # behaviour is exactly what it was.
     _zeros = (lambda shape, dtype, tag: np.zeros(shape, dtype=dtype)) if alloc is None \
         else alloc.zeros
+    _say(f"allocating off/w for {n_rows:,} rows "
+         f"({n_rows * 9 / 1e9:.1f} GB, {'shared' if alloc else 'private'})")
     off_all = _zeros((n_rows, 3), np.uint8, "off")
     w_all = _zeros((n_rows, 3), np.int16, "w")
+    _say("allocated; pass 2 of 2 (payload)")
 
     # pass 2: place the payload, one slab live at a time
-    for fname in man["files"]:
+    for _i, fname in enumerate(man["files"]):
         d, off, w, _occ, _sc = _slab(fname)
         row = 0
         for b in range(d * nb * nb, (d + 1) * nb * nb):
@@ -518,7 +539,10 @@ def load_slot_state(
         if row != len(off):
             raise ValueError(f"slab bx={d}: placed {row} rows of {len(off)}")
         del off, w, _occ
+        if _i % 32 == 31:
+            _say(f"pass 2: {_i + 1}/{len(man['files'])} slabs")
 
+    _say("payload placed; building SlotState")
     st = SlotState(
         t9=t9,
         bricks_per_side=nb,
