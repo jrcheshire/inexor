@@ -332,6 +332,20 @@ class EngineConfig:
         pcells = p**3
         phalf = p * p * (p // 2 + 1)
         slab = max(1, min(nc, 32))
+        # EVERY FINE-ARM TERM IS PER WORKER, and counting them once is what let
+        # 923313 die in a phase this priced at 1.4 GB. In pool mode the parent
+        # builds NO tile kernels at all -- `run` hands it `(None, tile_geom(...))`
+        # and each worker builds its own triple and runs its own tile -- so the
+        # node holds W copies of the kernels, W builds, and W tile working sets,
+        # not one. Serial runs have exactly one of each, which is what `max(W, 1)`
+        # gives, so no existing measurement moves.
+        #
+        # This is the same fault as the pool's startup footprint being in no
+        # table until it was measured, and the same one the umbrella note about
+        # parent RSS missing pool workers is about: ru_maxrss sees ONE process,
+        # so an instrument reading the parent cannot see this term AT ALL and
+        # the budget has to carry it by construction.
+        w = max(int(self.tile_workers), 1)
         return dict(
             # --- coarse, transient
             coarse_accumulator=cells * 8,          # int64 host, dtype-independent
@@ -380,7 +394,7 @@ class EngineConfig:
             # rather than a particle one.
             coarse_force_copy_transient=cells * cw,
             # --- fine, resident through the tile loop
-            tile_kernels=3 * phalf * 2 * fw,
+            tile_kernels=w * 3 * phalf * 2 * fw,
             # THE BUILD, which the tile arm never counted though the coarse arm
             # always did. `split_kernels` holds `k2_true`, `k2_safe` and `fac` as
             # full f64 half-grids plus `pref` at the fine dtype while it
@@ -396,11 +410,32 @@ class EngineConfig:
             # config ladder alone could not have found this: particles, coarse
             # cells and phalf scale together on every rung, and it took cdev's
             # 15.48x phalf against 8.00x particles to separate them.
-            tile_kernel_build_f64=3 * phalf * 8,
-            tile_kernel_pref=phalf * fw,
+            tile_kernel_build_f64=w * 3 * phalf * 8,
+            tile_kernel_pref=w * phalf * fw,
             # --- fine, transient per tile
-            tile_workspace=pcells * (fw + 4 + 3 * fw) + phalf * 2 * fw,
+            tile_workspace=w * (pcells * (fw + 4 + 3 * fw) + phalf * 2 * fw),
         )
+
+    def mesh_phase(self):
+        """`MESH_PHASE`, adjusted for how THIS config actually runs.
+
+        The module dict describes the serial engine, where `run` hoists
+        `make_tile_force_fn` and the kernel build lands at its own boundary
+        before the loop. **In pool mode the parent builds no tile kernels at
+        all** -- it is handed `(None, tile_geom(...))` and each worker builds
+        its own triple on its first task, which happens INSIDE the tile loop.
+
+        That distinction is not bookkeeping: `kernel_build` is a once-per-run
+        phase and is held apart from the in-step sum, so leaving the tile build
+        there would drop W builds out of the budget for the very step the run
+        keeps dying in. A phase map that cannot express "who runs this, and
+        when" is a phase map that quietly excuses the largest term.
+        """
+        m = dict(MESH_PHASE)
+        if self.tile_workers > 1:
+            m["tile_kernel_build_f64"] = "tile_loop"
+            m["tile_kernel_pref"] = "tile_loop"
+        return m
 
     def step_bytes(self, n_particles, n_rows=None, cap=None):
         """Per-step HOST terms that scale with PARTICLES, not with the mesh.
@@ -484,7 +519,9 @@ class EngineConfig:
             migrate_staging=int(round(190.0 * n / nb)),
         )
         if cap is not None:
-            out["tile_buffers"] = int(cap) * (8 + 1 + 24 + 24 + 1 + 8 + 24 + 24)
+            # per WORKER: each holds one tile's buffers at once
+            out["tile_buffers"] = (max(int(self.tile_workers), 1) * int(cap)
+                                   * (8 + 1 + 24 + 24 + 1 + 8 + 24 + 24))
         return out
 
     @property

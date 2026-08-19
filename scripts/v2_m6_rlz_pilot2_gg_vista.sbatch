@@ -65,11 +65,10 @@
 #      MB (cdev) -- five orders under a phase here.
 #
 #      REPLACES a flat 200 GB bar, retired here. That number was set when
-#      `inexor.plan` read 164.6 GB for this configuration; the corrected
-#      accounting reads 218.7 at these knobs, so the old bar would have refused
-#      a run that completes inside the node -- a gate that fails on a pass is
-#      worse than no gate. Nothing about the machine changed, only the
-#      arithmetic that had been wrong about it.
+#      `inexor.plan` read 164.6 GB for this configuration. The corrected
+#      accounting reads 243.4 GB against a node of 255.1, so the old bar was
+#      not merely stale -- it sat below the run's own floor and would have
+#      refused on arithmetic before any measurement was taken.
 #
 #      If (b) fails, arena_frac is the first lever and it is NAMED, not a
 #      mystery: it sets capacity and costs ~15 GB of resident state per 0.10.
@@ -90,19 +89,12 @@
 #      swaps the phase card from seconds to a `VmHWM` per phase, reset at each
 #      boundary, so the answer to "which phase holds the peak" is measured
 #      rather than modelled. `inexor.plan` prices the coarse solve at 30.1 GB
-#      and 923139's 10 s sampler suggests ~79; whichever way that lands, the
-#      budget stops being an argument. NOTE the card is PARENT ONLY -- VmHWM is
+#      and 923313's 2 s sampler puts ~85 GB of anonymous memory in that window;
+#      whichever way that lands, the budget stops being an argument. NOTE the card is PARENT ONLY -- VmHWM is
 #      one process's -- so read it beside the workers' summed RSS, not instead.
 #      Taking peaks costs wall at every boundary, so THIS RUN'S s_per_step is
 #      an upper bound and criterion (c) is owed a `--phase-instrument time`
 #      run before any wall figure from it is quoted.
-#
-# TENSION IN (b), FLAGGED NOT RESOLVED: the 200 GB gate was set when the bound
-# read 164.6 GB. The corrected accounting puts this configuration at 218.7 GB
-# of lower bound at these very knobs, so (b) as written would refuse a run that
-# completes inside a 237 GB node. Either the gate moves or the configuration
-# does, and that is JC's call, not this script's -- it is left at 200 so the
-# question surfaces as a refusal rather than being quietly rewritten.
 #
 # arena_frac 0.10, NOT the driver default 0.20. It sets the arena's CAPACITY,
 # not its occupancy -- what lands there is driven by `brick_slack` -- so this
@@ -368,10 +360,18 @@ df -h "$SCRATCH" | tail -1
 echo
 echo "=== READ THE CARDS, in this order ==="
 echo "  $W/realization_run_00_05.json"
-echo "     total_rss_bytes < 200e9   <- criterion (b). NOT peak_rss_bytes."
-echo "     s_per_step vs 1971 projected, and projected_full_run_h, which"
-echo "     REPLACES the ~21.9 h arithmetic -- the first measured wall."
-echo "     migrate_pooled_workers = 16, and the repack fast share at 2.1M bricks."
+echo "     criterion (b) is EVALUATED ABOVE, not read off here: the 200e9 bar"
+echo "     this line used to quote was retired -- it was set when the planner"
+echo "     read 164.6 GB for this run and the corrected accounting reads 243.4."
+echo "     The [phase] lines are the payload. They stream as each boundary is"
+echo "     crossed, so they exist even when the run is killed; read the LAST"
+echo "     one to see which phase was live, and its avail column beside its"
+echo "     peak -- a flat parent peak against a collapsing avail is the"
+echo "     WORKERS, which VmHWM cannot see."
+echo "     s_per_step here is an UPPER BOUND: taking peaks costs wall at every"
+echo "     boundary. The first measured wall is owed a --phase-instrument time"
+echo "     run and must not be quoted from this one."
+echo "     migrate_pooled_workers = 8, and the repack fast share at 2.1M bricks."
 echo "  $W/realization_export.json and realization_pk.json -> the paths at scale."
 echo "LEG 2 (scripts/v2_m6_rlz_run_gg_vista.sbatch, 30 h, ~6.6 SU) IS NOT"
 echo "AUTOMATIC: submit it only after criterion (b) is read and passed."

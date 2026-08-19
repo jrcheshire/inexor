@@ -464,10 +464,11 @@ def test_the_phase_model_would_have_refused_the_run_that_died():
         "no longer a bound"
     )
 
-    resident = sum(v for k, v in m.items() if engine.MESH_PHASE[k] == "resident")
+    mp = ec.mesh_phase()
+    resident = sum(v for k, v in m.items() if mp[k] == "resident")
     step = ec.step_bytes(ec.n_total, cap=5284492)
     in_step = {"coarse_solve": old_solve}
-    for src, phase_of in ((m, engine.MESH_PHASE), (step, engine.STEP_PHASE)):
+    for src, phase_of in ((m, mp), (step, engine.STEP_PHASE)):
         for k, v in src.items():
             p = phase_of[k]
             for one in (p,) if isinstance(p, str) else p:
@@ -481,9 +482,77 @@ def test_the_phase_model_would_have_refused_the_run_that_died():
         "fits a gg node -- so the corrected model would have passed it too"
     )
 
-    new_solve = sum(v for k, v in m.items()
-                    if engine.MESH_PHASE[k] == "coarse_solve")
+    new_solve = sum(v for k, v in m.items() if mp[k] == "coarse_solve")
     assert new_solve < old_solve / 2, (
         f"the hoisted build takes the solve from {old_solve / GB_:.1f} to "
         f"{new_solve / GB_:.1f} GB; the numpy half of that was measured at 23.7"
+    )
+
+
+def test_every_fine_arm_term_is_per_worker():
+    """923313 died in a phase this module priced at 1.4 GB.
+
+    In pool mode the parent builds NO tile kernels -- `run` hands it
+    `(None, tile_geom(...))` -- so each of W workers builds its own triple and
+    runs its own tile. The node holds W copies of every fine-arm term and the
+    budget was carrying one. An instrument reading the parent cannot see this
+    at all (ru_maxrss is one process's), so the accounting has to carry it by
+    construction or nothing will.
+    """
+    fine = ("tile_kernels", "tile_workspace", "tile_kernel_build_f64",
+            "tile_kernel_pref")
+    one = _ec("c-gh").mesh_bytes()
+    eight = EngineConfig(
+        box_size=PRESETS["c-gh"]["box"], n_part=PRESETS["c-gh"]["n_part"],
+        n_fine=PRESETS["c-gh"]["n_fine"], n_coarse=PRESETS["c-gh"]["n_coarse"],
+        n_tile=PRESETS["c-gh"]["tile"], b_fine=PRESETS["c-gh"]["buf"],
+        coarse_dtype="float32", fine_dtype="float64", tile_workers=8,
+    )
+    m8 = eight.mesh_bytes()
+    for k in fine:
+        assert m8[k] == 8 * one[k], f"{k} did not scale with tile_workers"
+    # and no COARSE term moves: the long arm is solved once, in the parent
+    for k, v in one.items():
+        if k not in fine:
+            assert m8[k] == v, f"{k} moved with the worker count and should not"
+    # the per-tile buffers are per worker too
+    assert (eight.step_bytes(eight.n_total, cap=1000)["tile_buffers"]
+            == 8 * _ec("c-gh").step_bytes(eight.n_total, cap=1000)["tile_buffers"])
+
+
+def test_the_tile_kernel_build_moves_into_the_loop_when_a_pool_runs_it():
+    """`kernel_build` is held apart from the in-step sum because it runs once
+    before the loop -- true of the PARENT. The workers build on their first
+    task, inside the tile loop, so leaving their build in `kernel_build` would
+    drop W builds out of the budget for the step the run keeps dying in."""
+    serial = _ec("c-gh").mesh_phase()
+    assert serial["tile_kernel_build_f64"] == "kernel_build"
+    pooled = EngineConfig(
+        box_size=PRESETS["c-gh"]["box"], n_part=PRESETS["c-gh"]["n_part"],
+        n_fine=PRESETS["c-gh"]["n_fine"], n_coarse=PRESETS["c-gh"]["n_coarse"],
+        n_tile=PRESETS["c-gh"]["tile"], b_fine=PRESETS["c-gh"]["buf"],
+        coarse_dtype="float32", fine_dtype="float64", tile_workers=8,
+    ).mesh_phase()
+    assert pooled["tile_kernel_build_f64"] == "tile_loop"
+    assert pooled["tile_kernel_pref"] == "tile_loop"
+    # and the coarse arm's phases are untouched by the worker count
+    assert pooled["coarse_kernels"] == serial["coarse_kernels"] == "coarse_solve"
+
+
+def test_the_worker_count_reaches_the_config_the_planner_prices(capsys):
+    """`--workers` fed only the shm table. It has to reach `EngineConfig`, or
+    the fine-arm terms are priced for one worker while the shm table is priced
+    for eight -- two halves of one report describing different runs, which is
+    the fault the whole module exists to prevent."""
+    main(["--preset", "c-gh", "--host-gb", "255.1", "--workers", "8",
+          "--cap", "5284492"])
+    eight = capsys.readouterr().out
+    main(["--preset", "c-gh", "--host-gb", "255.1", "--cap", "5284492"])
+    one = capsys.readouterr().out
+    def bound(o):
+        return float(o.split("a lower bound on the run's peak:")[1].split("GB")[0])
+
+    assert bound(eight) > bound(one) + 20.0, (
+        f"eight workers priced at {bound(eight):.1f} GB against one at "
+        f"{bound(one):.1f}; the fine arm is not scaling"
     )

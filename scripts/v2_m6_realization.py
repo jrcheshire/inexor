@@ -80,6 +80,55 @@ GEN_FDTYPE = np.float32
 K_STEPS = 40
 
 
+class _StreamingTracer(PhaseTracer):
+    """`PhaseTracer`, but every boundary is EMITTED when it happens.
+
+    923313 exists because nothing had taken a per-phase high-water at c-gh. It
+    took one and I never saw it, because the card is accumulated and printed
+    when the run finishes and the run was SIGKILLed in step 1 -- so the job
+    measured exactly the thing it was built to measure and left no record of it.
+    Both prior attempts had died mid-run; a report that only exists at the end
+    was never going to survive one.
+
+    So each boundary prints as it is crossed. A killed run leaves the phases it
+    reached, in order, with the reading that was live when it died -- which is
+    the line the next diagnosis starts from. `PYTHONUNBUFFERED` is set by the
+    sbatch, so a SIGKILL cannot strand these in a buffer either (922790 printed
+    nothing at all for exactly that reason).
+
+    `MemAvailable` rides along because `VmHWM` is the PARENT'S, and at C-gh the
+    parent is not where the pool's memory is. A phase whose parent peak is flat
+    while the node's available memory collapses is the workers, and those two
+    columns side by side are what distinguishes that from the parent growing.
+
+    Subclassed rather than edited in: `v2_m6_peak_trace.py` is a ratified probe
+    and D-v2-16 clause 7 gates promotion on those being unmodified.
+    """
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._step_no = 0
+
+    def __call__(self, name):
+        # the parent's reading FIRST, so the print cannot perturb what it reports
+        super().__call__(name)
+        if name == "coarse_paint":
+            self._step_no += 1
+        avail = ""
+        try:
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        avail = " avail %7.2f" % (int(line.split()[1]) * 1024 / 1e9)
+                        break
+        except OSError:
+            pass
+        if self.series:
+            _, hwm, own = self.series[-1]
+            print("  [phase] step %2d %-16s peak %7.2f  own %7.2f%s"
+                  % (self._step_no, name, hwm / 1e9, own / 1e9, avail), flush=True)
+
+
 def _require_linux_for_peaks():
     """Per-phase high-water needs procfs; there is no macOS equivalent.
 
@@ -362,7 +411,7 @@ def cmd_run(args):
         # without this the failure mode is "the job died after the expensive
         # part, on the instrument".
         _require_linux_for_peaks()
-        ph = PhaseTracer(trim="off")
+        ph = _StreamingTracer(trim="off")
     else:
         ph = PhaseTimer()
     stats = []

@@ -146,10 +146,14 @@ def build(args):
     from .codec import T9Layout
     from .engine import EngineConfig
 
+    # `--workers` reaches the ENGINE CONFIG, not just the shm table. Every fine-arm
+    # term is per worker and this was pricing one of each, which is how the tile
+    # loop read 1.4 GB in the budget for the phase that killed 923313.
     ec = EngineConfig(
         box_size=args.box, n_part=args.n_part, n_fine=args.n_fine,
         n_coarse=args.n_coarse, n_tile=args.tile, b_fine=args.buf,
         coarse_dtype=args.coarse_dtype, fine_dtype=args.fine_dtype,
+        tile_workers=max(int(args.workers), 1) if args.workers else 1,
     )
     t9 = T9Layout(box_size=args.box, n_part=args.n_part, bucket_cells=args.bucket_cells)
     return ec, t9
@@ -263,8 +267,11 @@ def main(argv=None):
     # The split is `engine.MESH_PHASE`'s, not this module's: a term's phase is a
     # property of the code that allocates it, so the accounting and the engine
     # cannot drift apart the way they did over `coarse_dtype`.
-    from .engine import MESH_PHASE, STEP_PHASE
+    from .engine import STEP_PHASE
 
+    # `ec.mesh_phase()`, not the module dict: in pool mode the tile kernel build
+    # moves INTO the tile loop, because the workers do it and the parent does not
+    MESH_PHASE = ec.mesh_phase()
     resident = {k: v for k, v in mesh.items() if MESH_PHASE[k] == "resident"}
     transient = {k: v for k, v in mesh.items() if k not in resident}
     _table("MESH, resident through the tile loop", resident)
