@@ -1325,3 +1325,50 @@ ratifying it did not measure it.
   measured 0.83-1.75 GB/s, not demonstrated); C-hero; f32-path invariance
   beyond unit scale; the engine's end-to-end peak (M-v2-4's open item,
   unchanged).
+
+## D-v2-24 -- M-v2-6's exit gate, written down where decisions live
+
+- **Status:** accepted in session (JC, 2026-08-11), written down here
+  2026-08-20 when `docs/m-v2-6-plan.md` was retired and this was the only
+  content in it that lived nowhere else. Clauses 1 and 3 are JC's calls from
+  that session; clauses 2 and 4 restate D-v2-8 clause 8 and D-v2-11 rather
+  than deciding anything new. Amends no ratified decision: it supplies the
+  reading of D-v2-18's M-v2-6 row, which carries no clause of its own.
+- **Record:** `runs/v2/m6_peak_record.md` (Stages 0/0b);
+  `runs/v2/m6_capacity_record.md` is owed at close.
+- **Decision:**
+  1. **The exit gate is not the charter row's literal words.** D-v2-18's row
+     (`decisions.md:942`) reads "a complete 2048^3 mock on one Vista gh node"
+     in full -- no clause, no bar, no definition of "complete" or "mock". It is
+     the fourth milestone running whose written criterion could not be read
+     literally. Ratified reading:
+     - **Product = dark matter only, persisted.** ICs -> K steps -> the evolved
+       state written to disk -> a large-scale P(k) computed without ever
+       building a full-size array. Halos, bias, HMF, b1 and the disco-mocks
+       read-back stay in M-v2-7 (`decisions.md:943`), which a literal reading
+       of "complete mock" would swallow.
+     - **Not presumed to be a `gh` node.** The charter row names one; the
+       machine is a verdict from measurement, not an inheritance from the row.
+     - **The capacity statement is completion + memory + wall + SU.** Accuracy
+       is the streaming parity number, reported beside it and never folded into
+       the capacity claim.
+  2. **Reporting is D-v2-8 clause 8's triple**: peak B/p, wall per step, and
+     node-hours + SU per realization.
+  3. **Run count (JC, 2026-08-11): three realizations if one costs under 5 h,
+     plus one run at a second (T,b) = T512/b32. Four runs maximum, and
+     deliberately not a matrix.** The second point discharges D-v2-16 clause
+     4's "PROVISIONAL until measured at C-gh"; accuracy is not its question
+     (evolved dP/P is measured P-independent, T128 = T256 = T512 = 1.896e-2 at
+     cgh64). **K is not a ratified config parameter** and is pinned in a run's
+     pre-registration rather than inherited silently.
+  4. **M-v2-6's output is explicitly NOT a production mock**, and the
+     obligation carries forward to M-v2-7: the D-v2-11 transfer correction is a
+     required production step and lives only in
+     `scripts/v2_g6b_calib_transport.py`, never in the package.
+- **Retires `docs/m-v2-6-plan.md`** (deleted 2026-08-20). It had become a
+  record rather than a plan: 674 lines over 7 commits in 5 days, 68% status and
+  completed-work writeups that `~/notes/threads/spherex/inexor.md` and
+  `runs/v2/` already own, plus a memory-arithmetic section superseded by
+  `python -m inexor.plan`, which computes those numbers on demand and cannot go
+  stale. Its transcription did, twice. Clauses 1-4 are the only content that
+  was neither duplicated nor computable. Nothing in the repo referenced it.
