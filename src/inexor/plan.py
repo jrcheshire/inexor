@@ -154,6 +154,8 @@ def build(args):
         n_coarse=args.n_coarse, n_tile=args.tile, b_fine=args.buf,
         coarse_dtype=args.coarse_dtype, fine_dtype=args.fine_dtype,
         tile_workers=max(int(args.workers), 1) if args.workers else 1,
+        eject_kernel=args.eject_kernel,
+        migrate_eject_inflight=args.eject_inflight,
     )
     t9 = T9Layout(box_size=args.box, n_part=args.n_part, bucket_cells=args.bucket_cells)
     return ec, t9
@@ -214,6 +216,18 @@ def main(argv=None):
     ap.add_argument("--workers", type=int, default=None,
                     help="tile_workers. >1 (or unset) means the pooled lane: the "
                          "loader writes into shared memory and the state exists once")
+    ap.add_argument("--eject-kernel", default="jax", choices=("numpy", "jax"),
+                    help="which eject the migrate runs. MEASURED at 129 B per "
+                         "slab-row for jax against 35 for numpy, and the pooled "
+                         "path holds one slab PER WORKER -- so at c-gh W=8 this "
+                         "is the difference between 69 GB and 19. Both kernels "
+                         "are bitwise (record 5s); numpy ejects 1.6-1.9x slower")
+    ap.add_argument("--eject-inflight", type=int, default=None,
+                    help="cap on EJECTS running at once, separately from "
+                         "--workers. An eject is 129 B per slab-row (jax) and "
+                         "an insert 50, both measured, so bounding this trades "
+                         "migrate memory for migrate wall while the tile loop "
+                         "keeps its worker count")
     ap.add_argument("--slabs", type=int, default=128,
                     help="T9 slab files the ICs were written as (c-gh: 128)")
     ap.add_argument("--disk-gb", type=float, default=None, help="scratch budget for IC staging")

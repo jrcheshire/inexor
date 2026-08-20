@@ -894,3 +894,14 @@ def test_stop_at_refuses_to_discard_a_segments_work(tmp_path):
         engine.run(st, cfg_c, co, stop_at=3)
     with pytest.raises(ValueError, match="advance nothing"):
         engine.run(st, cfg_c, co, stop_at=0)
+
+
+def test_eject_inflight_refuses_zero():
+    """At zero no eject can launch and the dispatch loop blocks forever, so
+    this has to refuse rather than hang a cluster job for its whole wall."""
+    import pytest as _pytest
+
+    from inexor.state import drift_and_migrate_pooled
+
+    with _pytest.raises(ValueError, match="eject_inflight must be >= 1"):
+        drift_and_migrate_pooled(None, 0.0, None, eject_inflight=0)

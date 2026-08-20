@@ -164,6 +164,7 @@ class EngineConfig:
         brick_slack=0.10,
         repack_every=1,
         eject_kernel="jax",
+        migrate_eject_inflight=None,
         coarse_dtype="float64",
         fine_dtype="float64",
         cap_rungs=CAP_RUNGS_PER_OCTAVE,
@@ -198,6 +199,8 @@ class EngineConfig:
         self.brick_slack = float(brick_slack)
         self.repack_every = int(repack_every)
         self.eject_kernel = str(eject_kernel)
+        self.migrate_eject_inflight = (
+            None if migrate_eject_inflight is None else int(migrate_eject_inflight))
         # M-v2-4. TWO knobs, defaulting independently, deliberately NOT coupled:
         # the coarse mesh is the gated arm (it grows with the box and is the
         # binding resident term at hero scale) and the fine tile mesh is
@@ -416,6 +419,64 @@ class EngineConfig:
             tile_workspace=w * (pcells * (fw + 4 + 3 * fw) + phalf * 2 * fw),
         )
 
+    # Eject output, MEASURED per row of the slab a worker is handed, numpy
+    # domain and flat over an 8x change in slab rows (cdev8 / cdev):
+    #
+    #     numpy kernel   36.20 / 34.81 B/row
+    #     jax kernel    142.77 / 129.35 B/row
+    #
+    # The jax arm's figure is its NUMPY allocations; its device buffers are
+    # invisible to tracemalloc and sit on top, so both are floors and the jax
+    # one is the looser of the two. Both kernels are bitwise (record 5s, and
+    # re-confirmed alongside these numbers), so the 3.7x is a pure memory/wall
+    # trade with no correctness content: numpy ejects measured 1.6-1.9x slower
+    # on arm64 CPU.
+    EJECT_BYTES_PER_ROW = {"numpy": 35.0, "jax": 129.0}
+
+    # An insert's own buffers, MEASURED the same way and flat to 0.1% over the
+    # same 8x: 50.28 / 50.25 B/row. Its INPUTS are free -- it reads slices of
+    # the shm scratch, which are views -- so this is the O(brick) working set
+    # alone, and it is why bounding ejects does not bound the pass on its own.
+    INSERT_BYTES_PER_ROW = 50.25
+
+    # The SERIAL pass's whole-phase coefficient, measured as `migrate`'s own
+    # increment at cdev8 and cdev (181.7 and 198.9 B per slab-particle). It
+    # covers eject AND insert and the 2r+1 slabs the serial schedule stages.
+    SERIAL_MIGRATE_BYTES_PER_ROW = 190.0
+
+    def _migrate_b_per_row(self):
+        """Bytes per slab-row the migrate holds, for THIS execution policy.
+
+        **The pooled path holds one slab per WORKER and the serial one holds
+        2r+1 in total**, and the model had no worker count in it at all -- it
+        carried the serial coefficient whatever was running. At c-gh that priced
+        a pass at 12.75 GB which measured over 91: eight jax ejects of a 67M-row
+        slab are 69 GB between them, and Vista 923341 died there, in the LEAD
+        DRIFT, before reaching a single step.
+
+        The insert side is NOT separately measured and is not added here. This
+        is therefore a floor, and it is a floor built from the eject alone.
+        """
+        if self.tile_workers <= 1 or self.migrate_pooled is False:
+            return self.SERIAL_MIGRATE_BYTES_PER_ROW
+        per_row = self.EJECT_BYTES_PER_ROW.get(self.eject_kernel)
+        if per_row is None:
+            raise ValueError(
+                f"no measured eject coefficient for kernel {self.eject_kernel!r}; "
+                f"known: {sorted(self.EJECT_BYTES_PER_ROW)}. A budget that guesses "
+                "one would be indistinguishable from a budget that measured it."
+            )
+        w = self.tile_workers
+        # WORST CASE, and the worst case is the point of a ceiling: every worker
+        # not held back from an eject is assumed to be running one. With the
+        # bound in place the rest can only be inserts, which are 2.6x cheaper
+        # but not free -- so a bound of E over W workers is E ejects PLUS W-E
+        # inserts, never E alone. Modelling it as E alone is how a knob comes to
+        # look like it solved a problem it only moved.
+        e = w if self.migrate_eject_inflight is None else min(
+            self.migrate_eject_inflight, w)
+        return per_row * e + self.INSERT_BYTES_PER_ROW * max(w - e, 0)
+
     def mesh_phase(self):
         """`MESH_PHASE`, adjusted for how THIS config actually runs.
 
@@ -516,7 +577,7 @@ class EngineConfig:
             # only holds while n_buckets and n_rows keep their ratio, which they
             # do up the config table.
             repack_scratch=int(round(rows * 2.1)),
-            migrate_staging=int(round(190.0 * n / nb)),
+            migrate_staging=int(round(self._migrate_b_per_row() * n / nb)),
         )
         if cap is not None:
             # per WORKER: each holds one tile's buffers at once
@@ -1265,7 +1326,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
 
     if pool is not None and cfg.migrate_pooled is not False:
         stats = drift_and_migrate_pooled(
-            st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window
+            st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window,
+            eject_inflight=cfg.migrate_eject_inflight,
         )
     else:
         stats = drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel)

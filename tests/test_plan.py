@@ -556,3 +556,114 @@ def test_the_worker_count_reaches_the_config_the_planner_prices(capsys):
         f"eight workers priced at {bound(eight):.1f} GB against one at "
         f"{bound(one):.1f}; the fine arm is not scaling"
     )
+
+
+def test_the_pooled_migrate_holds_one_slab_per_worker():
+    """The term that killed four jobs, and it was in the model as a constant.
+
+    `drift_and_migrate_pooled` hands each worker a whole slab and
+    `_eject_slab` returns keep/emig for all of it, so W slabs are live at once.
+    The model carried 190 B per slab-row whatever was running -- a coefficient
+    measured as the SERIAL pass's own increment, where the schedule stages
+    2r+1 = 3 slabs in total. At c-gh that priced a pass at 12.75 GB which
+    measured over 91, and Vista 923341 died in it, in the LEAD DRIFT, before
+    reaching a single step.
+
+    The per-row figures are measured (numpy domain, flat over an 8x change in
+    slab rows at cdev8/cdev) and the two kernels are bitwise, so the 3.7x
+    between them is a pure memory/wall trade.
+    """
+    g = PRESETS["c-gh"]
+    kw = dict(box_size=g["box"], n_part=g["n_part"], n_fine=g["n_fine"],
+              n_coarse=g["n_coarse"], n_tile=g["tile"], b_fine=g["buf"],
+              coarse_dtype="float32", fine_dtype="float64")
+    serial = EngineConfig(**kw)
+    pooled = EngineConfig(**kw, tile_workers=8, eject_kernel="jax")
+    lean = EngineConfig(**kw, tile_workers=8, eject_kernel="numpy")
+    n = serial.n_total
+
+    s = serial.step_bytes(n)["migrate_staging"]
+    p = pooled.step_bytes(n)["migrate_staging"]
+    m = lean.step_bytes(n)["migrate_staging"]
+
+    # the serial arm keeps the coefficient it was measured with
+    assert s / GB_ == pytest.approx(12.75, abs=0.2)
+    # the pooled arm scales with W, and at the production kernel it is the
+    # largest single per-step term at c-gh by a factor of three
+    assert p / GB_ == pytest.approx(69.3, abs=1.0)
+    assert p > 3 * EngineConfig(**kw, tile_workers=8).step_bytes(n)["repack_scratch"]
+    # and the kernel choice is worth ~50 GB
+    assert (p - m) / GB_ == pytest.approx(50.5, abs=1.5)
+    # linear in W, because each worker holds one slab
+    four = EngineConfig(**kw, tile_workers=4, eject_kernel="jax")
+    assert 2 * four.step_bytes(n)["migrate_staging"] == p
+
+
+def test_an_unmeasured_eject_kernel_is_refused_not_guessed():
+    """A budget that invents a coefficient is indistinguishable from one that
+    measured it, which is the fault this whole module exists against."""
+    g = PRESETS["cdev"]
+    ec = EngineConfig(
+        box_size=g["box"], n_part=g["n_part"], n_fine=g["n_fine"],
+        n_coarse=g["n_coarse"], n_tile=g["tile"], b_fine=g["buf"],
+        coarse_dtype="float32", fine_dtype="float64",
+        tile_workers=4, eject_kernel="numpy",
+    )
+    ec.eject_kernel = "something_new"
+    with pytest.raises(ValueError, match="no measured eject coefficient"):
+        ec.step_bytes(ec.n_total)
+
+
+def test_c_gh_does_not_fit_a_gg_node_at_the_knobs_that_have_been_failing(capsys):
+    """Four jobs said so; now the arithmetic does too.
+
+    Pinned because the whole value of this module is that it refuses BEFORE a
+    node is spent, and for the last four submissions it did the opposite -- it
+    said FITS at 0.75x for a run that OOM-killed. If this ever flips back to
+    FITS without a term being genuinely removed, something has been quietly
+    dropped from the budget again.
+    """
+    # the pilot's own knobs: W=8, arena_frac 0.10, jax eject
+    main(["--preset", "c-gh", "--host-gb", "255.1", "--workers", "8",
+          "--cap", "5284492", "--eject-kernel", "jax", "--arena-frac", "0.10"])
+    out = capsys.readouterr().out
+    assert "DOES NOT FIT" in out
+    est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
+    assert est == pytest.approx(299.9, abs=2.0)
+
+
+def test_bounding_ejects_charges_the_inserts_that_replace_them():
+    """A bound that only counted what it held back would flatter itself.
+
+    Measured, per row of the slab a task is handed: an eject is 129 B on the
+    jax kernel and 35 on numpy, an insert 50. So a worker prevented from
+    ejecting does not go idle -- it inserts -- and E ejects over W workers is
+    E ejects PLUS W-E inserts. The consequence is worth pinning because it is
+    counterintuitive: with the NUMPY eject the bound makes the pass BIGGER,
+    since an insert costs more than the eject it displaces.
+    """
+    g = PRESETS["c-gh"]
+    kw = dict(box_size=g["box"], n_part=g["n_part"], n_fine=g["n_fine"],
+              n_coarse=g["n_coarse"], n_tile=g["tile"], b_fine=g["buf"],
+              coarse_dtype="float32", fine_dtype="float64", tile_workers=8)
+    n = EngineConfig(**kw).n_total
+
+    def mig(**extra):
+        return EngineConfig(**kw, **extra).step_bytes(n)["migrate_staging"]
+
+    jax_free = mig(eject_kernel="jax")
+    jax_cap2 = mig(eject_kernel="jax", migrate_eject_inflight=2)
+    np_free = mig(eject_kernel="numpy")
+    np_cap2 = mig(eject_kernel="numpy", migrate_eject_inflight=2)
+
+    assert jax_cap2 < jax_free, "bounding the expensive side must help"
+    assert np_cap2 > np_free, (
+        "an insert is dearer than a numpy eject, so the bound must READ as a "
+        "cost here -- a model showing a saving would be counting only what it "
+        "held back"
+    )
+    # a bound at or above W is the unbounded case exactly
+    assert mig(eject_kernel="jax", migrate_eject_inflight=8) == jax_free
+    assert mig(eject_kernel="jax", migrate_eject_inflight=99) == jax_free
+    # and the cheapest arrangement of the four is the plain numpy eject
+    assert np_free == min(jax_free, jax_cap2, np_free, np_cap2)

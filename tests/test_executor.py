@@ -729,3 +729,48 @@ def test_engine_run_carries_the_allocator_all_the_way_to_the_pool(tmp_path):
         assert held_after_load >= state_bytes * 0.99
     finally:
         alloc.close()
+
+
+def test_bounding_ejects_in_flight_is_bitwise_the_unbounded_pass():
+    """The knob may cost wall; it may not change an answer.
+
+    `eject_inflight` only decides WHEN a slab's eject is dispatched. The pass's
+    arena interleave and bookkeeping run in the parent's serial replay at fixed
+    schedule points regardless, so dispatch order cannot reach the result --
+    which is the same argument that licenses the pooled migrate at all, and it
+    is worth a gate rather than an appeal to it. Includes the floor value 1,
+    where only one eject is ever outstanding.
+    """
+    import jax
+
+    from inexor.executor import TilePool
+    from inexor.plan import engine_config
+    from inexor.state import SlotState, drift_and_migrate_pooled
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        n_side, box = 32, 32.0
+        rng = np.random.default_rng(5)
+        x = rng.random((n_side**3, 3)) * box
+        v = rng.standard_normal((n_side**3, 3)) * 2.0
+        t9 = T9Layout(box_size=box, n_part=n_side, bucket_cells=2)
+        ec = engine_config("smoke", tile_workers=2)
+        nb = 64 // ec.n_brick if 64 // ec.n_brick else 8
+
+        out = {}
+        for cap in (None, 2, 1):
+            st = SlotState.build(x, v, t9, nb, brick_slack=0.2,
+                                 alloc_margin=0.1, arena_frac=0.10)
+            pool = TilePool(st, ec)
+            try:
+                drift_and_migrate_pooled(st, 0.02, pool, kernel="jax",
+                                         eject_inflight=cap)
+                out[cap] = (np.asarray(st.off).copy(), np.asarray(st.w).copy())
+            finally:
+                pool.close()
+        for cap in (2, 1):
+            assert np.array_equal(out[None][0], out[cap][0]), f"off differs at {cap}"
+            assert np.array_equal(out[None][1], out[cap][1]), f"w differs at {cap}"
+    finally:
+        jax.config.update("jax_enable_x64", prev)

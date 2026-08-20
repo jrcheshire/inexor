@@ -561,7 +561,8 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy"):
                 brick_reach_realized=realized_reach, peak_staged_slabs=peak_staged)
 
 
-def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None, max_staged_slabs=None):
+def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
+                             max_staged_slabs=None, eject_inflight=None):
     """`drift_and_migrate` on the worker pool, BITWISE the serial pass.
 
     The division of labour the C13 census licenses: workers eject and insert
@@ -596,7 +597,34 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None, max
     holds 2r+2 more, below which the dispatch loop cannot free a slot and
     would deadlock; the default adds the worker count so the pipeline can
     actually feed W workers.
+
+    `eject_inflight` bounds how many EJECTS may be running at once, separately
+    from the worker count. It exists because the two sides of this pass are not
+    the same size, measured per row of the slab a task is handed:
+
+        eject, jax kernel     129 B/row      eject, numpy kernel   35 B/row
+        insert                 50 B/row
+
+    An eject materializes its whole slab's keep/emig privately and then copies
+    it into the scratch slot; an insert reads scratch SLICES, which are views,
+    so its inputs are free and only its own O(brick) buffers cost anything.
+    With W workers and no bound, the worst case is W ejects at once -- 69 GB at
+    c-gh W=8 on the jax kernel, which is where Vista 923341 died, in the lead
+    drift, before reaching a single step.
+
+    Bounding ejects lets the tile loop keep a worker count that pays there (C5
+    measured 65-75% efficiency at W=8) while the migrate runs a few slabs in
+    flight. It cannot deadlock at any value >= 1: the loop only blocks in
+    `next_migrate_result`, and it reaches that with at least one task
+    outstanding whenever work remains -- if no eject may launch, either an
+    eject or an insert is already running, since a slab's slot is freed only by
+    an insert that must itself have been dispatched.
     """
+    if eject_inflight is not None and int(eject_inflight) < 1:
+        raise ValueError(
+            f"eject_inflight must be >= 1, got {eject_inflight}: at zero no "
+            "eject can ever launch and the dispatch loop blocks forever"
+        )
     nb = st.bricks_per_side
     p3 = st.buckets_per_brick
     n_before = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
@@ -636,6 +664,8 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None, max
     # launch into a free slot, and a slab's slot frees once every destination
     # its emig can feed has been inserted -- the serial release condition.
     free_slots = list(range(K))
+    e_cap = nb if eject_inflight is None else min(int(eject_inflight), nb)
+    e_inflight = 0
     slot_of = {}
     ejected = {}  # s -> (slot, n_keep, n_emig)
     rr_by_slab = {}
@@ -645,13 +675,15 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None, max
     eject_jax_calls = 0
     next_eject = 0
     while len(insert_res) < nb:
-        while next_eject < nb and free_slots:
+        while next_eject < nb and free_slots and e_inflight < e_cap:
             slot = free_slots.pop()
             slot_of[next_eject] = slot
             pool.submit_eject(next_eject, slot)
+            e_inflight += 1
             next_eject += 1
         res = pool.next_migrate_result()
         if res["kind"] == "eject":
+            e_inflight -= 1
             s = res["s"]
             ejected[s] = (res["slot"], res["n_keep"], res["n_emig"])
             rr_by_slab[s] = int(res["realized_reach"])
