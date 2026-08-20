@@ -855,3 +855,68 @@ def test_an_overlapping_slice_assignment_copies_before_it_writes():
             f"numpy did not copy before writing an overlapping range ({tag}); "
             "`repack`'s block moves must go back to an explicit .copy()"
         )
+
+
+def test_repack_still_refuses_a_brick_that_outgrows_the_index_dtype():
+    """The overflow refusal moved; it did not go away.
+
+    `repack` used to narrow its output through `layout._to_index` at the end.
+    It now builds that output at the index dtype directly -- which is where the
+    per-bucket int64 arrays went -- and the refusal is pulled forward onto the
+    per-BRICK totals, which bounds every bucket in a brick. That is strictly
+    stronger, but it is a different line of code, so it needs its own gate:
+    narrowing bare in `migrate` and `repack` is precisely the defect
+    `_to_index`'s docstring records being fixed, and numpy narrows MODULARLY --
+    an ungated overflow would not raise, it would shift the derived span of
+    every later bucket in the brick and very likely pass `check()`, which
+    samples three bricks.
+    """
+    n_side, box = 16, 16.0
+    rng = np.random.default_rng(4)
+    x = rng.random((n_side**3, 3)) * box
+    v = rng.standard_normal((n_side**3, 3)) * 0.1
+    t9 = T9Layout(box_size=box, n_part=n_side, bucket_cells=2)
+    st = state.SlotState.build(x, v, t9, 4, brick_slack=0.2, alloc_margin=0.5,
+                               arena_frac=0.05, index_dtype=np.uint16)
+    p3 = st.buckets_per_brick
+    st.occupancy[0:p3] = 0
+    st.occupancy[0] = np.iinfo(np.uint16).max
+    st.occupancy[1] = np.iinfo(np.uint16).max
+    with pytest.raises(ValueError, match="index ceiling"):
+        st.repack(brick_slack=0.2)
+
+
+def test_repack_is_unchanged_by_the_per_brick_census_rewrite():
+    """The census rewrite is an integer identity and has to behave like one.
+
+    `sum_over_buckets_in_brick(occupancy + arena_per_bucket)` equals
+    `run_counts + arena_per_BRICK`, so counting per brick rather than
+    materializing two n_buckets int64 arrays cannot move a row. Driven from a
+    state that actually HAS arena residents, because the arena term is the half
+    of the identity that is easy to get wrong and an empty arena would make
+    this gate vacuous.
+    """
+    # CLUSTERED, and with no per-brick spare: uniform positions spill nothing,
+    # so the obvious version of this gate would run with an empty arena and
+    # exercise none of the term it exists to check
+    n_side, box = 32, 32.0
+    rng = np.random.default_rng(9)
+    x = (rng.standard_normal((n_side**3, 3)) * 4.0 + box / 2) % box
+    v = rng.standard_normal((n_side**3, 3)) * 10.0
+    t9 = T9Layout(box_size=box, n_part=n_side, bucket_cells=2)
+    st = state.SlotState.build(x, v, t9, 4, brick_slack=0.0, alloc_margin=0.6,
+                               arena_frac=0.20)
+    state.drift_and_migrate(st, 0.3, kernel="numpy")
+    assert st.arena_used > 0, "this gate needs arena residents to be meaningful"
+
+    before = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    n_before = len(np.concatenate(
+        [np.asarray(st.decode_brick(b)[0]) for b in range(st.n_bricks)]))
+    st.repack(brick_slack=0.05)
+    after = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    assert after == before, f"repack moved the census {before} -> {after}"
+    n_after = len(np.concatenate(
+        [np.asarray(st.decode_brick(b)[0]) for b in range(st.n_bricks)]))
+    assert n_after == n_before
+    assert st.occupancy.dtype == st.index_dtype
+    st.check()

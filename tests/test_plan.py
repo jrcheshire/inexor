@@ -225,12 +225,12 @@ def test_c_gh_now_fits_a_cpu_only_node_with_margin(capsys):
     `gg` node. Deleting `kick_pending` (274.9 GB) and rewriting the repack in
     place (115.4 -> 21.8) brought it to 164.6.
 
-    It reads 197.2 now and that is a CORRECTION, not a regression. 164.6 came
-    from charging the single largest transient and summing the per-step host
-    terms; this charges every phase inside a step, which is the model that
-    would have refused the run that OOM-killed. The engine change went the other
-    way at the same time -- hoisting the coarse kernel build took 23.7 GB off
-    the solve -- so the number would be worse still without it.
+    It reads 180.5 now, and the path there ran in both directions. Charging
+    every phase inside a step rather than the single largest transient PUSHED
+    it up (that is the model which would have refused the run that OOM-killed);
+    hoisting the coarse kernel build and rewriting the repack census pulled it
+    back down by more. Neither move was for the number -- one is an accounting
+    correction and the other removes real allocations.
 
     Pinned because the margin is what makes a capacity run proposable at all,
     and it is now thin: still a LOWER BOUND, one measured to read ~1.9x low at
@@ -239,7 +239,7 @@ def test_c_gh_now_fits_a_cpu_only_node_with_margin(capsys):
     out = capsys.readouterr().out
     assert "FITS" in out and "DOES NOT FIT" not in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    assert est == pytest.approx(197.2, abs=1.0)
+    assert est == pytest.approx(180.5, abs=1.0)
     assert est < 237.0, "the bound no longer fits the node it was sized for"
 
 
@@ -277,20 +277,20 @@ def test_an_absent_cap_names_the_omission_instead_of_dropping_it(capsys):
 
 
 def test_the_estimate_is_a_lower_bound_and_says_so(capsys):
-    """Still a floor, and still known-soft: 3.396 GB against job 446's measured
-    7.461 at cdev, so 2.20x low where it has been checked. The ladder is
-    3.783 -> 3.305 -> 3.396: the M-v2-6 terms and then the phase model move it
-    in both directions and neither is claimed to close the gap, which is why
-    the wording stays. What the phase model DID fix is the shape of the error
+    """Still a floor, and still known-soft: 3.363 GB against job 446's measured
+    7.461 at cdev, so 2.22x low where it has been checked. The ladder is
+    3.783 -> 3.305 -> 3.396 -> 3.363: the M-v2-6 terms, the phase model and the
+    repack census move it in both directions and none is claimed to close the
+    gap, which is why the wording stays. What the phase model DID fix is the shape of the error
     at C-gh, where the old form under-charged the coarse solve by 3x."""
     main(["--preset", "cdev", "--host-gb", "124", "--cap", "5284492"])
     out = capsys.readouterr().out
     assert "LOWER BOUND" in out and "not a measurement" in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
     # 3.445 (derived 9 B/row) -> 3.488 (measured 11.1, out of place) -> 3.305
-    # (measured 2.1, in place) -> 3.396 (phases summed within a step).
-    # scripts/v2_m6_repack_bytes.py.
-    assert est == pytest.approx(3.396, abs=0.01)
+    # (measured 2.1, in place) -> 3.396 (phases summed within a step) -> 3.363
+    # (measured 0.49, per-brick census). scripts/v2_m6_repack_bytes.py.
+    assert est == pytest.approx(3.363, abs=0.01)
     assert est < 7.461, "the bound must sit under the measured peak it bounds"
 
 
@@ -328,11 +328,16 @@ def test_a_preset_buffer_is_not_shadowed_by_the_flag_default(capsys):
 def test_the_repack_scratch_coefficient_is_the_measured_one_not_the_payload_width():
     """9 B/row is what `off` and `w` come to; 11.1 is what the function costs.
 
-    The gap is two int64 occupancy arrays over `n_buckets` plus the sort, and it
-    was invisible for as long as the term was derived from the payload width
-    alone. Measured flat to 2.6% over 64x in particle count -- 11.35 / 11.09 /
-    11.06 B/row at 262k / 2.1M / 16.8M particles -- which is what says it is a
-    coefficient and not a fixed cost being amortized.
+    The gap was per-bucket int64 arrays plus the sort, and it was invisible for
+    as long as the term was derived from the payload width alone. Measured flat
+    over 8x in particle count at every stage of the ladder, which is what says
+    it is a coefficient and not a fixed cost being amortized:
+
+        11.1 B/row   out of place
+         2.1         in place (M-v2-6)
+         0.49        once the per-bucket arrays came out -- `occupancy` cast to
+                     int64 twice, an n_buckets bincount for the arena, and an
+                     int64 output narrowed at the end
 
     Pinned because the derived figure is the intuitive one and would be an easy
     "simplification" to reintroduce.
@@ -341,8 +346,8 @@ def test_the_repack_scratch_coefficient_is_the_measured_one_not_the_payload_widt
     ec = _ec("c-gh")
     rows = int(np.ceil(np.ceil(n * 1.10) * 1.10))
     scratch = ec.step_bytes(n, n_rows=rows)["repack_scratch"]
-    # 9 derived -> 11.1 measured out of place -> 2.1 measured in place.
-    assert scratch / rows == pytest.approx(2.1, abs=0.05)
+    # 9 derived -> 11.1 out of place -> 2.1 in place -> 0.49 per-brick census.
+    assert scratch / rows == pytest.approx(0.49, abs=0.02)
     assert scratch < 30e9, "the in-place rewrite should put this well under a gh host"
     assert scratch / rows < 9.0, (
         "the coefficient is back at or above the payload width, so the repack is "
@@ -629,7 +634,7 @@ def test_c_gh_does_not_fit_a_gg_node_at_the_knobs_that_have_been_failing(capsys)
     out = capsys.readouterr().out
     assert "DOES NOT FIT" in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    assert est == pytest.approx(299.9, abs=2.0)
+    assert est == pytest.approx(283.2, abs=2.0)
 
 
 def test_bounding_ejects_charges_the_inserts_that_replace_them():

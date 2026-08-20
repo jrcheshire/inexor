@@ -571,12 +571,14 @@ class EngineConfig:
         nb = max(1, self.n_fine // self.n_brick)
         out = dict(
             kick_pending=0,
-            # 2.1 MEASURED, after the in-place rewrite (was 11.1 out of place).
-            # What remains is almost entirely the two int64 occupancy arrays,
-            # which are per-BUCKET rather than per-row -- so this coefficient
-            # only holds while n_buckets and n_rows keep their ratio, which they
-            # do up the config table.
-            repack_scratch=int(round(rows * 2.1)),
+            # 0.49 MEASURED (2.135/2.066 -> 0.490/0.490 at 2.1M and 16.8M
+            # particles, `scripts/v2_m6_repack_bytes.py`), after the per-bucket
+            # arrays came out: 11.1 out of place -> 2.1 in place -> 0.49 once
+            # `repack` stopped casting `occupancy` to int64 twice, stopped
+            # building an n_buckets bincount for the arena, and built its output
+            # at the index dtype. This coefficient only holds while n_buckets and
+            # n_rows keep their ratio, which they do up the config table.
+            repack_scratch=int(round(rows * 0.49)),
             migrate_staging=int(round(self._migrate_b_per_row() * n / nb)),
         )
         if cap is not None:

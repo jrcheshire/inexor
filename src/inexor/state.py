@@ -1699,7 +1699,14 @@ class SlotState:
         off = np.zeros_like(self.off)
         w = np.zeros_like(self.w)
         ids = None if self.ids is None else np.full_like(self.ids, -1)
-        new_occ = np.zeros(self.n_buckets, dtype=np.int64)
+        # AT THE INDEX DTYPE, not int64, which halves the last per-bucket array
+        # in this function (4.3 GB at c-gh). The overflow refusal that `_to_index`
+        # applied at the end is not dropped -- it is PULLED FORWARD and made
+        # strictly stronger, above, where `counts` is checked. A bucket's count
+        # cannot exceed its own brick's total, so a bound on the per-brick maximum
+        # bounds every bucket, and it does so BEFORE any value is written rather
+        # than after they have already wrapped.
+        new_occ = np.zeros(self.n_buckets, dtype=self.index_dtype)
         for b in range(self.n_bricks):
             slots = self.brick_member_slots(b)
             if not len(slots):
@@ -1797,13 +1804,50 @@ class SlotState:
         scratch figure is exactly what hid the 39.4 above.
         """
         p3 = self.buckets_per_brick
-        run_counts = np.asarray(self.occupancy, dtype=np.int64).reshape(self.n_bricks, p3)
-        run_counts = run_counts.sum(axis=1)
-        occ = self.occupancy.astype(np.int64)
+        # PER BRICK THROUGHOUT, never per bucket. Both of these used to
+        # materialize a full n_buckets int64 array -- `occupancy` is the index
+        # dtype, so each cast was a copy at 8 B/bucket -- and with arena
+        # residents present there were three of them live at once (the cast,
+        # the n_buckets bincount, and their sum). At c-gh that is 25.8 GB of a
+        # phase modelled at 21.8, in a run that has 255 GB for everything.
+        #
+        # Both rewrites are exact integer identities, not approximations:
+        #   `sum(axis=1, dtype=int64)` accumulates in int64 without first
+        #   casting the array, and
+        #   sum_over_buckets_in_brick(occupancy + arena_per_bucket)
+        #       == run_counts + arena_per_BRICK,
+        # because summing a bucket-wise sum over a brick's buckets is the same
+        # as summing the brick-wise counts. `arena_bucket // p3` is the brick a
+        # resident belongs to, so the second bincount is n_bricks long rather
+        # than n_buckets -- 2.1M against 1.07e9 at c-gh.
+        run_counts = self.occupancy.reshape(self.n_bricks, p3).sum(axis=1, dtype=np.int64)
         arena_live = np.nonzero(self.arena_bucket >= 0)[0]
+        counts = run_counts.copy()
         if len(arena_live):
-            occ = occ + np.bincount(self.arena_bucket[arena_live], minlength=self.n_buckets)
-        counts = occ.reshape(self.n_bricks, p3).sum(axis=1)
+            counts += np.bincount(self.arena_bucket[arena_live] // p3,
+                                  minlength=self.n_bricks)
+
+        # THE OVERFLOW REFUSAL, pulled forward from the narrowing at the end so
+        # that `new_occ` can be built at the index dtype. This is not the same
+        # check moved -- it is a stronger one: `_to_index` tested the realized
+        # per-BUCKET maximum after the fact, and this tests the per-BRICK total,
+        # which bounds every bucket in that brick. A brick whose whole row count
+        # fits the index dtype cannot contain a bucket that does not.
+        #
+        # It matters that this refuses rather than wraps. numpy narrows
+        # modularly, and `occupancy` IS the bucket-boundary prefix sum, so one
+        # wrapped bucket shifts the derived span of every later bucket in its
+        # brick; `check()` samples three bricks and would very likely pass.
+        # `layout._to_index` exists because `migrate` and `repack` once narrowed
+        # bare, and this keeps repack guarded while changing what it allocates.
+        _limit = int(np.iinfo(self.index_dtype).max)
+        _hot = int(counts.max()) if counts.size else 0
+        if _hot > _limit:
+            raise ValueError(
+                f"repacked brick holds {_hot} rows against the "
+                f"{np.dtype(self.index_dtype).name} index ceiling {_limit}: a "
+                "bucket in it cannot be stored. Widen index_dtype at build."
+            )
         spare = np.ceil(counts * float(brick_slack)).astype(np.int64)
         spare = np.where(counts > 0, np.maximum(spare, 1), spare)
         new_start = np.zeros(self.n_bricks + 1, dtype=np.int64)
@@ -1856,7 +1900,14 @@ class SlotState:
                 self.ids[dst : dst + m] = self.ids[src : src + m]
 
         # ---- pass B: expand rightward, merging the arena residents back in
-        new_occ = np.zeros(self.n_buckets, dtype=np.int64)
+        # AT THE INDEX DTYPE, not int64, which halves the last per-bucket array
+        # in this function (4.3 GB at c-gh). The overflow refusal that `_to_index`
+        # applied at the end is not dropped -- it is PULLED FORWARD and made
+        # strictly stronger, above, where `counts` is checked. A bucket's count
+        # cannot exceed its own brick's total, so a bound on the per-brick maximum
+        # bounds every bucket, and it does so BEFORE any value is written rather
+        # than after they have already wrapped.
+        new_occ = np.zeros(self.n_buckets, dtype=self.index_dtype)
         bucket_ids = np.arange(p3, dtype=np.int64)
         n_fast = n_merge = 0
         for b in range(self.n_bricks - 1, -1, -1):
@@ -1942,7 +1993,10 @@ class SlotState:
         # the narrowing. `arena_base` is a scalar and rides the per-step task
         # header instead.
         self.brick_start[...] = new_start
-        self.occupancy[...] = _to_index(new_occ, self.index_dtype, "repacked")
+        # already the index dtype and already bounded, so no second narrowing:
+        # routing it through `_to_index` again would allocate another full
+        # n_buckets array to return, which is the term this change removes
+        self.occupancy[...] = new_occ
         self.arena_base = n_alloc
         self.arena_bucket[:] = -1
         self._invalidate_arena_index()
