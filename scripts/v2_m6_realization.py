@@ -416,8 +416,12 @@ def cmd_run(args):
         ph = PhaseTimer()
     stats = []
     t0 = time.perf_counter()
+    # `epoch` costs nothing at run time and is what lets `python -m inexor.export`
+    # write km/s off a bare checkpoint directory, without a reader having to
+    # know this driver's a-grid and reproduce it by hand.
     out = engine.run(st, ec, co, phase=ph, resume=resume, stop_at=stop,
-                     collect=stats.append, allocator=allocator)
+                     collect=stats.append, allocator=allocator,
+                     epoch=(a_steps, cosmo))
     wall = time.perf_counter() - t0
     # `clear_refs` RESETS ru_maxrss ALONG WITH VmHWM -- both read the kernel's
     # one `mm->hiwater_rss` -- so after a traced run `_maxrss_bytes()` reports
@@ -538,8 +542,14 @@ def cmd_export(args):
             pass
     print(f"  wall {wall / 60:.1f} min | peak host {peak / 1e9:.1f} GB"
           + (f" | {tot / 1e9:.1f} GB written" if tot else ""))
-    print("  NOTE: velocities are the engine's D-time dx/dD unless the header "
-          "says otherwise; the epoch and cosmology above set the km/s factor.")
+    # Report the units this export ACTUALLY carries, off the returned header.
+    # The line here used to say "D-time unless the header says otherwise",
+    # which was true and useless: this leg always passes `a` and `cosmo`, so it
+    # always writes km/s, and a reader had to go open the header to learn it.
+    print(f"  velocities: {man['units']['velocity']} at a={a_out:.6g}, "
+          f"Omega_m={cosmo.Omega_m!r}, h={cosmo.h!r}"
+          + (f" (x{man['peculiar_velocity_factor']:.6g} on the engine's dx/dD)"
+             if not man["velocity_is_dtime"] else ""))
     _card("export", args, dict(step=step, a_out=a_out, out_dir=out_dir,
                                wall_s=wall, peak_rss_bytes=peak, manifest=man))
     return 0

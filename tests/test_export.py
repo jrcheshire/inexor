@@ -6,6 +6,7 @@ refusal surface plus the two claims the module makes in prose -- that chunking
 is invisible, and that the f32 default resolves the position quantum.
 """
 
+import dataclasses
 import json
 import os
 
@@ -216,3 +217,148 @@ def test_header_records_the_box_and_the_row_order(tmp_path):
     assert head["provenance"] == {"job": "test"}
     with open(os.path.join(d, export.HEADER)) as fh:
         assert json.load(fh) == head
+
+
+# ---------------------------------------------------------------------------
+# The CLI's units decision. km/s is the DEFAULT (a halo finder is the consumer),
+# which is only possible when the checkpoint records its own epoch.
+
+
+def _checkpoint(tmp_path, name, epoch=None, **prov):
+    """A T9 slab directory, with or without a recorded epoch."""
+    from inexor import icgen
+
+    d = str(tmp_path / name)
+    if epoch is not None:
+        a, cosmo = epoch
+        prov = dict(prov, a=float(a), cosmology=dataclasses.asdict(cosmo))
+    icgen.write_t9_slabs(_evolved_state(), d, provenance=prov)
+    return d
+
+
+def test_cli_defaults_to_km_per_second_off_a_recorded_epoch(tmp_path, capsys):
+    """The point of the whole change: no flags, and the file is km/s at the
+    epoch the checkpoint carries. Compared against the D-time file times the
+    factor, so the DEFAULT is pinned to a value and not merely to a label."""
+    ck = _checkpoint(tmp_path, "ck", epoch=(0.5, PLANCK))
+    out = str(tmp_path / "out")
+    assert export._main([ck, out]) == 0
+
+    head = json.load(open(os.path.join(out, "export.json")))
+    assert head["velocity_is_dtime"] is False
+    assert head["units"]["velocity"] == "km/s peculiar"
+    assert head["a"] == 0.5
+    assert head["peculiar_velocity_factor"] == export.peculiar_velocity_factor(0.5, PLANCK)
+    assert "checkpoint epoch" in head["provenance"]["epoch_source"]
+
+    ref = str(tmp_path / "ref")
+    export.write_particles(_evolved_state(), ref, a=0.5, cosmo=PLANCK)
+    _, _, v_cli, _ = export.load_particles(out, mmap=False)
+    _, _, v_ref, _ = export.load_particles(ref, mmap=False)
+    np.testing.assert_array_equal(v_cli, v_ref)
+
+
+def test_cli_falls_back_to_dtime_and_says_so_when_no_epoch_is_recorded(tmp_path, capsys):
+    """The pre-epoch artifacts -- the banked 2048^3 slabs among them -- carry no
+    epoch, and must still export. What is NOT allowed is doing it quietly: the
+    fallback names itself on stdout and in the header's provenance."""
+    ck = _checkpoint(tmp_path, "ck", kind="inexor-checkpoint", step=3)
+    out = str(tmp_path / "out")
+    assert export._main([ck, out]) == 0
+
+    head = json.load(open(os.path.join(out, "export.json")))
+    assert head["velocity_is_dtime"] is True
+    assert head["a"] is None
+    assert "no epoch recorded" in head["provenance"]["epoch_source"]
+    assert "no epoch recorded" in capsys.readouterr().out
+
+
+def test_cli_flags_override_the_recorded_epoch(tmp_path):
+    """`--a` wins over a recorded epoch, and the header records that it did --
+    otherwise two files from one checkpoint differ with nothing to say why.
+    `--d-time` is the other explicit exit."""
+    ck = _checkpoint(tmp_path, "ck", epoch=(0.5, PLANCK))
+
+    a_dir = str(tmp_path / "over")
+    export._main([ck, a_dir, "--a", "1.0"])
+    head = json.load(open(os.path.join(a_dir, "export.json")))
+    assert head["a"] == 1.0
+    assert "overriding the recorded a=0.5" in head["provenance"]["epoch_source"]
+
+    d_dir = str(tmp_path / "dtime")
+    export._main([ck, d_dir, "--d-time"])
+    head = json.load(open(os.path.join(d_dir, "export.json")))
+    assert head["velocity_is_dtime"] is True
+    assert head["provenance"]["epoch_source"] == "--d-time"
+
+
+def test_cli_refuses_epoch_flags_that_cannot_act(tmp_path):
+    """A flag that is silently ignored writes a header claiming a cosmology that
+    never entered the file. Both directions refuse instead."""
+    with_epoch = _checkpoint(tmp_path, "with", epoch=(0.5, PLANCK))
+    without = _checkpoint(tmp_path, "without")
+
+    with pytest.raises(SystemExit, match="nothing to act on"):
+        export._main([with_epoch, str(tmp_path / "o1"), "--d-time", "--a", "1.0"])
+    with pytest.raises(SystemExit, match="need an epoch"):
+        export._main([without, str(tmp_path / "o2"), "--omega-m", "0.3"])
+
+
+def test_cli_cosmology_override_rides_on_the_recorded_epoch(tmp_path):
+    """`--omega-m` alone means "this epoch, that cosmology", which is the shape
+    a reader wants when the recorded cosmology is not the one they want to
+    convert with. The un-overridden fields come from the checkpoint."""
+    ck = _checkpoint(tmp_path, "ck", epoch=(0.5, PLANCK))
+    out = str(tmp_path / "out")
+    export._main([ck, out, "--omega-m", "0.25"])
+
+    head = json.load(open(os.path.join(out, "export.json")))
+    want = export.peculiar_velocity_factor(
+        0.5, dataclasses.replace(PLANCK, Omega_m=0.25)
+    )
+    assert head["a"] == 0.5
+    assert head["peculiar_velocity_factor"] == want
+    assert want != export.peculiar_velocity_factor(0.5, PLANCK), "override did not apply"
+
+    # The epoch and the cosmology now come from DIFFERENT places, so both the
+    # header and the terminal have to say so; reporting only the epoch would
+    # leave a reader thinking the checkpoint's own cosmology was used.
+    src = head["provenance"]["epoch_source"]
+    assert "checkpoint epoch" in src and "Omega_m=0.25" in src, src
+    assert head["cosmology"]["Omega_m"] == 0.25
+    assert head["cosmology"]["h"] == PLANCK.h, "un-overridden fields must come from the file"
+
+
+def test_cli_announces_the_epoch_it_converted_at(tmp_path, capsys):
+    """`--omega-m`/`--h` work alone, which means the epoch and the cosmology can
+    come from different places. The terminal line has to name the epoch, the
+    cosmology and where each came from -- a velocity converted at a neighbouring
+    scale factor is off by tens of percent and looks entirely reasonable.
+
+    The header carries the same three things, since stdout does not survive."""
+    ck = _checkpoint(tmp_path, "ck", epoch=(0.5, PLANCK))
+    export._main([ck, str(tmp_path / "out"), "--omega-m", "0.25"])
+
+    line = [ln for ln in capsys.readouterr().out.splitlines() if "velocities:" in ln]
+    assert len(line) == 1, line
+    said = line[0]
+    assert "a=0.5" in said, said
+    assert "Omega_m=0.25" in said, said
+    assert "checkpoint epoch" in said, said
+    assert "cosmology overridden" in said, said
+
+
+def test_dtime_export_records_no_cosmology(tmp_path):
+    """The header's `a` / factor / cosmology travel together: all three present
+    on a km/s file, all three None on a D-time one. A half-filled set is how a
+    reader ends up converting with numbers that were never applied."""
+    st = _evolved_state()
+    d = str(tmp_path / "dtime")
+    head = export.write_particles(st, d)
+    assert head["a"] is None
+    assert head["peculiar_velocity_factor"] is None
+    assert head["cosmology"] is None
+
+    k = str(tmp_path / "kms")
+    head = export.write_particles(st, k, a=0.5, cosmo=PLANCK)
+    assert head["cosmology"] == dataclasses.asdict(PLANCK)

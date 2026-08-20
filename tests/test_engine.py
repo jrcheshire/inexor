@@ -905,3 +905,84 @@ def test_eject_inflight_refuses_zero():
 
     with _pytest.raises(ValueError, match="eject_inflight must be >= 1"):
         drift_and_migrate_pooled(None, 0.0, None, eject_inflight=0)
+
+
+def _epoch(k=6):
+    """The a-grid `_coeffs` is built from, paired with its cosmology."""
+    return a_grid(0.1, 1.0, k, "log"), Cosmology()
+
+
+def test_a_checkpoint_records_the_epoch_it_actually_sits_at(tmp_path):
+    """THE index gate for `epoch_record`, and the reason it is a test rather
+    than a reading: `a_grid` emits n_steps+1 points, `_write_checkpoint` is
+    called with the number of COMPLETED steps, and the two conventions have to
+    agree or every exported velocity is scaled at the wrong epoch -- silently,
+    since a neighbouring epoch's factor is a perfectly plausible number.
+
+    Checked at EVERY checkpoint, not just the last: an off-by-one that happens
+    to be right at the final step is the version of this bug that ships."""
+    import json
+
+    a_steps, cosmo = _epoch(6)
+    d = str(tmp_path / "ck")
+    cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=1)
+    engine.run(_ck_state(cfg_c), cfg_c, _coeffs(6), epoch=(a_steps, cosmo))
+
+    # gen0/gen1 roll, so after six steps they hold steps 5 and 6
+    seen = {}
+    for gen in ("gen0", "gen1"):
+        with open(os.path.join(d, gen, "manifest.json")) as fh:
+            prov = json.load(fh)["provenance"]
+        seen[int(prov["step"])] = prov
+    assert sorted(seen) == [5, 6]
+    for step, prov in seen.items():
+        assert prov["a"] == float(a_steps[step]), f"step {step} recorded the wrong epoch"
+        assert prov["cosmology"]["Omega_m"] == cosmo.Omega_m
+    # and the last one is the final epoch, which is the case a wrong convention
+    # can still get right by accident
+    assert seen[6]["a"] == 1.0
+
+
+def test_epoch_is_optional_and_absent_by_default(tmp_path):
+    """A run that passes no epoch writes the manifest it always wrote. This is
+    what keeps the banked 2048^3 slabs and every existing checkpoint loading:
+    the epoch is provenance, not schema."""
+    import json
+
+    d = str(tmp_path / "ck")
+    cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=1)
+    engine.run(_ck_state(cfg_c), cfg_c, _coeffs(2))
+
+    with open(os.path.join(d, "gen1", "manifest.json")) as fh:
+        man = json.load(fh)
+    assert man["schema"] == "t9-slabs-2"
+    assert "a" not in man["provenance"] and "cosmology" not in man["provenance"]
+
+
+def test_epoch_does_not_move_the_fingerprint_or_the_trajectory(tmp_path):
+    """Recording the epoch must be inert. The fingerprint already hashes
+    `coeffs`, so adding the epoch to it would invalidate every checkpoint on
+    disk to record nothing new -- and a resume across the two arms must work."""
+    co = _epoch(4)
+    d0, d1 = str(tmp_path / "a"), str(tmp_path / "b")
+    c0 = _cfg(checkpoint_dir=d0, checkpoint_every=4)
+    c1 = _cfg(checkpoint_dir=d1, checkpoint_every=4)
+    st0, st1 = _ck_state(c0), _ck_state(c1)
+    engine.run(st0, c0, _coeffs(4))
+    engine.run(st1, c1, _coeffs(4), epoch=co)
+
+    np.testing.assert_array_equal(_rows(st0), _rows(st1))
+    assert (engine.checkpoint_fingerprint(c0, _coeffs(4))
+            == engine.checkpoint_fingerprint(c1, _coeffs(4)))
+    # a checkpoint written WITH an epoch resumes under a config that has none
+    engine.load_checkpoint(d1, _cfg(), _coeffs(4), arena_frac=0.05)
+
+
+def test_a_mismatched_epoch_grid_refuses_before_the_first_step(tmp_path):
+    """`coeffs` is always the full schedule, so `len(a_steps) == len(coeffs)+1`
+    holds on every leg including a `stop_at` segment. Checked at call time: the
+    alternative is discovering it one step into a run that costs hours."""
+    d = str(tmp_path / "ck")
+    cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=1)
+    with pytest.raises(ValueError, match="epoch grid has"):
+        engine.run(_ck_state(cfg_c), cfg_c, _coeffs(6), epoch=_epoch(5))

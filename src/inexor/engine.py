@@ -45,6 +45,7 @@ global `(n,3)` f64 arrays that would otherwise appear are 206 GB each at C-gh,
 and deleting them is what makes that configuration runnable.
 """
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -1428,14 +1429,16 @@ def checkpoint_fingerprint(cfg, coeffs):
     return h.hexdigest()
 
 
-def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen):
+def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=None):
     """One generation of a rolling pair. Returns the directory, which is the
     receipt: a run that believed it was checkpointing and was not has `None`
-    on every step."""
+    on every step.
+
+    `epoch` is the optional `(a_steps, cosmo)` from `run`; see `epoch_record`
+    for what it writes and why it is not in the fingerprint."""
     from . import icgen
 
-    d = os.path.join(cfg.checkpoint_dir, f"gen{gen}")
-    icgen.write_t9_slabs(st, d, provenance=dict(
+    prov = dict(
         kind="inexor-checkpoint",
         step=int(step),
         n_steps=int(len(coeffs)),
@@ -1443,8 +1446,48 @@ def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen):
         pad_shape=int(pad_shape),
         n_arena=int(st.n_arena),
         fingerprint=checkpoint_fingerprint(cfg, coeffs),
-    ))
+    )
+    prov.update(epoch_record(epoch, step))
+    d = os.path.join(cfg.checkpoint_dir, f"gen{gen}")
+    icgen.write_t9_slabs(st, d, provenance=prov)
     return d
+
+
+def epoch_record(epoch, step):
+    """The `{a, cosmology}` a checkpoint carries so its units can be chosen later.
+
+    `epoch` is `(a_steps, cosmo)` -- the FULL `integrate.a_grid` output and the
+    cosmology it was built from -- or `None`, which writes nothing and leaves
+    the manifest exactly as it was before this existed.
+
+    **The index convention is the whole content of this function.** `a_steps`
+    has `n_steps + 1` entries, `a_steps[0]` is the initial epoch, and
+    `_write_checkpoint` is called with `step` = the number of COMPLETED steps.
+    So a checkpoint at `step` sits at `a_steps[step]`, which is the same
+    indexing the M-v2-6 driver's export leg does. It is pinned in
+    `tests/test_engine.py` rather than left to a reading of two call sites.
+
+    **Deliberately NOT in `checkpoint_fingerprint`.** The fingerprint already
+    hashes `coeffs` as bytes, so the cosmology and the a-grid are inside it;
+    this is the same information written down READABLY, for a consumer that has
+    only the directory. Adding it to `_FINGERPRINTED` would change every
+    fingerprint and invalidate every checkpoint on disk to record nothing new.
+
+    Nothing here is required for a resume, and a manifest without it loads and
+    resumes exactly as before -- which is why this is provenance rather than a
+    schema field, and why the banked 2048^3 slabs still load unchanged.
+    """
+    if epoch is None:
+        return {}
+    a_steps, cosmo = epoch
+    step = int(step)
+    if not 0 <= step < len(a_steps):
+        raise IndexError(
+            f"checkpoint at step {step} against an a-grid of {len(a_steps)} points "
+            f"({len(a_steps) - 1} steps): the schedule and the epoch grid disagree, and "
+            "recording the wrong epoch would silently mis-scale every exported velocity"
+        )
+    return dict(a=float(a_steps[step]), cosmology=dataclasses.asdict(cosmo))
 
 
 def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=0.10,
@@ -1506,7 +1549,7 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
     return st, dict(prov)
 
 def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
-        stop_at=None, allocator=None):
+        stop_at=None, allocator=None, epoch=None):
     """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`.
 
     `phase` is forwarded to `step`; see its docstring. The boundaries `run`
@@ -1529,6 +1572,15 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     Stopping somewhere a checkpoint was not written throws that segment's work
     away, and doing so silently is the failure this refuses: with checkpointing
     on, `stop_at` must land on a checkpoint boundary.
+
+    **`epoch` is `(a_steps, cosmo)` and only checkpoints read it.** The engine
+    has no cosmology of its own -- `EngineConfig` is geometry and policy, and
+    `coeffs` are growth-factor numbers with no scale factor left in them -- so
+    a caller that wants its checkpoints to know their own epoch passes the
+    `integrate.a_grid` output and the cosmology it came from. What that buys is
+    `python -m inexor.export` writing peculiar km/s off a bare directory
+    instead of the reader having to supply the epoch by hand and get it right.
+    Omitted, everything behaves exactly as before; see `epoch_record`.
     """
     cfg.validate()
     ph = phase if phase is not None else _no_phase
@@ -1541,6 +1593,18 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             "checkpointing a state that carries ids: the t9-slabs-2 schema has no room "
             "for them, so the resumed run would silently lose particle identity"
         )
+    if epoch is not None:
+        # Same reason as above: check the grid against the schedule here rather
+        # than at the first checkpoint, which is a step into the run. `coeffs`
+        # is always the FULL schedule even for a `stop_at` segment, so this
+        # invariant holds on every leg.
+        a_steps, _ = epoch
+        if len(a_steps) != len(coeffs) + 1:
+            raise ValueError(
+                f"epoch grid has {len(a_steps)} points for a {len(coeffs)}-step schedule; "
+                f"`integrate.a_grid` emits n_steps + 1 = {len(coeffs) + 1}. A grid that is "
+                "not this schedule's would record a plausible wrong epoch on every checkpoint"
+            )
     pool = None
     if cfg.tile_workers > 1:
         # the pool's workers each build their own kernels + jitted program, so
@@ -1641,7 +1705,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             stats["checkpoint"] = None
             if ckpt_on and (k + 1) % cfg.checkpoint_every == 0:
                 stats["checkpoint"] = _write_checkpoint(
-                    st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2
+                    st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2, epoch=epoch
                 )
                 n_ckpt += 1
                 ph("checkpoint")

@@ -32,6 +32,7 @@ what was written, and the conversion factor rides along so a D-time file can be
 converted after the fact without re-deriving it.
 """
 
+import dataclasses
 import json
 import os
 import zlib
@@ -209,6 +210,12 @@ def write_particles(
         # converted later without re-deriving the factor or guessing the epoch.
         peculiar_velocity_factor=(float(vfac) if kms else None),
         a=(float(a) if kms else None),
+        # The epoch and the factor were here from the start; the COSMOLOGY that
+        # turns one into the other was not, so a reader could see `a=0.5` and a
+        # factor and still not know which Omega_m produced it. That gap widened
+        # once the CLI let the epoch and the cosmology come from different
+        # places, so the whole dataclass rides along.
+        cosmology=(dataclasses.asdict(cosmo) if kms else None),
         row_order="brick-major (the engine's spatial layout); no Lagrangian identity",
         has_ids="ids" in streams,
         source="write_particles",
@@ -252,6 +259,86 @@ def load_particles(workdir, mmap=True):
     return head, out["x"], out["v"], out.get("ids")
 
 
+def _resolve_epoch(man, args):
+    """Pick the output epoch and cosmology for the CLI. Returns `(a, cosmo, why)`.
+
+    `why` is carried into the export header's provenance, so a file always says
+    where its units came from rather than leaving a reader to infer it from
+    whether a number looks like km/s.
+
+    Precedence, and each rung exists for a reason:
+
+    1. `--d-time` -- an explicit request for the engine's native `dx/dD`.
+    2. `--a` -- an explicit epoch, which overrides a recorded one. Re-exporting
+       a checkpoint at a different epoch is wrong, but `--a` is also how the
+       banked pre-epoch artifacts get km/s at all, so this cannot refuse.
+    3. the checkpoint's own `a` + `cosmology` -- the default, and the point of
+       the exercise.
+    4. neither -- D-time, ANNOUNCED. A silent fallback is the failure this whole
+       change is about, so the caller is told which rung it landed on.
+
+    `--omega-m` / `--h` override individual cosmology fields on top of whichever
+    of 2 or 3 supplied the rest. Passing them with nothing to attach them to is
+    refused rather than ignored: the request was to change a number that is not
+    being used, and honouring it silently would write a header claiming a
+    cosmology that did not enter the file.
+
+    **An IC directory's `a_init` is deliberately NOT read as rung 3.** The
+    generator records `a_init` at manifest top level but no cosmology, so half
+    the conversion is missing; and exporting unevolved ICs to a halo finder is
+    not a use for this tool. Falling back for them is correct. This note exists
+    so the asymmetry reads as a choice rather than an oversight.
+    """
+    from .config import Cosmology
+
+    rec = man.get("provenance", {}) or {}
+    rec_a = rec.get("a")
+    rec_cosmo = rec.get("cosmology")
+    overrides = {k: v for k, v in (("Omega_m", args.omega_m), ("h", args.h)) if v is not None}
+
+    if args.d_time:
+        if args.a is not None or overrides:
+            raise SystemExit(
+                "--d-time writes the engine's native velocity, so --a/--omega-m/--h have "
+                "nothing to act on. Drop --d-time for km/s, or drop the epoch flags."
+            )
+        return None, None, "--d-time"
+
+    a = args.a if args.a is not None else rec_a
+    if a is None:
+        if overrides:
+            raise SystemExit(
+                "--omega-m/--h need an epoch: this checkpoint records none and --a was not "
+                "given, so there is no scale factor to convert at. Pass --a as well, or "
+                "--d-time to write the native velocity deliberately."
+            )
+        return None, None, "no epoch recorded; pass --a for km/s"
+
+    base = dict(rec_cosmo) if rec_cosmo else {}
+    try:
+        cosmo = Cosmology(**{**base, **overrides})
+    except TypeError as exc:
+        raise SystemExit(
+            f"the checkpoint records a cosmology this build cannot read ({exc}); "
+            "pass --a with --omega-m/--h to supply one, or --d-time"
+        ) from exc
+
+    if args.a is not None and rec_a is not None and args.a != rec_a:
+        why = f"--a, overriding the recorded a={rec_a:.6g}"
+    elif args.a is not None:
+        why = "--a"
+    else:
+        why = "checkpoint epoch"
+    if overrides:
+        # Named explicitly: with `--omega-m`/`--h` usable on their own, the
+        # epoch and the cosmology can now come from different places, and a
+        # line that reported only the epoch would leave that invisible.
+        why += "; cosmology overridden: " + ", ".join(
+            f"{k}={v!r}" for k, v in sorted(overrides.items())
+        )
+    return float(a), cosmo, why
+
+
 def _main(argv=None):
     """Turn a T9 checkpoint on disk into a portable export.
 
@@ -259,11 +346,17 @@ def _main(argv=None):
     thing a halo finder reads, without re-running anything. `checkpoint_dir` is
     a directory holding a `manifest.json` -- either a `genN` directory under a
     run's `checkpoint_dir`, or any `write_t9_slabs` output.
+
+    **Peculiar km/s is the default output**, because a halo finder is the
+    consumer and km/s is what it expects. That is only possible when the
+    checkpoint knows its own epoch, which one written by `engine.run(epoch=...)`
+    does; see `engine.epoch_record`. `--a` overrides the recorded epoch,
+    `--d-time` asks for the engine's native velocity, and a checkpoint carrying
+    no epoch falls back to D-time and says so on stdout.
     """
     import argparse
 
-    from .config import Cosmology
-    from .icgen import load_slot_state
+    from .icgen import load_slot_state, read_manifest
 
     ap = argparse.ArgumentParser(prog="python -m inexor.export", description=_main.__doc__)
     ap.add_argument("checkpoint_dir")
@@ -272,23 +365,37 @@ def _main(argv=None):
     ap.add_argument("--chunk-bricks", type=int, default=1024)
     ap.add_argument(
         "--a", type=float, default=None,
-        help="output scale factor; with --omega-m and --h, writes peculiar km/s "
-             "instead of the native D-time velocity",
+        help="output scale factor, overriding the epoch the checkpoint recorded; "
+             "use with --omega-m and --h",
     )
-    ap.add_argument("--omega-m", type=float, default=Cosmology().Omega_m)
-    ap.add_argument("--h", type=float, default=Cosmology().h)
+    ap.add_argument("--omega-m", type=float, default=None)
+    ap.add_argument("--h", type=float, default=None)
+    ap.add_argument(
+        "--d-time", action="store_true",
+        help="write the engine's native dx/dD velocity instead of peculiar km/s",
+    )
     args = ap.parse_args(argv)
 
+    man = read_manifest(args.checkpoint_dir)
+    a, cosmo, why = _resolve_epoch(man, args)
     st = load_slot_state(args.checkpoint_dir)
-    cosmo = Cosmology(Omega_m=args.omega_m, h=args.h) if args.a is not None else None
     head = write_particles(
         st, args.out_dir,
         dtype=np.dtype(args.dtype),
-        a=args.a, cosmo=cosmo,
+        a=a, cosmo=cosmo,
         chunk_bricks=args.chunk_bricks,
-        provenance=dict(source_checkpoint=os.path.abspath(args.checkpoint_dir)),
+        provenance=dict(source_checkpoint=os.path.abspath(args.checkpoint_dir),
+                        epoch_source=why),
     )
     gb = head["n_particles"] * 6 * np.dtype(args.dtype).itemsize / 1e9
+    # The epoch leads, because it is the number that silently makes the file
+    # wrong: a velocity converted at a neighbouring scale factor is off by tens
+    # of percent and looks entirely reasonable on inspection.
+    if a is not None:
+        print(f"  velocities: km/s peculiar at a={a:.6g}, Omega_m={cosmo.Omega_m!r}, "
+              f"h={cosmo.h!r} ({why})")
+    else:
+        print(f"  velocities: {head['units']['velocity']} ({why})")
     print(
         f"{head['n_particles']} particles -> {args.out_dir} "
         f"({gb:.3f} GB, {head['units']['velocity']})"

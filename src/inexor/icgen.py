@@ -432,6 +432,28 @@ def _shared_like(arr, alloc, tag):
     return view
 
 
+def read_manifest(workdir):
+    """The manifest for a T9 slab directory, with the same two refusals the
+    loader applies: a missing manifest marks an incomplete generation (it is
+    written last), and an unknown schema is not guessed at.
+
+    Split out of `load_slot_state` so a reader that wants only the metadata --
+    `python -m inexor.export` asking what epoch a checkpoint sits at -- gets the
+    identical validation without materializing the state.
+    """
+    mpath = os.path.join(workdir, MANIFEST)
+    if not os.path.exists(mpath):
+        raise FileNotFoundError(
+            f"no {MANIFEST} in {workdir}: the manifest is written last, so its absence "
+            "marks an incomplete or interrupted generation; refusing to load"
+        )
+    with open(mpath) as fh:
+        man = json.load(fh)
+    if man.get("schema") != SCHEMA:
+        raise ValueError(f"schema {man.get('schema')!r} != {SCHEMA!r}")
+    return man
+
+
 def load_slot_state(
     workdir,
     brick_slack=0.10,
@@ -448,16 +470,7 @@ def load_slot_state(
     as `build` leaves them. Refuses a missing manifest (incomplete
     generation), a schema it does not know, and any crc mismatch.
     """
-    mpath = os.path.join(workdir, MANIFEST)
-    if not os.path.exists(mpath):
-        raise FileNotFoundError(
-            f"no {MANIFEST} in {workdir}: the manifest is written last, so its absence "
-            "marks an incomplete or interrupted generation; refusing to load"
-        )
-    with open(mpath) as fh:
-        man = json.load(fh)
-    if man.get("schema") != SCHEMA:
-        raise ValueError(f"schema {man.get('schema')!r} != {SCHEMA!r}")
+    man = read_manifest(workdir)
     t9 = T9Layout(man["box_size"], man["n_part"], man["bucket_cells"])
     nb = int(man["bricks_per_side"])
     per3 = (t9.n_buckets_side // nb) ** 3
