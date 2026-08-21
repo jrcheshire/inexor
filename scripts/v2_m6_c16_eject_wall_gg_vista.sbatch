@@ -193,18 +193,27 @@ if not ok:
 CONV = 64 * 40 / 3600.0   # 1 s/step at cgh64 = 0.711 h at 2048^3, exact
 en = n["migrate_pool"]["eject_busy_s_median"]
 ej = j["migrate_pool"]["eject_busy_s_median"]
+W = int(n["migrate_pool"]["workers"])
 sn, sj = n["s_per_step"], j["s_per_step"]
 print()
-print(f"  eject busy   numpy {en:8.3f} s/step   jax {ej:8.3f} s/step   "
-      f"ratio {en / ej if ej else float('nan'):.2f}x")
-print(f"  whole step   numpy {sn:8.3f} s/step   jax {sj:8.3f} s/step   "
-      f"ratio {sn / sj if sj else float('nan'):.2f}x")
+# EJECT BUSY IS SUMMED OVER WORKERS AND IS NOT A WALL. The first version of this
+# block converted it at CONV as though it were, and printed a bill ~W times too
+# big. Busy time answers "which kernel does less work"; only the whole step
+# answers "what does this cost the run", so only the whole step is converted.
+print(f"  eject worker-busy  numpy {en:8.3f}   jax {ej:8.3f} s/step, SUMMED over W={W}"
+      f"   ratio {en / ej if ej else float('nan'):.2f}x")
+print(f"    at ideal overlap that is ~{en / W:.3f} vs ~{ej / W:.3f} s/step of wall, "
+      f"but the pool is not ideal -- this line is NOT the bill")
+print(f"  whole step         numpy {sn:8.3f}   jax {sj:8.3f} s/step"
+      f"   ratio {sn / sj if sj else float('nan'):.2f}x")
 print()
-print(f"  THE BILL at 2048^3 (x{CONV:.3f} h per s/step):")
-print(f"    eject alone adds {(en - ej) * CONV:7.2f} h per realization")
-print(f"    whole step  adds {(sn - sj) * CONV:7.2f} h per realization")
+print(f"  THE BILL at 2048^3, from the WHOLE STEP -- the only wall quantity here")
+print(f"  (x{CONV:.4f} h per s/step, recurring terms only):")
+print(f"    numpy vs jax: {(sn - sj) * CONV:+7.2f} h per realization "
+      f"({100 * (sn - sj) / sj if sj else float('nan'):+.1f}%)")
 print(f"    numpy-arm realization from this step total: {sn * CONV:7.2f} h "
-      f"(ARITHMETIC on cgh64, not a measured 2048^3 wall)")
+      f"(ARITHMETIC on cgh64, not a measured 2048^3 wall; and this total still "
+      f"carries the once-per-run lead_drift, so it is a slight over-estimate)")
 print("VERDICT: READ")
 PY
 rc=$?
