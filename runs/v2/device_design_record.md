@@ -4,7 +4,7 @@ Opened 2026-09-06, branch `jc/device-step-4096`. This is the design record that
 `m6_scaling_record.md` sec. 5y "Owed" names. Its companion is that record's
 sec. 5y and 5z, which price the design and are not repeated here.
 
-**Status: priced; one rung built and measured (D1, sec. 7).** Sections 1-6 are
+**Status: priced; one rung built and measured (D1, secs. 7-8).** Sections 1-6 are
 arithmetic over a design plus readings carried from 5y/5z; the one thing they
 add that was in neither is the MEMORY budget, which changes what the binding
 constraint is. Section 7 is the first MEASUREMENT of any part of this design:
@@ -227,3 +227,85 @@ the axis is alive, which is why the ladder is worth a job.
 - The 1024^3 leg reads 6.20e-06 against the 2.9e-06 that 972737's MONOLITHIC
   1024^3 read. Different factorization, different rounding; same order, so the
   stack has not moved. Do not quote them as the same measurement.
+
+## 8. D1 follow-up, Vista 974807 -- generation measured, the pass-2 knob is weak on Grace, and the "clean" control was not clean
+
+`0e4ae7b`, 2026-09-06, gb node **c672-002** (974643 ran on c672-004 -- see the
+confound below), 19:00 wall, all legs rc=0, ~0.35 SU.
+`scripts/v2_d1_device_fft2_vista.sbatch`, one GPU. Card:
+`runs/v2/d1_device_fft_gb2.json`.
+
+**Reproducibility receipt first:** the roundtrip residuals came back at
+4.053e-06 (512^3) and 6.676e-06 (2048^3) -- the same digits as 974643, on a
+different node. The correctness result of sec. 7 reproduces.
+
+### Field generation, measured
+
+**51.29 s** at 2048^3 (both reps 51.3). Sec. 7 inferred it at 46.5 / 44.1 s from
+the device and host forward-minus-inverse gaps; the inference was right in shape
+and ~10-15% low. So on real data:
+
+| term | s | basis |
+|---|---|---|
+| forward transform | **26.5** | 974643's noise-source forward 77.78 minus this 51.29 |
+| inverse transform | **31.3** | 974643's inverse, which generates no field at all |
+| **coarse solve = 1 fwd + 3 inv** | **120.5 s/step, one GPU** | **11.2% of the 1080 s bar** |
+| the same at a perfect 4-way split | 30.1 s/step | unmeasured split |
+
+That leaves sec. 7's headline standing: ~120 rather than ~125 s/step, and the
+step floor still moves from 114 to roughly 145 s/step at a 4-way split.
+
+### The pass-2 knob is real but small, and the laptop did not transfer
+
+| pencil_batch | 1 | 8 | 64 | 256 |
+|---|---|---|---|---|
+| per step (flat source) | 85.14 s | 90.51 | **76.62** | 76.77 |
+
+1.11x from y=1 to y=64, 1.18x across the whole ladder, and y=8 is *slower* than
+y=1. **The same numpy code on the laptop at n=512 read 3.4x.** It did not
+transfer -- a small config on different hardware bounded the payoff in neither
+direction and the record said so before the job ran. **Pass 2's strided access
+is NOT where the transform's time goes on Grace.** The axis is now varied and
+answered; it is worth ~11% and no more.
+
+### The defect: the flat source was not an inert control
+
+The flat-source legs read inverse **22.21 s** where 974643's noise-source legs
+read **31.32 s** for the same operation, same library code (`git diff` over
+`src/` between the two commits is empty), same n, slab and knobs. **The inverse
+generates no field, so the change it was supposed to be blind to moved it by
+1.41x.**
+
+**Two things differ between those readings, not one: the DATA and the NODE**
+(c672-002 against c672-004). The 1.41x is therefore UNATTRIBUTED and this
+record does not assign it. What follows regardless is that the flat-source
+numbers are not a clean measurement of the real transform, so every figure in
+the table above is taken from the noise-source job -- and the leg that was
+always clean is the INVERSE, which never generated a field in either job. The
+flat source solved a problem the inverse leg did not have and introduced one it
+did not have either.
+
+### Where the time actually goes -- a suspect with arithmetic, not a finding
+
+One transform moves ~275 GB across host<->device (pass 1 reads the 34.4 GB
+field and writes the 34.4 GB spectrum; pass 2 reads and writes it again; both
+directions). At 31.3 s that is **8.8 GB/s effective, against the 201 GB/s this
+same hardware streams from PINNED host memory** (974476, sec. 5z) -- a 23x gap.
+
+**This project has already measured that tax once**: the gb probe's eject
+kernel read 14 ms on device against 0.528 s end to end through pageable
+transfers, 38x (5y). Every transfer in this FFT path is pageable -- numpy in,
+`jnp.asarray`, `np.asarray` out. Pinning the spectrum is the obvious fix and it
+is something the design needs anyway, since the host state is pinned by
+construction.
+
+It is a SUSPECT. Two other candidates are untested: the 2048 per-plane dispatch
+round trips, and pass 2's `np.ascontiguousarray` host copy (which the ladder
+above bounds at ~11%, so it is not the whole story either way).
+
+### Owed off this section
+
+1. The pinned-buffer arm. If it recovers even half of the 23x, the coarse solve
+   stops being the second-largest term in the step floor.
+2. A four-GPU reading. Every number in secs. 7-8 is one GB200.
+3. Nothing on `pencil_batch`: the axis is answered.

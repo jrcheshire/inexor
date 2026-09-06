@@ -1,0 +1,305 @@
+{
+ "sizes": [
+  512,
+  2048
+ ],
+ "batches": [
+  1
+ ],
+ "slab": 32,
+ "pencils": [
+  1,
+  8,
+  64,
+  256
+ ],
+ "source": "flat",
+ "reps": 2,
+ "bar_s_per_step": 1080.0,
+ "arms": [
+  {
+   "arm": "roundtrip",
+   "n": 512,
+   "device": true,
+   "slab": 32,
+   "plane_batch": 1,
+   "pencil_batch": 1,
+   "n_mesh": 512,
+   "dtype": "float32",
+   "max_abs": 4.0531158447265625e-06,
+   "rms": 1.0001229354927492,
+   "residual": 4.05261763418078e-06,
+   "completed": true,
+   "wall_s": 8.259089084807783,
+   "peak_bytes_in_use": 8396544,
+   "spec_bytes": 538968064,
+   "peak_over_spec": 0.015578926769212062,
+   "worker_wall_s": 10.32777675287798,
+   "returncode": 0
+  },
+  {
+   "arm": "roundtrip",
+   "n": 2048,
+   "device": true,
+   "slab": 32,
+   "plane_batch": 1,
+   "pencil_batch": 1,
+   "n_mesh": 2048,
+   "dtype": "float32",
+   "max_abs": 6.67572021484375e-06,
+   "rms": 1.0000063402933979,
+   "residual": 6.675677889087304e-06,
+   "completed": true,
+   "wall_s": 147.62480709003285,
+   "peak_bytes_in_use": 117473280,
+   "spec_bytes": 34393292800,
+   "peak_over_spec": 0.0034155868902439024,
+   "worker_wall_s": 148.35921959532425,
+   "returncode": 0
+  },
+  {
+   "arm": "noise",
+   "n": 2048,
+   "device": false,
+   "slab": 32,
+   "plane_batch": 1,
+   "pencil_batch": 1,
+   "source": "noise",
+   "gen": {
+    "reps": 2,
+    "median_s": 51.28786388342269,
+    "min_s": 51.28741263598204,
+    "max_s": 51.28831513086334,
+    "all_s": [
+     51.28741263598204,
+     51.28831513086334
+    ]
+   },
+   "completed": true,
+   "worker_wall_s": 103.16004599584267,
+   "returncode": 0
+  },
+  {
+   "arm": "timing",
+   "n": 2048,
+   "device": true,
+   "slab": 32,
+   "plane_batch": 1,
+   "pencil_batch": 1,
+   "source": "flat",
+   "first_fwd_s": 19.87691959226504,
+   "fwd": {
+    "reps": 2,
+    "median_s": 18.509082504780963,
+    "min_s": 18.4964879732579,
+    "max_s": 18.521677036304027,
+    "all_s": [
+     18.4964879732579,
+     18.521677036304027
+    ]
+   },
+   "inv": {
+    "reps": 2,
+    "median_s": 22.211312979692593,
+    "min_s": 22.079129345249385,
+    "max_s": 22.343496614135802,
+    "all_s": [
+     22.343496614135802,
+     22.079129345249385
+    ]
+   },
+   "completed": true,
+   "per_step_s": 85.14302144385874,
+   "peak_bytes_in_use": 117473280,
+   "worker_wall_s": 102.29942348599434,
+   "returncode": 0
+  },
+  {
+   "arm": "timing",
+   "n": 2048,
+   "device": true,
+   "slab": 32,
+   "plane_batch": 1,
+   "pencil_batch": 1,
+   "source": "flat",
+   "first_fwd_s": 19.68351686373353,
+   "fwd": {
+    "reps": 2,
+    "median_s": 18.54741139593534,
+    "min_s": 18.545501973945647,
+    "max_s": 18.549320817925036,
+    "all_s": [
+     18.549320817925036,
+     18.545501973945647
+    ]
+   },
+   "inv": {
+    "reps": 2,
+    "median_s": 22.238696921383962,
+    "min_s": 22.116042813751847,
+    "max_s": 22.361351029016078,
+    "all_s": [
+     22.361351029016078,
+     22.116042813751847
+    ]
+   },
+   "completed": true,
+   "per_step_s": 85.26350216008723,
+   "peak_bytes_in_use": 117473280,
+   "worker_wall_s": 102.22462787711993,
+   "returncode": 0
+  },
+  {
+   "arm": "timing",
+   "n": 2048,
+   "device": true,
+   "slab": 32,
+   "plane_batch": 1,
+   "pencil_batch": 8,
+   "source": "flat",
+   "first_fwd_s": 21.197914788033813,
+   "fwd": {
+    "reps": 2,
+    "median_s": 19.85083492845297,
+    "min_s": 19.843501863069832,
+    "max_s": 19.858167993836105,
+    "all_s": [
+     19.858167993836105,
+     19.843501863069832
+    ]
+   },
+   "inv": {
+    "reps": 2,
+    "median_s": 23.554310351377353,
+    "min_s": 23.399004583712667,
+    "max_s": 23.70961611904204,
+    "all_s": [
+     23.70961611904204,
+     23.399004583712667
+    ]
+   },
+   "completed": true,
+   "per_step_s": 90.51376598258503,
+   "peak_bytes_in_use": 1073741824,
+   "worker_wall_s": 109.01505398796871,
+   "returncode": 0
+  },
+  {
+   "arm": "timing",
+   "n": 2048,
+   "device": true,
+   "slab": 32,
+   "plane_batch": 1,
+   "pencil_batch": 64,
+   "source": "flat",
+   "first_fwd_s": 17.671194798778743,
+   "fwd": {
+    "reps": 2,
+    "median_s": 16.163827770156786,
+    "min_s": 16.149625312071294,
+    "max_s": 16.178030228242278,
+    "all_s": [
+     16.178030228242278,
+     16.149625312071294
+    ]
+   },
+   "inv": {
+    "reps": 2,
+    "median_s": 20.152756502386183,
+    "min_s": 20.070344026666135,
+    "max_s": 20.23516897810623,
+    "all_s": [
+     20.23516897810623,
+     20.070344026666135
+    ]
+   },
+   "completed": true,
+   "per_step_s": 76.62209727731533,
+   "peak_bytes_in_use": 4299161600,
+   "worker_wall_s": 91.29921651538461,
+   "returncode": 0
+  },
+  {
+   "arm": "timing",
+   "n": 2048,
+   "device": true,
+   "slab": 32,
+   "plane_batch": 1,
+   "pencil_batch": 256,
+   "source": "flat",
+   "first_fwd_s": 17.631728946231306,
+   "fwd": {
+    "reps": 2,
+    "median_s": 16.220197890419513,
+    "min_s": 16.213656526058912,
+    "max_s": 16.226739254780114,
+    "all_s": [
+     16.213656526058912,
+     16.226739254780114
+    ]
+   },
+   "inv": {
+    "reps": 2,
+    "median_s": 20.181594542926177,
+    "min_s": 19.89795789308846,
+    "max_s": 20.465231192763895,
+    "all_s": [
+     20.465231192763895,
+     19.89795789308846
+    ]
+   },
+   "completed": true,
+   "per_step_s": 76.76498151919805,
+   "peak_bytes_in_use": 17196646400,
+   "worker_wall_s": 91.47710543172434,
+   "returncode": 0
+  },
+  {
+   "arm": "timing",
+   "n": 2048,
+   "device": false,
+   "slab": 32,
+   "plane_batch": 1,
+   "pencil_batch": 1,
+   "source": "flat",
+   "first_fwd_s": 65.03153392625973,
+   "fwd": {
+    "reps": 2,
+    "median_s": 64.87988180154935,
+    "min_s": 64.7241832120344,
+    "max_s": 65.03558039106429,
+    "all_s": [
+     65.03558039106429,
+     64.7241832120344
+    ]
+   },
+   "inv": {
+    "reps": 2,
+    "median_s": 74.36681475560181,
+    "min_s": 74.21176049718633,
+    "max_s": 74.52186901401728,
+    "all_s": [
+     74.52186901401728,
+     74.21176049718633
+    ]
+   },
+   "completed": true,
+   "per_step_s": 287.98032606835477,
+   "peak_bytes_in_use": null,
+   "worker_wall_s": 344.241639690008,
+   "returncode": 0
+  }
+ ],
+ "provenance": {
+  "host": "c672-002.vista.tacc.utexas.edu",
+  "python": "3.14.6",
+  "jax": "0.10.2",
+  "platform": "gpu",
+  "device": "cuda:0",
+  "n_devices": 1,
+  "cuda_visible": "0",
+  "host_mem_limit_gb": "900",
+  "preallocate": "false",
+  "argv": "scripts/v2_d1_device_fft.py --sizes 512,2048 --batches 1 --pencil-batches 1,8,64,256 --source flat --slab 32 --reps 2 --out-suffix _gb2"
+ }
+}
