@@ -100,6 +100,10 @@ def main():
     ap.add_argument("--n-gpus", type=float, default=4.0)
     ap.add_argument("--probe-suffix", default=None,
                     help="suffix of the m6_gb_probe card if it differs from --suffix")
+    ap.add_argument("--stream-suffix", default=None,
+                    help="suffix of the g4 streaming cards if they come from a later job "
+                         "(e.g. _gb2 for v2_m6_gb_stream_vista.sbatch); the single-GPU "
+                         "ceiling-control card falls back to --suffix")
     args = ap.parse_args()
 
     from v2_m6_gb_probe import geometry
@@ -116,9 +120,11 @@ def main():
     forces = _force_cards(args.suffix)
     engine = _load(f"m6_phase_time{args.suffix}_b200_cdev.json")
     hostfft = _load(f"m5_gate_fft-gh{args.suffix}.json")
-    stream_a = _load(f"g4_gh_memory{args.suffix}_a.json")
-    stream_b = _load(f"g4_gh_memory{args.suffix}_b.json")
-    stream_4x = [_load(f"g4_gh_memory{args.suffix}4x_gpu{i}.json") for i in range(4)]
+    ss = args.stream_suffix or args.suffix
+    stream_a = _load(f"g4_gh_memory{ss}_a.json") or _load(f"g4_gh_memory{args.suffix}_a.json")
+    stream_b = _load(f"g4_gh_memory{ss}_b.json")
+    stream_4x = [_load(f"g4_gh_memory{ss}4x_gpu{i}.json") or _load(f"g4_gh_memory{ss}x4_gpu{i}.json")
+                 for i in range(4)]
 
     rows = []  # (label, s_per_step, in_sum, source)
 
@@ -148,23 +154,30 @@ def main():
         missing.append("force card (m6_gb_force_T*_f64)")
 
     # --- decode + quantize ---------------------------------------------
+    # The engine's `tile_decode` phase is HOST numpy work (SlotState.decode_bricks)
+    # and is exactly what the design deletes, so it must NOT be scaled up as a
+    # device term (the first readout did, and it dominated the sum). On device
+    # the decode is int8/int16 -> f64 elementwise; the eject kernel already does
+    # that for positions AND velocities plus a drift, a re-quantize and a global
+    # partition, so one eject-kernel pass bounds a decode + quantize pass from
+    # above. Two passes cover the velocity re-encode after the kick.
+    ej0 = _arm(probe, "eject")
+    if ej0 and ej0.get("completed"):
+        pd0 = float(ej0["device_only"]["median_s"]) * g["rows_per_slab"] / float(ej0["rows"])
+        s = 2.0 * g["nb"] * pd0 / n_gpus
+        rows.append(("decode + quantize on device, BOUND: 2 x the eject kernel pass "
+                     f"({g['nb']} slabs x 2 x {pd0:.3f} s)", s, True, "m6_gb_probe (bound)"))
+    else:
+        unmeasured.append("decode + quantize on device (eject arm absent)")
     if engine:
         k_eng = int(engine.get("k", 1))
         ph = engine.get("phase_s", {})
-        dq = {n: v / k_eng for n, v in ph.items() if "decode" in n or "quant" in n}
-        ratio = g["n_total"] / CDEV_N_PART**3
-        if dq:
-            s = sum(dq.values()) * ratio / n_gpus
-            rows.append(("decode + quantize, engine cdev on B200 x "
-                         f"{ratio:.0f} ({', '.join(sorted(dq))})", s, True,
-                         f"m6_phase_time{args.suffix}_b200_cdev.json"))
-        else:
-            unmeasured.append("decode + quantize (no decode/quant phase on the engine card)")
+        rows.append((f"  [engine cdev on B200, serial, {engine.get('s_per_step', 0):.1f} s/step; "
+                     "host-plumbed phases, NOT scaled]", None, False,
+                     f"m6_phase_time{args.suffix}_b200_cdev.json"))
         for n in sorted(ph):
             rows.append((f"  [engine cdev on B200, per step, unscaled] {n}", ph[n] / k_eng,
                          False, "same card"))
-    else:
-        unmeasured.append("decode + quantize (engine card absent)")
 
     # --- coarse paint ----------------------------------------------------
     probe_preset = (probe or {}).get("geometry", {}).get("preset")
@@ -225,7 +238,14 @@ def main():
     solve_dev = None
     fits_one_gpu = None
     if probe:
-        done = [r for r in probe.get("arms", []) if r.get("arm") == "fft" and r.get("completed")]
+        RT_BAR = 1e-3  # f32 roundtrip reads ~3e-6 where the transform is right
+        alld = [r for r in probe.get("arms", []) if r.get("arm") == "fft" and r.get("completed")]
+        bad = [r for r in alld if (r.get("roundtrip_max_abs_over_rms") or 0) > RT_BAR]
+        for r in bad:
+            rows.append((f"  !! device fft {r['n']}^3 FAILED its roundtrip receipt "
+                         f"(max|d|/rms {r['roundtrip_max_abs_over_rms']:.1e}): NOT used",
+                         None, False, "m6_gb_probe"))
+        done = [r for r in alld if r not in bad]
         target = g["n_coarse"]
         exact = [r for r in done if int(r["n"]) == target]
         fits_one_gpu = bool(exact)
@@ -264,23 +284,36 @@ def main():
     if n_agg == 4:
         s = 2 * state_bytes / (agg * 1e9)
         rows.append((f"streaming, 2 x {state_bytes / 1e9:.0f} GB state at {agg:.0f} GB/s "
-                     "aggregate over 4 GPUs", s, True, f"g4_gh_memory{args.suffix}4x_gpu*.json"))
+                     "aggregate over 4 GPUs", s, True, f"g4_gh_memory{ss}*4*_gpu*.json"))
     elif single:
         s = 2 * state_bytes / (single * 1e9)
         rows.append((f"streaming, 2 x {state_bytes / 1e9:.0f} GB state at {single:.0f} GB/s, "
                      f"ONE GPU at the {single_gib:.0f} GiB rung ({n_agg}/4 4x cards)", s, True,
-                     f"g4_gh_memory{args.suffix}_[ab].json"))
+                     f"g4_gh_memory{ss}_[ab].json"))
     else:
         missing.append("streaming rate (no g4 card completed a rung)")
     if single:
         rows.append((f"  single-GPU staged rate at the largest completed rung: {single:.0f} GB/s "
                      f"at {single_gib:.0f} GiB", None, False, "g4"))
-    if stream_b:
-        top = max((float(r.get("working_set_gib", 0)) for r in stream_b.get("configs", [])
-                   if r.get("completed") and r.get("arm") in ("staged", "coherent")), default=0)
+    tops = []
+    fails = []
+    for c in (stream_a, stream_b):
+        for r in (c or {}).get("configs", []):
+            if r.get("arm") not in ("staged", "coherent") or r.get("real"):
+                continue
+            if r.get("completed"):
+                tops.append(float(r.get("working_set_gib", 0)))
+            else:
+                fails.append(f"{r.get('arm')}@{float(r.get('working_set_gib', 0)):.0f}")
+    if tops or fails:
+        top = max(tops, default=0.0)
+        note = (f"; host-arm rungs that did NOT complete: {', '.join(fails)}" if fails else "")
         rows.append((f"  largest host working set streamed by one GPU: {top:.0f} GiB "
-                     f"(state at {args.preset} is {state_bytes / 1024**3:.0f} GiB)", None, False,
-                     "g4 _b"))
+                     f"(state at {args.preset} is {state_bytes / 1024**3:.0f} GiB){note}",
+                     None, False, "g4 _a/_b"))
+        if top < state_bytes / 1024**3:
+            unmeasured.append(f"streaming a host set the size of the state: largest rung "
+                              f"completed {top:.0f} GiB, state is {state_bytes / 1024**3:.0f} GiB")
 
     # --- print -----------------------------------------------------------
     print(f"=== gb probe readout: {args.preset} = {g['n_part']}^3, K={args.k}, "

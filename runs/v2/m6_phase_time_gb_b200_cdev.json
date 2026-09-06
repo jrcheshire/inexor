@@ -1,0 +1,67 @@
+{
+ "config": "cdev",
+ "k": 3,
+ "repeats": 1,
+ "slack": 0.2,
+ "arena_frac": 0.2,
+ "traced_wall_s": [
+  66.39562662504613
+ ],
+ "control_wall_s": [
+  66.04238415788859
+ ],
+ "traced_median_s": 66.39562662504613,
+ "control_median_s": 66.04238415788859,
+ "control_sd_s": NaN,
+ "phase_s": {
+  "coarse_paint": 33.105421690735966,
+  "coarse_solve": 0.06663169199600816,
+  "kernel_build": 0.34813488321378827,
+  "lead_drift": 2.298967868089676,
+  "membership": 0.05796216242015362,
+  "migrate": 7.83567724423483,
+  "reconcile": 4.0638260543346405e-06,
+  "repack": 0.48840908519923687,
+  "tile_decode": 8.235418542288244,
+  "tile_long": 7.361077752895653,
+  "tile_loop_end": 3.0463561415672302e-05,
+  "tile_reduce": 3.5287110921926796,
+  "tile_short": 3.0493123456835747
+ },
+ "phase_frac": {
+  "coarse_paint": 0.4987577128485435,
+  "coarse_solve": 0.0010038558219742412,
+  "kernel_build": 0.005244910025208736,
+  "lead_drift": 0.03463565474296812,
+  "membership": 0.0008732429337555114,
+  "migrate": 0.11805028485855426,
+  "reconcile": 6.12245512897802e-08,
+  "repack": 0.007358244838083057,
+  "tile_decode": 0.1240726837698486,
+  "tile_long": 0.11090009178653398,
+  "tile_loop_end": 4.5895612987022123e-07,
+  "tile_reduce": 0.05316264780091314,
+  "tile_short": 0.045940150392935725
+ },
+ "s_per_step": 22.131875541682046,
+ "unknown_phases": [],
+ "tile_workers": 1,
+ "eject_kernel": "jax",
+ "eject_jax_calls": 192,
+ "paint_subblock": true,
+ "coarse_subblock_chunks_per_step": [
+  64
+ ],
+ "migrate_pooled": false,
+ "migrate_pooled_workers_per_step": [
+  0
+ ],
+ "instrument_overhead_s": 0.3532424671575427,
+ "gate_sigma_bound_s": NaN,
+ "gate_material_bound_s": 1.3208476831577718,
+ "gate_bound_used_s": 1.3208476831577718,
+ "gate_bound_that_bound": "material",
+ "instrument_neutral": true,
+ "commit": "1a3adf31420e95b8b90d508d84a8d61ace6ba0e7",
+ "slurm_job_id": "972737"
+}

@@ -1,0 +1,93 @@
+{
+ "config": "cdev8",
+ "k": 3,
+ "repeats": 1,
+ "slack": 0.2,
+ "arena_frac": 0.1,
+ "traced_wall_s": [
+  9.5261285379529
+ ],
+ "control_wall_s": [
+  9.406164843589067
+ ],
+ "traced_median_s": 9.5261285379529,
+ "control_median_s": 9.406164843589067,
+ "control_sd_s": NaN,
+ "phase_s": {
+  "coarse_paint": 1.408723145723343,
+  "coarse_solve": 0.03602003864943981,
+  "kernel_build": 0.013817518949508667,
+  "lead_drift": 0.7354880645871162,
+  "membership": 0.02710609883069992,
+  "migrate": 0.21979723684489727,
+  "reconcile": 9.404495358467102e-06,
+  "repack": 0.050597941502928734,
+  "tile_decode": 0.0,
+  "tile_long": 0.0,
+  "tile_loop_end": 6.796564945951104,
+  "tile_reduce": 0.0,
+  "tile_short": 0.0
+ },
+ "phase_frac": {
+  "coarse_paint": 0.1516692806569901,
+  "coarse_solve": 0.0038780745299619107,
+  "kernel_build": 0.001487654381131237,
+  "lead_drift": 0.07918585424423567,
+  "membership": 0.0029183608742075163,
+  "migrate": 0.023664329576655197,
+  "reconcile": 1.0125290056395729e-06,
+  "repack": 0.005447595160036351,
+  "tile_decode": 0.0,
+  "tile_long": 0.0,
+  "tile_loop_end": 0.7317478380477763,
+  "tile_reduce": 0.0,
+  "tile_short": 0.0
+ },
+ "s_per_step": 3.175376179317633,
+ "unknown_phases": [],
+ "tile_workers": 8,
+ "eject_kernel": "numpy",
+ "eject_jax_calls": 0,
+ "paint_subblock": true,
+ "coarse_subblock_chunks_per_step": [
+  8
+ ],
+ "migrate_pooled": true,
+ "migrate_pooled_workers_per_step": [
+  8
+ ],
+ "migrate_pool": {
+  "workers": 8,
+  "window": 8,
+  "scratch_mb": 47.30208,
+  "spill_rows_median": 125579.0,
+  "spill_bytes_median": 2134843.0,
+  "eject_busy_s_median": 0.2697410397231579,
+  "insert_busy_s_median": 0.16482685878872871,
+  "eject_jax_calls_per_step": [
+   0
+  ]
+ },
+ "pool": {
+  "wall_s_median": 2.4792541917413473,
+  "busy_s_median": {
+   "decode": 1.915578220039606,
+   "short": 7.244130544364452,
+   "long": 9.505341673269868,
+   "quant": 0.18375620990991592
+  },
+  "busy_total_s_median": 18.846391702070832,
+  "concurrency_median": 7.601637526660282,
+  "idle_s_median": 0.9876418318599463,
+  "rss_mb_max": 1590.656,
+  "workers": 8
+ },
+ "instrument_overhead_s": 0.11996369436383247,
+ "gate_sigma_bound_s": NaN,
+ "gate_material_bound_s": 0.18812329687178136,
+ "gate_bound_used_s": 0.18812329687178136,
+ "gate_bound_that_bound": "material",
+ "instrument_neutral": true,
+ "commit": "fc13a3a6a7ce73f4dca701d0df8aafdec9c0c9a1",
+ "slurm_job_id": "925683"
+}

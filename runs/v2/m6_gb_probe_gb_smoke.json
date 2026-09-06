@@ -1,0 +1,209 @@
+{
+ "geometry": {
+  "preset": "smoke",
+  "n_part": 32,
+  "box": 32.0,
+  "n_fine": 64,
+  "n_coarse": 16,
+  "tile": 16,
+  "buf": 8,
+  "brick_fine": 8,
+  "nb": 8,
+  "n_total": 32768,
+  "rows_per_brick": 64,
+  "rows_per_slab": 4096,
+  "tiles": 64,
+  "padded": 32,
+  "slab_thickness": 4.0,
+  "coarse_cells_per_slab": 2
+ },
+ "reps": 2,
+ "row_frac": 1.0,
+ "arms": [
+  {
+   "arm": "eject",
+   "completed": true,
+   "rows": 4096,
+   "n_pad": 4096,
+   "bricks_used": 64,
+   "bricks_per_slab": 64,
+   "slab_fraction": 1.0,
+   "rows_per_slab": 4096,
+   "nb": 8,
+   "buckets_per_brick_side": 2,
+   "sigma_quanta": 40.0,
+   "w_sigma": 3000.0,
+   "leave_fraction": 0.174072265625,
+   "leave_fraction_device_run": 0.174072265625,
+   "first_call_s": 2.9129748418927193,
+   "end_to_end": {
+    "median_s": 0.0017194394022226334,
+    "all_s": [
+     0.0019055986776947975,
+     0.0015332801267504692
+    ]
+   },
+   "device_only": {
+    "median_s": 0.00018380791880190372,
+    "all_s": [
+     0.00019350368529558182,
+     0.00017411215230822563
+    ]
+   },
+   "per_slab_end_to_end_s": 0.0017194394022226334,
+   "per_slab_device_only_s": 0.00018380791880190372,
+   "peak_bytes_in_use": 554496,
+   "platform": "gpu",
+   "device_kind": "NVIDIA GB200",
+   "n_devices_visible": 1,
+   "jax_version": "0.10.2",
+   "x64": true,
+   "memory_stats_available": true,
+   "cuda_visible_devices": "0",
+   "worker_wall_s": 4.507882576901466,
+   "worker_rc": 0
+  },
+  {
+   "arm": "paint",
+   "completed": true,
+   "rows": 4096,
+   "slab_fraction": 1.0,
+   "rows_per_slab": 4096,
+   "nb": 8,
+   "n_coarse": 16,
+   "frac_bits": 12,
+   "headroom": {
+    "ok": true,
+    "message": null
+   },
+   "subblock_origin": [
+    15,
+    0,
+    0
+   ],
+   "subblock_extent": [
+    5,
+    16,
+    16
+   ],
+   "subblock_first_s": 0.5664181862957776,
+   "subblock": {
+    "median_s": 0.00016632000915706158,
+    "all_s": [
+     0.00019321637228131294,
+     0.0001394236460328102
+    ]
+   },
+   "subblock_mass": 16776109,
+   "subblock_peak_bytes_in_use": 152576,
+   "full_first_s": 0.36138233728706837,
+   "full": {
+    "median_s": 0.00017057615332305431,
+    "all_s": [
+     0.00019551999866962433,
+     0.0001456323079764843
+    ]
+   },
+   "full_mass": 16776109,
+   "full_error": null,
+   "full_oom": false,
+   "mass_equal": true,
+   "expected_mass": 16777216,
+   "per_slab_subblock_s": 0.00016632000915706158,
+   "per_slab_full_s": 0.00017057615332305431,
+   "peak_bytes_in_use": 196864,
+   "platform": "gpu",
+   "device_kind": "NVIDIA GB200",
+   "n_devices_visible": 1,
+   "jax_version": "0.10.2",
+   "x64": true,
+   "memory_stats_available": true,
+   "cuda_visible_devices": "0",
+   "worker_wall_s": 3.3041266398504376,
+   "worker_rc": 0
+  },
+  {
+   "arm": "fft",
+   "n": 32,
+   "field_bytes": 131072,
+   "platform": "gpu",
+   "device_kind": "NVIDIA GB200",
+   "n_devices_visible": 1,
+   "jax_version": "0.10.2",
+   "x64": true,
+   "memory_stats_available": true,
+   "cuda_visible_devices": "0",
+   "completed": true,
+   "oom": false,
+   "first_fwd_s": 0.2786333649419248,
+   "first_inv_s": 0.2508530542254448,
+   "fwd": {
+    "median_s": 0.00014876807108521461,
+    "all_s": [
+     0.00018944032490253448,
+     0.00010809581726789474
+    ]
+   },
+   "inv": {
+    "median_s": 0.0005258712917566299,
+    "all_s": [
+     0.0006734398193657398,
+     0.00037830276414752007
+    ]
+   },
+   "roundtrip_max_abs_over_rms": 1.1345513557019253e-06,
+   "peak_bytes_in_use": 1089792,
+   "peak_over_field": 8.314453125,
+   "worker_wall_s": 3.3747878069989383,
+   "worker_rc": 0
+  },
+  {
+   "arm": "fft",
+   "n": 64,
+   "field_bytes": 1048576,
+   "platform": "gpu",
+   "device_kind": "NVIDIA GB200",
+   "n_devices_visible": 1,
+   "jax_version": "0.10.2",
+   "x64": true,
+   "memory_stats_available": true,
+   "cuda_visible_devices": "0",
+   "completed": true,
+   "oom": false,
+   "first_fwd_s": 0.11976607888936996,
+   "first_inv_s": 0.1622072528116405,
+   "fwd": {
+    "median_s": 0.0001450877171009779,
+    "all_s": [
+     0.00017833570018410683,
+     0.00011183973401784897
+    ]
+   },
+   "inv": {
+    "median_s": 0.0005119838751852512,
+    "all_s": [
+     0.0006353277713060379,
+     0.00038863997906446457
+    ]
+   },
+   "roundtrip_max_abs_over_rms": 1.5183235956087597e-06,
+   "peak_bytes_in_use": 10566912,
+   "peak_over_field": 10.077392578125,
+   "worker_wall_s": 3.1691582277417183,
+   "worker_rc": 0
+  }
+ ],
+ "provenance": {
+  "hostname": "c672-010.vista.tacc.utexas.edu",
+  "commit": "1a3adf3",
+  "slurm_job_id": "972737",
+  "cuda_visible_devices": "0",
+  "jax_platforms_env": null,
+  "argv": [
+   "--smoke",
+   "--out-suffix",
+   "_gb_smoke"
+  ],
+  "time": "2026-09-06 01:18:23"
+ }
+}

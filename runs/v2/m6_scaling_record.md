@@ -1835,6 +1835,156 @@ and the idle half is closed as a wall lever: after this, migrate is 3.78 s and
 repack 0.98 of a 30.76 s step, so ~85% of the step is the tile loop and the
 coarse paint, both already within 1.5-2x of the bandwidth ceiling (5t).
 
+## 5x. Vista 925683 -- C16: the numpy eject is FREE on Grace, and the 1.85x is refuted
+
+`fc13a3a`, 2026-08-20, gg, 55:45 wall, ~0.3 SU; cards
+`runs/v2/m6_phase_time_c16_cgh64_{numpy,jax}.json` (+ smoke twins), pulled and
+force-added 2026-09-06 -- this section was owed since the job ran; its numbers
+had lived only in the threads file and memory.
+
+**Why it ran.** `--eject-kernel numpy` is LOAD-BEARING for the 2048^3 memory
+fit: `inexor.plan` refuses the jax eject at 283.2 GB and passes numpy at 232.7
+of 255.1 (sec. 5v/5w's memory work, 2026-08-19). The only wall figure for
+numpy was an M4 laptop probe timing the row kernels in isolation: 1.85x slower
+per row. A 30 h leg should not rest on that.
+
+**Setup.** cgh64, `--tile-workers 8 --migrate-pooled --k 5 --repeats 3 --slack
+0.20 --arena-frac 0.10`, the two arms differing in one flag. Receipts clean on
+both: `migrate_pooled_workers_per_step` [8], `migrate_pool.eject_jax_calls_per_step`
+[0] on numpy and [32] (= nb) on jax. Instrument neutral both arms.
+
+| cgh64 W=8 pooled, per step | numpy | jax | ratio |
+|---|---|---|---|
+| eject worker-busy (summed over 8 workers) | 16.79 s | 20.53 s | 0.82x |
+| insert worker-busy (summed) | 11.07 s | 13.87 s | 0.80x |
+| `migrate` phase (wall) | 4.03 s | 4.81 s | 0.84x |
+| whole step (`s_per_step`) | **39.81 s** | **41.45 s** | **0.96x** |
+| control sd over 3 repeats | 0.97 s | 0.76 s | |
+
+**Reading.** numpy is FASTER on both the eject and the step. The 1.85x measured a
+different quantity from the one that bills a run (row kernels in isolation on
+an M4, not the pooled phase on Grace). So the arm the memory fit needs costs
+nothing in wall. Convert the WHOLE-STEP figure only: busy time is summed over
+8 workers and converting it as wall inflates the bill ~8x (the first readout
+of this job printed a bogus -2.66 h that way; the honest figure is -1.6 s/step
+= -1.2 h at 2048^3).
+
+**The projection this moves.** Recurring per step (minus `lead_drift` 0.97 and
+`kernel_build` 0.05, once per run) = 38.8 s at cgh64 -> x0.711 -> **~27.6 h at
+2048^3 K=40 at the configuration that fits.** The ~21.9 h in sec. 5w is a W=16
+figure and the memory fit affords W=8; the jax-at-W=8 arm reads 41.45 against
+5w's 30.76 at W=16, so the gap is worker count, not kernel. Still arithmetic
+on a cgh64 card: nothing has completed a step at 2048^3.
+
+## 5y. Vista 972737 -- the gb probe: a 4096^3 step's DEVICE work is ~2 min on one gb node; the host-resident streaming premise is still unmeasured
+
+`1a3adf3`, 2026-09-06, gb node c672-010 (4x GB200, 189,471 MiB each; GPUs 0-1
+on socket 0 / cores 0-71, GPUs 2-3 on socket 1), 22:35 wall, all 10 legs rc=0,
+~0.4 SU. `scripts/v2_m6_gb_probe_vista.sbatch`; cards force-added:
+`m6_gb_probe_gb.json` (+ `_gb_smoke`), `m6_gb_force_T{256,512}_f64_gb.json`,
+`m6_phase_time_gb_b200_cdev.json`, `m5_gate_fft-gh_gb.json`,
+`g4_gh_memory_gb_{a,b}.json`, `g4_gh_memory_gb4x_gpu{0..3}.json`. Readout:
+`scripts/v2_m6_gb_probe_readout.py --suffix _gb`.
+
+**The design priced.** The CPU engine is at its bandwidth floor (5t) and 4096^3
+fits no node's host at any worker count (the 2026-08-20 pricing). The reading
+of the memory-floor thesis that still reaches 4096^3 on ONE node: the host
+(gb: 1026 GB) holds the ~724 GB T9 state at 10.54 B/p, the four GPUs do every
+per-step phase, slabs stream over C2C. gb's MaxWall is 12 h, so **the bar is
+1080 s per step at K=40**, derived from the machine. This job prices the FLOOR
+of that design; nothing was built.
+
+**Measured (one GPU unless stated).**
+
+| leg | reading |
+|---|---|
+| eject kernel, one 4096^3-scale slab (268,435,456 rows, leaver fraction 4.6%) | **14.0 ms** on device; **0.528 s** end to end through `eject_rows` (numpy in/out = pageable H2D + kernel + D2H); first call 10.6 s (compile); device peak 30.8 GiB |
+| TSC int paint of that slab, x-slab SUB-BLOCK (11 x 2048 x 2048) | **0.196 s**; mass 1.09943e12 vs 1.09951e12 = 2^12 x rows (-0.008%, the per-corner quantization); device peak 37.2 GiB |
+| TSC int paint, FULL 2048^3 mesh | REFUSES: `Python integer 8589934592 out of bounds for int32` -- the flat index path is int32 and 2048^3 exceeds it (see findings) |
+| `jnp.fft.rfftn`/`irfftn` f32 1024^3 | fwd 5.8 ms / inv 17.1 ms, **peak/field 8.0x**, roundtrip 2.9e-6 |
+| same at 1536^3 | fwd 44.6 / inv 55.5 ms, peak/field 8.0x, **roundtrip 3.8e+3 = WRONG** (see findings) |
+| same at 2048^3 | OOM (designed: 8x of 34.4 GB against 185 GiB) |
+| per-tile force anatomy, cgh64 T256/b32, P=320 (V4a leg) | device **17.8 ms**/tile (GH200: 21.26 -> 1.19x); steady per tile 0.179 s = member 6.5 + stage 92.3 + device 17.8 + scatter 61.8 ms -- **host plumbing 90%**; compile ~8.6 s |
+| same, T512/b32, P=576 (the 4096^3 preset's tile) | device **94.2 ms**/tile; steady 1.073 s = member 62 + stage 410 + device 94 + scatter 507 ms -- 91% host |
+| the current engine, serial, cdev K=3, B200 | **22.13 s/step** (GH200, 5e: 24.39 -> 1.10x); coarse_paint 11.0 (50%), tile_decode 2.7, migrate 2.6, tile_long 2.5, tile_reduce 1.2, tile_short 1.0 s/step; neutral |
+| 2048^3 out-of-core FFT on the HOST (144 cores) | fwd **107.4** / inv **101.4 s** (a GH200 host, 902182: 85.7/85.9 -- slower with twice the cores, unattributed); io 0.96 write / 1.80 read GB/s |
+| streaming, one GPU, `hbm` control | 7.21-7.34 TB/s at 64/128 GiB (HBM-resident, 1.03x/1.02x residency) |
+| streaming, one GPU, `staged` (pinned host -> device) | **201 GB/s at 64 GiB** (gh: 359-367); device peak 4.0 GiB = 2 chunks (streamed) |
+| streaming, one GPU, `coherent` | does not COMPILE on this stack: `INTERNAL: Failed to get configs for: 3 out of 3 instructions` |
+| streaming, host rungs >= 128 GiB, both arms | ALL OOM `Out of host memory` -- the 64 GB default of `XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB`, which this sbatch did not export (finding 1) |
+| streaming, four GPUs at once, `staged` 64 GiB each | **670 GB/s aggregate** (unpinned processes); 128 GiB rungs OOM as above |
+
+**The projection (readout, after its own three defects were fixed -- finding
+5).** 4096^3 K=40, one gb node, a perfect 4-GPU split ASSUMED:
+
+| term | s/step | how |
+|---|---|---|
+| tile loop, device only, P=576 | 96.5 | 4096 tiles x 94.2 ms / 4 (P=320: 32,768 x 17.8 ms / 4 = 146.2) |
+| decode + quantize on device, BOUND | 1.8 | 2 eject-kernel passes per slab (the kernel decodes both arrays and re-quantizes; a strict superset of a decode) |
+| coarse paint, sub-block | 12.6 | 256 slabs x 0.196 s / 4 (full-mesh form unavailable at this N) |
+| migrate eject, kernel | 0.9 | 256 x 14 ms / 4 (end to end with pageable transfers: 33.8) |
+| coarse solve, device | 0.4 | 4 transforms, 1024^3 scaled n^3 log n -- REQUIRES the plane-factorized form: monolithic does not fit and 1536^3 is wrong; the HOST out-of-core alternative is **417 s** (39% of the bar on its own) |
+| streaming | 2.2 | 2 x 724 GB at 670 GB/s aggregate -- measured at 64 GiB sets only |
+| **sum** | **114 s/step = 1.3 h at K=40 = 0.11x of the bar** | a FLOOR |
+
+**What it establishes.** The device work of a 4096^3 step on one gb node is of
+order two minutes, an order of magnitude under the 12 h wall's per-step
+budget. The tile force is 85% of it and is the same kernel the engine runs
+today. Host plumbing is 90% of a tile as the engine stands, which is the
+1.28x-not-6.8x story of 5e restated per tile: a device design that keeps ANY
+per-particle host pass keeps the wall.
+
+**What it does NOT establish, in order of consequence.** (1) That a
+state-sized host set STREAMS: the largest set one GPU streamed was 64 GiB
+against 675 GiB of state, because of finding 1 -- the design's load-bearing
+premise is still unmeasured, and `scripts/v2_m6_gb_stream_vista.sbatch` (flag
+set to 900, ladder to 640 GiB, 4x to 768 GiB total) is written and unsubmitted.
+(2) The insert half of the migrate, repack, the kick, and the bookkeeping a
+built pipeline keeps -- none measured; the sum is a floor. (3) The 4-GPU split
+(assumed perfect; the two sockets supply four C2C links, and 670 GB/s
+aggregate at 64 GiB is the only reading). (4) The coarse solve on device needs
+the plane-factorized FFT (2-D per plane + 1-D along x), unbuilt; without it the
+host form costs 417 s/step. (5) gb only: Horizon's gb is a 240 GiB host.
+
+**Findings (apparatus, mine, all caught by the job's own receipts or by
+reading the cards -- none by the pre-registration).**
+1. **The streaming legs measured the 64 GB default of
+   `XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB`, not the node.** Every earlier streaming
+   sbatch exported it (gh 160, S3 hero 900; sec. 4 of `g4_record.md` records
+   the same trap from job 894010); this one did not. Two of the three witnesses
+   still fired correctly at 64 GiB (device peak pinned at 2 chunks; C2C-class
+   rate), so the reading at 64 GiB stands; everything above it is the flag.
+2. **`jnp.fft.rfftn` at 1536^3 f32 returns a WRONG transform silently** on
+   this stack (jax 0.10.2, GB200): roundtrip max|d|/rms 3.8e+3 where 1024^3
+   reads 2.9e-6, same peak/field, plausible timing. 1536^3 = 3.6e9 elements
+   > 2^31; 1024^3 = 1.07e9 < 2^31. Cause not measured (the cuFFT 32-bit-plan
+   class is the obvious suspect). Consequence: the device coarse solve must be
+   factorized per plane (2048^2 = 4.2e6 elements) regardless of memory, and any
+   monolithic transform above 2^31 elements needs its roundtrip receipt read.
+3. **`painting.paint_tsc_int` (the full-mesh form) cannot address a 2048^3
+   mesh**: its flat index arithmetic is int32 and the scatter's index
+   normalization casts the mesh size 8,589,934,592 to int32. The engine's
+   production path is `paint_tsc_int_subblock`, whose indices are block-local,
+   and it ran; the full-mesh form is the M-v2-4 gate oracle's arm and is
+   unaffected below n_coarse = 1290. int64 indices fix it if it is ever wanted
+   at this N.
+4. **The `coherent` streaming arm does not compile on GB200** (finding table
+   above). Explicit staging out of pinned host is the path on this stack.
+5. **Three readout defects, fixed before these numbers were written down.**
+   The first readout scaled the engine's `tile_decode` phase (HOST numpy,
+   `SlotState.decode_bricks`) as a device term and it dominated the sum at
+   2811 s/step (32 h, "DOES NOT FIT"); it counted the 1536^3 transform without
+   reading its roundtrip receipt; and it reported "largest set streamed 0 GiB"
+   from the second card alone. The corrected readout bounds decode+quantize by
+   the eject kernel, refuses a transform whose roundtrip exceeds 1e-3, and
+   reports the max over both cards with the failed rungs named.
+
+**Owed.** The streaming re-run (above; ~20 min, <= 1.5 SU). Then, if the
+design is opened: the plane-factorized device FFT; a design record for the
+host-state / device-step engine (state layout per socket, slab DMA, the
+per-tile device pipeline with no host pass, migrate insert on device); the
+unmeasured terms measured as they are built, each against this floor.
+
 ## 6. What is NOT established
 
 - ~~That this explains job 455's 43x.~~ **SETTLED by job 459: it does.** The
@@ -1933,3 +2083,10 @@ coarse paint, both already within 1.5-2x of the bandwidth ceiling (5t).
    `eject` only, which caps the phase at 1.64x; `insert` is 19.7 of the 33.26 s
    and needs its disjoint-write premise proved as C2 proved it for tiles before
    anything is built on it.
+
+8. **[2026-09-06] The gb streaming re-run** (`v2_m6_gb_stream_vista.sbatch`, sec. 5y):
+   the host-state premise at state size, blocked in 972737 by the 64 GB host
+   memory limit default. ~20 min, <= 1.5 SU, unsubmitted.
+9. **[2026-09-06] The plane-factorized device FFT for the coarse solve** (sec. 5y
+   findings 2 and the 8x workspace): unbuilt; the host form costs 417 s/step
+   at 4096^3 and cannot be the design's solve.
