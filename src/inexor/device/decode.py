@@ -182,5 +182,9 @@ def decode_rows(plan, off, w, vel_scale, arena_bucket, arena_base, t9,
     scale = jnp.asarray(vel_scale)[bricks[bi]]
     v = jnp.asarray(w)[slots].astype(fdtype) * scale[:, None]
 
-    return dict(slots=slots, x=x, v=v, brick_of_row=bricks[bi], live=live,
-                n_rows=n_rows)
+    # `brick_index` is `bi` itself -- the row's position in the TILE's brick
+    # list, not its global brick id. The kick's segmented reduction wants a
+    # dense 0..n_b-1 segment id, and recovering one from the global id would
+    # mean a searchsorted the decode has already done.
+    return dict(slots=slots, x=x, v=v, brick_of_row=bricks[bi], brick_index=bi,
+                live=live, n_rows=n_rows)
