@@ -61,6 +61,7 @@ ERR_DIR = os.path.join(OUT_DIR, "d1_fft_errs")
 DEFAULT_SIZES = "512,1024,2048"
 SMOKE_SIZES = "32,64"
 DEFAULT_BATCHES = "1,4,16"
+DEFAULT_PENCILS = "1,8,64,256"
 
 # The bar this is measured against, DERIVED: gb MaxWall 12 h / K=40 steps.
 # The coarse solve is four transforms per step (one forward, three inverse).
@@ -142,16 +143,59 @@ def arm_roundtrip(n, slab, plane_batch, pencil_batch, device, seed):
     return rec
 
 
-def arm_timing(n, slab, plane_batch, pencil_batch, device, seed, reps):
-    """The wall, forward and inverse separately, at one batch setting."""
+def arm_noise(n, slab, seed, reps):
+    """Time FIELD GENERATION alone, because in 974643 it was inside the forward.
+
+    That job's forward leg read 77.8 s against its own inverse's 31.3 s, and the
+    only thing the forward has that the inverse does not is `plane_noise` for
+    every plane -- 8.6e9 gaussians at 2048^3. The device and host legs put the
+    excess at 46.5 and 44.1 s, agreeing to 5% as they must if it is the shared
+    host RNG. That is a strong inference and it is still an inference; this arm
+    makes it a reading.
+    """
+    from inexor import ooc_fft
+
+    def gen():
+        for lo in range(0, n, slab):
+            hi = min(lo + slab, n)
+            np.stack([ooc_fft.plane_noise(n, i, np.float32, seed)
+                      for i in range(lo, hi)])
+
+    rec = dict(arm="noise", n=n, device=False, slab=slab, plane_batch=1,
+               pencil_batch=1, source="noise")
+    rec["gen"] = _timed(gen, reps)
+    rec["completed"] = True
+    return rec
+
+
+def arm_timing(n, slab, plane_batch, pencil_batch, device, seed, reps,
+               source="noise"):
+    """The wall, forward and inverse separately, at one batch setting.
+
+    `source` selects what the forward transforms. "noise" regenerates plane-keyed
+    white noise per plane and is what a correctness run wants; "flat" reuses ONE
+    pre-drawn plane for every x and exists only to take the host RNG out of the
+    forward leg, since an FFT's cost is data-independent but its input's
+    GENERATION is not. The card records which was used -- a wall quoted without
+    it is not comparable to one quoted with it, which is the defect this
+    argument was added to fix.
+    """
     from inexor import ooc_fft
 
     rec = dict(arm="timing", n=n, device=bool(device), slab=slab,
-               plane_batch=plane_batch, pencil_batch=pencil_batch)
+               plane_batch=plane_batch, pencil_batch=pencil_batch, source=source)
 
-    def field(lo, hi):
-        return np.stack([ooc_fft.plane_noise(n, i, np.float32, seed)
-                         for i in range(lo, hi)])
+    if source == "flat":
+        one = ooc_fft.plane_noise(n, 0, np.float32, seed)
+
+        def field(lo, hi):
+            return np.broadcast_to(one, (hi - lo, n, n))
+    elif source == "noise":
+        def field(lo, hi):
+            return np.stack([ooc_fft.plane_noise(n, i, np.float32, seed)
+                             for i in range(lo, hi)])
+    else:
+        raise ValueError(f"unknown source {source!r}")
 
     kw = dict(slab=slab)
     if device:
@@ -188,15 +232,17 @@ def arm_timing(n, slab, plane_batch, pencil_batch, device, seed, reps):
 # ===========================================================================
 
 
-def spawn(args, arm, n, plane_batch, device):
+def spawn(args, arm, n, plane_batch, device, pencil_batch=None, source="noise"):
+    pencil_batch = args.pencil_batch if pencil_batch is None else pencil_batch
     cmd = [sys.executable, os.path.abspath(__file__), "--single",
            "--arm", arm, "--n", str(n), "--slab", str(args.slab),
            "--plane-batch", str(plane_batch),
-           "--pencil-batch", str(args.pencil_batch),
+           "--pencil-batch", str(pencil_batch), "--source", source,
            "--seed", str(args.seed), "--reps", str(args.reps)]
     if not device:
         cmd.append("--host-path")
-    tag = f"{arm}_{n}_b{plane_batch}_{'dev' if device else 'host'}"
+    tag = (f"{arm}_{n}_p{plane_batch}_y{pencil_batch}_{source}"
+           f"_{'dev' if device else 'host'}")
     print(f"[worker] {tag} ...", flush=True)
     t0 = time.perf_counter()
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -224,11 +270,15 @@ def _line(rec):
     measures -- this project has lost four jobs' worth of readings to that.
     """
     who = "dev " if rec.get("device") else "host"
-    tag = f"{rec['arm']:9s} n={rec.get('n'):>5} {who} b={rec.get('plane_batch')}"
+    tag = (f"{rec['arm']:9s} n={rec.get('n'):>5} {who} "
+           f"p={rec.get('plane_batch'):>3} y={rec.get('pencil_batch'):>3} "
+           f"{rec.get('source', '-'):5s}")
     if not rec.get("completed"):
         why = "OOM" if rec.get("oom") else ("DIED" if rec.get("died_without_report")
                                             else "ERR")
         return f"{tag}  {why}: {str(rec.get('error') or rec.get('stderr_tail',''))[:70]}"
+    if rec["arm"] == "noise":
+        return f"{tag}  field generation alone {rec['gen']['median_s']:8.3f} s"
     if rec["arm"] == "roundtrip":
         pk = rec.get("peak_bytes_in_use")
         pk_s = f"{pk / 1024**3:7.2f} GiB" if pk else "      n/a"
@@ -249,6 +299,17 @@ def main(argv=None):
                     help=f"plane_batch ladder (default {DEFAULT_BATCHES})")
     ap.add_argument("--slab", type=int, default=32)
     ap.add_argument("--pencil-batch", type=int, default=1)
+    ap.add_argument("--pencil-batches", default=None,
+                    help="pass-2 batch ladder. 974643 varied plane_batch (pass "
+                         "1) over 1/4/16 and read 77.78/77.53/77.76 s -- a dead "
+                         "knob -- while THIS one stayed pinned at 1 in every "
+                         "leg, and pass 2 is the strided one: it reads "
+                         "spec[:, y, :] across the whole 34.4 GB spectrum 2048 "
+                         "times. An axis nothing varied is not an axis anything "
+                         "was learned about.")
+    ap.add_argument("--source", default="noise", choices=("noise", "flat"),
+                    help="what the forward transforms; 'flat' takes the host "
+                         "RNG out of the timed region")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--timing-n", type=int, default=None,
@@ -275,7 +336,9 @@ def main(argv=None):
         elif args.arm == "timing":
             rec = arm_timing(args.n, args.slab, args.plane_batch,
                              args.pencil_batch, not args.host_path, args.seed,
-                             args.reps)
+                             args.reps, source=args.source)
+        elif args.arm == "noise":
+            rec = arm_noise(args.n, args.slab, args.seed, args.reps)
         else:
             raise ValueError(args.arm)
         print("WORKER_JSON " + json.dumps(rec), flush=True)
@@ -284,12 +347,14 @@ def main(argv=None):
     sizes = [int(s) for s in (args.sizes or
                               (SMOKE_SIZES if args.smoke else DEFAULT_SIZES)).split(",")]
     batches = [int(b) for b in (args.batches or DEFAULT_BATCHES).split(",")]
+    pencils = [int(y) for y in (args.pencil_batches or DEFAULT_PENCILS).split(",")]
     if args.smoke:
         args.reps = min(args.reps, 2)
-        batches = batches[:2]
+        batches, pencils = batches[:2], pencils[:2]
 
-    print(f"D1: the plane-factorized device FFT. sizes={sizes} batches={batches} "
-          f"slab={args.slab} reps={args.reps}", flush=True)
+    print(f"D1: the plane-factorized device FFT. sizes={sizes} "
+          f"plane_batches={batches} pencil_batches={pencils} "
+          f"source={args.source} slab={args.slab} reps={args.reps}", flush=True)
     print(f"the bar: {WALL_S / 3600:.0f} h wall / 40 steps = "
           f"{WALL_S / 40:.0f} s per step; the coarse solve is "
           f"{TRANSFORMS_PER_STEP} transforms of it", flush=True)
@@ -308,14 +373,25 @@ def main(argv=None):
         print("no size roundtripped: NOTHING IS TIMED. A wall for a transform "
               "that did not come back is not a reading.", flush=True)
     else:
-        # --- the wall, over the batch ladder
+        # --- field generation alone: the term 974643 timed inside its forward
+        rec = spawn(args, "noise", timing_n, 1, device=False)
+        recs.append(rec)
+        print(_line(rec), flush=True)
+        # --- the wall over pass 1's knob, then over pass 2's
         for b in batches:
-            rec = spawn(args, "timing", timing_n, b, device=True)
+            rec = spawn(args, "timing", timing_n, b, device=True,
+                        source=args.source)
+            recs.append(rec)
+            print(_line(rec), flush=True)
+        for y in pencils:
+            rec = spawn(args, "timing", timing_n, batches[0], device=True,
+                        pencil_batch=y, source=args.source)
             recs.append(rec)
             print(_line(rec), flush=True)
         # --- the ratio's other leg, in THIS job
         if not args.no_host_leg:
-            rec = spawn(args, "timing", timing_n, 1, device=False)
+            rec = spawn(args, "timing", timing_n, 1, device=False,
+                        source=args.source)
             recs.append(rec)
             print(_line(rec), flush=True)
 
@@ -347,6 +423,7 @@ def main(argv=None):
     path = os.path.join(OUT_DIR, f"d1_device_fft{args.out_suffix}.json")
     with open(path, "w") as fh:
         json.dump(dict(sizes=sizes, batches=batches, slab=args.slab,
+                       pencils=pencils, source=args.source,
                        reps=args.reps, bar_s_per_step=WALL_S / 40,
                        arms=recs, provenance=_provenance()), fh, indent=1)
     print(f"wrote {path}", flush=True)

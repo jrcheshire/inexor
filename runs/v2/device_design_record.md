@@ -4,10 +4,12 @@ Opened 2026-09-06, branch `jc/device-step-4096`. This is the design record that
 `m6_scaling_record.md` sec. 5y "Owed" names. Its companion is that record's
 sec. 5y and 5z, which price the design and are not repeated here.
 
-**Status: designed and priced, nothing built.** Every number below is
-arithmetic over a design or a reading carried across from 5y/5z. The one thing
-this record adds that was not in either is the MEMORY budget, and it changes
-what the binding constraint is.
+**Status: priced; one rung built and measured (D1, sec. 7).** Sections 1-6 are
+arithmetic over a design plus readings carried from 5y/5z; the one thing they
+add that was in neither is the MEMORY budget, which changes what the binding
+constraint is. Section 7 is the first MEASUREMENT of any part of this design:
+the coarse solve's transform, which is correct at 2048^3 and 78x its projected
+wall.
 
 ## 1. The design
 
@@ -127,8 +129,101 @@ alive and the device peak equals the whole working set.
 
 ## 6. Owed
 
-1. The plane-factorized device FFT (also the largest per-GPU phase, sec. 2).
+1. ~~The plane-factorized device FFT.~~ **BUILT AND MEASURED, sec. 7**:
+   correct at 2048^3 (6.68e-06) and streaming (0.0034x of the spectrum). Its
+   WALL is 78x the projection and the step floor moves with it. Still owed off
+   it: the pass-2 access pattern (`pencil_batch`, the axis 974643 never varied)
+   and a four-GPU reading.
 2. A decision on `slack` / `alloc_margin` at c-hero (sec. 2, item 3).
 3. The IC stage at 4096^3: a machine and a policy (sec. 3).
-4. This record's budget re-read against a measurement, the first time any part
-   of the device pipeline runs at scale.
+4. **The per-GPU budget's `coarse_solve` line re-read against sec. 7.** Sec. 2
+   prices that phase at 60.2 GB from the MONOLITHIC form's terms
+   (`coarse_kernel_build_f64` + `coarse_fft_workspace`, 51.6 of the 60.2). The
+   factorized form does not allocate them -- it peaked at 117.5 MB -- so the
+   per-GPU column is now conservative by ~50 GB and the 0.91x should fall once
+   `DEVICE_PLACEMENT` learns the factorized terms. Not corrected here: the
+   budget must not be edited to match a measurement of code that has not yet
+   replaced the code it prices.
+
+## 7. D1, Vista 974643 -- the factorized device FFT is CORRECT at 2048^3, and the coarse solve is 78x its projection
+
+`f9f973f`, 2026-09-06, gb node c672-004 (4x GB200), 35:20 wall, all legs rc=0,
+~0.6 SU. `scripts/v2_d1_device_fft_vista.sbatch`, one GPU. Card:
+`runs/v2/d1_device_fft_gb.json`. jax 0.10.2.
+
+### The two witnesses that decided it, both PASS
+
+| n | roundtrip max\|d\|/rms | device peak | peak / spectrum |
+|---|---|---|---|
+| 512^3 | 4.053e-06 | 8.4 MB | 0.0156 |
+| 1024^3 | 6.199e-06 | 29.4 MB | 0.0068 |
+| **2048^3** | **6.676e-06** | **117.5 MB** | **0.0034** |
+
+**The factorized form does NOT inherit the monolithic form's silent-wrong
+class.** The monolithic `jnp.fft.rfftn` read 3.8e+3 at 1536^3 on this stack;
+factorized, 2048^3 reads 6.68e-06 -- the same order as 512 and 1024, rising
+mildly with n as accumulated rounding should. This is the result the rung
+existed to get, and it is what keeps the device coarse solve alive.
+
+**And it streams.** 117.5 MB of device high-water against a 34.4 GB spectrum.
+The spectrum stayed on the host, which is the property the per-GPU budget of
+sec. 2 assumes.
+
+### The wall, and the correction to it
+
+Every reading was repeatable to the third digit (forward 77.8/77.8/77.8).
+
+| leg (one GB200 unless stated) | forward | inverse |
+|---|---|---|
+| device, plane_batch 1 / 4 / 16 | 77.78 / 77.53 / 77.76 s | 31.32 / 30.72 / 30.84 s |
+| host out-of-core, same node, same job | 114.13 s | 69.98 s |
+
+**The forward legs time the host RNG, and the number to quote is the inverse.**
+A forward has exactly one thing an inverse does not: generating the field, 8.6e9
+gaussians at 2048^3. Device forward-minus-inverse is 46.5 s; host
+forward-minus-inverse is 44.1 s. Two different backends agree to 5% on an
+excess that must be identical if it is the shared host generator, so the
+transform costs **31.3 s on device and 70.0 s on the host**, and:
+
+- **coarse solve = 4 transforms = ~125 s/step on ONE GPU, 11.6% of the 1080 s
+  bar.** Device is **2.23x** the host form, not the 1.9x the readout printed
+  from the contaminated legs.
+- The gb probe projected **0.4 s/step** for this term, already divided by four
+  GPUs -- 1.6 s on one. Measured is **78x that**. The projection was scaled
+  `n^3 log n` device compute; this transform is not compute-bound.
+- **The step floor moves.** 5y's 114 s/step carried the coarse solve at 0.4 s.
+  At a perfect 4-way split it becomes ~145 s/step (0.13x of the bar); with no
+  split, ~239 s/step (0.22x). It still fits, but the margin falls from 9.5x to
+  4-7x and the coarse solve goes from a rounding error to the second-largest
+  term after the tile force.
+
+### Two defects in the instrument, both mine, both found by reading the card
+
+1. **The forward leg timed field generation inside the transform** (above). The
+   headline it printed, 169.7 s/step, is ~45 s of host RNG the engine will
+   never do -- its forward's source is the painted density mesh, already in
+   memory. Same class as 5y finding 5, where a host phase was scaled as device
+   work; caught the same way, by reading the card rather than the summary.
+2. **The ladder varied the dead axis.** plane_batch (pass 1) read
+   77.78 / 77.53 / 77.76 -- identical digits -- while pencil_batch (pass 2)
+   stayed pinned at 1 in all four legs. Pass 2 is the strided one: it reads
+   `spec[:, y, :]` across the whole 34.4 GB spectrum 2048 times, with 16.8 MB
+   between consecutive x rows. **The axis that could move the number is the one
+   nothing varied.**
+
+The same numpy pass-2 code on the laptop at n=512 reads 0.403 s at
+pencil_batch=1 against 0.118 at 8. That is a small config on different
+hardware and bounds the payoff on Grace in NEITHER direction; it says only that
+the axis is alive, which is why the ladder is worth a job.
+
+### What this does NOT establish
+
+- **Any four-GPU number.** Every reading is one GB200. The 4-way split is
+  assumed in the step-floor arithmetic above exactly as it was in 5y.
+- **Where the 31.3 s goes.** Pass 2's access pattern is the leading suspect and
+  it is a suspect, not a finding. The next candidate is the per-plane
+  host<->device transfer.
+- **f64.** All legs are f32, which is what the coarse mesh runs (D-v2-22).
+- The 1024^3 leg reads 6.20e-06 against the 2.9e-06 that 972737's MONOLITHIC
+  1024^3 read. Different factorization, different rounding; same order, so the
+  stack has not moved. Do not quote them as the same measurement.
