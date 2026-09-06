@@ -171,6 +171,243 @@ def irfftn_ooc(spec, n_mesh, workers=_DEF_WORKERS):
 
 
 # ---------------------------------------------------------------------------
+# the device path: the SAME factorization, planes transformed on an accelerator
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS AT ALL. The coarse solve at 4096^3 is a 2048^3 transform. The
+# monolithic device form does not fit (peak/field 8.0x measured, 275 GB against
+# a GB200's 185 GiB) and the HOST out-of-core form above costs 417 s/step, 39%
+# of a gb node's 1080 s per-step budget on its own. Factorized per plane it is
+# projected at 0.4 s. Same factorization as the host path, different executor.
+#
+# The spectral array stays HOST-RESIDENT here exactly as it does above: only
+# planes cross to the device. That is the property that makes the design's
+# memory work, not an implementation detail.
+
+#: A device transform at or above this many elements is REFUSED, never attempted.
+#:
+#: MEASURED (Vista 972737, jax 0.10.2 + GB200, record 5y finding 2):
+#: `jnp.fft.rfftn` of a 1536^3 f32 field -- 3.6e9 elements -- returns a WRONG
+#: transform SILENTLY. Its roundtrip reads max|d|/rms 3.8e+3 where 1024^3
+#: (1.07e9 elements) reads 2.9e-6, with the same peak/field ratio and a
+#: plausible wall, so nothing about the call looks wrong from outside. 2^31 is
+#: where those two readings bracket; the cuFFT 32-bit-plan class is the obvious
+#: suspect and is NOT measured, so treat the bound as empirical.
+#:
+#: The factorization below never approaches it -- one 2048^2 plane is 4.2e6
+#: elements, three orders under. This guard is for the batch knobs and for any
+#: caller who reaches past them for a monolithic transform. It refuses rather
+#: than checking a receipt afterwards because a wrong spectrum that is merely
+#: reported is still a wrong spectrum, and D-007's discipline is to refuse.
+MAX_DEVICE_TRANSFORM_ELEMENTS = 2**31
+
+
+def refuse_oversize_device_transform(n_elements, what="transform"):
+    """Refuse a device FFT big enough to hit the silent-wrong-result class."""
+    n_elements = int(n_elements)
+    if n_elements >= MAX_DEVICE_TRANSFORM_ELEMENTS:
+        raise ValueError(
+            f"{what} of {n_elements:,} elements is at or above the "
+            f"{MAX_DEVICE_TRANSFORM_ELEMENTS:,} bound where a device FFT has "
+            "been MEASURED to return a wrong result silently (1536^3 f32 "
+            "roundtrip 3.8e+3 against 1024^3's 2.9e-6, Vista 972737). "
+            "Factorize it: the plane is the unit."
+        )
+
+
+def _require_x64_for(dtype):
+    """f64 on device needs the caller to have enabled x64, or it silently narrows.
+
+    Same contract and same reason as `eject_jax.require_x64`: this library never
+    toggles `jax_enable_x64`, and with it off a float64 field is transformed at
+    single precision and handed back in a float64 container, which is a wrong
+    answer wearing the right dtype.
+    """
+    if np.dtype(dtype) != np.float64:
+        return
+    import jax
+
+    if not jax.config.read("jax_enable_x64"):
+        raise RuntimeError(
+            "the device FFT path was given a float64 field with jax_enable_x64 "
+            "off: jax would narrow it to f32 and the complex128 output would be "
+            "single precision wearing a double dtype. Enable x64 in the caller "
+            "(this library never toggles it), or pass a float32 field."
+        )
+
+
+def _check_spectral_dtype(got, want, what):
+    """The dtype ledger, on the seam where a silent upcast would hide.
+
+    `np.fft` upcasts f32 to complex128 and that is why the host path uses scipy;
+    the device path has the mirror-image risk (a narrowing under x64-off). An
+    f32 arm that came back complex128 would pass every value comparison in this
+    module and double the spectral residency the whole design is sized on.
+    """
+    if np.dtype(got) != np.dtype(want):
+        raise TypeError(
+            f"{what} returned {np.dtype(got).name}, want {np.dtype(want).name}: "
+            "the device FFT changed precision underneath the caller"
+        )
+
+
+def rfft2_planes_device(planes, plane_batch=1, out=None):
+    """Pass 1 on device: 2-D real FFTs of axis-0 planes, (t, N, N) -> (t, N, M).
+
+    numpy in, numpy out -- the spectrum is host-resident by design.
+
+    `plane_batch` IS PART OF THE TRANSFORM'S DEFINITION, not a free knob. The
+    host path fixed its unit at one plane because pocketfft's results are
+    batch-size dependent at the bit level (module docstring: 341 elements on a
+    32^3 f64 field), and there is no reason to expect a device FFT library to be
+    kinder. So the default is 1, matching the host unit, and any card or record
+    that quotes a spectrum must carry the batch beside it. What IS guaranteed is
+    that `slab` cannot move a bit at fixed `plane_batch` -- streaming stays an
+    outer loop bound, which is the property D-v2-15 clause 5 is defined against.
+    """
+    import jax.numpy as jnp
+
+    a = np.asarray(planes)
+    if a.ndim != 3 or a.shape[1] != a.shape[2]:
+        raise ValueError(f"want (t, N, N) planes, got {a.shape}")
+    t, n = a.shape[0], a.shape[1]
+    _require_x64_for(a.dtype)
+    b = max(1, int(plane_batch))
+    refuse_oversize_device_transform(b * n * n, "device rfft2 batch")
+    cd = _cdtype_for(a.dtype)
+    if out is None:
+        out = np.empty((t, n, n // 2 + 1), dtype=cd)
+    for lo in range(0, t, b):
+        hi = min(lo + b, t)
+        d = np.asarray(jnp.fft.rfft2(jnp.asarray(a[lo:hi]), axes=(-2, -1)))
+        _check_spectral_dtype(d.dtype, cd, "device rfft2")
+        out[lo:hi] = d
+    return out
+
+
+def fft_axis0_device_inplace(spec, inverse=False, pencil_batch=1):
+    """Pass 2 on device: (i)fft along axis 0, y-pencil-planes at a time, in place.
+
+    The host twin's unit is one (N, M) pencil-plane; `pencil_batch` widens it and
+    carries the same definitional status as `plane_batch` above.
+    """
+    import jax.numpy as jnp
+
+    fn = jnp.fft.ifft if inverse else jnp.fft.fft
+    n, ny, m = spec.shape
+    b = max(1, int(pencil_batch))
+    refuse_oversize_device_transform(b * n * m, "device axis-0 fft batch")
+    for lo in range(0, ny, b):
+        hi = min(lo + b, ny)
+        blk = np.ascontiguousarray(spec[:, lo:hi, :])
+        d = np.asarray(fn(jnp.asarray(blk), axis=0))
+        _check_spectral_dtype(d.dtype, spec.dtype, "device axis-0 fft")
+        spec[:, lo:hi, :] = d
+    return spec
+
+
+def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
+                              pencil_batch=1):
+    """Device twin of `forward_from_slabs`; identical structure, identical contract."""
+    n = int(n_mesh)
+    slab = n if slab is None else int(slab)
+    if slab < 1:
+        raise ValueError(f"slab must be >= 1, got {slab}")
+    spec = None
+    for lo in range(0, n, slab):
+        hi = min(lo + slab, n)
+        s = np.asarray(slab_fn(lo, hi))
+        if s.shape != (hi - lo, n, n):
+            raise ValueError(f"slab_fn({lo}, {hi}) returned shape {s.shape}, "
+                             f"want {(hi - lo, n, n)}")
+        if spec is None:
+            spec = np.empty(_spec_shape(n), dtype=_cdtype_for(s.dtype))
+        rfft2_planes_device(s, plane_batch=plane_batch, out=spec[lo:hi])
+    fft_axis0_device_inplace(spec, pencil_batch=pencil_batch)
+    return spec
+
+
+def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
+                            pencil_batch=1):
+    """Device twin of `inverse_to_slabs`. MUTATES spec, exactly as that one does."""
+    import jax.numpy as jnp
+
+    n = int(n_mesh)
+    slab = n if slab is None else int(slab)
+    fft_axis0_device_inplace(spec, inverse=True, pencil_batch=pencil_batch)
+    rdtype = np.float64 if spec.dtype == np.complex128 else np.float32
+    b = max(1, int(plane_batch))
+    refuse_oversize_device_transform(b * n * n, "device irfft2 batch")
+    for lo in range(0, n, slab):
+        hi = min(lo + slab, n)
+        out = np.empty((hi - lo, n, n), dtype=rdtype)
+        for i in range(lo, hi, b):
+            j = min(i + b, hi)
+            d = np.asarray(jnp.fft.irfft2(jnp.asarray(spec[i:j]), s=(n, n),
+                                          axes=(-2, -1)))
+            _check_spectral_dtype(d.dtype, rdtype, "device irfft2")
+            out[i - lo : j - lo] = d
+        yield lo, out
+
+
+# ---------------------------------------------------------------------------
+# the roundtrip receipt
+# ---------------------------------------------------------------------------
+
+
+def plane_noise(n_mesh, plane, fdtype, seed=0):
+    """One deterministic plane of white noise, keyed by its OWN index.
+
+    Keyed per plane rather than per slab so the field a receipt transforms is
+    independent of the streaming decomposition -- otherwise the slab-invariance
+    gate would be comparing two different fields and would pass by construction.
+    Same reason the IC stage keys its noise stream per plane.
+    """
+    rng = np.random.default_rng([int(seed), int(plane)])
+    return rng.standard_normal((int(n_mesh), int(n_mesh))).astype(fdtype)
+
+
+def roundtrip_residual(n_mesh, fdtype=np.float32, seed=0, slab=_DEF_SLAB,
+                       plane_batch=1, pencil_batch=1, device=True):
+    """max|forward-then-inverse - original| / rms(original). THE receipt.
+
+    Streams: the field is regenerated plane by plane for the comparison rather
+    than held, so this is runnable at 2048^3 where a resident field is 34.4 GB.
+
+    This is the measurement that catches the silent-wrong-transform class. It is
+    reported, never asserted here -- what a caller does with 3.8e+3 is a gate's
+    decision, and `MAX_DEVICE_TRANSFORM_ELEMENTS` is what makes the wrong regime
+    unreachable in the first place.
+    """
+    n = int(n_mesh)
+    fwd = forward_from_slabs_device if device else None
+    if device:
+        spec = fwd(lambda lo, hi: np.stack(
+            [plane_noise(n, i, fdtype, seed) for i in range(lo, hi)]),
+            n, slab=slab, plane_batch=plane_batch, pencil_batch=pencil_batch)
+        gen = inverse_to_slabs_device(spec, n, slab=slab,
+                                      plane_batch=plane_batch,
+                                      pencil_batch=pencil_batch)
+    else:
+        spec = forward_from_slabs(lambda lo, hi: np.stack(
+            [plane_noise(n, i, fdtype, seed) for i in range(lo, hi)]),
+            n, slab=slab)
+        gen = inverse_to_slabs(spec, n, slab=slab)
+    max_abs, sq, count = 0.0, 0.0, 0
+    for lo, got in gen:
+        for i in range(got.shape[0]):
+            want = plane_noise(n, lo + i, fdtype, seed)
+            max_abs = max(max_abs, float(np.max(np.abs(got[i] - want))))
+            sq += float(np.sum(np.square(want, dtype=np.float64)))
+            count += want.size
+    rms = np.sqrt(sq / max(count, 1))
+    return {"n_mesh": n, "dtype": np.dtype(fdtype).name, "slab": int(slab),
+            "plane_batch": int(plane_batch), "pencil_batch": int(pencil_batch),
+            "device": bool(device), "max_abs": max_abs, "rms": float(rms),
+            "residual": float(max_abs / rms) if rms else float("inf")}
+
+
+# ---------------------------------------------------------------------------
 # spectral multipliers (slab-built, f64 precision island, k_components
 # conventions: fftfreq-signed ik; k = 0 -> 1/k^2 = 1 with ik zero there)
 # ---------------------------------------------------------------------------

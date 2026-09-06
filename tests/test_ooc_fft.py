@@ -181,3 +181,162 @@ def test_require_fits_refuses_loudly():
         ooc_fft.require_fits(2048, np.float64, "derivative", budget_bytes=116e9)
     plan = ooc_fft.require_fits(2048, np.float32, "derivative", budget_bytes=116e9)
     assert plan["peak"] < 116e9
+
+
+# ------------------------------------------------------- the device path (D1)
+#
+# Same factorization on an accelerator, so the same discipline: BITWISE for
+# anything that must be invariant WITHIN a backend, tolerance only across two.
+# Cross-backend bitwise is deliberately NOT asserted -- on this laptop's CPU
+# jax the device path happens to reproduce scipy exactly, and a test that
+# pinned that would fail on the GPU this code exists for, for a legitimate
+# reason. `MAX_DEVICE_TRANSFORM_ELEMENTS` is the one gate that is about
+# correctness rather than reproducibility.
+
+pytest.importorskip("jax")
+
+
+def _fwd_dev(field, slab, **kw):
+    return ooc_fft.forward_from_slabs_device(
+        lambda lo, hi: field[lo:hi], N, slab=slab, **kw)
+
+
+def test_device_forward_is_bitwise_invariant_to_slab_thickness(field32):
+    """Streaming stays an OUTER LOOP BOUND on device too.
+
+    This is the property the whole design rests on: the spectrum of a 2048^3
+    field must not depend on how many planes were resident at a time, or a
+    checkpoint/resume or a different window size silently changes the physics.
+    """
+    ref = _fwd_dev(field32, N)
+    for slab in (1, 7, 8, N):
+        got = _fwd_dev(field32, slab)
+        assert got.dtype == ref.dtype
+        assert np.array_equal(got, ref), f"device slab={slab} moved bits"
+
+
+def test_device_inverse_is_bitwise_invariant_to_slab(field32):
+    spec = _fwd_dev(field32, N)
+    ref = np.empty_like(field32)
+    for lo, s in ooc_fft.inverse_to_slabs_device(spec.copy(), N, slab=N):
+        ref[lo : lo + s.shape[0]] = s
+    for slab in (1, 7, 8):
+        out = np.empty_like(field32)
+        for lo, s in ooc_fft.inverse_to_slabs_device(spec.copy(), N, slab=slab):
+            out[lo : lo + s.shape[0]] = s
+        assert np.array_equal(out, ref), f"device inverse slab={slab} moved bits"
+
+
+def test_device_invariance_can_fail(field32):
+    """Anti-vacuity for the two above.
+
+    FOUR ulps, not one, and the number is MEASURED rather than picked. At f32 a
+    one-ulp change to a single element of a 32^3 field is genuinely invisible
+    through the transform -- n_diff 0 of 17,408 spectral elements -- because
+    2.98e-08 against a spectrum of order 5 is below f32 eps. The ladder reads
+    1 -> 0, 4 -> 314, 64 -> 4,230, 1024 -> 17,344. So four is the smallest
+    perturbation that this comparison can actually see, which is the strongest
+    honest form of the arm; a bigger bump would prove less.
+
+    Two traps sit in writing it. `np.nextafter(x_f32, np.inf)` promotes to
+    float64 (np.inf is a Python float) and storing it back into an f32 array
+    rounds it to the value it started from, so the destination dtype has to be
+    in the call -- the f64 twin higher in this file does not have that problem,
+    which is why it reads `np.inf`. And the assert below that the perturbation
+    changed the input is not decoration: without it, both forms of no-op above
+    would have made the two invariance gates vacuous instead of failing here.
+    """
+    ref = _fwd_dev(field32, N)
+    bumped = field32.copy()
+    for _ in range(4):
+        bumped[13, 0, 0] = np.nextafter(bumped[13, 0, 0], np.float32(np.inf))
+    assert bumped[13, 0, 0] != field32[13, 0, 0], "the perturbation was a no-op"
+    assert not np.array_equal(_fwd_dev(bumped, N), ref)
+
+
+def test_device_matches_the_host_path_at_tolerance(field32):
+    """Across backends, tolerance -- and the tolerance is checked against the
+
+    spectrum's own scale, not an absolute number, so it cannot pass by the
+    array being small.
+    """
+    host = ooc_fft.rfftn_ooc(field32.copy())
+    dev = _fwd_dev(field32, 8)
+    scale = np.sqrt(np.mean(np.abs(host) ** 2))
+    assert scale > 1e-3, "vacuous: the reference spectrum is ~zero"
+    assert np.max(np.abs(host - dev)) / scale < 1e-5
+
+
+def test_device_preserves_single_precision(field32):
+    """The dtype ledger on the seam where a silent precision change would hide."""
+    spec = _fwd_dev(field32, 8)
+    assert spec.dtype == np.complex64
+    out = np.empty_like(field32)
+    for lo, s in ooc_fft.inverse_to_slabs_device(spec, N, slab=8):
+        out[lo : lo + s.shape[0]] = s
+    assert out.dtype == np.float32
+
+
+def test_f64_on_device_refuses_rather_than_narrowing(field64):
+    """With x64 off jax would transform an f64 field at f32 and hand it back in
+
+    an f64 container: a wrong answer wearing the right dtype. Same contract as
+    `eject_jax.require_x64`, and the suite runs x64-off by default.
+    """
+    import jax
+
+    if jax.config.read("jax_enable_x64"):
+        pytest.skip("x64 is on in this session; the narrowing cannot occur")
+    with pytest.raises(RuntimeError, match="jax_enable_x64"):
+        _fwd_dev(field64, 8)
+
+
+def test_a_transform_at_the_silent_wrong_bound_is_refused():
+    """The measured failure this whole factorization exists to make unreachable.
+
+    1536^3 f32 (3.6e9 elements) came back SILENTLY WRONG on jax 0.10.2 + GB200
+    -- roundtrip 3.8e+3 against 1024^3's 2.9e-6, same peak ratio, plausible
+    wall. Refuse the regime rather than report a receipt from inside it.
+    """
+    with pytest.raises(ValueError, match="silently"):
+        ooc_fft.refuse_oversize_device_transform(2**31, "test")
+    with pytest.raises(ValueError, match="silently"):
+        ooc_fft.refuse_oversize_device_transform(1536**3, "the measured case")
+    # anti-vacuity: the bound is a bound, not a blanket refusal. One 2048^2
+    # plane -- the unit the coarse solve actually runs -- is three orders under.
+    ooc_fft.refuse_oversize_device_transform(2**31 - 1, "just under")
+    ooc_fft.refuse_oversize_device_transform(2048 * 2048, "one coarse plane")
+
+
+def test_the_batch_knobs_cannot_reach_the_bound_unnoticed(field32):
+    """A batch big enough to hit the silent regime is refused, not attempted."""
+    with pytest.raises(ValueError, match="silently"):
+        ooc_fft.rfft2_planes_device(field32, plane_batch=2**31 // (N * N) + 1)
+
+
+def test_the_receipt_is_plane_keyed_so_the_field_is_slab_independent():
+    """If the receipt's field depended on the slab, the invariance gates above
+
+    would be comparing two different fields and would pass by construction.
+    """
+    a = ooc_fft.plane_noise(N, 5, np.float32, seed=3)
+    b = ooc_fft.plane_noise(N, 5, np.float32, seed=3)
+    c = ooc_fft.plane_noise(N, 6, np.float32, seed=3)
+    assert np.array_equal(a, b)
+    assert not np.array_equal(a, c)
+
+
+def test_the_roundtrip_receipt_reads_the_f32_floor_on_both_paths():
+    """The instrument the 2048^3 measurement will be read off, exercised small.
+
+    Reported as a number, not asserted into a verdict: what counts as a pass at
+    a given n is a gate's decision. Here it must simply be at the f32 floor and
+    nowhere near the 3.8e+3 the wrong regime produced.
+    """
+    dev = ooc_fft.roundtrip_residual(N, np.float32, slab=8, device=True)
+    host = ooc_fft.roundtrip_residual(N, np.float32, slab=8, device=False)
+    assert dev["residual"] < 1e-4, dev
+    assert host["residual"] < 1e-4, host
+    assert dev["rms"] > 0.5, "vacuous: the receipt transformed a ~zero field"
+    for k in ("n_mesh", "dtype", "slab", "plane_batch", "pencil_batch"):
+        assert k in dev, f"the receipt must carry {k} beside the number"
