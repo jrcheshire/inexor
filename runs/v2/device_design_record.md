@@ -287,10 +287,18 @@ did not have either.
 
 ### Where the time actually goes -- a suspect with arithmetic, not a finding
 
-One transform moves ~275 GB across host<->device (pass 1 reads the 34.4 GB
-field and writes the 34.4 GB spectrum; pass 2 reads and writes it again; both
-directions). At 31.3 s that is **8.8 GB/s effective, against the 201 GB/s this
-same hardware streams from PINNED host memory** (974476, sec. 5z) -- a 23x gap.
+One transform moves **~137.5 GB** across host<->device. The inverse: pass 2
+reads and writes the 34.4 GB spectrum (68.8), then the per-plane irfft2 reads
+the spectrum and writes the 34.4 GB field (68.8). The forward is the same total
+the other way round. At 31.3 s that is **4.4 GB/s effective, against the 201
+GB/s this same hardware streams from PINNED host memory** (974476, sec. 5z) --
+a **46x** gap.
+
+> CORRECTION (same day): this paragraph first read ~275 GB and 8.8 GB/s, both
+> exactly 2x too large -- the expression counted the forward AND the inverse as
+> one transform. The gap is 46x, not the 23x first written here. The conclusion
+> is unchanged and stronger; the arithmetic was wrong and is corrected rather
+> than quietly replaced.
 
 **This project has already measured that tax once**: the gb probe's eject
 kernel read 14 ms on device against 0.528 s end to end through pageable
