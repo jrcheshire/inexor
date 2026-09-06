@@ -168,6 +168,99 @@ def arm_noise(n, slab, seed, reps):
     return rec
 
 
+def arm_transfer(n, mode, reps, seed=0):
+    """ATTRIBUTE the transform's wall: is it the bus, at the unit the FFT uses?
+
+    974807 left ~31 s per transform unexplained. Pass 2's strided access is
+    bounded at ~11% by its own ladder, so the leading suspect is that every
+    transfer in this path is PAGEABLE -- numpy in, `jnp.asarray`, `np.asarray`
+    out -- against the 201 GB/s this hardware streams from PINNED host (5z).
+    One transform moves ~137.5 GB, which at 31.3 s is 4.4 GB/s: a 46x gap.
+
+    This arm does the transform's TRAFFIC and none of its arithmetic, so what
+    comes back is the bus and not the FFT. Both modes move identical bytes in
+    identical units and differ only in the memory kind, and they run in ONE job
+    on ONE node -- 974807's flat-source leg changed the data AND the node at
+    once and its 1.41x is unattributable because of it.
+
+    The unit is one plane, 16.8 MB, because that is what the factorization
+    actually moves; a bandwidth quoted at a 2 GiB chunk would be measuring a
+    different code path's best case.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    dev = jax.devices()[0]
+    kinds = []
+    try:
+        kinds = sorted(dev.memory_stats() and [] or [])
+    except Exception:
+        pass
+    try:
+        kinds = sorted({m.kind for m in dev.addressable_memories()})
+    except Exception:
+        kinds = []
+
+    rec = dict(arm="transfer", n=n, device=True, mode=mode, plane_batch=1,
+               pencil_batch=1, source="-", memory_kinds=kinds)
+
+    real = np.ascontiguousarray(
+        np.random.default_rng(seed).standard_normal((n, n)), dtype=np.float32)
+    spec = np.ascontiguousarray(
+        (np.random.default_rng(seed + 1).standard_normal((n, n // 2 + 1))
+         + 1j * np.random.default_rng(seed + 2).standard_normal((n, n // 2 + 1)))
+        .astype(np.complex64))
+    # One transform's traffic, in the units the factorization moves it in:
+    # 2n plane-sized H2D and 2n plane-sized D2H (module docstring / record 8).
+    units = [real, spec, spec, spec]
+    bytes_per_pass = sum(a.nbytes for a in units) * n
+    rec["planes"] = n
+    rec["bytes_total"] = int(bytes_per_pass)
+
+    if mode == "pinned":
+        try:
+            host_kind = "pinned_host"
+            hs = jax.sharding.SingleDeviceSharding(dev, memory_kind=host_kind)
+            ds = jax.sharding.SingleDeviceSharding(dev)
+            staged = [jax.device_put(a, hs) for a in units]
+            rec["host_kind_used"] = host_kind
+        except Exception as exc:
+            rec.update(completed=False,
+                       error=f"pinned_host unavailable: {type(exc).__name__}: {exc}")
+            return rec
+
+        def once():
+            for a in staged:
+                for _ in range(n):
+                    d = jax.device_put(a, ds)
+                    jax.block_until_ready(d)
+                    b = jax.device_put(d, hs)
+                    jax.block_until_ready(b)
+    elif mode == "pageable":
+        rec["host_kind_used"] = "numpy (pageable)"
+
+        def once():
+            for a in units:
+                for _ in range(n):
+                    d = jnp.asarray(a)
+                    jax.block_until_ready(d)
+                    np.asarray(d)
+    else:
+        raise ValueError(f"unknown transfer mode {mode!r}")
+
+    try:
+        once_small = None
+        rec["move"] = _timed(once, reps)
+        rec["completed"] = True
+        rec["gbps"] = bytes_per_pass / 1e9 / rec["move"]["median_s"]
+        _ = once_small
+    except Exception as exc:
+        rec.update(completed=False, error=f"{type(exc).__name__}: {exc}",
+                   oom="MEMORY" in str(exc).upper())
+    rec["peak_bytes_in_use"] = _peak_bytes()
+    return rec
+
+
 def arm_timing(n, slab, plane_batch, pencil_batch, device, seed, reps,
                source="noise"):
     """The wall, forward and inverse separately, at one batch setting.
@@ -232,16 +325,18 @@ def arm_timing(n, slab, plane_batch, pencil_batch, device, seed, reps,
 # ===========================================================================
 
 
-def spawn(args, arm, n, plane_batch, device, pencil_batch=None, source="noise"):
+def spawn(args, arm, n, plane_batch, device, pencil_batch=None, source="noise",
+          mode="pageable"):
     pencil_batch = args.pencil_batch if pencil_batch is None else pencil_batch
     cmd = [sys.executable, os.path.abspath(__file__), "--single",
            "--arm", arm, "--n", str(n), "--slab", str(args.slab),
            "--plane-batch", str(plane_batch),
            "--pencil-batch", str(pencil_batch), "--source", source,
+           "--mode", mode,
            "--seed", str(args.seed), "--reps", str(args.reps)]
     if not device:
         cmd.append("--host-path")
-    tag = (f"{arm}_{n}_p{plane_batch}_y{pencil_batch}_{source}"
+    tag = (f"{arm}_{n}_p{plane_batch}_y{pencil_batch}_{source}_{mode}"
            f"_{'dev' if device else 'host'}")
     print(f"[worker] {tag} ...", flush=True)
     t0 = time.perf_counter()
@@ -277,6 +372,12 @@ def _line(rec):
         why = "OOM" if rec.get("oom") else ("DIED" if rec.get("died_without_report")
                                             else "ERR")
         return f"{tag}  {why}: {str(rec.get('error') or rec.get('stderr_tail',''))[:70]}"
+    if rec["arm"] == "transfer":
+        if not rec.get("completed"):
+            return f"{tag}  {rec.get('mode')}: {str(rec.get('error'))[:60]}"
+        return (f"{tag}  {rec['mode']:8s} {rec['bytes_total'] / 1e9:7.1f} GB in "
+                f"{rec['move']['median_s']:7.2f} s = {rec['gbps']:6.1f} GB/s "
+                f"[{rec.get('host_kind_used')}]")
     if rec["arm"] == "noise":
         return f"{tag}  field generation alone {rec['gen']['median_s']:8.3f} s"
     if rec["arm"] == "roundtrip":
@@ -307,6 +408,11 @@ def main(argv=None):
                          "spec[:, y, :] across the whole 34.4 GB spectrum 2048 "
                          "times. An axis nothing varied is not an axis anything "
                          "was learned about.")
+    ap.add_argument("--mode", default="pageable", choices=("pageable", "pinned"),
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--transfer", action="store_true",
+                    help="run the pageable-vs-pinned transfer A/B that "
+                         "attributes the transform's wall to the bus or not")
     ap.add_argument("--source", default="noise", choices=("noise", "flat"),
                     help="what the forward transforms; 'flat' takes the host "
                          "RNG out of the timed region")
@@ -339,6 +445,8 @@ def main(argv=None):
                              args.reps, source=args.source)
         elif args.arm == "noise":
             rec = arm_noise(args.n, args.slab, args.seed, args.reps)
+        elif args.arm == "transfer":
+            rec = arm_transfer(args.n, args.mode, args.reps, args.seed)
         else:
             raise ValueError(args.arm)
         print("WORKER_JSON " + json.dumps(rec), flush=True)
@@ -373,6 +481,12 @@ def main(argv=None):
         print("no size roundtripped: NOTHING IS TIMED. A wall for a transform "
               "that did not come back is not a reading.", flush=True)
     else:
+        # --- the bus, both memory kinds, same node, same job
+        if args.transfer:
+            for m in ("pageable", "pinned"):
+                rec = spawn(args, "transfer", timing_n, 1, device=True, mode=m)
+                recs.append(rec)
+                print(_line(rec), flush=True)
         # --- field generation alone: the term 974643 timed inside its forward
         rec = spawn(args, "noise", timing_n, 1, device=False)
         recs.append(rec)
