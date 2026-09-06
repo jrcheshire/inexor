@@ -1934,8 +1934,9 @@ today. Host plumbing is 90% of a tile as the engine stands, which is the
 1.28x-not-6.8x story of 5e restated per tile: a device design that keeps ANY
 per-particle host pass keeps the wall.
 
-**What it does NOT establish, in order of consequence.** (1) That a
-state-sized host set STREAMS: the largest set one GPU streamed was 64 GiB
+**What it does NOT establish, in order of consequence.** (1) [DISCHARGED by
+sec. 5z, 974476: streams to 640 GiB on one GPU, 768 GiB across four, no
+collapse] That a state-sized host set STREAMS: the largest set one GPU streamed was 64 GiB
 against 675 GiB of state, because of finding 1 -- the design's load-bearing
 premise is still unmeasured, and `scripts/v2_m6_gb_stream_vista.sbatch` (flag
 set to 900, ladder to 640 GiB, 4x to 768 GiB total) is written and unsubmitted.
@@ -1984,6 +1985,55 @@ design is opened: the plane-factorized device FFT; a design record for the
 host-state / device-step engine (state layout per socket, slab DMA, the
 per-tile device pipeline with no host pass, migrate insert on device); the
 unmeasured terms measured as they are built, each against this floor.
+
+## 5z. Vista 974476 -- the gb streaming re-run: the host-state premise HOLDS to 640 GiB on one GPU and 768 GiB across four
+
+`e71a788`, 2026-09-06, gb node c672-002, 5:18 wall, both legs rc=0, ~0.1 SU;
+`scripts/v2_m6_gb_stream_vista.sbatch` with `XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=900`
+(the flag 972737 lacked -- sec. 5y finding 1; the job's log carries the echo
+as its receipt). Cards force-added: `g4_gh_memory_gb2_b.json` (one GPU),
+`g4_gh_memory_gb2x4_gpu{0..3}.json` (four at once). `coherent` arm dropped:
+it does not compile on this stack (5y). Readout:
+`v2_m6_gb_probe_readout.py --suffix _gb --stream-suffix _gb2`.
+
+**One GPU, `staged` (pinned host -> device), 3 reps each, sd at the third digit:**
+
+| set GiB | GB/s | wall/rep | device peak | > HBM | note |
+|---|---|---|---|---|---|
+| 64 | 201.2 | 0.34 s | 4.0 GiB | no | matches 972737's 201.3 |
+| 128 | 201.1 | 0.68 | 4.0 | no | |
+| 256 | 201.3 | 1.37 | 4.0 | **yes** | the capacity witness fires |
+| 384 | 201.2 | 2.05 | 4.0 | yes | |
+| 512 | 182.2 | 3.02 | 4.0 | yes | past one socket (LPDDR 488.6 / 489.8 GB per node) |
+| 640 | 165.3 | 4.16 | 4.0 | yes | 62% of host RAM; gh COLLAPSED 150-270x at 67% |
+
+Device peak pinned at 4.0 GiB = 2 chunks at every rung: the sets streamed,
+none was copied wholesale. **No collapse.** The rate is flat at 201 GB/s
+while the set fits one socket and eases to 0.82x by 640 GiB as it spans both,
+which is the cross-socket share rising, not a cliff. The state at 4096^3 is
+675 GiB (10.54 B/p) -- 5% above the top rung, on a monotone 201 -> 182 -> 165
+trend; the ladder stopped at 640 by my choice, not the node's.
+
+**Four GPUs at once, `staged`, one process per card, unpinned:** 167-171 GB/s
+each at 64, 128 and 192 GiB (768 GiB of pinned host in flight in total, 75% of
+the node), rates FLAT across the three rungs on every card, all twelve rungs
+completed with the 2-chunk peak. **Aggregate 685 GB/s** = 0.85x of four single
+streams, 0.70x of the two sockets' paper supply (2 x 486). The readout bills a
+step's 2 x 724 GB at this rate: 2.1 s.
+
+**What it establishes.** The design's load-bearing premise -- a host-resident
+state larger than HBM, larger than one socket, streamed to the GPUs at a
+useful rate -- holds on Vista gb at the sizes the design needs, with the
+pinned-host allocation itself never the limit once the flag is set. The 5y
+projection stands unchanged at **114 s/step, 1.3 h at K=40, 0.11x of the 12 h
+wall's bar**, still a FLOOR (insert, repack, kick, host bookkeeping, the
+4-way split).
+
+**What it does not.** 640 is not 675 GiB (an extrapolation of 5% on a smooth
+trend, not a measurement); the four-GPU leg is unpinned (NUMA placement of
+each process against its card's socket is untested and could only help);
+`gb` only -- on gh the same ladder collapsed at 128 of 192 GiB, and Horizon's
+gb is a 240 GiB host.
 
 ## 6. What is NOT established
 
@@ -2084,9 +2134,8 @@ unmeasured terms measured as they are built, each against this floor.
    and needs its disjoint-write premise proved as C2 proved it for tiles before
    anything is built on it.
 
-8. **[2026-09-06] The gb streaming re-run** (`v2_m6_gb_stream_vista.sbatch`, sec. 5y):
-   the host-state premise at state size, blocked in 972737 by the 64 GB host
-   memory limit default. ~20 min, <= 1.5 SU, unsubmitted.
+8. ~~The gb streaming re-run~~ DONE (Vista 974476, sec. 5z): the host-state
+   premise holds to 640 GiB on one GPU and 768 GiB across four, no collapse.
 9. **[2026-09-06] The plane-factorized device FFT for the coarse solve** (sec. 5y
    findings 2 and the 8x workspace): unbuilt; the host form costs 417 s/step
    at 4096^3 and cannot be the design's solve.

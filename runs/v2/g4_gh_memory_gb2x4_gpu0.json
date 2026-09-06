@@ -1,0 +1,129 @@
+{
+ "ladder": [
+  64.0,
+  128.0,
+  192.0
+ ],
+ "chunk_gib": 2.0,
+ "reps": 3,
+ "hbm_bytes": 198674743296,
+ "ceilings_gbs": {
+  "hbm": 3400.0,
+  "lpddr": 486.0,
+  "c2c_read": 375.0,
+  "c2c_write": 297.0
+ },
+ "configs": [
+  {
+   "arm": "staged",
+   "working_set_gib": 64.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GB200",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 32,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 68719476736,
+   "device_bytes_limit": 148176371712,
+   "env_host_limit_gb": "900",
+   "env_mem_fraction": null,
+   "env_preallocate": "false",
+   "alloc_s": 3.2469564653001726,
+   "peak_after_alloc": 4294967808,
+   "peak_after_warmup": 4294967808,
+   "completed": true,
+   "wall_median_s": 0.41115880105644464,
+   "wall_min_s": 0.38813581597059965,
+   "wall_all_s": [
+    0.41189192002639174,
+    0.41115880105644464,
+    0.38813581597059965
+   ],
+   "gbytes_per_s": 167.13609573583238,
+   "peak_total": 4294967808,
+   "hbm_peak_over_working_set": 0.0625000074505806,
+   "hbm_peak_over_chunk": 2.000000238418579,
+   "exceeds_hbm": false,
+   "capacity_witness": false
+  },
+  {
+   "arm": "staged",
+   "working_set_gib": 128.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GB200",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 64,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 137438953472,
+   "device_bytes_limit": 148176371712,
+   "env_host_limit_gb": "900",
+   "env_mem_fraction": null,
+   "env_preallocate": "false",
+   "alloc_s": 6.431087454315275,
+   "peak_after_alloc": 4294967808,
+   "peak_after_warmup": 4294967808,
+   "completed": true,
+   "wall_median_s": 0.8092723661102355,
+   "wall_min_s": 0.8000267441384494,
+   "wall_all_s": [
+    0.812559979967773,
+    0.8092723661102355,
+    0.8000267441384494
+   ],
+   "gbytes_per_s": 169.83028116059344,
+   "peak_total": 4294967808,
+   "hbm_peak_over_working_set": 0.0312500037252903,
+   "hbm_peak_over_chunk": 2.000000238418579,
+   "exceeds_hbm": false,
+   "capacity_witness": false
+  },
+  {
+   "arm": "staged",
+   "working_set_gib": 192.0,
+   "chunk_gib": 2.0,
+   "platform": "gpu",
+   "device": "NVIDIA GB200",
+   "memory_kinds_available": [
+    "device",
+    "pinned_host"
+   ],
+   "host_kind_used": "pinned_host",
+   "jax_version": "0.10.2",
+   "n_chunks": 96,
+   "chunk_elems": 536870912,
+   "working_set_bytes": 206158430208,
+   "device_bytes_limit": 148176371712,
+   "env_host_limit_gb": "900",
+   "env_mem_fraction": null,
+   "env_preallocate": "false",
+   "alloc_s": 15.15524058882147,
+   "peak_after_alloc": 4294967808,
+   "peak_after_warmup": 4294967808,
+   "completed": true,
+   "wall_median_s": 1.204327791929245,
+   "wall_min_s": 1.2031761761754751,
+   "wall_all_s": [
+    1.204327791929245,
+    1.2062489739619195,
+    1.2031761761754751
+   ],
+   "gbytes_per_s": 171.18132753355238,
+   "peak_total": 4294967808,
+   "hbm_peak_over_working_set": 0.0208333358168602,
+   "hbm_peak_over_chunk": 2.000000238418579,
+   "exceeds_hbm": true,
+   "capacity_witness": true
+  }
+ ]
+}

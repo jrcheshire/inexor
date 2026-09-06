@@ -297,7 +297,9 @@ def main():
                      f"at {single_gib:.0f} GiB", None, False, "g4"))
     tops = []
     fails = []
-    for c in (stream_a, stream_b):
+    # a later streaming job (--stream-suffix) supersedes the first job's host
+    # rungs: its failures must not be reported beside the re-run's successes
+    for c in ((stream_a, stream_b) if ss == args.suffix else (stream_b,)):
         for r in (c or {}).get("configs", []):
             if r.get("arm") not in ("staged", "coherent") or r.get("real"):
                 continue
