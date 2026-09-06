@@ -142,6 +142,228 @@ def load_stages(*, n, n_rows, n_buckets, index_itemsize, n_arena, n_bricks,
     return stages
 
 
+# ---------------------------------------------------------------------------
+# The device design: the host is a byte store, the four GPUs do the step.
+# ---------------------------------------------------------------------------
+#
+# WHERE EACH MESH TERM LIVES. This table is a DESIGN ASSERTION, not a reading of
+# code -- the device executor does not exist yet. `MESH_PHASE` lives in `engine`
+# precisely because a term's phase is a property of the code that allocates it;
+# when the device lane exists this table moves into it for the same reason, and
+# until then every verdict below is arithmetic over a design, not over a run.
+#
+#   shard   -- decomposed along x across the GPUs, so each card holds 1/n_gpus.
+#              The coarse mesh is planar-decomposed for the factorized FFT, so
+#              every coarse term follows the same split.
+#   replica -- every card runs whole tiles, so each holds its own copy.
+#   gone    -- the host pass the port deletes.
+DEVICE_PLACEMENT = {
+    "coarse_delta": "shard",
+    "coarse_force_resident": "shard",
+    "coarse_force_copy_transient": "shard",
+    "coarse_kernels": "shard",
+    "coarse_kernel_pref": "shard",
+    "coarse_match_factor": "shard",
+    "coarse_kernel_build_f64": "shard",
+    "coarse_fft_workspace": "shard",
+    # Priced at the HOST path's int64 width, which over-charges the device form:
+    # the sub-block paint accumulates int32 (`painting.paint_tsc_int_subblock`)
+    # and the engine's int64 mesh is the parent-side accumulator the port
+    # deletes. Left at 8 B/cell deliberately -- a budget that guesses its way
+    # DOWN is the shape of a gate that cannot fail.
+    "coarse_accumulator": "shard",
+    "tile_kernels": "replica",
+    "tile_kernel_build_f64": "replica",
+    "tile_kernel_pref": "replica",
+    "tile_workspace": "replica",
+    # `SlotState.decode_bricks` on the host is the pass the design exists to
+    # remove; it has no device counterpart because the rows are decoded inside
+    # the tile kernel from the streamed slab.
+    "coarse_decode_slab": "gone",
+}
+
+# MEASURED, not chosen: `scripts/v2_g4_gh_memory.py` streams pinned host memory
+# in CHUNK_GIB = 2.0 chunks and the device high-water sat at exactly 2 chunks
+# (4.0 GiB) at every rung of the 64 -> 640 GiB ladder, on one GPU and on four
+# (Vista 974476, record 5z). The per-chunk `block_until_ready` is what makes it
+# 2 and not the whole set -- without it XLA keeps every staged copy alive.
+STREAM_CHUNK_BYTES = 2.0 * 2**30
+STREAM_CHUNKS_IN_FLIGHT = 2
+
+
+def device_window_slabs(ec):
+    """x-slabs of bricks that must be resident to serve one plane of tiles.
+
+    DERIVED, not picked. A tile draws from `brick_span` bricks per side
+    (`layout.brick_span`, the same function the engine's membership uses), so
+    walking tiles in x-order needs that many consecutive x-slabs live at once.
+    At c-hero it is 18: 512/32 bricks across the tile plus one brick of pad on
+    each side, and `choose_brick`'s `c | b_fine` contract is what makes the
+    union exactly the padded box rather than a 1.7x superset.
+    """
+    from .layout import brick_span
+
+    nb = max(1, ec.n_fine // ec.n_brick)
+    _pad, span = brick_span(ec.n_tile, ec._b_realized, ec.n_brick, nb)
+    return min(span, nb)
+
+
+def _print_load_and_ic(args, ec, t9, n, rows, arena, shared):
+    """The load path and the IC stage. Shared by both backends, and it is the
+
+    same host either way: whoever does the step, the state is still built on the
+    host and the IC transform is still out of core.
+    """
+    idx_itemsize = t9.index_bytes() // max(t9.n_buckets_side**3, 1)
+    ld = load_stages(
+        n=n, n_rows=rows + arena, n_buckets=t9.n_buckets_side**3,
+        index_itemsize=max(idx_itemsize, 1), n_arena=arena,
+        n_bricks=ec.n_brick and (args.n_fine // ec.n_brick) ** 3,
+        n_slabs=args.slabs, shared=shared,
+    )
+    _table("LOADING THE STATE, peak resident at each stage", ld,
+           total_label="PEAK (max, not sum)", reduce=max)
+    print("  the total line above is a MAX: these stages do not coexist")
+
+    try:
+        from .ooc_fft import plan_bytes
+
+        ic = plan_bytes(args.n_part, np.dtype(args.coarse_dtype), "derivative")
+        print(f"\nIC STAGE (out-of-core, 'derivative' policy): peak "
+              f"{_fmt(ic['peak'])}")
+    except Exception as exc:  # pragma: no cover - informational only
+        print(f"\nIC STAGE: not evaluable here ({exc})")
+    return max(ld.values())
+
+
+def device_budget(ec, *, n, n_gpus, row_bytes=9):
+    """Per-GPU bytes for the host-state / device-step design.
+
+    Returns `(resident, transient, phases)` in the shape the CPU column uses, so
+    the same sum-within-a-phase / max-across discipline applies: glibc's arena
+    behaviour is not the reason on a device, but XLA does not return a buffer to
+    the pool between phases either, and understating a phase is how a run that
+    does not fit gets a FITS.
+    """
+    from .engine import ONCE_PER_RUN_PHASES
+
+    mesh = ec.mesh_bytes()
+    phase_of = ec.mesh_phase()
+    resident, transient, phases = {}, {}, {}
+    for k, v in mesh.items():
+        where = DEVICE_PLACEMENT.get(k)
+        if where is None:
+            raise KeyError(
+                f"mesh term {k!r} has no entry in DEVICE_PLACEMENT. A new term "
+                "must be placed deliberately: defaulting it to either side is "
+                "how an omitted term becomes a budget that cannot be traded "
+                "against, which is what this module exists to prevent.")
+        if where == "gone":
+            continue
+        b = int(v / n_gpus) if where == "shard" else int(v)
+        p = phase_of[k]
+        if p == "resident":
+            resident[k] = b
+        else:
+            transient[k] = b
+        for one in (p,) if isinstance(p, str) else p:
+            if one != "resident":
+                phases[one] = phases.get(one, 0) + b
+
+    # The two terms the CPU model has no name for, because on the CPU path the
+    # state IS the working set and nothing streams.
+    slabs = device_window_slabs(ec)
+    nb = max(1, ec.n_fine // ec.n_brick)
+    resident["slab_window (state rows a tile plane needs)"] = int(
+        slabs * (n / nb) * row_bytes)
+    resident["stream_chunks_in_flight"] = int(
+        STREAM_CHUNKS_IN_FLIGHT * STREAM_CHUNK_BYTES)
+
+    in_step = sum(v for k, v in phases.items() if k not in ONCE_PER_RUN_PHASES)
+    once = max((v for k, v in phases.items() if k in ONCE_PER_RUN_PHASES),
+               default=0)
+    return resident, transient, phases, max(in_step, once), slabs
+
+
+def _device_main(args, ec, t9, n, rows, arena, state):
+    """The host / per-GPU split for the host-state / device-step design.
+
+    Two columns, two budgets, two verdicts. The host column is the state and
+    nothing else that scales with N; the per-GPU column is the sharded coarse
+    mesh, one card's tile workspace, and the window of state a tile plane needs.
+    """
+    dev_args = argparse.Namespace(**vars(args))
+    # ONE process per GPU. Every fine-arm term in `mesh_bytes` is multiplied by
+    # `tile_workers`, so pricing this column at the CPU lane's worker count
+    # would charge each card W tile workspaces it does not allocate.
+    dev_args.workers = 1
+    ec_dev, _ = build(dev_args)
+    n_gpus = max(1, int(args.n_gpus))
+
+    resident, transient, phases, worst_phase, slabs = device_budget(
+        ec_dev, n=n, n_gpus=n_gpus)
+
+    step = ec_dev.step_bytes(n, n_rows=rows, cap=args.cap)
+    host = dict(state)
+    for k, v in step.items():
+        if v:
+            host[f"{k} (host until D3/D4)"] = v
+    _table("HOST: the state, plus the per-step terms nothing has moved yet", host)
+    print(f"  state alone: {sum(state.values()) / n:6.2f} B/p")
+    print("  `migrate_staging` and `repack_scratch` are exactly the terms the "
+          "device\n  migrate and repack delete. They are charged to the host "
+          "because nothing\n  has moved them, not because the design wants them "
+          "there.")
+
+    _table(f"PER GPU (of {n_gpus}), resident through the tile loop", resident)
+    if transient:
+        _table(f"PER GPU (of {n_gpus}), transient (peak while that phase runs)",
+               transient)
+    _table(f"PER GPU (of {n_gpus}), BY PHASE", phases,
+           total_label="sum of ALL phases listed")
+    print(f"  the verdict below charges {_fmt(worst_phase).strip()}, which is "
+          "max(the in-step\n  phases summed, the largest once-per-run phase) -- "
+          "`kernel_build` runs before\n  the loop and is never co-resident with "
+          "it, so adding it would overcharge.")
+    print(f"  the slab window is {slabs} x-slabs, DERIVED from "
+          f"`layout.brick_span`:\n  a tile draws from that many bricks per side, "
+          "so walking tiles in x-order\n  needs that many consecutive slabs live. "
+          "It is not a tuning knob.")
+
+    load_peak = _print_load_and_ic(args, ec, t9, n, rows, arena, shared=True)
+
+    print("\nBINDING TERMS")
+    host_peak = sum(host.values())
+    dev_peak = sum(resident.values()) + worst_phase
+    print(f"  host, a lower bound on the run's peak: {_fmt(host_peak)}")
+    print(f"  the LOAD stage peaks at:               {_fmt(load_peak)}"
+          f"   {'<- BINDING' if load_peak > host_peak else ''}")
+    print(f"  per GPU, resident + worst phase:       {_fmt(dev_peak)}")
+    if args.host_gb is not None:
+        r = host_peak / (args.host_gb * GB)
+        print(f"  against --host-gb {args.host_gb}: "
+              f"{'FITS' if r < 1.0 else 'DOES NOT FIT'} ({r:.2f}x)")
+        rl = load_peak / (args.host_gb * GB)
+        print(f"    and the LOAD stage:               "
+              f"{'FITS' if rl < 1.0 else 'DOES NOT FIT'} ({rl:.2f}x)")
+    else:
+        print("  no --host-gb given, so no host verdict (a Vista gb node is 1026)")
+    if args.device_gb is not None:
+        r = dev_peak / (args.device_gb * GB)
+        print(f"  against --device-gb {args.device_gb} per card: "
+              f"{'FITS' if r < 1.0 else 'DOES NOT FIT'} ({r:.2f}x)")
+    else:
+        print("  no --device-gb given, so no per-card verdict (a GB200 detected "
+              "185 GiB = 199 GB)")
+    print("\n  NB the same LOWER BOUND caveat as the CPU column, and two more "
+          "that are\n  specific to this one. (1) DEVICE_PLACEMENT is a design "
+          "assertion, not a\n  reading of code -- no device executor exists yet. "
+          "(2) The four-way split\n  is charged as an exact quarter; the probe's "
+          "own 114 s/step floor assumes\n  the same perfect split and says so. "
+          "Neither is measured.")
+    return 0
+
+
 def build(args):
     from .codec import T9Layout
     from .engine import EngineConfig
@@ -166,6 +388,16 @@ def main(argv=None):
         description="Memory anatomy of an inexor configuration, and whether it fits.",
     )
     ap.add_argument("--preset", choices=sorted(PRESETS), default=None)
+    # The CPU column is unchanged and stays the default: the pooled host engine
+    # remains a supported backend and its numbers must not move when this flag
+    # is added. `device` prices the host-state / device-step design instead --
+    # the host holds only the state, the GPUs hold the mesh and a slab window.
+    ap.add_argument("--backend", choices=("cpu", "device"), default="cpu",
+                    help="which engine to price. `device` = the host is a byte "
+                         "store and the GPUs do the step (Vista gb).")
+    ap.add_argument("--n-gpus", type=int, default=4,
+                    help="accelerators the coarse mesh is sharded across, for "
+                         "--backend device. A Vista gb node has 4.")
     ap.add_argument("--n-part", type=int, default=None, help="particles per side")
     ap.add_argument("--box", type=float, default=None, help="box size, Mpc/h")
     ap.add_argument("--n-fine", type=int, default=None)
@@ -277,6 +509,12 @@ def main(argv=None):
     _table("STATE (resident for the whole run)", state)
     print(f"  {'':<20}  {sum(state.values()) / n:6.2f} B/p")
 
+    # The tables below price a host that holds the coarse mesh and runs the tile
+    # loop. The device design's host does neither, so it gets its own two
+    # columns rather than a footnote on these.
+    if args.backend == "device":
+        return _device_main(args, ec, t9, n, rows, arena, state)
+
     mesh = ec.mesh_bytes()
     # The split is `engine.MESH_PHASE`'s, not this module's: a term's phase is a
     # property of the code that allocates it, so the accounting and the engine
@@ -342,26 +580,9 @@ def main(argv=None):
                   "a fit. `df -B1 /dev/shm` on the node you will run on.")
 
     # ---- the load path, which is where two jobs actually died
-    idx_itemsize = t9.index_bytes() // max(t9.n_buckets_side**3, 1)
-    ld = load_stages(
-        n=n, n_rows=rows + arena, n_buckets=t9.n_buckets_side**3,
-        index_itemsize=max(idx_itemsize, 1), n_arena=arena,
-        n_bricks=ec.n_brick and (args.n_fine // ec.n_brick) ** 3,
-        n_slabs=args.slabs, shared=(args.workers is None or args.workers > 1),
-    )
-    _table("LOADING THE STATE, peak resident at each stage", ld,
-           total_label="PEAK (max, not sum)", reduce=max)
-    print("  the total line above is a MAX: these stages do not coexist")
-
-    # ---- IC stage
-    try:
-        from .ooc_fft import plan_bytes
-
-        ic = plan_bytes(args.n_part, np.dtype(args.coarse_dtype), "derivative")
-        print(f"\nIC STAGE (out-of-core, 'derivative' policy): peak "
-              f"{_fmt(ic['peak'])}")
-    except Exception as exc:  # pragma: no cover - informational only
-        print(f"\nIC STAGE: not evaluable here ({exc})")
+    load_peak = _print_load_and_ic(
+        args, ec, t9, n, rows, arena,
+        shared=(args.workers is None or args.workers > 1))
 
     # ---- the verdict, with the binding term NAMED
     print("\nBINDING TERMS")
@@ -389,7 +610,6 @@ def main(argv=None):
     workers_b = int(n_workers * WORKER_STARTUP_BYTES) if n_workers > 1 else 0
     peak_est = (sum(state.values()) + sum(resident.values()) + worst_phase
                 + workers_b)
-    load_peak = max(ld.values())
     # TRANSIENTS ARE CANDIDATES. They were excluded here, so the line could not
     # name a transient however large -- at cdev it reported `tile_kernels` (0.791
     # GB) while `tile_workspace` (1.443) was bigger and the phase MEASURED to set

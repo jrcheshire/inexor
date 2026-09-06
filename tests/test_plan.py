@@ -672,3 +672,141 @@ def test_bounding_ejects_charges_the_inserts_that_replace_them():
     assert mig(eject_kernel="jax", migrate_eject_inflight=99) == jax_free
     # and the cheapest arrangement of the four is the plain numpy eject
     assert np_free == min(jax_free, jax_cap2, np_free, np_cap2)
+
+
+# --------------------------------------------- the device column (--backend device)
+#
+# The CPU column stays the default and must not move when this one is added, so
+# the first gate here is an invariance and not a new number.
+
+
+def test_the_cpu_column_does_not_move_when_the_device_column_exists(capsys):
+    """The refactor that put the load path behind a helper must be a no-op.
+
+    Both backends build the state on the same host and transform the ICs out of
+    core the same way, so `_print_load_and_ic` is shared -- and a shared helper
+    is exactly where an accidental behaviour change hides. Pin the two lines the
+    C-gh verdict is read off.
+    """
+    main(["--preset", "c-gh", "--host-gb", "237", "--arena-frac", "0.20",
+          "--workers", "8"])
+    out = capsys.readouterr().out
+    assert "LOADING THE STATE, peak resident at each stage" in out
+    assert "the total line above is a MAX: these stages do not coexist" in out
+    assert "IC STAGE (out-of-core, 'derivative' policy)" in out
+    # the CPU column still prices a host that holds the mesh
+    assert "MESH, resident through the tile loop" in out
+    assert "PER GPU" not in out
+
+
+@pytest.mark.parametrize("name", sorted(PRESETS))
+def test_every_mesh_term_is_placed_deliberately(name):
+    """A term with no side is the omitted-term fault, in the module about it.
+
+    `DEVICE_PLACEMENT` is a design assertion and it will go stale the moment a
+    new mesh term lands. It must go stale LOUDLY: defaulting an unplaced term to
+    the host understates the GPU and defaulting it to the GPU understates the
+    host, and either way the budget cannot be traded against.
+    """
+    from inexor.plan import DEVICE_PLACEMENT
+
+    for k in _ec(name).mesh_bytes():
+        assert k in DEVICE_PLACEMENT, f"{k} has no device placement"
+
+
+def test_an_unplaced_mesh_term_is_refused_not_guessed(monkeypatch):
+    """The anti-vacuity arm of the test above: prove the refusal actually fires."""
+    from inexor import plan
+
+    ec = _ec("cdev")
+    real = ec.mesh_bytes
+
+    def with_a_new_term():
+        d = dict(real())
+        d["a_term_nobody_placed"] = 1234
+        return d
+
+    monkeypatch.setattr(ec, "mesh_bytes", with_a_new_term)
+    with pytest.raises(KeyError, match="a_term_nobody_placed"):
+        plan.device_budget(ec, n=ec.n_total, n_gpus=4)
+
+
+def test_one_gpu_charges_every_surviving_term_in_full():
+    """The identity under the shard: at n_gpus=1 nothing is divided.
+
+    This is what makes the /4 a SPLIT rather than a discount -- if the shard
+    arithmetic were wrong in a way that scaled, this arm would catch it, because
+    at one GPU the device column must reproduce `mesh_bytes` exactly for every
+    term the design keeps.
+    """
+    from inexor.plan import DEVICE_PLACEMENT, device_budget
+
+    ec = _ec("cgh64")
+    mesh = ec.mesh_bytes()
+    resident, transient, _phases, _worst, _slabs = device_budget(
+        ec, n=ec.n_total, n_gpus=1)
+    got = {**resident, **transient}
+    kept = {k: v for k, v in mesh.items() if DEVICE_PLACEMENT[k] != "gone"}
+    assert kept, "vacuous: no mesh term survives the placement"
+    for k, v in kept.items():
+        assert got[k] == v, k
+    # and the deleted host pass is really gone
+    assert "coarse_decode_slab" not in got
+
+
+def test_the_shard_is_exactly_a_quarter_across_four_cards():
+    from inexor.plan import DEVICE_PLACEMENT, device_budget
+
+    ec = _ec("cgh64")
+    mesh = ec.mesh_bytes()
+    r1, t1, _p, _w, _s = device_budget(ec, n=ec.n_total, n_gpus=1)
+    r4, t4, _p, _w, _s = device_budget(ec, n=ec.n_total, n_gpus=4)
+    one, four = {**r1, **t1}, {**r4, **t4}
+    sharded = [k for k, v in DEVICE_PLACEMENT.items()
+               if v == "shard" and k in mesh]
+    replicated = [k for k, v in DEVICE_PLACEMENT.items()
+                  if v == "replica" and k in mesh]
+    assert sharded and replicated, "vacuous: one of the two classes is empty"
+    for k in sharded:
+        assert four[k] == int(one[k] / 4), k
+    for k in replicated:
+        assert four[k] == one[k], f"{k} is replicated and must not shrink"
+
+
+@pytest.mark.parametrize("name", sorted(PRESETS))
+def test_the_slab_window_is_the_brick_span_and_never_wraps_the_box(name):
+    """DERIVED, not picked. A window smaller than the span would drop members.
+
+    `brick_span` is the same function `SlotState.tile_bricks` walks, so this is
+    the membership contract read as a residency requirement rather than a
+    second, independent guess at it.
+    """
+    from inexor.layout import brick_span
+    from inexor.plan import device_window_slabs
+
+    ec = _ec(name)
+    nb = max(1, ec.n_fine // ec.n_brick)
+    _pad, span = brick_span(ec.n_tile, ec._b_realized, ec.n_brick, nb)
+    got = device_window_slabs(ec)
+    assert got == min(span, nb)
+    assert 1 <= got <= nb, "a window wider than the brick grid double-counts"
+
+
+def test_c_hero_fits_a_gb_node_on_the_device_backend_and_the_cpu_one_does_not(capsys):
+    """The verdict the whole design turns on, both directions, one machine.
+
+    The CPU column at 4096^3 does not fit a 1026 GB host at any worker count;
+    the device column does, because the mesh moves to the cards. If this ever
+    flips, the build has lost its premise and the record must say so.
+    """
+    main(["--preset", "c-hero", "--host-gb", "1026", "--arena-frac", "0.01",
+          "--workers", "1"])
+    cpu = capsys.readouterr().out
+    assert "DOES NOT FIT" in cpu.split("against --host-gb")[1]
+
+    main(["--preset", "c-hero", "--backend", "device", "--host-gb", "1026",
+          "--device-gb", "199", "--arena-frac", "0.01"])
+    dev = capsys.readouterr().out
+    assert "against --host-gb 1026.0: FITS" in dev
+    assert "against --device-gb 199.0 per card: FITS" in dev
+    assert "the slab window is 18 x-slabs" in dev
