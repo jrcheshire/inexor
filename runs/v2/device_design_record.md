@@ -4,7 +4,7 @@ Opened 2026-09-06, branch `jc/device-step-4096`. This is the design record that
 `m6_scaling_record.md` sec. 5y "Owed" names. Its companion is that record's
 sec. 5y and 5z, which price the design and are not repeated here.
 
-**Status: priced; one rung built and measured (D1, secs. 7-8).** Sections 1-6 are
+**Status: priced; D1 built and CLOSED (secs. 7-9).** Sections 1-6 are
 arithmetic over a design plus readings carried from 5y/5z; the one thing they
 add that was in neither is the MEMORY budget, which changes what the binding
 constraint is. Section 7 is the first MEASUREMENT of any part of this design:
@@ -269,6 +269,8 @@ is NOT where the transform's time goes on Grace.** The axis is now varied and
 answered; it is worth ~11% and no more.
 
 ### The defect: the flat source was not an inert control
+### [SUPERSEDED BY SEC. 9 -- the variable was the NODE, not the source. The
+### flat source WAS inert (1.04x same-node). Read sec. 9 before this section.]
 
 The flat-source legs read inverse **22.21 s** where 974643's noise-source legs
 read **31.32 s** for the same operation, same library code (`git diff` over
@@ -317,3 +319,91 @@ above bounds at ~11%, so it is not the whole story either way).
    stops being the second-largest term in the step floor.
 2. A four-GPU reading. Every number in secs. 7-8 is one GB200.
 3. Nothing on `pencil_batch`: the axis is answered.
+
+## 9. D1 attribution, Vista 975164 -- 91% of the transform is the bus, pinning is 6.8x, and sec. 8's confound resolves to the NODE
+
+`38cf5bf`, 2026-09-06, gb node **c672-002** (the same node as 974807 -- that is
+what resolves sec. 8), 11:36 wall, all legs rc=0, ~0.2 SU.
+`scripts/v2_d1_device_fft3_vista.sbatch`, one GPU. Card:
+`runs/v2/d1_device_fft_gb3.json`. 512^3 roundtrip reproduced at 4.053e-06 for
+the third time.
+
+### The transfer A/B, same node, same job
+
+| mode | bytes | wall | rate | memory kind used |
+|---|---|---|---|---|
+| pageable (numpy -> `jnp.asarray` -> `np.asarray`) | 137.5 GB | 21.07 s | **6.5 GB/s** | numpy |
+| pinned (`pinned_host` memory space) | 137.5 GB | 3.10 s | **44.4 GB/s** | `pinned_host` |
+
+Device kinds available: `['device', 'pinned_host']` -- the pinned leg used the
+kind it claimed, so it is a reading and not a silent fallback.
+
+**91% of the transform is the bus.** The inverse on this node reads 23.06 s and
+the identical traffic in identical 16.8 MB units reads 21.07 s pageable. The
+suspect of sec. 8 is CONFIRMED: this factorization is not compute-bound, it is
+not bound by pass 2's stride (~11%), it is bound by pageable host<->device
+copies.
+
+**Pinning is 6.8x on the bus** and projects the transform from 23.06 to
+**~5.1 s (4.5x)**, i.e. a coarse solve of **~20 s/step on one GPU, 1.9% of the
+bar** -- back to a minor term. Projected, not measured: the pinned rate is a
+microbenchmark of the traffic, and a pinned FFT path has not been built.
+
+**The UNIT is a second constraint, not just the kind.** Pinned reads 44.4 GB/s
+at a 16.8 MB plane against the **201 GB/s the same hardware reached at 2 GiB
+chunks** (5z) -- 378 us per transfer over 8192 of them. So a device phase that
+pins its buffers but moves them a plane at a time still leaves 4.5x on the
+table. **Both constraints are D2's, not D1's:** every device phase pins, and
+every device phase moves in the largest unit its algorithm allows.
+
+### Sec. 8's 1.41x was the NODE, and my suspicion was wrong
+
+Sec. 8 recorded that the flat-source inverse (22.21 s) and the noise-source
+inverse (31.32 s) differed by 1.41x on an operation that generates no field,
+named the two variables that moved together -- the DATA and the NODE -- and
+declined to assign it. This job holds the node fixed:
+
+| comparison | held fixed | varied | ratio |
+|---|---|---|---|
+| 22.21 (974807 flat) vs 23.06 (975164 noise) | node c672-002 | the data | **1.04x** |
+| 31.32 (974643 noise) vs 23.06 (975164 noise) | the data | node c672-004 -> c672-002 | **1.36x** |
+
+**The data barely matters and the node is the whole effect.** The flat source
+was an inert control after all; the variable I failed to hold was the machine.
+Sec. 8's suspicion that "the flat source was not clean" is **withdrawn** -- it
+was clean, and the sentence in sec. 8 saying the flat legs "are not a clean
+measurement of the real transform" is wrong. Left standing there with this
+correction pointing at it rather than edited away, because the mistake is the
+transferable part: two jobs differing in one deliberate knob also differed in a
+node nobody chose, and only a same-node arm could tell them apart.
+
+**1.36x of node-to-node spread on identical work is itself a result.** Any
+single-node reading of this transform carries it, including every number in
+secs. 7 and 8.
+
+### The coarse solve, restated with the node named
+
+On c672-002, noise source, generation (52.02 s) subtracted:
+
+| pencil_batch | forward | inverse | coarse solve = 1 fwd + 3 inv |
+|---|---|---|---|
+| 1 | 17.15 s | 23.06 s | **86.3 s/step, 8.0% of the bar** |
+| 64 | 14.13 s | 19.70 s | **73.2 s/step, 6.8% of the bar** |
+
+Sec. 8's 120.5 s/step was the same measurement on the slower node at y=1. **The
+honest range for the coarse solve on one GPU is 73-120 s/step, 7-11% of the
+bar, spanning node and knob** -- and ~20 s/step if pinned. The pencil knob
+reproduces at 1.10x here against 974807's 1.11x.
+
+### What D1 has established, and what closes it
+
+Correct at 2048^3 (three jobs, two nodes, 4.053e-06 / 6.676e-06 to the digit).
+Streams (0.0034x of the spectrum resident). Costs 73-120 s/step on one GPU as
+built, ~20 s/step pinned, against a 1080 s bar. The rung is DONE.
+
+Owed forward into D2, not into D1:
+1. **Pin every device buffer.** Established at 6.8x on this phase.
+2. **Move in the largest unit the algorithm allows.** 44.4 GB/s at a plane
+   against 201 GB/s at 2 GiB; the slab window (2.4 GB) is the natural unit.
+3. **A four-GPU reading.** Every number in secs. 7-9 is one GB200.
+4. **Name the node on every future reading of this class.** 1.36x.
