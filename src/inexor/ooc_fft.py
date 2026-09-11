@@ -251,7 +251,21 @@ def _check_spectral_dtype(got, want, what):
         )
 
 
-def rfft2_planes_device(planes, plane_batch=1, out=None):
+def _to_device(a, device):
+    """Commit a host array to `device`, or let jax place it (device=None).
+
+    `jnp.asarray` places on the default device; `jax.device_put` COMMITS to the
+    one named. The distinction is the whole of the multi-device path -- an
+    uncommitted array on a four-GPU node runs every batch on device 0 while
+    looking exactly like work.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    return jnp.asarray(a) if device is None else jax.device_put(a, device)
+
+
+def rfft2_planes_device(planes, plane_batch=1, out=None, device=None):
     """Pass 1 on device: 2-D real FFTs of axis-0 planes, (t, N, N) -> (t, N, M).
 
     numpy in, numpy out -- the spectrum is host-resident by design.
@@ -279,13 +293,13 @@ def rfft2_planes_device(planes, plane_batch=1, out=None):
         out = np.empty((t, n, n // 2 + 1), dtype=cd)
     for lo in range(0, t, b):
         hi = min(lo + b, t)
-        d = np.asarray(jnp.fft.rfft2(jnp.asarray(a[lo:hi]), axes=(-2, -1)))
+        d = np.asarray(jnp.fft.rfft2(_to_device(a[lo:hi], device), axes=(-2, -1)))
         _check_spectral_dtype(d.dtype, cd, "device rfft2")
         out[lo:hi] = d
     return out
 
 
-def fft_axis0_device_inplace(spec, inverse=False, pencil_batch=1):
+def fft_axis0_device_inplace(spec, inverse=False, pencil_batch=1, device=None):
     """Pass 2 on device: (i)fft along axis 0, y-pencil-planes at a time, in place.
 
     The host twin's unit is one (N, M) pencil-plane; `pencil_batch` widens it and
@@ -300,15 +314,108 @@ def fft_axis0_device_inplace(spec, inverse=False, pencil_batch=1):
     for lo in range(0, ny, b):
         hi = min(lo + b, ny)
         blk = np.ascontiguousarray(spec[:, lo:hi, :])
-        d = np.asarray(fn(jnp.asarray(blk), axis=0))
+        d = np.asarray(fn(_to_device(blk, device), axis=0))
         _check_spectral_dtype(d.dtype, spec.dtype, "device axis-0 fft")
         spec[:, lo:hi, :] = d
     return spec
 
 
+# ---------------------------------------------------------------------------
+# splitting a pass across devices
+# ---------------------------------------------------------------------------
+#
+# The factorization is embarrassingly parallel and has NO inter-device
+# communication: pass 1 is independent per plane, pass 2 is independent per
+# y-pencil-plane, and the spectrum stays host-resident throughout. So "use four
+# GPUs" is a partition of a loop, not a distributed transform -- and the only
+# thing that can stop it scaling is the shared host bus, which D1 measured this
+# path to be bound by (91% of the wall, record sec. 9).
+
+
+def partition_units(total, n_parts, unit):
+    """Split [0, total) into `n_parts` contiguous ranges, boundaries on `unit`.
+
+    The alignment is the transform's DEFINITION, not tidiness. This layer's
+    results are batch-size dependent at the bit level (module docstring: 341
+    elements on a 32^3 f64 field) and a batch restarts at the start of every
+    part, so a boundary off a `unit` multiple gives a different sequence of
+    batch sizes from the unpartitioned loop -- a different spectrum, silently,
+    at exactly the widths nobody runs by default. With aligned boundaries the
+    partition is an identity and "W devices == 1 device, bitwise" is a theorem
+    the tests confirm rather than a hope.
+
+    Refuses a width it cannot realize (fewer whole units than parts) instead of
+    returning empty ranges: a part with no work is a device that quietly did
+    not participate, which reads downstream as "it did not scale".
+    """
+    total, n_parts = int(total), int(n_parts)
+    unit = max(1, int(unit))
+    if total < 0:
+        raise ValueError(f"total must be >= 0, got {total}")
+    if n_parts < 1:
+        raise ValueError(f"n_parts must be >= 1, got {n_parts}")
+    n_units = -(-total // unit)
+    if n_units < n_parts:
+        raise ValueError(
+            f"cannot split {total} elements into {n_parts} parts at a batch "
+            f"unit of {unit}: only {n_units} whole units exist, so "
+            f"{n_parts - n_units} part(s) would get no work. Widen the slab, "
+            "narrow the batch, or ask for fewer parts."
+        )
+    base, extra = divmod(n_units, n_parts)
+    parts, u = [], 0
+    for k in range(n_parts):
+        lo = u * unit
+        u += base + (1 if k < extra else 0)
+        parts.append((lo, min(u * unit, total)))
+    return parts
+
+
+def _run_parts(fn, parts, devices):
+    """Run `fn(lo, hi, device)` over `parts` concurrently, one thread per part.
+
+    Threads, not processes: the engine is ONE process holding one host-resident
+    state, and jax releases the GIL across dispatch and transfer. A single part
+    runs INLINE, so the one-device path carries no pool overhead and stays the
+    reference every wider width is measured against.
+    """
+    if len(parts) == 1:
+        fn(parts[0][0], parts[0][1], devices[0])
+        return
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=len(parts)) as ex:
+        futures = [ex.submit(fn, lo, hi, dev)
+                   for (lo, hi), dev in zip(parts, devices)]
+        for f in futures:
+            f.result()
+
+
+def _devices_or_default(devices):
+    if devices is None:
+        return [None]
+    devs = list(devices)
+    if not devs:
+        raise ValueError("devices= was an empty sequence; pass None for the "
+                         "single-device path")
+    return devs
+
+
 def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
-                              pencil_batch=1):
-    """Device twin of `forward_from_slabs`; identical structure, identical contract."""
+                              pencil_batch=1, devices=None):
+    """Device twin of `forward_from_slabs`; identical structure, identical contract.
+
+    `devices` is a sequence of jax devices to split each pass across, or None
+    for jax's own placement on one device. The split is contiguous and
+    batch-aligned, so the spectrum is BITWISE identical to the devices=None one
+    at the same `plane_batch` / `pencil_batch` (`partition_units`).
+
+    Pass 1 splits the planes WITHIN a slab and the slab loop stays sequential:
+    `slab_fn` is the caller's generator and is not assumed re-entrant. That puts
+    a barrier at every slab boundary, which is a real property of streaming and
+    is why a measured split is owed rather than assumed.
+    """
+    devs = _devices_or_default(devices)
     n = int(n_mesh)
     slab = n if slab is None else int(slab)
     if slab < 1:
@@ -322,31 +429,59 @@ def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
                              f"want {(hi - lo, n, n)}")
         if spec is None:
             spec = np.empty(_spec_shape(n), dtype=_cdtype_for(s.dtype))
-        rfft2_planes_device(s, plane_batch=plane_batch, out=spec[lo:hi])
-    fft_axis0_device_inplace(spec, pencil_batch=pencil_batch)
+
+        def pass1(a, b, dev, s=s, lo=lo):
+            rfft2_planes_device(s[a:b], plane_batch=plane_batch,
+                                out=spec[lo + a:lo + b], device=dev)
+
+        _run_parts(pass1, partition_units(hi - lo, len(devs), plane_batch), devs)
+
+    def pass2(a, b, dev):
+        fft_axis0_device_inplace(spec[:, a:b, :], pencil_batch=pencil_batch,
+                                 device=dev)
+
+    _run_parts(pass2, partition_units(n, len(devs), pencil_batch), devs)
     return spec
 
 
 def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
-                            pencil_batch=1):
-    """Device twin of `inverse_to_slabs`. MUTATES spec, exactly as that one does."""
+                            pencil_batch=1, devices=None):
+    """Device twin of `inverse_to_slabs`. MUTATES spec, exactly as that one does.
+
+    `devices` splits both passes as in `forward_from_slabs_device`, bitwise
+    identically to the one-device path. This is the leg the coarse solve pays
+    three times per step, and the only one that generates no field, so it is the
+    clean thing to time: a forward's wall carries host RNG that does NOT split.
+    """
     import jax.numpy as jnp
 
+    devs = _devices_or_default(devices)
     n = int(n_mesh)
     slab = n if slab is None else int(slab)
-    fft_axis0_device_inplace(spec, inverse=True, pencil_batch=pencil_batch)
+
+    def pass2(a, b, dev):
+        fft_axis0_device_inplace(spec[:, a:b, :], inverse=True,
+                                 pencil_batch=pencil_batch, device=dev)
+
+    _run_parts(pass2, partition_units(spec.shape[1], len(devs), pencil_batch),
+               devs)
+
     rdtype = np.float64 if spec.dtype == np.complex128 else np.float32
     b = max(1, int(plane_batch))
     refuse_oversize_device_transform(b * n * n, "device irfft2 batch")
     for lo in range(0, n, slab):
         hi = min(lo + slab, n)
         out = np.empty((hi - lo, n, n), dtype=rdtype)
-        for i in range(lo, hi, b):
-            j = min(i + b, hi)
-            d = np.asarray(jnp.fft.irfft2(jnp.asarray(spec[i:j]), s=(n, n),
-                                          axes=(-2, -1)))
-            _check_spectral_dtype(d.dtype, rdtype, "device irfft2")
-            out[i - lo : j - lo] = d
+
+        def pass1(a, bb, dev, lo=lo, out=out):
+            for i in range(lo + a, lo + bb, b):
+                j = min(i + b, lo + bb)
+                d = np.asarray(jnp.fft.irfft2(_to_device(spec[i:j], dev),
+                                              s=(n, n), axes=(-2, -1)))
+                _check_spectral_dtype(d.dtype, rdtype, "device irfft2")
+                out[i - lo : j - lo] = d
+
+        _run_parts(pass1, partition_units(hi - lo, len(devs), b), devs)
         yield lo, out
 
 

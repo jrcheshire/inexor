@@ -340,3 +340,95 @@ def test_the_roundtrip_receipt_reads_the_f32_floor_on_both_paths():
     assert dev["rms"] > 0.5, "vacuous: the receipt transformed a ~zero field"
     for k in ("n_mesh", "dtype", "slab", "plane_batch", "pencil_batch"):
         assert k in dev, f"the receipt must carry {k} beside the number"
+
+
+# ---------------------------------------------------------------------------
+# splitting a pass across devices (owed off D1: every D1 number is one GB200)
+# ---------------------------------------------------------------------------
+
+
+def _devices(w):
+    """`w` device handles, replicating if the backend has fewer.
+
+    Replication is not a weaker gate for the BITWISE properties below: the
+    partition, the threads and the write-through views are all exercised either
+    way, and the arithmetic cannot depend on which handle it ran under. Run the
+    suite with `--xla_force_host_platform_device_count=4` (or on a four-GPU
+    node) and the same tests become a true multi-device gate.
+    """
+    import jax
+
+    devs = jax.devices()
+    return [devs[i % len(devs)] for i in range(w)]
+
+
+def test_partition_units_reproduces_the_unpartitioned_batch_sequence():
+    """Interior boundaries land on `unit` multiples, parts tile [0, total)."""
+    for total, w, unit in ((32, 4, 1), (2048, 4, 64), (10, 2, 4), (32, 3, 8)):
+        parts = ooc_fft.partition_units(total, w, unit)
+        assert len(parts) == w
+        assert parts[0][0] == 0 and parts[-1][1] == total
+        for (_, a), (b, _) in zip(parts, parts[1:]):
+            assert a == b, f"{parts} is not contiguous"
+            assert a % unit == 0, f"boundary {a} is not a multiple of {unit}"
+        assert all(hi > lo for lo, hi in parts), f"{parts} has an empty part"
+
+
+def test_partition_units_refuses_a_width_it_cannot_realize():
+    """A part with no work is a device that silently did not participate, which
+    reads downstream as 'it did not scale'. Refuse instead."""
+    with pytest.raises(ValueError, match="only 1 whole units"):
+        ooc_fft.partition_units(32, 4, 64)
+    with pytest.raises(ValueError, match="n_parts"):
+        ooc_fft.partition_units(32, 0, 1)
+
+
+@pytest.mark.parametrize("w", [2, 4])
+def test_device_split_is_bitwise_identical_to_one_device(field32, w):
+    """W devices == 1 device, to the bit, forward AND inverse.
+
+    This is the identity the four-GPU reading is measured against: the
+    factorization has no inter-device communication, so a split is a partition
+    of a loop and cannot touch a value. Anything else and a wall measured at
+    W=4 is a wall for a different transform.
+    """
+    devs = _devices(w)
+    for pb, yb in ((1, 1), (1, 8), (2, 4)):
+        kw = dict(plane_batch=pb, pencil_batch=yb)
+        ref = _fwd_dev(field32, 8, **kw)
+        got = _fwd_dev(field32, 8, devices=devs, **kw)
+        assert got.dtype == ref.dtype
+        assert np.array_equal(got, ref), f"w={w} pb={pb} yb={yb} moved bits (forward)"
+
+        def _inv(spec, **extra):
+            out = np.empty_like(field32)
+            for lo, s in ooc_fft.inverse_to_slabs_device(spec, N, slab=8, **kw, **extra):
+                out[lo : lo + s.shape[0]] = s
+            return out
+
+        assert np.array_equal(_inv(ref.copy(), devices=devs), _inv(ref.copy())), (
+            f"w={w} pb={pb} yb={yb} moved bits (inverse)")
+
+
+def test_a_misaligned_split_really_does_move_bits():
+    """Anti-vacuity for the alignment rule, MEASURED rather than argued.
+
+    jax's batch-size dependence is real but not monotone: on this backend at
+    N=64, plane_batch 1, 2 and 3 each give a distinct spectrum while 4 and 8
+    agree (n_diff 538 / 722 / 520 against batch 1, 0 between 4 and 8). So a
+    misaligned cut sometimes happens not to bite -- splitting a 16-plane batch
+    of 8 at plane 4 gives sizes (4, 8, 4) and reads n_diff 0 purely because
+    4 and 8 agree here. That coincidence is exactly why the rule cannot be
+    'align when it seems to matter': the case below strands a size-1 batch and
+    moves 1,062 f32 words.
+    """
+    n, t, pb = 64, 16, 2
+    planes = np.stack([ooc_fft.plane_noise(n, i, np.float32, 3) for i in range(t)])
+    whole = ooc_fft.rfft2_planes_device(planes, plane_batch=pb)
+    mis = np.empty_like(whole)
+    ooc_fft.rfft2_planes_device(planes[:1], plane_batch=pb, out=mis[:1])
+    ooc_fft.rfft2_planes_device(planes[1:], plane_batch=pb, out=mis[1:])
+    n_diff = int((whole.view(np.float32) != mis.view(np.float32)).sum())
+    assert n_diff > 0, (
+        "a split that strands a size-1 batch did NOT move bits, so the "
+        "alignment rule in partition_units is guarding nothing on this backend")
