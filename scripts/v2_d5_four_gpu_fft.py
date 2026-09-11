@@ -240,9 +240,12 @@ def arm_timing(n, slab, plane_batch, pencil_batch, width, seed, reps):
         t0 = time.perf_counter()
         spec = ooc_fft.forward_from_slabs_device(field, n, **kw)
         rec["first_fwd_s"] = time.perf_counter() - t0  # carries the compile
+        fwd_t = {}
         rec["fwd"] = _timed_with_setup(
-            lambda: None, lambda _: ooc_fft.forward_from_slabs_device(field, n, **kw),
+            lambda: None,
+            lambda _: ooc_fft.forward_from_slabs_device(field, n, timings=fwd_t, **kw),
             reps)
+        rec["fwd_passes"] = dict(fwd_t)
 
         # The 34.4 GB host copy D1 timed INSIDE the inverse, measured on its own.
         t0 = time.perf_counter()
@@ -251,11 +254,15 @@ def arm_timing(n, slab, plane_batch, pencil_batch, width, seed, reps):
         rec["spec_gb"] = float(spec.nbytes / 1e9)
         del _scratch
 
+        inv_t = {}
+
         def body(s):
-            for _lo, _out in ooc_fft.inverse_to_slabs_device(s, n, **kw):
+            for _lo, _out in ooc_fft.inverse_to_slabs_device(s, n, timings=inv_t,
+                                                             **kw):
                 pass
 
         rec["inv"] = _timed_with_setup(spec.copy, body, reps)
+        rec["inv_passes"] = dict(inv_t)
         rec["per_step_s"] = rec["fwd"]["median_s"] + 3 * rec["inv"]["median_s"]
         rec["per_step_frac_of_bar"] = rec["per_step_s"] / BAR_S
         # what the same step costs if the unsplittable host copy is charged too
@@ -301,13 +308,21 @@ def arm_transfer(n, mode, width, reps, seed=0):
     parts = ooc_fft.partition_units(n, width, 1)
     rec["parts"] = [list(p) for p in parts]
 
+    # EXACTLY TWO CROSSINGS PER UNIT in both modes -- one H2D, one D2H -- so
+    # `bytes_total` is the traffic that was actually moved. The first version of
+    # this arm got BOTH modes wrong: pageable did a second `device_put` instead
+    # of reusing the device array (3 crossings, rate 1.5x low), and pinned asked
+    # `device_put` to send an already-pinned array back to pinned host, which
+    # returns the SAME OBJECT and moved nothing (1 crossing, rate 2x high).
+    # Neither error was visible in the number it printed. `_crossing_receipt`
+    # below is what makes the next one visible.
     if mode == "pinned":
         try:
             staged = []
             for d in devs:
                 hs = jax.sharding.SingleDeviceSharding(d, memory_kind="pinned_host")
                 staged.append(([jax.device_put(a, hs) for a in units],
-                               jax.sharding.SingleDeviceSharding(d)))
+                               jax.sharding.SingleDeviceSharding(d), hs))
             rec["host_kind_used"] = "pinned_host"
         except Exception as exc:
             rec.update(completed=False,
@@ -315,12 +330,13 @@ def arm_transfer(n, mode, width, reps, seed=0):
             return _participation(rec, width)
 
         def work(k, lo, hi):
-            arrs, ds = staged[k]
-            hs = jax.sharding.SingleDeviceSharding(devs[k], memory_kind="pinned_host")
+            arrs, ds, hs = staged[k]
             for a in arrs:
                 for _ in range(hi - lo):
-                    jax.block_until_ready(jax.device_put(a, ds))
-                    jax.block_until_ready(jax.device_put(a, hs))
+                    d = jax.device_put(a, ds)      # H2D
+                    jax.block_until_ready(d)
+                    b = jax.device_put(d, hs)      # D2H, from the DEVICE array
+                    jax.block_until_ready(b)
     elif mode == "pageable":
         rec["host_kind_used"] = "numpy (pageable)"
 
@@ -328,10 +344,17 @@ def arm_transfer(n, mode, width, reps, seed=0):
             d = devs[k]
             for a in units:
                 for _ in range(hi - lo):
-                    jax.block_until_ready(jax.device_put(a, d))
-                    np.asarray(jax.device_put(a, d))
+                    x = jax.device_put(a, d)       # H2D
+                    jax.block_until_ready(x)
+                    np.asarray(x)                  # D2H
     else:
         raise ValueError(f"unknown transfer mode {mode!r}")
+
+    ok, why = _crossing_receipt(mode, devs[0], units[0])
+    rec["crossing_receipt"] = why
+    if not ok:
+        rec.update(completed=False, error=f"crossing receipt failed: {why}")
+        return _participation(rec, width)
 
     def once():
         if width == 1:
@@ -350,6 +373,39 @@ def arm_transfer(n, mode, width, reps, seed=0):
     except Exception as exc:
         rec.update(completed=False, error=f"{type(exc).__name__}: {exc}")
     return _participation(rec, width)
+
+
+def _crossing_receipt(mode, dev, unit):
+    """Prove each leg of the round trip MOVED something, before timing it.
+
+    A transfer that silently did not happen looks exactly like a fast one. This
+    checks the D2H leg specifically, because that is the one that failed
+    silently: `device_put` of an already-pinned array returns the identical
+    object, so the arm measured H2D only and reported a rate 2x high.
+    """
+    import jax
+
+    try:
+        if mode == "pinned":
+            hs = jax.sharding.SingleDeviceSharding(dev, memory_kind="pinned_host")
+            ds = jax.sharding.SingleDeviceSharding(dev)
+            h = jax.device_put(unit, hs)
+            d = jax.device_put(h, ds)
+            b = jax.device_put(d, hs)
+            if b is d or d is h:
+                return False, "device_put returned the same object: a leg was a no-op"
+            kinds = (getattr(d.sharding, "memory_kind", None),
+                     getattr(b.sharding, "memory_kind", None))
+            if kinds[1] != "pinned_host":
+                return False, f"D2H landed in {kinds[1]!r}, not pinned_host"
+            return True, f"H2D->{kinds[0]!r} D2H->{kinds[1]!r}, distinct objects"
+        d = jax.device_put(unit, dev)
+        back = np.asarray(d)
+        if back.nbytes != unit.nbytes:
+            return False, f"D2H returned {back.nbytes} B for a {unit.nbytes} B unit"
+        return True, f"H2D->device D2H->numpy {back.nbytes} B"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def _barrier(bdir, rank, width, timeout=600.0):
@@ -397,16 +453,26 @@ def arm_transfer_child(n, mode, width, rank, reps, bdir, seed=0):
             def work():
                 for a in staged:
                     for _ in range(hi - lo):
-                        jax.block_until_ready(jax.device_put(a, ds))
-                        jax.block_until_ready(jax.device_put(a, hs))
+                        d = jax.device_put(a, ds)
+                        jax.block_until_ready(d)
+                        jax.block_until_ready(jax.device_put(d, hs))
         else:
             rec["host_kind_used"] = "numpy (pageable)"
 
             def work():
                 for a in units:
                     for _ in range(hi - lo):
-                        jax.block_until_ready(jax.device_put(a, dev))
-                        np.asarray(jax.device_put(a, dev))
+                        x = jax.device_put(a, dev)
+                        jax.block_until_ready(x)
+                        np.asarray(x)
+
+        ok, why = _crossing_receipt(mode, dev, units[0])
+        rec["crossing_receipt"] = why
+        if not ok:
+            rec.update(completed=False, error=f"crossing receipt failed: {why}")
+            with open(os.path.join(bdir, f"card_{rank}.json"), "w") as fh:
+                json.dump(rec, fh)
+            return rec
 
         work()  # warm before the barrier, so compile is not inside the window
         _barrier(bdir, rank, width)
@@ -527,6 +593,10 @@ def _line(rec):
         bits.append(f"bitwise={rec['bitwise']} "
                     f"n_diff={rec.get('n_diff_forward')}/{rec.get('n_diff_inverse')}")
     if "inv" in rec:
+        ip = rec.get("inv_passes") or {}
+        if ip:
+            bits.append(f"inv[p2={ip.get('pass2_s', 0):.2f} "
+                        f"p1={ip.get('pass1_s', 0):.2f}]")
         bits.append(f"fwd={rec['fwd']['median_s']:.2f}s "
                     f"inv={rec['inv']['median_s']:.2f}s "
                     f"copy={rec.get('spec_copy_s', float('nan')):.2f}s "

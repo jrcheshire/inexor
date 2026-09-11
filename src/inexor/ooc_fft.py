@@ -37,6 +37,8 @@ Spectral multipliers reuse `forces.k_components`' conventions exactly
 very term D-v2-15 clause 2 retires.
 """
 
+import time as _time
+
 import numpy as np
 import scipy.fft
 
@@ -402,7 +404,7 @@ def _devices_or_default(devices):
 
 
 def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
-                              pencil_batch=1, devices=None):
+                              pencil_batch=1, devices=None, timings=None):
     """Device twin of `forward_from_slabs`; identical structure, identical contract.
 
     `devices` is a sequence of jax devices to split each pass across, or None
@@ -414,6 +416,11 @@ def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
     `slab_fn` is the caller's generator and is not assumed re-entrant. That puts
     a barrier at every slab boundary, which is a real property of streaming and
     is why a measured split is owed rather than assumed.
+
+    `timings`, if a dict is passed, receives `pass1_s` and `pass2_s`. The two
+    passes have different shapes -- pass 1 is per-plane device work behind a
+    per-slab barrier, pass 2 is a strided HOST gather plus device work -- so a
+    split that stalls is attributable rather than inferred from an Amdahl fit.
     """
     devs = _devices_or_default(devices)
     n = int(n_mesh)
@@ -421,6 +428,7 @@ def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
     if slab < 1:
         raise ValueError(f"slab must be >= 1, got {slab}")
     spec = None
+    _p1 = 0.0
     for lo in range(0, n, slab):
         hi = min(lo + slab, n)
         s = np.asarray(slab_fn(lo, hi))
@@ -434,18 +442,24 @@ def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
             rfft2_planes_device(s[a:b], plane_batch=plane_batch,
                                 out=spec[lo + a:lo + b], device=dev)
 
+        _t0 = _time.perf_counter()
         _run_parts(pass1, partition_units(hi - lo, len(devs), plane_batch), devs)
+        _p1 += _time.perf_counter() - _t0
 
     def pass2(a, b, dev):
         fft_axis0_device_inplace(spec[:, a:b, :], pencil_batch=pencil_batch,
                                  device=dev)
 
+    _t0 = _time.perf_counter()
     _run_parts(pass2, partition_units(n, len(devs), pencil_batch), devs)
+    if timings is not None:
+        timings["pass1_s"] = _p1
+        timings["pass2_s"] = _time.perf_counter() - _t0
     return spec
 
 
 def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
-                            pencil_batch=1, devices=None):
+                            pencil_batch=1, devices=None, timings=None):
     """Device twin of `inverse_to_slabs`. MUTATES spec, exactly as that one does.
 
     `devices` splits both passes as in `forward_from_slabs_device`, bitwise
@@ -463,8 +477,11 @@ def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
         fft_axis0_device_inplace(spec[:, a:b, :], inverse=True,
                                  pencil_batch=pencil_batch, device=dev)
 
+    _t0 = _time.perf_counter()
     _run_parts(pass2, partition_units(spec.shape[1], len(devs), pencil_batch),
                devs)
+    _p2 = _time.perf_counter() - _t0
+    _p1 = 0.0
 
     rdtype = np.float64 if spec.dtype == np.complex128 else np.float32
     b = max(1, int(plane_batch))
@@ -481,7 +498,12 @@ def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
                 _check_spectral_dtype(d.dtype, rdtype, "device irfft2")
                 out[i - lo : j - lo] = d
 
+        _t0 = _time.perf_counter()
         _run_parts(pass1, partition_units(hi - lo, len(devs), b), devs)
+        _p1 += _time.perf_counter() - _t0
+        if timings is not None:
+            timings["pass1_s"] = _p1
+            timings["pass2_s"] = _p2
         yield lo, out
 
 
