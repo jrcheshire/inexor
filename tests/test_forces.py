@@ -121,8 +121,14 @@ def test_the_hoisted_coarse_build_is_bitwise_the_build_it_replaced(n, fdtype, x6
 
     want = _reference_coarse_solve(delta, n, box, r_s, match, fdtype)
     parts = coarse_kernel_parts(n, box, "long", r_s=r_s, match=match, fdtype=fdtype)
+    # `transform="monolithic"` is LOAD-BEARING, not leftover. The oracle above is
+    # the pre-hoist spelling and it transforms monolithically; once the shipping
+    # default became the factorized form, leaving this to the default compared a
+    # monolithic reference against a factorized subject and moved two variables
+    # at once. The knob under test is the kernel HOIST, so the transform is held.
     got = coarse_force_meshes(jnp.asarray(delta), n, box, "long", r_s=r_s,
-                              match=match, fdtype=fdtype, parts=parts)
+                              match=match, fdtype=fdtype, parts=parts,
+                              transform="monolithic")
     for i, (a, b) in enumerate(zip(want, got)):
         assert np.array_equal(a, b), (
             f"component {i} at n={n}/{fdtype.name} is not bitwise the pre-hoist "
@@ -330,3 +336,31 @@ def test_an_unknown_transform_is_refused():
     delta = np.zeros((8, 8, 8), dtype=np.float32)
     with pytest.raises(ValueError, match="transform must be"):
         forces.coarse_force_meshes(delta, 8, 16.0, "long", r_s=2.0, transform="ooc")
+
+
+@pytest.mark.parametrize("fdtype", [np.float32, np.float64])
+def test_the_hoisted_build_is_bitwise_on_the_factorized_path_too(fdtype, x64):
+    """The hoist property, on the path that now ships.
+
+    The test above holds the transform at monolithic because its oracle is the
+    pre-hoist monolithic spelling. That leaves the shipping path ungated for the
+    same property, so this pins it there with the function's own per-call build
+    as the oracle: passing prebuilt `parts` must be bitwise identical to letting
+    it build them, because hoisting reorders WHEN a kernel is formed and never
+    what is multiplied by what.
+    """
+    from inexor.forces import coarse_force_meshes, coarse_kernel_parts
+
+    fdtype = np.dtype(fdtype)
+    n, box = 24, 24.0
+    r_s, match = 2.0 * box / n, (box / n, box / (4 * n))
+    delta = (np.random.default_rng(11).standard_normal((n, n, n)) * 1e-3).astype(fdtype)
+
+    kw = dict(r_s=r_s, match=match, fdtype=fdtype, transform="factorized")
+    built_per_call = coarse_force_meshes(delta, n, box, "long", **kw)
+    parts = coarse_kernel_parts(n, box, "long", r_s=r_s, match=match, fdtype=fdtype)
+    hoisted = coarse_force_meshes(delta, n, box, "long", parts=parts, **kw)
+    for i, (a, b) in enumerate(zip(built_per_call, hoisted)):
+        assert np.array_equal(np.asarray(a), np.asarray(b)), (
+            f"component {i} at n={n}/{fdtype.name}: hoisting the kernel build "
+            "moved bits on the factorized path")

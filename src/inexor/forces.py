@@ -640,7 +640,7 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab):
 
 
 def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None,
-                        fdtype=None, parts=None, out=None, transform="monolithic",
+                        fdtype=None, parts=None, out=None, transform="factorized",
                         slab=None):
     """The three long-range force meshes from an ALREADY-PAINTED delta.
 
