@@ -83,12 +83,17 @@ def tile_decode_plan(st, bricks):
 
 
 def decode_rows(plan, off, w, vel_scale, arena_bucket, arena_base, t9,
-                bricks_per_side, cap, fdtype=None):
+                bricks_per_side, cap, fdtype=None, velocities=True):
     """(slots, x, v, brick_of_row, live) for a tile's rows, padded to `cap`.
 
     Device arithmetic, host indices. Bitwise identical to
     `SlotState.decode_bricks` followed by `np.repeat` of the brick ids, in the
     same row order.
+
+    `velocities=False` skips the velocity decode and returns no `v`; `w` and
+    `vel_scale` are then unused and may be None. The coarse paint needs
+    positions only, and uploading `w` for it would be 6 B per row of bus
+    traffic that buys nothing.
 
     `cap` is the padded row count the tile force already uses
     (`forces.tile_capacity` / `capacity_shape`), and it is padded here for the
@@ -188,16 +193,17 @@ def decode_rows(plan, off, w, vel_scale, arena_bucket, arena_base, t9,
     off_rows = jnp.asarray(off)[slots]
     x = decode_positions(off_rows, bucket_ijk, t9, fdtype=fdtype)
 
-    # velocity: the brick's own scale, which is why `decode_brick` takes a
-    # SNAPSHOT -- `_insert_slab` rewrites a scale in place and a decode reading
-    # the live array would be correct only while the schedule happens to eject
-    # every brick before inserting it.
-    scale = jnp.asarray(vel_scale)[bricks[bi]]
-    v = jnp.asarray(w)[slots].astype(fdtype) * scale[:, None]
-
     # `brick_index` is `bi` itself -- the row's position in the TILE's brick
     # list, not its global brick id. The kick's segmented reduction wants a
     # dense 0..n_b-1 segment id, and recovering one from the global id would
     # mean a searchsorted the decode has already done.
-    return dict(slots=slots, x=x, v=v, brick_of_row=bricks[bi], brick_index=bi,
-                live=live, n_rows=n_rows)
+    out = dict(slots=slots, x=x, brick_of_row=bricks[bi], brick_index=bi,
+               live=live, n_rows=n_rows)
+    if velocities:
+        # velocity: the brick's own scale, which is why `decode_brick` takes a
+        # SNAPSHOT -- `_insert_slab` rewrites a scale in place and a decode
+        # reading the live array would be correct only while the schedule
+        # happens to eject every brick before inserting it.
+        scale = jnp.asarray(vel_scale)[bricks[bi]]
+        out["v"] = jnp.asarray(w)[slots].astype(fdtype) * scale[:, None]
+    return out

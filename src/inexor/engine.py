@@ -865,6 +865,33 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
               for a in range(3)]
         mesh[np.ix_(*ax)] += sub
         n_sub += 1
+    out, peak, inexact = _delta_from_accumulated(mesh, cfg, census=census)
+    if stats is not None:
+        # both, for the same reason `cap`/`cap_true` are both reported: one hides
+        # the padding cost, the other hides the shape churn, and the churn leaked
+        stats["coarse_pad"] = pad
+        stats["coarse_pad_true"] = pad_true
+        stats["coarse_peak_int"] = peak
+        # how many chunks took the sub-block path: an A/B whose knob did not
+        # apply must be readable as such (a knob must prove it applied) --
+        # same rule for the pool (0 = the serial path painted this mesh)
+        stats["coarse_subblock_chunks"] = n_sub
+        stats["coarse_pooled_workers"] = pooled_workers
+        if census:
+            stats["coarse_cells_inexact_f32"] = inexact
+            stats["coarse_exact_decode_ok"] = inexact == 0
+    return out
+
+
+def _delta_from_accumulated(mesh, cfg, census=False):
+    """(delta, peak, inexact) from the accumulated int64 coarse paint.
+
+    Shared by the host streamed paint and the device one (`device.paint`), so
+    the two cannot decode differently: whatever accumulated the integers, this
+    is the one place they become a density. `inexact` is the f32 round-trip
+    census count when `census`, else 0.
+    """
+    n = cfg.n_coarse
     peak = int(np.abs(mesh).max())
     if peak >= 2**31:
         raise ValueError(
@@ -893,21 +920,7 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
         out[i0 : i0 + slab] = s.astype(np.float64) * scale / mean - 1.0
         if census:
             inexact += int(np.count_nonzero(s.astype(np.float32).astype(np.int64) != s))
-    if stats is not None:
-        # both, for the same reason `cap`/`cap_true` are both reported: one hides
-        # the padding cost, the other hides the shape churn, and the churn leaked
-        stats["coarse_pad"] = pad
-        stats["coarse_pad_true"] = pad_true
-        stats["coarse_peak_int"] = peak
-        # how many chunks took the sub-block path: an A/B whose knob did not
-        # apply must be readable as such (a knob must prove it applied) --
-        # same rule for the pool (0 = the serial path painted this mesh)
-        stats["coarse_subblock_chunks"] = n_sub
-        stats["coarse_pooled_workers"] = pooled_workers
-        if census:
-            stats["coarse_cells_inexact_f32"] = inexact
-            stats["coarse_exact_decode_ok"] = inexact == 0
-    return out
+    return out, peak, inexact
 
 
 # ===========================================================================
