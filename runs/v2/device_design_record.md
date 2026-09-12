@@ -547,3 +547,93 @@ Owed forward:
    projection is quoted as anything but a projection.
 3. Whether the coarse solve can avoid the 34.4 GB spectrum copy.
 4. Name the node on every reading of this class. Four nodes now, 1.28-1.36x.
+
+## 11. D5b + D5c -- pinning is CLOSED for this engine, and D1's first inherited constraint is refuted
+
+`f8edf30` / `7567b60` / `9f06942`, 2026-09-12, gb nodes c672-005, c672-008 and
+c672-004. Jobs 992589 (FAILED, correctly), 992621 and 992680, ~0.7 SU.
+Cards: `runs/v2/d5_four_gpu_gb.json`, `runs/v2/d5c_host_register_gb.json`.
+
+D1 recorded two constraints "every later phase inherits": **pin every host
+buffer that crosses**, and **move in the largest unit the algorithm allows**.
+The first is now REFUTED for this engine. The second is untouched, and is
+therefore the whole of the remaining opportunity.
+
+### D5b: staging each crossing is SLOWER than ordinary numpy
+
+| policy | W=1 | W=4 |
+|---|---|---|
+| pageable | **83.0 s/step** | **27.3 s/step** |
+| staged (via `pinned_host`) | 115.1 s/step | 33.5 s/step |
+| staged / pageable | **1.39x slower** | **1.23x slower** |
+
+Uniform across both passes at W=4 (+23% each), so it is the crossing itself and
+not one pass's access pattern. Bitwise-gated: the policy changes where a buffer
+lives, not what is computed.
+
+**Why.** JAX arrays are immutable, so there is no reusable pinned buffer to
+copy into: every crossing allocates a fresh one and pays a kernel call to
+page-lock it. The proxy's pinned arm pins ONCE outside its timed loop and reads
+36.1 GB/s; the staged transform pins on every one of 8192 crossings and lands
+below pageable. Same memory kind, same job, same node, opposite results, and
+the only difference is amortized versus per-crossing pinning.
+
+**So the 7.8x memory-kind ceiling is real but belongs only to a buffer pinned
+once and reused.**
+
+### D5c: XLA does not take the fast path for registered memory
+
+The surviving route was memory that is page-locked AND numpy-writable, which
+JAX cannot express and `cudaHostRegister` can, by locking pages that already
+exist. c672-004, page size 65536, `memlock` unlimited, libcudart via ctypes
+with no dependency added.
+
+| flags | pageable | registered | ceiling | speedup | of the way |
+|---|---|---|---|---|---|
+| portable | 7.2 GB/s | 7.4 | 63.3 | **1.03x** | **0%** |
+| default | 7.1 GB/s | 7.3 | 67.2 | **1.03x** | **0%** |
+
+Confirmed end to end: the real 2048^3 inverse reads 21.68 s unregistered and
+21.71 s registered, **1.00x**, with both passes flat. Three gates agree.
+
+**The allocation side was never the problem.** Registration runs at 187-284
+GB/s (128 GB in 0.45 s; the design's ~724 GB host state would page-lock in
+~3 s), and the compute node permits it without limit. XLA simply does not ask
+whether a host pointer is already locked -- it stages every one of them.
+
+### What this closes, and what it does not
+
+**CLOSED: pinning as a line of work for this engine.** Not argued, measured, on
+three independent gates. The 7.8x is reachable only by a JAX-owned `pinned_host`
+buffer, which is immutable, and the engine's state is numpy written in place by
+construction (T9, the arena, migrate, repack). From numpy-resident state the
+ceiling is unreachable, and the two ways of trying both cost more than they
+save.
+
+**NOT closed, and stated narrowly:** this is a property of THIS engine's
+architecture against THIS jax/XLA, not a general claim about pinning. An engine
+whose host state were JAX-resident and functionally updated would reach the
+ceiling; that is a different engine, and the design study's own rule applies --
+name the workflow before building the capability.
+
+**What survives as the remaining lever.** D5 established that the four-GPU
+shortfall is shared host bandwidth spread across both passes rather than a
+serial section, so there is nothing to delete. D5c now removes the bus as
+something that can be made faster. Together those leave exactly one direction:
+**move less host traffic**, which is D1's second constraint and is untouched.
+The nearest concrete target is the 34.4 GB spectrum copy -- flat ~3.0 s at
+every width, ~9.1 s/step across three inverses, and the largest single host
+term now that pinning cannot shrink the others.
+
+**The coarse solve is not a problem either way**: 27.3 s/step at W=4, 2.5% of
+the 1080 s bar, against D1's 73-120 s/step on one GPU.
+
+### Owed
+
+1. Whether the solve can avoid the spectrum copy (it is now the biggest host
+   term, and the only one with an obvious fix).
+2. The synthetic traffic proxy remains 1.83x slower than the inverse whose
+   traffic it replicates, and the commitment suspect was REFUTED by a control
+   leg (84.2 vs 83.0 s/step, 1.01x). Recorded as unexplained. It is off the
+   decision path and is not worth a job.
+3. Nothing further on pinning.
