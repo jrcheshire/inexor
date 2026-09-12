@@ -278,15 +278,28 @@ def _pinned_sharding(device):
     return jax.sharding.SingleDeviceSharding(device, memory_kind="pinned_host")
 
 
+def _device_sharding(device):
+    """The device target for a buffer that is currently in another memory kind.
+
+    MUST be a sharding, not the bare `Device`. `jax.device_put(pinned, dev)`
+    raises "Memory kind mismatch with xla::PjRtBuffers" -- a bare device carries
+    no memory kind to switch TO, so the move out of `pinned_host` has nothing to
+    target. Vista 992589 failed on exactly this: `staging_supported` probed with
+    a bare device, reported False on four GB200s that stage perfectly well, and
+    every staged leg refused. The refusal was right; the probe was wrong.
+    """
+    import jax
+
+    return jax.sharding.SingleDeviceSharding(device)
+
+
 def staging_supported(device=None):
     """Can this backend do the host -> pinned_host -> device round trip?
 
-    jax's CPU backend advertises a `pinned_host` memory kind but refuses to move
-    a buffer from it to `device` ("Memory kind mismatch with xla::PjRtBuffers"),
-    so the staged policy cannot run there. Callers ASK, and refuse, rather than
-    catching the failure and quietly transferring pageable: a staged arm that
-    silently ran pageable would report that staging buys nothing, which is the
-    one wrong answer this whole measurement could produce.
+    Callers ASK, and refuse, rather than catching a failure and quietly
+    transferring pageable: a staged arm that silently ran pageable would report
+    that staging buys nothing, which is the one wrong answer this measurement
+    can produce.
     """
     import jax
 
@@ -294,7 +307,7 @@ def staging_supported(device=None):
         dev = jax.devices()[0] if device is None else device
         probe = np.zeros((2, 2), dtype=np.float32)
         h = jax.device_put(probe, _pinned_sharding(dev))
-        back = jax.device_put(h, dev)
+        back = jax.device_put(h, _device_sharding(dev))
         return bool(np.array_equal(np.asarray(back), probe))
     except Exception:
         return False
@@ -315,7 +328,8 @@ def _to_device(a, device, transfer="pageable"):
         raise ValueError(f"transfer must be one of {TRANSFER_POLICIES}, got {transfer!r}")
     if transfer == "staged":
         dev = jax.devices()[0] if device is None else device
-        return jax.device_put(jax.device_put(a, _pinned_sharding(dev)), dev)
+        return jax.device_put(jax.device_put(a, _pinned_sharding(dev)),
+                              _device_sharding(dev))
     return jnp.asarray(a) if device is None else jax.device_put(a, device)
 
 
