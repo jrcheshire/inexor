@@ -432,3 +432,41 @@ def test_a_misaligned_split_really_does_move_bits():
     assert n_diff > 0, (
         "a split that strands a size-1 batch did NOT move bits, so the "
         "alignment rule in partition_units is guarding nothing on this backend")
+
+
+@pytest.mark.parametrize("w", [1, 2])
+def test_transfer_policy_changes_the_route_not_a_bit(field32, w):
+    """`staged` and `pageable` differ in WHERE the host buffer lives, nothing else.
+
+    The policy picks whether the driver copies the buffer into its own staging
+    memory (pageable) or we hand it page-locked memory it can DMA from (staged).
+    Same bytes, same kernels, same order -- so anything but bitwise equality
+    means the policy is doing something it was not asked to do, and any wall
+    measured under it would be a wall for a different computation.
+    """
+    if not ooc_fft.staging_supported():
+        pytest.skip("backend has no host -> pinned_host -> device round trip "
+                    "(jax CPU refuses it); this gate runs on the accelerator")
+    devs = _devices(w)
+    kw = dict(plane_batch=1, pencil_batch=4, devices=devs)
+    ref = _fwd_dev(field32, 8, **kw)
+    got = _fwd_dev(field32, 8, transfer="staged", **kw)
+    assert got.dtype == ref.dtype
+    assert np.array_equal(got, ref), "the staged transfer policy moved bits (forward)"
+
+    def _inv(spec, **extra):
+        out = np.empty_like(field32)
+        for lo, s in ooc_fft.inverse_to_slabs_device(spec, N, slab=8, **kw, **extra):
+            out[lo : lo + s.shape[0]] = s
+        return out
+
+    assert np.array_equal(_inv(ref.copy(), transfer="staged"), _inv(ref.copy())), (
+        "the staged transfer policy moved bits (inverse)")
+
+
+def test_an_unknown_transfer_policy_is_refused():
+    """A typo'd policy must not fall through to the default and be timed as if
+    it applied -- an arm that did not change anything is worse than no arm."""
+    with pytest.raises(ValueError, match="transfer must be one of"):
+        ooc_fft.rfft2_planes_device(
+            np.zeros((2, 8, 8), np.float32), transfer="pinned")

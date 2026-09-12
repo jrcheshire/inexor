@@ -253,8 +253,55 @@ def _check_spectral_dtype(got, want, what):
         )
 
 
-def _to_device(a, device):
-    """Commit a host array to `device`, or let jax place it (device=None).
+#: How a host buffer gets to the device and back.
+#:
+#: "pageable" hands the driver ordinary numpy. The OS may move that memory, so
+#: the GPU cannot DMA from it: the driver copies it into a staging buffer of its
+#: own first, and every crossing pays that copy.
+#:
+#: "staged" routes through `pinned_host` -- page-locked memory the OS has
+#: promised not to move, which the DMA engine reads directly. The copy is still
+#: paid (host -> pinned), but EXPLICITLY, and the crossing itself is then a
+#: straight DMA. D5 measured 7.8x between the two memory kinds on a synthetic
+#: microbenchmark at width; whether that survives the explicit copy is the whole
+#: question this policy exists to answer, and it is measured on the real
+#: transform rather than on a proxy.
+#:
+#: The policy MUST NOT move a bit -- it changes the route, not the arithmetic --
+#: and a test pins that.
+TRANSFER_POLICIES = ("pageable", "staged")
+
+
+def _pinned_sharding(device):
+    import jax
+
+    return jax.sharding.SingleDeviceSharding(device, memory_kind="pinned_host")
+
+
+def staging_supported(device=None):
+    """Can this backend do the host -> pinned_host -> device round trip?
+
+    jax's CPU backend advertises a `pinned_host` memory kind but refuses to move
+    a buffer from it to `device` ("Memory kind mismatch with xla::PjRtBuffers"),
+    so the staged policy cannot run there. Callers ASK, and refuse, rather than
+    catching the failure and quietly transferring pageable: a staged arm that
+    silently ran pageable would report that staging buys nothing, which is the
+    one wrong answer this whole measurement could produce.
+    """
+    import jax
+
+    try:
+        dev = jax.devices()[0] if device is None else device
+        probe = np.zeros((2, 2), dtype=np.float32)
+        h = jax.device_put(probe, _pinned_sharding(dev))
+        back = jax.device_put(h, dev)
+        return bool(np.array_equal(np.asarray(back), probe))
+    except Exception:
+        return False
+
+
+def _to_device(a, device, transfer="pageable"):
+    """Host -> device, under a transfer policy.
 
     `jnp.asarray` places on the default device; `jax.device_put` COMMITS to the
     one named. The distinction is the whole of the multi-device path -- an
@@ -264,10 +311,26 @@ def _to_device(a, device):
     import jax
     import jax.numpy as jnp
 
+    if transfer not in TRANSFER_POLICIES:
+        raise ValueError(f"transfer must be one of {TRANSFER_POLICIES}, got {transfer!r}")
+    if transfer == "staged":
+        dev = jax.devices()[0] if device is None else device
+        return jax.device_put(jax.device_put(a, _pinned_sharding(dev)), dev)
     return jnp.asarray(a) if device is None else jax.device_put(a, device)
 
 
-def rfft2_planes_device(planes, plane_batch=1, out=None, device=None):
+def _from_device(d, transfer="pageable"):
+    """Device -> host numpy, under the same policy."""
+    import jax
+
+    if transfer == "staged":
+        dev = next(iter(d.devices()))
+        return np.asarray(jax.device_put(d, _pinned_sharding(dev)))
+    return np.asarray(d)
+
+
+def rfft2_planes_device(planes, plane_batch=1, out=None, device=None,
+                        transfer="pageable"):
     """Pass 1 on device: 2-D real FFTs of axis-0 planes, (t, N, N) -> (t, N, M).
 
     numpy in, numpy out -- the spectrum is host-resident by design.
@@ -295,13 +358,15 @@ def rfft2_planes_device(planes, plane_batch=1, out=None, device=None):
         out = np.empty((t, n, n // 2 + 1), dtype=cd)
     for lo in range(0, t, b):
         hi = min(lo + b, t)
-        d = np.asarray(jnp.fft.rfft2(_to_device(a[lo:hi], device), axes=(-2, -1)))
+        d = _from_device(jnp.fft.rfft2(_to_device(a[lo:hi], device, transfer),
+                                       axes=(-2, -1)), transfer)
         _check_spectral_dtype(d.dtype, cd, "device rfft2")
         out[lo:hi] = d
     return out
 
 
-def fft_axis0_device_inplace(spec, inverse=False, pencil_batch=1, device=None):
+def fft_axis0_device_inplace(spec, inverse=False, pencil_batch=1, device=None,
+                             transfer="pageable"):
     """Pass 2 on device: (i)fft along axis 0, y-pencil-planes at a time, in place.
 
     The host twin's unit is one (N, M) pencil-plane; `pencil_batch` widens it and
@@ -316,7 +381,7 @@ def fft_axis0_device_inplace(spec, inverse=False, pencil_batch=1, device=None):
     for lo in range(0, ny, b):
         hi = min(lo + b, ny)
         blk = np.ascontiguousarray(spec[:, lo:hi, :])
-        d = np.asarray(fn(_to_device(blk, device), axis=0))
+        d = _from_device(fn(_to_device(blk, device, transfer), axis=0), transfer)
         _check_spectral_dtype(d.dtype, spec.dtype, "device axis-0 fft")
         spec[:, lo:hi, :] = d
     return spec
@@ -404,7 +469,8 @@ def _devices_or_default(devices):
 
 
 def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
-                              pencil_batch=1, devices=None, timings=None):
+                              pencil_batch=1, devices=None, timings=None,
+                              transfer="pageable"):
     """Device twin of `forward_from_slabs`; identical structure, identical contract.
 
     `devices` is a sequence of jax devices to split each pass across, or None
@@ -440,7 +506,8 @@ def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
 
         def pass1(a, b, dev, s=s, lo=lo):
             rfft2_planes_device(s[a:b], plane_batch=plane_batch,
-                                out=spec[lo + a:lo + b], device=dev)
+                                out=spec[lo + a:lo + b], device=dev,
+                                transfer=transfer)
 
         _t0 = _time.perf_counter()
         _run_parts(pass1, partition_units(hi - lo, len(devs), plane_batch), devs)
@@ -448,7 +515,7 @@ def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
 
     def pass2(a, b, dev):
         fft_axis0_device_inplace(spec[:, a:b, :], pencil_batch=pencil_batch,
-                                 device=dev)
+                                 device=dev, transfer=transfer)
 
     _t0 = _time.perf_counter()
     _run_parts(pass2, partition_units(n, len(devs), pencil_batch), devs)
@@ -459,7 +526,8 @@ def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
 
 
 def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
-                            pencil_batch=1, devices=None, timings=None):
+                            pencil_batch=1, devices=None, timings=None,
+                            transfer="pageable"):
     """Device twin of `inverse_to_slabs`. MUTATES spec, exactly as that one does.
 
     `devices` splits both passes as in `forward_from_slabs_device`, bitwise
@@ -475,7 +543,8 @@ def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
 
     def pass2(a, b, dev):
         fft_axis0_device_inplace(spec[:, a:b, :], inverse=True,
-                                 pencil_batch=pencil_batch, device=dev)
+                                 pencil_batch=pencil_batch, device=dev,
+                                 transfer=transfer)
 
     _t0 = _time.perf_counter()
     _run_parts(pass2, partition_units(spec.shape[1], len(devs), pencil_batch),
@@ -493,8 +562,9 @@ def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
         def pass1(a, bb, dev, lo=lo, out=out):
             for i in range(lo + a, lo + bb, b):
                 j = min(i + b, lo + bb)
-                d = np.asarray(jnp.fft.irfft2(_to_device(spec[i:j], dev),
-                                              s=(n, n), axes=(-2, -1)))
+                d = _from_device(
+                    jnp.fft.irfft2(_to_device(spec[i:j], dev, transfer),
+                                   s=(n, n), axes=(-2, -1)), transfer)
                 _check_spectral_dtype(d.dtype, rdtype, "device irfft2")
                 out[i - lo : j - lo] = d
 

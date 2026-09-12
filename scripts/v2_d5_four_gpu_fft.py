@@ -96,8 +96,18 @@ def _provenance():
         host_mem_limit_gb=os.environ.get("XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB"),
         preallocate=os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE"),
         xla_flags=os.environ.get("XLA_FLAGS"),
+        staging_supported=_staging_probe(),
         argv=" ".join(sys.argv),
     )
+
+
+def _staging_probe():
+    try:
+        from inexor import ooc_fft
+
+        return ooc_fft.staging_supported()
+    except Exception:
+        return None
 
 
 def _per_device_peak():
@@ -221,21 +231,42 @@ def arm_identity(n, slab, plane_batch, pencil_batch, width, seed):
     return _participation(rec, width)
 
 
-def arm_timing(n, slab, plane_batch, pencil_batch, width, seed, reps):
-    """The wall at width W. Flat source: host RNG does not split and is 52 s."""
+def arm_timing(n, slab, plane_batch, pencil_batch, width, seed, reps,
+               transfer="pageable", commit=True, allow_no_staging=False):
+    """The wall at width W. Flat source: host RNG does not split and is 52 s.
+
+    `transfer` is measured HERE, on the real transform, rather than on the
+    synthetic proxy. 991236 showed why: that proxy took 1.69x LONGER than the
+    inverse whose traffic it claims to replicate (36.60 s against 21.68), so it
+    cannot carry an attribution, let alone a route decision.
+
+    `commit=False` runs the package's devices=None path -- jax places the
+    buffers itself instead of being told a device. It is the control for whether
+    COMMITTING costs anything on its own, which is the one code difference
+    between this apparatus and D1's.
+    """
     from inexor import ooc_fft
 
     rec = dict(arm="timing", n=n, width=width, slab=slab,
-               plane_batch=plane_batch, pencil_batch=pencil_batch, source="flat")
+               plane_batch=plane_batch, pencil_batch=pencil_batch, source="flat",
+               transfer=transfer, committed=bool(commit))
     try:
-        devs = _devices_for(width)
+        if transfer == "staged" and not ooc_fft.staging_supported():
+            msg = ("backend has no host -> pinned_host -> device round trip, so "
+                   "a staged leg here would silently measure pageable")
+            rec.update(completed=bool(allow_no_staging), skipped=True, error=msg)
+            return _participation(rec, width) if allow_no_staging else rec
+        rec["staging_supported"] = ooc_fft.staging_supported()
+        devs = _devices_for(width) if commit else None
+        if devs is None:
+            rec["devices_used"] = "uncommitted (jax places)"
         one = ooc_fft.plane_noise(n, 0, np.float32, seed)
 
         def field(lo, hi):
             return np.broadcast_to(one, (hi - lo, n, n))
 
         kw = dict(slab=slab, plane_batch=plane_batch, pencil_batch=pencil_batch,
-                  devices=devs)
+                  devices=devs, transfer=transfer)
 
         t0 = time.perf_counter()
         spec = ooc_fft.forward_from_slabs_device(field, n, **kw)
@@ -271,7 +302,7 @@ def arm_timing(n, slab, plane_batch, pencil_batch, width, seed, reps):
     except Exception as exc:
         rec.update(completed=False, error=f"{type(exc).__name__}: {exc}",
                    oom="MEMORY" in str(exc).upper() or "RESOURCE_EXHAUSTED" in str(exc))
-    return _participation(rec, width)
+    return _participation(rec, width if commit else 1)
 
 
 def arm_transfer(n, mode, width, reps, seed=0):
@@ -564,6 +595,8 @@ def spawn(args, arm, n, width, mode="pageable", extra=None):
            "--slab", str(args.slab), "--plane-batch", str(args.plane_batch),
            "--pencil-batch", str(args.pencil_batch), "--reps", str(args.reps),
            "--seed", str(args.seed)]
+    if args.allow_no_staging:
+        cmd.append("--allow-no-staging")
     cmd += list(extra or [])
     t0 = time.perf_counter()
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -583,6 +616,12 @@ def _line(rec):
     head = f"[{rec.get('arm'):>15}] n={rec.get('n')} W={rec.get('width')}"
     if rec.get("mode") and rec.get("arm") == "transfer":
         head += f" {rec['mode']:>8}/{rec.get('driver', '?')}"
+    if rec.get("arm") == "timing":
+        head += f" {rec.get('transfer', '?'):>8}"
+        if not rec.get("committed", True):
+            head += "/uncommitted"
+    if rec.get("skipped"):
+        return head + f"  SKIPPED: {str(rec.get('error'))[:110]}"
     if not rec.get("completed"):
         return head + f"  FAILED: {str(rec.get('error'))[:150]}"
     bits = []
@@ -645,6 +684,11 @@ def main(argv=None):
                     help="D1's measured best on Grace (1.10x over 1)")
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--transfers", default="pageable,staged",
+                    help="transfer policies for the timing arm")
+    ap.add_argument("--allow-no-staging", action="store_true",
+                    help="a staged leg on a backend that cannot stage is a "
+                         "recorded SKIP rather than a failure (smoke only)")
     ap.add_argument("--no-processes", action="store_true",
                     help="skip the process-driver control")
     ap.add_argument("--smoke", action="store_true",
@@ -657,6 +701,8 @@ def main(argv=None):
     ap.add_argument("--mode", default="pageable",
                     choices=("pageable", "pinned"), help=argparse.SUPPRESS)
     ap.add_argument("--rank", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--transfer", default="pageable", help=argparse.SUPPRESS)
+    ap.add_argument("--uncommitted", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--barrier-dir", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
@@ -669,7 +715,9 @@ def main(argv=None):
                                args.pencil_batch, args.width, args.seed)
         elif args.arm == "timing":
             rec = arm_timing(args.n, args.slab, args.plane_batch,
-                             args.pencil_batch, args.width, args.seed, args.reps)
+                             args.pencil_batch, args.width, args.seed, args.reps,
+                             transfer=args.transfer, commit=not args.uncommitted,
+                             allow_no_staging=args.allow_no_staging)
         elif args.arm == "transfer":
             rec = arm_transfer(args.n, args.mode, args.width, args.reps, args.seed)
         elif args.arm == "transfer-child":
@@ -683,6 +731,7 @@ def main(argv=None):
     if args.smoke:
         args.n, args.receipt_n = 64, 32
         args.slab, args.pencil_batch, args.reps = 16, 4, 1
+        args.allow_no_staging = True
 
     widths = [int(w) for w in args.widths.split(",") if w.strip()]
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -713,11 +762,17 @@ def main(argv=None):
             json.dump(dict(provenance=prov, args=vars(args), cards=cards), fh,
                       indent=1)
 
+    transfers = [t.strip() for t in args.transfers.split(",") if t.strip()]
     record(spawn(args, "roundtrip", args.receipt_n, 1))
     for w in widths:
         record(spawn(args, "identity", args.n, w))
-    for w in widths:
-        record(spawn(args, "timing", args.n, w))
+    for t in transfers:
+        for w in widths:
+            record(spawn(args, "timing", args.n, w, extra=["--transfer", t]))
+    # CONTROL: does committing to a device cost anything on its own? This is the
+    # one code difference between this apparatus and D1's.
+    record(spawn(args, "timing", args.n, 1,
+                 extra=["--transfer", transfers[0], "--uncommitted"]))
     for mode in ("pageable", "pinned"):
         for w in widths:
             record(spawn(args, "transfer", args.n, w, mode=mode))
