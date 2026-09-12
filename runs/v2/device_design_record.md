@@ -407,3 +407,143 @@ Owed forward into D2, not into D1:
    against 201 GB/s at 2 GiB; the slab window (2.4 GB) is the natural unit.
 3. **A four-GPU reading.** Every number in secs. 7-9 is one GB200.
 4. **Name the node on every future reading of this class.** 1.36x.
+
+## 10. D5 pulled forward, Vista 991162 + 991236 -- the transform splits 2.8-3.0x across four GPUs, not 4x
+
+`6760488` and `38d4bec`, 2026-09-11/12, gb nodes **c672-010** and **c672-016**,
+11:09 and 12:56 wall, all legs rc=0, **~0.4 SU total**.
+`scripts/v2_d5_four_gpu_vista.sbatch`, four GB200s, all four visible in every
+leg. Cards: `runs/v2/d5_four_gpu_gb.json`. 512^3 roundtrip reproduced at
+4.053e-06 for the fourth and fifth time.
+
+Pulled ahead of D2c at JC's direction: D0's budget and 5y's 114 s/step floor
+both rest on a 4-way split that had never been measured, and D2c..D2e would
+have been built on top of it.
+
+### The measurement, and why it is a contention measurement
+
+The factorization is embarrassingly parallel with **no inter-device
+communication** -- pass 1 independent per plane, pass 2 per y-pencil-plane,
+spectrum host-resident throughout -- so nothing in the algorithm stops a 4x
+split. But D1 measured this path at 91% host bus, and the bus is the one
+resource four GPUs share. Strong scaling at fixed total work, widths 1/2/4, all
+in ONE job on ONE node.
+
+**The identity arm gates everything else and passed at every width**: the W=4
+spectrum is BITWISE equal to the W=1 spectrum at 2048^3, forward and inverse
+(n_diff 0 of 8.6e9 f32 words). Partitioning a loop cannot change a value, so
+this is an identity rather than a tolerance; without it a wall measured at W=4
+would be a wall for a different transform. Every leg also records which devices
+did work, and a width served by fewer devices fails the job rather than
+printing a number -- a W=4 leg that quietly ran on device 0 is
+indistinguishable from "it did not scale".
+
+### The split, c672-016 (991236, the corrected job)
+
+| | W=1 | W=2 | W=4 | T(1)/T(4) |
+|---|---|---|---|---|
+| forward | 20.79 s | 11.64 | 6.86 | 3.03x |
+| inverse | 21.68 s | 12.06 | 7.13 | 3.04x |
+| inverse, pass 2 | 7.63 s | 4.53 | 2.60 | **2.93x** |
+| inverse, pass 1 | 13.37 s | 7.34 | 4.11 | **3.25x** |
+| host spectrum copy | 2.97 s | 3.21 | 3.04 | **1.00x** |
+| coarse solve (1 fwd + 3 inv) | **85.8 s/step** | 47.8 | **28.2 s/step** | **3.04x** |
+| % of the 1080 s bar | 7.9% | 4.4% | **2.6%** | |
+
+991162 on c672-010 read the same quantities 1.28x faster throughout (67.1 /
+37.9 / 23.8 s/step) for a split of **2.80x**. So the split is **2.8-3.0x on two
+nodes**, and the node spread that D1 measured at 1.36x reproduces at 1.28x on a
+third and fourth node.
+
+**The exact-quarter charge is wrong.** Any term in 5y's 114 s/step floor priced
+by dividing a single-card time by four should be divided by ~2.9 instead.
+D0's per-GPU column is NOT affected: that column is memory, and each GPU still
+holds its quarter of the working set however the wall splits.
+
+**But the absolute number moves the right way anyway.** 28.2 s/step against
+D1's 73-120 s/step on one GPU. The coarse solve stops being a large term -- for
+a different reason than the design assumed.
+
+### The sub-linearity is a shared resource, not a serial section
+
+An Amdahl fit on the inverse gives 2.28 s serial against 19.4 s parallel and
+predicts W=2 to 0.7% on a point it was not fitted to. My first reading of that
+named a suspect with arithmetic: pass 2's strided host gather, ~103 GB of host
+traffic per pass at 2048^3.
+
+**The per-pass split REFUTES it.** Pass 2 scales 2.93x; a 2.4 s serial section
+inside it would have capped it at 2.06x. Fitting each pass separately puts
+~0.9 s in pass 2 and ~1.0 s in pass 1 -- spread across both roughly in
+proportion to their size, which is the signature of a shared resource (four
+threads do not get four times the host memory bandwidth) and not of
+unsplittable code.
+
+**Consequence: there is no serial section to go delete.** The missing 1.0-1.2x
+is bought by moving less host traffic, not by restructuring the loop. This is
+why the per-pass instrumentation was added rather than the fit being trusted.
+
+### The transfer proxy, and two defects in it that were mine
+
+| mode | W=1 | W=2 | W=4 threads | W=4 processes | T(1)/T(4) |
+|---|---|---|---|---|---|
+| pageable | 3.8 GB/s | 7.1 | 13.9 | 14.2 | 3.69x |
+| pinned | 37.3 GB/s | 71.3 | 108.9 | **139.5** | 2.92x |
+
+The first version of this arm got BOTH modes wrong and **neither error was
+visible in the rate it printed**. Pageable did a second `device_put` where D1
+reused the device array, so it moved three plane-crossings per unit instead of
+two and read 1.5x low. Pinned asked `device_put` to send an already-pinned
+array back to `pinned_host`, which returns the IDENTICAL OBJECT and moves
+nothing, so the D2H leg never ran and the rate read 2x high. Both errors were
+width-independent, so 991162's speedups survived them; its absolute rates did
+not.
+
+Corrected, **the pinned proxy agrees with D1**: 37.3 GB/s here against 44.4 on
+c672-002, a 1.19x gap inside the node spread. That agreement is the evidence
+the fix took. A prior claim that the corrected PAGEABLE figure matched D1's 6.5
+GB/s is **withdrawn** -- that arithmetic assumed H2D and D2H cost the same,
+which this job contradicts; normalized for the node the corrected reading is
+~4.8 GB/s against D1's 6.5, a node-sized gap rather than a match.
+
+`_crossing_receipt` now runs before any timing and FAILS the leg: it checks the
+D2H leg returned a distinct object in the expected memory kind, which is
+exactly what the pinned no-op could not have satisfied. A transfer that
+silently did not happen looks identical to a fast one, and my own instrument is
+not exempt from that.
+
+### Pinning is the remaining lever, and it is large
+
+Pinned buys **7.8x on the bus at W=4** (108.9 against 13.9 GB/s). Carrying D1's
+attribution that the transform is 91% bus, a pinned transform on four GPUs
+projects to **~5.8 s/step, 0.5% of the bar**. PROJECTED, on a 91% measured at
+W=1 pageable and not remeasured at width -- and no pinned FFT path exists,
+because doing it honestly needs the slab window itself allocated in pinned host
+memory, which is pipeline work.
+
+**If that lands, the 34.4 GB host spectrum copy becomes the largest term in the
+coarse solve**: flat at ~3.0 s across every width (it is serial host work), and
+at three inverses per step that is ~9.1 s/step against a ~5.8 s/step transform.
+Whether the solve can avoid making it is worth settling before anything else in
+this phase is optimized.
+
+The driver control, with the bytes finally right: pageable **1.02x** (threads
+and processes identical), pinned **1.28x** in favour of processes. The GIL
+costs nothing while transfers are slow and ~28% once they are fast.
+
+### What D5 has established, and what is owed
+
+Established: the split is 2.8-3.0x not 4x, on two nodes, under a bitwise
+identity gate; the shortfall is shared host bandwidth in both passes rather
+than a serial section; pinning is worth 7.8x on the bus at width.
+
+Owed forward:
+1. **Does an explicit copy into a reusable pinned buffer beat the driver's
+   pageable path?** The engine's host buffers are numpy and JAX's pinned arrays
+   are immutable, so the allocation cannot simply be swapped. The pageable path
+   already pays a host copy inside the driver; the question is whether the
+   driver is doing something worse than a plain memcpy. This decides the route
+   and is one cheap arm.
+2. The 91% bus attribution remeasured AT WIDTH, before the ~5.8 s/step
+   projection is quoted as anything but a projection.
+3. Whether the coarse solve can avoid the 34.4 GB spectrum copy.
+4. Name the node on every reading of this class. Four nodes now, 1.28-1.36x.
