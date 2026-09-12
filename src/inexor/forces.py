@@ -1115,15 +1115,30 @@ def coarse_subblock_origin_extent(tijk, n_tile, n_coarse, n_fine, halo=COARSE_HA
 def stage_coarse_subblock(g_coarse, origin_cells, extent):
     """Extract the (extent,)*3 periodic sub-block at `origin_cells`.
 
-    Host-side numpy with `mode="wrap"` per axis, so a block straddling the
+    Host-side numpy, wrapped per axis by construction, so a block straddling the
     periodic boundary needs no special case and no copy of the whole mesh.
+
+    ONE 3-D GATHER, NOT THREE 1-D ONES. Taking axis by axis is the obvious
+    spelling and it materializes the whole intermediate slab before the second
+    axis narrows it: at c-hero the first take alone builds (132, 2048, 2048) =
+    2.21 GB to deliver a 9.20 MB block, and it runs once per force component per
+    tile -- 3 x 4096 = 12,288 times a step, i.e. **27.2 TB of host writes per
+    step to produce 113 GB of output**. `np.ix_` gathers the extent^3 elements
+    directly. It is the same elements in the same order, so the change is an
+    identity and `test_the_subblock_is_the_wrapped_slice` pins it against the
+    global mesh element by element, independent of either spelling.
+
+    The defect was invisible until c-hero because the intermediate scales as
+    extent x n_coarse^2: at cgh64 it is small enough to disappear into noise,
+    and the engine has never run at c-hero. It is also ~2.21 GB of transient
+    host allocation per call that no budget carries -- at W=8 workers, ~17.7 GB.
     """
     g = np.asarray(g_coarse)
-    out = g
-    for axis, o in enumerate(np.asarray(origin_cells, dtype=np.int64)):
-        idx = (np.arange(int(extent), dtype=np.int64) + int(o)) % g.shape[axis]
-        out = np.take(out, idx, axis=axis)
-    return out
+    o = np.asarray(origin_cells, dtype=np.int64)
+    if o.shape != (3,) or g.ndim != 3:
+        raise ValueError(f"want a 3-D mesh and a (3,) origin, got {g.shape} and {o.shape}")
+    span = np.arange(int(extent), dtype=np.int64)
+    return g[np.ix_(*((span + int(o[axis])) % g.shape[axis] for axis in range(3)))]
 
 
 def gather_coarse_subblock(

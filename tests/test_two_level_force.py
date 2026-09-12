@@ -666,6 +666,76 @@ def test_the_staged_subblock_is_a_verbatim_periodic_slice():
                 assert sub[i, j, k] == want
 
 
+def test_staging_allocates_the_block_and_not_a_slab():
+    """The transient, which is what the axis-by-axis spelling got wrong.
+
+    Taking axis by axis materializes (extent, n, n) before the second axis
+    narrows it. That is invisible at test sizes and enormous at c-hero -- 2.21
+    GB per call to deliver 9.20 MB, 12,288 calls a step -- so the VALUE tests
+    above could never have caught it. This one watches the allocation instead.
+
+    The bar is the SLAB, not a multiple of the output, because the honest
+    floor here is not the output: numpy broadcasts the `np.ix_` index arrays
+    over the output shape, and an int64 index is twice the bytes of an f32
+    value, so a correct 3-D gather legitimately peaks at ~4.6x its output
+    (measured: 0.25 MB for 0.055 MB). That is inherent to fancy indexing and
+    not a defect, and a bar set off the output would be policing it. What the
+    gate has to exclude is SLAB-scale allocation, which is 6.3 MB here -- 115x
+    the output and 25x what the gather actually uses. A quarter of the slab
+    sits an order clear of both sides.
+    """
+    import tracemalloc
+
+    n, extent = 256, 24
+    g = np.zeros((n, n, n), dtype=np.float32)
+    out_bytes = extent**3 * g.itemsize
+    slab_bytes = extent * n * n * g.itemsize
+    assert slab_bytes > 50 * out_bytes, "the test size stopped separating the two regimes"
+
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        sub = forces.stage_coarse_subblock(g, [3, 3, 3], extent)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert sub.nbytes == out_bytes
+    transient = peak - before
+    assert transient < slab_bytes / 4, (
+        f"staging allocated {transient / 1e6:.2f} MB for a {out_bytes / 1e6:.2f} MB "
+        f"block -- slab-scale, and an axis-at-a-time gather is ~{slab_bytes / 1e6:.1f} MB"
+    )
+
+
+def test_staging_matches_an_axis_at_a_time_gather_bitwise():
+    """The change that removed the slab is an IDENTITY -- same elements, same
+    order -- so the retired spelling is kept here as the oracle and must agree
+    to the bit, including where the block straddles the periodic boundary and
+    where the origin is negative."""
+    rng = np.random.default_rng(4)
+    n, extent = 32, 7
+    g = rng.standard_normal((n, n, n)).astype(np.float64)
+
+    def axis_at_a_time(mesh, origin, ext):
+        out = mesh
+        for axis, o in enumerate(np.asarray(origin, dtype=np.int64)):
+            idx = (np.arange(int(ext), dtype=np.int64) + int(o)) % mesh.shape[axis]
+            out = np.take(out, idx, axis=axis)
+        return out
+
+    for origin in ([5, 5, 5], [-3, 30, 1], [n - 1, n - 1, n - 1], [-n - 2, 0, n + 4]):
+        got = forces.stage_coarse_subblock(g, origin, extent)
+        want = axis_at_a_time(g, origin, extent)
+        assert np.array_equal(got, want), f"origin {origin} moved bits"
+
+    # anti-vacuity: the comparison can fail
+    bumped = g.copy()
+    bumped[5, 5, 5] = np.nextafter(bumped[5, 5, 5], np.inf)
+    assert bumped[5, 5, 5] != g[5, 5, 5], "the perturbation was a no-op"
+    assert not np.array_equal(forces.stage_coarse_subblock(bumped, [5, 5, 5], extent),
+                              axis_at_a_time(g, [5, 5, 5], extent))
+
+
 def test_the_subblock_is_far_smaller_than_the_global_mesh():
     """The reason it exists. Asserted as a ratio so a later halo change that
     quietly ate the saving shows up here."""
