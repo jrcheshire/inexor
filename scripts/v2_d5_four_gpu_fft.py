@@ -655,8 +655,14 @@ def _speedups(cards, key):
     for c in cards:
         if not c.get("completed"):
             continue
+        # The family MUST carry every axis that distinguishes a leg. It did not
+        # carry `transfer` or `committed`, so 992621 collapsed five timing legs
+        # into one row and printed T(1)/T(4) as the UNCOMMITTED W=1 inverse over
+        # the STAGED W=4 one -- 2.495x, a ratio between two different arms, and
+        # exactly the kind of number that reaches a record unchallenged.
         fam = (c.get("arm"), c.get("mode") if c.get("arm") == "transfer" else None,
-               c.get("driver"))
+               c.get("driver"), c.get("transfer"),
+               None if c.get("committed", True) else "uncommitted")
         t = c.get(key) or (c.get("move") or {}).get("median_s") \
             or (c.get("inv") or {}).get("median_s")
         if t:
