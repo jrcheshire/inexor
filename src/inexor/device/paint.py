@@ -7,11 +7,14 @@ resolves per-brick INDICES and hands over one contiguous slice of the state;
 the decode, the containment bounds and the integer sub-block paint all run on
 the device.
 
-THE UNIT IS ONE X-SLAB OF BRICKS by default. The host path paints
-`cfg.chunk_bricks` (64) bricks at a time, which at 4096^3 is 262,144 chunks and
-so 262,144 device launches per step; a whole x-slab is 256. Any chunk length
-whose bricks form a cuboid is accepted (`engine._chunk_cuboid`), so a smaller
-unit can trade device memory for launches.
+THE UNIT IS A QUARTER OF AN X-SLAB OF BRICKS by default
+(`default_chunk_bricks`). The host path paints `cfg.chunk_bricks` (64) bricks at
+a time, which at 4096^3 is 262,144 chunks and so 262,144 device launches per
+step; a quarter-slab is 1,024. A whole x-slab (256 launches) was the first
+choice and does not fit a card: measured on a GB200 at 266 B per padded row
+(Vista 993139), it is 90 GB at 4096^3 and puts a card at 1.15x its memory,
+where a quarter-slab is 22.5 GB and 0.81x. Any chunk length whose bricks form a
+cuboid is accepted (`engine._chunk_cuboid`).
 
 BITWISE against the host paint, and it can be. Positions decode bitwise
 (`device.decode`), the paint kernel is the same `paint_tsc_int_subblock` with
@@ -33,6 +36,18 @@ arrangement as the tile gather's deferred guard. Nothing here is wired into
 from __future__ import annotations
 
 import numpy as np
+
+
+def default_chunk_bricks(bricks_per_side):
+    """A quarter of an x-slab of bricks, or a whole x-slab where a quarter does
+    not tile into cuboids (bricks per side not divisible by 4).
+
+    A quarter-slab is (1, nb/4, nb) bricks, which `engine._chunk_cuboid`
+    accepts whenever 4 divides nb -- at every production config nb is 32 or
+    more and a power of two.
+    """
+    nb = int(bricks_per_side)
+    return nb * nb // 4 if nb % 4 == 0 else nb * nb
 
 
 def chunk_rows(st, chunk_len):
@@ -209,7 +224,7 @@ def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
     """delta on the coarse mesh, painted chunk by chunk on the device.
 
     Bitwise `engine.coarse_delta_streamed` at any `chunk_bricks` that tiles the
-    brick grid into cuboids; the default is one x-slab of bricks. `pad_shape`
+    brick grid into cuboids; the default is `default_chunk_bricks`. `pad_shape`
     carries the chunk row shape across steps as the host path does.
     `accumulator` defaults to `HostInt64Accumulator`.
 
@@ -230,7 +245,7 @@ def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
         raise ValueError(f"state has {nb} bricks per side, config implies "
                          f"{cfg.n_fine // cfg.n_brick}")
     n_b = int(st.n_bricks)
-    L = nb * nb if chunk_bricks is None else int(chunk_bricks)
+    L = default_chunk_bricks(nb) if chunk_bricks is None else int(chunk_bricks)
     if L < 1 or n_b % L:
         raise ValueError(
             f"chunk_bricks {L} does not divide the {n_b} bricks, so the chunks "

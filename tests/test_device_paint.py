@@ -70,9 +70,11 @@ def test_device_density_is_bitwise_the_host_streamed_density():
     want = engine.coarse_delta_streamed(st, cfg)
     s = {}
     got = dpaint.coarse_delta_device(st, cfg, stats=s)
-    nb = st.bricks_per_side
-    assert s["coarse_chunk_bricks"] == nb * nb, "default unit is not one x-slab"
-    assert s["coarse_device_chunks"] == nb, "the device path did not paint every slab"
+    L = dpaint.default_chunk_bricks(st.bricks_per_side)
+    assert L == st.bricks_per_side**2 // 4, "the default is not a quarter-slab here"
+    assert s["coarse_chunk_bricks"] == L, "the default chunk length did not apply"
+    assert s["coarse_device_chunks"] == st.n_bricks // L, \
+        "the device path did not paint every chunk"
     assert np.array_equal(got, want), "the device paint moved a bit of the density"
     _nontrivial(got)
 
@@ -147,7 +149,7 @@ def test_chunk_size_does_not_move_a_bit_and_the_knob_applies():
     st = _state(cfg, 4, arena=True)
     nb = st.bricks_per_side
     s_slab, s_row = {}, {}
-    a = dpaint.coarse_delta_device(st, cfg, stats=s_slab)
+    a = dpaint.coarse_delta_device(st, cfg, stats=s_slab, chunk_bricks=nb * nb)
     b = dpaint.coarse_delta_device(st, cfg, stats=s_row, chunk_bricks=nb)
     assert s_slab["coarse_chunk_bricks"] == nb * nb and s_row["coarse_chunk_bricks"] == nb
     assert s_row["coarse_device_chunks"] > s_slab["coarse_device_chunks"], \
@@ -249,9 +251,9 @@ def _live_peak(jaxpr):
     return peak
 
 
-def test_a_chunk_stays_inside_the_planners_per_row_charge():
-    """`plan.PAINT_CHUNK_B_PER_ROW` is read off this program, so the program is
-    held to it: re-trace one chunk at two padded row counts, difference out the
+def test_a_chunk_stays_inside_the_traced_per_row_floor():
+    """`plan.PAINT_CHUNK_TRACED_B_PER_ROW` is read off this program, so the program
+    is held to it: re-trace one chunk at two padded row counts, difference out the
     fixed terms, and fail if the live bytes per row exceed the charge. The floor
     is the decoded positions (24) plus the three per-axis TSC weight arrays (72),
     which are alive together through the whole corner loop -- a reading below
@@ -286,10 +288,10 @@ def test_a_chunk_stays_inside_the_planners_per_row_charge():
     p2 = 4 * p1
     per_row = (peak_at(p2) - peak_at(p1)) / (p2 - p1)
     assert per_row >= 96, f"liveness reads {per_row:.1f} B/row, below positions + weights"
-    assert per_row <= planner.PAINT_CHUNK_B_PER_ROW, (
-        f"one paint chunk now holds {per_row:.1f} B/row on the device against the "
-        f"planner's {planner.PAINT_CHUNK_B_PER_ROW}: re-derive the charge and re-read "
-        "the per-card budget")
+    assert per_row <= planner.PAINT_CHUNK_TRACED_B_PER_ROW, (
+        f"one paint chunk's traced program now holds {per_row:.1f} B/row against "
+        f"the recorded floor of {planner.PAINT_CHUNK_TRACED_B_PER_ROW}: the program "
+        "grew, so the card-measured PAINT_CHUNK_B_PER_ROW is stale too -- re-measure")
 
 
 def test_x64_off_is_refused():

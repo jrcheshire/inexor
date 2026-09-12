@@ -201,21 +201,21 @@ DEVICE_PLACEMENT = {
 STREAM_CHUNK_BYTES = 2.0 * 2**30
 STREAM_CHUNKS_IN_FLIGHT = 2
 
-# ONE COARSE-PAINT CHUNK ON A CARD (`device.paint`): the decoded positions, the
-# per-axis TSC weights and the corner-loop temporaries of one chunk, alive
-# together. DERIVED FROM THE TRACED PROGRAM, not modelled: bytes alive at once
-# under last-use freeing, differenced over two padded row counts so fixed
-# terms drop out (121 B/row; positions + weights alone are 96).
-# `tests/test_device_paint.py` re-traces it and fails if the program ever
-# exceeds this charge.
-#
-# It is a FLOOR for the code as written: last-use freeing is what a jitted
-# program's allocator can reach, and the paint runs eagerly, where Python keeps
-# the decode's intermediates alive until it returns. The card measurement is
-# owed.
-PAINT_CHUNK_B_PER_ROW = 121
-# the window of `off` the chunk uploads, 3 B per row
-PAINT_WINDOW_B_PER_ROW = 3
+# ONE COARSE-PAINT CHUNK ON A CARD (`device.paint`), MEASURED on a GB200 (Vista
+# 993139, c672-004): device `peak_bytes_in_use` per padded row, the `off` window
+# upload included, 272.0 / 264.8 / 266.2 B at 16.8M / 84.6M / 338M padded rows.
+# Flat over 20x in rows, so it is a rate and not a fixed cost. This is the
+# EAGER program, which is how the paint runs.
+PAINT_CHUNK_B_PER_ROW = 266
+# folded into the measured rate above; kept at 0 so the job card's reader,
+# which adds the two, still resolves
+PAINT_WINDOW_B_PER_ROW = 0
+# THE TRACED FLOOR: bytes alive at once under last-use freeing, read off the
+# traced program and differenced over two padded row counts (121 B/row;
+# positions + TSC weights alone are 96). Roughly what a jitted chunk's allocator
+# could reach. `tests/test_device_paint.py` re-traces the program and fails if
+# it ever exceeds this, which catches program growth without a card.
+PAINT_CHUNK_TRACED_B_PER_ROW = 121
 # a chunk's rows are padded on `forces.capacity_shape`'s ladder, whose padding
 # is derived at <= 26.0%
 PAINT_PAD_BOUND = 1.26
@@ -276,7 +276,7 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
     does not fit gets a FITS.
 
     `paint_chunk_bricks` is the device coarse paint's chunk length in bricks;
-    None is `device.paint`'s default, one x-slab of bricks.
+    None is `device.paint.default_chunk_bricks`.
     """
     from .engine import ONCE_PER_RUN_PHASES
 
@@ -323,7 +323,10 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
     # The device coarse paint's own working set. The host decode it replaces is
     # "gone" in DEVICE_PLACEMENT, and until this line nothing charged the card
     # for doing that work instead.
-    chunk_len = nb * nb if paint_chunk_bricks is None else int(paint_chunk_bricks)
+    from .device.paint import default_chunk_bricks
+
+    chunk_len = (default_chunk_bricks(nb) if paint_chunk_bricks is None
+                 else int(paint_chunk_bricks))
     chunk_rows = n / nb**3 * chunk_len * PAINT_PAD_BOUND
     paint_b = int(chunk_rows * (PAINT_CHUNK_B_PER_ROW + PAINT_WINDOW_B_PER_ROW))
     key = f"coarse_paint_chunk ({chunk_len} bricks, decoded + painted)"
@@ -458,8 +461,9 @@ def main(argv=None):
                          "--backend device. A Vista gb node has 4.")
     ap.add_argument("--paint-chunk-bricks", type=int, default=None,
                     help="for --backend device: bricks per coarse-paint chunk on a "
-                         "card. Default one x-slab of bricks; smaller trades card "
-                         "memory for more device launches per step.")
+                         "card. Default a quarter of an x-slab of bricks (a whole "
+                         "x-slab does not fit a GB200 at 4096^3, measured); "
+                         "smaller trades card memory for more device launches.")
     ap.add_argument("--n-part", type=int, default=None, help="particles per side")
     ap.add_argument("--box", type=float, default=None, help="box size, Mpc/h")
     ap.add_argument("--n-fine", type=int, default=None)

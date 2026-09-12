@@ -637,3 +637,102 @@ the 1080 s bar, against D1's 73-120 s/step on one GPU.
    leg (84.2 vs 83.0 s/step, 1.01x). Recorded as unexplained. It is off the
    decision path and is not worth a job.
 3. Nothing further on pinning.
+
+## 12. D2d, Vista 993139 -- the device coarse paint is bitwise across backends, and a whole x-slab chunk does not fit a card
+
+`573d55f`, 2026-09-12, gb node c672-004, one GB200 read (`jax.devices()[0]`),
+COMPLETED rc=0 in 8:08, ~0.14 SU. Script `scripts/v2_d2d_device_paint.py`,
+sbatch `v2_d2d_device_paint_vista.sbatch`; cards
+`runs/v2/d2d_device_paint_{gb,smoke}.json` (force-added). Every arm a fresh
+subprocess, so each device high-water is its own (baseline `bytes_in_use` 0).
+
+**What was built** (`6c3cd17`, `7882701`, `73ee946`): `device/paint.py` decodes
+a chunk of consecutive bricks from one contiguous slot slice plus its arena
+residents, checks stencil containment as device scalars and paints the integer
+sub-block on the device. The accumulator is a seam; this job used the host
+int64 mesh. Also found and fixed on the way: `device.decode`'s bucket search
+built a (rows, 512) table -- ~1.1 TB for an x-slab chunk, ~100 GB for a 4096^3
+tile -- now one searchsorted, O(rows).
+
+### Identity: PASS on every gate
+
+- **Cross-backend.** A `JAX_PLATFORMS=cpu` process hashed
+  `engine.coarse_delta_streamed` at cdev (256^3); the GPU's
+  `coarse_delta_device` hash-equals it for a plain state and for one with
+  **61,879 arena residents**. The laptop suite could only show device == host on
+  one backend.
+- **Per chunk.** Each chunk's block equals host `decode_bricks` through the same
+  kernel, at all three sizes below. The smoke leg (32^3, on the GPU) passed the
+  same gates first.
+
+### Memory: a clean per-row rate, 2.2x the traced floor
+
+Chunks built at production brick geometry (4096 rows, 512 buckets per brick),
+so their rows are 4096^3 chunks' rows:
+
+| chunk | real rows | padded rows | device peak | B per padded row |
+|---|---|---|---|---|
+| 1/16 x-slab (512^3, 4096 bricks) | 16.8M | 16.8M | 4.56 GB | 272.0 |
+| 1/4 x-slab (512^3, 16384 bricks) | 67.1M | 84.6M | 22.39 GB | 264.8 |
+| whole x-slab (1024^3, 65536 bricks) | 268.4M | 338.2M | 90.03 GB | 266.2 |
+
+Flat over 20x in rows. The traced program under last-use freeing reads 121 B/row
+(what `PAINT_CHUNK_B_PER_ROW` charged until this job, plus 3 for the window);
+the eager program as it runs holds 2.2x that. **The planner now charges the
+measured 266** (`PAINT_CHUNK_B_PER_ROW`), and keeps 121 as
+`PAINT_CHUNK_TRACED_B_PER_ROW`, the laptop gate on program growth.
+
+**At 4096^3 (`inexor.plan --backend device`, measured rate):**
+
+| chunk | paint on a card | per-card total | verdict |
+|---|---|---|---|
+| whole x-slab | 90.0 GB | 228.4 GB | **DOES NOT FIT, 1.15x** |
+| 1/4 x-slab | 22.5 GB | 160.9 GB | fits, 0.81x |
+| 1/16 x-slab | 5.6 GB | 144.0 GB | fits, 0.72x |
+
+By the rule pre-registered in the sbatch (the reading picks the chunk size),
+**the device paint's default is now a quarter of an x-slab**
+(`device.paint.default_chunk_bricks`). Host column unchanged at 0.93x.
+
+### Time: the paint is now the largest measured term in the step
+
+| chunk | median s/chunk (3 reps) | host window prep | ns per real row |
+|---|---|---|---|
+| 1/16 x-slab | 0.234 | 0.016 | 13.9 |
+| 1/4 x-slab | 0.798 | 0.034 | 11.9 |
+| whole x-slab | 2.590 | 0.165 | 9.6 |
+
+Warm (first) calls 5.2-7.7 s: eager per-op compilation, once per shape per
+process. Carried to a 4096^3 step, ONE card, serial: 958 / 817 / 663 s at
+1/16 / 1/4 / whole. **At the quarter-slab default that is ~204 s/step on four
+cards at an exact quarter split and ~282 s at D5's 2.9x** -- 19-26% of the
+1080 s bar, against the coarse solve's 27.3 s/step at W=4. Both four-card
+figures are arithmetic on a one-card reading; the paint's own split is not
+measured.
+
+**The gb probe projected this phase at 12.6 s/step** (sec. 5y: 0.196 s per
+268M-row slab for the sub-block paint alone, split four ways); a whole slab
+measures 2.59 s here. So most of the chunk's time is plausibly the decode and
+containment, not the paint kernel -- an INFERENCE across two jobs and two nodes,
+not attributed inside this one.
+
+### Environment note
+
+The gpu env prints `cuBLAS < 13.2 (120902 found) has a known issue ... executing
+a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can
+lead to silent data corruption.` This job is single-stream and its gates are
+bitwise, so it is not implicated. Not checked: whether any device path in this
+engine calls cuBLAS (the transforms are cuFFT, the paint and gather are
+scatter/gather), which matters for every multi-stream layout, D5's threads
+included.
+
+### Owed
+
+1. **Jit the chunk, gated bitwise BEFORE the jitted numbers are read.** The
+   traced floor (121 against 266 eager) says memory has room to fall; how much
+   wall moves is not predicted here.
+2. Attribute the 2.59 s inside one job: decode vs containment vs paint vs
+   readback.
+3. Whether cuBLAS is on any device path (environment note).
+4. Where the coarse mesh lives (host vs sharded on cards): still open, and the
+   accumulator seam is where either lands.
