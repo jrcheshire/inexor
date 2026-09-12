@@ -226,3 +226,107 @@ def test_the_monolithic_coarse_solve_refuses_the_silent_wrong_size():
     else:
         with pytest.raises(ValueError, match="MEASURED to return a wrong result"):
             forces.refuse_oversize_coarse_solve(at_or_above)
+
+
+def _coarse_parity_setup(fdtype, n=32, box=64.0, seed=5):
+    from inexor import forces
+
+    delta = np.random.default_rng(seed).standard_normal((n, n, n)).astype(fdtype)
+    kw = dict(r_s=2.0)
+    mono = forces.coarse_force_meshes(delta, n, box, "long", transform="monolithic", **kw)
+    fact = forces.coarse_force_meshes(delta, n, box, "long", transform="factorized", **kw)
+    return delta, mono, fact
+
+
+@pytest.mark.parametrize("fdtype", [np.float32, np.float64])
+def test_the_factorized_coarse_solve_agrees_with_monolithic_at_roundoff(fdtype):
+    """The parity gate for the port, in units of EPS rather than a picked number.
+
+    Bitwise is unavailable by construction: a different transform order rounds
+    differently, which `ooc_fft` says outright about `np.fft.rfftn`. So the
+    honest bar is that the disagreement is ROUNDOFF, and the way to show that is
+    that it scales with the dtype's epsilon instead of sitting at some absolute
+    level. Measured ~6 eps at f64 and ~7 eps at f32 -- the same relative size at
+    two precisions two orders apart, which a bug would not do.
+
+    The cap is 50 eps: an order clear of what both precisions actually read, and
+    three orders under the 1e-3-ish level any real error in a Poisson solve
+    would land at.
+    """
+    import jax
+
+    from inexor import forces
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", fdtype is np.float64)
+    try:
+        _, mono, fact = _coarse_parity_setup(fdtype)
+        eps = float(np.finfo(fdtype).eps)
+        for i in range(3):
+            m, f = np.asarray(mono[i]), np.asarray(fact[i])
+            assert f.dtype == np.dtype(fdtype), "the factorized solve changed precision"
+            rel = float(np.max(np.abs(m - f)) / np.std(m))
+            assert rel < 50 * eps, (
+                f"component {i} disagrees by {rel:.3e} = {rel / eps:.1f} eps at "
+                f"{np.dtype(fdtype).name}; roundoff between two factorizations is "
+                "a few eps, so this is a difference in the computation")
+        # anti-vacuity: the comparison can fail
+        assert np.max(np.abs(np.asarray(mono[0]) - np.asarray(fact[1]))) > 0
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+def test_the_per_slab_kernel_is_bitwise_the_whole_grid_kernel():
+    """The one piece of the port that CAN be bitwise, so it is.
+
+    `iks` are low-rank broadcasts whose x-component is the only one that
+    slices, `pref` and `mf` are real half-grids sliced on the same axis, and the
+    expression is `(pref * ik) * mf` element for element -- the association
+    `coarse_kernel_parts` deliberately refuses to fold. Nothing reduces across
+    x, so a slab cannot see its neighbours and the slice is an identity.
+
+    Without this, the factorized solve's tolerance gate above would be covering
+    for a kernel that quietly differed per slab.
+    """
+    from inexor import forces
+
+    n, box, fdtype = 24, 48.0, np.float32
+    parts = forces.coarse_kernel_parts(n, box, "long", r_s=2.0, match=(box / n, box / n),
+                                       fdtype=fdtype)
+    cdtype = np.complex64
+    for axis in range(3):
+        whole = forces.coarse_kernel_slab(parts, axis, 0, n, cdtype)
+        for slab in (1, 5, 8, n):
+            got = np.concatenate(
+                [forces.coarse_kernel_slab(parts, axis, lo, min(lo + slab, n), cdtype)
+                 for lo in range(0, n, slab)], axis=0)
+            assert got.dtype == whole.dtype
+            assert np.array_equal(got, whole), f"axis {axis} slab {slab} moved bits"
+
+
+def test_the_factorized_solve_is_bitwise_invariant_to_slab_thickness():
+    """Streaming is an OUTER LOOP BOUND here too: how many x-slabs are resident
+    at a time must not touch a value, or a checkpoint resumed with a different
+    window would change the physics."""
+    from inexor import forces
+
+    n, box, fdtype = 32, 64.0, np.float32
+    delta = np.random.default_rng(9).standard_normal((n, n, n)).astype(fdtype)
+    ref = forces.coarse_force_meshes(delta, n, box, "long", r_s=2.0,
+                                     transform="factorized", slab=n)
+    for slab in (1, 7, 8):
+        got = forces.coarse_force_meshes(delta, n, box, "long", r_s=2.0,
+                                         transform="factorized", slab=slab)
+        for i in range(3):
+            assert np.array_equal(np.asarray(got[i]), np.asarray(ref[i])), (
+                f"slab={slab} moved bits in component {i}")
+
+
+def test_an_unknown_transform_is_refused():
+    """A typo'd transform must not fall through to the monolithic default and be
+    measured as if the factorized path had run."""
+    from inexor import forces
+
+    delta = np.zeros((8, 8, 8), dtype=np.float32)
+    with pytest.raises(ValueError, match="transform must be"):
+        forces.coarse_force_meshes(delta, 8, 16.0, "long", r_s=2.0, transform="ooc")

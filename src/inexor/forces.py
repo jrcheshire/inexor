@@ -576,8 +576,72 @@ def refuse_oversize_coarse_solve(n_mesh):
     )
 
 
+def coarse_kernel_slab(parts, axis, lo, hi, cdtype):
+    """The complex kernel for one component, on the x-slab [lo, hi).
+
+    BITWISE the corresponding slice of the whole-grid kernel, and that is an
+    identity rather than a hope: `iks` are low-rank broadcasts whose x-component
+    is the only one that slices, `pref` and `mf` are real half-grids sliced along
+    the same axis, and the expression is `(pref * ik) * mf` element for element
+    -- the same association `coarse_kernel_parts` refuses to fold, for the same
+    reason. Nothing here reduces across x, so a slab cannot see its neighbours.
+
+    This is what lets the factorized solve never hold a whole complex kernel:
+    24 B/half becomes 24 B/slab, which is the same argument that kept `pref`
+    real and the `ik_j` low-rank in the first place.
+    """
+    ikx, iky, ikz = parts["iks"]
+    ik = (ikx[lo:hi], iky, ikz)[axis]
+    k = parts["pref"][lo:hi] * np.asarray(ik).astype(cdtype, copy=False)
+    if parts["mf"] is not None:
+        k = k * parts["mf"][lo:hi]
+    return k
+
+
+def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab):
+    """The coarse solve through `ooc_fft`'s canonical factorization.
+
+    WHY THIS EXISTS. The monolithic form does not fit at c-hero and is four
+    times over the size where a device FFT was MEASURED to be silently wrong
+    (`refuse_oversize_coarse_solve`). It is also the last place in the engine
+    still calling `jnp.fft.rfftn` directly: the IC stage already goes through
+    this factorization, which `ooc_fft`'s docstring calls the layer's
+    definition of the transform.
+
+    IT DOES NOT AGREE WITH THE MONOLITHIC FORM TO THE BIT, and cannot -- a
+    different transform order rounds differently, which `ooc_fft` says outright
+    about `np.fft.rfftn`. The gate is tolerance against monolithic at sizes
+    monolithic can still do, plus the invariances that ARE bitwise: the spectrum
+    must not depend on slab thickness, and the per-slab kernel must equal the
+    whole-grid one exactly.
+
+    THE COPY IS THE MULTIPLY, not an extra pass. `inverse_to_slabs_device`
+    mutates its spectrum, so each of the three components needs its own -- but
+    writing `work[lo:hi] = spec[lo:hi] * k` produces that copy AS the kernel
+    multiply, one read and one write over the half-grid, which is what a
+    standalone copy would have cost on its own. D5 measured that traversal at
+    ~3.0 s per component at 2048^3 (~9.1 s/step), flat in device count because
+    it is host work; this is where that term comes from.
+    """
+    from inexor import ooc_fft
+
+    n = int(n_mesh)
+    spec = ooc_fft.forward_from_slabs_device(
+        lambda lo, hi: delta[lo:hi], n, slab=slab)
+    for axis in range(3):
+        work = np.empty_like(spec)
+        for lo in range(0, spec.shape[0], slab):
+            hi = min(lo + slab, spec.shape[0])
+            work[lo:hi] = spec[lo:hi] * coarse_kernel_slab(parts, axis, lo, hi, cdtype)
+        for lo, block in ooc_fft.inverse_to_slabs_device(work, n, slab=slab):
+            out[axis][lo:lo + block.shape[0]] = block
+        del work
+    return out
+
+
 def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None,
-                        fdtype=None, parts=None, out=None):
+                        fdtype=None, parts=None, out=None, transform="monolithic",
+                        slab=None):
     """The three long-range force meshes from an ALREADY-PAINTED delta.
 
     `force_global` paints from every position AND gathers at every position,
@@ -638,6 +702,15 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
     cdtype = np.complex128 if fdtype == np.dtype(np.float64) else np.complex64
     if out is None:
         out = [np.empty((int(n_mesh),) * 3, dtype=fdtype) for _ in range(3)]
+    if transform == "factorized":
+        from inexor import ooc_fft
+
+        return _coarse_solve_factorized(
+            delta, n_mesh, parts, cdtype, out,
+            ooc_fft._DEF_SLAB if slab is None else int(slab))
+    if transform != "monolithic":
+        raise ValueError(
+            f"transform must be 'monolithic' or 'factorized', got {transform!r}")
     refuse_oversize_coarse_solve(int(n_mesh))
     dk = jnp.fft.rfftn(delta)
     # SEQUENTIAL PER-COMPONENT SOLVES, and now the comment is true of the
