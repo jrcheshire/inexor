@@ -201,6 +201,25 @@ DEVICE_PLACEMENT = {
 STREAM_CHUNK_BYTES = 2.0 * 2**30
 STREAM_CHUNKS_IN_FLIGHT = 2
 
+# ONE COARSE-PAINT CHUNK ON A CARD (`device.paint`): the decoded positions, the
+# per-axis TSC weights and the corner-loop temporaries of one chunk, alive
+# together. DERIVED FROM THE TRACED PROGRAM, not modelled: bytes alive at once
+# under last-use freeing, differenced over two padded row counts so fixed
+# terms drop out (121 B/row; positions + weights alone are 96).
+# `tests/test_device_paint.py` re-traces it and fails if the program ever
+# exceeds this charge.
+#
+# It is a FLOOR for the code as written: last-use freeing is what a jitted
+# program's allocator can reach, and the paint runs eagerly, where Python keeps
+# the decode's intermediates alive until it returns. The card measurement is
+# owed.
+PAINT_CHUNK_B_PER_ROW = 121
+# the window of `off` the chunk uploads, 3 B per row
+PAINT_WINDOW_B_PER_ROW = 3
+# a chunk's rows are padded on `forces.capacity_shape`'s ladder, whose padding
+# is derived at <= 26.0%
+PAINT_PAD_BOUND = 1.26
+
 
 def device_window_slabs(ec):
     """x-slabs of bricks that must be resident to serve one plane of tiles.
@@ -247,7 +266,7 @@ def _print_load_and_ic(args, ec, t9, n, rows, arena, shared):
     return max(ld.values())
 
 
-def device_budget(ec, *, n, n_gpus, row_bytes=9):
+def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
     """Per-GPU bytes for the host-state / device-step design.
 
     Returns `(resident, transient, phases)` in the shape the CPU column uses, so
@@ -255,6 +274,9 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9):
     behaviour is not the reason on a device, but XLA does not return a buffer to
     the pool between phases either, and understating a phase is how a run that
     does not fit gets a FITS.
+
+    `paint_chunk_bricks` is the device coarse paint's chunk length in bricks;
+    None is `device.paint`'s default, one x-slab of bricks.
     """
     from .engine import ONCE_PER_RUN_PHASES
 
@@ -298,6 +320,16 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9):
     resident["stream_chunks_in_flight"] = int(
         STREAM_CHUNKS_IN_FLIGHT * STREAM_CHUNK_BYTES)
 
+    # The device coarse paint's own working set. The host decode it replaces is
+    # "gone" in DEVICE_PLACEMENT, and until this line nothing charged the card
+    # for doing that work instead.
+    chunk_len = nb * nb if paint_chunk_bricks is None else int(paint_chunk_bricks)
+    chunk_rows = n / nb**3 * chunk_len * PAINT_PAD_BOUND
+    paint_b = int(chunk_rows * (PAINT_CHUNK_B_PER_ROW + PAINT_WINDOW_B_PER_ROW))
+    key = f"coarse_paint_chunk ({chunk_len} bricks, decoded + painted)"
+    transient[key] = paint_b
+    phases["coarse_paint"] = phases.get("coarse_paint", 0) + paint_b
+
     in_step = sum(v for k, v in phases.items() if k not in ONCE_PER_RUN_PHASES)
     once = max((v for k, v in phases.items() if k in ONCE_PER_RUN_PHASES),
                default=0)
@@ -320,7 +352,7 @@ def _device_main(args, ec, t9, n, rows, arena, state):
     n_gpus = max(1, int(args.n_gpus))
 
     resident, transient, phases, worst_phase, slabs, host_mesh = device_budget(
-        ec_dev, n=n, n_gpus=n_gpus)
+        ec_dev, n=n, n_gpus=n_gpus, paint_chunk_bricks=args.paint_chunk_bricks)
 
     step = ec_dev.step_bytes(n, n_rows=rows, cap=args.cap)
     host = dict(state)
@@ -424,6 +456,10 @@ def main(argv=None):
     ap.add_argument("--n-gpus", type=int, default=4,
                     help="accelerators the coarse mesh is sharded across, for "
                          "--backend device. A Vista gb node has 4.")
+    ap.add_argument("--paint-chunk-bricks", type=int, default=None,
+                    help="for --backend device: bricks per coarse-paint chunk on a "
+                         "card. Default one x-slab of bricks; smaller trades card "
+                         "memory for more device launches per step.")
     ap.add_argument("--n-part", type=int, default=None, help="particles per side")
     ap.add_argument("--box", type=float, default=None, help="box size, Mpc/h")
     ap.add_argument("--n-fine", type=int, default=None)

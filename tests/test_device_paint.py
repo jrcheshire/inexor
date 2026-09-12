@@ -209,6 +209,89 @@ def test_the_accumulator_is_a_seam():
     assert np.array_equal(got, engine.coarse_delta_streamed(st, cfg))
 
 
+# ----------------------------------------------- memory, by structure
+
+
+def _nbytes(v):
+    shape = getattr(v.aval, "shape", ())
+    size = int(np.prod(shape)) if shape else 1
+    return size * np.dtype(v.aval.dtype).itemsize
+
+
+def _live_peak(jaxpr):
+    """Peak bytes alive at once under last-use freeing, sub-jaxprs included.
+
+    Inputs and lifted constants are not counted -- only what the program
+    allocates. Literals are skipped when recording uses: they are not buffers.
+    """
+    last = {}
+    for i, e in enumerate(jaxpr.eqns):
+        for v in e.invars:
+            if type(v).__name__ != "Literal":
+                last[v] = i
+    for v in jaxpr.outvars:
+        if type(v).__name__ != "Literal":
+            last[v] = len(jaxpr.eqns)
+    alive, cur, peak = {}, 0, 0
+    for i, e in enumerate(jaxpr.eqns):
+        for v in e.outvars:
+            alive[v] = _nbytes(v)
+            cur += alive[v]
+        inner = 0
+        for p in e.params.values():
+            for s in p if isinstance(p, (tuple, list)) else (p,):
+                sub = getattr(s, "jaxpr", s)
+                if hasattr(sub, "eqns"):
+                    inner = max(inner, _live_peak(sub))
+        peak = max(peak, cur + inner)
+        for v in [v for v in alive if last.get(v, -1) <= i]:
+            cur -= alive.pop(v)
+    return peak
+
+
+def test_a_chunk_stays_inside_the_planners_per_row_charge():
+    """`plan.PAINT_CHUNK_B_PER_ROW` is read off this program, so the program is
+    held to it: re-trace one chunk at two padded row counts, difference out the
+    fixed terms, and fail if the live bytes per row exceed the charge. The floor
+    is the decoded positions (24) plus the three per-axis TSC weight arrays (72),
+    which are alive together through the whole corner loop -- a reading below
+    that means the liveness pass is broken, not that the paint got cheaper."""
+    import jax
+
+    from inexor import plan as planner
+    from inexor.device.decode import decode_rows
+    from inexor.painting import paint_tsc_int_subblock
+
+    cfg = _cfg()
+    st = _state(cfg, 4, arena=True)
+    nb = st.bricks_per_side
+    L = nb * nb
+    p, off, ab, base = dpaint.slab_window(st, np.arange(L, dtype=np.int64))
+    origin, extent = dpaint.chunk_origin_extent(0, L, nb, cfg.n_coarse)
+    n = cfg.n_coarse
+
+    def peak_at(pad):
+        def fn(off_w):
+            dec = decode_rows(p, off_w, None, None, ab, base, st.t9, nb, pad,
+                              velocities=False)
+            guard = []
+            dpaint.containment_bounds(dec["x"], dec["live"], cfg.box_size / float(n),
+                                      origin, extent, n, guard)
+            return paint_tsc_int_subblock(
+                dec["x"], tuple(int(o) for o in origin), tuple(int(e) for e in extent),
+                n, cfg.box_size, cfg.frac_bits, live=dec["live"])
+        return _live_peak(jax.make_jaxpr(fn)(off).jaxpr)
+
+    p1 = p["n_rows"] + 9
+    p2 = 4 * p1
+    per_row = (peak_at(p2) - peak_at(p1)) / (p2 - p1)
+    assert per_row >= 96, f"liveness reads {per_row:.1f} B/row, below positions + weights"
+    assert per_row <= planner.PAINT_CHUNK_B_PER_ROW, (
+        f"one paint chunk now holds {per_row:.1f} B/row on the device against the "
+        f"planner's {planner.PAINT_CHUNK_B_PER_ROW}: re-derive the charge and re-read "
+        "the per-card budget")
+
+
 def test_x64_off_is_refused():
     import jax
 
