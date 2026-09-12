@@ -239,7 +239,8 @@ def test_c_gh_now_fits_a_cpu_only_node_with_margin(capsys):
     out = capsys.readouterr().out
     assert "FITS" in out and "DOES NOT FIT" not in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    assert est == pytest.approx(180.5, abs=1.0)
+    # 180.5 -> 167.889: the factorized coarse solve (2026-09-12): the monolithic form's `coarse_kernels` (2 complex half-grids) and `coarse_fft_workspace` (3) became a host-resident spectrum, one per-component work buffer and a slab-sized kernel.
+    assert est == pytest.approx(167.889, abs=1.0)
     assert est < 237.0, "the bound no longer fits the node it was sized for"
 
 
@@ -290,7 +291,8 @@ def test_the_estimate_is_a_lower_bound_and_says_so(capsys):
     # 3.445 (derived 9 B/row) -> 3.488 (measured 11.1, out of place) -> 3.305
     # (measured 2.1, in place) -> 3.396 (phases summed within a step) -> 3.363
     # (measured 0.49, per-brick census). scripts/v2_m6_repack_bytes.py.
-    assert est == pytest.approx(3.363, abs=0.01)
+    # ... -> 3.343: the factorized coarse solve (2026-09-12): the monolithic form's `coarse_kernels` (2 complex half-grids) and `coarse_fft_workspace` (3) became a host-resident spectrum, one per-component work buffer and a slab-sized kernel.
+    assert est == pytest.approx(3.343, abs=0.01)
     assert est < 7.461, "the bound must sit under the measured peak it bounds"
 
 
@@ -454,10 +456,17 @@ def test_the_phase_model_would_have_refused_the_run_that_died():
     # the old shape: three complex kernels built per step and matched, so a
     # SECOND triple, the f64 island rebuilt every step, and three force meshes
     # copied out at once because the comprehension rebinds only at the end
-    old_solve = (3 * m["coarse_kernels"]                 # six half-grids, not two
+    # Expressed in COMPLEX HALF-GRIDS, which is exactly what `coarse_spectrum`
+    # is, because the two terms this used to name (`coarse_kernels` at two of
+    # them, `coarse_fft_workspace` at three) stopped existing when the coarse
+    # solve was factorized. Same nine half-grids, same bytes, reconstructed from
+    # a term that still exists -- a historical model has to be expressible in
+    # current units or it quietly stops being checkable.
+    half_grid = m["coarse_spectrum"]
+    old_solve = (6 * half_grid          # three kernels, each matched: a second triple
                  + m["coarse_kernel_build_f64"]
                  + m["coarse_kernel_pref"] + m["coarse_match_factor"]
-                 + m["coarse_fft_workspace"]
+                 + 3 * half_grid        # monolithic dk, its device copy, their product
                  + 3 * m["coarse_force_copy_transient"])
     assert old_solve / GB_ == pytest.approx(68.8, abs=1.0), (
         f"the pre-M-v2-6 solve reconstructs to {old_solve / GB_:.1f} GB; if this "
@@ -541,7 +550,7 @@ def test_the_tile_kernel_build_moves_into_the_loop_when_a_pool_runs_it():
     assert pooled["tile_kernel_build_f64"] == "tile_loop"
     assert pooled["tile_kernel_pref"] == "tile_loop"
     # and the coarse arm's phases are untouched by the worker count
-    assert pooled["coarse_kernels"] == serial["coarse_kernels"] == "coarse_solve"
+    assert pooled["coarse_spectrum"] == serial["coarse_spectrum"] == "coarse_solve"
 
 
 def test_the_worker_count_reaches_the_config_the_planner_prices(capsys):
@@ -634,7 +643,8 @@ def test_c_gh_does_not_fit_a_gg_node_at_the_knobs_that_have_been_failing(capsys)
     out = capsys.readouterr().out
     assert "DOES NOT FIT" in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    assert est == pytest.approx(283.2, abs=2.0)
+    # 283.2 -> 270.578: the factorized coarse solve (2026-09-12): the monolithic form's `coarse_kernels` (2 complex half-grids) and `coarse_fft_workspace` (3) became a host-resident spectrum, one per-component work buffer and a slab-sized kernel.
+    assert est == pytest.approx(270.578, abs=2.0)
 
 
 def test_bounding_ejects_charges_the_inserts_that_replace_them():
@@ -743,15 +753,25 @@ def test_one_gpu_charges_every_surviving_term_in_full():
 
     ec = _ec("cgh64")
     mesh = ec.mesh_bytes()
-    resident, transient, _phases, _worst, _slabs = device_budget(
+    resident, transient, _phases, _worst, _slabs, host_mesh = device_budget(
         ec, n=ec.n_total, n_gpus=1)
     got = {**resident, **transient}
-    kept = {k: v for k, v in mesh.items() if DEVICE_PLACEMENT[k] != "gone"}
+    kept = {k: v for k, v in mesh.items()
+            if DEVICE_PLACEMENT[k] not in ("gone", "host")}
     assert kept, "vacuous: no mesh term survives the placement"
     for k, v in kept.items():
         assert got[k] == v, k
     # and the deleted host pass is really gone
     assert "coarse_decode_slab" not in got
+    # EVERY surviving term lands in EXACTLY ONE column, at full value. A term
+    # placed "host" leaves the device table, and if it did not arrive in
+    # `host_mesh` it would be charged nowhere -- the same omission the
+    # DEVICE_PLACEMENT KeyError guards, reached by a different door.
+    on_host = {k: v for k, v in mesh.items() if DEVICE_PLACEMENT[k] == "host"}
+    assert on_host, "vacuous: no term is host-placed, so this arm proves nothing"
+    for k, v in on_host.items():
+        assert host_mesh[k] == v, f"{k} is host-placed but not charged to the host"
+        assert k not in got, f"{k} is charged to BOTH columns"
 
 
 def test_the_shard_is_exactly_a_quarter_across_four_cards():
@@ -759,8 +779,8 @@ def test_the_shard_is_exactly_a_quarter_across_four_cards():
 
     ec = _ec("cgh64")
     mesh = ec.mesh_bytes()
-    r1, t1, _p, _w, _s = device_budget(ec, n=ec.n_total, n_gpus=1)
-    r4, t4, _p, _w, _s = device_budget(ec, n=ec.n_total, n_gpus=4)
+    r1, t1, _p, _w, _s, _h = device_budget(ec, n=ec.n_total, n_gpus=1)
+    r4, t4, _p, _w, _s, _h = device_budget(ec, n=ec.n_total, n_gpus=4)
     one, four = {**r1, **t1}, {**r4, **t4}
     sharded = [k for k, v in DEVICE_PLACEMENT.items()
                if v == "shard" and k in mesh]

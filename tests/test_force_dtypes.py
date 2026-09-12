@@ -787,7 +787,10 @@ def test_the_kernel_build_does_not_shrink_with_the_knob():
     f32 = engine.EngineConfig(**C_GH, coarse_dtype="float32").mesh_bytes()
     f64 = engine.EngineConfig(**C_GH, coarse_dtype="float64").mesh_bytes()
     assert f32["coarse_kernel_build_f64"] == f64["coarse_kernel_build_f64"]
-    assert f32["coarse_kernels"] * 2 == f64["coarse_kernels"]
+    # the factorized solve's terms, all of which carry the complex width
+    for k in ("coarse_spectrum", "coarse_solve_work", "coarse_kernel_slab",
+              "coarse_device_planes"):
+        assert f32[k] * 2 == f64[k], f"{k} did not follow the coarse knob"
 
 
 def test_the_coarse_knob_does_not_move_the_fine_terms_or_the_accumulator():
@@ -798,8 +801,8 @@ def test_the_coarse_knob_does_not_move_the_fine_terms_or_the_accumulator():
     for k in ("tile_kernels", "tile_workspace", "coarse_accumulator", "coarse_decode_slab",
               "coarse_kernel_build_f64"):
         assert a[k] == b[k], f"{k} moved with the COARSE knob"
-    for k in ("coarse_delta", "coarse_force_resident", "coarse_kernels",
-              "coarse_fft_workspace"):
+    for k in ("coarse_delta", "coarse_force_resident", "coarse_spectrum",
+              "coarse_solve_work", "coarse_kernel_slab", "coarse_device_planes"):
         assert a[k] * 2 == b[k], f"{k} did not halve with the coarse knob"
 
     c = engine.EngineConfig(**C_GH, coarse_dtype="float64", fine_dtype="float32").mesh_bytes()

@@ -114,8 +114,10 @@ MESH_PHASE = {
     "coarse_match_factor": "resident",
     "coarse_accumulator": "coarse_paint",
     "coarse_decode_slab": "coarse_paint",
-    "coarse_kernels": "coarse_solve",
-    "coarse_fft_workspace": "coarse_solve",
+    "coarse_spectrum": "coarse_solve",
+    "coarse_solve_work": "coarse_solve",
+    "coarse_kernel_slab": "coarse_solve",
+    "coarse_device_planes": "coarse_solve",
     "coarse_force_copy_transient": "coarse_solve",
     # BOTH, and it is not resident: the decode allocates it inside the paint and
     # `step` drops the host name as soon as the jax copy exists, so it spans the
@@ -362,7 +364,25 @@ class EngineConfig:
             # then measured 60.01 B per half-grid element per step against the
             # 16.01 it costs now (flat to 0.2% over 7.9x in `half`, n_coarse
             # 128/192/256), and that 44 B/half is 23.7 GB per step at C-gh.
-            coarse_kernels=2 * half * 2 * cw,
+            # THE FACTORIZED SOLVE'S TERMS (the monolithic ones they replace are
+            # in git history; `coarse_kernels` at 2 complex half-grids and
+            # `coarse_fft_workspace` at 3). The record's rule was that a budget
+            # must not be edited to match a measurement of code that has not yet
+            # replaced the code it prices -- the factorized transform IS now the
+            # default, so these price what actually runs.
+            #
+            # HOST-RESIDENT, all three: `_coarse_solve_factorized` keeps the
+            # spectrum in numpy and only planes cross to a device. That is not an
+            # implementation detail, it is the property the whole design rests
+            # on, and it is why these carry the "host" placement rather than
+            # being sharded across the cards.
+            coarse_spectrum=half * 2 * cw,        # the forward's output, held
+            coarse_solve_work=half * 2 * cw,      # per component: copy AS multiply
+            # the per-slab kernel and its product. `2 *` because the kernel slab
+            # and the `spec * k` temporary are live together; slab thickness is
+            # an outer loop bound, so this is the whole cost of the kernel that
+            # used to be a full complex half-grid.
+            coarse_kernel_slab=2 * slab * nc * (nc // 2 + 1) * 2 * cw,
             # THREE complex half-grids, not one, and this is a DERIVATION rather
             # than a measurement: `dk`, the device copy `jnp.asarray(k)` makes of
             # the host kernel, and their product, all live while `irfftn` runs.
@@ -372,7 +392,13 @@ class EngineConfig:
             # `memory_stats()` is None on CPU). Modelled high on purpose: this
             # is a budget, and the failure that costs a node is the one where a
             # term was left out.
-            coarse_fft_workspace=3 * half * 2 * cw,
+            # What the transform actually holds ON a device, which is the term
+            # the monolithic form could not make small. MEASURED at 117.5 MB at
+            # 2048^3 against a 34.4 GB spectrum -- 0.0034x, the witness D1
+            # existed to get. Modelled at 16 planes rather than the ~8 that
+            # measurement implies, on the same "a budget is not a best case"
+            # posture as the terms above.
+            coarse_device_planes=16 * nc * (nc // 2 + 1) * 2 * cw,
             # --- coarse, RESIDENT for the whole run: what the once-per-run
             # build leaves behind (`forces.coarse_kernel_parts`). Both are real
             # half-grids at the coarse dtype; the complex kernels are not kept.

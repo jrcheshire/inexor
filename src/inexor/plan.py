@@ -156,16 +156,27 @@ def load_stages(*, n, n_rows, n_buckets, index_itemsize, n_arena, n_bricks,
 #              The coarse mesh is planar-decomposed for the factorized FFT, so
 #              every coarse term follows the same split.
 #   replica -- every card runs whole tiles, so each holds its own copy.
+#   host    -- exists, but in HOST memory: no card holds it. Distinct from
+#              "gone", which means the term stops existing at all. The
+#              factorized coarse solve's spectrum is the reason this category
+#              exists -- it is 34.4 GB at c-hero that the design deliberately
+#              never puts on a card.
 #   gone    -- the host pass the port deletes.
 DEVICE_PLACEMENT = {
     "coarse_delta": "shard",
     "coarse_force_resident": "shard",
     "coarse_force_copy_transient": "shard",
-    "coarse_kernels": "shard",
     "coarse_kernel_pref": "shard",
     "coarse_match_factor": "shard",
     "coarse_kernel_build_f64": "shard",
-    "coarse_fft_workspace": "shard",
+    # HOST-RESIDENT: the factorized solve keeps the spectrum in numpy and sends
+    # only planes across, so a card never holds one. `coarse_device_planes` is
+    # what it DOES hold, and it is a replica because each card transforms its
+    # own planes.
+    "coarse_spectrum": "host",
+    "coarse_solve_work": "host",
+    "coarse_kernel_slab": "host",
+    "coarse_device_planes": "replica",
     # Priced at the HOST path's int64 width, which over-charges the device form:
     # the sub-block paint accumulates int32 (`painting.paint_tsc_int_subblock`)
     # and the engine's int64 mesh is the parent-side accumulator the port
@@ -249,7 +260,7 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9):
 
     mesh = ec.mesh_bytes()
     phase_of = ec.mesh_phase()
-    resident, transient, phases = {}, {}, {}
+    resident, transient, phases, host_mesh = {}, {}, {}, {}
     for k, v in mesh.items():
         where = DEVICE_PLACEMENT.get(k)
         if where is None:
@@ -259,6 +270,14 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9):
                 "how an omitted term becomes a budget that cannot be traded "
                 "against, which is what this module exists to prevent.")
         if where == "gone":
+            continue
+        if where == "host":
+            # NOT skipped -- handed back so the HOST table charges it. Dropping
+            # it here would put the term in neither column, which is precisely
+            # the omission the KeyError above exists to prevent, arriving by a
+            # different door: the device table would look smaller and nothing
+            # would look bigger.
+            host_mesh[k] = int(v)
             continue
         b = int(v / n_gpus) if where == "shard" else int(v)
         p = phase_of[k]
@@ -282,7 +301,7 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9):
     in_step = sum(v for k, v in phases.items() if k not in ONCE_PER_RUN_PHASES)
     once = max((v for k, v in phases.items() if k in ONCE_PER_RUN_PHASES),
                default=0)
-    return resident, transient, phases, max(in_step, once), slabs
+    return resident, transient, phases, max(in_step, once), slabs, host_mesh
 
 
 def _device_main(args, ec, t9, n, rows, arena, state):
@@ -300,7 +319,7 @@ def _device_main(args, ec, t9, n, rows, arena, state):
     ec_dev, _ = build(dev_args)
     n_gpus = max(1, int(args.n_gpus))
 
-    resident, transient, phases, worst_phase, slabs = device_budget(
+    resident, transient, phases, worst_phase, slabs, host_mesh = device_budget(
         ec_dev, n=n, n_gpus=n_gpus)
 
     step = ec_dev.step_bytes(n, n_rows=rows, cap=args.cap)
@@ -308,6 +327,13 @@ def _device_main(args, ec, t9, n, rows, arena, state):
     for k, v in step.items():
         if v:
             host[f"{k} (host until D3/D4)"] = v
+    # The mesh terms the design puts in HOST memory ON PURPOSE -- the factorized
+    # coarse solve's spectrum and its per-component work buffer. They are the
+    # design working as intended, not a port debt like the two above, so they
+    # are labelled as such rather than lumped in with them.
+    for k, v in host_mesh.items():
+        if v:
+            host[f"{k} (host by design)"] = v
     _table("HOST: the state, plus the per-step terms nothing has moved yet", host)
     print(f"  state alone: {sum(state.values()) / n:6.2f} B/p")
     print("  `migrate_staging` and `repack_scratch` are exactly the terms the "
