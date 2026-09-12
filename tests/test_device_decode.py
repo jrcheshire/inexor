@@ -240,3 +240,60 @@ def test_x64_off_is_refused_rather_than_silently_narrowing_the_slots():
             _device(st, bricks, cap)
     finally:
         jax.config.update("jax_enable_x64", prev)
+
+
+# ------------------------------------------------------- memory, by structure
+
+
+def _largest_intermediate(jaxpr):
+    """Element count of the largest array any equation produces, sub-jaxprs included.
+
+    Inputs and lifted constants are not equation outputs, so the state arrays
+    and the host plan do not count -- only what the decode itself allocates.
+    """
+    best = 0
+    for eqn in jaxpr.eqns:
+        for v in eqn.outvars:
+            shape = getattr(v.aval, "shape", ())
+            best = max(best, int(np.prod(shape)) if shape else 1)
+        for p in eqn.params.values():
+            for sub in p if isinstance(p, (tuple, list)) else (p,):
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    best = max(best, _largest_intermediate(inner))
+    return best
+
+
+def test_no_intermediate_scales_as_rows_times_buckets_per_brick():
+    """The decode must be O(rows) on the device, not O(rows x buckets per brick).
+
+    A bucket search that compares every row against its brick's whole prefix sum
+    builds a (rows, 512) table at every production config. That is invisible
+    here and fatal at scale: ~100 GB for one 4096^3 tile and ~1.1 TB for an
+    x-slab of bricks, against a 199 GB card. A value test cannot see it, so the
+    traced program's largest intermediate is gated instead.
+    """
+    import jax
+
+    from inexor.device import decode as dev
+
+    st = _with_arena_residents()
+    bricks = _all_bricks()
+    assert sum(len(st.arena_slots_of_brick(b)) for b in bricks) > 0
+    cap = len(st.decode_bricks(bricks)[0]) + 5
+    plan = dev.tile_decode_plan(st, bricks)
+    p3 = int(plan["p3"])
+    bar = max(4 * cap, 2 * len(bricks) * p3)
+    assert cap * p3 > 4 * bar, "vacuous: a rows x buckets table would not clear the bar"
+
+    def fn(off, w):
+        out = dev.decode_rows(plan, off, w, st.vel_scale, st.arena_bucket,
+                              st.arena_base, _t9(), BRICKS, cap)
+        return out["slots"], out["x"], out["v"]
+
+    closed = jax.make_jaxpr(fn)(st.off, st.w)
+    biggest = _largest_intermediate(closed.jaxpr)
+    assert biggest <= bar, (
+        f"the decode allocates a {biggest}-element intermediate against a bar of "
+        f"{bar} ({cap} rows x {p3} buckets per brick = {cap * p3}): something "
+        "scales as rows x buckets")

@@ -139,11 +139,24 @@ def decode_rows(plan, off, w, vel_scale, arena_bucket, arena_base, t9,
 
     # --- live rows: slot is the brick's run, bucket is a prefix over occupancy
     slot_live = starts[bi] + rank
-    # cumulative occupancy within the row's own brick, then the same
-    # searchsorted trick: the rows are already grouped by bucket, so the bucket
-    # ordinal is where this rank falls in the brick's own prefix sum.
+    # The bucket ordinal is how many of the row's OWN brick's prefix sums are
+    # <= its rank. Comparing every row against its brick's whole prefix sum
+    # (`occ_cum[bi] <= rank[:, None]`) is the obvious spelling and it builds a
+    # (rows, buckets_per_brick) table: ~100 GB for one 4096^3 tile and ~1.1 TB
+    # for an x-slab of bricks. So the per-brick prefix sums are lifted into ONE
+    # nondecreasing sequence -- brick b's by b * lift, with lift above any
+    # value a prefix sum or a rank can take -- and one searchsorted counts the
+    # same thing: every entry of the earlier bricks, plus exactly the own
+    # brick's entries <= rank, and none of the later ones. Same integers, O(rows).
+    #
+    # int64 throughout: `searchsorted` returns int32, and b * lift at an x-slab
+    # of bricks is ~2e13.
     occ_cum = jnp.cumsum(occ, axis=1)
-    within = jnp.sum(occ_cum[bi] <= rank[:, None], axis=1)
+    lift = max(cap, n_rows) + 1
+    bi64 = bi.astype(jnp.int64)
+    keys = (occ_cum
+            + (jnp.arange(occ.shape[0], dtype=jnp.int64) * lift)[:, None]).reshape(-1)
+    within = jnp.searchsorted(keys, bi64 * lift + rank, side="right") - bi64 * p3
     within = jnp.clip(within, 0, p3 - 1)
     bucket_flat_live = bricks[bi] * p3 + within
 
