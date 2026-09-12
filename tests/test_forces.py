@@ -197,3 +197,32 @@ def test_the_parts_hold_only_real_half_grids():
     # would keep three more full grids without anyone noticing
     for a in parts["iks"]:
         assert a.size <= n, f"ik grid is full-rank ({a.size} elements)"
+
+
+def test_the_monolithic_coarse_solve_refuses_the_silent_wrong_size():
+    """`ooc_fft` refuses a device transform above 2**31 elements; the module the
+    engine's coarse solve actually calls did not, and c-hero's 2048^3 coarse
+    mesh is 4x that bound.
+
+    The exemption is the interesting half: the bound was measured on cuFFT and
+    refusing on CPU would be inventing a limit rather than enforcing one, so the
+    check is on the backend about to run the transform. Both halves are pinned,
+    since a guard that fires everywhere would be as wrong as one that fires
+    nowhere.
+    """
+    import jax
+
+    from inexor import forces, ooc_fft
+
+    below = 1024  # c-gh's coarse mesh; the size that read 2.9e-6 correctly
+    at_or_above = 2048  # c-hero's
+    assert below**3 < ooc_fft.MAX_DEVICE_TRANSFORM_ELEMENTS <= at_or_above**3, (
+        "the test sizes no longer bracket the bound")
+
+    forces.refuse_oversize_coarse_solve(below)  # must not raise, any backend
+
+    if jax.default_backend() == "cpu":
+        forces.refuse_oversize_coarse_solve(at_or_above)  # exempt, must not raise
+    else:
+        with pytest.raises(ValueError, match="MEASURED to return a wrong result"):
+            forces.refuse_oversize_coarse_solve(at_or_above)

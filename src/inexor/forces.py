@@ -535,6 +535,47 @@ def coarse_kernel_parts(n_mesh, box_size, which, r_s=None, match=None, clip=None
                 fdtype=fdtype, n_mesh=int(n_mesh), which=which)
 
 
+def refuse_oversize_coarse_solve(n_mesh):
+    """Refuse a MONOLITHIC coarse solve big enough to be silently wrong.
+
+    `ooc_fft` refuses a device transform at or above 2**31 elements because one
+    was MEASURED to return a wrong result with no symptom (1536^3 f32 roundtrip
+    3.8e+3 against 1024^3's 2.9e-6, Vista 972737, jax 0.10.2 + GB200). This
+    module never had that guard, and it is the one the engine's coarse solve
+    actually calls: at c-hero the coarse mesh is 2048^3 = 8.59e9 elements, FOUR
+    TIMES the bound, so the port to a device backend would walk straight into
+    the silent-wrong class. Every preset that has ever run is below it -- c-gh's
+    1024^3 is exactly the size that read 2.9e-6 correctly -- so this refuses
+    nothing that works today.
+
+    CPU IS EXEMPT, deliberately. The bound is empirical and the suspect is
+    cuFFT's 32-bit plan class; refusing on a backend where nothing was ever
+    measured would be inventing a limit rather than enforcing one. The check is
+    therefore on the backend that is about to run the transform.
+
+    The fix when this fires is not a bigger bound, it is the factorized form:
+    `ooc_fft.forward_from_slabs_device` reads 6.676e-06 at 2048^3 where the
+    monolithic call does not fit and does not survive its own roundtrip.
+    """
+    import jax
+
+    from inexor import ooc_fft
+
+    n_elements = int(n_mesh) ** 3
+    if n_elements < ooc_fft.MAX_DEVICE_TRANSFORM_ELEMENTS:
+        return
+    if jax.default_backend() == "cpu":
+        return
+    raise ValueError(
+        f"the monolithic coarse solve at n_mesh={n_mesh} is {n_elements:,} "
+        f"elements, at or above the {ooc_fft.MAX_DEVICE_TRANSFORM_ELEMENTS:,} "
+        f"bound where a device FFT has been MEASURED to return a wrong result "
+        f"silently, on backend {jax.default_backend()!r}. Use the factorized "
+        "path (`ooc_fft.forward_from_slabs_device`), which reads 6.676e-06 at "
+        "2048^3; the plane is the unit."
+    )
+
+
 def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None,
                         fdtype=None, parts=None, out=None):
     """The three long-range force meshes from an ALREADY-PAINTED delta.
@@ -597,6 +638,7 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
     cdtype = np.complex128 if fdtype == np.dtype(np.float64) else np.complex64
     if out is None:
         out = [np.empty((int(n_mesh),) * 3, dtype=fdtype) for _ in range(3)]
+    refuse_oversize_coarse_solve(int(n_mesh))
     dk = jnp.fft.rfftn(delta)
     # SEQUENTIAL PER-COMPONENT SOLVES, and now the comment is true of the
     # outputs as well as of the transforms. `k` is formed, used and dropped
