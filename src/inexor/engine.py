@@ -64,6 +64,7 @@ from .forces import (
     coarse_subblock_origin_extent,
     gather_coarse_subblock,
     make_tile_force_fn,
+    check_stencil_guard,
     stage_coarse_subblock,
     tile_capacity,
     tile_geom,
@@ -1067,12 +1068,20 @@ def tile_task(st, one_tile, C, g_coarse, t, bricks, ph=_no_phase):
     xo[:n_own] = x[owned]
     lv = np.zeros(C["cap"], dtype=bool)
     lv[:n_own] = True
-    g_long = np.asarray(
-        gather_coarse_subblock(
-            *sub, jnp.asarray(xo), o_cells, C["coarse_cell"], C["n_coarse"],
-            assign="tsc", live=lv,
-        )
-    )[:n_own]
+    # `guard_out` keeps the stencil-containment check off the critical path:
+    # computing its bounds on the host meant a device->host sync in the MIDDLE
+    # of the gather, before the corner loop that is the actual work, plus a host
+    # min/max over every padded row. Deferred, the bounds are device scalars and
+    # are resolved BELOW, after the forces have been read back and the device is
+    # idle, so the refusal costs a round-trip's latency instead of a stall. It
+    # still fires before `g_long` is used, which is the property that matters.
+    stencil_guard = []
+    g_long_dev = gather_coarse_subblock(
+        *sub, jnp.asarray(xo), o_cells, C["coarse_cell"], C["n_coarse"],
+        assign="tsc", live=lv, guard_out=stencil_guard,
+    )
+    g_long = np.asarray(g_long_dev)[:n_own]
+    check_stencil_guard(stencil_guard)
     ph("tile_long")
     t_quant = time.perf_counter()
     g_tot = g_short[owned] + g_long

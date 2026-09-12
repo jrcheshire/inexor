@@ -1141,9 +1141,45 @@ def stage_coarse_subblock(g_coarse, origin_cells, extent):
     return g[np.ix_(*((span + int(o[axis])) % g.shape[axis] for axis in range(3)))]
 
 
+def stencil_violation_message(assign, lo_needed, hi_needed, extent):
+    return (
+        f"a row's {assign} stencil reaches outside the staged sub-block: needs "
+        f"[{lo_needed}, {hi_needed}] of [0, {extent - 1}]. Pass only the tile's OWNED "
+        "rows, or raise the halo -- reading past the block wraps to the far side of "
+        "the mesh and is silent."
+    )
+
+
+def check_stencil_guard(guard_out):
+    """Resolve deferred stencil bounds and refuse. Call before USING the result.
+
+    Reads the device scalars, so it is a sync -- it belongs immediately beside
+    the readback of the forces themselves, never inside the tile loop's
+    arithmetic.
+    """
+    for lo_needed, hi_needed, extent, assign in guard_out:
+        lo_i, hi_i = int(lo_needed), int(hi_needed)
+        if lo_i < 0 or hi_i >= extent:
+            raise ValueError(stencil_violation_message(assign, lo_i, hi_i, extent))
+
+
+def _stencil_bounds(i, m, first, n_w, n_coarse, extent):
+    """Lowest and highest cell any LIVE row's stencil reaches, on device.
+
+    Dead rows are pushed to sentinels that cannot win their own reduction, which
+    reproduces the host form's `if keep.any()` exactly: with every row dead the
+    min comes back above zero and the max below `extent`, so an all-padded tile
+    raises nothing, as it did before.
+    """
+    big = jnp.int32(int(n_coarse) + int(extent) + 1)
+    i_lo = i if m is None else jnp.where(m, i, big)
+    i_hi = i if m is None else jnp.where(m, i, -big)
+    return jnp.min(i_lo) + first, jnp.max(i_hi) + first + n_w - 1
+
+
 def gather_coarse_subblock(
     sub_x, sub_y, sub_z, positions, origin_cells, cell_coarse, n_coarse, assign="tsc",
-    live=None,
+    live=None, guard_out=None,
 ):
     """Read the long force for one tile's rows out of a staged sub-block.
 
@@ -1177,6 +1213,17 @@ def gather_coarse_subblock(
     The caller must pass only rows whose stencil fits the halo. Rows outside the
     tile's core would read wrapped values from the far side of the block,
     silently and plausibly, so they are refused rather than trusted.
+
+    **`guard_out` moves that refusal off the critical path without weakening
+    it.** Computing the bounds on the host meant `np.asarray(i)` in the MIDDLE
+    of the gather: it stalls the device before the corner loop, which is the
+    actual work, and then runs a host min/max over every padded row -- a
+    per-particle host pass, once per tile, in a function whose arithmetic is
+    otherwise entirely on device. Pass a list and the bounds come back as
+    device scalars instead, for the caller to check on the sync it already
+    performs on the forces. The refusal then happens after the tile is computed
+    but BEFORE its result is used, which is why a deferred guard is still a
+    guard: nothing wrong is ever written to the state.
     """
     extent = int(np.asarray(sub_x).shape[0])
     origin = np.asarray(origin_cells, dtype=np.int64)
@@ -1198,22 +1245,24 @@ def gather_coarse_subblock(
     # boundary back in range without touching any float
     i = jnp.mod(base - jnp.asarray(origin, dtype=jnp.int32), int(n_coarse))
 
-    i_np = np.asarray(i)
-    keep = np.ones(i_np.shape[0], dtype=bool) if live is None else np.asarray(live)
-    if keep.any():
-        lo_needed = int(i_np[keep].min()) + first
-        hi_needed = int(i_np[keep].max()) + first + len(w_axis) - 1
-        if lo_needed < 0 or hi_needed >= extent:
-            raise ValueError(
-                f"a row's {assign} stencil reaches outside the staged sub-block: needs "
-                f"[{lo_needed}, {hi_needed}] of [0, {extent - 1}]. Pass only the tile's OWNED "
-                "rows, or raise the halo -- reading past the block wraps to the far side of "
-                "the mesh and is silent."
-            )
-    if live is not None:
+    m = None if live is None else jnp.asarray(live)[:, None]
+    lo_needed, hi_needed = _stencil_bounds(i, m, first, len(w_axis), n_coarse, extent)
+    if guard_out is None:
+        # EAGER: pull the two scalars back and refuse here. This is the original
+        # behaviour and it costs a device->host sync in the MIDDLE of the
+        # gather, before the corner loop that is the actual work.
+        lo_i, hi_i = int(lo_needed), int(hi_needed)
+        if lo_i < 0 or hi_i >= extent:
+            raise ValueError(stencil_violation_message(assign, lo_i, hi_i, extent))
+    else:
+        # DEFERRED: hand the caller the two device scalars unevaluated, so they
+        # ride back on the sync it already performs on the forces. The refusal
+        # still happens before this tile's result is used -- see the guard_out
+        # note in the docstring.
+        guard_out.append((lo_needed, hi_needed, extent, assign))
+    if m is not None:
         # padded rows read a valid address with zero weight, exactly as
         # `_tile_corner` does; the index must stay in range for every row
-        m = jnp.asarray(keep)[:, None]
         i = jnp.where(m, i, -first)
         w_axis = tuple(jnp.where(m, w, 0.0) for w in w_axis)
 

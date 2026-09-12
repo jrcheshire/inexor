@@ -736,6 +736,74 @@ def test_staging_matches_an_axis_at_a_time_gather_bitwise():
                               axis_at_a_time(g, [5, 5, 5], extent))
 
 
+def test_the_deferred_guard_is_the_same_guard():
+    """`guard_out` must change WHEN the refusal happens, not WHETHER it does.
+
+    Three properties, because a deferred guard that quietly stopped guarding is
+    the failure mode this whole change could have: it refuses exactly what the
+    eager form refuses, it accepts exactly what the eager form accepts, and the
+    forces it returns are BITWISE what the eager path returns.
+    """
+    import jax.numpy as jnp
+
+    g, _, n_coarse, cell = _coarse_setup()
+    origin, extent = forces.coarse_subblock_origin_extent(
+        (0, 0, 0), N_TILE_T, n_coarse, N_FINE_T
+    )
+    sub = [jnp.asarray(forces.stage_coarse_subblock(c, origin, extent)) for c in g]
+
+    # a position whose stencil sits inside the block, and one half a box away
+    inside = np.full((1, 3), (origin[0] + extent // 2) * cell, dtype=np.float64)
+    outside = inside + np.array([[L_BOX / 2, 0.0, 0.0]])
+
+    def call(pos, defer):
+        guard = [] if defer else None
+        out = forces.gather_coarse_subblock(
+            *sub, jnp.asarray(pos), origin, cell, n_coarse, assign="tsc",
+            guard_out=guard,
+        )
+        if defer:
+            forces.check_stencil_guard(guard)
+        return out
+
+    # accepts what the eager form accepts, and to the BIT
+    eager_ok = call(inside, defer=False)
+    defer_ok = call(inside, defer=True)
+    assert np.array_equal(np.asarray(eager_ok), np.asarray(defer_ok)), (
+        "deferring the guard moved the forces")
+
+    # refuses what the eager form refuses, with the same message
+    with pytest.raises(ValueError, match="reaches outside the staged sub-block"):
+        call(outside, defer=False)
+    with pytest.raises(ValueError, match="reaches outside the staged sub-block"):
+        call(outside, defer=True)
+
+
+def test_the_deferred_guard_stays_quiet_when_every_row_is_padding():
+    """The all-dead case, which the host form handled with `if keep.any()`.
+
+    On device the dead rows are pushed to sentinels, and the arithmetic has to
+    come back BELOW zero for the max and ABOVE it for the min so that an
+    all-padded tile raises nothing. Getting that backwards would make every
+    empty tile throw.
+    """
+    import jax.numpy as jnp
+
+    g, _, n_coarse, cell = _coarse_setup()
+    origin, extent = forces.coarse_subblock_origin_extent(
+        (0, 0, 0), N_TILE_T, n_coarse, N_FINE_T
+    )
+    sub = [jnp.asarray(forces.stage_coarse_subblock(c, origin, extent)) for c in g]
+    # positions that WOULD violate, but every row is dead
+    pos = np.zeros((4, 3), dtype=np.float64) + L_BOX / 2
+    guard = []
+    forces.gather_coarse_subblock(
+        *sub, jnp.asarray(pos), origin, cell, n_coarse, assign="tsc",
+        live=np.zeros(4, dtype=bool), guard_out=guard,
+    )
+    forces.check_stencil_guard(guard)  # must not raise
+
+
 def test_the_subblock_is_far_smaller_than_the_global_mesh():
     """The reason it exists. Asserted as a ratio so a later halo change that
     quietly ate the saving shows up here."""
