@@ -1079,3 +1079,92 @@ and is set from its own measured floor, not from this one.
 3. Carried from sec. 16: the division exposure in `codec.encode_positions` /
    `encode_velocities` for D3; a per-tile slab window; coarse mesh placement;
    the four-card split.
+
+## 18. D2e on a GB200, Vista 993754 -- the device tile's GPU-vs-CPU floor, and one tile at the 4096^3 tile shape
+
+`1a41cb0`, 2026-09-12, gb node c672-011, COMPLETED rc=0 in 5:15, ~0.1 SU.
+Sbatch `v2_d2e_device_tile_vista.sbatch`, script `v2_d2e_device_tile.py`; cards
+`runs/v2/d2e_device_tile_{gb,smoke}.json` (force-added), log copied to
+`runs/v2/d2e-tile-993754.log`. Every arm its own process.
+
+### Check A on Grace: PASS
+
+On the node's CPU backend at cdev (P=320, 8 tiles, 61,879 arena residents,
+ratified f64 fine / f32 coarse), the eager device tile equals `engine.tile_task`
+exactly on every tile: owned slots, codes, written bricks, scales. The same arm
+on the M4 laptop also passed on all 8 tiles (50.2 s, 13.7 GB peak RSS).
+
+### The GPU-vs-CPU floor at cdev (P=320), no bar applied
+
+GPU against the CPU arm's saved outputs. `one_tile` alone is fed the CPU arm's
+exact inputs.
+
+| quantity | values differing | worst tile, eps x rms | worst rms-relative |
+|---|---|---|---|
+| layout (owned slots, written bricks, counts) | **0** | -- | -- |
+| short force, `one_tile` alone (f64) | 91.8% | **19.6** | 6.0e-16 |
+| short force, inside the jitted tile | 91.8% | 19.6 (identical to alone) | 6.0e-16 |
+| long force (f32 coarse) | 50.7% | **8.2** | 6.4e-8 |
+| kicked velocity (f64) | 86.3% | -- | 2.1e-8 |
+| velocity codes | 5,549 of 50,331,648 (0.011%), each by 1 | -- | -- |
+| per-brick scales | -- | -- | max relative 4.5e-8 |
+
+(The kicked velocity's eps x rms column in the card is in f64 eps while its
+difference comes from the f32 long force, so it reads ~1.5e9 and is not a
+measure of anything; the rms-relative figure is.)
+
+- **The jitted tile adds nothing to the short force's cross-backend floor**:
+  inside the tile it is identical to `one_tile` alone on the same inputs.
+- **The long force's floor is 8.2 eps x rms against the CPU jit-vs-eager 5.88
+  (sec. 17)**: the GPU comparison is jit against jit, so it is a different
+  pair and not a sum of the two.
+- **The floor grows with P**: the 32^3 smoke (P=32) read 11.3 for the short
+  force against 19.6 at P=320. **P=576 was not compared across backends.**
+
+### One tile at the 4096^3 tile shape (cgh64, tile 512, buffer 32: P=576)
+
+cap 26,632,171 rows, largest tile 23,888,100: 4096^3's tile shape and row count.
+One GB200.
+
+| | `one_tile` alone | jitted device tile |
+|---|---|---|
+| compile (first tile) | 20.4 s | 22.8 s |
+| per tile, median of 3 | **126 ms** | **566 ms** |
+| of which host prep (decode plan + coarse staging) | -- | 30 ms |
+| device memory held before the first call | 4.60 GB | 4.60 GB |
+| peak over that | 13.1 GB | 17.5 GB, **16.0 GB** excluding the state upload |
+| per padded row, excluding the upload | -- | 599 B |
+
+- **Neither per-tile time is device time.** The 126 ms includes reading back
+  the cap x 3 f64 short forces (639 MB). The 566 ms includes uploading the
+  whole state's `off`/`w`/`vel_scale`/`arena_bucket`, **1.58 GB per call**, which
+  this development path does and the 4096^3 design does not (it streams a
+  window), plus the result readback. **So the 566 ms is not a per-tile rate
+  for the design and no step wall is projected from it.** The probe's 94.2 ms
+  was device-only on a different paint (f64 gauss), so 126 ms is not a
+  like-for-like comparison with it either.
+- **Memory against the planner** (`inexor.plan --preset c-hero --backend
+  device`): the 4.60 GB held before any call is the planner's `tile_kernels`,
+  4.602 GB, to the MB. Its `tile_workspace` charge is **8.414 GB, against 13.1
+  measured for `one_tile` alone (1.56x) and 16.0 for the jitted tile (1.90x)**.
+  The per-GPU total (144.5 GB, 0.73x) does not move: its worst phase is
+  another one at 57.7 GB.
+- **The persistent compilation cache refused both programs** as 4.6 GB
+  executables (over protobuf's 2 GiB). That is the size of the three P=576
+  f64 short kernels (3 x 1.53 GB), which `make_tile_force_fn` closes over, so
+  they are compiled in as constants. The run is unaffected (only the cache
+  write fails); whether the constants also occupy device memory beside the
+  4.60 GB held is not attributed here.
+
+### Owed
+
+1. **Attribute the 566 ms**: device compute, the 1.58 GB upload and the result
+   readback, separately, before any per-step projection.
+2. **The GPU-vs-CPU floor at P=576**, then a cross-backend tolerance set with
+   JC from it.
+3. **`tile_workspace` in the planner** re-read against 13.1 / 16.0 GB, once the
+   tile path that prices it replaces the one the charge was written for.
+4. **The short kernels as program arguments** rather than closure constants.
+5. Carried: `JIT_LONG_FORCE_EPS` measured on one state (sec. 17); the division
+   exposure in `codec` for D3; a per-tile slab window; coarse mesh placement;
+   the four-card split.
