@@ -19,6 +19,17 @@ arm and nothing earlier in the job can set it.
               timed reps each ended by a host readback; the device's
               `peak_bytes_in_use`; then the block compared bitwise against host
               `decode_bricks` fed through the same kernel.
+  xback-cards D2f. The density painted, accumulated and decoded ON THE CARDS
+              (`device.paint.coarse_delta_cards`) at each `--card-widths` card
+              count must hash-equal the CPU arm's host density, for both states;
+              and the three force meshes solved from the cards must hash-equal
+              the solve of that density from host memory on this backend.
+  cards-scale D2f at 4096^3 SHARD SHAPES, synthetic blocks (the paint's cost is
+              measured elsewhere): each card's real accumulator, 1024 quarter-slab
+              blocks routed to their cards, the ghost fold and the decode, timed;
+              an exact mass identity and sampled planes decoded in numpy as
+              receipts; then pass 1 + 2 of the forward transform from the cards
+              against the host-slab path at the same width, spectra bitwise.
 
 Device arms record the platform they ran on and refuse `cpu` unless
 `--allow-cpu` (the laptop smoke), so a leg that silently fell back to the CPU
@@ -304,7 +315,226 @@ def arm_chunk(args):
     return rec, 0 if equal else 3
 
 
-ARMS = {"xback-host": arm_xback_host, "xback-dev": arm_xback_dev, "chunk": arm_chunk}
+def _card_devices(w, allow_cpu):
+    """`w` distinct devices, or a refusal: a width served by fewer devices is not
+    a reading at that width. `allow_cpu` (the laptop smoke) replicates handles."""
+    import jax
+
+    devs = jax.devices()
+    if len(devs) >= w:
+        return list(devs[:w])
+    if not allow_cpu:
+        raise RuntimeError(f"{w} cards asked for and {len(devs)} devices visible; a "
+                           "width served by fewer devices is not a reading at that width")
+    return [devs[i % len(devs)] for i in range(w)]
+
+
+def _peaks(devs):
+    return [int((d.memory_stats() or {}).get("peak_bytes_in_use", 0)) for d in devs]
+
+
+def arm_xback_cards(args):
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    from inexor import forces
+    from inexor.device import paint as dpaint
+
+    host = json.load(open(args.host_hashes))
+    g = _geometry(args.n_part)
+    ec = _engine_config(g)
+    rec = dict(arm="xback-cards", n_part=g["n_part"],
+               platform=_require_device(args.allow_cpu), n_visible=len(jax.devices()))
+    widths = [int(w) for w in args.card_widths.split("+")]
+    rc = 0
+    for tag, arena in (("plain", False), ("arena", True)):
+        st = _build_state(g, ec, seed=7, arena=arena)
+        if arena and st.arena_used == 0:
+            raise RuntimeError("VACUOUS: the arena state has no residents")
+        rec[tag] = dict(arena_used=int(st.arena_used))
+        solves, d = {}, None
+        for w in widths:
+            devs = _card_devices(w, args.allow_cpu)
+            s = {}
+            t0 = time.perf_counter()
+            shards = dpaint.coarse_delta_cards(st, ec, devices=devs, stats=s)
+            jax.block_until_ready([x["delta"] for x in shards])
+            t1 = time.perf_counter()
+            used = len({str(next(iter(x["delta"].devices()))) for x in shards})
+            d = dpaint.gather_card_delta(shards)
+            sha = _sha(d)
+            equal = sha == host[tag]["sha"]
+            t2 = time.perf_counter()
+            meshes = forces.coarse_force_meshes(shards, ec.n_coarse, ec.box_size, "long",
+                                                r_s=ec.r_s)
+            t3 = time.perf_counter()
+            solves[w] = [_sha(m) for m in meshes]
+            ghosts = s["coarse_ghost_planes_nonzero"]
+            rec[tag][f"w{w}"] = dict(sha=sha, equal_to_cpu_host=equal, devices_used=used,
+                                     card_chunks=s["coarse_card_chunks"],
+                                     ghost_planes_nonzero=ghosts,
+                                     jit_traces=s["coarse_jit_traces"],
+                                     paint_s=t1 - t0, solve_s=t3 - t2)
+            _say(f"[xback-cards] {tag} {w} card(s): BITWISE vs CPU host = {equal}; devices "
+                 f"used {used}; chunks per card {s['coarse_card_chunks']}; ghost planes "
+                 f"with mass {ghosts}; paint {t1 - t0:.1f}s, solve {t3 - t2:.1f}s")
+            if not equal or ghosts == 0 or (used != w and not args.allow_cpu):
+                rc = 3
+        ref = [_sha(m) for m in forces.coarse_force_meshes(d, ec.n_coarse, ec.box_size,
+                                                           "long", r_s=ec.r_s)]
+        solve_equal = all(solves[w] == ref for w in widths)
+        rec[tag]["solve_equal_to_host_density_solve"] = solve_equal
+        _say(f"[xback-cards] {tag}: force meshes from the cards BITWISE the host "
+             f"density's solve at every width = {solve_equal}")
+        if not solve_equal:
+            rc = 3
+    return rec, rc
+
+
+def arm_cards_scale(args):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+
+    from inexor import ooc_fft
+    from inexor.device import paint as dpaint
+    from inexor.engine import _chunk_cuboid
+
+    platform = _require_device(args.allow_cpu)
+    g = _geometry(args.scale_n_part)
+    ec = _engine_config(g)
+    n = int(ec.n_coarse)
+    nb = int(ec.n_fine // ec.n_brick)
+    W = int(args.scale_cards)
+    devs = _card_devices(W, args.allow_cpu)
+    L = dpaint.default_chunk_bricks(nb)
+    _o, extent = dpaint.chunk_origin_extent(0, L, nb, n)
+    extent = tuple(int(e) for e in extent)
+    ranges = dpaint.card_x_ranges(n, W, int(_chunk_cuboid(0, L, nb, n)[1][0]))
+    by_card = [[] for _ in range(W)]
+    for gi in range(nb**3 // L):
+        c0 = int(_chunk_cuboid(gi, L, nb, n)[0][0])
+        by_card[next(k for k, (lo, hi) in enumerate(ranges) if lo <= c0 < hi)].append(gi)
+    cells = int(np.prod(extent))
+    GL = dpaint.ACC_GHOST_LO
+    _say(f"[cards-scale] n_coarse={n} bricks/side={nb} chunk {L} bricks -> block {extent}; "
+         f"{W} cards {ranges}; chunks per card {[len(b) for b in by_card]}; on {platform}")
+
+    t0 = time.perf_counter()
+    accs = [dpaint.CardInt64Accumulator(n, lo, hi, d) for (lo, hi), d in zip(ranges, devs)]
+    jax.block_until_ready([a.mesh for a in accs])
+    alloc_s = time.perf_counter() - t0
+    acc_bytes = [int(a.mesh.nbytes) for a in accs]
+    _say(f"[cards-scale] accumulators allocated on the cards in {alloc_s:.2f}s "
+         f"({[round(b / 1e9, 2) for b in acc_bytes]} GB)")
+
+    per_card = [None] * W
+
+    def run(k):
+        a = accs[k]
+        sub = jax.device_put(np.ones(extent, dtype=np.int32), devs[k])
+        ts = []
+        tk = time.perf_counter()
+        for gi in by_card[k]:
+            o, e = dpaint.chunk_origin_extent(gi, L, nb, n)
+            t = time.perf_counter()
+            a.add(sub, o, e)
+            jax.block_until_ready(a.mesh)
+            ts.append(time.perf_counter() - t)
+        per_card[k] = dict(chunks=len(ts), first_add_s=ts[0], card_s=time.perf_counter() - tk,
+                           add_median_ms=1e3 * float(np.median(ts[1:] or ts)))
+
+    t0 = time.perf_counter()
+    if W == 1:
+        run(0)
+    else:
+        with ThreadPoolExecutor(max_workers=W) as ex:
+            for f in [ex.submit(run, k) for k in range(W)]:
+                f.result()
+    add_wall_s = time.perf_counter() - t0
+    _say(f"[cards-scale] adds, synced each: {add_wall_s:.2f}s wall over {W} card threads; "
+         f"per card {[(c['chunks'], round(c['first_add_s'], 2), round(c['add_median_ms'], 2)) for c in per_card]} "  # noqa: E501
+         f"(chunks, first add s, median ms)")
+
+    fs = {}
+    t0 = time.perf_counter()
+    dpaint.fold_ghosts(accs, stats=fs)
+    jax.block_until_ready([a.mesh for a in accs])
+    fold_s = time.perf_counter() - t0
+
+    def own_sum(a):
+        w = a.hi - a.lo
+        return int(jax.jit(lambda m: m[GL:GL + w].sum())(a.mesh))
+
+    mass = sum(own_sum(a) for a in accs)
+    want_mass = sum(len(b) for b in by_card) * cells
+    mass_ok = mass == want_mass
+    _say(f"[cards-scale] fold {fold_s:.2f}s (ghost planes with mass "
+         f"{fs['coarse_ghost_planes_nonzero']}); owned mass {mass:,} vs blocks x cells "
+         f"{want_mass:,}: EXACT = {mass_ok}")
+
+    t0 = time.perf_counter()
+    deltas, peak, _ = dpaint._delta_on_cards(accs, ec)
+    jax.block_until_ready(deltas)
+    decode_s = time.perf_counter() - t0
+    scale = 2.0 ** -ec.frac_bits
+    mean = float(ec.n_total) / float(n) ** 3
+    take = jax.jit(lambda m, i: m[i])
+    decode_ok, overlap_seen = True, False
+    for k, a in enumerate(accs):
+        w = a.hi - a.lo
+        for i in sorted({0, 1, w // 2, w - 1}):
+            s = np.asarray(take(a.mesh, GL + i))
+            want = np.empty((n, n), dtype=ec.np_coarse_dtype)
+            want[...] = s.astype(np.float64) * scale / mean - 1.0
+            decode_ok &= bool(np.array_equal(np.asarray(deltas[k][i]), want))
+            overlap_seen |= int(s.max()) >= 2
+    decode_ok &= overlap_seen
+    peaks = _peaks(devs)
+    _say(f"[cards-scale] decode {decode_s:.2f}s; sampled planes BITWISE numpy's decode = "
+         f"{decode_ok} (an overlap cell seen: {overlap_seen}); device peaks "
+         f"{[round(p / 1e9, 2) for p in peaks]} GB")
+
+    shards = [dict(lo=a.lo, hi=a.hi, device=d, delta=x)
+              for a, d, x in zip(accs, devs, deltas)]
+    accs = deltas = None  # free the accumulators on the cards before the transforms
+    tc = {}
+    t0 = time.perf_counter()
+    spec_c = ooc_fft.forward_from_card_planes(shards, n, timings=tc)
+    cards_fwd_s = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    dh = dpaint.gather_card_delta(shards)
+    gather_s = time.perf_counter() - t0
+    del shards
+    th = {}
+    t0 = time.perf_counter()
+    spec_h = ooc_fft.forward_from_slabs_device(lambda lo, hi: dh[lo:hi], n,
+                                               devices=devs, timings=th)
+    host_fwd_s = time.perf_counter() - t0
+    spec_ok = bool(np.array_equal(spec_c, spec_h))
+    _say(f"[cards-scale] forward from the cards {cards_fwd_s:.2f}s (pass 1 "
+         f"{tc['pass1_s']:.2f}, pass 2 {tc['pass2_s']:.2f}) vs from host slabs "
+         f"{host_fwd_s:.2f}s (pass 1 {th['pass1_s']:.2f}, pass 2 {th['pass2_s']:.2f}); "
+         f"density to host {gather_s:.2f}s; spectra BITWISE = {spec_ok}")
+
+    rec = dict(arm="cards-scale", platform=platform, n_coarse=n, bricks_per_side=nb,
+               cards=W, ranges=ranges, chunk_bricks=L, block_extent=list(extent),
+               accumulator_bytes=acc_bytes,
+               alloc_s=alloc_s, add_wall_s=add_wall_s, per_card=per_card, fold_s=fold_s,
+               ghost_planes_nonzero=fs["coarse_ghost_planes_nonzero"], mass=mass,
+               want_mass=want_mass, mass_exact=mass_ok, decode_s=decode_s, peak_int=peak,
+               decode_bitwise_numpy=decode_ok, device_peaks=peaks,
+               cards_forward_s=cards_fwd_s, cards_pass1_s=tc["pass1_s"],
+               cards_pass2_s=tc["pass2_s"], host_forward_s=host_fwd_s,
+               host_pass1_s=th["pass1_s"], host_pass2_s=th["pass2_s"],
+               gather_to_host_s=gather_s, spectra_bitwise=spec_ok)
+    return rec, 0 if (mass_ok and decode_ok and spec_ok) else 3
+
+
+ARMS = {"xback-host": arm_xback_host, "xback-dev": arm_xback_dev, "chunk": arm_chunk,
+        "xback-cards": arm_xback_cards, "cards-scale": arm_cards_scale}
 
 
 # ------------------------------------------------------------ the orchestrator
@@ -353,6 +583,13 @@ def main(argv=None):
     ap.add_argument("--smoke", action="store_true",
                     help="32^3 everything, CPU allowed: exercises the apparatus only")
     ap.add_argument("--skip-xback", action="store_true")
+    ap.add_argument("--skip-xback-dev", action="store_true",
+                    help="skip the host-mesh device arm (eager + jit)")
+    ap.add_argument("--card-widths", default="",
+                    help="'+'-separated card counts for the xback-cards arm (D2f)")
+    ap.add_argument("--scale", action="store_true", help="run the cards-scale arm, last")
+    ap.add_argument("--scale-n-part", type=int, default=4096)
+    ap.add_argument("--scale-cards", type=int, default=4)
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args(argv)
 
@@ -363,6 +600,7 @@ def main(argv=None):
 
     if args.smoke:
         args.xback_n, args.chunks, args.reps = 32, "32:64:eager,32:64:jit", 1
+        args.scale_n_part = 32
     common = ["--reps", str(args.reps)] + (["--allow-cpu"] if args.allow_cpu or args.smoke
                                            else [])
     out = os.path.join(REPO, "runs", "v2", f"d2d_device_paint{args.out_suffix}.json")
@@ -388,18 +626,26 @@ def main(argv=None):
         if res["record"] is not None:
             with open(hashes, "w") as f:
                 json.dump(res["record"], f)
-            res, rc = _run_worker(["--arm", "xback-dev", "--n-part", str(args.xback_n),
-                                   "--host-hashes", hashes, *common], {}, "xback-dev")
-            card["arms"].append(res)
-            write()
-            worst = max(worst, rc)
+            if not args.skip_xback_dev:
+                res, rc = _run_worker(["--arm", "xback-dev", "--n-part", str(args.xback_n),
+                                       "--host-hashes", hashes, *common], {}, "xback-dev")
+                card["arms"].append(res)
+                write()
+                worst = max(worst, rc)
+            if args.card_widths:
+                res, rc = _run_worker(["--arm", "xback-cards", "--n-part", str(args.xback_n),
+                                       "--host-hashes", hashes, "--card-widths",
+                                       args.card_widths, *common], {}, "xback-cards")
+                card["arms"].append(res)
+                write()
+                worst = max(worst, rc)
         if worst:
             _say("\nFATAL: the cross-backend identity did not hold or did not run; "
-                 "no chunk timing or memory is read as the device paint's")
+                 "no chunk or scale timing or memory is read as the device paint's")
             card["verdict"] = "cross-backend identity FAILED or missing"
             write()
             return 1
-    for spec in args.chunks.split(","):
+    for spec in ([] if args.chunks in ("", "none") else args.chunks.split(",")):
         parts = spec.split(":")
         n_part, L = int(parts[0]), int(parts[1])
         mode = parts[2] if len(parts) > 2 else "eager"
@@ -411,6 +657,13 @@ def main(argv=None):
                                "--chunk-bricks", str(L), *common,
                                *(["--jit"] if mode == "jit" else []), *pad_arg,
                                *dead_arg], {}, f"chunk {spec}")
+        card["arms"].append(res)
+        write()
+        worst = max(worst, rc)
+    if args.scale:
+        res, rc = _run_worker(["--arm", "cards-scale", "--scale-n-part",
+                               str(args.scale_n_part), "--scale-cards", str(args.scale_cards),
+                               *common], {}, "cards-scale")
         card["arms"].append(res)
         write()
         worst = max(worst, rc)
