@@ -35,11 +35,13 @@ plain and with 61,879 arena residents, and every jitted chunk block up to 268M
 rows equals the host decode. It holds 62 B per padded row against eager's 266
 and is the DEFAULT; `jit=False` is the eager path.
 
-THE ACCUMULATOR IS A SEAM. Where the coarse mesh lives on a gb node is an open
-design question: the budget (`plan.DEVICE_PLACEMENT`) shards it across the
-cards, the code keeps it on the host. `HostInt64Accumulator` is the host form
-the engine has today, and a card-resident accumulator replaces it without
-touching the paint.
+THE COARSE MESH LIVES ON THE CARDS (JC, record sec. 23). `coarse_delta_cards`
+shards it along x: each card owns a contiguous run of x-planes, paints the
+chunks whose bricks start there into an int64 `CardInt64Accumulator` carrying
+the ghost planes a chunk at its edge writes past it, folds those ghosts into
+the neighbour that owns them, and decodes its own planes to the density on the
+card. Integer addition makes every split bitwise the host mesh.
+`HostInt64Accumulator` and `coarse_delta_device` remain the host-mesh form.
 
 SCOPE. The containment check comes back as device scalars and is resolved at
 the sync the accumulator performs anyway, before the block is added -- the same
@@ -49,6 +51,8 @@ arrangement as the tile gather's deferred guard. Nothing here is wired into
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 # One compiled chunk program per distinct set of static parameters, and a count
@@ -56,6 +60,10 @@ import numpy as np
 # executable served a whole step: a per-chunk shape would retrace every chunk.
 _KERNELS = {}
 _TRACES = [0]
+# the card path's small programs (accumulate, fold, decode); one lock guards
+# both caches, since each card's thread may ask for a program first
+_CARD_KERNELS = {}
+_KERNEL_LOCK = threading.Lock()
 
 
 def default_chunk_bricks(bricks_per_side):
@@ -319,26 +327,29 @@ def _chunk_kernel(*, cap, lift, p3, per, nb, arena_base, extent, n_coarse, box,
                                      live=live, dead_rows=dead_rows)
         return sub, lo, hi
 
-    fn = jax.jit(body)
-    _KERNELS[key] = fn
-    return fn
+    with _KERNEL_LOCK:
+        return _KERNELS.setdefault(key, jax.jit(body))
 
 
 def paint_chunk(st, bricks, chunk_index, chunk_len, cfg, pad, guard_out, jit=False,
-                shapes=None, dead_rows="spread"):
+                shapes=None, dead_rows="spread", device=None):
     """(sub, origin, extent) for one chunk, or None when it holds no rows.
 
     `sub` is the int32 sub-block, still on the device. Its containment bounds
     are appended to `guard_out`; `check_containment` must run before `sub` is
     used. `jit=True` needs `shapes` from `step_shapes`. `dead_rows` is
-    `paint_tsc_int_subblock`'s switch for where padded rows scatter.
+    `paint_tsc_int_subblock`'s switch for where padded rows scatter. `device`
+    (jit only) places the chunk's inputs, and so its program, on that device.
     """
     n = int(cfg.n_coarse)
     nb = int(st.bricks_per_side)
     origin, extent = chunk_origin_extent(chunk_index, chunk_len, nb, n)
     if jit:
         return _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out,
-                                dead_rows)
+                                dead_rows, device)
+    if device is not None:
+        raise ValueError("device= places the jitted chunk; the eager path runs on "
+                         "jax's default device")
 
     from ..painting import paint_tsc_int_subblock
     from .decode import decode_rows
@@ -360,10 +371,18 @@ def paint_chunk(st, bricks, chunk_index, chunk_len, cfg, pad, guard_out, jit=Fal
     return sub, origin, extent
 
 
-def _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out,
-                     dead_rows="spread"):
+def _on(a, device, dtype=None):
+    """`a` as a jax array on `device`, or on jax's default device when None."""
+    import jax
     import jax.numpy as jnp
 
+    if device is None:
+        return jnp.asarray(a, dtype=dtype)
+    return jax.device_put(np.asarray(a, dtype=dtype), device)
+
+
+def _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out,
+                     dead_rows="spread", device=None):
     from ..eject_jax import require_x64
 
     require_x64()
@@ -379,12 +398,13 @@ def _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out,
         per=int(st.t9.n_buckets_side // nb), nb=nb, arena_base=int(shapes["live_w"]),
         extent=extent, n_coarse=int(cfg.n_coarse), box=float(cfg.box_size),
         frac_bits=int(cfg.frac_bits), t9=st.t9, dead_rows=dead_rows)
+    d = device
     sub, lo, hi = fn(
-        jnp.asarray(w["starts"]), jnp.asarray(w["occ"]), jnp.asarray(w["live_counts"]),
-        jnp.asarray(w["arena_slots"]), jnp.asarray(w["row_offsets"]),
-        jnp.asarray(w["bricks"]), jnp.asarray(w["off"]), jnp.asarray(w["arena_bucket"]),
-        jnp.asarray(w["n_rows"], dtype=jnp.int64),
-        jnp.asarray(origin, dtype=jnp.int32))
+        _on(w["starts"], d), _on(w["occ"], d), _on(w["live_counts"], d),
+        _on(w["arena_slots"], d), _on(w["row_offsets"], d),
+        _on(w["bricks"], d), _on(w["off"], d), _on(w["arena_bucket"], d),
+        _on(w["n_rows"], d, np.int64),
+        _on(origin, d, np.int32))
     axes = tuple(ax for ax in range(3) if int(extent[ax]) < int(cfg.n_coarse))
     _guard_entries(axes, lo, hi, origin, extent, cfg.n_coarse, guard_out)
     return sub, origin, extent
@@ -436,21 +456,7 @@ def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
     from ..engine import _delta_from_accumulated
     from ..forces import capacity_shape
 
-    if cfg.paint_long != "int":
-        raise ValueError(
-            "the device coarse paint requires the integer accumulator: an f64 "
-            "accumulation is order-dependent, so chunking it changes the result")
-    nb = int(st.bricks_per_side)
-    if nb != cfg.n_fine // cfg.n_brick:
-        raise ValueError(f"state has {nb} bricks per side, config implies "
-                         f"{cfg.n_fine // cfg.n_brick}")
-    n_b = int(st.n_bricks)
-    L = default_chunk_bricks(nb) if chunk_bricks is None else int(chunk_bricks)
-    if L < 1 or n_b % L:
-        raise ValueError(
-            f"chunk_bricks {L} does not divide the {n_b} bricks, so the chunks "
-            "cannot all be cuboids of one shape")
-
+    n_b, L = _chunking(st, cfg, chunk_bricks)
     rows = chunk_rows(st, L)
     pad_true = int(rows.max()) if len(rows) else 0
     pad = (capacity_shape(pad_true, rungs=cfg.cap_rungs, floor_shape=pad_shape)
@@ -488,3 +494,336 @@ def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
             stats["coarse_cells_inexact_f32"] = inexact
             stats["coarse_exact_decode_ok"] = inexact == 0
     return out
+
+
+def _chunking(st, cfg, chunk_bricks):
+    """(n_bricks, chunk length) after the refusals both device paints share."""
+    if cfg.paint_long != "int":
+        raise ValueError(
+            "the device coarse paint requires the integer accumulator: an f64 "
+            "accumulation is order-dependent, so chunking it changes the result")
+    nb = int(st.bricks_per_side)
+    if nb != cfg.n_fine // cfg.n_brick:
+        raise ValueError(f"state has {nb} bricks per side, config implies "
+                         f"{cfg.n_fine // cfg.n_brick}")
+    n_b = int(st.n_bricks)
+    L = default_chunk_bricks(nb) if chunk_bricks is None else int(chunk_bricks)
+    if L < 1 or n_b % L:
+        raise ValueError(
+            f"chunk_bricks {L} does not divide the {n_b} bricks, so the chunks "
+            "cannot all be cuboids of one shape")
+    return n_b, L
+
+
+# ===========================================================================
+# the coarse mesh on the cards
+# ===========================================================================
+
+#: Ghost planes a card's accumulator carries below and above the x-planes it
+#: owns. A chunk's block starts one plane before its first coarse cell and ends
+#: two after its last (`extent = span + 3`), so a chunk at a card's edge writes
+#: exactly these past it.
+ACC_GHOST_LO = 1
+ACC_GHOST_HI = 2
+
+
+def _cached(key, build):
+    with _KERNEL_LOCK:
+        fn = _CARD_KERNELS.get(key)
+        if fn is None:
+            fn = _CARD_KERNELS[key] = build()
+    return fn
+
+
+def _zeros_on(shape, dtype, device):
+    """A zero array built ON `device` by a program, never staged from the host or
+    from jax's default device (17 GB per card at 4096^3)."""
+    import jax
+    import jax.numpy as jnp
+
+    shape = tuple(int(s) for s in shape)
+
+    def build():
+        return jax.jit(lambda z: jnp.broadcast_to(z, shape))
+
+    fn = _cached(("zeros", shape, np.dtype(dtype).str), build)
+    return fn(_on(np.zeros((), dtype=dtype), device))
+
+
+def card_x_ranges(n_coarse, n_cards, x_unit):
+    """The [lo, hi) x-plane ranges each card owns: contiguous, tiling [0, n), with
+    boundaries on `x_unit` -- a chunk's x thickness in coarse cells, so every
+    chunk's cells start and end on one card."""
+    from ..ooc_fft import partition_units
+
+    return partition_units(int(n_coarse), int(n_cards), int(x_unit))
+
+
+class CardInt64Accumulator:
+    """One card's share of the coarse mesh: int64, resident on that card.
+
+    Holds global x-planes `lo - ACC_GHOST_LO .. hi + ACC_GHOST_HI - 1` (mod n);
+    local x index 0 is global plane `lo - ACC_GHOST_LO`. `add` scatter-adds a
+    block in one compiled program that donates the mesh, so a card never holds
+    two. After `fold_ghosts`, the owned planes are local `ACC_GHOST_LO ..
+    ACC_GHOST_LO + hi - lo - 1`.
+    """
+
+    def __init__(self, n_coarse, lo, hi, device=None):
+        self.n, self.lo, self.hi = int(n_coarse), int(lo), int(hi)
+        if not 0 <= self.lo < self.hi <= self.n:
+            raise ValueError(f"card range [{lo}, {hi}) is not inside [0, {n_coarse})")
+        self.nx = self.hi - self.lo + ACC_GHOST_LO + ACC_GHOST_HI
+        self.device = device
+        self.mesh = _zeros_on((self.nx, self.n, self.n), np.int64, device)
+        self.chunks = 0
+        self.folded = False
+
+    def local_x(self, origin_x, extent_x):
+        """The block's first x index in this accumulator, or a refusal."""
+        lx = (int(origin_x) - (self.lo - ACC_GHOST_LO)) % self.n
+        if lx + int(extent_x) > self.nx:
+            raise ValueError(
+                f"block x planes from {int(origin_x)} (extent {int(extent_x)}) are not "
+                f"inside this card's accumulator, planes [{self.lo - ACC_GHOST_LO}, "
+                f"{self.hi + ACC_GHOST_HI}) mod {self.n}; the scatter would drop or "
+                "misplace them silently")
+        return lx
+
+    def add(self, sub, origin, extent):
+        if self.folded:
+            raise RuntimeError("add after fold_ghosts: the ghost planes were already moved")
+        ext = tuple(int(e) for e in extent)
+        lx = self.local_x(origin[0], ext[0])
+        fn = _card_add_kernel(self.n, ext)
+        self.mesh = fn(self.mesh, _on(lx, self.device, np.int64),
+                       _on(origin, self.device, np.int64), sub)
+        self.chunks += 1
+
+
+def _card_add_kernel(n, extent):
+    import jax
+    import jax.numpy as jnp
+
+    def build():
+        def body(mesh, lx, origin, sub):
+            r = [jnp.arange(e, dtype=jnp.int64) for e in extent]
+            xi = lx + r[0]
+            yi = (origin[1] + r[1]) % n
+            zi = (origin[2] + r[2]) % n
+            # indices are unique per axis (extent < n, or the full axis from 0),
+            # so the add is the host's `mesh[np.ix_] += sub`
+            return mesh.at[xi[:, None, None], yi[None, :, None],
+                           zi[None, None, :]].add(sub.astype(jnp.int64))
+        return jax.jit(body, donate_argnums=0)
+
+    return _cached(("add", int(n), tuple(extent)), build)
+
+
+def fold_ghosts(accs, stats=None):
+    """Add every card's ghost planes into the card that owns each plane.
+
+    Exact: integer addition. Every ghost plane is read before any card is
+    written, so a card that owns its own ghosts (one card, wrapping) folds the
+    same as four. `stats` receives `coarse_ghost_planes_nonzero`, the receipt
+    that some chunk actually wrote past a card's edge.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    n = accs[0].n
+
+    def owner(g):
+        for a in accs:
+            if a.lo <= g < a.hi:
+                return a
+        raise ValueError(f"no card owns x-plane {g}: the ranges do not tile the mesh")
+
+    take = _cached(("take",), lambda: jax.jit(lambda m, i: m[i]))
+    put = _cached(("plane_add",),
+                  lambda: jax.jit(lambda m, i, p: m.at[i].add(p), donate_argnums=0))
+    ghosts = []
+    for a in accs:
+        if a.folded:
+            raise RuntimeError("fold_ghosts called twice would add the ghosts twice")
+        locs = list(range(ACC_GHOST_LO)) + list(range(a.nx - ACC_GHOST_HI, a.nx))
+        for li in locs:
+            g = (a.lo - ACC_GHOST_LO + li) % n
+            ghosts.append((g, take(a.mesh, _on(li, a.device, np.int64))))
+    nonzero = 0
+    for g, plane in ghosts:
+        t = owner(g)
+        if stats is not None:
+            nonzero += bool(jnp.any(plane != 0))
+        p = plane if t.device is None else jax.device_put(plane, t.device)
+        t.mesh = put(t.mesh, _on(g - t.lo + ACC_GHOST_LO, t.device, np.int64), p)
+    for a in accs:
+        a.folded = True
+    if stats is not None:
+        stats["coarse_ghost_planes_nonzero"] = nonzero
+
+
+def _delta_on_cards(accs, cfg, census=False):
+    """(deltas, peak, inexact): each card's owned planes as the coarse density,
+    on that card, in `cfg`'s coarse dtype.
+
+    The arithmetic of `engine._delta_from_accumulated`, plane by plane, with the
+    mean passed in as a plane-shaped runtime array: CPU XLA computes a scalar
+    divisor as a reciprocal multiply, one ulp off numpy's division.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    for a in accs:
+        if not a.folded:
+            raise RuntimeError("decode before fold_ghosts would drop the ghost planes' mass")
+    n = int(cfg.n_coarse)
+    fdt = np.dtype(cfg.np_coarse_dtype)
+    peak, inexact = 0, 0
+    for a in accs:
+        w = a.hi - a.lo
+
+        def build(w=w):
+            def body(mesh):
+                own = mesh[ACC_GHOST_LO:ACC_GHOST_LO + w]
+                pk = jnp.abs(own).max()
+                ix = jnp.count_nonzero(own.astype(jnp.float32).astype(jnp.int64) != own)
+                return pk, ix
+            return jax.jit(body)
+
+        pk, ix = _cached(("census", n, w), build)(a.mesh)
+        peak = max(peak, int(pk))
+        if census:
+            inexact += int(ix)
+    if peak >= 2**31:
+        raise ValueError(
+            f"the accumulated coarse paint reached {peak}, past int32. "
+            "Lower frac_bits -- this is D-007-class corruption, not imprecision."
+        )
+    mean = float(cfg.n_total) / float(n) ** 3
+    scale = 2.0 ** -cfg.frac_bits
+
+    def build_decode():
+        def body(d, mesh, i, div):
+            s = mesh[i + ACC_GHOST_LO]
+            return d.at[i].set((s.astype(jnp.float64) * scale / div - 1.0).astype(fdt))
+        return jax.jit(body, donate_argnums=0)
+
+    decode = _cached(("decode", fdt.str, scale), build_decode)
+    deltas = []
+    for a in accs:
+        w = a.hi - a.lo
+        div = _on(np.full((n, n), mean), a.device, np.float64)
+        d = _zeros_on((w, n, n), fdt, a.device)
+        for i in range(w):
+            d = decode(d, a.mesh, _on(i, a.device, np.int64), div)
+        deltas.append(d)
+    return deltas, peak, inexact
+
+
+def coarse_delta_cards(st, cfg, devices=None, stats=None, pad_shape=0, chunk_bricks=None,
+                       census=False, shape_floor=None, dead_rows="spread", fold=True):
+    """The coarse density painted, accumulated and decoded on the cards.
+
+    Returns one dict per card, `lo`, `hi`, `device` and `delta` (the density on
+    x-planes [lo, hi), shape (hi - lo, n, n), on that card). BITWISE
+    `engine.coarse_delta_streamed` over the whole mesh (`gather_card_delta`), at
+    any card count and any `chunk_bricks` that tiles the brick grid into cuboids.
+
+    `devices` is a sequence of jax devices, one per card (None: one card on jax's
+    default device). Each card owns the chunks whose bricks start in its x range
+    and paints them, jitted, on its own thread. `fold=False` skips the ghost
+    fold and exists only for the gate that proves the fold matters.
+
+    `stats`, if a dict, receives `coarse_device_chunks` in total and
+    `coarse_card_chunks` per card, `coarse_cards`, `coarse_card_ranges`,
+    `coarse_ghost_planes_nonzero`, and the fields `coarse_delta_device` reports.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from ..eject_jax import require_x64
+    from ..engine import _chunk_cuboid
+    from ..forces import capacity_shape
+
+    require_x64()  # before an int64 accumulator exists: without x64 it would be int32
+    n_b, L = _chunking(st, cfg, chunk_bricks)
+    devs = [None] if devices is None else list(devices)
+    if not devs:
+        raise ValueError("devices= was an empty sequence; pass None for one card")
+    W = len(devs)
+    n = int(cfg.n_coarse)
+    nb = int(st.bricks_per_side)
+    chunk_origin_extent(0, L, nb, n)  # refuses a chunk length with no cuboid
+    x_unit = int(_chunk_cuboid(0, L, nb, n)[1][0])
+    if W > 1 and x_unit + 3 >= n:
+        raise ValueError(
+            f"chunk_bricks {L} paints the full x axis ({x_unit} + 3 >= {n} cells), so "
+            "no chunk belongs to one card; use a chunk no thicker than n - 3 in x")
+    ranges = card_x_ranges(n, W, x_unit)
+    accs = [CardInt64Accumulator(n, lo, hi, dev) for (lo, hi), dev in zip(ranges, devs)]
+
+    rows = chunk_rows(st, L)
+    pad_true = int(rows.max()) if len(rows) else 0
+    pad = (capacity_shape(pad_true, rungs=cfg.cap_rungs, floor_shape=pad_shape)
+           if cfg.pad_ladder else pad_true)
+    shapes = step_shapes(st, L, pad, floor=shape_floor)
+    by_card = [[] for _ in range(W)]
+    for gi in range(n_b // L):
+        if rows[gi] == 0:
+            continue
+        c0 = int(_chunk_cuboid(gi, L, nb, n)[0][0])
+        k = next(k for k, (lo, hi) in enumerate(ranges) if lo <= c0 < hi)
+        by_card[k].append(gi)
+
+    traces0 = _TRACES[0]
+
+    def run(k):
+        guard = []
+        for gi in by_card[k]:
+            res = paint_chunk(st, np.arange(gi * L, (gi + 1) * L, dtype=np.int64), gi, L,
+                              cfg, pad, guard, jit=True, shapes=shapes,
+                              dead_rows=dead_rows, device=devs[k])
+            if res is None:
+                continue
+            check_containment(guard)  # before the block is used
+            accs[k].add(*res)
+
+    if W == 1:
+        run(0)
+    else:
+        with ThreadPoolExecutor(max_workers=W) as ex:
+            for f in [ex.submit(run, k) for k in range(W)]:
+                f.result()
+
+    fold_stats = {}
+    if fold:
+        fold_ghosts(accs, stats=fold_stats)
+    else:
+        for a in accs:
+            a.folded = True  # gate instrument: the ghosts' mass is dropped
+    deltas, peak, inexact = _delta_on_cards(accs, cfg, census=census)
+    if stats is not None:
+        stats["coarse_pad"] = pad
+        stats["coarse_pad_true"] = pad_true
+        stats["coarse_peak_int"] = peak
+        stats["coarse_card_chunks"] = [a.chunks for a in accs]
+        stats["coarse_device_chunks"] = sum(a.chunks for a in accs)
+        stats["coarse_cards"] = W
+        stats["coarse_card_ranges"] = ranges
+        stats["coarse_chunk_bricks"] = L
+        stats["coarse_device_jit"] = True
+        stats["coarse_dead_rows"] = dead_rows
+        stats["coarse_jit_shapes"] = shapes
+        stats["coarse_jit_traces"] = _TRACES[0] - traces0
+        stats.update(fold_stats)
+        if census:
+            stats["coarse_cells_inexact_f32"] = inexact
+            stats["coarse_exact_decode_ok"] = inexact == 0
+    return [dict(lo=lo, hi=hi, device=dev, delta=d)
+            for (lo, hi), dev, d in zip(ranges, devs, deltas)]
+
+
+def gather_card_delta(shards):
+    """The whole density on the host, from `coarse_delta_cards`' shards."""
+    shards = sorted(shards, key=lambda s: s["lo"])
+    return np.concatenate([np.asarray(s["delta"]) for s in shards], axis=0)
