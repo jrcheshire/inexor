@@ -1020,3 +1020,62 @@ hit a sensitive brick. GPU untested.
 4. Carried: a per-tile slab window (the tile's bricks are not a contiguous slot
    range, so this path decodes against the whole `off` / `w`); coarse mesh
    placement; the four-card split.
+
+## 17. D2e jit -- one compiled program per run, NOT bitwise the eager tile, accepted on a measured floor
+
+Local only, no cluster time. `tile_task_device(jit=True, shapes=tile_step_shapes(st))`.
+Decode, tile-local shift, ownership, short force, coarse gather, kick and
+quantize are one program at fixed per-step shapes. The tile index, origins,
+arena base, row count and kick coefficients are runtime values, so every tile
+of every step reuses one executable: one trace across a whole step and a
+second step with new coefficients (asserted). The coefficients enter as 0-d
+arrays cast to the dtype the host's Python-float operand takes, and the
+quantize's scale divisor is passed in (sec. 16). `forces.gather_coarse_subblock`
+now accepts a traced origin and block; the integers are unchanged and every
+test file using it passes.
+
+### The pre-registered rule did not fire: jit is not bitwise
+
+Compiled against eager, stage by stage over all 64 tiles at all four
+fine/coarse dtype pairs: decoded positions and velocities, tile-local
+coordinates and the short force are **bitwise**. **Every difference starts in
+the coarse gather**:
+
+| coarse arm | long-force values differing | worst tile | velocity codes differing |
+|---|---|---|---|
+| f64 | 50,042 of 98,304 | 4.48 eps x rms | 0 |
+| f32 | 49,860 of 98,304 | **5.88 eps x rms** | 13-21 of 98,304, each by 1 |
+
+(eps of the arm's own dtype; rms of that tile's eager long force.) The same
+gather was measured non-bitwise under jit on 2026-08-09 (86 of 189 at 2.2e-16).
+**Not fixable cheaply**: `jax.lax.optimization_barrier` after the coordinate
+division, the offset, the TSC weights, the masking, the per-axis and corner
+products, or the accumulation changes nothing (same count at every placement),
+nor does `--xla_cpu_enable_fast_math=false`.
+
+### Decision (JC, 2026-09-12): accept jit on a tolerance
+
+The eager path stays the bitwise oracle against `engine.tile_task` (sec. 16);
+jit is gated against eager in `tests/test_device_tile.py` by:
+- **the long force within `JIT_LONG_FORCE_EPS` = 6 eps x rms**: the measured
+  worst (5.88) rounded up to a whole eps, JC's choice among the measured-worst,
+  per-dtype-exact and multi-seed options. One state's worst case is its whole
+  basis.
+- **exact**: short force, owned slots, written bricks, owned and overhang counts;
+- **identities**: no code moves by more than 1, and each brick's scale moves by
+  at most its largest kicked-velocity change / 32767 plus one ulp (a max is
+  1-Lipschitz; met with equality at f32, never exceeded);
+- **anti-vacuity**: coarse meshes nudged by 1e-13 (~450 f64 eps) fail the floor.
+
+GPU against CPU cannot be bitwise either (the FFTs); that tolerance is check C's
+and is set from its own measured floor, not from this one.
+
+### Owed
+
+1. **Check C, a GB200 job** (its own proposal): the GPU-vs-CPU floor of
+   `one_tile` alone, then of the compiled tile; per-tile device time and card
+   memory at the 4096^3 tile shape (P=576) against the probe's 94.2 ms.
+2. Whether 6 eps holds across states: the floor was measured on one state.
+3. Carried from sec. 16: the division exposure in `codec.encode_positions` /
+   `encode_velocities` for D3; a per-tile slab window; coarse mesh placement;
+   the four-card split.

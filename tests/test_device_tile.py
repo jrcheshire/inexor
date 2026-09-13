@@ -20,6 +20,7 @@ from inexor import engine, forces, state  # noqa: E402
 from inexor.codec import T9Layout  # noqa: E402
 from inexor.device import kick as dkick  # noqa: E402
 from inexor.device import tile as dtile  # noqa: E402
+from inexor.device.decode import tile_decode_plan  # noqa: E402
 
 # `tests/test_engine.py`'s validated smoke geometry, verbatim.
 L_BOX, N_PART, N_FINE, N_COARSE, N_TILE, B_FINE = 32.0, 32, 64, 16, 16, 8
@@ -155,6 +156,100 @@ def test_the_codes_use_the_whole_int16_range():
     w = res["w_codes"].astype(np.int32)
     dkick.assert_int16_range_device(w)
     assert np.abs(w).max() == dkick.INT16_MAX
+
+
+# ---------------------------------------------------------------- jit, tolerance
+#
+# The jitted tile is NOT bitwise the eager one: XLA compiles the coarse gather to
+# a different rounding (record sec. 17). Measured over every tile of this state
+# at all four dtype pairs, the long force differs by at most 4.48 eps x rms at an
+# f64 coarse arm and 5.88 at f32, and nothing upstream of the gather differs.
+# JIT_LONG_FORCE_EPS is that floor rounded up to a whole eps (JC, 2026-09-12).
+# Everything else below is exact or an identity, not a tolerance.
+JIT_LONG_FORCE_EPS = 6.0
+
+
+def _jit_within_floor(j, e, st, bricks, t, cfg):
+    """`j` (jit) against `e` (eager), both with `with_forces=True`."""
+    assert j["empty"] == e["empty"]
+    if e["empty"]:
+        return
+    for k in ("slots_o", "run_bricks"):
+        assert np.array_equal(j[k], e[k]), f"{k} differ"
+    assert j["n_owned"] == e["n_owned"] and j["n_out"] == e["n_out"]
+    fj, fe = j["forces"], e["forces"]
+    assert np.array_equal(fj["g_short"], fe["g_short"]), "the short force moved under jit"
+
+    gl_e = fe["g_long"].astype(np.float64)
+    rms = float(np.sqrt(np.mean(gl_e**2)))
+    eps = float(np.finfo(fe["g_long"].dtype).eps)
+    worst = float(np.abs(fj["g_long"].astype(np.float64) - gl_e).max()) / (eps * rms)
+    assert worst <= JIT_LONG_FORCE_EPS, (
+        f"tile {t}: jitted long force {worst:.2f} eps x rms from eager, floor "
+        f"{JIT_LONG_FORCE_EPS}")
+
+    dw = np.abs(j["w_codes"].astype(np.int32) - e["w_codes"].astype(np.int32))
+    assert dw.max() <= 1, "a velocity code moved by more than one"
+
+    # a max is 1-Lipschitz: a brick's scale cannot move further than its largest
+    # velocity change / 32767, plus one ulp of the division
+    plan = tile_decode_plan(st, np.asarray(bricks, dtype=np.int64))
+    bor = np.repeat(plan["bricks"], plan["member_counts"])
+    nb = N_FINE // cfg.n_brick
+    bo = bor[forces.owned_mask_from_bricks(bor, t, cfg.n_tile, cfg.n_brick, nb)]
+    dv = np.abs(fj["v_new"] - fe["v_new"]).max(axis=1)
+    for b, se, sj in zip(e["run_bricks"], e["run_scales"], j["run_scales"]):
+        assert abs(sj - se) <= dv[bo == b].max() / 32767 + np.spacing(max(se, sj)), (
+            f"brick {b}: scale moved beyond what its velocities allow")
+
+
+@pytest.mark.parametrize("fine,coarse", DTYPES)
+def test_the_jitted_tile_is_within_the_floor_of_eager(fine, coarse):
+    cfg, st, members, one_tile, C, g_coarse = _setup(fine, coarse)
+    shapes = dtile.tile_step_shapes(st)
+    for t in [cfg.tiles[0], cfg.tiles[len(cfg.tiles) // 2], cfg.tiles[-1]]:
+        e = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t],
+                                   with_forces=True)
+        j = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t], jit=True,
+                                   shapes=shapes, with_forces=True)
+        _jit_within_floor(j, e, st, members[t], t, cfg)
+
+
+def test_a_jitted_step_is_one_program_within_the_floor():
+    """Every tile of a step through one compiled program; a second step with new
+    kick coefficients must not retrace."""
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = dtile.tile_step_shapes(st)
+    dtile._KERNELS.clear()
+    t0 = dtile._TRACES[0]
+    for t in cfg.tiles:
+        e = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t],
+                                   with_forces=True)
+        j = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t], jit=True,
+                                   shapes=shapes, with_forces=True)
+        _jit_within_floor(j, e, st, members[t], t, cfg)
+    assert dtile._TRACES[0] - t0 == 1, "a per-tile value is keying a new program"
+    C2 = dict(C, alpha_k=0.91, bcoef=1.07)
+    t = cfg.tiles[1]
+    e = dtile.tile_task_device(st, one_tile, C2, g_coarse, t, members[t], with_forces=True)
+    j = dtile.tile_task_device(st, one_tile, C2, g_coarse, t, members[t], jit=True,
+                               shapes=shapes, with_forces=True)
+    _jit_within_floor(j, e, st, members[t], t, cfg)
+    assert dtile._TRACES[0] - t0 == 1, "new kick coefficients retraced the program"
+
+
+def test_the_jit_floor_can_fail():
+    """Anti-vacuity: coarse meshes moved by 1e-13 relative (~450 f64 eps) must
+    exceed the floor."""
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float64")
+    shapes = dtile.tile_step_shapes(st)
+    t = cfg.tiles[0]
+    e = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t], with_forces=True)
+    nudged = [g * (1.0 + 1e-13) for g in g_coarse]
+    j = dtile.tile_task_device(st, one_tile, C, nudged, t, members[t], jit=True,
+                               shapes=shapes, with_forces=True)
+    with pytest.raises(AssertionError, match="eps x rms"):
+        _jit_within_floor(j, e, st, members[t], t, cfg)
 
 
 def test_ownership_twin_is_the_host_rule():

@@ -73,12 +73,16 @@ def kick_and_quantize(v, g_short, g_long_rows, owned, brick_index, n_bricks,
     return quantize_per_brick(v_new, owned, brick_index, n_bricks)
 
 
-def quantize_per_brick(v_new, owned, brick_index, n_bricks):
+def quantize_per_brick(v_new, owned, brick_index, n_bricks, scale_div=None):
     """(w_codes, scales, owned_counts, v_new, w32) from already-kicked velocities.
 
     The quantize half of `kick_and_quantize`, for a caller that forms `v_new`
     itself (`device.tile`, which must reproduce the host kick's own dtype
     promotion). Same shapes and masking contract as `kick_and_quantize`.
+
+    `scale_div` is an (n_bricks,) array of 32767s in `v_new`'s dtype. Eager
+    callers may omit it; a jitted caller must PASS it, because building it
+    inside the program folds back to a scalar divisor (see below).
     """
     import jax
     import jax.numpy as jnp
@@ -109,7 +113,8 @@ def quantize_per_brick(v_new, owned, brick_index, n_bricks):
     # Only a full-shape divisor that exists as a runtime array is exact. Here
     # that cost 6 of 512 per-brick scales at the D2e test geometry; under jit
     # the array must be passed in, not built.
-    scales = vmax / jnp.full_like(vmax, INT16_MAX)
+    div = jnp.full_like(vmax, INT16_MAX) if scale_div is None else jnp.asarray(scale_div)
+    scales = vmax / div
     # an all-zero brick has no scale; encode to zeros and keep the decode exact
     scales = jnp.where(scales > 0.0, scales, jnp.ones_like(scales))
 
@@ -120,11 +125,14 @@ def quantize_per_brick(v_new, owned, brick_index, n_bricks):
     # value path and the twin of the host's `np.rint(...).astype(np.int16)`.
     # Routing through int32 is not cosmetic: float->int16 overflow is
     # backend-defined where int32->int16 narrowing is guaranteed modular.
-    # full-shape divisor for the reason `scales` has one: dividing by
-    # `scales[seg][:, None]` broadcasts along axis 1 and came back one ulp off
-    # true division in 27% of values (CPU XLA); rint hides most of that, not a
-    # value on a rounding tie
-    w32 = rint_i(v_new / jnp.broadcast_to(scales[seg][:, None], v_new.shape))
+    # Column by column, each divided by the per-row scale -- a same-shape
+    # division, which is exact. Dividing by `scales[seg][:, None]` broadcasts
+    # along axis 1 and came back one ulp off true division in 27% of values
+    # (CPU XLA), and under jit `broadcast_to` or a `stack` of the column fold
+    # back to that broadcast (measured 155,874 of 600,000). rint hides most of
+    # it, not a value on a rounding tie.
+    s_row = scales[seg]
+    w32 = rint_i(jnp.stack([v_new[:, k] / s_row for k in range(3)], axis=1))
     w_codes = jnp.where(own[:, None], w32, 0).astype(jnp.int16)
     return dict(w_codes=w_codes, scales=scales, owned_counts=owned_counts,
                 v_new=v_new, w32=w32)

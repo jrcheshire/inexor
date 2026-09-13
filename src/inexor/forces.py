@@ -1340,8 +1340,10 @@ def gather_coarse_subblock(
     but BEFORE its result is used, which is why a deferred guard is still a
     guard: nothing wrong is ever written to the state.
     """
-    extent = int(np.asarray(sub_x).shape[0])
-    origin = np.asarray(origin_cells, dtype=np.int64)
+    # `.shape`, not `np.asarray(...).shape`, and the origin straight to int32:
+    # both must accept tracers so `device.tile` can jit the gather with the
+    # origin as a runtime value. The integers are the same either way.
+    extent = int(sub_x.shape[0])
     xp = jnp.asarray(positions) / float(cell_coarse)
     if assign == "tsc":
         base_f = jnp.round(xp)
@@ -1358,7 +1360,7 @@ def gather_coarse_subblock(
     base = jax.lax.stop_gradient(base_f).astype(jnp.int32)
     # exact integer re-basing; `% n_coarse` puts a block straddling the periodic
     # boundary back in range without touching any float
-    i = jnp.mod(base - jnp.asarray(origin, dtype=jnp.int32), int(n_coarse))
+    i = jnp.mod(base - jnp.asarray(origin_cells, dtype=jnp.int32), int(n_coarse))
 
     m = None if live is None else jnp.asarray(live)[:, None]
     lo_needed, hi_needed = _stencil_bounds(i, m, first, len(w_axis), n_coarse, extent)

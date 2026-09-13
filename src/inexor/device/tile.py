@@ -7,7 +7,7 @@ of owned rows for the long gather, and the numpy kick and per-brick quantize.
 `engine.apply_result` consumes it unchanged.
 
 The pieces are the ones earlier rungs put on the device, composed rather than
-rewritten: `device.decode.decode_rows` (D2a), the caller's `one_tile`,
+rewritten: `device.decode.decode_core` (D2a), the caller's `one_tile`,
 `forces.gather_coarse_subblock` with its deferred guard (D2c), and
 `device.kick.quantize_per_brick` (D2b).
 
@@ -28,9 +28,18 @@ WHAT MOVES AND WHAT DOES NOT, relative to the host form.
   the extremes land on +-32767, and `kick.assert_int16_range_device` is the
   explicit check for gates.
 
-SCOPE. Eager, and decoding against the whole `off` / `w` arrays; the tile's
-bricks are not a contiguous slot range, so `device.paint.slab_window` does not
-apply. Nothing here is wired into `engine.step`.
+EAGER OR JITTED (`jit=`). Jitted, the decode, force, gather, kick and quantize
+are one program at fixed per-step shapes (`tile_step_shapes`), with the tile
+index, origins and kick coefficients as runtime values, so every tile of every
+step reuses one executable. The coefficients enter as 0-d arrays cast to the
+dtype the host's Python-float operand takes (a weak float adopts the array's
+dtype), and the quantize's scale divisor is passed in: a divisor built inside
+the program folds back to a scalar, which CPU XLA computes as a reciprocal
+multiply (record sec. 16).
+
+SCOPE. Decodes against the whole `off` / `w` arrays; the tile's bricks are not a
+contiguous slot range, so `device.paint.slab_window` does not apply. Nothing
+here is wired into `engine.step`.
 """
 
 from __future__ import annotations
@@ -39,9 +48,17 @@ import time
 
 import numpy as np
 
+# One compiled tile program per set of static parameters, and a count of
+# traces: the receipt that one executable served every tile.
+_KERNELS = {}
+_TRACES = [0]
+
 
 def owned_rows_device(brick_of_row, tijk, n_tile, n_brick, nb):
-    """The jnp twin of `forces.owned_mask_from_bricks`: integer, so exact."""
+    """The jnp twin of `forces.owned_mask_from_bricks`: integer, so exact.
+
+    `tijk` may be a traced int array.
+    """
     import jax.numpy as jnp
 
     b = jnp.asarray(brick_of_row, dtype=jnp.int64)
@@ -49,15 +66,88 @@ def owned_rows_device(brick_of_row, tijk, n_tile, n_brick, nb):
     per = int(n_tile) // int(n_brick)
     bi, rem = jnp.divmod(b, nb * nb)
     bj, bk = jnp.divmod(rem, nb)
-    t = [int(c) for c in tijk]
+    t = jnp.asarray(tijk, dtype=jnp.int64)
     return (bi // per == t[0]) & (bj // per == t[1]) & (bk // per == t[2])
 
 
-def tile_task_device(st, one_tile, C, g_coarse, t, bricks):
+def tile_step_shapes(st, floor=None):
+    """Fixed per-step shapes for the jitted tile: the arena rectangle's width.
+
+    Every tile of a step has the same brick count and `cap`; only the widest
+    per-brick arena varies, so it sits on `forces.capacity_shape`'s ladder and
+    `floor` keeps it monotone across steps. O(bricks + arena).
+    """
+    from ..forces import capacity_shape
+    from .paint import _arena_per_brick
+
+    floor = floor or {}
+    return dict(arena_rect=int(capacity_shape(
+        max(int(_arena_per_brick(st).max()), 1),
+        floor_shape=int(floor.get("arena_rect", 0)))))
+
+
+def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
+                 coarse_cell, box, t9, with_forces=False):
+    key = (id(one_tile), cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
+           float(coarse_cell), float(box), float(t9.quantum), int(t9.n_buckets_side),
+           bool(with_forces))
+    fn = _KERNELS.get(key)
+    if fn is not None:
+        return fn
+    import jax
+    import jax.numpy as jnp
+
+    from ..forces import gather_coarse_subblock
+    from .decode import decode_core
+    from .kick import quantize_per_brick
+
+    def body(starts, occ, live_counts, arena_slots, row_offsets, bricks, off, w,
+             vel_scale, arena_bucket, arena_base, n_rows, origin, tijk, o_cells,
+             sub_x, sub_y, sub_z, alpha_k, bcoef, scale_div):
+        _TRACES[0] += 1  # trace time only
+        slots, x, bor, bi, live = decode_core(
+            starts, occ, live_counts, arena_slots, row_offsets, bricks, off,
+            arena_bucket, arena_base, n_rows, cap=cap, lift=cap + 1, p3=p3, per=per,
+            bricks_per_side=nb, t9=t9, fdtype=jnp.float64)
+        v = w[slots].astype(jnp.float64) * vel_scale[bor][:, None]
+        cyc = jnp.arange(cap, dtype=jnp.int64) % n_rows
+        u = jnp.mod(x[cyc] - origin, box)
+        own = owned_rows_device(bor, tijk, n_tile, n_brick, nb) & live
+        g_short, owned, n_out = one_tile(u, live, own)
+        guard = []
+        g_long = gather_coarse_subblock(
+            sub_x, sub_y, sub_z, x, o_cells, coarse_cell, n_coarse, assign="tsc",
+            live=owned, guard_out=guard)
+        g_tot = g_short + g_long
+        v_new = alpha_k.astype(v.dtype) * v + bcoef.astype(g_tot.dtype) * g_tot
+        q = quantize_per_brick(v_new, owned, bi, n_b, scale_div=scale_div)
+        lo, hi, _ext, _assign = guard[0]
+        out = dict(slots=slots, owned=owned, n_out=n_out, n_own=jnp.sum(owned),
+                   w_codes=q["w_codes"], scales=q["scales"],
+                   counts=q["owned_counts"], lo=lo, hi=hi)
+        if with_forces:
+            out.update(g_short=g_short, g_long=g_long, v_new=v_new)
+        return out
+
+    fn = jax.jit(body)
+    _KERNELS[key] = fn
+    return fn
+
+
+def tile_task_device(st, one_tile, C, g_coarse, t, bricks, jit=False, shapes=None,
+                     with_forces=False):
     """One tile of the kick on the device; the `engine.tile_task` contract.
 
     `C` is `engine.step`'s per-step header and `g_coarse` its three coarse
-    force meshes. Returns the dict `engine.apply_result` consumes.
+    force meshes. Returns the dict `engine.apply_result` consumes. `jit=True`
+    needs `shapes` from `tile_step_shapes`.
+
+    `with_forces=True` adds `forces`: `g_short`, `g_long` and `v_new` at the
+    owned rows, in row order. A gate instrument; it costs a readback.
+
+    JIT IS NOT BITWISE THE EAGER PATH, and is accepted on a tolerance (record
+    sec. 17): the compiled coarse gather differs by roundoff, a few eps of the
+    long force. The eager path is the bitwise oracle against `engine.tile_task`.
     """
     import jax.numpy as jnp
 
@@ -82,10 +172,19 @@ def tile_task_device(st, one_tile, C, g_coarse, t, bricks):
         return dict(t=t, empty=True, n_owned=0, n_out=0)
     if m > cap:
         raise RuntimeError(f"tile {t}: {m} members > cap {cap}")
+    origin, _ = tile_origin_extent(t, C["n_tile"], C["b_real"], C["cell"])
+    o_cells, extent = coarse_subblock_origin_extent(
+        t, C["n_tile"], C["n_coarse"], C["n_fine"], halo=COARSE_HALO)
+
+    if jit:
+        if shapes is None:
+            raise ValueError("jit=True needs the step's fixed shapes (tile_step_shapes)")
+        return _tile_task_jit(st, one_tile, C, g_coarse, t, bricks, plan, origin,
+                              o_cells, extent, shapes, t_dec, with_forces)
+
     dec = decode_rows(plan, st.off, st.w, st.vel_scale, st.arena_bucket,
                       st.arena_base, st.t9, nb, cap)
     live = dec["live"]
-    origin, _ = tile_origin_extent(t, C["n_tile"], C["b_real"], C["cell"])
     # the host's padding: row r reads real row r mod m
     cyc = jnp.arange(cap, dtype=jnp.int64) % m
     u = jnp.mod(dec["x"][cyc] - jnp.asarray(origin), C["box"])
@@ -98,8 +197,6 @@ def tile_task_device(st, one_tile, C, g_coarse, t, bricks):
         return dict(t=t, empty=True, n_owned=0, n_out=int(n_out))
 
     t_long = time.perf_counter()
-    o_cells, extent = coarse_subblock_origin_extent(
-        t, C["n_tile"], C["n_coarse"], C["n_fine"], halo=COARSE_HALO)
     sub = [jnp.asarray(stage_coarse_subblock(g, o_cells, extent)) for g in g_coarse]
     guard = []
     g_long = gather_coarse_subblock(
@@ -111,19 +208,81 @@ def tile_task_device(st, one_tile, C, g_coarse, t, bricks):
     v_new = C["alpha_k"] * dec["v"] + C["bcoef"] * g_tot
     q = quantize_per_brick(v_new, owned, dec["brick_index"], len(bricks))
 
-    own_h = np.asarray(owned)
-    counts = np.asarray(q["owned_counts"])
     check_stencil_guard(guard)  # before anything below is used
-    written = counts > 0
-    res = dict(
-        t=t, empty=False,
-        slots_o=np.asarray(dec["slots"])[own_h],
-        w_codes=np.asarray(q["w_codes"])[own_h],
-        run_bricks=bricks[written],
-        run_scales=np.asarray(q["scales"])[written],
-        n_owned=n_own, n_out=int(n_out),
-    )
+    res = _result(t, bricks, np.asarray(dec["slots"]), np.asarray(owned),
+                  np.asarray(q["w_codes"]), np.asarray(q["scales"]),
+                  np.asarray(q["owned_counts"]), n_own, int(n_out))
+    if with_forces:
+        res["forces"] = _forces(owned, g_short, g_long, v_new)
     t_end = time.perf_counter()
     res["busy"] = dict(decode=t_short - t_dec, short=t_long - t_short,
                        long=t_quant - t_long, quant=t_end - t_quant)
+    return res
+
+
+def _forces(owned, g_short, g_long, v_new):
+    o = np.asarray(owned)
+    return dict(g_short=np.asarray(g_short)[o], g_long=np.asarray(g_long)[o],
+                v_new=np.asarray(v_new)[o])
+
+
+def _result(t, bricks, slots, owned, w_codes, scales, counts, n_own, n_out):
+    written = counts > 0
+    return dict(t=t, empty=False, slots_o=slots[owned], w_codes=w_codes[owned],
+                run_bricks=bricks[written], run_scales=scales[written],
+                n_owned=int(n_own), n_out=int(n_out))
+
+
+def _tile_task_jit(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells,
+                   extent, shapes, t_dec, with_forces=False):
+    import jax.numpy as jnp
+
+    from ..eject_jax import require_x64
+    from ..forces import check_stencil_guard, stage_coarse_subblock
+
+    require_x64()
+    nb = int(C["n_fine"]) // int(C["n_brick"])
+    n_b = len(bricks)
+    R = int(shapes["arena_rect"])
+    a = plan["arena_slots"]
+    if int(plan["arena_counts"].max()) > R:
+        raise ValueError(
+            f"tile {t}: {int(plan['arena_counts'].max())} arena residents in one "
+            f"brick > the step's arena_rect {R}; rebuild shapes with tile_step_shapes")
+    rect = np.full((n_b, R), -1, dtype=np.int64)
+    rect[:, : min(a.shape[1], R)] = a[:, :R]
+
+    fn = _tile_kernel(
+        one_tile, cap=int(C["cap"]), n_b=n_b, p3=int(plan["p3"]),
+        per=int(st.t9.n_buckets_side // nb), nb=nb, n_tile=int(C["n_tile"]),
+        n_brick=int(C["n_brick"]), n_coarse=int(C["n_coarse"]),
+        coarse_cell=C["coarse_cell"], box=C["box"], t9=st.t9, with_forces=with_forces)
+    sub = [stage_coarse_subblock(g, o_cells, extent) for g in g_coarse]
+    t_short = time.perf_counter()
+    out = fn(
+        jnp.asarray(plan["starts"]), jnp.asarray(plan["occ"]),
+        jnp.asarray(plan["live_counts"]), jnp.asarray(rect),
+        jnp.asarray(plan["row_offsets"]), jnp.asarray(bricks),
+        jnp.asarray(st.off), jnp.asarray(st.w), jnp.asarray(st.vel_scale),
+        jnp.asarray(st.arena_bucket), jnp.asarray(int(st.arena_base), dtype=jnp.int64),
+        jnp.asarray(int(plan["n_rows"]), dtype=jnp.int64),
+        jnp.asarray(origin, dtype=jnp.float64),
+        jnp.asarray(np.asarray(t, dtype=np.int64)),
+        jnp.asarray(np.asarray(o_cells), dtype=jnp.int32),
+        *(jnp.asarray(s) for s in sub),
+        jnp.asarray(C["alpha_k"], dtype=jnp.float64),
+        jnp.asarray(C["bcoef"], dtype=jnp.float64),
+        jnp.full((n_b,), 32767.0, dtype=jnp.float64),
+    )
+    n_own = int(out["n_own"])
+    if n_own == 0:
+        return dict(t=t, empty=True, n_owned=0, n_out=int(out["n_out"]))
+    check_stencil_guard([(out["lo"], out["hi"], int(extent), "tsc")])
+    res = _result(t, bricks, np.asarray(out["slots"]), np.asarray(out["owned"]),
+                  np.asarray(out["w_codes"]), np.asarray(out["scales"]),
+                  np.asarray(out["counts"]), n_own, int(out["n_out"]))
+    if with_forces:
+        res["forces"] = _forces(out["owned"], out["g_short"], out["g_long"], out["v_new"])
+    t_end = time.perf_counter()
+    res["busy"] = dict(decode=0.0, short=t_end - t_short, long=0.0, quant=0.0)
     return res
