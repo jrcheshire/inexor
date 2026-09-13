@@ -6,10 +6,12 @@ arm and nothing earlier in the job can set it.
   xback-host  JAX_PLATFORMS=cpu. The HOST engine's streamed density
               (`engine.coarse_delta_streamed`) for two states at one geometry --
               plain, and with arena residents -- hashed.
+              It also hashes the JITTED device paint on the CPU backend.
   xback-dev   the default backend. The DEVICE paint's density
-              (`device.paint.coarse_delta_device`) for the same two states must
-              hash-equal the CPU arm's. This is the cross-backend claim: the
-              laptop suite can only show device == host on ONE backend.
+              (`device.paint.coarse_delta_device`) for the same two states,
+              eager AND jitted, must hash-equal the CPU arm's host density. This
+              is the cross-backend claim: the laptop suite can only show
+              device == host on ONE backend.
   chunk       one chunk of L bricks at production brick geometry (4096 rows
               and 512 buckets per brick), so its rows are a 4096^3 chunk's:
               L=4096 at 512^3 is 1/16 of a 4096^3 x-slab, L=16384 at 512^3 a
@@ -137,22 +139,31 @@ def arm_xback_host(args):
 
     jax.config.update("jax_enable_x64", True)
     from inexor import engine
+    from inexor.device import paint as dpaint
 
     g = _geometry(args.n_part)
     ec = _engine_config(g)
     rec = dict(arm="xback-host", n_part=g["n_part"], platform=_platform())
+    rc = 0
     for tag, arena in (("plain", False), ("arena", True)):
         t0 = time.perf_counter()
         st = _build_state(g, ec, seed=7, arena=arena)
         t1 = time.perf_counter()
         d = engine.coarse_delta_streamed(st, ec)
         t2 = time.perf_counter()
+        # the jitted device paint on THIS backend, against the host engine here
+        dj = dpaint.coarse_delta_device(st, ec, jit=True)
+        jit_equal = _sha(dj) == _sha(d)
         rec[tag] = dict(sha=_sha(d), arena_used=int(st.arena_used),
                         abs_max=float(np.abs(d).max()),
-                        build_s=t1 - t0, paint_s=t2 - t1)
+                        build_s=t1 - t0, paint_s=t2 - t1, jit_sha=_sha(dj),
+                        jit_equal_to_host_here=jit_equal)
         _say(f"[xback-host] {tag}: arena_used={st.arena_used} |delta|max="
-             f"{rec[tag]['abs_max']:.3f} build {t1 - t0:.1f}s paint {t2 - t1:.1f}s")
-    return rec, 0
+             f"{rec[tag]['abs_max']:.3f} build {t1 - t0:.1f}s paint {t2 - t1:.1f}s; "
+             f"JIT on this backend BITWISE = {jit_equal}")
+        if not jit_equal:
+            rc = 3
+    return rec, rc
 
 
 def arm_xback_dev(args):
@@ -171,20 +182,25 @@ def arm_xback_dev(args):
         st = _build_state(g, ec, seed=7, arena=arena)
         if arena and st.arena_used == 0:
             raise RuntimeError("VACUOUS: the arena state has no residents")
-        s = {}
-        t0 = time.perf_counter()
-        d = dpaint.coarse_delta_device(st, ec, stats=s)
-        t1 = time.perf_counter()
-        sha = _sha(d)
-        equal = sha == host[tag]["sha"]
-        rec[tag] = dict(sha=sha, equal_to_cpu_host=equal, arena_used=int(st.arena_used),
-                        device_chunks=s["coarse_device_chunks"],
-                        chunk_bricks=s["coarse_chunk_bricks"], paint_s=t1 - t0)
-        _say(f"[xback-dev] {tag}: BITWISE vs CPU host = {equal}  chunks="
-             f"{s['coarse_device_chunks']} ({s['coarse_chunk_bricks']} bricks) "
-             f"arena_used={st.arena_used} {t1 - t0:.1f}s")
-        if not equal:
-            rc = 3
+        rec[tag] = dict(arena_used=int(st.arena_used))
+        for mode in ("eager", "jit"):
+            s = {}
+            t0 = time.perf_counter()
+            d = dpaint.coarse_delta_device(st, ec, stats=s, jit=(mode == "jit"))
+            t1 = time.perf_counter()
+            sha = _sha(d)
+            equal = sha == host[tag]["sha"]
+            rec[tag][mode] = dict(sha=sha, equal_to_cpu_host=equal,
+                                  device_chunks=s["coarse_device_chunks"],
+                                  chunk_bricks=s["coarse_chunk_bricks"],
+                                  jit_traces=s.get("coarse_jit_traces"),
+                                  paint_s=t1 - t0)
+            _say(f"[xback-dev] {tag} {mode}: BITWISE vs CPU host = {equal}  chunks="
+                 f"{s['coarse_device_chunks']} ({s['coarse_chunk_bricks']} bricks) "
+                 f"traces={s.get('coarse_jit_traces')} arena_used={st.arena_used} "
+                 f"{t1 - t0:.1f}s")
+            if not equal:
+                rc = 3
     return rec, rc
 
 
@@ -211,15 +227,20 @@ def arm_chunk(args):
     pad = int(capacity_shape(rows, rungs=ec.cap_rungs))
     bricks = np.arange(0, L, dtype=np.int64)
     frac = rows / (N_4096 / NB_4096)
-    _say(f"[chunk] n_part={g['n_part']} L={L} bricks rows={rows:,} pad={pad:,} "
+    jit = bool(args.jit)
+    shapes = dpaint.step_shapes(st, L, pad) if jit else None
+    _say(f"[chunk] {'JIT' if jit else 'eager'} n_part={g['n_part']} L={L} bricks "
+         f"rows={rows:,} pad={pad:,} "
          f"= {frac:.4f} of a 4096^3 x-slab; built in {build_s:.1f}s on {platform}")
 
     in_use0, peak0 = _mem("bytes_in_use"), _mem("peak_bytes_in_use")
+    traces0 = dpaint._TRACES[0]
     times, s = [], None
     for rep in range(int(args.reps) + 1):
         guard = []
         t0 = time.perf_counter()
-        sub, origin, extent = dpaint.paint_chunk(st, bricks, 0, L, ec, pad, guard)
+        sub, origin, extent = dpaint.paint_chunk(st, bricks, 0, L, ec, pad, guard,
+                                                 jit=jit, shapes=shapes)
         dpaint.check_containment(guard)
         s = np.asarray(sub)
         dt = time.perf_counter() - t0
@@ -228,8 +249,12 @@ def arm_chunk(args):
              f"device peak {(_mem('peak_bytes_in_use') or 0) / 1e9:.2f} GB")
         del sub
     peak = _mem("peak_bytes_in_use")
+    traces = dpaint._TRACES[0] - traces0
     t0 = time.perf_counter()
-    dpaint.slab_window(st, bricks)
+    if jit:
+        dpaint.slab_window_fixed(st, bricks, shapes)
+    else:
+        dpaint.slab_window(st, bricks)
     window_s = time.perf_counter() - t0
 
     _, xh, _ = st.decode_bricks(list(bricks))
@@ -242,7 +267,8 @@ def arm_chunk(args):
         ec.n_coarse, ec.box_size, ec.frac_bits, live=lv))
     equal = bool(np.array_equal(ref, s)) and int(np.abs(ref).sum()) > 0
 
-    rec = dict(arm="chunk", platform=platform, n_part=g["n_part"], chunk_bricks=L,
+    rec = dict(arm="chunk", platform=platform, jit=jit, jit_traces=traces,
+               jit_shapes=shapes, n_part=g["n_part"], chunk_bricks=L,
                bricks_per_side=nb, rows=rows, pad=pad, frac_of_4096_xslab=frac,
                build_s=build_s, warm_s=times[0], rep_s=times[1:], window_s=window_s,
                bitwise_vs_host_decode=equal, bytes_in_use_before=in_use0,
@@ -263,7 +289,7 @@ def arm_chunk(args):
              f"{rec['planner_4096_gb']:.1f}")
     reps = times[1:] or times
     _say(f"[chunk]   median {np.median(reps):.3f}s/chunk (host window prep "
-         f"{window_s:.3f}s of it); BITWISE vs host decode = {equal}")
+         f"{window_s:.3f}s of it); traces {traces}; BITWISE vs host decode = {equal}")
     return rec, 0 if equal else 3
 
 
@@ -299,11 +325,13 @@ def main(argv=None):
     ap.add_argument("--arm", choices=sorted(ARMS), help=argparse.SUPPRESS)
     ap.add_argument("--n-part", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--chunk-bricks", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--jit", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--host-hashes", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--xback-n", type=int, default=256,
                     help="particles per side for the cross-backend arms (cdev: 256)")
     ap.add_argument("--chunks", default="512:4096,512:16384,1024:65536",
-                    help="n_part:chunk_bricks list for the chunk arms, smallest first")
+                    help="n_part:chunk_bricks[:eager|jit] list for the chunk arms, "
+                         "smallest first (mode defaults to eager)")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--allow-cpu", action="store_true")
     ap.add_argument("--smoke", action="store_true",
@@ -318,7 +346,7 @@ def main(argv=None):
         return rc
 
     if args.smoke:
-        args.xback_n, args.chunks, args.reps = 32, "32:64", 1
+        args.xback_n, args.chunks, args.reps = 32, "32:64:eager,32:64:jit", 1
     common = ["--reps", str(args.reps)] + (["--allow-cpu"] if args.allow_cpu or args.smoke
                                            else [])
     out = os.path.join(REPO, "runs", "v2", f"d2d_device_paint{args.out_suffix}.json")
@@ -356,9 +384,15 @@ def main(argv=None):
             write()
             return 1
     for spec in args.chunks.split(","):
-        n_part, L = (int(t) for t in spec.split(":"))
+        parts = spec.split(":")
+        n_part, L = int(parts[0]), int(parts[1])
+        mode = parts[2] if len(parts) > 2 else "eager"
+        if mode not in ("eager", "jit"):
+            raise ValueError(f"chunk spec {spec!r}: mode must be eager or jit")
         res, rc = _run_worker(["--arm", "chunk", "--n-part", str(n_part),
-                               "--chunk-bricks", str(L), *common], {}, f"chunk {spec}")
+                               "--chunk-bricks", str(L), *common,
+                               *(["--jit"] if mode == "jit" else [])], {},
+                              f"chunk {spec}")
         card["arms"].append(res)
         write()
         worst = max(worst, rc)

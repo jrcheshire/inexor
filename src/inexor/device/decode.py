@@ -29,11 +29,15 @@ contiguity because "if a brick ever appeared in two runs, the second run would
 silently overwrite the first one's scale and decode every row of it wrong".
 This module reproduces that order exactly.
 
+TWO ENTRY POINTS, ONE PROGRAM. `decode_core` is pure jnp with the row count and
+the arena base as values, so it can be traced under `jax.jit`
+(`device.paint`'s jitted chunk). `decode_rows` is the eager wrapper over it that
+the tile pass and the tests call. Both run the same operations.
+
 SCOPE, stated so it is not mistaken for more than it is. `decode_rows` takes
 the WHOLE `off` and `w` arrays as device inputs, which is right at development
 scale and is not the design at 4096^3, where the state is 794 GB on the host
-and only a window of slabs is ever resident. Making the gather read a streamed
-window is a separate rung; this one establishes the arithmetic and its gate.
+and only a window of slabs is ever resident. `device.paint` feeds it a window.
 """
 
 from __future__ import annotations
@@ -82,6 +86,88 @@ def tile_decode_plan(st, bricks):
     )
 
 
+def decode_core(starts, occ, live_counts, arena_slots, row_offsets, bricks, off,
+                arena_bucket, arena_base, n_rows, *, cap, lift, p3, per,
+                bricks_per_side, t9, fdtype):
+    """(slots, x, brick_of_row, brick_index, live) at `cap` rows. Pure jnp.
+
+    Every array argument is a device array or a tracer; `arena_base` and
+    `n_rows` may be Python ints or traced scalars. The keyword arguments fix
+    shapes and constants. `lift` must exceed every value a per-brick occupancy
+    prefix sum or a row rank can take -- `max(cap, n_rows) + 1` does.
+    """
+    import jax.numpy as jnp
+
+    from ..codec import decode_positions
+
+    n_b = bricks.shape[0]
+    r = jnp.arange(cap, dtype=jnp.int64)
+    live = r < n_rows
+
+    # WHICH BRICK each row belongs to. `searchsorted` on the running row total
+    # is the device form of the host's `np.repeat` over member counts -- same
+    # answer, fixed shape, and it does not need the ragged intermediate.
+    bi = jnp.clip(jnp.searchsorted(row_offsets[1:], r, side="right"), 0, n_b - 1)
+    rank = r - row_offsets[bi]
+
+    lc = live_counts[bi]
+    is_arena = rank >= lc
+
+    # --- live rows: slot is the brick's run, bucket is a prefix over occupancy
+    slot_live = starts[bi] + rank
+    # The bucket ordinal is how many of the row's OWN brick's prefix sums are
+    # <= its rank. Comparing every row against its brick's whole prefix sum
+    # (`occ_cum[bi] <= rank[:, None]`) is the obvious spelling and it builds a
+    # (rows, buckets_per_brick) table: ~100 GB for one 4096^3 tile and ~1.1 TB
+    # for an x-slab of bricks. So the per-brick prefix sums are lifted into ONE
+    # nondecreasing sequence -- brick b's by b * lift, with lift above any
+    # value a prefix sum or a rank can take -- and one searchsorted counts the
+    # same thing: every entry of the earlier bricks, plus exactly the own
+    # brick's entries <= rank, and none of the later ones. Same integers, O(rows).
+    #
+    # int64 throughout: `searchsorted` returns int32, and b * lift at an x-slab
+    # of bricks is ~2e13.
+    occ_cum = jnp.cumsum(occ.astype(jnp.int64), axis=1)
+    bi64 = bi.astype(jnp.int64)
+    keys = (occ_cum
+            + (jnp.arange(n_b, dtype=jnp.int64) * lift)[:, None]).reshape(-1)
+    within = jnp.searchsorted(keys, bi64 * lift + rank, side="right") - bi64 * p3
+    within = jnp.clip(within, 0, p3 - 1)
+    bucket_flat_live = bricks[bi] * p3 + within
+
+    # --- arena rows: slot and bucket both come from the arena's own records
+    a_k = jnp.clip(rank - lc, 0, arena_slots.shape[1] - 1)
+    slot_arena = arena_slots[bi, a_k]
+    slot_arena = jnp.where(slot_arena < 0, 0, slot_arena)
+    bucket_flat_arena = arena_bucket[jnp.clip(slot_arena - arena_base, 0, None)]
+
+    slots = jnp.where(is_arena, slot_arena, slot_live)
+    bucket_flat = jnp.where(is_arena, bucket_flat_arena, bucket_flat_live)
+    slots = jnp.where(live, slots, 0)
+
+    # --- the brick-major ordinal -> per-axis bucket index, the jnp twin of
+    # `layout.bucket_ijk_from_key`. Written out rather than imported because
+    # that one is numpy by design ("the layout never puts the global position
+    # array on the device").
+    brick_flat, within_flat = jnp.divmod(bucket_flat, per**3)
+    bx, rem = jnp.divmod(brick_flat, bricks_per_side * bricks_per_side)
+    by, bz = jnp.divmod(rem, bricks_per_side)
+    wx, rem = jnp.divmod(within_flat, per * per)
+    wy, wz = jnp.divmod(rem, per)
+    bucket_ijk = jnp.stack([bx * per + wx, by * per + wy, bz * per + wz], axis=-1)
+
+    # `decode_positions` owns the 256 (LEVELS_PER_BUCKET); it is deliberately
+    # not re-spelled here, because a second copy of that constant is how the
+    # decode and the encode drift apart.
+    x = decode_positions(off[slots], bucket_ijk, t9, fdtype=fdtype)
+
+    # `brick_index` is `bi` itself -- the row's position in the TILE's brick
+    # list, not its global brick id. The kick's segmented reduction wants a
+    # dense 0..n_b-1 segment id, and recovering one from the global id would
+    # mean a searchsorted the decode has already done.
+    return slots, x, bricks[bi], bi, live
+
+
 def decode_rows(plan, off, w, vel_scale, arena_bucket, arena_base, t9,
                 bricks_per_side, cap, fdtype=None, velocities=True):
     """(slots, x, v, brick_of_row, live) for a tile's rows, padded to `cap`.
@@ -104,7 +190,6 @@ def decode_rows(plan, off, w, vel_scale, arena_bucket, arena_base, t9,
     """
     import jax.numpy as jnp
 
-    from ..codec import decode_positions
     from ..eject_jax import require_x64
 
     # x64 OR NOTHING, the same contract and the same reason as the compiled
@@ -117,93 +202,24 @@ def decode_rows(plan, off, w, vel_scale, arena_bucket, arena_base, t9,
     require_x64()
 
     fdtype = jnp.float64 if fdtype is None else fdtype
-    p3 = int(plan["p3"])
-    per = int(t9.n_buckets_side // bricks_per_side)
     cap = int(cap)
-
-    starts = jnp.asarray(plan["starts"])
-    occ = jnp.asarray(plan["occ"])
-    live_counts = jnp.asarray(plan["live_counts"])
-    arena_slots = jnp.asarray(plan["arena_slots"])
-    row_offsets = jnp.asarray(plan["row_offsets"])
-    bricks = jnp.asarray(plan["bricks"])
     n_rows = int(plan["n_rows"])
-
-    r = jnp.arange(cap, dtype=jnp.int64)
-    live = r < n_rows
-
-    # WHICH BRICK each row belongs to. `searchsorted` on the running row total
-    # is the device form of the host's `np.repeat` over member counts -- same
-    # answer, fixed shape, and it does not need the ragged intermediate.
-    bi = jnp.clip(jnp.searchsorted(row_offsets[1:], r, side="right"), 0,
-                  len(plan["bricks"]) - 1)
-    rank = r - row_offsets[bi]
-
-    lc = live_counts[bi]
-    is_arena = rank >= lc
-
-    # --- live rows: slot is the brick's run, bucket is a prefix over occupancy
-    slot_live = starts[bi] + rank
-    # The bucket ordinal is how many of the row's OWN brick's prefix sums are
-    # <= its rank. Comparing every row against its brick's whole prefix sum
-    # (`occ_cum[bi] <= rank[:, None]`) is the obvious spelling and it builds a
-    # (rows, buckets_per_brick) table: ~100 GB for one 4096^3 tile and ~1.1 TB
-    # for an x-slab of bricks. So the per-brick prefix sums are lifted into ONE
-    # nondecreasing sequence -- brick b's by b * lift, with lift above any
-    # value a prefix sum or a rank can take -- and one searchsorted counts the
-    # same thing: every entry of the earlier bricks, plus exactly the own
-    # brick's entries <= rank, and none of the later ones. Same integers, O(rows).
-    #
-    # int64 throughout: `searchsorted` returns int32, and b * lift at an x-slab
-    # of bricks is ~2e13.
-    occ_cum = jnp.cumsum(occ, axis=1)
-    lift = max(cap, n_rows) + 1
-    bi64 = bi.astype(jnp.int64)
-    keys = (occ_cum
-            + (jnp.arange(occ.shape[0], dtype=jnp.int64) * lift)[:, None]).reshape(-1)
-    within = jnp.searchsorted(keys, bi64 * lift + rank, side="right") - bi64 * p3
-    within = jnp.clip(within, 0, p3 - 1)
-    bucket_flat_live = bricks[bi] * p3 + within
-
-    # --- arena rows: slot and bucket both come from the arena's own records
-    a_k = jnp.clip(rank - lc, 0, arena_slots.shape[1] - 1)
-    slot_arena = arena_slots[bi, a_k]
-    slot_arena = jnp.where(slot_arena < 0, 0, slot_arena)
-    bucket_flat_arena = jnp.asarray(arena_bucket)[
-        jnp.clip(slot_arena - int(arena_base), 0, None)]
-
-    slots = jnp.where(is_arena, slot_arena, slot_live)
-    bucket_flat = jnp.where(is_arena, bucket_flat_arena, bucket_flat_live)
-    slots = jnp.where(live, slots, 0)
-
-    # --- the brick-major ordinal -> per-axis bucket index, the jnp twin of
-    # `layout.bucket_ijk_from_key`. Written out rather than imported because
-    # that one is numpy by design ("the layout never puts the global position
-    # array on the device").
-    brick_flat, within_flat = jnp.divmod(bucket_flat, per**3)
-    bx, rem = jnp.divmod(brick_flat, bricks_per_side * bricks_per_side)
-    by, bz = jnp.divmod(rem, bricks_per_side)
-    wx, rem = jnp.divmod(within_flat, per * per)
-    wy, wz = jnp.divmod(rem, per)
-    bucket_ijk = jnp.stack([bx * per + wx, by * per + wy, bz * per + wz], axis=-1)
-
-    # `decode_positions` owns the 256 (LEVELS_PER_BUCKET); it is deliberately
-    # not re-spelled here, because a second copy of that constant is how the
-    # decode and the encode drift apart.
-    off_rows = jnp.asarray(off)[slots]
-    x = decode_positions(off_rows, bucket_ijk, t9, fdtype=fdtype)
-
-    # `brick_index` is `bi` itself -- the row's position in the TILE's brick
-    # list, not its global brick id. The kick's segmented reduction wants a
-    # dense 0..n_b-1 segment id, and recovering one from the global id would
-    # mean a searchsorted the decode has already done.
-    out = dict(slots=slots, x=x, brick_of_row=bricks[bi], brick_index=bi,
+    slots, x, brick_of_row, bi, live = decode_core(
+        jnp.asarray(plan["starts"]), jnp.asarray(plan["occ"]),
+        jnp.asarray(plan["live_counts"]), jnp.asarray(plan["arena_slots"]),
+        jnp.asarray(plan["row_offsets"]), jnp.asarray(plan["bricks"]),
+        jnp.asarray(off), jnp.asarray(arena_bucket), int(arena_base), n_rows,
+        cap=cap, lift=max(cap, n_rows) + 1, p3=int(plan["p3"]),
+        per=int(t9.n_buckets_side // bricks_per_side),
+        bricks_per_side=int(bricks_per_side), t9=t9, fdtype=fdtype,
+    )
+    out = dict(slots=slots, x=x, brick_of_row=brick_of_row, brick_index=bi,
                live=live, n_rows=n_rows)
     if velocities:
         # velocity: the brick's own scale, which is why `decode_brick` takes a
         # SNAPSHOT -- `_insert_slab` rewrites a scale in place and a decode
         # reading the live array would be correct only while the schedule
         # happens to eject every brick before inserting it.
-        scale = jnp.asarray(vel_scale)[bricks[bi]]
+        scale = jnp.asarray(vel_scale)[brick_of_row]
         out["v"] = jnp.asarray(w)[slots].astype(fdtype) * scale[:, None]
     return out

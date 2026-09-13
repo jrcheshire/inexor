@@ -21,6 +21,16 @@ BITWISE against the host paint, and it can be. Positions decode bitwise
 the same padding mask, and the accumulation is integer addition -- so neither
 the chunk size nor the order chunks arrive in can move a bit.
 
+EAGER OR JITTED (`jit=`). Eager runs the decode and paint op by op, which holds
+every intermediate a Python name keeps alive: 266 B per padded row measured on
+a card. `jit=True` compiles decode + containment + paint into ONE program per
+step. For that the chunk's inputs are padded to fixed per-step shapes
+(`step_shapes`) -- the live slice, the arena rectangle and the arena rows -- and
+the sub-block origin is a traced value, so every chunk of a step reuses one
+executable. XLA is free to fuse the TSC weight arithmetic, which could move a
+rounded integer weight, so jit is OFF by default and adopted only on a bitwise
+gate against the eager path, on each backend.
+
 THE ACCUMULATOR IS A SEAM. Where the coarse mesh lives on a gb node is an open
 design question: the budget (`plan.DEVICE_PLACEMENT`) shards it across the
 cards, the code keeps it on the host. `HostInt64Accumulator` is the host form
@@ -37,6 +47,12 @@ from __future__ import annotations
 
 import numpy as np
 
+# One compiled chunk program per distinct set of static parameters, and a count
+# of how many times any of them was TRACED. The count is the receipt that one
+# executable served a whole step: a per-chunk shape would retrace every chunk.
+_KERNELS = {}
+_TRACES = [0]
+
 
 def default_chunk_bricks(bricks_per_side):
     """A quarter of an x-slab of bricks, or a whole x-slab where a quarter does
@@ -50,6 +66,15 @@ def default_chunk_bricks(bricks_per_side):
     return nb * nb // 4 if nb % 4 == 0 else nb * nb
 
 
+def _arena_per_brick(st):
+    p3 = int(st.buckets_per_brick)
+    n_b = int(st.n_bricks)
+    if not st.n_arena:
+        return np.zeros(n_b, dtype=np.int64)
+    res = st.arena_bucket[st.arena_bucket >= 0] // p3
+    return np.bincount(res, minlength=n_b).astype(np.int64)
+
+
 def chunk_rows(st, chunk_len):
     """Member rows (live + arena) in each chunk of `chunk_len` consecutive bricks.
 
@@ -59,10 +84,34 @@ def chunk_rows(st, chunk_len):
     p3 = int(st.buckets_per_brick)
     n_b = int(st.n_bricks)
     per_brick = st.occupancy.reshape(n_b, p3).sum(axis=1, dtype=np.int64)
-    if st.n_arena:
-        res = st.arena_bucket[st.arena_bucket >= 0] // p3
-        per_brick = per_brick + np.bincount(res, minlength=n_b).astype(np.int64)
+    per_brick = per_brick + _arena_per_brick(st)
     return per_brick.reshape(-1, int(chunk_len)).sum(axis=1)
+
+
+def step_shapes(st, chunk_len, pad, floor=None):
+    """Fixed per-step input shapes for the jitted chunk, so one program serves it.
+
+    `live_w` bounds every chunk's slot span, `arena_n` its arena residents and
+    `arena_rect` the residents of any one brick; each sits on
+    `forces.capacity_shape`'s ladder, as `pad` does, and `floor` (a previous
+    step's shapes) keeps them monotone across steps for the same reason.
+    O(bricks + arena) on the host.
+    """
+    from ..forces import capacity_shape
+
+    L = int(chunk_len)
+    n_b = int(st.n_bricks)
+    bs = np.asarray(st.brick_start, dtype=np.int64)
+    spans = bs[L::L] - bs[:n_b:L]
+    ar = _arena_per_brick(st)
+    floor = floor or {}
+
+    def rung(v, key):
+        return int(capacity_shape(max(int(v), 1), floor_shape=int(floor.get(key, 0))))
+
+    return dict(pad=int(pad), live_w=rung(spans.max(), "live_w"),
+                arena_n=rung(ar.reshape(-1, L).sum(axis=1).max(), "arena_n"),
+                arena_rect=rung(ar.max(), "arena_rect"))
 
 
 def slab_window(st, bricks):
@@ -81,12 +130,7 @@ def slab_window(st, bricks):
     """
     from .decode import tile_decode_plan
 
-    bricks = np.asarray(bricks, dtype=np.int64)
-    if len(bricks) == 0 or not np.array_equal(
-            bricks, np.arange(bricks[0], bricks[0] + len(bricks), dtype=np.int64)):
-        raise ValueError(
-            "a device paint chunk must be a run of CONSECUTIVE brick ids: only "
-            "then are its live rows one contiguous slot range")
+    bricks = _consecutive(bricks)
     plan = tile_decode_plan(st, bricks)
     s0 = int(st.brick_start[bricks[0]])
     s1 = int(st.brick_start[bricks[-1] + 1])
@@ -108,6 +152,67 @@ def slab_window(st, bricks):
     return plan_w, off, arena_bucket, span
 
 
+def slab_window_fixed(st, bricks, shapes):
+    """`slab_window` at the fixed shapes of `step_shapes`, for the jitted chunk.
+
+    The live slice is padded to `live_w` rows and arena residents follow at row
+    `live_w`, so `arena_base` is the same for every chunk of the step. The
+    arena rectangle is padded to `arena_rect` columns and the arena rows to
+    `arena_n`. Padding is never read for a live row. Refuses a chunk that
+    exceeds the step's shapes rather than truncating it.
+    """
+    from .decode import tile_decode_plan
+
+    bricks = _consecutive(bricks)
+    plan = tile_decode_plan(st, bricks)
+    b0, L = int(bricks[0]), len(bricks)
+    s0 = int(st.brick_start[b0])
+    s1 = int(st.brick_start[bricks[-1] + 1])
+    span = s1 - s0
+    W, A, R = shapes["live_w"], shapes["arena_n"], shapes["arena_rect"]
+    a = plan["arena_slots"]
+    valid = a >= 0
+    flat = a[valid]
+    n_ar = len(flat)
+    a_cols = int(plan["arena_counts"].max()) if L else 0
+    if span > W or n_ar > A or a_cols > R or plan["n_rows"] > shapes["pad"]:
+        raise ValueError(
+            f"chunk at brick {b0} exceeds the step's fixed shapes (span {span} of "
+            f"{W}, arena {n_ar} of {A}, per-brick arena {a_cols} of {R}, rows "
+            f"{plan['n_rows']} of {shapes['pad']}); rebuild them with step_shapes")
+
+    off = np.zeros((W + A, 3), dtype=st.off.dtype)
+    off[:span] = st.off[s0:s1]
+    arena_bucket = np.zeros(A, dtype=np.int64)
+    rect = np.full((L, R), -1, dtype=np.int64)
+    if n_ar:
+        off[W:W + n_ar] = st.off[flat]
+        arena_bucket[:n_ar] = st.arena_bucket[flat - int(st.arena_base)]
+        sub = np.full(a.shape, -1, dtype=np.int64)
+        sub[valid] = W + np.arange(n_ar, dtype=np.int64)
+        rect[:, : a.shape[1]] = sub
+    p3 = int(st.buckets_per_brick)
+    return dict(
+        starts=plan["starts"] - s0,
+        # the index itself, not the int64 copy the plan makes: a view, 4 B per
+        # bucket over the bus, widened on the device
+        occ=np.asarray(st.occupancy).reshape(-1, p3)[b0:b0 + L],
+        live_counts=plan["live_counts"], arena_slots=rect,
+        row_offsets=plan["row_offsets"], bricks=bricks, off=off,
+        arena_bucket=arena_bucket, n_rows=int(plan["n_rows"]),
+    )
+
+
+def _consecutive(bricks):
+    bricks = np.asarray(bricks, dtype=np.int64)
+    if len(bricks) == 0 or not np.array_equal(
+            bricks, np.arange(bricks[0], bricks[0] + len(bricks), dtype=np.int64)):
+        raise ValueError(
+            "a device paint chunk must be a run of CONSECUTIVE brick ids: only "
+            "then are its live rows one contiguous slot range")
+    return bricks
+
+
 def chunk_origin_extent(chunk_index, chunk_len, bricks_per_side, n_coarse):
     """The chunk's sub-block, exactly as `engine.coarse_delta_streamed` derives it."""
     from ..engine import _chunk_cuboid
@@ -125,26 +230,41 @@ def chunk_origin_extent(chunk_index, chunk_len, bricks_per_side, n_coarse):
     return origin, extent
 
 
-def containment_bounds(x, live, cell, origin, extent, n_coarse, guard_out):
-    """Append this chunk's containment bounds to `guard_out`, as device scalars.
-
-    The device half of `engine._assert_stencil_contained`: the same rint, the
-    same wrapped local index, over live rows only. Dead rows are pushed to
-    sentinels that cannot win their own reduction, so a chunk with no live row
-    reports nothing to refuse.
-    """
+def _containment_lohi(x, live, cell, origin, extent, n_coarse):
+    """(axes, lo, hi): for each axis the block does not span in full, the lowest
+    and highest wrapped local TSC base over live rows. Dead rows are pushed to
+    sentinels that cannot win their own reduction. `origin` may be traced;
+    `extent` fixes which axes are checked."""
     import jax.numpy as jnp
 
     n = int(n_coarse)
     base = jnp.rint(x / float(cell)).astype(jnp.int64)
+    o = jnp.asarray(origin, dtype=jnp.int64)
+    axes, lo, hi = [], [], []
     for ax in range(3):
-        e = int(extent[ax])
-        if e >= n:
+        if int(extent[ax]) >= n:
             continue  # full axis: any index is in range by construction
-        local = jnp.mod(base[:, ax] - int(origin[ax]), n)
-        lo = jnp.min(jnp.where(live, local, n))
-        hi = jnp.max(jnp.where(live, local, -1))
-        guard_out.append((ax, lo, hi, int(origin[ax]), e, n))
+        local = jnp.mod(base[:, ax] - o[ax], n)
+        axes.append(ax)
+        lo.append(jnp.min(jnp.where(live, local, n)))
+        hi.append(jnp.max(jnp.where(live, local, -1)))
+    return tuple(axes), lo, hi
+
+
+def containment_bounds(x, live, cell, origin, extent, n_coarse, guard_out):
+    """Append this chunk's containment bounds to `guard_out`, as device scalars.
+
+    The device half of `engine._assert_stencil_contained`: the same rint, the
+    same wrapped local index, over live rows only, so a chunk with no live row
+    reports nothing to refuse.
+    """
+    axes, lo, hi = _containment_lohi(x, live, cell, origin, extent, n_coarse)
+    _guard_entries(axes, lo, hi, origin, extent, n_coarse, guard_out)
+
+
+def _guard_entries(axes, lo, hi, origin, extent, n_coarse, guard_out):
+    for ax, a, b in zip(axes, lo, hi):
+        guard_out.append((ax, a, b, int(origin[ax]), int(extent[ax]), int(n_coarse)))
 
 
 def check_containment(guard_out):
@@ -165,19 +285,57 @@ def check_containment(guard_out):
         guard_out.clear()
 
 
-def paint_chunk(st, bricks, chunk_index, chunk_len, cfg, pad, guard_out):
+def _chunk_kernel(*, cap, lift, p3, per, nb, arena_base, extent, n_coarse, box,
+                  frac_bits, t9):
+    """The jitted decode + containment + paint for one set of static parameters."""
+    key = (cap, lift, p3, per, nb, arena_base, tuple(int(e) for e in extent),
+           n_coarse, float(box), frac_bits, float(t9.quantum), int(t9.n_buckets_side))
+    fn = _KERNELS.get(key)
+    if fn is not None:
+        return fn
+    import jax
+    import jax.numpy as jnp
+
+    from ..painting import paint_tsc_int_subblock
+    from .decode import decode_core
+
+    ext = tuple(int(e) for e in extent)
+    cell = float(box) / float(n_coarse)
+
+    def body(starts, occ, live_counts, arena_slots, row_offsets, bricks, off,
+             arena_bucket, n_rows, origin):
+        _TRACES[0] += 1  # runs at trace time only: the one-compile receipt
+        _slots, x, _bor, _bi, live = decode_core(
+            starts, occ, live_counts, arena_slots, row_offsets, bricks, off,
+            arena_bucket, arena_base, n_rows, cap=cap, lift=lift, p3=p3, per=per,
+            bricks_per_side=nb, t9=t9, fdtype=jnp.float64)
+        _axes, lo, hi = _containment_lohi(x, live, cell, origin, ext, n_coarse)
+        sub = paint_tsc_int_subblock(x, origin, ext, n_coarse, box, frac_bits,
+                                     live=live)
+        return sub, lo, hi
+
+    fn = jax.jit(body)
+    _KERNELS[key] = fn
+    return fn
+
+
+def paint_chunk(st, bricks, chunk_index, chunk_len, cfg, pad, guard_out, jit=False,
+                shapes=None):
     """(sub, origin, extent) for one chunk, or None when it holds no rows.
 
     `sub` is the int32 sub-block, still on the device. Its containment bounds
     are appended to `guard_out`; `check_containment` must run before `sub` is
-    used.
+    used. `jit=True` needs `shapes` from `step_shapes`.
     """
-    from ..painting import paint_tsc_int_subblock
-    from .decode import decode_rows
-
     n = int(cfg.n_coarse)
     nb = int(st.bricks_per_side)
     origin, extent = chunk_origin_extent(chunk_index, chunk_len, nb, n)
+    if jit:
+        return _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out)
+
+    from ..painting import paint_tsc_int_subblock
+    from .decode import decode_rows
+
     plan, off, arena_bucket, arena_base = slab_window(st, bricks)
     if plan["n_rows"] == 0:
         return None
@@ -192,6 +350,35 @@ def paint_chunk(st, bricks, chunk_index, chunk_len, cfg, pad, guard_out):
         x, tuple(int(o) for o in origin), tuple(int(e) for e in extent), n,
         cfg.box_size, cfg.frac_bits, live=live,
     )
+    return sub, origin, extent
+
+
+def _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out):
+    import jax.numpy as jnp
+
+    from ..eject_jax import require_x64
+
+    require_x64()
+    if shapes is None:
+        raise ValueError("jit=True needs the step's fixed shapes (step_shapes)")
+    w = slab_window_fixed(st, bricks, shapes)
+    if w["n_rows"] == 0:
+        return None
+    nb = int(st.bricks_per_side)
+    cap = int(shapes["pad"])
+    fn = _chunk_kernel(
+        cap=cap, lift=cap + 1, p3=int(st.buckets_per_brick),
+        per=int(st.t9.n_buckets_side // nb), nb=nb, arena_base=int(shapes["live_w"]),
+        extent=extent, n_coarse=int(cfg.n_coarse), box=float(cfg.box_size),
+        frac_bits=int(cfg.frac_bits), t9=st.t9)
+    sub, lo, hi = fn(
+        jnp.asarray(w["starts"]), jnp.asarray(w["occ"]), jnp.asarray(w["live_counts"]),
+        jnp.asarray(w["arena_slots"]), jnp.asarray(w["row_offsets"]),
+        jnp.asarray(w["bricks"]), jnp.asarray(w["off"]), jnp.asarray(w["arena_bucket"]),
+        jnp.asarray(w["n_rows"], dtype=jnp.int64),
+        jnp.asarray(origin, dtype=jnp.int32))
+    axes = tuple(ax for ax in range(3) if int(extent[ax]) < int(cfg.n_coarse))
+    _guard_entries(axes, lo, hi, origin, extent, cfg.n_coarse, guard_out)
     return sub, origin, extent
 
 
@@ -220,18 +407,21 @@ class HostInt64Accumulator:
 
 
 def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
-                        accumulator=None, census=False):
+                        accumulator=None, census=False, jit=False, shape_floor=None):
     """delta on the coarse mesh, painted chunk by chunk on the device.
 
     Bitwise `engine.coarse_delta_streamed` at any `chunk_bricks` that tiles the
     brick grid into cuboids; the default is `default_chunk_bricks`. `pad_shape`
     carries the chunk row shape across steps as the host path does.
-    `accumulator` defaults to `HostInt64Accumulator`.
+    `accumulator` defaults to `HostInt64Accumulator`. `jit=True` compiles each
+    chunk as one program at fixed per-step shapes; `shape_floor` carries those
+    shapes from a previous step.
 
     `stats`, if a dict, receives `coarse_pad`, `coarse_pad_true`,
     `coarse_peak_int`, `coarse_device_chunks` (the receipt that this path
-    painted the mesh) and `coarse_chunk_bricks`, plus the census fields when
-    `census`.
+    painted the mesh), `coarse_chunk_bricks`, `coarse_device_jit`, and with jit
+    `coarse_jit_shapes` and `coarse_jit_traces` (compilations during this call),
+    plus the census fields when `census`.
     """
     from ..engine import _delta_from_accumulated
     from ..forces import capacity_shape
@@ -255,6 +445,8 @@ def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
     pad_true = int(rows.max()) if len(rows) else 0
     pad = (capacity_shape(pad_true, rungs=cfg.cap_rungs, floor_shape=pad_shape)
            if cfg.pad_ladder else pad_true)
+    shapes = step_shapes(st, L, pad, floor=shape_floor) if jit else None
+    traces0 = _TRACES[0]
     acc = HostInt64Accumulator(cfg.n_coarse) if accumulator is None else accumulator
     guard = []
     n_dev = 0
@@ -262,7 +454,7 @@ def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
         if rows[gi] == 0:
             continue
         res = paint_chunk(st, np.arange(gi * L, (gi + 1) * L, dtype=np.int64), gi,
-                          L, cfg, pad, guard)
+                          L, cfg, pad, guard, jit=jit, shapes=shapes)
         if res is None:
             continue
         check_containment(guard)  # before the block is used
@@ -276,6 +468,10 @@ def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
         stats["coarse_peak_int"] = peak
         stats["coarse_device_chunks"] = n_dev
         stats["coarse_chunk_bricks"] = L
+        stats["coarse_device_jit"] = bool(jit)
+        if jit:
+            stats["coarse_jit_shapes"] = shapes
+            stats["coarse_jit_traces"] = _TRACES[0] - traces0
         if census:
             stats["coarse_cells_inexact_f32"] = inexact
             stats["coarse_exact_decode_ok"] = inexact == 0

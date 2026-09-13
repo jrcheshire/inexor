@@ -340,12 +340,19 @@ def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
     An axis whose extent equals `n_mesh` is the degenerate full-axis case
     (origin 0), which the engine uses whenever span + 3 would exceed the
     mesh -- keeping the caller's scatter-add indices unique per axis.
+
+    `extent` sets the block's shape and must be Python ints. `origin_cells`
+    may be ints or an int array, including a traced one, so one compiled
+    program can paint every chunk of a step (`device.paint`). It enters as
+    int32, the dtype the stencil base already has, so the index arithmetic is
+    the same int32 arithmetic whichever form the caller passes.
     """
     scale = np.float32(2.0**frac_bits)
     N = int(n_mesh)
     cell = float(box_size) / N
     ex, ey, ez = (int(e) for e in extent)
-    ox, oy, oz = (int(o) for o in origin_cells)
+    o = jnp.asarray(origin_cells, dtype=jnp.int32)
+    ox, oy, oz = o[0], o[1], o[2]
     base, w = _tsc_pieces(positions, cell)
     mesh = jnp.zeros((ex * ey * ez,), dtype=jnp.int32)
     m = None if live is None else jnp.asarray(live)

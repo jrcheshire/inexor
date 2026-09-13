@@ -211,6 +211,101 @@ def test_the_accumulator_is_a_seam():
     assert np.array_equal(got, engine.coarse_delta_streamed(st, cfg))
 
 
+# ------------------------------------------------------- the jitted chunk
+#
+# jit is adopted only on a bitwise gate: XLA may fuse the TSC weight arithmetic,
+# and a fused multiply-add rounds differently, which could move a rounded
+# integer weight. These gates run on whatever backend the suite runs on; the
+# GPU reading is its own job.
+
+
+@pytest.mark.parametrize("arena", [False, True])
+def test_jit_density_is_bitwise_the_host_density(arena):
+    cfg = _cfg()
+    st = _state(cfg, 4, arena=arena)
+    if arena:
+        assert st.arena_used > 0, "VACUOUS: no arena residents"
+    want = engine.coarse_delta_streamed(st, cfg)
+    s = {}
+    got = dpaint.coarse_delta_device(st, cfg, stats=s, jit=True)
+    assert s["coarse_device_jit"] is True and s["coarse_device_chunks"] > 1
+    assert np.array_equal(got, want), "the jitted paint moved a bit of the density"
+    _nontrivial(got)
+
+
+def test_every_jitted_chunk_block_is_bitwise_the_eager_block():
+    """Per chunk, arena residents present, so a disagreement names the chunk."""
+    from inexor.forces import capacity_shape
+
+    cfg = _cfg()
+    st = _state(cfg, 4, arena=True)
+    assert st.arena_used > 0
+    nb = st.bricks_per_side
+    L = dpaint.default_chunk_bricks(nb)
+    pad = int(capacity_shape(int(dpaint.chunk_rows(st, L).max())))
+    shapes = dpaint.step_shapes(st, L, pad)
+    compared = 0
+    for gi in range(st.n_bricks // L):
+        bricks = np.arange(gi * L, (gi + 1) * L, dtype=np.int64)
+        g_e, g_j = [], []
+        e = dpaint.paint_chunk(st, bricks, gi, L, cfg, pad, g_e)
+        j = dpaint.paint_chunk(st, bricks, gi, L, cfg, pad, g_j, jit=True, shapes=shapes)
+        if e is None:
+            assert j is None
+            continue
+        dpaint.check_containment(g_e)
+        dpaint.check_containment(g_j)
+        assert np.array_equal(np.asarray(e[0]), np.asarray(j[0])), f"chunk {gi}"
+        compared += 1
+    assert compared > 1
+
+
+def test_one_compilation_serves_every_chunk_of_a_step():
+    cfg = _cfg()
+    st = _state(cfg, 4, arena=True)
+    dpaint._KERNELS.clear()
+    s = {}
+    dpaint.coarse_delta_device(st, cfg, stats=s, jit=True)
+    assert s["coarse_device_chunks"] > 1, "vacuous: one chunk cannot show reuse"
+    assert s["coarse_jit_traces"] == 1, (
+        f"{s['coarse_jit_traces']} traces for {s['coarse_device_chunks']} chunks: "
+        "a per-chunk shape is keying a new program")
+    s2 = {}
+    dpaint.coarse_delta_device(st, cfg, stats=s2, jit=True,
+                               shape_floor=s["coarse_jit_shapes"])
+    assert s2["coarse_jit_traces"] == 0, "a second step at the same shapes retraced"
+
+
+def test_the_jitted_guard_refuses_a_wrong_cuboid():
+    from inexor.forces import capacity_shape
+
+    cfg = _cfg()
+    st = _state(cfg, 2)
+    nb = st.bricks_per_side
+    L = dpaint.default_chunk_bricks(nb)
+    pad = int(capacity_shape(int(dpaint.chunk_rows(st, L).max())))
+    shapes = dpaint.step_shapes(st, L, pad)
+    far = (st.n_bricks // L) // 2
+    guard = []
+    dpaint.paint_chunk(st, np.arange(0, L, dtype=np.int64), far, L, cfg, pad, guard,
+                       jit=True, shapes=shapes)
+    assert guard, "no containment bounds were recorded"
+    with pytest.raises(ValueError, match="containment violated"):
+        dpaint.check_containment(guard)
+
+
+def test_a_chunk_past_the_steps_fixed_shapes_is_refused():
+    from inexor.forces import capacity_shape
+
+    cfg = _cfg()
+    st = _state(cfg, 4, arena=True)
+    L = dpaint.default_chunk_bricks(st.bricks_per_side)
+    pad = int(capacity_shape(int(dpaint.chunk_rows(st, L).max())))
+    shapes = dict(dpaint.step_shapes(st, L, pad), live_w=1)
+    with pytest.raises(ValueError, match="exceeds the step's fixed shapes"):
+        dpaint.slab_window_fixed(st, np.arange(0, L, dtype=np.int64), shapes)
+
+
 # ----------------------------------------------- memory, by structure
 
 
