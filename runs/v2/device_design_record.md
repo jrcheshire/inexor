@@ -1168,3 +1168,64 @@ One GB200.
 5. Carried: `JIT_LONG_FORCE_EPS` measured on one state (sec. 17); the division
    exposure in `codec` for D3; a per-tile slab window; coarse mesh placement;
    the four-card split.
+
+## 19. D2e attribution, Vista 993817 -- of sec. 18's 566 ms per tile, 71 ms is device compute; the largest term is a host pass
+
+`5283433`, 2026-09-12, gb node c672-011 (the node 993754 ran on), COMPLETED rc=0
+in 4:17, ~0.1 SU. Submitted with `D2E_ARMS=short+tile+tile-staged`; cards
+`runs/v2/d2e_device_tile_attr_{gb,gbsmoke}.json` (force-added), log copied to
+`runs/v2/d2e-tile-993817.log`. P=576, cap 26,632,171, one GB200, median of 3
+tiles after a warm one. Every phase is ended by a device sync
+(`tile_task_device(timings=)`); an untimed call on the same tile precedes each
+timed one.
+
+**The instrument is neutral**: timed 577 ms against untimed 570 (state uploaded
+each call), 391 against 389 (state placed once). **The untimed 570 ms
+reproduces 993754's 566.**
+
+| phase, per tile | state uploaded every call | state placed once |
+|---|---|---|
+| host: decode plan | 8 ms | 8 ms |
+| host: coarse sub-block staging | 25 ms | 22 ms |
+| upload: per-tile inputs | 12 ms | 12 ms |
+| **upload: state arrays (1.58 GB)** | **183 ms** | 0 |
+| **device compute, the whole tile program** | **71 ms** | **71 ms** |
+| readback of results | 62 ms | 62 ms |
+| **host: result assembly** | **214 ms** | **214 ms** |
+| total (untimed) | 570 ms | 389 ms |
+
+`one_tile` alone at the same shape: **29 ms device compute**, 87 ms to read back
+its cap x 3 f64 forces (639 MB), 95 ms to upload its inputs.
+
+### What it establishes
+
+- **Device compute is 71 ms of a tile; 29 ms of that is the short force.** The
+  other 42 ms is the decode, ownership, coarse gather, kick and quantize in the
+  same program. Everything else in the 566 ms is host work or bus traffic.
+- **The largest term is the host result assembly, 214 ms, 37% of the tile.**
+  It is `device.tile._result`: two boolean-mask gathers over the 26.6M padded
+  rows (owned slots, int64, and their codes, (cap, 3) int16) that build the
+  `engine.apply_result` contract. That is a per-particle host pass, the class
+  the design exists to delete (sec. 1). The split between the two gathers is
+  not measured.
+- **The state upload is 183 ms for 1.58 GB (8.6 GB/s)**, and placing the state
+  once removes exactly that: 570 -> 389 ms, with every other phase unchanged
+  to within 3 ms. At 4096^3 the state is streamed as a window, not uploaded per
+  tile, so this term belongs to the development path.
+- **Readback is 62 ms** for the cap-sized slots, owned mask and codes (~400 MB).
+  It moves padded rows the host then discards.
+- The gb probe's 94.2 ms per tile was device-only on the f64 paint; this short
+  force is the integer paint inside a compiled program, 29 ms. The two are not
+  the same program, so the ratio is not attributed to either difference.
+
+### Owed
+
+1. **The result contract, off the host**: compact owned slots and codes on the
+   device (or write codes into the device-side window) so neither the 214 ms
+   host gathers nor the padded-row readback remain. Fixed shapes rule out a
+   per-tile compaction; the write target is the D3 / streaming design.
+2. The four-card split of the tile loop; the GPU-vs-CPU floor at P=576; the
+   short kernels as program arguments; `tile_workspace` in the planner (sec.
+   18).
+3. Carried: `JIT_LONG_FORCE_EPS` on one state; the `codec` division exposure for
+   D3; a per-tile slab window; coarse mesh placement.
