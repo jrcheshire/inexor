@@ -290,10 +290,11 @@ def check_containment(guard_out):
 
 
 def _chunk_kernel(*, cap, lift, p3, per, nb, arena_base, extent, n_coarse, box,
-                  frac_bits, t9):
+                  frac_bits, t9, dead_rows="cell0"):
     """The jitted decode + containment + paint for one set of static parameters."""
     key = (cap, lift, p3, per, nb, arena_base, tuple(int(e) for e in extent),
-           n_coarse, float(box), frac_bits, float(t9.quantum), int(t9.n_buckets_side))
+           n_coarse, float(box), frac_bits, float(t9.quantum), int(t9.n_buckets_side),
+           dead_rows)
     fn = _KERNELS.get(key)
     if fn is not None:
         return fn
@@ -315,7 +316,7 @@ def _chunk_kernel(*, cap, lift, p3, per, nb, arena_base, extent, n_coarse, box,
             bricks_per_side=nb, t9=t9, fdtype=jnp.float64)
         _axes, lo, hi = _containment_lohi(x, live, cell, origin, ext, n_coarse)
         sub = paint_tsc_int_subblock(x, origin, ext, n_coarse, box, frac_bits,
-                                     live=live)
+                                     live=live, dead_rows=dead_rows)
         return sub, lo, hi
 
     fn = jax.jit(body)
@@ -324,18 +325,20 @@ def _chunk_kernel(*, cap, lift, p3, per, nb, arena_base, extent, n_coarse, box,
 
 
 def paint_chunk(st, bricks, chunk_index, chunk_len, cfg, pad, guard_out, jit=False,
-                shapes=None):
+                shapes=None, dead_rows="cell0"):
     """(sub, origin, extent) for one chunk, or None when it holds no rows.
 
     `sub` is the int32 sub-block, still on the device. Its containment bounds
     are appended to `guard_out`; `check_containment` must run before `sub` is
-    used. `jit=True` needs `shapes` from `step_shapes`.
+    used. `jit=True` needs `shapes` from `step_shapes`. `dead_rows` is
+    `paint_tsc_int_subblock`'s switch for where padded rows scatter.
     """
     n = int(cfg.n_coarse)
     nb = int(st.bricks_per_side)
     origin, extent = chunk_origin_extent(chunk_index, chunk_len, nb, n)
     if jit:
-        return _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out)
+        return _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out,
+                                dead_rows)
 
     from ..painting import paint_tsc_int_subblock
     from .decode import decode_rows
@@ -352,12 +355,13 @@ def paint_chunk(st, bricks, chunk_index, chunk_len, cfg, pad, guard_out, jit=Fal
                        guard_out)
     sub = paint_tsc_int_subblock(
         x, tuple(int(o) for o in origin), tuple(int(e) for e in extent), n,
-        cfg.box_size, cfg.frac_bits, live=live,
+        cfg.box_size, cfg.frac_bits, live=live, dead_rows=dead_rows,
     )
     return sub, origin, extent
 
 
-def _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out):
+def _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out,
+                     dead_rows="cell0"):
     import jax.numpy as jnp
 
     from ..eject_jax import require_x64
@@ -374,7 +378,7 @@ def _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out):
         cap=cap, lift=cap + 1, p3=int(st.buckets_per_brick),
         per=int(st.t9.n_buckets_side // nb), nb=nb, arena_base=int(shapes["live_w"]),
         extent=extent, n_coarse=int(cfg.n_coarse), box=float(cfg.box_size),
-        frac_bits=int(cfg.frac_bits), t9=st.t9)
+        frac_bits=int(cfg.frac_bits), t9=st.t9, dead_rows=dead_rows)
     sub, lo, hi = fn(
         jnp.asarray(w["starts"]), jnp.asarray(w["occ"]), jnp.asarray(w["live_counts"]),
         jnp.asarray(w["arena_slots"]), jnp.asarray(w["row_offsets"]),
@@ -411,7 +415,8 @@ class HostInt64Accumulator:
 
 
 def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
-                        accumulator=None, census=False, jit=True, shape_floor=None):
+                        accumulator=None, census=False, jit=True, shape_floor=None,
+                        dead_rows="cell0"):
     """delta on the coarse mesh, painted chunk by chunk on the device.
 
     Bitwise `engine.coarse_delta_streamed` at any `chunk_bricks` that tiles the
@@ -459,7 +464,8 @@ def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
         if rows[gi] == 0:
             continue
         res = paint_chunk(st, np.arange(gi * L, (gi + 1) * L, dtype=np.int64), gi,
-                          L, cfg, pad, guard, jit=jit, shapes=shapes)
+                          L, cfg, pad, guard, jit=jit, shapes=shapes,
+                          dead_rows=dead_rows)
         if res is None:
             continue
         check_containment(guard)  # before the block is used
@@ -474,6 +480,7 @@ def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
         stats["coarse_device_chunks"] = n_dev
         stats["coarse_chunk_bricks"] = L
         stats["coarse_device_jit"] = bool(jit)
+        stats["coarse_dead_rows"] = dead_rows
         if jit:
             stats["coarse_jit_shapes"] = shapes
             stats["coarse_jit_traces"] = _TRACES[0] - traces0

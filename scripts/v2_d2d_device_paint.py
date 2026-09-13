@@ -235,7 +235,8 @@ def arm_chunk(args):
     frac = rows / (N_4096 / NB_4096)
     jit = bool(args.jit)
     shapes = dpaint.step_shapes(st, L, pad) if jit else None
-    _say(f"[chunk] {'JIT' if jit else 'eager'} n_part={g['n_part']} L={L} bricks "
+    _say(f"[chunk] {'JIT' if jit else 'eager'} dead={args.dead} n_part={g['n_part']} "
+         f"L={L} bricks "
          f"rows={rows:,} pad={pad:,} "
          f"= {frac:.4f} of a 4096^3 x-slab; built in {build_s:.1f}s on {platform}")
 
@@ -246,7 +247,8 @@ def arm_chunk(args):
         guard = []
         t0 = time.perf_counter()
         sub, origin, extent = dpaint.paint_chunk(st, bricks, 0, L, ec, pad, guard,
-                                                 jit=jit, shapes=shapes)
+                                                 jit=jit, shapes=shapes,
+                                                 dead_rows=args.dead)
         dpaint.check_containment(guard)
         s = np.asarray(sub)
         dt = time.perf_counter() - t0
@@ -275,6 +277,7 @@ def arm_chunk(args):
 
     rec = dict(arm="chunk", platform=platform, jit=jit, jit_traces=traces,
                pad_override=bool(args.pad), pad_is_pow2=bool(pad & (pad - 1) == 0),
+               dead_rows=args.dead,
                block_extent=[int(e) for e in extent],
                jit_shapes=shapes, n_part=g["n_part"], chunk_bricks=L,
                bricks_per_side=nb, rows=rows, pad=pad, frac_of_4096_xslab=frac,
@@ -335,13 +338,16 @@ def main(argv=None):
     ap.add_argument("--chunk-bricks", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--jit", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--pad", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--dead", default="cell0", choices=("cell0", "spread"),
+                    help=argparse.SUPPRESS)
     ap.add_argument("--host-hashes", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--xback-n", type=int, default=256,
                     help="particles per side for the cross-backend arms (cdev: 256)")
     ap.add_argument("--chunks", default="512:4096,512:16384,1024:65536",
-                    help="n_part:chunk_bricks[:eager|jit[:pad]] list for the chunk "
-                         "arms (mode defaults to eager; pad overrides the padded "
-                         "row count, an instrument)")
+                    help="n_part:chunk_bricks[:eager|jit[:pad[:cell0|spread]]] list "
+                         "for the chunk arms (mode defaults to eager; pad, which may "
+                         "be empty, overrides the padded row count; the last field "
+                         "is where padded rows scatter). Pad and dead are instruments")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--allow-cpu", action="store_true")
     ap.add_argument("--smoke", action="store_true",
@@ -399,11 +405,12 @@ def main(argv=None):
         mode = parts[2] if len(parts) > 2 else "eager"
         if mode not in ("eager", "jit"):
             raise ValueError(f"chunk spec {spec!r}: mode must be eager or jit")
-        pad_arg = ["--pad", parts[3]] if len(parts) > 3 else []
+        pad_arg = ["--pad", parts[3]] if len(parts) > 3 and parts[3] else []
+        dead_arg = ["--dead", parts[4]] if len(parts) > 4 else []
         res, rc = _run_worker(["--arm", "chunk", "--n-part", str(n_part),
                                "--chunk-bricks", str(L), *common,
-                               *(["--jit"] if mode == "jit" else []), *pad_arg], {},
-                              f"chunk {spec}")
+                               *(["--jit"] if mode == "jit" else []), *pad_arg,
+                               *dead_arg], {}, f"chunk {spec}")
         card["arms"].append(res)
         write()
         worst = max(worst, rc)

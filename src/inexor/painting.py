@@ -315,7 +315,7 @@ def paint_tsc_int(positions, n_mesh, box_size, frac_bits=12, live=None):
 
 
 def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
-                           frac_bits=12, live=None):
+                           frac_bits=12, live=None, dead_rows="cell0"):
     """Integer TSC paint into a coarse SUB-BLOCK. Returns the raw int32 block.
 
     The paint-side twin of `forces.gather_coarse_subblock`, carrying the same
@@ -346,6 +346,13 @@ def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
     program can paint every chunk of a step (`device.paint`). It enters as
     int32, the dtype the stencil base already has, so the index arithmetic is
     the same int32 arithmetic whichever form the caller passes.
+
+    `dead_rows` says where masked rows scatter their zero weight: "cell0" (every
+    one into block cell 0) or "spread" (row i into cell i mod the block size).
+    Adding zero anywhere is a no-op, so the block is bitwise the same either
+    way; the switch exists because on a GB200 a padded row costs far more than
+    a real one (Vista 993350), and one heavily duplicated scatter index is the
+    suspect.
     """
     scale = np.float32(2.0**frac_bits)
     N = int(n_mesh)
@@ -356,6 +363,12 @@ def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
     base, w = _tsc_pieces(positions, cell)
     mesh = jnp.zeros((ex * ey * ez,), dtype=jnp.int32)
     m = None if live is None else jnp.asarray(live)
+    if dead_rows == "cell0":
+        dead = 0
+    elif dead_rows == "spread":
+        dead = jnp.arange(positions.shape[0], dtype=jnp.int32) % (ex * ey * ez)
+    else:
+        raise ValueError(f"dead_rows must be 'cell0' or 'spread', got {dead_rows!r}")
     for corner in _TSC_CORNERS:
         dx, dy, dz = corner
         lx = (base[:, 0] + dx - ox) % N
@@ -365,7 +378,7 @@ def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
         flat = (lx * ey + ly) * ez + lz
         if m is not None:
             ww = jnp.where(m, ww, 0.0)
-            flat = jnp.where(m, flat, 0)
+            flat = jnp.where(m, flat, dead)
         mesh = mesh.at[flat].add(
             rint_i(ww.astype(jnp.float32) * scale), mode="promise_in_bounds"
         )

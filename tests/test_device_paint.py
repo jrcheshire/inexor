@@ -287,6 +287,33 @@ def test_one_compilation_serves_every_chunk_of_a_step():
     assert s2["coarse_jit_traces"] == 0, "a second step at the same shapes retraced"
 
 
+@pytest.mark.parametrize("jit", [False, True])
+def test_spreading_the_dead_rows_moves_no_bit(jit):
+    """Padded rows scatter a zero weight; WHERE they scatter it cannot matter.
+    On a jitted run the spread kernel must also be a distinct program, which is
+    the receipt that the switch reached the compiled paint."""
+    cfg = _cfg()
+    st = _state(cfg, 4, arena=True)
+    s0, s1 = {}, {}
+    a = dpaint.coarse_delta_device(st, cfg, stats=s0, jit=jit)
+    b = dpaint.coarse_delta_device(st, cfg, stats=s1, jit=jit, dead_rows="spread")
+    assert s1["coarse_pad"] > s1["coarse_pad_true"], "vacuous: no padded rows"
+    assert s0["coarse_dead_rows"] == "cell0" and s1["coarse_dead_rows"] == "spread"
+    if jit:
+        assert s1["coarse_jit_traces"] == 1, "the spread kernel reused the cell-0 program"
+    assert np.array_equal(a, b)
+
+
+def test_an_unknown_dead_row_mode_is_refused():
+    import jax.numpy as jnp
+
+    from inexor.painting import paint_tsc_int_subblock
+
+    with pytest.raises(ValueError, match="dead_rows"):
+        paint_tsc_int_subblock(jnp.zeros((4, 3)), (0, 0, 0), (4, 4, 4), 16, 16.0,
+                               live=np.ones(4, bool), dead_rows="elsewhere")
+
+
 def test_the_jitted_guard_refuses_a_wrong_cuboid():
     from inexor.forces import capacity_shape
 
