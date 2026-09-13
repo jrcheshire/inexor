@@ -1229,3 +1229,46 @@ its cap x 3 f64 forces (639 MB), 95 ms to upload its inputs.
    18).
 3. Carried: `JIT_LONG_FORCE_EPS` on one state; the `codec` division exposure for
    D3; a per-tile slab window; coarse mesh placement.
+
+## 20. D2e step loop -- the kick written into the device state, bitwise the host-apply path
+
+Local only, no cluster time. `device.tile.tile_loop_device(st, one_tile, C,
+g_coarse, members, shapes)`, tests in `tests/test_device_tile.py`. JC chose a
+step-level function over a per-tile write option, and approved the sec. 17
+tolerance as the fallback if exactness failed. It did not fail.
+
+**What it does.** Each tile's compiled program writes its codes and per-brick
+scales into the device state and returns only scalars (owned count, overhang,
+stencil bounds). The program donates `w` and `vel_scale`, so the card never
+holds two copies. After the loop every stencil guard is resolved and, for a
+full step, the owned total checked against the particle count; only then are
+`st.w` and `st.vel_scale` copied back to the host, once. That removes both
+sec. 19 terms that moved results: the 62 ms readback of padded rows and the
+214 ms host result assembly.
+
+**How the write stays exact.** Codes: the new code minus the stored code, in
+int32, zeroed on rows the tile does not own, narrowed to int16 (modular, the
+codec's rule) and scatter-ADDED at the rows' slots. Adding it back gives the new
+code exactly; padding, all at slot 0, adds zero, so repeated indices cannot
+collide the way a scatter-set's would. Scales: a set on the tile's own bricks,
+which are unique within a tile, keeping the stored scale where the tile owns no
+rows. `stage_state_on_device` copies rather than views the host arrays, because
+a donated buffer aliasing numpy memory would be overwritten under the host.
+
+**Gate: PASS, bitwise.** Every tile of a step at f64 fine / f32 coarse, arena
+residents present:
+- `w` and `vel_scale` after the device loop equal the jitted tile's host
+  results applied tile by tile with `engine.apply_result`; owned total equals
+  the particle count; the step writes something.
+- A skipped tile's owned rows and bricks keep their stored codes and scales, and
+  the host arrays are untouched while the device state changes.
+- A loop missing a tile is refused as a step, before the host is written.
+
+### Owed
+
+1. **A gb timing job** of this loop at P=576 (its own proposal): which phases
+   remain per tile once results stay on the device.
+2. Carried from sec. 19: the four-card split of the tile loop; the GPU-vs-CPU
+   floor at P=576; the short kernels as program arguments; `tile_workspace` in
+   the planner; the `codec` division exposure for D3; a per-tile slab window;
+   coarse mesh placement.

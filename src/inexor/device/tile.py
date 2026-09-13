@@ -44,6 +44,16 @@ per tile at a 512^3 state (Vista 993754). The 4096^3 design supplies a streamed
 window here instead; the tile's bricks are not a contiguous slot range, so
 `device.paint.slab_window` does not apply as is.
 
+THE RESULTS ON THE DEVICE (`tile_loop_device`). Returning a tile's owned slots
+and codes to the host costs a readback of padded rows and two boolean-mask
+gathers over them: 62 + 214 ms of a 389 ms tile at P=576 (Vista 993817). The
+step-level loop instead writes each tile's codes and per-brick scales into the
+device state inside the same program, returns only scalars, and copies the
+state back to the host once, after every guard has been resolved and the
+ownership partition checked. Order cannot matter: a tile writes only rows it
+owns, and a later tile reads those rows only as buffer, whose velocities are
+decoded and never used.
+
 Nothing here is wired into `engine.step`.
 """
 
@@ -94,19 +104,25 @@ def tile_step_shapes(st, floor=None):
 
 
 def stage_state_on_device(st):
-    """The state arrays the jitted tile decodes against, placed on the device
-    once, for `tile_task_device(device_state=...)`. Blocks until placed."""
+    """The state arrays the jitted tile decodes against, COPIED onto the device
+    once, for `device_state=`. Blocks until placed.
+
+    A copy on every backend, never a view of the host arrays: `tile_loop_device`
+    donates `w` and `vel_scale` to its program, and a donated buffer that aliased
+    numpy memory would be overwritten under the host state.
+    """
     import jax
     import jax.numpy as jnp
 
-    return {k: jax.block_until_ready(jnp.asarray(getattr(st, k))) for k in STATE_FIELDS}
+    return {k: jax.block_until_ready(jnp.array(getattr(st, k), copy=True))
+            for k in STATE_FIELDS}
 
 
 def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
-                 coarse_cell, box, t9, with_forces=False):
+                 coarse_cell, box, t9, with_forces=False, write=False):
     key = (id(one_tile), cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
            float(coarse_cell), float(box), float(t9.quantum), int(t9.n_buckets_side),
-           bool(with_forces))
+           bool(with_forces), bool(write))
     fn = _KERNELS.get(key)
     if fn is not None:
         return fn
@@ -117,7 +133,7 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
     from .decode import decode_core
     from .kick import quantize_per_brick
 
-    def body(starts, occ, live_counts, arena_slots, row_offsets, bricks, off, w,
+    def tile(starts, occ, live_counts, arena_slots, row_offsets, bricks, off, w,
              vel_scale, arena_bucket, arena_base, n_rows, origin, tijk, o_cells,
              sub_x, sub_y, sub_z, alpha_k, bcoef, scale_div):
         _TRACES[0] += 1  # trace time only
@@ -138,14 +154,38 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
         v_new = alpha_k.astype(v.dtype) * v + bcoef.astype(g_tot.dtype) * g_tot
         q = quantize_per_brick(v_new, owned, bi, n_b, scale_div=scale_div)
         lo, hi, _ext, _assign = guard[0]
-        out = dict(slots=slots, owned=owned, n_out=n_out, n_own=jnp.sum(owned),
-                   w_codes=q["w_codes"], scales=q["scales"],
-                   counts=q["owned_counts"], lo=lo, hi=hi)
-        if with_forces:
-            out.update(g_short=g_short, g_long=g_long, v_new=v_new)
-        return out
+        return dict(slots=slots, owned=owned, n_out=n_out, n_own=jnp.sum(owned),
+                    w_codes=q["w_codes"], scales=q["scales"],
+                    counts=q["owned_counts"], lo=lo, hi=hi,
+                    g_short=g_short, g_long=g_long, v_new=v_new)
 
-    fn = jax.jit(body)
+    def body(*args):
+        out = tile(*args)
+        keep = ("slots", "owned", "n_out", "n_own", "w_codes", "scales", "counts", "lo", "hi")
+        if with_forces:
+            keep += ("g_short", "g_long", "v_new")
+        return {k: out[k] for k in keep}
+
+    def body_write(*args):
+        out = tile(*args)
+        w, vel_scale, bricks = args[7], args[8], args[5]
+        # codes: widen, subtract the stored code, mask to owned rows, narrow --
+        # the codec's modular rule (`codec.isub`). Adding that difference back
+        # gives the new code exactly, and a row this tile does not own (padding
+        # included, all at slot 0) adds exactly zero, so repeated indices cannot
+        # collide the way a scatter-SET would
+        slots, owned = out["slots"], out["owned"]
+        inc = jnp.where(owned[:, None],
+                        out["w_codes"].astype(jnp.int32) - w[slots].astype(jnp.int32), 0)
+        w_new = w.at[slots].add(inc.astype(w.dtype), mode="promise_in_bounds")
+        # scales: a set on the tile's own bricks (unique within a tile), keeping
+        # the stored scale where the tile owns no rows
+        keep_old = out["counts"] == 0
+        vs_new = vel_scale.at[bricks].set(
+            jnp.where(keep_old, vel_scale[bricks], out["scales"]), mode="promise_in_bounds")
+        return w_new, vs_new, {k: out[k] for k in ("n_own", "n_out", "lo", "hi")}
+
+    fn = jax.jit(body_write, donate_argnums=(7, 8)) if write else jax.jit(body)
     _KERNELS[key] = fn
     return fn
 
@@ -261,25 +301,34 @@ def _result(t, bricks, slots, owned, w_codes, scales, counts, n_own, n_out):
                 n_owned=int(n_own), n_out=int(n_out))
 
 
-def _tile_task_jit(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells,
-                   extent, shapes, with_forces=False, device_state=None, timings=None):
+def _clock(timings, accumulate=False):
+    """A phase marker: syncs on the arrays given and records the elapsed time
+    under a name, only when `timings` is a dict."""
     import jax
-    import jax.numpy as jnp
 
-    from ..eject_jax import require_x64
-    from ..forces import check_stencil_guard, stage_coarse_subblock
-
-    require_x64()
-    timed = timings is not None
     clock = [time.perf_counter()]
 
     def mark(name, *arrays):
-        if timed:
-            for a in arrays:
-                jax.block_until_ready(a)
-            now = time.perf_counter()
-            timings[name] = now - clock[0]
-            clock[0] = now
+        if timings is None:
+            return
+        for a in arrays:
+            jax.block_until_ready(a)
+        now = time.perf_counter()
+        dt = now - clock[0]
+        timings[name] = timings.get(name, 0.0) + dt if accumulate else dt
+        clock[0] = now
+
+    return mark
+
+
+def _jit_inputs(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells, extent,
+                shapes, with_forces, write, mark):
+    """(program, leading args, trailing args) for one tile; the state arrays go
+    between them. Host work and the per-tile upload, marked `stage` and
+    `h2d_tile`."""
+    import jax.numpy as jnp
+
+    from ..forces import stage_coarse_subblock
 
     nb = int(C["n_fine"]) // int(C["n_brick"])
     n_b = len(bricks)
@@ -295,7 +344,8 @@ def _tile_task_jit(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells,
         one_tile, cap=int(C["cap"]), n_b=n_b, p3=int(plan["p3"]),
         per=int(st.t9.n_buckets_side // nb), nb=nb, n_tile=int(C["n_tile"]),
         n_brick=int(C["n_brick"]), n_coarse=int(C["n_coarse"]),
-        coarse_cell=C["coarse_cell"], box=C["box"], t9=st.t9, with_forces=with_forces)
+        coarse_cell=C["coarse_cell"], box=C["box"], t9=st.t9, with_forces=with_forces,
+        write=write)
     sub = [stage_coarse_subblock(g, o_cells, extent) for g in g_coarse]
     mark("stage")
 
@@ -312,7 +362,20 @@ def _tile_task_jit(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells,
             jnp.asarray(C["bcoef"], dtype=jnp.float64),
             jnp.full((n_b,), 32767.0, dtype=jnp.float64)]
     mark("h2d_tile", *head, *tail)
+    return fn, head, tail
 
+
+def _tile_task_jit(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells,
+                   extent, shapes, with_forces=False, device_state=None, timings=None):
+    import jax.numpy as jnp
+
+    from ..eject_jax import require_x64
+    from ..forces import check_stencil_guard
+
+    require_x64()
+    mark = _clock(timings)
+    fn, head, tail = _jit_inputs(st, one_tile, C, g_coarse, t, bricks, plan, origin,
+                                 o_cells, extent, shapes, with_forces, False, mark)
     ds = device_state
     if ds is None:
         ds = {k: jnp.asarray(getattr(st, k)) for k in STATE_FIELDS}
@@ -336,3 +399,85 @@ def _tile_task_jit(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells,
     mark("result")
     res["busy"] = dict(decode=0.0, short=0.0, long=0.0, quant=0.0)
     return res
+
+
+def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
+                     device_state=None, write_host=True, timings=None):
+    """One step's tile loop on the device, writing the kick into the device state.
+
+    `members` maps tile -> bricks (`SlotState.tile_bricks`) and `tiles` selects
+    and orders them (default: every tile in `members`, which is then required to
+    partition the particles). Each tile's codes and per-brick scales are written
+    into `device_state` (default: a fresh `stage_state_on_device(st)`) inside
+    its compiled program, which donates the old `w` and `vel_scale`; the dict is
+    updated in place. Only scalars come back per tile.
+
+    After the loop, every tile's stencil guard is resolved and, for a full step,
+    the owned total checked against `st.n_particles` -- both BEFORE anything is
+    used. Then, if `write_host`, `st.w` and `st.vel_scale` are overwritten from
+    the device once.
+
+    Returns `n_owned`, `n_out`, `tiles_run` and `device_state`. `timings`, if a
+    dict, accumulates synced phase seconds over the loop (`plan`, `stage`,
+    `h2d_tile`, `compute`) plus `d2h_state` once.
+    """
+    import jax.numpy as jnp
+
+    from ..eject_jax import require_x64
+    from ..forces import (
+        COARSE_HALO,
+        check_stencil_guard,
+        coarse_subblock_origin_extent,
+        tile_origin_extent,
+    )
+    from .decode import tile_decode_plan
+
+    require_x64()
+    full_step = tiles is None
+    tiles = list(members) if full_step else list(tiles)
+    ds = stage_state_on_device(st) if device_state is None else device_state
+    mark = _clock(timings, accumulate=True)
+    cap = int(C["cap"])
+    los, his, extents, owns, outs = [], [], [], [], []
+    mark("h2d_state_once", *ds.values())
+    for t in tiles:
+        bricks = np.asarray(members[t], dtype=np.int64)
+        plan = tile_decode_plan(st, bricks)
+        m = int(plan["n_rows"])
+        if m == 0:
+            continue
+        if m > cap:
+            raise RuntimeError(f"tile {t}: {m} members > cap {cap}")
+        origin, _ = tile_origin_extent(t, C["n_tile"], C["b_real"], C["cell"])
+        o_cells, extent = coarse_subblock_origin_extent(
+            t, C["n_tile"], C["n_coarse"], C["n_fine"], halo=COARSE_HALO)
+        mark("plan")
+        fn, head, tail = _jit_inputs(st, one_tile, C, g_coarse, t, bricks, plan, origin,
+                                     o_cells, extent, shapes, False, True, mark)
+        w_new, vs_new, sc = fn(*head, ds["off"], ds["w"], ds["vel_scale"],
+                               ds["arena_bucket"], *tail)
+        ds["w"], ds["vel_scale"] = w_new, vs_new
+        mark("compute", w_new, vs_new, *sc.values())
+        los.append(sc["lo"])
+        his.append(sc["hi"])
+        extents.append(int(extent))
+        owns.append(sc["n_own"])
+        outs.append(sc["n_out"])
+
+    if los:
+        lo_h = np.asarray(jnp.stack(los))
+        hi_h = np.asarray(jnp.stack(his))
+        check_stencil_guard([(lo_h[i], hi_h[i], extents[i], "tsc") for i in range(len(los))])
+        n_owned = int(np.asarray(jnp.sum(jnp.stack(owns))))
+        n_out = int(np.asarray(jnp.sum(jnp.stack(outs))))
+    else:
+        n_owned = n_out = 0
+    if full_step and n_owned != st.n_particles:
+        raise AssertionError(
+            f"ownership is not a partition: {n_owned} rows owned across the step's "
+            f"tiles against {st.n_particles} particles; the host state was NOT written")
+    if write_host:
+        st.w[...] = np.asarray(ds["w"])
+        st.vel_scale[...] = np.asarray(ds["vel_scale"])
+        mark("d2h_state")
+    return dict(n_owned=n_owned, n_out=n_out, tiles_run=len(los), device_state=ds)

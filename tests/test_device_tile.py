@@ -259,6 +259,76 @@ def test_a_staged_state_and_timings_change_no_bit():
                                members[cfg.tiles[0]], device_state=ds)
 
 
+# ------------------------------------------------ the step loop, results on device
+
+
+def _host_apply_step(st, one_tile, C, g_coarse, members, shapes):
+    """The jitted tile with host results and `engine.apply_result`, every tile."""
+    n = 0
+    for t in members:
+        res = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t], jit=True,
+                                     shapes=shapes)
+        engine.apply_result(st, res)
+        n += res["n_owned"]
+    return n
+
+
+def test_a_device_step_writes_the_state_the_host_apply_path_writes():
+    """The whole step's codes and scales written on the device and copied back
+    once equal the jitted tile's host results applied tile by tile."""
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = dtile.tile_step_shapes(st)
+    st_h, st_d = copy.deepcopy(st), copy.deepcopy(st)
+    n_h = _host_apply_step(st_h, one_tile, C, g_coarse, members, shapes)
+    out = dtile.tile_loop_device(st_d, one_tile, C, g_coarse, members, shapes)
+    assert n_h == out["n_owned"] == st.n_particles
+    assert out["tiles_run"] == len(cfg.tiles)
+    assert not np.array_equal(st_h.w, st.w), "vacuous: the step wrote nothing"
+    assert np.array_equal(st_d.w, st_h.w), "velocity codes differ"
+    assert np.array_equal(st_d.vel_scale, st_h.vel_scale), "per-brick scales differ"
+
+
+def test_a_skipped_tile_leaves_its_rows_and_the_host_untouched():
+    """Anti-vacuity on the write: a tile left out keeps its stored codes and
+    scales, and the donated device buffers never alias the host state."""
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = dtile.tile_step_shapes(st)
+    st_d = copy.deepcopy(st)
+    skip = cfg.tiles[3]
+    w_before = st_d.w.copy()
+    vs_before = st_d.vel_scale.copy()
+    ds = dtile.stage_state_on_device(st_d)
+    out = dtile.tile_loop_device(st_d, one_tile, C, g_coarse, members, shapes,
+                                 tiles=[t for t in cfg.tiles if t != skip],
+                                 device_state=ds, write_host=False)
+    assert np.array_equal(st_d.w, w_before), "the donated program wrote into host memory"
+    assert out["n_owned"] < st.n_particles
+    w_dev, vs_dev = np.asarray(ds["w"]), np.asarray(ds["vel_scale"])
+    assert not np.array_equal(w_dev, w_before), "vacuous: nothing was written"
+
+    b = np.asarray(members[skip], dtype=np.int64)
+    slots, _x, _v = st.decode_bricks(b)
+    bor = np.repeat(b, [st.brick_member_count(x) for x in b])
+    nb = N_FINE // cfg.n_brick
+    own = forces.owned_mask_from_bricks(bor, skip, cfg.n_tile, cfg.n_brick, nb)
+    assert own.sum() > 0
+    assert np.array_equal(w_dev[slots[own]], w_before[slots[own]]), (
+        "a skipped tile's owned rows were written")
+    owned_bricks = np.unique(bor[own])
+    assert np.array_equal(vs_dev[owned_bricks], vs_before[owned_bricks])
+
+
+def test_a_partial_loop_refuses_to_pass_as_a_step():
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = dtile.tile_step_shapes(st)
+    st_d = copy.deepcopy(st)
+    w_before = st_d.w.copy()
+    part = {t: members[t] for t in cfg.tiles[:-1]}
+    with pytest.raises(AssertionError, match="not a partition"):
+        dtile.tile_loop_device(st_d, one_tile, C, g_coarse, part, shapes)
+    assert np.array_equal(st_d.w, w_before), "the host state was written before the check"
+
+
 def test_the_jit_floor_can_fail():
     """Anti-vacuity: coarse meshes moved by 1e-13 relative (~450 f64 eps) must
     exceed the floor."""
