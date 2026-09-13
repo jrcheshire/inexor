@@ -3,16 +3,16 @@
 #SBATCH -p gb
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 00:30:00
+#SBATCH -t 00:15:00
 #SBATCH -A JPL-SPHEREx
 #SBATCH -o d2e-tile-%j.log
-# TIME ASK: ~5 min of measured-rate phases plus the CPU cross-backend arm, whose
-# per-tile rate on Grace is UNMEASURED; wall is set once that is priced.
+# TIME ASK: ~5.5 min estimated, 15 min wall, one gb node, ~0.25 SU at most.
 #
 #   phase                     count  each (source)                          total
 #   smoke, 4 arms at 32^3       1    ~45 s (993600's smoke leg)            ~45 s
-#   xback-cpu, cdev             1    10 s start + 7.6 s build (993139)
-#                                    + 8 tiles x UNMEASURED CPU tile        ?
+#   xback-cpu, cdev             1    50.2 s whole arm, 13.7 GB peak RSS,
+#                                    MEASURED on the M4 laptop 2026-09-12
+#                                    (Grace's CPU rate is not measured)    ~50 s
 #   xback-gpu, cdev             1    10 s + 7.6 s + ~20 s compile (972737
 #                                    P=576: 21 s) + 8 tiles < 1 s          ~45 s
 #   short, P=576                1    10 s + 29.5 s build (993139) + 21 s
