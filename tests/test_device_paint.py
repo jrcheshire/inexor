@@ -69,7 +69,8 @@ def test_device_density_is_bitwise_the_host_streamed_density():
     st = _state(cfg, 2)
     want = engine.coarse_delta_streamed(st, cfg)
     s = {}
-    got = dpaint.coarse_delta_device(st, cfg, stats=s)
+    got = dpaint.coarse_delta_device(st, cfg, stats=s, jit=False)
+    assert s["coarse_device_jit"] is False
     L = dpaint.default_chunk_bricks(st.bricks_per_side)
     assert L == st.bricks_per_side**2 // 4, "the default is not a quarter-slab here"
     assert s["coarse_chunk_bricks"] == L, "the default chunk length did not apply"
@@ -87,9 +88,19 @@ def test_device_density_is_bitwise_WITH_arena_residents():
         "VACUOUS: no brick overflowed into the arena, so the arena rows of the "
         "window were never painted")
     want = engine.coarse_delta_streamed(st, cfg)
-    got = dpaint.coarse_delta_device(st, cfg)
+    got = dpaint.coarse_delta_device(st, cfg, jit=False)
     assert np.array_equal(got, want)
     _nontrivial(got)
+
+
+def test_the_default_is_the_jitted_paint():
+    """Adopted on the GB200 bitwise gate (Vista 993294); eager is `jit=False`."""
+    cfg = _cfg()
+    st = _state(cfg, 2)
+    s = {}
+    got = dpaint.coarse_delta_device(st, cfg, stats=s)
+    assert s["coarse_device_jit"] is True and s["coarse_jit_traces"] <= 1
+    assert np.array_equal(got, engine.coarse_delta_streamed(st, cfg))
 
 
 def test_a_chunk_block_is_bitwise_the_host_decode_and_paint():

@@ -702,6 +702,13 @@ By the rule pre-registered in the sbatch (the reading picks the chunk size),
 | 1/4 x-slab | 0.798 | 0.034 | 11.9 |
 | whole x-slab | 2.590 | 0.165 | 9.6 |
 
+**[CORRECTION, sec. 13] These chunks match 4096^3 chunks in ROWS, not in block
+shape.** `_chunk_cuboid` tiles a chunk by the brick grid, so at 4096^3 (256
+bricks per side) an x-slab chunk paints an 11 x 2048 x 2048 cell block, thin in
+x, while the test's whole x-slab (1024^3, 64 per side) paints 131 x 512 x 512.
+Memory follows rows and projects cleanly; chunk TIME may depend on the block's
+shape, so the per-step times below are arithmetic that assumes it does not.
+
 Warm (first) calls 5.2-7.7 s: eager per-op compilation, once per shape per
 process. Carried to a 4096^3 step, ONE card, serial: 958 / 817 / 663 s at
 1/16 / 1/4 / whole. **At the quarter-slab default that is ~204 s/step on four
@@ -736,3 +743,85 @@ included.
 3. Whether cuBLAS is on any device path (environment note).
 4. Where the coarse mesh lives (host vs sharded on cards): still open, and the
    accumulator seam is where either lands.
+
+## 13. D2d jit, Vista 993294 -- the jitted paint is bitwise on a GB200 and holds 4.3x less; it is the default
+
+`9556ffc`, 2026-09-12, gb node c672-016, one GB200 read, COMPLETED rc=0 in
+15:19, ~0.26 SU. Sbatch `v2_d2d_jit_paint_vista.sbatch`; cards
+`runs/v2/d2d_device_paint_{jit_gb,jitsmoke}.json` (force-added). Eager and jit
+arms at every chunk size in ONE job, each its own subprocess.
+
+**What was built** (`9556ffc`): `coarse_delta_device(jit=True)` compiles decode
++ containment + integer paint into one program per step. Chunk inputs are padded
+to fixed per-step shapes (`step_shapes`) and the sub-block origin is traced;
+`decode_rows` became an eager wrapper over a pure-jnp `decode_core`, and
+`paint_tsc_int_subblock` takes its origin as an int array.
+
+### Identity: PASS on every gate, so jit is adopted
+
+- The GPU's JITTED density hash-equals a CPU-only host engine at cdev (256^3),
+  plain and with 61,879 arena residents -- as does the GPU eager density, and
+  the CPU's own jitted density. The risk this gated was XLA fusing the TSC
+  weight arithmetic and moving a rounded integer weight; it did not, at tens of
+  millions of rows x 27 corners.
+- Every jitted chunk block (up to 268M rows) equals host `decode_bricks`
+  through the eager kernel. Each jit arm traced exactly once.
+
+**`coarse_delta_device` now defaults to `jit=True`**, per the sbatch's
+pre-registration; `jit=False` is the eager path and keeps its own tests.
+
+### Memory and time, same job and node
+
+| chunk rows (padded) | eager B/row | jit B/row | eager s/chunk | jit s/chunk | jit host prep |
+|---|---|---|---|---|---|
+| 16.8M (16.8M) | 293.0 | 72.1 | 0.216 | 0.038 | 0.019 |
+| 67.1M (84.6M) | 269.7 | 62.2 | 0.804 | 0.459 | 0.051 |
+| 268.4M (338.2M) | 266.0 | 62.2 | 2.707 | 1.829 | 0.243 |
+
+The eager arms reproduce sec. 12 on a different node (269.7 vs 264.8 and 266.0
+vs 266.2 B/row; 0.804 vs 0.798 and 2.707 vs 2.590 s). **Jit holds 4.3x less on
+the card**, and below the traced program's 121 B/row -- that reading has no
+operator fusion, so it is not a floor for the compiled program
+(`PAINT_CHUNK_TRACED_B_PER_ROW` is renamed in meaning, not value: it still gates
+program growth on the laptop). **The planner now charges jit's 72**
+(`PAINT_CHUNK_B_PER_ROW`; eager's 266 kept as `PAINT_CHUNK_EAGER_B_PER_ROW`).
+
+**At 4096^3, per card:**
+
+| chunk | eager | jit |
+|---|---|---|
+| whole x-slab | 1.15x, does not fit | 0.82x |
+| 1/4 x-slab (default) | 0.81x | 0.73x |
+| 1/16 x-slab | 0.72x | 0.70x |
+
+**Time, stated with its caveat.** Carried to a 4096^3 step on ONE card as
+chunks x s/chunk: jit 156 / 470 / 468 s at 1/16 / 1/4 / whole, eager 885 / 823 /
+693 s. On four cards that is ~120-160 s at the quarter-slab default (exact
+quarter vs D5's 2.9x) against the 1080 s bar. **None of this is measured at
+4096^3's block shape** (sec. 12 correction): the test blocks are thick in x
+(35-131 cells) where every 4096^3 chunk block is 11 cells thick.
+
+**UNEXPLAINED: jit's per-row time is not flat.** The device part of a chunk
+(total minus host prep) is 1.1 ns per padded row at 16.8M and 4.8 / 4.7 at
+84.6M / 338M, where eager's device part is 12.0 / 9.1 / 7.5. The two larger
+arms agree across two different states (512^3 and 1024^3) and a 4x difference
+in block size, so block size alone does not explain it; the 16.8M arm is the
+only one whose padded row count is a power of two (2^24), carrying 16 rows of
+padding against 26% at the other two. Not attributed. It matters because it decides the chunk size: taken at
+face value the 1/16 chunk is 3x faster per step.
+
+**The default chunk stays a quarter-slab** until the time is measured at the
+block shape 4096^3 actually paints.
+
+### Owed
+
+1. **Chunk time at 4096^3's block shape.** `_chunk_cuboid` only makes thin-in-x
+   blocks when a chunk is at most one brick plane thick, i.e. at `chunk_bricks
+   <= nb^2`. A 1024^3 state (64 bricks per side) gives thin blocks at 4096
+   (1 x 64 x 64 bricks = 16.8M rows) and 1024 bricks (4.2M), so the same
+   16.8M rows can be timed thin (1024^3) and thick (512^3, sec. 13 table) in
+   one job. Rows and shape cannot both match 4096^3 below 4096^3.
+2. **The 1/16 per-row anomaly**: pad at an exact power of two vs padded, same
+   rows, one job.
+3. Carried: the paint's own four-card split; cuBLAS on device paths (sec. 12);
+   where the coarse mesh lives.

@@ -11,10 +11,11 @@ THE UNIT IS A QUARTER OF AN X-SLAB OF BRICKS by default
 (`default_chunk_bricks`). The host path paints `cfg.chunk_bricks` (64) bricks at
 a time, which at 4096^3 is 262,144 chunks and so 262,144 device launches per
 step; a quarter-slab is 1,024. A whole x-slab (256 launches) was the first
-choice and does not fit a card: measured on a GB200 at 266 B per padded row
-(Vista 993139), it is 90 GB at 4096^3 and puts a card at 1.15x its memory,
-where a quarter-slab is 22.5 GB and 0.81x. Any chunk length whose bricks form a
-cuboid is accepted (`engine._chunk_cuboid`).
+choice and does not fit a card EAGER: at 266 B per padded row (Vista 993139) it
+is 90 GB at 4096^3, 1.15x a card. Jitted it is 62 B per row and fits; the
+default stays a quarter-slab until chunk time is measured at 4096^3's block
+shape (record sec. 13). Any chunk length whose bricks form a cuboid is accepted
+(`engine._chunk_cuboid`).
 
 BITWISE against the host paint, and it can be. Positions decode bitwise
 (`device.decode`), the paint kernel is the same `paint_tsc_int_subblock` with
@@ -28,8 +29,11 @@ step. For that the chunk's inputs are padded to fixed per-step shapes
 (`step_shapes`) -- the live slice, the arena rectangle and the arena rows -- and
 the sub-block origin is a traced value, so every chunk of a step reuses one
 executable. XLA is free to fuse the TSC weight arithmetic, which could move a
-rounded integer weight, so jit is OFF by default and adopted only on a bitwise
-gate against the eager path, on each backend.
+rounded integer weight, so jit was adopted only on a bitwise gate: on a GB200
+(Vista 993294) the jitted density hash-equals a CPU-only host engine at cdev,
+plain and with 61,879 arena residents, and every jitted chunk block up to 268M
+rows equals the host decode. It holds 62 B per padded row against eager's 266
+and is the DEFAULT; `jit=False` is the eager path.
 
 THE ACCUMULATOR IS A SEAM. Where the coarse mesh lives on a gb node is an open
 design question: the budget (`plan.DEVICE_PLACEMENT`) shards it across the
@@ -407,15 +411,16 @@ class HostInt64Accumulator:
 
 
 def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
-                        accumulator=None, census=False, jit=False, shape_floor=None):
+                        accumulator=None, census=False, jit=True, shape_floor=None):
     """delta on the coarse mesh, painted chunk by chunk on the device.
 
     Bitwise `engine.coarse_delta_streamed` at any `chunk_bricks` that tiles the
     brick grid into cuboids; the default is `default_chunk_bricks`. `pad_shape`
     carries the chunk row shape across steps as the host path does.
-    `accumulator` defaults to `HostInt64Accumulator`. `jit=True` compiles each
-    chunk as one program at fixed per-step shapes; `shape_floor` carries those
-    shapes from a previous step.
+    `accumulator` defaults to `HostInt64Accumulator`. `jit` (default True)
+    compiles each chunk as one program at fixed per-step shapes, and
+    `shape_floor` carries those shapes from a previous step; `jit=False` runs
+    the eager path.
 
     `stats`, if a dict, receives `coarse_pad`, `coarse_pad_true`,
     `coarse_peak_int`, `coarse_device_chunks` (the receipt that this path
