@@ -329,6 +329,40 @@ def test_a_partial_loop_refuses_to_pass_as_a_step():
     assert np.array_equal(st_d.w, w_before), "the host state was written before the check"
 
 
+# ------------------------------------------------ the coarse meshes on the device
+
+
+def test_a_device_coarse_shard_is_bitwise_host_staging_per_tile():
+    from inexor.device import coarse as dcoarse
+
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = dtile.tile_step_shapes(st)
+    sh = dcoarse.whole_mesh_shard(g_coarse)
+    for t in [cfg.tiles[0], cfg.tiles[len(cfg.tiles) // 2], cfg.tiles[-1]]:
+        host = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t], jit=True,
+                                      shapes=shapes)
+        dev = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t], jit=True,
+                                     shapes=shapes, coarse_shard=sh)
+        _same(dev, host)
+
+
+def test_a_device_coarse_shard_step_writes_the_host_staged_state():
+    from inexor.device import coarse as dcoarse
+
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = dtile.tile_step_shapes(st)
+    st_h, st_d = copy.deepcopy(st), copy.deepcopy(st)
+    dtile.tile_loop_device(st_h, one_tile, C, g_coarse, members, shapes)
+    sh = dcoarse.whole_mesh_shard(g_coarse)
+    # g_coarse deliberately zeroed for the sharded run: it must not be read
+    zeros = [np.zeros_like(g) for g in g_coarse]
+    out = dtile.tile_loop_device(st_d, one_tile, C, zeros, members, shapes, coarse_shard=sh)
+    assert out["n_owned"] == st.n_particles
+    assert not np.array_equal(st_h.w, st.w), "vacuous: the step wrote nothing"
+    assert np.array_equal(st_d.w, st_h.w), "velocity codes differ"
+    assert np.array_equal(st_d.vel_scale, st_h.vel_scale), "per-brick scales differ"
+
+
 def test_the_jit_floor_can_fail():
     """Anti-vacuity: coarse meshes moved by 1e-13 relative (~450 f64 eps) must
     exceed the floor."""
