@@ -1325,3 +1325,73 @@ readback 61, host result assembly 213 ms).
    P=576; the short kernels as program arguments; `tile_workspace` in the
    planner; `JIT_LONG_FORCE_EPS` on one state; the `codec` division exposure for
    D3; a per-tile slab window.
+
+## 22. Four-GPU split of the device tile loop, and host coarse staging at 2048^3, Vista 993849
+
+`166c1ec`, 2026-09-13, gb node c672-011, COMPLETED rc=0 in 5:44, ~0.1 SU.
+Submitted with `D2E_ARMS=split+stage`, bundled into one job at JC's direction;
+cards `runs/v2/d2e_device_tile_split_{gb,gbsmoke}.json` (force-added), log
+copied to `runs/v2/d2e-tile-993849.log`.
+
+### The tile loop scales 3.36x across four GB200s
+
+P=576 (cgh64, tile 512), `tile_loop_device` with results on the device and no
+copy-back, 30 timed steps per process after a warm step. One-GPU reference: all
+8 tiles on GPU 0. Four GPUs: one process per card, 2 tiles each, timed steps
+released together by a barrier. Each arm has its own reference in the same job.
+
+| | one GPU | four GPUs, combined | per card in the four | efficiency |
+|---|---|---|---|---|
+| pinned (`numactl`) | 12.48 tiles/s = 80.1 ms/tile | 41.99 tiles/s | 94.8-95.8 ms/tile | **3.36x** |
+| unpinned | 12.37 tiles/s = 80.9 ms/tile | 40.98 tiles/s | 94.9-99.7 ms/tile | **3.31x** |
+
+- **3.36x, where the coarse FFT's split was 2.8-3.0x (sec. 10).** Each card
+  runs its tiles ~19% slower beside three others than alone; which shared
+  resource that is (host prep threads, bus, memory bandwidth) is not attributed.
+- **Pinning is worth ~1.5%.** CPU binding is proven by the receipts: pinned
+  workers could run on exactly their card's socket (cores 0-71 for GPUs 0-1,
+  72-143 for GPUs 2-3), unpinned on all 144. **Memory binding is NOT proven**:
+  every worker, pinned or not, reports `Mems_allowed_list` `0-2,10,18,26`, which
+  is the cpuset and not `--membind`'s policy, so the receipt cannot see it.
+- **The single-GPU rate cross-checks sec. 21**: 80.1 ms/tile here with no
+  copy-back, against 993837's untimed step less its copy-back, (883 - 227) / 8
+  = 82 ms.
+- **At this throughput, 4096 tiles take 4096 / 41.99 = 97.5 s.** This is the
+  development path's tile loop only: it decodes against a whole 512^3 state
+  already on each card, where the 4096^3 design streams a window, and it
+  includes no copy-back, migrate or coarse solve. It is the first measured
+  replacement for 5y's projected 96.5 s tile force, which covered the short
+  force alone and assumed a perfect four-way split.
+
+### Host staging of the coarse sub-blocks does not slow at the real mesh size
+
+Three 2048^3 f32 meshes (103.1 GB, every page written in 5.9 s, pinned to
+socket 0; 1,722 GB available), 32 tile positions at 4096^3 geometry including
+wrapping corners, extent 132, three sub-blocks per tile:
+
+| mesh | per tile, median | p90 |
+|---|---|---|
+| 2048^3, pass 1 | **22.7 ms** | 22.9 ms |
+| 2048^3, pass 2 | 22.7 ms | 22.8 ms |
+| 256^3, same process | 24.6 ms | -- |
+
+- **The 2048^3 mesh is no slower than the 256^3 one (0.92x)**, and the first
+  pass is no slower than the second: the gather's cost is the ~27.6 MB it
+  delivers, not the size of the mesh it reads from. It reproduces sec. 21's
+  22.6 ms.
+- **For the coarse mesh placement decision**: keeping the mesh on the host costs
+  ~23 ms of host staging per tile, flat in mesh size, plus the sub-blocks' share
+  of the per-tile upload. That is ~28% of a tile's 80 ms on one card. The
+  device-side gather that card placement would use instead is still unmeasured,
+  and so is the paint accumulator's side of the decision (sec. 12).
+
+### Owed
+
+1. What the four-card slowdown (~19% per card) is spent on.
+2. Whether `--membind` applied (read the policy, e.g. `numa_maps`, not the
+   cpuset).
+3. The device-side sub-block gather's cost, for the coarse mesh placement
+   decision (JC's).
+4. Carried: the GPU-vs-CPU floor at P=576; the short kernels as program
+   arguments; `tile_workspace` in the planner; `JIT_LONG_FORCE_EPS` on one
+   state; the `codec` division exposure for D3; a per-tile slab window.
