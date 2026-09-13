@@ -896,3 +896,50 @@ gated by host allocation against the whole index
 2. Host prep re-measured after the index fix.
 3. Carried: the paint's four-card split; cuBLAS on device paths; where the
    coarse mesh lives.
+
+## 15. D2d dead rows, Vista 993600 -- the padding cost is the duplicated scatter index; spreading the dead rows removes it
+
+`dbb852b`, 2026-09-12, gb node c672-012, COMPLETED rc=0 in 3:54, ~0.1 SU.
+Sbatch `v2_d2d_dead_rows_vista.sbatch`; cards
+`runs/v2/d2d_device_paint_{dead_gb,deadsmoke}.json` (force-added). Five jitted
+arms on the 512^3 state, 4096-brick chunk (16.78M rows, block 35x256x256), one
+node, each its own subprocess. Device time = median of 3 chunk times minus the
+host window prep, as in sec. 14.
+
+| pad | dead rows | device s | ns / padded row | ns / real row | vs unpadded | B / padded row |
+|---|---|---|---|---|---|---|
+| +0.0% (2^24) | cell0 | 0.0190 | 1.13 | 1.13 | 1.00x | 72.1 |
+| +26.0% | cell0 | 0.0986 | 4.67 | 5.88 | 5.20x | 74.2 |
+| +26.0% | spread | 0.0219 | 1.04 | 1.31 | 1.15x | 71.0 |
+| +100% (2^25) | cell0 | 0.3533 | 10.53 | 21.06 | 18.6x | 113.5 |
+| +100% (2^25) | spread | 0.0255 | 0.76 | 1.52 | 1.34x | 69.5 |
+
+Every block equals host decode; every arm traced once.
+
+### What it establishes
+
+- **The pre-registered first reading fired.** Spreading the dead rows brings a
+  padded row to 0.76-1.04 ns, at or under the unpadded 1.13, so the cost was the
+  one heavily duplicated scatter index (every dead row into block cell 0 on all
+  27 corners). Spread is 4.5x faster than cell0 at 26% padding and 13.9x at 100%.
+- **The cell0 arms reproduce sec. 14**: 0.0190 / 0.0986 against 0.019 / 0.099;
+  at 100% 0.353 against 0.328, 1.08x, inside node spread.
+- **Memory moves too.** At 100% padding cell0 holds 113.5 B per padded row and
+  spread 69.5, back under the planner's 72. So sec. 14's "104-114 at 2x" was also
+  the duplicated index, not a property of padding.
+- Padding is not free under spread (1.34x the unpadded device time for twice the
+  rows), but a padded row now costs less than a real one.
+
+**Host window prep** read 0.0096-0.0097 s per arm against sec. 14's 0.019-0.020
+on the same 512^3 state and chunk, after the index fix (`bc7b43b`). Different
+node, and the 512^3 state is not where the fix bites; the 1024^3 re-read is
+still owed.
+
+### Owed
+
+1. **Make "spread" the default** in `painting.paint_tsc_int_subblock` and
+   `device.paint`, behind `test_spreading_the_dead_rows_moves_no_bit`.
+2. Chunk size under jit, re-read now that padding no longer penalizes it.
+3. Host prep at 1024^3 after the index fix.
+4. Carried: the paint's four-card split; cuBLAS on device paths; where the
+   coarse mesh lives.
