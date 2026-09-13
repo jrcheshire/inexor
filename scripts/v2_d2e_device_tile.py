@@ -137,6 +137,12 @@ def _short_inputs(st, C, t, bricks):
     return u, live, own & live
 
 
+def _xback_tiles(s, args):
+    """The cross-backend tiles: all of them, or the first `--xback-tiles`."""
+    tiles = list(s["ec"].tiles)
+    return tiles[: int(args.xback_tiles)] if args.xback_tiles else tiles
+
+
 def _floor(a, b):
     """max |a - b| in eps of a's dtype x rms(a), over float arrays of one dtype."""
     a64, b64 = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
@@ -160,7 +166,7 @@ def arm_xback_cpu(args):
     from inexor import engine
     from inexor.device import tile as dtile
 
-    g = _geometry(args.xback_preset)
+    g = _geometry(args.xback_preset, args.xback_tile, args.xback_buf)
     s = _setup(g, arena=True, fine=args.fine, coarse=args.coarse)
     st, C = s["st"], s["C"]
     if st.arena_used == 0:
@@ -171,7 +177,7 @@ def arm_xback_cpu(args):
                cap=s["cap"], arena_used=int(st.arena_used), build_s=s["build_s"],
                tiles=[])
     rc = 0
-    for i, t in enumerate(s["ec"].tiles):
+    for i, t in enumerate(_xback_tiles(s, args)):
         b = s["members"][t]
         host = engine.tile_task(st, s["one_tile"], C, s["g_coarse"], t, b)
         eager = dtile.tile_task_device(st, s["one_tile"], C, s["g_coarse"], t, b)
@@ -205,7 +211,7 @@ def arm_xback_gpu(args):
     from inexor.device import tile as dtile
 
     platform = _require_device(args.allow_cpu)
-    g = _geometry(args.xback_preset)
+    g = _geometry(args.xback_preset, args.xback_tile, args.xback_buf)
     s = _setup(g, arena=True, fine=args.fine, coarse=args.coarse)
     st, C = s["st"], s["C"]
     rec = dict(arm="xback-gpu", platform=platform, preset=args.xback_preset,
@@ -214,7 +220,7 @@ def arm_xback_gpu(args):
     rc = 0
     worst = dict(short_alone=0.0, g_short=0.0, g_long=0.0, v_new=0.0)
     codes_diff = codes_n = codes_max = 0
-    for i, t in enumerate(s["ec"].tiles):
+    for i, t in enumerate(_xback_tiles(s, args)):
         cpu = np.load(os.path.join(args.workdir, f"tile{i}.npz"))
         own = cpu["own"]
         gs = np.asarray(s["one_tile"](jnp.asarray(cpu["u"]), jnp.asarray(cpu["live"]),
@@ -388,7 +394,13 @@ def arm_loop(args):
     st, C = s["st"], s["C"]
     state_bytes = int(sum(getattr(st, k).nbytes for k in dtile.STATE_FIELDS))
     back_bytes = int(st.w.nbytes + st.vel_scale.nbytes)
-    _say(f"[loop] {args.tile_preset} tile {g['tile']} buf {g['buf']}: P={s['P']} "
+    shard = None
+    if args.coarse_device:
+        from inexor.device import coarse as dcoarse
+
+        shard = dcoarse.whole_mesh_shard(s["g_coarse"])
+    _say(f"[loop] coarse on {'device' if shard else 'host'}; "
+         f"{args.tile_preset} tile {g['tile']} buf {g['buf']}: P={s['P']} "
          f"cap={s['cap']:,}, {len(s['members'])} tiles; state {state_bytes / 1e9:.2f} GB "
          f"placed once, {back_bytes / 1e9:.2f} GB copied back per step; built "
          f"{s['build_s']:.1f}s on {platform}")
@@ -401,7 +413,8 @@ def arm_loop(args):
         tm = {} if tag == "timed" else None
         t0 = time.perf_counter()
         out = dtile.tile_loop_device(st, s["one_tile"], C, s["g_coarse"], s["members"],
-                                     s["shapes"], device_state=ds, timings=tm)
+                                     s["shapes"], device_state=ds, timings=tm,
+                                     coarse_shard=shard)
         wall = time.perf_counter() - t0
         n = out["tiles_run"]
         steps.append(dict(tag=tag, wall_s=wall, tiles=n, n_owned=out["n_owned"],
@@ -415,7 +428,8 @@ def arm_loop(args):
         _say(line + f"; owned {out['n_owned']:,} of {int(st.n_particles):,}; device peak "
              f"{(_mem('peak_bytes_in_use') or 0) / 1e9:.2f} GB")
     peak = _mem("peak_bytes_in_use")
-    rec = dict(arm="loop", platform=platform, preset=args.tile_preset, tile=g["tile"],
+    rec = dict(arm="loop", coarse="device" if shard else "host", platform=platform,
+               preset=args.tile_preset, tile=g["tile"],
                buf=g["buf"], P=s["P"], cap=s["cap"], max_rows=s["max_rows"],
                build_s=s["build_s"], state_bytes=state_bytes, copy_back_bytes=back_bytes,
                place_s=place_s, steps=steps, bytes_in_use_before=in_use0,
@@ -572,8 +586,125 @@ def arm_stage(args):
     return rec, 0
 
 
+def arm_dgather(args):
+    """One card's x-shard of the three coarse meshes at 4096^3 geometry, built
+    on the device from a formula of global cell coordinates; each tile's three
+    sub-blocks gathered by the compiled `device.coarse.subblock_device`, synced,
+    no readback, and every block checked against the formula. The host
+    placement's other cost -- uploading host-staged blocks -- timed beside it."""
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    import jax.numpy as jnp
+
+    from inexor.device.coarse import check_covers, subblock_device
+    from inexor.forces import COARSE_HALO, coarse_subblock_origin_extent
+
+    if args.ready:
+        open(args.ready, "w").close()
+    platform = _require_device(args.allow_cpu)
+    n = int(args.stage_n)
+    n_tile, n_fine = n // 4, 4 * n
+    side = n_fine // n_tile
+    x0, nx = -COARSE_HALO, n // 4 + 2 * COARSE_HALO  # a 4-way x split, halo planes
+    shard = dict(x0=x0, nx=nx, n=n)
+    in_use0 = _mem("bytes_in_use")
+
+    def build(c):
+        xg = (x0 + jnp.arange(nx, dtype=jnp.int32)) % n
+        ax = jnp.arange(n, dtype=jnp.int32)
+        yz = ax[:, None] * n + ax[None, :]
+        return (yz[None, :, :] + (c + 1) * xg[:, None, None]).astype(jnp.float32)
+
+    t0 = time.perf_counter()
+    meshes = tuple(jax.block_until_ready(jax.jit(build, static_argnums=0)(c)) for c in range(3))
+    build_s = time.perf_counter() - t0
+    rng = np.random.default_rng(5)
+    tiles = [(0, 0, 0), (3, side - 1, side - 1), (1, 0, side - 1)]
+    tiles += [(int(rng.integers(0, 4)), int(rng.integers(0, side)), int(rng.integers(0, side)))
+              for _ in range(int(args.stage_tiles) - 3)]
+    extent = int(coarse_subblock_origin_extent(tiles[0], n_tile, n, n_fine)[1])
+    fn = jax.jit(lambda ms, xa, o: subblock_device(ms, xa, n, o, extent))
+    x0a = jnp.asarray(x0, dtype=jnp.int64)
+
+    def expected(o, c):
+        r = np.arange(extent, dtype=np.int64)
+        xg, yi, zi = (o[0] + r) % n, (o[1] + r) % n, (o[2] + r) % n
+        return ((yi[:, None] * n + zi[None, :])[None, :, :]
+                + (c + 1) * xg[:, None, None]).astype(np.float32)
+
+    o_first = np.asarray(coarse_subblock_origin_extent(tiles[0], n_tile, n, n_fine)[0])
+    t0 = time.perf_counter()
+    jax.block_until_ready(fn(meshes, x0a, jnp.asarray(o_first, dtype=jnp.int64)))
+    compile_s = time.perf_counter() - t0
+    wrong = np.asarray(fn(meshes, jnp.asarray(x0 + 1, dtype=jnp.int64),
+                          jnp.asarray(o_first, dtype=jnp.int64))[0])
+    anti_vacuity = not np.array_equal(wrong, expected(o_first, 0))
+    gather_s, h2d_s, exact = [], [], True
+    for t in tiles:
+        o, e = coarse_subblock_origin_extent(t, n_tile, n, n_fine)
+        check_covers(shard, o, e)
+        oa = jax.block_until_ready(jnp.asarray(np.asarray(o), dtype=jnp.int64))
+        t0 = time.perf_counter()
+        blocks = jax.block_until_ready(fn(meshes, x0a, oa))
+        gather_s.append(time.perf_counter() - t0)
+        host_blocks = [expected(o, c) for c in range(3)]
+        exact &= all(np.array_equal(np.asarray(b), h) for b, h in zip(blocks, host_blocks))
+        t0 = time.perf_counter()
+        up = [jax.block_until_ready(jnp.asarray(h)) for h in host_blocks]
+        h2d_s.append(time.perf_counter() - t0)
+        del blocks, up
+    peak = _mem("peak_bytes_in_use")
+    shard_bytes = 3 * nx * n * n * 4
+    rec = dict(arm="dgather", platform=platform, n=n, shard_x0=x0, shard_nx=nx,
+               shard_bytes=shard_bytes, extent=extent, tiles=[list(t) for t in tiles],
+               build_s=build_s, compile_s=compile_s, gather_s=gather_s, h2d_s=h2d_s,
+               bitwise_vs_formula=bool(exact), anti_vacuity=bool(anti_vacuity),
+               bytes_in_use_before=in_use0, peak_bytes_in_use=peak)
+    for k in ("gather_s", "h2d_s"):
+        rec[k.replace("_s", "_median_ms")] = float(np.median(rec[k]) * 1e3)
+        rec[k.replace("_s", "_p90_ms")] = float(np.percentile(rec[k], 90) * 1e3)
+    if peak is not None and in_use0 is not None:
+        rec["peak_minus_baseline"] = peak - in_use0
+    _say(f"[dgather] shard {nx}x{n}x{n} x3 ({shard_bytes / 1e9:.1f} GB) built on {platform} "
+         f"in {build_s:.1f}s; compile {compile_s:.2f}s; {len(tiles)} tiles x 3 blocks of "
+         f"{extent}^3: device gather median {rec['gather_median_ms']:.2f} ms (p90 "
+         f"{rec['gather_p90_ms']:.2f}); host-staged upload {rec['h2d_median_ms']:.2f} ms (p90 "
+         f"{rec['h2d_p90_ms']:.2f}); every block == formula: {exact}; wrong offset "
+         f"differs: {anti_vacuity}; device peak over baseline "
+         f"{(rec.get('peak_minus_baseline') or 0) / 1e9:.1f} GB")
+    return rec, 0 if (exact and anti_vacuity) else 3
+
+
+def arm_numa(args):
+    """Where a touched 2 GB allocation's pages actually land, and under which
+    memory policy, read from /proc/self/numa_maps: the receipt that a
+    `numactl --membind` prefix applied (Mems_allowed shows the cpuset only)."""
+    if args.ready:
+        open(args.ready, "w").close()
+    a = np.ones(2 * 1024**3 // 8)
+    rec = dict(arm="numa", label=args.label, touched_bytes=int(a.nbytes))
+    try:
+        best = None
+        with open("/proc/self/numa_maps") as f:
+            for line in f:
+                parts = line.split()
+                pages = {p.split("=")[0]: int(p.split("=")[1]) for p in parts[2:]
+                         if p[0] == "N" and "=" in p and p[1:].split("=")[0].isdigit()}
+                total = sum(pages.values())
+                if best is None or total > best[0]:
+                    best = (total, parts[1], pages)
+        rec.update(largest_mapping_pages=best[0], largest_mapping_policy=best[1],
+                   largest_mapping_nodes=best[2])
+    except (OSError, TypeError) as exc:
+        rec["numa_maps"] = f"unavailable: {exc}"
+    _say(f"[numa {args.label}] {rec}")
+    return rec, 0
+
+
 ARMS = {"xback-cpu": arm_xback_cpu, "xback-gpu": arm_xback_gpu, "short": arm_short,
-        "tile": arm_tile, "loop": arm_loop, "split": arm_split, "stage": arm_stage}
+        "tile": arm_tile, "loop": arm_loop, "split": arm_split, "stage": arm_stage,
+        "dgather": arm_dgather, "numa": arm_numa}
 
 
 def _pin_prefix(socket, socket_cores):
@@ -673,7 +804,8 @@ def main(argv=None):
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--workdir", default=os.path.join(REPO, "runs", "v2", "_d2e_xback"))
     ap.add_argument("--arms", default="xback,short,tile",
-                    help="comma list of xback, short, tile, tile-staged, loop, split, stage")
+                    help="comma list of xback, xback576, short, tile, tile-staged, loop, "
+                         "loop-shard, dgather, numa, split, stage")
     ap.add_argument("--staged", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--part", default="0/1", help=argparse.SUPPRESS)
     ap.add_argument("--label", default="", help=argparse.SUPPRESS)
@@ -685,6 +817,11 @@ def main(argv=None):
                     help="socket of each GPU (gb: GPUs 0-1 on socket 0, 2-3 on 1)")
     ap.add_argument("--socket-cores", default="0-71,72-143",
                     help="core list per socket, for taskset if numactl is absent")
+    ap.add_argument("--xback-tile", type=int, default=None)
+    ap.add_argument("--xback-buf", type=int, default=None)
+    ap.add_argument("--xback-tiles", type=int, default=None,
+                    help="compare only the first N tiles across backends")
+    ap.add_argument("--coarse-device", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--stage-n", type=int, default=2048, help="coarse mesh side, stage arm")
     ap.add_argument("--stage-tiles", type=int, default=32)
     ap.add_argument("--allow-cpu", action="store_true")
@@ -722,22 +859,34 @@ def main(argv=None):
 
     worst = 0
     arms = args.arms.split(",")
-    if "xback" in arms:
-        res, rc = _run_worker(["--arm", "xback-cpu", *common], {"JAX_PLATFORMS": "cpu"},
+    if "xback" in arms or "xback576" in arms:
+        xcommon = list(common)
+        if "xback576" in arms and not args.smoke:
+            # the 4096^3 tile shape, and only the first few tiles: a CPU tile at
+            # P=576 is the expensive leg
+            xcommon += ["--xback-preset", "cgh64", "--xback-tile", "512", "--xback-buf", "32",
+                        "--xback-tiles", str(args.xback_tiles or 2)]
+        elif args.xback_tiles:
+            xcommon += ["--xback-tiles", str(args.xback_tiles)]
+        res, rc = _run_worker(["--arm", "xback-cpu", *xcommon], {"JAX_PLATFORMS": "cpu"},
                               "xback-cpu")
         card["arms"].append(res)
         write()
         worst = max(worst, rc)
         if rc == 0:
-            res, rc = _run_worker(["--arm", "xback-gpu", *common], {}, "xback-gpu")
+            res, rc = _run_worker(["--arm", "xback-gpu", *xcommon], {}, "xback-gpu")
             card["arms"].append(res)
             write()
             worst = max(worst, rc)
         else:
             _say("\nthe CPU arm failed or did not record; the GPU comparison is not run")
-    for name in ("short", "tile", "tile-staged", "loop"):
+    named = {"tile-staged": ["--arm", "tile", "--staged"],
+             "loop-shard": ["--arm", "loop", "--coarse-device"],
+             "dgather": ["--arm", "dgather", "--stage-n", str(args.stage_n),
+                         "--stage-tiles", str(args.stage_tiles)]}
+    for name in ("short", "tile", "tile-staged", "loop", "loop-shard", "dgather"):
         if name in arms:
-            argv = ["--arm", "tile", "--staged"] if name == "tile-staged" else ["--arm", name]
+            argv = named.get(name, ["--arm", name])
             res, rc = _run_worker([*argv, *common], {}, name)
             card["arms"].append(res)
             write()
@@ -770,6 +919,17 @@ def main(argv=None):
                 res["split_efficiency"] = r4 / r1
                 _say(f"--- {mode}: four devices {r4:.2f} tiles/s against one {r1:.2f} "
                      f"= {r4 / r1:.2f}x (method {method})")
+            write()
+            worst = max(worst, rc)
+    if "numa" in arms:
+        cores = args.socket_cores.split(",")
+        prefix1, method = _pin_prefix(1, cores)
+        card.setdefault("pinning_method", {})["numa"] = method
+        for label, prefix in (("bound-socket1", prefix1), ("default", [])):
+            res, rc = _run_group(f"numa-{label}", [(["--arm", "numa", "--label", label,
+                                                     *common], {"JAX_PLATFORMS": "cpu"},
+                                                    prefix)], args.workdir)
+            card["arms"].append(res)
             write()
             worst = max(worst, rc)
     if "stage2048" in arms or "stage" in arms:
