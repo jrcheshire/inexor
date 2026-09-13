@@ -101,6 +101,40 @@
 #   stage                      10 s + 103 GB page-writing fill (not
 #                              measured; ~10-20 s at 5-10 GB/s) + 64
 #                              tile stagings + the 256^3 reference       ~1 min
+# (993849 ran that: 5:44, ~0.1 SU. Record sec. 22.)
+#
+# COARSE-ON-DEVICE + BUNDLE RE-RUN, submitted with
+#   sbatch --export=ALL,D2E_ARMS=loop+loop-shard+dgather+numa+xback576,D2E_SUFFIX=_shard_gb
+# Bundled on JC's direction. Arms run in this order; each writes the card as it
+# finishes.
+#   loop, loop-shard  the P=576 step loop with the coarse mesh on the host
+#                     (staged per tile) and on the card (gathered in the tile
+#                     program), same node. QUESTION: what card placement saves
+#                     per tile.
+#   dgather           one card's 4096^3 coarse shard (516x2048x2048 x3, ~26 GB)
+#                     built on the device; each tile's three 132^3 blocks gathered
+#                     by the compiled subblock_device, checked against a formula,
+#                     beside the upload of host-staged blocks. QUESTION: the
+#                     device gather's cost at the real shard size.
+#   numa              page placement and policy of a touched 2 GB allocation,
+#                     under numactl bound to socket 1 and unbound. QUESTION:
+#                     whether --membind applied (owed from 993849).
+#   xback576, LAST    the GPU-vs-CPU floor at P=576 (cgh64 tile 512), first tile
+#                     only. UNPRICED: no CPU tile at P=576 has been timed; it
+#                     runs last so an overrun costs only this pair (JC's choice).
+# TIME ASK: ~5 min of priced arms, the rest of a 15 min wall for xback576,
+# one gb node, ~0.25 SU.
+#   phase                     each (source)                               total
+#   smoke, 7 processes at 32^3 ~10 s start each (laptop: 11.7 s total)   ~1.5 min
+#   loop                       10 s + 29 s build + 23 s compile + 3
+#                              steps (993837)                            ~75 s
+#   loop-shard                 the same, plus a 264^3 x3 shard placement ~75 s
+#   dgather                    10 s + three 8.7 GB device fills (not
+#                              measured) + 32 tiles x (gather, formula
+#                              check, 27.6 MB upload)                    ~45 s
+#   numa, two processes        10 s + a 2 GB touch each                  ~25 s
+#   xback576, 1 tile           CPU: 512^3 arena build + 4 CPU one_tile
+#                              calls at P=576, UNPRICED; GPU: ~70 s      rest of wall
 #
 # ENV copied verbatim from the D2d gb sbatch (v2_d2d_dead_rows_vista.sbatch).
 

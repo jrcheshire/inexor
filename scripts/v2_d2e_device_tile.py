@@ -859,13 +859,14 @@ def main(argv=None):
 
     worst = 0
     arms = args.arms.split(",")
-    if "xback" in arms or "xback576" in arms:
+    def xback_pair():
+        nonlocal worst
         xcommon = list(common)
         if "xback576" in arms and not args.smoke:
-            # the 4096^3 tile shape, and only the first few tiles: a CPU tile at
-            # P=576 is the expensive leg
+            # the 4096^3 tile shape, and only the first tile by default: a CPU
+            # tile at P=576 has never been priced
             xcommon += ["--xback-preset", "cgh64", "--xback-tile", "512", "--xback-buf", "32",
-                        "--xback-tiles", str(args.xback_tiles or 2)]
+                        "--xback-tiles", str(args.xback_tiles or 1)]
         elif args.xback_tiles:
             xcommon += ["--xback-tiles", str(args.xback_tiles)]
         res, rc = _run_worker(["--arm", "xback-cpu", *xcommon], {"JAX_PLATFORMS": "cpu"},
@@ -941,6 +942,10 @@ def main(argv=None):
         card["arms"].append(res)
         write()
         worst = max(worst, rc)
+    # LAST: the cross-backend pair's CPU arm is the job's one unpriced leg, so a
+    # long run there costs only this pair; every arm above has written its card
+    if "xback" in arms or "xback576" in arms:
+        xback_pair()
     card["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     write()
     _say(f"\ncard: {out}\nworst rc {worst}")
