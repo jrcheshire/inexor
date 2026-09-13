@@ -225,6 +225,12 @@ def arm_chunk(args):
     nb = st.bricks_per_side
     rows = int(dpaint.chunk_rows(st, L)[0])
     pad = int(capacity_shape(rows, rungs=ec.cap_rungs))
+    if args.pad:
+        # an INSTRUMENT: padding fraction and power-of-two-ness varied at fixed
+        # rows. Never an operating point.
+        if int(args.pad) < rows:
+            raise ValueError(f"--pad {args.pad} is below the chunk's {rows} rows")
+        pad = int(args.pad)
     bricks = np.arange(0, L, dtype=np.int64)
     frac = rows / (N_4096 / NB_4096)
     jit = bool(args.jit)
@@ -268,6 +274,8 @@ def arm_chunk(args):
     equal = bool(np.array_equal(ref, s)) and int(np.abs(ref).sum()) > 0
 
     rec = dict(arm="chunk", platform=platform, jit=jit, jit_traces=traces,
+               pad_override=bool(args.pad), pad_is_pow2=bool(pad & (pad - 1) == 0),
+               block_extent=[int(e) for e in extent],
                jit_shapes=shapes, n_part=g["n_part"], chunk_bricks=L,
                bricks_per_side=nb, rows=rows, pad=pad, frac_of_4096_xslab=frac,
                build_s=build_s, warm_s=times[0], rep_s=times[1:], window_s=window_s,
@@ -326,12 +334,14 @@ def main(argv=None):
     ap.add_argument("--n-part", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--chunk-bricks", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--jit", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--pad", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--host-hashes", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--xback-n", type=int, default=256,
                     help="particles per side for the cross-backend arms (cdev: 256)")
     ap.add_argument("--chunks", default="512:4096,512:16384,1024:65536",
-                    help="n_part:chunk_bricks[:eager|jit] list for the chunk arms, "
-                         "smallest first (mode defaults to eager)")
+                    help="n_part:chunk_bricks[:eager|jit[:pad]] list for the chunk "
+                         "arms (mode defaults to eager; pad overrides the padded "
+                         "row count, an instrument)")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--allow-cpu", action="store_true")
     ap.add_argument("--smoke", action="store_true",
@@ -389,9 +399,10 @@ def main(argv=None):
         mode = parts[2] if len(parts) > 2 else "eager"
         if mode not in ("eager", "jit"):
             raise ValueError(f"chunk spec {spec!r}: mode must be eager or jit")
+        pad_arg = ["--pad", parts[3]] if len(parts) > 3 else []
         res, rc = _run_worker(["--arm", "chunk", "--n-part", str(n_part),
                                "--chunk-bricks", str(L), *common,
-                               *(["--jit"] if mode == "jit" else [])], {},
+                               *(["--jit"] if mode == "jit" else []), *pad_arg], {},
                               f"chunk {spec}")
         card["arms"].append(res)
         write()
