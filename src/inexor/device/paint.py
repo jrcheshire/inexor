@@ -290,7 +290,7 @@ def check_containment(guard_out):
 
 
 def _chunk_kernel(*, cap, lift, p3, per, nb, arena_base, extent, n_coarse, box,
-                  frac_bits, t9, dead_rows="cell0"):
+                  frac_bits, t9, dead_rows="spread"):
     """The jitted decode + containment + paint for one set of static parameters."""
     key = (cap, lift, p3, per, nb, arena_base, tuple(int(e) for e in extent),
            n_coarse, float(box), frac_bits, float(t9.quantum), int(t9.n_buckets_side),
@@ -325,7 +325,7 @@ def _chunk_kernel(*, cap, lift, p3, per, nb, arena_base, extent, n_coarse, box,
 
 
 def paint_chunk(st, bricks, chunk_index, chunk_len, cfg, pad, guard_out, jit=False,
-                shapes=None, dead_rows="cell0"):
+                shapes=None, dead_rows="spread"):
     """(sub, origin, extent) for one chunk, or None when it holds no rows.
 
     `sub` is the int32 sub-block, still on the device. Its containment bounds
@@ -361,7 +361,7 @@ def paint_chunk(st, bricks, chunk_index, chunk_len, cfg, pad, guard_out, jit=Fal
 
 
 def _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out,
-                     dead_rows="cell0"):
+                     dead_rows="spread"):
     import jax.numpy as jnp
 
     from ..eject_jax import require_x64
@@ -416,7 +416,7 @@ class HostInt64Accumulator:
 
 def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
                         accumulator=None, census=False, jit=True, shape_floor=None,
-                        dead_rows="cell0"):
+                        dead_rows="spread"):
     """delta on the coarse mesh, painted chunk by chunk on the device.
 
     Bitwise `engine.coarse_delta_streamed` at any `chunk_bricks` that tiles the

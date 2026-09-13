@@ -315,7 +315,7 @@ def paint_tsc_int(positions, n_mesh, box_size, frac_bits=12, live=None):
 
 
 def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
-                           frac_bits=12, live=None, dead_rows="cell0"):
+                           frac_bits=12, live=None, dead_rows="spread"):
     """Integer TSC paint into a coarse SUB-BLOCK. Returns the raw int32 block.
 
     The paint-side twin of `forces.gather_coarse_subblock`, carrying the same
@@ -334,8 +334,8 @@ def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
     `origin/extent` from the chunk's brick cuboid (stencil bound: base can
     round up to the cell AT the cuboid's upper edge, corners reach one
     further, so extent = span + 3) and asserts containment per chunk in
-    numpy before calling. Masked pad rows are routed to cell 0 with a
-    quantized weight of exactly zero -- in bounds and bitwise inert.
+    numpy before calling. Masked pad rows scatter a quantized weight of
+    exactly zero to an in-bounds cell -- bitwise inert (see `dead_rows`).
 
     An axis whose extent equals `n_mesh` is the degenerate full-axis case
     (origin 0), which the engine uses whenever span + 3 would exceed the
@@ -347,12 +347,12 @@ def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
     int32, the dtype the stencil base already has, so the index arithmetic is
     the same int32 arithmetic whichever form the caller passes.
 
-    `dead_rows` says where masked rows scatter their zero weight: "cell0" (every
-    one into block cell 0) or "spread" (row i into cell i mod the block size).
-    Adding zero anywhere is a no-op, so the block is bitwise the same either
-    way; the switch exists because on a GB200 a padded row costs far more than
-    a real one (Vista 993350), and one heavily duplicated scatter index is the
-    suspect.
+    `dead_rows` says where masked rows scatter their zero weight: "spread" (the
+    default; row i into cell i mod the block size) or "cell0" (every one into
+    block cell 0). Adding zero anywhere is a no-op, so the block is bitwise the
+    same either way. On a GB200 the one heavily duplicated index of "cell0"
+    makes a padded row cost ~4-10x a real one and holds more card memory at
+    large padding; "spread" removes both (Vista 993600).
     """
     scale = np.float32(2.0**frac_bits)
     N = int(n_mesh)

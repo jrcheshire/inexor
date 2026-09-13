@@ -215,11 +215,13 @@ PAINT_CHUNK_EAGER_B_PER_ROW = 266
 PAINT_WINDOW_B_PER_ROW = 0
 # THE TRACED READING: bytes alive at once under last-use freeing in the traced
 # program, with no operator fusion, differenced over two padded row counts
-# (121 B/row; positions + TSC weights alone are 96). It is NOT a floor for the
+# (125 B/row; positions + TSC weights alone are 96). It is NOT a floor for the
 # compiled program: XLA fuses and reuses buffers, and measured 62 on the card.
 # `tests/test_device_paint.py` re-traces the program and fails if it ever
-# exceeds this, which catches program growth without a card.
-PAINT_CHUNK_TRACED_B_PER_ROW = 121
+# exceeds this, which catches program growth without a card. 121 before the
+# dead rows were spread by default; the +4 is that int32 per-row index, and
+# the card read 69.5-71.0 B/row with it (Vista 993600).
+PAINT_CHUNK_TRACED_B_PER_ROW = 125
 # a chunk's rows are padded on `forces.capacity_shape`'s ladder, whose padding
 # is derived at <= 26.0%
 PAINT_PAD_BOUND = 1.26

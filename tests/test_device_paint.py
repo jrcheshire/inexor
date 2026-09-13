@@ -291,15 +291,18 @@ def test_one_compilation_serves_every_chunk_of_a_step():
 def test_spreading_the_dead_rows_moves_no_bit(jit):
     """Padded rows scatter a zero weight; WHERE they scatter it cannot matter.
     On a jitted run the spread kernel must also be a distinct program, which is
-    the receipt that the switch reached the compiled paint."""
+    the receipt that the switch reached the compiled paint. "spread" is the
+    default, so the second call names nothing."""
     cfg = _cfg()
     st = _state(cfg, 4, arena=True)
     s0, s1 = {}, {}
-    a = dpaint.coarse_delta_device(st, cfg, stats=s0, jit=jit)
-    b = dpaint.coarse_delta_device(st, cfg, stats=s1, jit=jit, dead_rows="spread")
+    dpaint._KERNELS.clear()  # an earlier test may already hold either program
+    a = dpaint.coarse_delta_device(st, cfg, stats=s0, jit=jit, dead_rows="cell0")
+    b = dpaint.coarse_delta_device(st, cfg, stats=s1, jit=jit)
     assert s1["coarse_pad"] > s1["coarse_pad_true"], "vacuous: no padded rows"
     assert s0["coarse_dead_rows"] == "cell0" and s1["coarse_dead_rows"] == "spread"
     if jit:
+        assert s0["coarse_jit_traces"] == 1
         assert s1["coarse_jit_traces"] == 1, "the spread kernel reused the cell-0 program"
     assert np.array_equal(a, b)
 

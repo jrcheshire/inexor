@@ -937,8 +937,15 @@ still owed.
 
 ### Owed
 
-1. **Make "spread" the default** in `painting.paint_tsc_int_subblock` and
-   `device.paint`, behind `test_spreading_the_dead_rows_moves_no_bit`.
+1. ~~Make "spread" the default~~ DONE: `painting.paint_tsc_int_subblock` and
+   every `device.paint` entry point default to "spread", behind
+   `test_spreading_the_dead_rows_moves_no_bit`. The host engine's paint takes
+   the same default; its output is bitwise unchanged, and its CPU time under
+   "spread" is not measured at a production row count (sec. 14 saw 5-9% at 4M
+   rows on the laptop). The traced per-row reading rises 121 -> 125 B/row, the
+   int32 per-row dead index exactly (traced both ways on one chunk), and
+   `PAINT_CHUNK_TRACED_B_PER_ROW` moves with it; the card rate the planner
+   charges is unaffected (69.5-71.0 above).
 2. Chunk size under jit, re-read now that padding no longer penalizes it.
 3. Host prep at 1024^3 after the index fix.
 4. Carried: the paint's four-card split; cuBLAS on device paths; where the
