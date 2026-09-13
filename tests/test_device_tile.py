@@ -238,6 +238,27 @@ def test_a_jitted_step_is_one_program_within_the_floor():
     assert dtile._TRACES[0] - t0 == 1, "new kick coefficients retraced the program"
 
 
+def test_a_staged_state_and_timings_change_no_bit():
+    """The state placed on the device once, and the timed (synced) call, return
+    exactly what the plain jitted call returns; every phase is timed."""
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = dtile.tile_step_shapes(st)
+    ds = dtile.stage_state_on_device(st)
+    for t in (cfg.tiles[0], cfg.tiles[-1]):
+        plain = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t], jit=True,
+                                       shapes=shapes)
+        tm = {}
+        staged = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t], jit=True,
+                                        shapes=shapes, device_state=ds, timings=tm)
+        _same(staged, plain)
+        assert set(tm) == {"plan", "stage", "h2d_tile", "h2d_state", "compute", "d2h",
+                           "result"}
+        assert all(v >= 0.0 for v in tm.values())
+    with pytest.raises(ValueError, match="jitted path only"):
+        dtile.tile_task_device(st, one_tile, C, g_coarse, cfg.tiles[0],
+                               members[cfg.tiles[0]], device_state=ds)
+
+
 def test_the_jit_floor_can_fail():
     """Anti-vacuity: coarse meshes moved by 1e-13 relative (~450 f64 eps) must
     exceed the floor."""

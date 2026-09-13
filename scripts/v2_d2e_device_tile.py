@@ -267,27 +267,40 @@ def arm_short(args):
          f"cap={s['cap']:,} (max tile rows {s['max_rows']:,}); built {s['build_s']:.1f}s "
          f"on {platform}")
     in_use0 = _mem("bytes_in_use")
-    times = []
+    times, phases = [], []
     for rep, t in enumerate(tiles):
         u, live, own = _short_inputs(st, C, t, s["members"][t])
-        ua, la, oa = jnp.asarray(u), jnp.asarray(live), jnp.asarray(own)
         t0 = time.perf_counter()
+        ua = jax.block_until_ready(jnp.asarray(u))
+        la = jax.block_until_ready(jnp.asarray(live))
+        oa = jax.block_until_ready(jnp.asarray(own))
+        t1 = time.perf_counter()
         out = s["one_tile"](ua, la, oa)
+        jax.block_until_ready(out)
+        t2 = time.perf_counter()
         np.asarray(out[0])
-        dt = time.perf_counter() - t0
-        times.append(dt)
-        _say(f"[short]   {'warm' if rep == 0 else f'rep {rep}'} tile {t}: {dt:.4f}s  "
+        t3 = time.perf_counter()
+        ph = dict(h2d=t1 - t0, compute=t2 - t1, d2h=t3 - t2)
+        phases.append(ph)
+        times.append(t3 - t1)
+        _say(f"[short]   {'warm' if rep == 0 else f'rep {rep}'} tile {t}: h2d "
+             f"{ph['h2d']:.4f}s compute {ph['compute']:.4f}s d2h {ph['d2h']:.4f}s  "
              f"device peak {(_mem('peak_bytes_in_use') or 0) / 1e9:.2f} GB")
         del out, ua, la, oa
     peak = _mem("peak_bytes_in_use")
     rec = dict(arm="short", platform=platform, preset=args.tile_preset, tile=g["tile"],
                buf=g["buf"], P=s["P"], cap=s["cap"], max_rows=s["max_rows"],
-               build_s=s["build_s"], warm_s=times[0], rep_s=times[1:],
-               bytes_in_use_before=in_use0, peak_bytes_in_use=peak)
+               build_s=s["build_s"], warm_s=times[0], rep_s=times[1:], phases=phases,
+               bytes_in_use_before=in_use0, peak_bytes_in_use=peak,
+               readback_bytes=int(s["cap"]) * 3 * np.dtype(s["ec"].np_fine_dtype).itemsize)
     if peak is not None and in_use0 is not None:
         rec["peak_minus_baseline"] = peak - in_use0
-    reps = times[1:] or times
-    _say(f"[short]   median {np.median(reps) * 1e3:.1f} ms/tile (device force + readback)")
+    reps = phases[1:] or phases
+    med = {k: float(np.median([p[k] for p in reps])) for k in reps[0]}
+    rec["median_phases"] = med
+    _say(f"[short]   median ms/tile: compute {med['compute'] * 1e3:.1f}, readback of "
+         f"{rec['readback_bytes'] / 1e6:.0f} MB {med['d2h'] * 1e3:.1f}, input upload "
+         f"{med['h2d'] * 1e3:.1f}")
     return rec, 0
 
 
@@ -297,57 +310,66 @@ def arm_tile(args):
     jax.config.update("jax_enable_x64", True)
 
     from inexor.device import tile as dtile
-    from inexor.device.decode import tile_decode_plan
-    from inexor.forces import (
-        COARSE_HALO,
-        coarse_subblock_origin_extent,
-        stage_coarse_subblock,
-    )
 
     platform = _require_device(args.allow_cpu)
     g = _geometry(args.tile_preset, args.tile, args.buf)
     s = _setup(g, arena=False)
     st, C = s["st"], s["C"]
-    upload = int(st.off.nbytes + st.w.nbytes + st.vel_scale.nbytes + st.arena_bucket.nbytes)
+    upload = int(sum(getattr(st, k).nbytes for k in dtile.STATE_FIELDS))
     tiles = s["ec"].tiles[: int(args.reps) + 1]
-    _say(f"[tile] {args.tile_preset} tile {g['tile']} buf {g['buf']}: P={s['P']} "
-         f"cap={s['cap']:,}; state arrays uploaded per call {upload / 1e9:.2f} GB; "
+    mode = "staged" if args.staged else "plain"
+    _say(f"[tile:{mode}] {args.tile_preset} tile {g['tile']} buf {g['buf']}: P={s['P']} "
+         f"cap={s['cap']:,}; state arrays {upload / 1e9:.2f} GB "
+         f"{'placed on the device once' if args.staged else 'uploaded every call'}; "
          f"built {s['build_s']:.1f}s on {platform}")
     in_use0 = _mem("bytes_in_use")
-    times, preps, owned = [], [], []
+    ds, stage_s = None, None
+    if args.staged:
+        t0 = time.perf_counter()
+        ds = dtile.stage_state_on_device(st)
+        stage_s = time.perf_counter() - t0
+        _say(f"[tile:{mode}]   state placed in {stage_s:.3f}s")
+    # the untimed call first: its wall is the production call's, with no syncs
+    # inserted; the timed calls then attribute it
+    walls, phases, owned = [], [], []
     for rep, t in enumerate(tiles):
         b = s["members"][t]
         t0 = time.perf_counter()
-        tile_decode_plan(st, np.asarray(b, dtype=np.int64))
-        o_cells, extent = coarse_subblock_origin_extent(t, C["n_tile"], C["n_coarse"],
-                                                        C["n_fine"], halo=COARSE_HALO)
-        for gc in s["g_coarse"]:
-            stage_coarse_subblock(gc, o_cells, extent)
-        prep = time.perf_counter() - t0
-        t0 = time.perf_counter()
         res = dtile.tile_task_device(st, s["one_tile"], C, s["g_coarse"], t, b, jit=True,
-                                     shapes=s["shapes"])
-        dt = time.perf_counter() - t0
-        times.append(dt)
-        preps.append(prep)
+                                     shapes=s["shapes"], device_state=ds)
+        walls.append(time.perf_counter() - t0)
+        tm = {}
+        t0 = time.perf_counter()
+        dtile.tile_task_device(st, s["one_tile"], C, s["g_coarse"], t, b, jit=True,
+                               shapes=s["shapes"], device_state=ds, timings=tm)
+        tm["total"] = time.perf_counter() - t0
+        phases.append(tm)
         owned.append(int(res["n_owned"]))
-        _say(f"[tile]   {'warm' if rep == 0 else f'rep {rep}'} tile {t}: {dt:.3f}s "
-             f"(host prep {prep:.3f}s of it); {res['n_owned']:,} owned; device peak "
-             f"{(_mem('peak_bytes_in_use') or 0) / 1e9:.2f} GB")
+        _say(f"[tile:{mode}]   {'warm' if rep == 0 else f'rep {rep}'} tile {t}: untimed "
+             f"{walls[-1]:.3f}s | timed {tm['total']:.3f}s = "
+             + " ".join(f"{k} {tm[k]:.3f}" for k in ("plan", "stage", "h2d_tile",
+                                                     "h2d_state", "compute", "d2h",
+                                                     "result"))
+             + f"; device peak {(_mem('peak_bytes_in_use') or 0) / 1e9:.2f} GB")
     peak = _mem("peak_bytes_in_use")
-    rec = dict(arm="tile", platform=platform, preset=args.tile_preset, tile=g["tile"],
-               buf=g["buf"], P=s["P"], cap=s["cap"], max_rows=s["max_rows"],
-               build_s=s["build_s"], warm_s=times[0], rep_s=times[1:], prep_s=preps,
-               n_owned=owned, upload_bytes=upload, bytes_in_use_before=in_use0,
-               peak_bytes_in_use=peak, traces=dtile._TRACES[0])
+    rec = dict(arm="tile", mode=mode, platform=platform, preset=args.tile_preset,
+               tile=g["tile"], buf=g["buf"], P=s["P"], cap=s["cap"], max_rows=s["max_rows"],
+               build_s=s["build_s"], state_place_s=stage_s, warm_s=walls[0],
+               rep_s=walls[1:], phases=phases, n_owned=owned, upload_bytes=upload,
+               bytes_in_use_before=in_use0, peak_bytes_in_use=peak,
+               traces=dtile._TRACES[0])
+    reps = phases[1:] or phases
+    med = {k: float(np.median([p[k] for p in reps])) for k in reps[0]}
+    rec["median_phases"] = med
     if peak is not None and in_use0 is not None:
         rec["peak_minus_baseline"] = peak - in_use0
         rec["peak_minus_upload"] = peak - in_use0 - upload
-        _say(f"[tile]   peak over baseline {(peak - in_use0) / 1e9:.2f} GB, of which "
-             f"state upload {upload / 1e9:.2f} GB; per padded row excluding the upload "
+        _say(f"[tile:{mode}]   peak over baseline {(peak - in_use0) / 1e9:.2f} GB, of "
+             f"which state arrays {upload / 1e9:.2f} GB; per padded row excluding them "
              f"{(peak - in_use0 - upload) / s['cap']:.0f} B")
-    reps = times[1:] or times
-    _say(f"[tile]   median {np.median(reps):.3f}s/tile; traces {dtile._TRACES[0]}")
+    _say(f"[tile:{mode}]   median untimed {np.median(walls[1:] or walls):.3f}s/tile; "
+         "median timed phases: " + " ".join(f"{k} {v:.3f}" for k, v in med.items())
+         + f"; traces {dtile._TRACES[0]}")
     return rec, 0
 
 
@@ -390,7 +412,9 @@ def main(argv=None):
     ap.add_argument("--buf", type=int, default=32)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--workdir", default=os.path.join(REPO, "runs", "v2", "_d2e_xback"))
-    ap.add_argument("--arms", default="xback,short,tile")
+    ap.add_argument("--arms", default="xback,short,tile",
+                    help="comma list of xback, short, tile, tile-staged")
+    ap.add_argument("--staged", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--allow-cpu", action="store_true")
     ap.add_argument("--smoke", action="store_true",
                     help="smoke geometry everywhere, CPU allowed: exercises the apparatus only")
@@ -439,9 +463,10 @@ def main(argv=None):
             worst = max(worst, rc)
         else:
             _say("\nthe CPU arm failed or did not record; the GPU comparison is not run")
-    for name in ("short", "tile"):
+    for name in ("short", "tile", "tile-staged"):
         if name in arms:
-            res, rc = _run_worker(["--arm", name, *common], {}, name)
+            argv = ["--arm", "tile", "--staged"] if name == "tile-staged" else ["--arm", name]
+            res, rc = _run_worker([*argv, *common], {}, name)
             card["arms"].append(res)
             write()
             worst = max(worst, rc)

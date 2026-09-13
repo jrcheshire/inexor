@@ -37,9 +37,14 @@ dtype), and the quantize's scale divisor is passed in: a divisor built inside
 the program folds back to a scalar, which CPU XLA computes as a reciprocal
 multiply (record sec. 16).
 
-SCOPE. Decodes against the whole `off` / `w` arrays; the tile's bricks are not a
-contiguous slot range, so `device.paint.slab_window` does not apply. Nothing
-here is wired into `engine.step`.
+THE STATE ON THE DEVICE (`device_state=`). The jitted path decodes against the
+whole `off` / `w` / `vel_scale` / `arena_bucket`. Unless the caller passes them
+already on the device (`stage_state_on_device`), every call uploads them: 1.58 GB
+per tile at a 512^3 state (Vista 993754). The 4096^3 design supplies a streamed
+window here instead; the tile's bricks are not a contiguous slot range, so
+`device.paint.slab_window` does not apply as is.
+
+Nothing here is wired into `engine.step`.
 """
 
 from __future__ import annotations
@@ -52,6 +57,8 @@ import numpy as np
 # traces: the receipt that one executable served every tile.
 _KERNELS = {}
 _TRACES = [0]
+
+STATE_FIELDS = ("off", "w", "vel_scale", "arena_bucket")
 
 
 def owned_rows_device(brick_of_row, tijk, n_tile, n_brick, nb):
@@ -84,6 +91,15 @@ def tile_step_shapes(st, floor=None):
     return dict(arena_rect=int(capacity_shape(
         max(int(_arena_per_brick(st).max()), 1),
         floor_shape=int(floor.get("arena_rect", 0)))))
+
+
+def stage_state_on_device(st):
+    """The state arrays the jitted tile decodes against, placed on the device
+    once, for `tile_task_device(device_state=...)`. Blocks until placed."""
+    import jax
+    import jax.numpy as jnp
+
+    return {k: jax.block_until_ready(jnp.asarray(getattr(st, k))) for k in STATE_FIELDS}
 
 
 def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
@@ -135,7 +151,7 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
 
 
 def tile_task_device(st, one_tile, C, g_coarse, t, bricks, jit=False, shapes=None,
-                     with_forces=False):
+                     with_forces=False, device_state=None, timings=None):
     """One tile of the kick on the device; the `engine.tile_task` contract.
 
     `C` is `engine.step`'s per-step header and `g_coarse` its three coarse
@@ -144,6 +160,14 @@ def tile_task_device(st, one_tile, C, g_coarse, t, bricks, jit=False, shapes=Non
 
     `with_forces=True` adds `forces`: `g_short`, `g_long` and `v_new` at the
     owned rows, in row order. A gate instrument; it costs a readback.
+
+    `device_state` (jit only) is `stage_state_on_device(st)`; without it every
+    call uploads the state arrays.
+
+    `timings`, if a dict (jit only), receives per-phase seconds, each phase
+    ended by a device sync: `plan`, `stage` (host), `h2d_tile`, `h2d_state`,
+    `compute`, `d2h`, `result` (host). The syncs are taken only when it is
+    passed, so the timed call is not the production call's scheduling.
 
     JIT IS NOT BITWISE THE EAGER PATH, and is accepted on a tolerance (record
     sec. 17): the compiled coarse gather differs by roundoff, a few eps of the
@@ -179,8 +203,12 @@ def tile_task_device(st, one_tile, C, g_coarse, t, bricks, jit=False, shapes=Non
     if jit:
         if shapes is None:
             raise ValueError("jit=True needs the step's fixed shapes (tile_step_shapes)")
+        if timings is not None:
+            timings["plan"] = time.perf_counter() - t_dec
         return _tile_task_jit(st, one_tile, C, g_coarse, t, bricks, plan, origin,
-                              o_cells, extent, shapes, t_dec, with_forces)
+                              o_cells, extent, shapes, with_forces, device_state, timings)
+    if device_state is not None or timings is not None:
+        raise ValueError("device_state and timings apply to the jitted path only")
 
     dec = decode_rows(plan, st.off, st.w, st.vel_scale, st.arena_bucket,
                       st.arena_base, st.t9, nb, cap)
@@ -234,13 +262,25 @@ def _result(t, bricks, slots, owned, w_codes, scales, counts, n_own, n_out):
 
 
 def _tile_task_jit(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells,
-                   extent, shapes, t_dec, with_forces=False):
+                   extent, shapes, with_forces=False, device_state=None, timings=None):
+    import jax
     import jax.numpy as jnp
 
     from ..eject_jax import require_x64
     from ..forces import check_stencil_guard, stage_coarse_subblock
 
     require_x64()
+    timed = timings is not None
+    clock = [time.perf_counter()]
+
+    def mark(name, *arrays):
+        if timed:
+            for a in arrays:
+                jax.block_until_ready(a)
+            now = time.perf_counter()
+            timings[name] = now - clock[0]
+            clock[0] = now
+
     nb = int(C["n_fine"]) // int(C["n_brick"])
     n_b = len(bricks)
     R = int(shapes["arena_rect"])
@@ -251,38 +291,48 @@ def _tile_task_jit(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells,
             f"brick > the step's arena_rect {R}; rebuild shapes with tile_step_shapes")
     rect = np.full((n_b, R), -1, dtype=np.int64)
     rect[:, : min(a.shape[1], R)] = a[:, :R]
-
     fn = _tile_kernel(
         one_tile, cap=int(C["cap"]), n_b=n_b, p3=int(plan["p3"]),
         per=int(st.t9.n_buckets_side // nb), nb=nb, n_tile=int(C["n_tile"]),
         n_brick=int(C["n_brick"]), n_coarse=int(C["n_coarse"]),
         coarse_cell=C["coarse_cell"], box=C["box"], t9=st.t9, with_forces=with_forces)
     sub = [stage_coarse_subblock(g, o_cells, extent) for g in g_coarse]
-    t_short = time.perf_counter()
-    out = fn(
-        jnp.asarray(plan["starts"]), jnp.asarray(plan["occ"]),
-        jnp.asarray(plan["live_counts"]), jnp.asarray(rect),
-        jnp.asarray(plan["row_offsets"]), jnp.asarray(bricks),
-        jnp.asarray(st.off), jnp.asarray(st.w), jnp.asarray(st.vel_scale),
-        jnp.asarray(st.arena_bucket), jnp.asarray(int(st.arena_base), dtype=jnp.int64),
-        jnp.asarray(int(plan["n_rows"]), dtype=jnp.int64),
-        jnp.asarray(origin, dtype=jnp.float64),
-        jnp.asarray(np.asarray(t, dtype=np.int64)),
-        jnp.asarray(np.asarray(o_cells), dtype=jnp.int32),
-        *(jnp.asarray(s) for s in sub),
-        jnp.asarray(C["alpha_k"], dtype=jnp.float64),
-        jnp.asarray(C["bcoef"], dtype=jnp.float64),
-        jnp.full((n_b,), 32767.0, dtype=jnp.float64),
-    )
-    n_own = int(out["n_own"])
+    mark("stage")
+
+    head = [jnp.asarray(plan["starts"]), jnp.asarray(plan["occ"]),
+            jnp.asarray(plan["live_counts"]), jnp.asarray(rect),
+            jnp.asarray(plan["row_offsets"]), jnp.asarray(bricks)]
+    tail = [jnp.asarray(int(st.arena_base), dtype=jnp.int64),
+            jnp.asarray(int(plan["n_rows"]), dtype=jnp.int64),
+            jnp.asarray(origin, dtype=jnp.float64),
+            jnp.asarray(np.asarray(t, dtype=np.int64)),
+            jnp.asarray(np.asarray(o_cells), dtype=jnp.int32),
+            *(jnp.asarray(s) for s in sub),
+            jnp.asarray(C["alpha_k"], dtype=jnp.float64),
+            jnp.asarray(C["bcoef"], dtype=jnp.float64),
+            jnp.full((n_b,), 32767.0, dtype=jnp.float64)]
+    mark("h2d_tile", *head, *tail)
+
+    ds = device_state
+    if ds is None:
+        ds = {k: jnp.asarray(getattr(st, k)) for k in STATE_FIELDS}
+    mark("h2d_state", *ds.values())
+
+    out = fn(*head, ds["off"], ds["w"], ds["vel_scale"], ds["arena_bucket"], *tail)
+    mark("compute", *out.values())
+
+    host = {k: np.asarray(v) for k, v in out.items()}
+    mark("d2h")
+
+    n_own = int(host["n_own"])
     if n_own == 0:
-        return dict(t=t, empty=True, n_owned=0, n_out=int(out["n_out"]))
-    check_stencil_guard([(out["lo"], out["hi"], int(extent), "tsc")])
-    res = _result(t, bricks, np.asarray(out["slots"]), np.asarray(out["owned"]),
-                  np.asarray(out["w_codes"]), np.asarray(out["scales"]),
-                  np.asarray(out["counts"]), n_own, int(out["n_out"]))
+        return dict(t=t, empty=True, n_owned=0, n_out=int(host["n_out"]))
+    check_stencil_guard([(host["lo"], host["hi"], int(extent), "tsc")])
+    res = _result(t, bricks, host["slots"], host["owned"], host["w_codes"],
+                  host["scales"], host["counts"], n_own, int(host["n_out"]))
     if with_forces:
-        res["forces"] = _forces(out["owned"], out["g_short"], out["g_long"], out["v_new"])
-    t_end = time.perf_counter()
-    res["busy"] = dict(decode=0.0, short=t_end - t_short, long=0.0, quant=0.0)
+        res["forces"] = _forces(host["owned"], host["g_short"], host["g_long"],
+                                host["v_new"])
+    mark("result")
+    res["busy"] = dict(decode=0.0, short=0.0, long=0.0, quant=0.0)
     return res

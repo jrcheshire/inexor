@@ -3,7 +3,7 @@
 #SBATCH -p gb
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 00:15:00
+#SBATCH -t 00:10:00
 #SBATCH -A JPL-SPHEREx
 #SBATCH -o d2e-tile-%j.log
 # TIME ASK: ~5.5 min estimated, 15 min wall, one gb node, ~0.25 SU at most.
@@ -34,6 +34,29 @@
 #      device time and peak.
 #
 # NO BAR is applied to question 1; the card is the floor a bar is set from.
+# (993754 ran that: 5:15, ~0.1 SU. Record sec. 18.)
+#
+# ATTRIBUTION RE-RUN, submitted with
+#   sbatch --export=ALL,D2E_ARMS=short+tile+tile-staged,D2E_SUFFIX=_attr_gb
+# (`+` separates arms: --export itself splits on commas)
+# ONE QUESTION: where do the jitted tile's 566 ms go at P=576 (993754)? Every
+# phase ended by a device sync, in one job on one node:
+#   short        one_tile alone: input upload / compute / readback of the
+#                cap x 3 f64 forces.
+#   tile         the path 993754 timed (state arrays uploaded every call): an
+#                untimed call (the reference wall), then a timed call split
+#                into plan / stage (host) / h2d_tile / h2d_state / compute /
+#                d2h / result (host).
+#   tile-staged  the same with the state placed on the device once.
+# TIME ASK: ~4.5 min estimated, 10 min wall, one gb node, ~0.2 SU at most.
+#   phase                 each (source: 993754's arms)                    total
+#   smoke, 5 arms at 32^3  ~55 s (993754 smoke, one arm more)            ~55 s
+#   short                  10 s start + 28.7 s build + 20.4 s compile
+#                          + 4 tiles x ~6 s host decode of inputs        ~83 s
+#   tile                   10 s + 28.9 s + 22.8 s compile + 4 tiles x 2
+#                          calls x 0.57 s                                ~67 s
+#   tile-staged            the same, less the per-call upload, plus one
+#                          1.58 GB placement                             ~67 s
 #
 # ENV copied verbatim from the D2d gb sbatch (v2_d2d_dead_rows_vista.sbatch).
 
@@ -52,6 +75,12 @@ echo "=== $(hostname): commit $(git rev-parse --short HEAD), job $SLURM_JOB_ID =
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || echo "no nvidia-smi"
 
 WORK="$SCRATCH/inexor_runs/d2e_xback_$SLURM_JOB_ID"
+# which arms run and the card's suffix; 993754 ran the defaults
+# (xback,short,tile -> _gb). Override at submit: sbatch --export=ALL,D2E_ARMS=a+b,D2E_SUFFIX=...
+D2E_ARMS="${D2E_ARMS:-xback,short,tile}"
+D2E_ARMS="${D2E_ARMS//+/,}"
+D2E_SUFFIX="${D2E_SUFFIX:-_gb}"
+echo "arms: $D2E_ARMS  card suffix: $D2E_SUFFIX"
 rc_total=0
 run_leg () {
   local name="$1"; shift
@@ -64,7 +93,7 @@ run_leg () {
 
 run_leg smoke \
   pixi run -e gpu python scripts/v2_d2e_device_tile.py --smoke \
-    --workdir "$WORK/smoke" --out-suffix _smoke
+    --arms xback,short,tile,tile-staged --workdir "$WORK/smoke" --out-suffix "${D2E_SUFFIX}smoke"
 if [ $rc_total -ne 0 ]; then
   echo "FATAL: smoke failed, not spending the node on the long arms"
   exit 1
@@ -72,7 +101,7 @@ fi
 
 run_leg d2e \
   pixi run -e gpu python scripts/v2_d2e_device_tile.py --workdir "$WORK/cdev" \
-    --out-suffix _gb
+    --arms "$D2E_ARMS" --out-suffix "$D2E_SUFFIX"
 
 echo ""
 echo "=== rc_total=$rc_total ==="
