@@ -1591,10 +1591,119 @@ Spectra bitwise equal. Getting the density to the host for the second leg took
 
 ### Owed
 
-1. A warm-started forward pair (both legs warmed, alternated) if the pass 1
-   saving is ever needed as a number rather than a direction.
+1. [DONE, sec. 25] A warm-started forward pair (both legs warmed, alternated).
+   It reads a 0.50 s pass 1 saving, SMALLER than the 1.25 s above: the cold
+   reading overstated the saving rather than bounding it from below.
 2. Carried: the cross-backend tolerance for the tile (JC); the four-card ~19%
    per-card tile slowdown; the tile loop's split under threads rather than
    processes; the short kernels as program arguments; `tile_workspace` in the
    planner; the `codec` division exposure for D3; a per-tile slab window; the
    inverse transforms still read and write host slabs.
+
+## 25. D2f bundle, Vista 994675 -- one thread per card splits the tile loop 3.6-3.8x, as processes do; the paint splits 2.2-2.3x; the warm forward saves 0.5 s from the cards
+
+`dfd5bfa`, 2026-09-13, gb node c672-015, COMPLETED rc=0 in 13:13. Sbatch
+`v2_d2f_bundle_vista.sbatch`, bundled at JC's direction; cards
+`runs/v2/d2e_device_tile_d2f_{threads_gb,bundle_smoke}.json` and
+`runs/v2/d2d_device_paint_d2f_bundle_{gb,smoke}.json`, log copied to
+`runs/v2/d2f-bundle-994675.log`. Every arm its own process; both smoke legs
+passed on the GPUs first.
+
+### The tile loop split: threads against processes (cgh64, tile 512, P=576, coarse on the cards, unpinned, 30 steps)
+
+`split-threads` runs one process with one thread per card (`tile_loop_device(device=)`,
+`dfd5bfa`); `split` runs one process per card (`CUDA_VISIBLE_DEVICES`). Each arm
+takes its own one-card reference in the same shape. The threads arm ran before
+AND after the process legs.
+
+| | one card, tiles/s | four cards, summed tiles/s | split, summed | split, by the slowest card |
+|---|---|---|---|---|
+| threads, before | 13.03 | 47.03 (per card 11.64-11.96) | **3.61x** | 3.57x |
+| processes | 12.89 | 47.87 (per card 11.83-12.09) | **3.71x** | -- |
+| threads, after | 12.97 | 48.80 (per card 12.07-12.32) | **3.76x** | 3.72x |
+
+- **Pre-registered criterion: threads and processes more than ~1.3x apart means
+  the GIL is the variable. They are 0.98x and 1.02x apart**, straddling the
+  processes reading, and the before/after drift (3.61 -> 3.76) is larger than
+  either gap. **The GIL is not the variable; one process with a thread per card
+  is admissible for the executor** (the D5 criterion).
+- **4096 tiles cost ~84-88 s** on the development path (48.8 summed, 46.5 by the
+  slowest card), against sec. 22's 97.5 s.
+- **Per card, four-wide is 5-10% below a lone card** (11.6-12.3 against
+  12.9-13.0), where sec. 22 read ~19%. The two jobs differ in where the coarse
+  meshes live (sec. 22 staged them from the host per tile, a host pass four
+  processes share) and in pinning; this job ran no host-staged four-wide leg, so
+  the placement is a candidate for the difference, not its measured cause.
+- Steady per-step walls are flat over 30 steps: 0.619-0.622 s for 8 tiles on one
+  card; 0.165-0.170 s for 2 tiles per card four-wide.
+- **Compilation.** Each process compiles the 4.60 GB tile program (23 s on one
+  card) and the persistent cache refuses it (`GpuExecutableProto` > 2 GiB), so no
+  run reuses it. Under threads, cards 1-3 compiled concurrently in 29.7-31.0 s
+  each; card 0 reused the reference leg's in-process executable (2.8-2.9 s). A
+  one-time cost per run, not per step.
+- The 32^3 smoke split read 1.39-2.04x: tiles of that size are overhead, not a
+  reading of the split.
+
+### The coarse paint across four cards (`coarse_delta_cards`, one thread per card, n_part=1024, 64 bricks/side)
+
+State built in 243.6 s. Medians of three after one warm call per width.
+
+| chunk | rows per chunk (padded to) | chunks | one card | four cards | split |
+|---|---|---|---|---|---|
+| 16384 bricks | 67,109,413 (84,551,871) | 16, 4 per card | 2.00 s | 0.90 s | **2.23x** |
+| 1024 bricks | 4,194,760 (5,284,492) | 256, 64 per card | 2.27 s | 1.00 s | **2.28x** |
+
+- **Density hash-equal between one and four cards at both chunk sizes.**
+- **The paint does not divide by four.** Any paint term priced by dividing a
+  one-card time by four is ~1.75x optimistic. This arm records no phase
+  breakdown, so the shortfall is NOT attributed; host-side per-chunk work shared
+  by the four threads is the leading candidate, as it was for the transform
+  (sec. 10's 2.8-3.0x), and it is a candidate only.
+- The 16x smaller chunk is 13% slower on one card and splits the same.
+- Device peak 6.20 GB on card 0, 5.29 GB on cards 1-3.
+
+### 4096^3 shard shapes, repeated (four cards)
+
+| phase | 994608 (sec. 24) | 994675 |
+|---|---|---|
+| allocate four accumulators | 0.88 s | 0.87 s |
+| one add, median | 1.05 ms | **1.07 ms** |
+| all 1024 adds | 0.43 s | 0.41 s |
+| ghost fold, 12 planes | 0.97 s | 0.89 s |
+| decode | 1.51 s | 1.42 s |
+| device peak per card | 25.90 GB | 25.90 GB |
+
+Mass exact (11,880,366,080), sampled planes bitwise numpy's decode (an overlap
+cell among them). **Accumulate + fold + decode reproduces at ~2.7 s per step.**
+
+### The forward transform, warmed and ABBA
+
+Each leg warmed once, then cards-host-host-cards; medians of the two reps.
+
+| | from the cards | from host slabs |
+|---|---|---|
+| warm call | 5.81 s | 5.74 s |
+| pass 1 | **2.15 s** | 2.65 s |
+| pass 2 | 3.10 s | 3.10 s |
+| forward | **5.25 s** | 5.75 s |
+
+Spectra bitwise. Density to the host for the second leg: 4.64 s.
+
+- **Reading from the cards saves 0.50 s, all of it in pass 1**; pass 2 is the
+  same host-resident work in both legs to 5 ms.
+- **This corrects sec. 24**, which called its 1.25 s pass 1 saving a lower bound.
+  Warm, the saving is 0.50 s: the cold single calls (9.15 / 10.00 s) carried ~4 s
+  of first-call cost each, unevenly. The host leg's 5.75 s is also below sec. 10's
+  6.86 s, so the "10.00 above 6.86" gap sec. 24 left unattributed was the cold
+  start.
+- At step level the card design still skips the density's host copy (4.64 s
+  here) and the inbound planes.
+
+### Owed
+
+1. The paint's four-card shortfall, attributed by phase, if a step projection
+   needs the paint term to better than the measured 2.2-2.3x.
+2. Carried: the cross-backend tolerance for the tile (JC); the short kernels as
+   program arguments (the 4.60 GB executables, which also defeat the persistent
+   cache); `tile_workspace` in the planner; the `codec` division exposure; a
+   per-tile slab window; the inverse transforms still read and write host slabs.

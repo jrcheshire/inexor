@@ -1,0 +1,329 @@
+{
+ "argv": [
+  "scripts/v2_d2d_device_paint.py",
+  "--smoke",
+  "--skip-xback",
+  "--paint-n-part",
+  "1024",
+  "--scale",
+  "--out-suffix",
+  "_d2f_bundle_smoke"
+ ],
+ "started": "2026-09-13T17:37:53",
+ "job": "994675",
+ "node": "c672-015.vista.tacc.utexas.edu",
+ "commit": "dfd5bfa",
+ "arms": [
+  {
+   "arm": "chunk 32:64:eager",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": false,
+    "jit_traces": 0,
+    "pad_override": false,
+    "pad_is_pow2": false,
+    "dead_rows": "cell0",
+    "block_extent": [
+     5,
+     16,
+     16
+    ],
+    "jit_shapes": null,
+    "n_part": 32,
+    "chunk_bricks": 64,
+    "bricks_per_side": 8,
+    "rows": 4099,
+    "pad": 5161,
+    "frac_of_4096_xslab": 1.5269964933395386e-05,
+    "build_s": 0.0067922070156782866,
+    "warm_s": 4.059727690008003,
+    "rep_s": [
+     0.21857419097796082
+    ],
+    "window_s": 0.00018339301459491253,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 1473024,
+    "peak_minus_baseline": 1473024,
+    "b_per_padded_row": 285.41445456306917,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 0.001473024,
+    "planner_4096_gb": 0.000371592
+   }
+  },
+  {
+   "arm": "chunk 32:64:jit",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": false,
+    "pad_is_pow2": false,
+    "dead_rows": "cell0",
+    "block_extent": [
+     5,
+     16,
+     16
+    ],
+    "jit_shapes": {
+     "pad": 5161,
+     "live_w": 5161,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 32,
+    "chunk_bricks": 64,
+    "bricks_per_side": 8,
+    "rows": 4099,
+    "pad": 5161,
+    "frac_of_4096_xslab": 1.5269964933395386e-05,
+    "build_s": 0.006720718985889107,
+    "warm_s": 0.5612703270162456,
+    "rep_s": [
+     0.0034651279565878212
+    ],
+    "window_s": 0.0001737929997034371,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 241152,
+    "peak_minus_baseline": 241152,
+    "b_per_padded_row": 46.72582832784344,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 0.00024115199999999998,
+    "planner_4096_gb": 0.000371592
+   }
+  },
+  {
+   "arm": "cards-paint",
+   "rc": 0,
+   "record": {
+    "arm": "cards-paint",
+    "platform": "gpu",
+    "n_part": 32,
+    "bricks_per_side": 8,
+    "build_s": 0.00679534295341,
+    "chunks": {
+     "16": {
+      "chunk_bricks": 16,
+      "rows_per_chunk": 1038,
+      "pad": 1291,
+      "chunks": 32,
+      "card_chunks": [
+       8,
+       8,
+       8,
+       8
+      ],
+      "warm_s": {
+       "1": 2.4296859520254657,
+       "4": 2.232631072984077
+      },
+      "times_s": {
+       "1": [
+        0.09215816104551777,
+        0.08480355201754719,
+        0.08270364301279187
+       ],
+       "4": [
+        0.07483008998678997,
+        0.06771922495681792,
+        0.06752930500078946
+       ]
+      },
+      "median_1_s": 0.08480355201754719,
+      "median_4_s": 0.06771922495681792,
+      "split": 1.2522817866214995,
+      "density_equal_across_widths": true,
+      "device_peaks": [
+       131840,
+       107264,
+       107264,
+       107264
+      ]
+     },
+     "64": {
+      "chunk_bricks": 64,
+      "rows_per_chunk": 4118,
+      "pad": 5161,
+      "chunks": 8,
+      "card_chunks": [
+       2,
+       2,
+       2,
+       2
+      ],
+      "warm_s": {
+       "1": 0.8431265820399858,
+       "4": 0.6442933949874714
+      },
+      "times_s": {
+       "1": [
+        0.028100478986743838,
+        0.02529327297816053,
+        0.025076376972720027
+       ],
+       "4": [
+        0.03253559401491657,
+        0.031349574972409755,
+        0.03108429501298815
+       ]
+      },
+      "median_1_s": 0.02529327297816053,
+      "median_4_s": 0.031349574972409755,
+      "split": 0.8068139041891549,
+      "density_equal_across_widths": true,
+      "device_peaks": [
+       296960,
+       261120,
+       261120,
+       261120
+      ]
+     }
+    }
+   }
+  },
+  {
+   "arm": "cards-scale",
+   "rc": 0,
+   "record": {
+    "arm": "cards-scale",
+    "platform": "gpu",
+    "n_coarse": 16,
+    "bricks_per_side": 8,
+    "cards": 4,
+    "ranges": [
+     [
+      0,
+      4
+     ],
+     [
+      4,
+      8
+     ],
+     [
+      8,
+      12
+     ],
+     [
+      12,
+      16
+     ]
+    ],
+    "chunk_bricks": 16,
+    "block_extent": [
+     5,
+     7,
+     16
+    ],
+    "accumulator_bytes": [
+     14336,
+     14336,
+     14336,
+     14336
+    ],
+    "alloc_s": 0.3887717289617285,
+    "add_wall_s": 0.10296551295323297,
+    "per_card": [
+     {
+      "chunks": 8,
+      "first_add_s": 0.09292261098744348,
+      "card_s": 0.10147734999191016,
+      "add_median_ms": 1.1520349653437734
+     },
+     {
+      "chunks": 8,
+      "first_add_s": 0.0908538699732162,
+      "card_s": 0.09995341103058308,
+      "add_median_ms": 1.2218909687362611
+     },
+     {
+      "chunks": 8,
+      "first_add_s": 0.09072682895930484,
+      "card_s": 0.09953497699461877,
+      "add_median_ms": 1.1490260367281735
+     },
+     {
+      "chunks": 8,
+      "first_add_s": 0.0855431379750371,
+      "card_s": 0.09454943001037464,
+      "add_median_ms": 1.2742109829559922
+     }
+    ],
+    "fold_s": 0.6825948579935357,
+    "ghost_planes_nonzero": 12,
+    "mass": 17920,
+    "want_mass": 17920,
+    "mass_exact": true,
+    "decode_s": 0.7266929419711232,
+    "peak_int": 6,
+    "decode_bitwise_numpy": true,
+    "device_peaks": [
+     24576,
+     24576,
+     24576,
+     24576
+    ],
+    "forward_warm": {
+     "cards": {
+      "total_s": 0.30660130304750055,
+      "pass1_s": 0.18582557298941538,
+      "pass2_s": 0.12069685000460595
+     },
+     "host": {
+      "total_s": 0.013218462001532316,
+      "pass1_s": 0.0067296469933353364,
+      "pass2_s": 0.006445390987209976
+     }
+    },
+    "forward_reps": {
+     "cards": [
+      {
+       "total_s": 0.013162942021153867,
+       "pass1_s": 0.0069097429513931274,
+       "pass2_s": 0.0062139350338838995
+      },
+      {
+       "total_s": 0.013182877970393747,
+       "pass1_s": 0.006695375021081418,
+       "pass2_s": 0.006461359036620706
+      }
+     ],
+     "host": [
+      {
+       "total_s": 0.01206185104092583,
+       "pass1_s": 0.006006797018926591,
+       "pass2_s": 0.006034637975972146
+      },
+      {
+       "total_s": 0.01278342102887109,
+       "pass1_s": 0.006601454981137067,
+       "pass2_s": 0.006166349980048835
+      }
+     ]
+    },
+    "forward_order": "warm each, then ABBA",
+    "forward_median": {
+     "cards": {
+      "total_s": 0.013172909995773807,
+      "pass1_s": 0.006802558986237273,
+      "pass2_s": 0.006337647035252303
+     },
+     "host": {
+      "total_s": 0.01242263603489846,
+      "pass1_s": 0.006304126000031829,
+      "pass2_s": 0.0061004939780104905
+     }
+    },
+    "gather_to_host_s": 0.0006407370092347264,
+    "spectra_bitwise": true
+   }
+  }
+ ],
+ "finished": "2026-09-13T17:38:25"
+}
