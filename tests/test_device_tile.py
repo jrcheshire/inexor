@@ -1,0 +1,181 @@
+"""D2e: one tile of the kick on the device, gated BITWISE against `tile_task`.
+
+The oracle is the real host code with the real short force: `engine.tile_task`
+and `tile_task_device` get the same state, the same jitted `one_tile`, the same
+header and the same coarse meshes, and must return the same writes. On the CPU
+jax backend both run the same FFTs, so equality is the bar, not a tolerance.
+
+The arena branch must run: the state is built with no spare so a migrate forces
+residents, and the test asserts they reached the tiles it compares.
+"""
+
+import copy
+
+import numpy as np
+import pytest
+
+pytest.importorskip("jax")
+
+from inexor import engine, forces, state  # noqa: E402
+from inexor.codec import T9Layout  # noqa: E402
+from inexor.device import kick as dkick  # noqa: E402
+from inexor.device import tile as dtile  # noqa: E402
+
+# `tests/test_engine.py`'s validated smoke geometry, verbatim.
+L_BOX, N_PART, N_FINE, N_COARSE, N_TILE, B_FINE = 32.0, 32, 64, 16, 16, 8
+
+DTYPES = [("float64", "float64"), ("float64", "float32"),
+          ("float32", "float32"), ("float32", "float64")]
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    import jax
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    yield
+    jax.config.update("jax_enable_x64", prev)
+
+
+def _cfg(fine="float64", coarse="float64"):
+    return engine.EngineConfig(box_size=L_BOX, n_part=N_PART, n_fine=N_FINE,
+                               n_coarse=N_COARSE, n_tile=N_TILE, b_fine=B_FINE,
+                               fine_dtype=fine, coarse_dtype=coarse)
+
+
+def _state(cfg):
+    rng = np.random.default_rng(4)
+    g = (np.arange(N_PART) + 0.5) * (L_BOX / N_PART)
+    q = np.stack(np.meshgrid(g, g, g, indexing="ij"), axis=-1).reshape(-1, 3)
+    x = np.mod(q + rng.normal(scale=0.25 * L_BOX / N_PART, size=q.shape), L_BOX)
+    v = np.random.default_rng(5).normal(scale=0.5, size=x.shape)
+    t9 = T9Layout(box_size=L_BOX, n_part=N_PART, bucket_cells=2)
+    st = state.SlotState.build(x, v, t9, N_FINE // cfg.n_brick, brick_slack=0.0,
+                               arena_frac=0.30)
+    state.drift_and_migrate(st, 2.0)
+    return st
+
+
+def _setup(fine="float64", coarse="float64"):
+    cfg = _cfg(fine, coarse)
+    st = _state(cfg)
+    members = {t: st.tile_bricks(t, cfg.n_tile, cfg._b_realized, cfg.n_brick, cfg.n_fine)
+               for t in cfg.tiles}
+    counts = [sum(st.brick_member_count(b) for b in members[t]) for t in cfg.tiles]
+    cap = forces.capacity_shape(forces.tile_capacity(counts) + 6)
+    tile_force = forces.make_tile_force_fn(
+        cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine, r_s=cfg.r_s,
+        paint=cfg.paint_short, frac_bits=cfg.frac_bits, fdtype=cfg.np_fine_dtype)
+    one_tile, geom = tile_force
+    C = dict(cap=int(cap), n_tile=cfg.n_tile, n_brick=cfg.n_brick, n_fine=cfg.n_fine,
+             n_coarse=cfg.n_coarse, box=cfg.box_size, coarse_cell=cfg.coarse_cell,
+             cell=geom["cell"], b_real=int(cfg._b_realized), alpha_k=0.87, bcoef=1.31)
+    rng = np.random.default_rng(6)
+    g_coarse = [rng.normal(scale=0.3, size=(N_COARSE,) * 3).astype(cfg.np_coarse_dtype)
+                for _ in range(3)]
+    return cfg, st, members, one_tile, C, g_coarse
+
+
+def _same(a, b):
+    assert a["empty"] == b["empty"] and a["n_owned"] == b["n_owned"]
+    assert a["n_out"] == b["n_out"]
+    if a["empty"]:
+        return
+    assert np.array_equal(a["slots_o"], b["slots_o"]), "owned slots differ"
+    assert a["w_codes"].dtype == b["w_codes"].dtype
+    assert np.array_equal(a["w_codes"], b["w_codes"]), "velocity codes differ"
+    assert np.array_equal(a["run_bricks"], b["run_bricks"]), "written bricks differ"
+    assert np.array_equal(a["run_scales"], b["run_scales"]), "per-brick scales differ"
+
+
+def _arena_rows(st, bricks):
+    return sum(len(st.arena_slots_of_brick(int(b))) for b in bricks)
+
+
+# ------------------------------------------------------------------ the gate
+
+
+@pytest.mark.parametrize("fine,coarse", DTYPES)
+def test_one_tile_is_bitwise_the_host_tile_task(fine, coarse):
+    cfg, st, members, one_tile, C, g_coarse = _setup(fine, coarse)
+    tiles = [cfg.tiles[0], cfg.tiles[len(cfg.tiles) // 2], cfg.tiles[-1]]
+    assert sum(_arena_rows(st, members[t]) for t in tiles) > 0, (
+        "vacuous: no arena residents in the compared tiles")
+    for t in tiles:
+        want = engine.tile_task(st, one_tile, C, g_coarse, t, members[t])
+        got = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t])
+        assert not want["empty"], f"vacuous: tile {t} owns nothing"
+        _same(got, want)
+
+
+def test_a_whole_step_of_tiles_writes_the_same_state():
+    """Every tile, applied: the same velocity codes and scales everywhere, and
+    ownership still a partition (every particle written exactly once)."""
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    st_h, st_d = copy.deepcopy(st), copy.deepcopy(st)
+    n_h = n_d = 0
+    for t in cfg.tiles:
+        rh = engine.tile_task(st, one_tile, C, g_coarse, t, members[t])
+        rd = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t])
+        _same(rd, rh)
+        engine.apply_result(st_h, rh)
+        engine.apply_result(st_d, rd)
+        n_h += rh["n_owned"]
+        n_d += rd["n_owned"]
+    assert n_d == n_h == st.n_particles
+    assert not np.array_equal(st_h.w, st.w), "vacuous: the step wrote nothing"
+    assert np.array_equal(st_d.w, st_h.w)
+    assert np.array_equal(st_d.vel_scale, st_h.vel_scale)
+
+
+def test_the_comparison_can_fail():
+    """Anti-vacuity on each force arm: changing either must move the codes."""
+    cfg, st, members, one_tile, C, g_coarse = _setup()
+    t = cfg.tiles[0]
+    base = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t])
+    bumped = [2.0 * g for g in g_coarse]
+    long_moved = dtile.tile_task_device(st, one_tile, C, bumped, t, members[t])
+    assert not np.array_equal(base["w_codes"], long_moved["w_codes"])
+
+    def no_short(u, live, own):
+        g, o, n = one_tile(u, live, own)
+        return 0.0 * g, o, n
+
+    short_moved = dtile.tile_task_device(st, no_short, C, g_coarse, t, members[t])
+    assert not np.array_equal(base["w_codes"], short_moved["w_codes"])
+
+
+def test_the_codes_use_the_whole_int16_range():
+    """D-007 is off this path, so check what makes it unnecessary: every written
+    brick's extreme lands on +-32767 and nothing exceeds it."""
+    cfg, st, members, one_tile, C, g_coarse = _setup()
+    res = dtile.tile_task_device(st, one_tile, C, g_coarse, cfg.tiles[0],
+                                 members[cfg.tiles[0]])
+    w = res["w_codes"].astype(np.int32)
+    dkick.assert_int16_range_device(w)
+    assert np.abs(w).max() == dkick.INT16_MAX
+
+
+def test_ownership_twin_is_the_host_rule():
+    cfg = _cfg()
+    nb = N_FINE // cfg.n_brick
+    b = np.arange(nb**3, dtype=np.int64)
+    for t in cfg.tiles[:: max(1, len(cfg.tiles) // 5)]:
+        want = forces.owned_mask_from_bricks(b, t, cfg.n_tile, cfg.n_brick, nb)
+        got = np.asarray(dtile.owned_rows_device(b, t, cfg.n_tile, cfg.n_brick, nb))
+        assert want.any() and np.array_equal(got, want)
+
+
+def test_a_stencil_outside_the_block_is_refused():
+    """The deferred guard must still fire: a coarse halo of zero cannot contain a
+    TSC stencil, so the tile must raise rather than read wrapped values."""
+    cfg, st, members, one_tile, C, g_coarse = _setup()
+    t = cfg.tiles[0]
+    orig = forces.COARSE_HALO
+    forces.COARSE_HALO = 0
+    try:
+        with pytest.raises(ValueError, match="stencil"):
+            dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t])
+    finally:
+        forces.COARSE_HALO = orig

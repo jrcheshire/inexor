@@ -950,3 +950,73 @@ still owed.
 3. Host prep at 1024^3 after the index fix.
 4. Carried: the paint's four-card split; cuBLAS on device paths; where the
    coarse mesh lives.
+
+## 16. D2e eager -- one tile of the kick on the device is bitwise `tile_task` on the CPU backend
+
+Local only, no cluster time. `src/inexor/device/tile.py`
+(`tile_task_device`), tests `tests/test_device_tile.py`. Same arguments and
+same returned dict as `engine.tile_task`, so `engine.apply_result` consumes it
+unchanged.
+
+**What it composes.** `device.decode.decode_rows` (D2a); the tile-local shift
+and ownership, the latter a jnp twin of `forces.owned_mask_from_bricks`
+(integer, so exact); the caller's `one_tile`; `forces.gather_coarse_subblock`
+reading the tile's rows in row order with `live=owned` and its deferred guard
+(D2c); the kick written with the host's operands in the host's order; and
+`device.kick.quantize_per_brick`, split out of D2b's `kick_and_quantize`
+unchanged apart from the fix below. Padded rows handed to the short arm are the
+host's own (real rows cycled), so the tile paint sees exactly the host's input.
+The coarse sub-blocks are still staged on the host and copied per tile: the
+seam for where the coarse mesh lives.
+
+### The gate: PASS, bitwise
+
+Real `tile_task` and real jitted `one_tile` on both sides, random coarse
+meshes, a state built with no brick spare and migrated so arena residents are
+present (asserted). Equal: owned slots, int16 codes, written bricks, per-brick
+scales, owned and overhang counts.
+- Three tiles (first, middle, last) at all four fine/coarse dtype pairs,
+  f64/f64, f64/f32, f32/f32, f32/f64. The kick promotes an f32 arm the way the
+  host's numpy does; `kick_and_quantize` casts both arms to f64 first and would
+  differ from the host whenever the fine arm is f32, which is why the tile
+  writes the kick itself.
+- **Every tile of a step, applied**, at f64 fine / f32 coarse (the driver's
+  setting): `w` and `vel_scale` bitwise the host's, every particle written
+  exactly once.
+- Anti-vacuity on each arm: doubling the coarse meshes, and zeroing the short
+  force, each move the codes. A halo of zero cells is refused by the deferred
+  guard. Every written brick's extreme lands on +-32767.
+
+### What the gate found: scalar division on CPU XLA is a reciprocal multiply
+
+The first run failed on per-brick scales alone, 1 ulp low, in 6 of 64 tiles at
+f64/f32 and 8 at f32/f32, with every input bitwise equal: short force, long
+force, their sum, the kicked velocities, and the brick maxima out of
+`segment_max`. `vmax / 32767` came back as `vmax * (1/32767)`. Measured
+directly on 200,000 values (jax 0.10.2, CPU): dividing by a Python float, a 0-d
+array, a literal under jit, or **a 0-d runtime argument to a jitted program**
+all give the reciprocal form in 1,183 elements, and so does `full_like` built
+inside jit. Only a full-shape divisor that exists as a runtime array matches
+numpy. The per-row codes had the same exposure along one axis
+(`v / scales[seg][:, None]`: 161,074 of 600,000 values one ulp off) and `rint`
+hid it, but not for a value on a rounding tie.
+
+Fixed in `quantize_per_brick`: both divisors are full-shape arrays. **D2b's own
+gate had passed with the scalar form**, on random forces that happened not to
+hit a sensitive brick. GPU untested.
+
+### Owed
+
+1. **Check B, jit**: one compiled tile program per step, bitwise the eager path
+   on CPU or the difference reported in eps; the full-shape divisors must be
+   passed in as arguments, since building them inside the program folds back to
+   the reciprocal form.
+2. **Check C, a GB200 job** (its own proposal): the GPU-vs-CPU floor of
+   `one_tile` alone before any tolerance is set; per-tile device time and card
+   memory at the 4096^3 tile shape.
+3. The same division exposure wherever a device path must reproduce numpy:
+   `codec.encode_positions` (`x / quantum`) and `codec.encode_velocities` face
+   it when D3 puts the migrate insert on the device.
+4. Carried: a per-tile slab window (the tile's bricks are not a contiguous slot
+   range, so this path decodes against the whole `off` / `w`); coarse mesh
+   placement; the four-card split.

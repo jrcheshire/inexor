@@ -57,10 +57,8 @@ def kick_and_quantize(v, g_short, g_long_rows, owned, brick_index, n_bricks,
     `owned_counts == 0` gets scale 1.0 and its rows are all masked; the caller
     drops it rather than writing a scale for a brick it does not own.
     """
-    import jax
     import jax.numpy as jnp
 
-    from ..codec import rint_i
     from ..eject_jax import require_x64
 
     # Same contract as the decode: with x64 off the f64 kick silently becomes
@@ -69,10 +67,28 @@ def kick_and_quantize(v, g_short, g_long_rows, owned, brick_index, n_bricks,
     require_x64()
     fdtype = jnp.float64 if fdtype is None else fdtype
 
-    own = jnp.asarray(owned).astype(bool)
     g_tot = jnp.asarray(g_short, dtype=fdtype) + jnp.asarray(g_long_rows, dtype=fdtype)
     v_new = (jnp.asarray(alpha_k, dtype=fdtype) * jnp.asarray(v, dtype=fdtype)
              + jnp.asarray(bcoef, dtype=fdtype) * g_tot)
+    return quantize_per_brick(v_new, owned, brick_index, n_bricks)
+
+
+def quantize_per_brick(v_new, owned, brick_index, n_bricks):
+    """(w_codes, scales, owned_counts, v_new, w32) from already-kicked velocities.
+
+    The quantize half of `kick_and_quantize`, for a caller that forms `v_new`
+    itself (`device.tile`, which must reproduce the host kick's own dtype
+    promotion). Same shapes and masking contract as `kick_and_quantize`.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from ..codec import rint_i
+    from ..eject_jax import require_x64
+
+    require_x64()
+    own = jnp.asarray(owned).astype(bool)
+    v_new = jnp.asarray(v_new)
     v_new = jnp.where(own[:, None], v_new, jnp.zeros_like(v_new))
 
     # THE SEGMENTED MAX. `max|v|` per brick over its OWNED rows, taken across
@@ -85,7 +101,15 @@ def kick_and_quantize(v, g_short, g_long_rows, owned, brick_index, n_bricks,
                                indices_are_sorted=False)
     vmax = jnp.maximum(vmax, 0.0)  # segment_max seeds empty segments at -inf
 
-    scales = vmax / fdtype(INT16_MAX)
+    # The divisor is a FULL-SHAPE array, not a scalar. Measured on CPU XLA
+    # (jax 0.10.2): x / scalar comes back as x * (1/scalar) -- one ulp off
+    # numpy's true division in ~0.6% of elements -- whether the scalar is a
+    # Python float, a 0-d array, or a runtime argument to a jitted program, and
+    # `full_like` built INSIDE a jitted program folds back to the same form.
+    # Only a full-shape divisor that exists as a runtime array is exact. Here
+    # that cost 6 of 512 per-brick scales at the D2e test geometry; under jit
+    # the array must be passed in, not built.
+    scales = vmax / jnp.full_like(vmax, INT16_MAX)
     # an all-zero brick has no scale; encode to zeros and keep the decode exact
     scales = jnp.where(scales > 0.0, scales, jnp.ones_like(scales))
 
@@ -96,7 +120,11 @@ def kick_and_quantize(v, g_short, g_long_rows, owned, brick_index, n_bricks,
     # value path and the twin of the host's `np.rint(...).astype(np.int16)`.
     # Routing through int32 is not cosmetic: float->int16 overflow is
     # backend-defined where int32->int16 narrowing is guaranteed modular.
-    w32 = rint_i(v_new / scales[seg][:, None])
+    # full-shape divisor for the reason `scales` has one: dividing by
+    # `scales[seg][:, None]` broadcasts along axis 1 and came back one ulp off
+    # true division in 27% of values (CPU XLA); rint hides most of that, not a
+    # value on a rounding tie
+    w32 = rint_i(v_new / jnp.broadcast_to(scales[seg][:, None], v_new.shape))
     w_codes = jnp.where(own[:, None], w32, 0).astype(jnp.int16)
     return dict(w_codes=w_codes, scales=scales, owned_counts=owned_counts,
                 v_new=v_new, w32=w32)
