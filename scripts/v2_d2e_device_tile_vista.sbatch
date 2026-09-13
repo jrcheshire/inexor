@@ -3,7 +3,7 @@
 #SBATCH -p gb
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 00:10:00
+#SBATCH -t 00:15:00
 #SBATCH -A JPL-SPHEREx
 #SBATCH -o d2e-tile-%j.log
 # TIME ASK: ~5.5 min estimated, 15 min wall, one gb node, ~0.25 SU at most.
@@ -74,6 +74,33 @@
 #   loop                   10 s + 28.9 s build + ~23 s compile in the
 #                          warm step + 3 steps x 8 tiles x <= 0.39 s
 #                          + 3 copy-backs of ~0.8 GB                     ~75 s
+# (993837 ran that: 3:18, ~0.1 SU. Record sec. 21.)
+#
+# FOUR-GPU SPLIT + COARSE STAGING RE-RUN, submitted with
+#   sbatch --export=ALL,D2E_ARMS=split+stage,D2E_SUFFIX=_split_gb
+# Bundled on JC's direction (a job under 15 min pays that minimum anyway).
+# QUESTION 1 (split): does the device tile loop's throughput scale 4x across
+#   four GB200s? P=576, cgh64 tile 512: a one-GPU reference runs all 8 tiles for
+#   30 steps; then four processes, one per card, 2 tiles each, released together
+#   by a barrier after their warm steps, 30 steps each; results on the device, no
+#   copy-back. Done PINNED (numactl to the card's socket, else taskset) with its
+#   own pinned reference, then UNPINNED with its own unpinned reference. Each
+#   worker records its affinity, allowed memory nodes and visible device count.
+# QUESTION 2 (stage): does host staging of the coarse sub-blocks slow down at the
+#   real mesh size? Three 2048^3 f32 meshes (103 GB, every page written, pinned to
+#   socket 0), extent 132 at 32 4096^3 tile positions, two passes; the same
+#   staging from a 256^3 mesh (993837's size) in the same process.
+# TIME ASK: ~7.5 min estimated, 15 min wall, one gb node, ~0.25 SU.
+#   phase                     each (source)                               total
+#   smoke, split + stage       9 processes x ~10 s start, 32^3 work      ~1.5 min
+#   ref-pinned (1 GPU)         10 s + 29 s build + 23 s compile
+#                              + 30 steps x 8 tiles x 0.11 s (993837)    ~1.5 min
+#   four-pinned (4 GPUs)       concurrent builds/compiles ~60-70 s
+#                              + 30 steps x 2 tiles x ~0.11 s            ~1.3 min
+#   ref-unpinned, four-unpinned  the same again                          ~2.8 min
+#   stage                      10 s + 103 GB page-writing fill (not
+#                              measured; ~10-20 s at 5-10 GB/s) + 64
+#                              tile stagings + the 256^3 reference       ~1 min
 #
 # ENV copied verbatim from the D2d gb sbatch (v2_d2d_dead_rows_vista.sbatch).
 
@@ -110,7 +137,7 @@ run_leg () {
 
 run_leg smoke \
   pixi run -e gpu python scripts/v2_d2e_device_tile.py --smoke \
-    --arms xback,short,tile,tile-staged,loop --workdir "$WORK/smoke" --out-suffix "${D2E_SUFFIX}smoke"
+    --arms "$D2E_ARMS" --workdir "$WORK/smoke" --out-suffix "${D2E_SUFFIX}smoke"
 if [ $rc_total -ne 0 ]; then
   echo "FATAL: smoke failed, not spending the node on the long arms"
   exit 1

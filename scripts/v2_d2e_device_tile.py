@@ -427,8 +427,214 @@ def arm_loop(args):
     return rec, 0
 
 
+def _placement_receipt():
+    """What this process can actually run on: the proof that pinning and device
+    isolation applied, not the flags that asked for them."""
+    import jax
+
+    rec = dict(cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+               n_devices=len(jax.devices()), platform=_platform())
+    if hasattr(os, "sched_getaffinity"):
+        cpus = sorted(os.sched_getaffinity(0))
+        rec.update(n_cpus=len(cpus), cpu_min=cpus[0], cpu_max=cpus[-1])
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("Mems_allowed_list"):
+                    rec["mems_allowed"] = line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return rec
+
+
+def _part(items, spec):
+    """Contiguous part i of k of a list ("i/k")."""
+    i, k = (int(x) for x in spec.split("/"))
+    return [items[j] for j in np.array_split(np.arange(len(items)), k)[i]]
+
+
+def arm_split(args):
+    """One process's share of a concurrent tile loop: its part of the tiles on
+    its one visible device, results written on the device, no copy-back. Warm
+    step, then waits at `--barrier` so every process's timed steps start
+    together."""
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    from inexor.device import tile as dtile
+
+    platform = _require_device(args.allow_cpu)
+    receipt = _placement_receipt()
+    if receipt["n_devices"] != 1:
+        raise RuntimeError(f"split worker sees {receipt['n_devices']} devices, wants 1: "
+                           "CUDA_VISIBLE_DEVICES did not isolate it")
+    g = _geometry(args.tile_preset, args.tile, args.buf)
+    s = _setup(g, arena=False)
+    st, C = s["st"], s["C"]
+    tiles = _part(list(s["ec"].tiles), args.part)
+    ds = dtile.stage_state_on_device(st)
+    t0 = time.perf_counter()
+    dtile.tile_loop_device(st, s["one_tile"], C, s["g_coarse"], s["members"], s["shapes"],
+                           tiles=tiles, device_state=ds, write_host=False)
+    warm_s = time.perf_counter() - t0
+    tag = f"[split {args.label} part {args.part}]"
+    _say(f"{tag} {len(tiles)} tiles, warm step {warm_s:.1f}s, receipt {receipt}")
+    if args.ready:
+        open(args.ready, "w").close()
+    while args.barrier and not os.path.exists(args.barrier):
+        time.sleep(0.005)
+    walls = []
+    t_all = time.perf_counter()
+    for _ in range(int(args.steps)):
+        t0 = time.perf_counter()
+        dtile.tile_loop_device(st, s["one_tile"], C, s["g_coarse"], s["members"],
+                               s["shapes"], tiles=tiles, device_state=ds, write_host=False)
+        walls.append(time.perf_counter() - t0)
+    total = time.perf_counter() - t_all
+    n = int(args.steps) * len(tiles)
+    _say(f"{tag} {int(args.steps)} steps x {len(tiles)} tiles in {total:.3f}s = "
+         f"{n / total:.2f} tiles/s ({total / n * 1e3:.1f} ms/tile); median step "
+         f"{np.median(walls):.3f}s")
+    return dict(arm="split", label=args.label, part=args.part, platform=platform,
+                receipt=receipt, P=s["P"], cap=s["cap"], tiles=[list(t) for t in tiles],
+                steps=int(args.steps), warm_s=warm_s, step_walls=walls, total_s=total,
+                tiles_per_s=n / total), 0
+
+
+def arm_stage(args):
+    """Host staging of the coarse sub-blocks from real-size coarse meshes: three
+    n^3 f32 meshes, every page written, staged at 4096^3-geometry tile origins
+    (16 tiles per side, extent n/16 + 4) in two passes; the same staging from a
+    256^3 mesh (993837's size) in the same process as the reference."""
+    from inexor.forces import coarse_subblock_origin_extent, stage_coarse_subblock
+
+    if args.ready:  # run as a group of one; nothing to synchronize with
+        open(args.ready, "w").close()
+    n = int(args.stage_n)
+    need = 3 * n**3 * 4
+    avail = None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable"):
+                    avail = int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    receipt = dict(n_cpus=len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+                   else None, mem_available=avail)
+    if avail is not None and avail < 1.2 * need:
+        raise RuntimeError(f"{need / 1e9:.1f} GB of meshes against {avail / 1e9:.1f} GB "
+                           "available; refusing rather than swapping")
+    n_tile, n_fine = n // 4, 4 * n  # c-hero's ratios: 16 tiles/side, coarse = fine/4
+    t0 = time.perf_counter()
+    meshes = []
+    for c in range(3):
+        m = np.empty((n, n, n), dtype=np.float32)
+        for i in range(n):
+            m[i] = np.float32(c + i * 1e-3)
+        meshes.append(m)
+    fill_s = time.perf_counter() - t0
+    side = n_fine // n_tile
+    rng = np.random.default_rng(3)
+    tiles = [(0, 0, 0), (side - 1, side - 1, side - 1), (0, side - 1, side // 2)]
+    tiles += [tuple(int(v) for v in rng.integers(0, side, 3)) for _ in range(int(args.stage_tiles) - 3)]
+    o_ext = [coarse_subblock_origin_extent(t, n_tile, n, n_fine) for t in tiles]
+    extent = int(o_ext[0][1])
+
+    def per_tile(ms, origins):
+        out = []
+        for o, _e in origins:
+            t0 = time.perf_counter()
+            for g in ms:
+                stage_coarse_subblock(g, o, extent)
+            out.append(time.perf_counter() - t0)
+        return out
+
+    pass1 = per_tile(meshes, o_ext)
+    pass2 = per_tile(meshes, o_ext)
+    del meshes
+    n_ref = 256 if n >= 512 else n
+    ref = [np.full((n_ref,) * 3, np.float32(c), dtype=np.float32) for c in range(3)]
+    ref_o = [(np.mod(np.asarray(o), n_ref), e) for o, e in o_ext]
+    per_tile(ref, ref_o)  # warm
+    ref_t = per_tile(ref, ref_o)
+    rec = dict(arm="stage", n=n, mesh_bytes=need, fill_s=fill_s, extent=extent,
+               tiles=[list(t) for t in tiles], pass1_s=pass1, pass2_s=pass2, n_ref=n_ref,
+               ref_s=ref_t, receipt=receipt)
+    for k in ("pass1_s", "pass2_s", "ref_s"):
+        rec[k.replace("_s", "_median_ms")] = float(np.median(rec[k]) * 1e3)
+        rec[k.replace("_s", "_p90_ms")] = float(np.percentile(rec[k], 90) * 1e3)
+    _say(f"[stage] three {n}^3 f32 meshes ({need / 1e9:.1f} GB) filled in {fill_s:.1f}s; "
+         f"extent {extent}, {len(tiles)} tiles x 3 meshes: pass 1 median "
+         f"{rec['pass1_median_ms']:.1f} ms (p90 {rec['pass1_p90_ms']:.1f}), pass 2 "
+         f"{rec['pass2_median_ms']:.1f} ms (p90 {rec['pass2_p90_ms']:.1f}); from a "
+         f"{n_ref}^3 mesh {rec['ref_median_ms']:.1f} ms; receipt {receipt}")
+    return rec, 0
+
+
 ARMS = {"xback-cpu": arm_xback_cpu, "xback-gpu": arm_xback_gpu, "short": arm_short,
-        "tile": arm_tile, "loop": arm_loop}
+        "tile": arm_tile, "loop": arm_loop, "split": arm_split, "stage": arm_stage}
+
+
+def _pin_prefix(socket, socket_cores):
+    """(command prefix, method) binding a process to one socket, or ([], 'none')."""
+    import shutil
+
+    if shutil.which("numactl"):
+        return ["numactl", f"--cpunodebind={socket}", f"--membind={socket}"], "numactl"
+    if shutil.which("taskset"):
+        return ["taskset", "-c", socket_cores[socket]], "taskset"
+    return [], "none"
+
+
+def _run_group(label, workers, workdir):
+    """Run workers concurrently: each gets `--ready` / `--barrier` files, the
+    barrier is released once every worker is ready, and output streams with a
+    per-worker prefix. A worker that dies before ready kills the group."""
+    import threading
+
+    gdir = os.path.join(workdir, f"group_{label}")
+    os.makedirs(gdir, exist_ok=True)
+    barrier = os.path.join(gdir, "go")
+    if os.path.exists(barrier):
+        os.remove(barrier)
+    procs, recs, lock = [], {}, threading.Lock()
+    _say(f"\n--- group {label}: {len(workers)} workers")
+    for i, (argv, env_extra, prefix) in enumerate(workers):
+        ready = os.path.join(gdir, f"ready{i}")
+        if os.path.exists(ready):
+            os.remove(ready)
+        env = dict(os.environ, PYTHONUNBUFFERED="1", **env_extra)
+        cmd = [*prefix, sys.executable, os.path.abspath(__file__), "--worker", *argv,
+               "--ready", ready, "--barrier", barrier]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, env=env)
+        procs.append((p, ready))
+
+        def pump(p=p, i=i):
+            for line in p.stdout:
+                if line.startswith("WORKER_JSON "):
+                    with lock:
+                        recs[i] = json.loads(line[len("WORKER_JSON "):])
+                else:
+                    print(f"  [{label}:{i}] {line}", end="", flush=True)
+
+        threading.Thread(target=pump, daemon=True).start()
+    while not all(os.path.exists(r) for _p, r in procs):
+        dead = [i for i, (p, r) in enumerate(procs) if p.poll() is not None and not os.path.exists(r)]
+        if dead:
+            for p, _r in procs:
+                if p.poll() is None:
+                    p.kill()
+            _say(f"--- group {label}: worker(s) {dead} died before ready; group killed")
+            return dict(group=label, rc=1, records={}), 1
+        time.sleep(0.05)
+    open(barrier, "w").close()
+    rcs = [p.wait() for p, _r in procs]
+    time.sleep(0.2)
+    worst = max(rcs + [0 if len(recs) == len(procs) else 1])
+    _say(f"--- group {label}: rcs {rcs}")
+    return dict(group=label, rc=worst, rcs=rcs, records=[recs.get(i) for i in range(len(procs))]), worst
 
 
 # ------------------------------------------------------------ the orchestrator
@@ -467,8 +673,20 @@ def main(argv=None):
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--workdir", default=os.path.join(REPO, "runs", "v2", "_d2e_xback"))
     ap.add_argument("--arms", default="xback,short,tile",
-                    help="comma list of xback, short, tile, tile-staged, loop")
+                    help="comma list of xback, short, tile, tile-staged, loop, split, stage")
     ap.add_argument("--staged", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--part", default="0/1", help=argparse.SUPPRESS)
+    ap.add_argument("--label", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--ready", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--barrier", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--steps", type=int, default=30, help="timed steps per split worker")
+    ap.add_argument("--gpus", type=int, default=4, help="devices in the split arm")
+    ap.add_argument("--gpu-sockets", default="0,0,1,1",
+                    help="socket of each GPU (gb: GPUs 0-1 on socket 0, 2-3 on 1)")
+    ap.add_argument("--socket-cores", default="0-71,72-143",
+                    help="core list per socket, for taskset if numactl is absent")
+    ap.add_argument("--stage-n", type=int, default=2048, help="coarse mesh side, stage arm")
+    ap.add_argument("--stage-tiles", type=int, default=32)
     ap.add_argument("--allow-cpu", action="store_true")
     ap.add_argument("--smoke", action="store_true",
                     help="smoke geometry everywhere, CPU allowed: exercises the apparatus only")
@@ -483,7 +701,7 @@ def main(argv=None):
     if args.smoke:
         args.xback_preset, args.tile_preset, args.tile, args.buf, args.reps = (
             "smoke", "smoke", 16, 8, 1)
-        args.allow_cpu = True
+        args.allow_cpu, args.steps, args.stage_n, args.stage_tiles = True, 2, 64, 5
     common = ["--reps", str(args.reps), "--workdir", args.workdir,
               "--xback-preset", args.xback_preset, "--tile-preset", args.tile_preset,
               "--tile", str(args.tile), "--buf", str(args.buf)]
@@ -524,6 +742,45 @@ def main(argv=None):
             card["arms"].append(res)
             write()
             worst = max(worst, rc)
+    if "split" in arms:
+        sockets = [int(x) for x in args.gpu_sockets.split(",")]
+        cores = args.socket_cores.split(",")
+        split_common = [*common, "--steps", str(args.steps)]
+        for pinned in (True, False):
+            mode = "pinned" if pinned else "unpinned"
+            prefix0, method = _pin_prefix(sockets[0], cores) if pinned else ([], "none")
+            card.setdefault("pinning_method", {})[mode] = method
+            ref = [(["--arm", "split", "--label", f"ref-{mode}", "--part", "0/1",
+                     *split_common], {"CUDA_VISIBLE_DEVICES": "0"}, prefix0)]
+            res, rc = _run_group(f"ref-{mode}", ref, args.workdir)
+            card["arms"].append(res)
+            write()
+            worst = max(worst, rc)
+            four = []
+            for i in range(int(args.gpus)):
+                prefix = _pin_prefix(sockets[i], cores)[0] if pinned else []
+                four.append((["--arm", "split", "--label", f"four-{mode}", "--part",
+                              f"{i}/{args.gpus}", *split_common],
+                             {"CUDA_VISIBLE_DEVICES": str(i)}, prefix))
+            res, rc = _run_group(f"four-{mode}", four, args.workdir)
+            card["arms"].append(res)
+            if rc == 0 and card["arms"][-2]["rc"] == 0:
+                r1 = card["arms"][-2]["records"][0]["tiles_per_s"]
+                r4 = sum(r["tiles_per_s"] for r in res["records"])
+                res["split_efficiency"] = r4 / r1
+                _say(f"--- {mode}: four devices {r4:.2f} tiles/s against one {r1:.2f} "
+                     f"= {r4 / r1:.2f}x (method {method})")
+            write()
+            worst = max(worst, rc)
+    if "stage2048" in arms or "stage" in arms:
+        socket0, method = _pin_prefix(0, args.socket_cores.split(","))
+        card.setdefault("pinning_method", {})["stage"] = method
+        res, rc = _run_group("stage", [(["--arm", "stage", "--stage-n", str(args.stage_n),
+                                         "--stage-tiles", str(args.stage_tiles), *common],
+                                        {"JAX_PLATFORMS": "cpu"}, socket0)], args.workdir)
+        card["arms"].append(res)
+        write()
+        worst = max(worst, rc)
     card["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     write()
     _say(f"\ncard: {out}\nworst rc {worst}")
