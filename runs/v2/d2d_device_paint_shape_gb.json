@@ -1,0 +1,341 @@
+{
+ "argv": [
+  "scripts/v2_d2d_device_paint.py",
+  "--skip-xback",
+  "--reps",
+  "3",
+  "--out-suffix",
+  "_shape_gb",
+  "--chunks",
+  "1024:4096:jit,512:4096:jit,512:4096:jit:21139272,512:4096:jit:33554432,512:16384:jit,512:16384:jit:67109009,512:16384:jit:134217728"
+ ],
+ "started": "2026-09-12T20:25:14",
+ "job": "993350",
+ "node": "c672-004.vista.tacc.utexas.edu",
+ "commit": "a93b3be",
+ "arms": [
+  {
+   "arm": "chunk 1024:4096:jit",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": false,
+    "pad_is_pow2": false,
+    "block_extent": [
+     11,
+     512,
+     512
+    ],
+    "jit_shapes": {
+     "pad": 21137968,
+     "live_w": 21137968,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 1024,
+    "chunk_bricks": 4096,
+    "bricks_per_side": 64,
+    "rows": 16777459,
+    "pad": 21137968,
+    "frac_of_4096_xslab": 0.06250090524554253,
+    "build_s": 244.71732055209577,
+    "warm_s": 1.6753212995827198,
+    "rep_s": [
+     0.19190185191109776,
+     0.19023616192862391,
+     0.1900837142020464
+    ],
+    "window_s": 0.09101209510117769,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 1503445504,
+    "peak_minus_baseline": 1503445504,
+    "b_per_padded_row": 71.12535623102467,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 1.503445504,
+    "planner_4096_gb": 1.521933696
+   }
+  },
+  {
+   "arm": "chunk 512:4096:jit",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": false,
+    "pad_is_pow2": true,
+    "block_extent": [
+     35,
+     256,
+     256
+    ],
+    "jit_shapes": {
+     "pad": 16777216,
+     "live_w": 21137968,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 512,
+    "chunk_bricks": 4096,
+    "bricks_per_side": 32,
+    "rows": 16777200,
+    "pad": 16777216,
+    "frac_of_4096_xslab": 0.062499940395355225,
+    "build_s": 29.408657031599432,
+    "warm_s": 1.2090919339098036,
+    "rep_s": [
+     0.04022453119978309,
+     0.03865045588463545,
+     0.0379222990013659
+    ],
+    "window_s": 0.019775225315243006,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 1208914176,
+    "peak_minus_baseline": 1208914176,
+    "b_per_padded_row": 72.05690002441406,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 1.208914176,
+    "planner_4096_gb": 1.207959552
+   }
+  },
+  {
+   "arm": "chunk 512:4096:jit:21139272",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": true,
+    "pad_is_pow2": false,
+    "block_extent": [
+     35,
+     256,
+     256
+    ],
+    "jit_shapes": {
+     "pad": 21139272,
+     "live_w": 21137968,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 512,
+    "chunk_bricks": 4096,
+    "bricks_per_side": 32,
+    "rows": 16777200,
+    "pad": 21139272,
+    "frac_of_4096_xslab": 0.062499940395355225,
+    "build_s": 29.440478361211717,
+    "warm_s": 1.5083523839712143,
+    "rep_s": [
+     0.11972389789298177,
+     0.11824473505839705,
+     0.11793516902253032
+    ],
+    "window_s": 0.019440410193055868,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 1501175552,
+    "peak_minus_baseline": 1501175552,
+    "b_per_padded_row": 71.01358797975635,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 1.191410304471376,
+    "planner_4096_gb": 1.207959552
+   }
+  },
+  {
+   "arm": "chunk 512:4096:jit:33554432",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": true,
+    "pad_is_pow2": true,
+    "block_extent": [
+     35,
+     256,
+     256
+    ],
+    "jit_shapes": {
+     "pad": 33554432,
+     "live_w": 21137968,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 512,
+    "chunk_bricks": 4096,
+    "bricks_per_side": 32,
+    "rows": 16777200,
+    "pad": 33554432,
+    "frac_of_4096_xslab": 0.062499940395355225,
+    "build_s": 29.22399563388899,
+    "warm_s": 1.991290810983628,
+    "rep_s": [
+     0.3492585779167712,
+     0.34769282303750515,
+     0.3470186498016119
+    ],
+    "window_s": 0.019599514082074165,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 3809382656,
+    "peak_minus_baseline": 3809382656,
+    "b_per_padded_row": 113.52845001220703,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 1.904691328,
+    "planner_4096_gb": 1.207959552
+   }
+  },
+  {
+   "arm": "chunk 512:16384:jit",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": false,
+    "pad_is_pow2": false,
+    "block_extent": [
+     131,
+     256,
+     256
+    ],
+    "jit_shapes": {
+     "pad": 84551871,
+     "live_w": 84551871,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 512,
+    "chunk_bricks": 16384,
+    "bricks_per_side": 32,
+    "rows": 67109009,
+    "pad": 84551871,
+    "frac_of_4096_xslab": 0.2500005401670933,
+    "build_s": 29.446400515269488,
+    "warm_s": 1.7124898727051914,
+    "rep_s": [
+     0.44761528726667166,
+     0.4466101387515664,
+     0.44647116400301456
+    ],
+    "window_s": 0.05188093800097704,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 5255849216,
+    "peak_minus_baseline": 5255849216,
+    "b_per_padded_row": 62.16124083167834,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 5.255849216,
+    "planner_4096_gb": 6.087734712
+   }
+  },
+  {
+   "arm": "chunk 512:16384:jit:67109009",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": true,
+    "pad_is_pow2": false,
+    "block_extent": [
+     131,
+     256,
+     256
+    ],
+    "jit_shapes": {
+     "pad": 67109009,
+     "live_w": 84551871,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 512,
+    "chunk_bricks": 16384,
+    "bricks_per_side": 32,
+    "rows": 67109009,
+    "pad": 67109009,
+    "frac_of_4096_xslab": 0.2500005401670933,
+    "build_s": 29.31181110208854,
+    "warm_s": 1.5507388901896775,
+    "rep_s": [
+     0.12672086572274566,
+     0.1258384371176362,
+     0.12529559107497334
+    ],
+    "window_s": 0.05143149895593524,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 4296481792,
+    "peak_minus_baseline": 4296481792,
+    "b_per_padded_row": 64.02242941778502,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 5.4132161932391645,
+    "planner_4096_gb": 6.087734712
+   }
+  },
+  {
+   "arm": "chunk 512:16384:jit:134217728",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": true,
+    "pad_is_pow2": true,
+    "block_extent": [
+     131,
+     256,
+     256
+    ],
+    "jit_shapes": {
+     "pad": 134217728,
+     "live_w": 84551871,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 512,
+    "chunk_bricks": 16384,
+    "bricks_per_side": 32,
+    "rows": 67109009,
+    "pad": 134217728,
+    "frac_of_4096_xslab": 0.2500005401670933,
+    "build_s": 29.305336276069283,
+    "warm_s": 2.7860091300681233,
+    "rep_s": [
+     1.355633624829352,
+     1.354200478643179,
+     1.3538103699684143
+    ],
+    "window_s": 0.05233188020065427,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 13893047040,
+    "peak_minus_baseline": 13893047040,
+    "b_per_padded_row": 103.51126670837402,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 8.752071269773035,
+    "planner_4096_gb": 6.087734712
+   }
+  }
+ ],
+ "finished": "2026-09-12T20:33:39"
+}

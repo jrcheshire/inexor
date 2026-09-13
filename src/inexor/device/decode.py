@@ -64,7 +64,9 @@ def tile_decode_plan(st, bricks):
     p3 = int(st.buckets_per_brick)
     n_b = len(bricks)
 
-    occ = np.asarray(st.occupancy, dtype=np.int64).reshape(-1, p3)[bricks]
+    # slice the bricks out of the uint32 index FIRST, then widen: widening first
+    # copies the whole state's index, 68.7 GB per call at 4096^3
+    occ = np.asarray(st.occupancy).reshape(-1, p3)[bricks].astype(np.int64)
     live_counts = occ.sum(axis=1)
     starts = np.asarray(st.brick_start, dtype=np.int64)[bricks]
 

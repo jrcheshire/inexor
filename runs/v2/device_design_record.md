@@ -825,3 +825,74 @@ block shape 4096^3 actually paints.
    rows, one job.
 3. Carried: the paint's own four-card split; cuBLAS on device paths (sec. 12);
    where the coarse mesh lives.
+
+## 14. D2d chunk shape, Vista 993350 -- padding, not block shape, sets the jitted chunk's time; and the host plan copies the whole index
+
+`a93b3be`, 2026-09-12, gb node c672-004, COMPLETED rc=0 in 9:14, ~0.15 SU.
+Sbatch `v2_d2d_chunk_shape_vista.sbatch`; cards
+`runs/v2/d2d_device_paint_{shape_gb,shapesmoke}.json` (force-added). Seven
+jitted arms, one node, each its own subprocess; the pad override is an
+instrument. Device time = median chunk time minus the host window prep
+(timed once, separately).
+
+| state | block (cells) | rows | pad | device s | ns / padded row | ns / real row | B / padded row |
+|---|---|---|---|---|---|---|---|
+| 1024^3 | 11x512x512 | 16.78M | +26.0% | 0.099 | 4.69 | 5.91 | 71.1 |
+| 512^3 | 35x256x256 | 16.78M | +0.0% (2^24) | 0.019 | 1.13 | 1.13 | 72.1 |
+| 512^3 | 35x256x256 | 16.78M | +26.0% | 0.099 | 4.67 | 5.89 | 71.0 |
+| 512^3 | 35x256x256 | 16.78M | +100% (2^25) | 0.328 | 9.78 | 19.56 | 113.5 |
+| 512^3 | 131x256x256 | 67.11M | +26.0% | 0.395 | 4.67 | 5.88 | 62.2 |
+| 512^3 | 131x256x256 | 67.11M | +0.0% | 0.074 | 1.11 | 1.11 | 64.0 |
+| 512^3 | 131x256x256 | 67.11M | +100% (2^27) | 1.302 | 9.70 | 19.40 | 103.5 |
+
+Every block equals host decode through the eager kernel; every arm traced once.
+The two repeats of 993294's arms land within 3% of it on a different node.
+
+### What it establishes
+
+- **Block shape does not move the device time.** 16.78M rows into the thin
+  block every 4096^3 chunk has (11 cells in x, from a 1024^3 state) and into a
+  thick one, at the same ~21.14M pad: 0.099 s both. The sec. 12 correction's
+  caveat is lifted for time at this row count; it is one row count.
+- **Power of two is not the variable**: the 2^25 and 2^27 pads are the slowest
+  arms.
+- **Padding is.** Unpadded, the rate is 1.11-1.13 ns per row at both sizes.
+  26% padding costs ~5.3x the chunk's device time and 100% ~17x, identically at
+  16.8M and 67M rows, so on the card a padded row costs far more than a real
+  one. **Sec. 13's "per-row time is not flat" was this**: its fast arm was the
+  only one whose ladder happened to pad by 16 rows.
+- **Memory**: 62-72 B per padded row at up to 26% padding, so the planner's 72
+  holds for the ladder's range; 104-114 at 2x, which is not an operating point.
+
+**The mechanism is NOT attributed.** Every padded row scatter-adds a zero
+weight into block cell 0 on all 27 corners, so the paint's scatter carries one
+heavily duplicated index -- the same class as the tiled force's zero-filled
+padding (`eba91ab`, 2.2x there) -- and a duplicate-index scatter on the GPU is
+the leading suspect. **The laptop cannot attribute it**: a jitted CPU paint at
+4M rows costs 24-32 ns per padded row, flat across 0 / 26 / 100% padding, and
+spreading the dead rows over the block (still weight zero, bitwise the shipped
+kernel's output) moves it 5-9%. The CPU shows no padding penalty, so the test
+has to run on a card.
+
+### Host prep scales with the STATE, and that one is attributed
+
+Host window prep reads 0.091 s on the 1024^3 state against 0.019 s on 512^3 for
+the same 4096 bricks. `device.decode.tile_decode_plan` opened with
+`np.asarray(st.occupancy, dtype=np.int64).reshape(-1, p3)[bricks]`, which widens
+the ENTIRE uint32 index to int64 before slicing: measured on the laptop, the
+plan's host peak is 0.33 / 2.17 MB at 64^3 / 128^3 for the same 16 bricks,
+against 8 B x buckets = 0.26 / 2.10 MB. At 4096^3 that is **68.7 GB per chunk
+call**. D2a's "O(bricks + arena), never O(rows)" was true of the plan's output
+and false of its work, and its test gated sizes only. Fixed by slicing first;
+gated by host allocation against the whole index
+(`test_the_host_plan_does_not_copy_the_whole_index`).
+
+### Owed
+
+1. **The padding cost on a card, attributed**: the same 16.8M-row chunk at
+   26% and 100% padding with dead rows sent to cell 0 (as shipped) and spread
+   over the block, bitwise identical by construction. If spreading closes it,
+   ship it behind that gate; if not, the cost is elsewhere in the padded rows.
+2. Host prep re-measured after the index fix.
+3. Carried: the paint's four-card split; cuBLAS on device paths; where the
+   coarse mesh lives.

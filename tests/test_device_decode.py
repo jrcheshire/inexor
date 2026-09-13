@@ -217,6 +217,39 @@ def test_the_host_plan_is_not_per_particle():
                 f"this is per-particle work on the host ({n_rows} rows)")
 
 
+def test_the_host_plan_does_not_copy_the_whole_index():
+    """The plan's OUTPUT is O(bricks + arena), and so must its WORK be.
+
+    `test_the_host_plan_is_not_per_particle` gates array sizes, and a plan that
+    widens the entire occupancy index to int64 before slicing out its bricks
+    passes it: that copy is 8 B per bucket of the WHOLE state -- 68.7 GB per
+    chunk at 4096^3 -- and it was measured on a GB200 as host prep growing with
+    the state rather than the chunk (Vista 993350). Host allocation is gated
+    against the whole index instead.
+    """
+    import tracemalloc
+
+    from inexor.device import decode as dev
+
+    n, box = 64, 32.0
+    ax = (np.arange(n) + 0.5) * (box / n)
+    x = np.stack(np.meshgrid(ax, ax, ax, indexing="ij"), axis=-1).reshape(-1, 3)
+    st = state.SlotState.build(x, np.zeros_like(x),
+                               T9Layout(box_size=box, n_part=n, bucket_cells=2), 4)
+    bricks = [0, 1]
+    whole = st.n_buckets * 8
+    assert whole >= 16 * len(bricks) * st.buckets_per_brick * 8, \
+        "vacuous: the index is not much larger than the chunk's share of it"
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    dev.tile_decode_plan(st, bricks)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak < whole / 4, (
+        f"tile_decode_plan allocated {peak:,} B for {len(bricks)} bricks against a "
+        f"whole-index int64 copy of {whole:,} B: it is copying the state, not the chunk")
+
+
 def test_x64_off_is_refused_rather_than_silently_narrowing_the_slots():
     """The failure that is INVISIBLE at this file's own scale.
 
