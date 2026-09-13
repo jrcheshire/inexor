@@ -1513,3 +1513,88 @@ node's host at 1.17-1.23x; card placement is not slower.
    ~19% per-card slowdown; the short kernels as program arguments;
    `tile_workspace` in the planner; `JIT_LONG_FORCE_EPS` on one state; the
    `codec` division exposure for D3; a per-tile slab window.
+
+## 24. D2f on a gb node, Vista 994608 -- the density on the cards is bitwise the CPU host at one and four GB200s, and accumulating a 4096^3 step costs ~3 s
+
+`fd7a70f`, 2026-09-13, gb node c672-017, COMPLETED rc=0 in 2:53. Sbatch
+`v2_d2f_cards_vista.sbatch`; cards `runs/v2/d2d_device_paint_d2f_{gb,smoke}.json`,
+log copied to `runs/v2/d2f-cards-994608.log`. Every arm its own process; the
+32^3 smoke passed every arm on the GPUs first.
+
+**What was built** (`adbe030`, `adfe9f5`): `device.paint.coarse_delta_cards` --
+per-card int64 accumulators with 1 + 2 ghost planes, a ghost fold into the
+owning card, the density decoded on each card with a plane-shaped runtime
+divisor -- and `ooc_fft.forward_from_card_planes`, which the factorized solve
+uses when handed the cards' shards. Gated bitwise on the laptop at 1, 2 and 4
+cards (including four forced host devices).
+
+### Identity: PASS on every gate
+
+At cdev (128^3 coarse mesh), against a `JAX_PLATFORMS=cpu` process's
+`engine.coarse_delta_streamed`:
+
+| state | 1 GB200 | 4 GB200s | ghost planes with mass (1 / 4 cards) |
+|---|---|---|---|
+| plain | hash-equal | hash-equal, 4 devices used, 16 chunks each | 3 / 12 |
+| 61,879 arena residents | hash-equal | hash-equal, 4 devices used, 16 chunks each | 3 / 12 |
+
+- **The three force meshes solved from the cards hash-equal the solve of the
+  same density from host memory on the GPU**, at both widths and both states.
+- The CPU process's own jitted paint hash-equals its host engine (both states).
+
+### Cost at 4096^3 shard shapes (synthetic blocks, four GB200s)
+
+Four accumulators of 515 x 2048 x 2048 int64 on x-ranges of 512 planes; 1024
+quarter-slab blocks of 11 x 515 x 2048 (the 4096^3 chunk block), 256 per card,
+each add synced.
+
+| phase | reading |
+|---|---|
+| allocate four accumulators on the cards | 0.88 s, 17,280,532,480 B each (= the planner's 17.281 GB) |
+| one add | **1.05 ms median** on every card; first add 0.10-0.15 s |
+| all 1024 adds, one thread per card | **0.43 s** wall |
+| ghost fold, 12 planes | 0.97 s |
+| decode, 2048 planes on 4 cards | 1.51 s |
+| device peak per card | **25.90 GB**: accumulator 17.28 + density 8.59 + 34 MB |
+
+- **Receipts.** Owned mass 11,880,366,080 = blocks x block cells, exactly.
+  Sampled planes on every card, including each card's first plane (which
+  carries a folded ghost), decode **bitwise against numpy** -- the first GPU
+  reading of the plane-shaped divisor. An overlap cell (value >= 2) was among
+  them.
+- **Accumulate + fold + decode is ~3 s per 4096^3 step**, 0.3% of the 1080 s
+  bar; the paint itself (secs. 13-15) is the term that matters on this side.
+- **The per-card peak matches the planner's paint-phase charge** of accumulator
+  plus density to 34 MB, which is one decode plane of f64.
+
+### The forward transform from the cards
+
+| | from the cards | from host slabs, same four devices |
+|---|---|---|
+| pass 1 | **3.50 s** | 4.75 s |
+| pass 2 | 5.65 s | 5.25 s |
+| forward | **9.15 s** | 10.00 s |
+
+Spectra bitwise equal. Getting the density to the host for the second leg took
+6.02 s (34.4 GB), which the card path does not pay at all.
+
+- **Pass 1 is 1.25 s faster from the cards**: the planes no longer cross the
+  bus inbound. Pass 2 is the same host-resident work in both legs (5.65 vs 5.25).
+- **Caveat on the ratio.** One call per leg, no warm-up, and the card leg ran
+  FIRST, so any per-op compilation of the eager transforms landed on it. The
+  pass 1 difference is therefore a lower bound on the saving, not a measurement
+  of it. The host leg's 10.00 s forward is also above sec. 10's 6.86 s on another
+  node, a gap this job does not attribute.
+- **Against the host-mesh design at step level**: that design pays the density's
+  host round trip (6.02 s out here) plus pass 1's inbound planes; the card design
+  pays neither.
+
+### Owed
+
+1. A warm-started forward pair (both legs warmed, alternated) if the pass 1
+   saving is ever needed as a number rather than a direction.
+2. Carried: the cross-backend tolerance for the tile (JC); the four-card ~19%
+   per-card tile slowdown; the tile loop's split under threads rather than
+   processes; the short kernels as program arguments; `tile_workspace` in the
+   planner; the `codec` division exposure for D3; a per-tile slab window; the
+   inverse transforms still read and write host slabs.
