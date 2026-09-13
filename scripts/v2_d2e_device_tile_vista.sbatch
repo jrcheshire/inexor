@@ -57,6 +57,23 @@
 #                          calls x 0.57 s                                ~67 s
 #   tile-staged            the same, less the per-call upload, plus one
 #                          1.58 GB placement                             ~67 s
+# (993817 ran that: 4:17, ~0.1 SU. Record sec. 19.)
+#
+# STEP-LOOP RE-RUN, submitted with
+#   sbatch --export=ALL,D2E_ARMS=tile-staged+loop,D2E_SUFFIX=_loop_gb
+# ONE QUESTION: with results written into the device state (tile_loop_device,
+# record sec. 20), what does a tile cost at P=576, and what does the once-per-
+# step copy-back cost? tile-staged repeats 993817's 389 ms baseline on the same
+# node; loop runs whole steps (8 tiles): warm (compile), untimed (the
+# reference wall), synced timed (phases accumulated per tile, copy-back once).
+# TIME ASK: ~3.5 min estimated, 10 min wall, one gb node, ~0.2 SU at most.
+#   phase                 each (source)                                   total
+#   smoke, 6 arms at 32^3  ~65 s (993817's smoke, one arm more)          ~65 s
+#   tile-staged            10 s start + 28.9 s build + 22.5 s compile
+#                          + 4 tiles x 2 calls x 0.39 s (993817)         ~65 s
+#   loop                   10 s + 28.9 s build + ~23 s compile in the
+#                          warm step + 3 steps x 8 tiles x <= 0.39 s
+#                          + 3 copy-backs of ~0.8 GB                     ~75 s
 #
 # ENV copied verbatim from the D2d gb sbatch (v2_d2d_dead_rows_vista.sbatch).
 
@@ -93,7 +110,7 @@ run_leg () {
 
 run_leg smoke \
   pixi run -e gpu python scripts/v2_d2e_device_tile.py --smoke \
-    --arms xback,short,tile,tile-staged --workdir "$WORK/smoke" --out-suffix "${D2E_SUFFIX}smoke"
+    --arms xback,short,tile,tile-staged,loop --workdir "$WORK/smoke" --out-suffix "${D2E_SUFFIX}smoke"
 if [ $rc_total -ne 0 ]; then
   echo "FATAL: smoke failed, not spending the node on the long arms"
   exit 1

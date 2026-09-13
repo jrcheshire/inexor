@@ -373,8 +373,62 @@ def arm_tile(args):
     return rec, 0
 
 
+def arm_loop(args):
+    """`tile_loop_device` over whole steps: results written on the device, the
+    state copied back once per step. Warm step (compile), untimed step (the
+    reference wall), synced timed step (phases accumulated over its tiles)."""
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    from inexor.device import tile as dtile
+
+    platform = _require_device(args.allow_cpu)
+    g = _geometry(args.tile_preset, args.tile, args.buf)
+    s = _setup(g, arena=False)
+    st, C = s["st"], s["C"]
+    state_bytes = int(sum(getattr(st, k).nbytes for k in dtile.STATE_FIELDS))
+    back_bytes = int(st.w.nbytes + st.vel_scale.nbytes)
+    _say(f"[loop] {args.tile_preset} tile {g['tile']} buf {g['buf']}: P={s['P']} "
+         f"cap={s['cap']:,}, {len(s['members'])} tiles; state {state_bytes / 1e9:.2f} GB "
+         f"placed once, {back_bytes / 1e9:.2f} GB copied back per step; built "
+         f"{s['build_s']:.1f}s on {platform}")
+    in_use0 = _mem("bytes_in_use")
+    t0 = time.perf_counter()
+    ds = dtile.stage_state_on_device(st)
+    place_s = time.perf_counter() - t0
+    steps = []
+    for tag in ("warm", "untimed", "timed"):
+        tm = {} if tag == "timed" else None
+        t0 = time.perf_counter()
+        out = dtile.tile_loop_device(st, s["one_tile"], C, s["g_coarse"], s["members"],
+                                     s["shapes"], device_state=ds, timings=tm)
+        wall = time.perf_counter() - t0
+        n = out["tiles_run"]
+        steps.append(dict(tag=tag, wall_s=wall, tiles=n, n_owned=out["n_owned"],
+                          n_particles=int(st.n_particles), timings=tm))
+        line = f"[loop]   {tag} step: {wall:.3f}s over {n} tiles = {wall / n:.3f}s/tile"
+        if tm:
+            per_tile = " ".join(f"{k} {tm[k] / n * 1e3:.1f}" for k in
+                                ("plan", "stage", "h2d_tile", "compute") if k in tm)
+            line += (f" | timed ms/tile: {per_tile}; copy-back once "
+                     f"{tm.get('d2h_state', 0.0) * 1e3:.1f} ms")
+        _say(line + f"; owned {out['n_owned']:,} of {int(st.n_particles):,}; device peak "
+             f"{(_mem('peak_bytes_in_use') or 0) / 1e9:.2f} GB")
+    peak = _mem("peak_bytes_in_use")
+    rec = dict(arm="loop", platform=platform, preset=args.tile_preset, tile=g["tile"],
+               buf=g["buf"], P=s["P"], cap=s["cap"], max_rows=s["max_rows"],
+               build_s=s["build_s"], state_bytes=state_bytes, copy_back_bytes=back_bytes,
+               place_s=place_s, steps=steps, bytes_in_use_before=in_use0,
+               peak_bytes_in_use=peak, traces=dtile._TRACES[0])
+    if peak is not None and in_use0 is not None:
+        rec["peak_minus_baseline"] = peak - in_use0
+        _say(f"[loop]   peak over baseline {(peak - in_use0) / 1e9:.2f} GB (state "
+             f"{state_bytes / 1e9:.2f} GB of it); traces {dtile._TRACES[0]}")
+    return rec, 0
+
+
 ARMS = {"xback-cpu": arm_xback_cpu, "xback-gpu": arm_xback_gpu, "short": arm_short,
-        "tile": arm_tile}
+        "tile": arm_tile, "loop": arm_loop}
 
 
 # ------------------------------------------------------------ the orchestrator
@@ -413,7 +467,7 @@ def main(argv=None):
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--workdir", default=os.path.join(REPO, "runs", "v2", "_d2e_xback"))
     ap.add_argument("--arms", default="xback,short,tile",
-                    help="comma list of xback, short, tile, tile-staged")
+                    help="comma list of xback, short, tile, tile-staged, loop")
     ap.add_argument("--staged", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--allow-cpu", action="store_true")
     ap.add_argument("--smoke", action="store_true",
@@ -463,7 +517,7 @@ def main(argv=None):
             worst = max(worst, rc)
         else:
             _say("\nthe CPU arm failed or did not record; the GPU comparison is not run")
-    for name in ("short", "tile", "tile-staged"):
+    for name in ("short", "tile", "tile-staged", "loop"):
         if name in arms:
             argv = ["--arm", "tile", "--staged"] if name == "tile-staged" else ["--arm", name]
             res, rc = _run_worker([*argv, *common], {}, name)
