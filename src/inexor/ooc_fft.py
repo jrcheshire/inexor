@@ -539,6 +539,78 @@ def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
     return spec
 
 
+def forward_from_card_planes(shards, n_mesh, plane_batch=1, pencil_batch=1,
+                             timings=None, transfer="pageable"):
+    """`forward_from_slabs_device` for a real-space field already on the cards.
+
+    `shards` are dicts with `lo`, `hi`, `device` and `delta`: x-planes [lo, hi)
+    of the field, shape (hi - lo, N, N), resident on that device, together
+    tiling [0, N) (`device.paint.coarse_delta_cards`). Pass 1 transforms each
+    card's planes where they sit, one thread per card, so no real-space plane
+    crosses the bus; pass 2 is `forward_from_slabs_device`'s, split across the
+    same devices. The spectrum stays host-resident.
+
+    BITWISE the host-slab path at the same `plane_batch` / `pencil_batch`: every
+    card boundary must be a `plane_batch` multiple, so the batch sequence is the
+    unpartitioned one (`partition_units`). `timings` receives `pass1_s` and
+    `pass2_s`.
+    """
+    import jax.numpy as jnp
+
+    n = int(n_mesh)
+    shards = sorted(shards, key=lambda s: int(s["lo"]))
+    b = max(1, int(plane_batch))
+    edge = 0
+    for s in shards:
+        lo, hi = int(s["lo"]), int(s["hi"])
+        if lo != edge:
+            raise ValueError(f"card shards do not tile [0, {n}): a shard starts at {lo} "
+                             f"where the previous one ended at {edge}")
+        if tuple(s["delta"].shape) != (hi - lo, n, n):
+            raise ValueError(f"shard [{lo}, {hi}) has shape {tuple(s['delta'].shape)}, "
+                             f"want {(hi - lo, n, n)}")
+        if lo % b:
+            raise ValueError(
+                f"card boundary {lo} is not a multiple of plane_batch {b}: pass 1's "
+                "batches would restart off the unpartitioned sequence and give a "
+                "different spectrum")
+        edge = hi
+    if edge != n:
+        raise ValueError(f"card shards do not tile [0, {n}): they end at {edge}")
+    dt = np.dtype(shards[0]["delta"].dtype)
+    if any(np.dtype(s["delta"].dtype) != dt for s in shards):
+        raise TypeError("card shards disagree on dtype")
+    _require_x64_for(dt)
+    refuse_oversize_device_transform(b * n * n, "device rfft2 batch")
+    cd = _cdtype_for(dt)
+    spec = np.empty(_spec_shape(n), dtype=cd)
+    devs = [s["device"] for s in shards]
+
+    def pass1(k, _k1, _dev):
+        s = shards[k]
+        lo, w = int(s["lo"]), int(s["hi"]) - int(s["lo"])
+        for a in range(0, w, b):
+            z = min(a + b, w)
+            d = _from_device(jnp.fft.rfft2(s["delta"][a:z], axes=(-2, -1)), transfer)
+            _check_spectral_dtype(d.dtype, cd, "device rfft2")
+            spec[lo + a:lo + z] = d
+
+    _t0 = _time.perf_counter()
+    _run_parts(pass1, [(k, k + 1) for k in range(len(shards))], devs)
+    _p1 = _time.perf_counter() - _t0
+
+    def pass2(a, z, dev):
+        fft_axis0_device_inplace(spec[:, a:z, :], pencil_batch=pencil_batch,
+                                 device=dev, transfer=transfer)
+
+    _t0 = _time.perf_counter()
+    _run_parts(pass2, partition_units(n, len(devs), pencil_batch), devs)
+    if timings is not None:
+        timings["pass1_s"] = _p1
+        timings["pass2_s"] = _time.perf_counter() - _t0
+    return spec
+
+
 def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
                             pencil_batch=1, devices=None, timings=None,
                             transfer="pageable"):

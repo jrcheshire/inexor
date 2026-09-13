@@ -747,12 +747,14 @@ def test_one_gpu_charges_every_surviving_term_in_full():
     This is what makes the /4 a SPLIT rather than a discount -- if the shard
     arithmetic were wrong in a way that scaled, this arm would catch it, because
     at one GPU the device column must reproduce `mesh_bytes` exactly for every
-    term the design keeps.
+    term the design keeps -- plus the ghost planes a shard carries even on one
+    card (`plan.shard_halo_planes`).
     """
-    from inexor.plan import DEVICE_PLACEMENT, device_budget
+    from inexor.plan import DEVICE_PLACEMENT, device_budget, shard_halo_planes
 
     ec = _ec("cgh64")
     mesh = ec.mesh_bytes()
+    halo = shard_halo_planes()
     resident, transient, _phases, _worst, _slabs, host_mesh = device_budget(
         ec, n=ec.n_total, n_gpus=1)
     got = {**resident, **transient}
@@ -760,7 +762,7 @@ def test_one_gpu_charges_every_surviving_term_in_full():
             if DEVICE_PLACEMENT[k] not in ("gone", "host")}
     assert kept, "vacuous: no mesh term survives the placement"
     for k, v in kept.items():
-        assert got[k] == v, k
+        assert got[k] == v + (v // ec.n_coarse) * halo.get(k, 0), k
     # and the deleted host pass is really gone
     assert "coarse_decode_slab" not in got
     # EVERY surviving term lands in EXACTLY ONE column, at full value. A term
@@ -774,11 +776,12 @@ def test_one_gpu_charges_every_surviving_term_in_full():
         assert k not in got, f"{k} is charged to BOTH columns"
 
 
-def test_the_shard_is_exactly_a_quarter_across_four_cards():
-    from inexor.plan import DEVICE_PLACEMENT, device_budget
+def test_the_shard_is_a_quarter_plus_its_ghost_planes_across_four_cards():
+    from inexor.plan import DEVICE_PLACEMENT, device_budget, shard_halo_planes
 
     ec = _ec("cgh64")
     mesh = ec.mesh_bytes()
+    halo = shard_halo_planes()
     r1, t1, _p, _w, _s, _h = device_budget(ec, n=ec.n_total, n_gpus=1)
     r4, t4, _p, _w, _s, _h = device_budget(ec, n=ec.n_total, n_gpus=4)
     one, four = {**r1, **t1}, {**r4, **t4}
@@ -787,10 +790,22 @@ def test_the_shard_is_exactly_a_quarter_across_four_cards():
     replicated = [k for k, v in DEVICE_PLACEMENT.items()
                   if v == "replica" and k in mesh]
     assert sharded and replicated, "vacuous: one of the two classes is empty"
+    assert any(halo.get(k) for k in sharded), "vacuous: no sharded term has ghost planes"
     for k in sharded:
-        assert four[k] == int(one[k] / 4), k
+        plane = mesh[k] // ec.n_coarse
+        assert four[k] == int(mesh[k] / 4) + plane * halo.get(k, 0), k
     for k in replicated:
         assert four[k] == one[k], f"{k} is replicated and must not shrink"
+
+
+def test_the_card_force_shard_is_charged_the_bytes_a_gb200_held():
+    """Vista 993866 (record sec. 23): one card's 4096^3 coarse force shard, three
+    f32 meshes of 516 x 2048 x 2048, held 25,971,130,368 bytes on the device."""
+    from inexor.plan import device_budget
+
+    ec = _ec("c-hero")
+    resident, *_ = device_budget(ec, n=ec.n_total, n_gpus=4)
+    assert resident["coarse_force_resident"] == 25_971_130_368
 
 
 @pytest.mark.parametrize("name", sorted(PRESETS))

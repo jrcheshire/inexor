@@ -1507,7 +1507,8 @@ node's host at 1.17-1.23x; card placement is not slower.
 
 1. A card-resident paint accumulator behind the `HostInt64Accumulator` seam
    (`device/paint.py`), now that the cards hold the coarse mesh.
-2. The planner's `coarse_force_resident` without the ghost planes (0.20 GB/card).
+2. [DONE] The planner charges each shard's ghost planes (`plan.shard_halo_planes`):
+   `coarse_force_resident` is now exactly the 25,971,130,368 bytes this job held.
 3. Carried: the cross-backend tolerance (JC) from the floor above; the four-card
    ~19% per-card slowdown; the short kernels as program arguments;
    `tile_workspace` in the planner; `JIT_LONG_FORCE_EPS` on one state; the

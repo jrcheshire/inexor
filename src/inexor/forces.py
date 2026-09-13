@@ -626,8 +626,11 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab):
     from inexor import ooc_fft
 
     n = int(n_mesh)
-    spec = ooc_fft.forward_from_slabs_device(
-        lambda lo, hi: delta[lo:hi], n, slab=slab)
+    if isinstance(delta, (list, tuple)):
+        spec = ooc_fft.forward_from_card_planes(delta, n)
+    else:
+        spec = ooc_fft.forward_from_slabs_device(
+            lambda lo, hi: delta[lo:hi], n, slab=slab)
     for axis in range(3):
         work = np.empty_like(spec)
         for lo in range(0, spec.shape[0], slab):
@@ -676,11 +679,18 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
     built a numpy copy of each, and because a comprehension rebinds only after
     it completes, that is six full meshes live at once -- 25.8 GB at C-gh. One
     component at a time is 8.6.
+
+    `delta` may instead be the per-card shards of `device.paint.coarse_delta_cards`;
+    the factorized solve then transforms each card's planes where they sit
+    (`ooc_fft.forward_from_card_planes`), bitwise the solve of the same density
+    on the host.
     """
-    fdtype = field_dtype(delta.dtype if fdtype is None else fdtype)
-    if np.dtype(delta.dtype) != fdtype:
+    on_cards = isinstance(delta, (list, tuple))
+    ddt = np.dtype(delta[0]["delta"].dtype if on_cards else delta.dtype)
+    fdtype = field_dtype(ddt if fdtype is None else fdtype)
+    if ddt != fdtype:
         raise ValueError(
-            f"coarse_force_meshes: delta is {np.dtype(delta.dtype).name} but fdtype is "
+            f"coarse_force_meshes: delta is {ddt.name} but fdtype is "
             f"{fdtype.name}. These must agree -- the kernels are built at fdtype and a "
             "mismatched multiply promotes the whole solve back to the wider type, which "
             "reads as a working f32 arm that is silently costing f64 memory. Narrow the "
@@ -708,6 +718,10 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
         return _coarse_solve_factorized(
             delta, n_mesh, parts, cdtype, out,
             ooc_fft._DEF_SLAB if slab is None else int(slab))
+    if on_cards:
+        raise ValueError(
+            "coarse_force_meshes: a density on the cards has only the factorized "
+            "solve; a monolithic transform would need the whole mesh on one device")
     if transform != "monolithic":
         raise ValueError(
             f"transform must be 'monolithic' or 'factorized', got {transform!r}")

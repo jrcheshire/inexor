@@ -193,6 +193,21 @@ DEVICE_PLACEMENT = {
     "coarse_decode_slab": "gone",
 }
 
+
+def shard_halo_planes():
+    """x-planes a card's shard holds beyond its 1/n_gpus of the mesh, per term.
+
+    Only for terms whose device code builds them with ghosts: the accumulator's
+    1 + 2 (`device.paint.ACC_GHOST_LO/HI`) and the force meshes' `COARSE_HALO`
+    on each side (`device.coarse`; 993866 held 516 planes per card at 4096^3,
+    record sec. 23).
+    """
+    from .device.paint import ACC_GHOST_HI, ACC_GHOST_LO
+    from .forces import COARSE_HALO
+
+    return {"coarse_accumulator": ACC_GHOST_LO + ACC_GHOST_HI,
+            "coarse_force_resident": 2 * COARSE_HALO}
+
 # MEASURED, not chosen: `scripts/v2_g4_gh_memory.py` streams pinned host memory
 # in CHUNK_GIB = 2.0 chunks and the device high-water sat at exactly 2 chunks
 # (4.0 GiB) at every rung of the 64 -> 640 GiB ladder, on one GPU and on four
@@ -288,6 +303,8 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
 
     mesh = ec.mesh_bytes()
     phase_of = ec.mesh_phase()
+    nc = int(ec.n_coarse)
+    halo = shard_halo_planes()
     resident, transient, phases, host_mesh = {}, {}, {}, {}
     for k, v in mesh.items():
         where = DEVICE_PLACEMENT.get(k)
@@ -307,7 +324,10 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
             # would look bigger.
             host_mesh[k] = int(v)
             continue
-        b = int(v / n_gpus) if where == "shard" else int(v)
+        # a shard is its 1/n_gpus of the x axis plus its ghost planes; every
+        # sharded term is whole x-planes, so v // nc is one plane's bytes exactly
+        b = (int(v / n_gpus) + (int(v) // nc) * halo.get(k, 0) if where == "shard"
+             else int(v))
         p = phase_of[k]
         if p == "resident":
             resident[k] = b

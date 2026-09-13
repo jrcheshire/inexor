@@ -199,3 +199,33 @@ def test_x64_off_is_refused():
             dpaint.coarse_delta_cards(st, cfg)
     finally:
         jax.config.update("jax_enable_x64", prev)
+
+
+# ------------------------------------------------ the solve reads the cards
+
+
+@pytest.mark.parametrize("coarse_dtype", ["float32", "float64"])
+@pytest.mark.parametrize("w", [1, 4])
+def test_the_solve_from_the_cards_is_bitwise_the_host_density_solve(w, coarse_dtype):
+    from inexor import forces
+
+    cfg = _cfg(coarse_dtype=coarse_dtype)
+    st = _state(cfg, 4, arena=True)
+    host = engine.coarse_delta_streamed(st, cfg)
+    shards = dpaint.coarse_delta_cards(st, cfg, devices=_devices(w))
+    want = forces.coarse_force_meshes(host, N_COARSE, L_BOX, "long", r_s=cfg.r_s)
+    got = forces.coarse_force_meshes(shards, N_COARSE, L_BOX, "long", r_s=cfg.r_s)
+    for i in range(3):
+        assert got[i].dtype == want[i].dtype == np.dtype(coarse_dtype)
+        assert np.array_equal(got[i], want[i]), f"component {i}, {w} card(s)"
+    assert float(np.abs(want[0]).max()) > 0, "vacuous: zero force"
+
+
+def test_a_monolithic_solve_of_card_shards_is_refused():
+    from inexor import forces
+
+    cfg = _cfg()
+    shards = dpaint.coarse_delta_cards(_state(cfg, 2), cfg, devices=_devices(2))
+    with pytest.raises(ValueError, match="factorized"):
+        forces.coarse_force_meshes(shards, N_COARSE, L_BOX, "long", r_s=cfg.r_s,
+                                   transform="monolithic")
