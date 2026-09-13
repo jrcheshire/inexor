@@ -1395,3 +1395,120 @@ wrapping corners, extent 132, three sub-blocks per tile:
 4. Carried: the GPU-vs-CPU floor at P=576; the short kernels as program
    arguments; `tile_workspace` in the planner; `JIT_LONG_FORCE_EPS` on one
    state; the `codec` division exposure for D3; a per-tile slab window.
+
+## 23. The coarse mesh on the card, Vista 993866 -- the device gather is 0.19 ms at the 4096^3 shard, and the step loop does not slow
+
+`3790d66`, 2026-09-13, gb node c672-011, COMPLETED rc=0 in 7:45.
+Submitted with `D2E_ARMS=loop+loop-shard+dgather+numa+xback576`, bundled at JC's
+direction; cards `runs/v2/d2e_device_tile_shard_{gb,gbsmoke}.json`, log copied to
+`runs/v2/d2e-tile-993866.log`. Every arm its own process; the smoke leg passed
+every arm first.
+
+### The step loop with the coarse mesh on the card (cgh64, tile 512, P=576, one GB200)
+
+`tile_loop_device`, results on the device, one copy-back per step (1.02 GB).
+`loop` stages each tile's three sub-blocks on the host and uploads them;
+`loop-shard` holds the coarse meshes as a resident shard and gathers the
+sub-blocks inside the tile program (`coarse_shard=`, bitwise host staging,
+sec. 22's commit `f43646f`). Same node, same process shape.
+
+| | coarse on host | coarse on card |
+|---|---|---|
+| untimed step, 8 tiles (the reference wall) | 873.2 ms = 109.1 ms/tile | **850.7 ms = 106.3 ms/tile** |
+| synced timed, per tile: plan | 6.5 ms | 6.5 ms |
+| stage (host) | **23.0 ms** | 0.3 ms |
+| h2d_tile | 9.1 ms | 5.5 ms |
+| compute | 75.3 ms | 75.4 ms |
+| copy-back, once per step | 229.6 ms | 231.2 ms |
+| device peak over baseline | 17.56 GB | 17.52 GB |
+
+- **On one card, placement moves the untimed wall by 2.6%**, 2.8 ms/tile, where
+  the synced phases say the host path spends 26 ms/tile more. The gap is the
+  sec. 21 trap in the other direction: unsynced, host staging overlaps the
+  previous tile's device compute, so most of its 23 ms is not on the wall. One
+  untimed reading per arm; 993837's host-path reading was 883 ms, so run-to-run
+  spread is of the same order as the difference.
+- **Compute is identical** (75.3 vs 75.4 ms): the gather inside the program
+  costs nothing visible.
+- **Not measured: the host path under four cards.** Sec. 22's four-card tile
+  loop lost ~19% per card to an unattributed shared resource; host staging is a
+  per-tile host-memory pass that four processes would share. Neither arm here
+  was run four-wide.
+
+### The device gather at the real shard size
+
+One card's 4096^3 coarse shard: three f32 meshes of 516 x 2048 x 2048 (x origin
+-2, so 512 owned planes plus two ghost planes each side), **25.97 GB, built on
+the device in 0.59 s**; compile 0.11 s. 32 tile positions at 4096^3 geometry
+including wrapping corners, extent 132, three blocks per tile.
+
+| | per tile, median | p90 |
+|---|---|---|
+| device gather (`subblock_device`) | **0.19 ms** | 0.20 ms |
+| upload of host-staged blocks (27.6 MB) | 3.86 ms | 3.89 ms |
+| host staging from a 2048^3 mesh (sec. 22, for reference) | 22.7 ms | 22.9 ms |
+
+- **Every block equals its formula bitwise, and a wrong offset differs**
+  (anti-vacuity), so the gather reads the right cells.
+- Device peak over baseline 26.04 GB: the shard plus 64 MB. **The planner's
+  `coarse_force_resident` charges 25.770 GB per card, the owned planes only;
+  the ghost planes add 0.20 GB per card**, too small to move any verdict.
+
+### Memory binding applies
+
+A 2 GB touched allocation under `numactl` bound to socket 1 reads policy
+`bind:1` in `numa_maps`, all 32,771 pages on N1; unbound it reads `default`.
+**`--membind` takes effect, and `numa_maps` is the receipt that can see it**
+(sec. 22's `Mems_allowed_list` could not). The unbound process's pages also
+landed on N1 (first touch where it ran), so placement alone would not have
+distinguished the two.
+
+### The GPU-vs-CPU floor at P=576, one tile, no bar applied
+
+Check A on Grace at P=576: the eager device tile equals `engine.tile_task`
+exactly (16,777,547 owned; CPU jit 26.9 s). GPU against that CPU arm:
+
+| quantity | values differing | eps x rms | rms-relative |
+|---|---|---|---|
+| layout | **0** | -- | -- |
+| short force, alone and in the jitted tile (f64) | 93.2% | **26.9** | 7.3e-16 |
+| long force (f32 coarse) | 50.7% | **8.2** | 6.4e-8 |
+| kicked velocity (f64) | 88.1% | -- (sec. 18's note) | 2.1e-8 |
+| velocity codes | 5,547 of 50,332,641, each by 1 | -- | -- |
+| per-brick scales | -- | -- | max relative 4.6e-8 |
+
+- **The short force's floor keeps growing with P: 11.3 (P=32), 19.6 (P=320),
+  26.9 (P=576). The long force's does not: 8.2 at both P=320 and P=576.** One
+  tile at P=576, so a tolerance set from this carries one reading.
+
+### The placement decision, as measured (JC's call)
+
+Coarse meshes, their kernel prefactor and match factor, the paint accumulator
+and the coarse delta are the terms that move with placement.
+`inexor.plan --preset c-hero --backend device` shards them (`DEVICE_PLACEMENT`);
+moving the planner's own per-card figures x 4 onto the host is arithmetic, not a
+planner run:
+
+| | host | per card |
+|---|---|---|
+| sharded on the cards (planner, today) | 956.3 GB, **0.93x** of 1026 | 144.5 GB, **0.73x** of 199 |
+| on the host: + resident meshes, pref, match factor (137.5 GB) | 1093.7 GB, 1.07x | -- |
+| + the paint phase's accumulator and delta (103.1 GB) | 1196.8 GB, **1.17x** | -- |
+| + the solve phase's delta and copy, summed as the CPU column sums (68.7 GB) | 1265.5 GB, **1.23x** | -- |
+
+On time, one card: card placement is 2.6% faster on the untimed wall, with an
+identical compute term. The four-card host-path cost is the unmeasured side.
+
+**DECIDED (JC, 2026-09-13): the coarse mesh lives on the cards**, sharded as
+`plan.DEVICE_PLACEMENT` already charges it. Host placement does not fit a gb
+node's host at 1.17-1.23x; card placement is not slower.
+
+### Owed
+
+1. A card-resident paint accumulator behind the `HostInt64Accumulator` seam
+   (`device/paint.py`), now that the cards hold the coarse mesh.
+2. The planner's `coarse_force_resident` without the ghost planes (0.20 GB/card).
+3. Carried: the cross-backend tolerance (JC) from the floor above; the four-card
+   ~19% per-card slowdown; the short kernels as program arguments;
+   `tile_workspace` in the planner; `JIT_LONG_FORCE_EPS` on one state; the
+   `codec` division exposure for D3; a per-tile slab window.
