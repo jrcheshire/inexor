@@ -450,8 +450,9 @@ def test_the_release_census_fires_on_a_dropped_emigrant(monkeypatch):
     """
     orig = state.SlotState._insert_slab
 
-    def pinned(self, bx, staged, emig, reach=(-1, 0, 1), consumed=None, scales=None):
-        return orig(self, bx, staged, emig, (-1, 0, 1), consumed, scales=scales)
+    def pinned(self, bx, staged, emig, reach=(-1, 0, 1), consumed=None, scales=None,
+               kernel="numpy"):
+        return orig(self, bx, staged, emig, (-1, 0, 1), consumed, scales=scales, kernel=kernel)
 
     monkeypatch.setattr(state.SlotState, "_insert_slab", pinned)
     x = _positions(30)

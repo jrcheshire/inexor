@@ -402,7 +402,10 @@ def brick_reach(st, c_drift, vel_scale=None):
     return int(np.ceil(abs(float(c_drift)) * s * INT16_MAX / extent))
 
 
-def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy"):
+def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert_kernel="numpy"):
+    # `insert_kernel="jax"` routes every `_insert_slab` through `insert_jax`,
+    # independently of the eject's `kernel`; both default to numpy here for the
+    # reason the NB below gives.
     # NB this default stays "numpy" while `EngineConfig.eject_kernel` defaults to
     # "jax", and the asymmetry is deliberate. The engine always passes the config
     # value, so nothing routes through this default in production; what DOES use
@@ -490,7 +493,8 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy"):
             if d in inserted:
                 continue
             if all(((d + o) % nb) in emig for o in reach):
-                n_over += st._insert_slab(d, staged, emig, reach, consumed, scales=scales)
+                n_over += st._insert_slab(d, staged, emig, reach, consumed, scales=scales,
+                                          kernel=insert_kernel)
                 inserted.add(d)
         # release what no pending write can still need
         for s2 in list(staged):
@@ -1437,7 +1441,8 @@ class SlotState:
         )
 
     def _insert_slab(
-        self, bx, staged, emig, reach=(-1, 0, 1), consumed=None, scales=None, spill_sink=None
+        self, bx, staged, emig, reach=(-1, 0, 1), consumed=None, scales=None, spill_sink=None,
+        kernel="numpy",
     ):
         """Write one slab's bricks back: keepers + immigrants + arena residents.
 
@@ -1458,7 +1463,15 @@ class SlotState:
 
         `scales` is the pre-migration snapshot, needed because a row arrives
         holding a code written at its SOURCE brick's scale.
+
+        `kernel="jax"` routes to `_insert_slab_jax`, gated elementwise against
+        this function, which stays the reference and is never conditionally
+        modified (the same rule `_eject_slab` states).
         """
+        if kernel == "jax":
+            return self._insert_slab_jax(bx, staged, emig, reach, consumed, scales, spill_sink)
+        if kernel != "numpy":
+            raise ValueError(f"unknown insert kernel {kernel!r}; expected 'numpy' or 'jax'")
         nb = self.bricks_per_side
         p3 = self.buckets_per_brick
         lo_b, hi_b = self.slab_bricks(bx)
@@ -1535,6 +1548,72 @@ class SlotState:
                 )
             n_over += self._write_brick(b, dest, off, w, ids, spill_sink=spill_sink)
         return n_over
+
+    def _insert_slab_jax(self, bx, staged, emig, reach=(-1, 0, 1), consumed=None,
+                         scales=None, spill_sink=None):
+        """`_insert_slab` with the grouping, scale, rescale and within-brick order
+        compiled (`insert_jax`). Same contract, return value and mutations.
+
+        Kept here: the consumption census (line for line), each row's old-scale
+        gather, the writes into the state, and every arena claim, replayed per
+        brick in ascending order -- `_to_arena` takes the lowest free slots, so the
+        order of claims is the arena layout. An int16 escape refuses before any
+        write, where the numpy path refuses at the offending brick.
+        """
+        from .insert_jax import insert_rows
+
+        nb = self.bricks_per_side
+        p3 = self.buckets_per_brick
+        lo_b, hi_b = self.slab_bricks(bx)
+        keep = staged[bx]
+        sources = sorted({(int(bx) + o) % nb for o in reach})
+        if consumed is not None:
+            for s in sources:
+                if s in emig and len(emig[s]["dest"]):
+                    d_slab = emig[s]["dest"] // (p3 * nb * nb)
+                    consumed[s] += int(np.count_nonzero(d_slab == bx))
+        imm = _cat_dicts([emig[s] for s in sources if s in emig])
+        has_ids = self.ids is not None
+
+        def ids_of(d):
+            return d["ids"] if d["ids"] is not None else np.empty(0, np.int32)
+
+        dest = np.concatenate([keep["dest"], imm["dest"]])
+        src_brick = np.concatenate([keep["dest"] // p3, np.asarray(imm["src"], dtype=np.int64)])
+        res = insert_rows(
+            dest, np.concatenate([keep["off"], imm["off"]]),
+            np.concatenate([keep["w"], imm["w"]]),
+            np.concatenate([ids_of(keep), ids_of(imm)]) if has_ids else None,
+            np.asarray(scales, dtype=np.float64)[src_brick], lo_b,
+            self.brick_start[lo_b:hi_b + 1], p3)
+        if res["abs_max"] > INT16_MAX:
+            raise ValueError(
+                f"velocity code {res['abs_max']:.0f} escapes int16 under a rescale to a "
+                "scale that does not cover it. Per-brick scales make this reachable where a "
+                "global scale made it impossible; the caller must fix the destination scale "
+                "over the rows it is about to write. D-007 forbids the clamp."
+            )
+        nw, ns = res["n_write"], res["n_spill"]
+        pos = res["pos"][:nw]
+        self.off[pos] = res["off"][:nw]
+        self.w[pos] = res["w"][:nw]
+        if has_ids:
+            self.ids[pos] = res["ids"][:nw]
+        self.occupancy[lo_b * p3 : hi_b * p3] = _to_index(res["occupancy"], self.index_dtype,
+                                                          "migrated")
+        self.vel_scale[lo_b:hi_b] = res["scales"]
+        if ns:
+            sl = slice(nw, nw + ns)
+            sd, so, sw = res["dest"][sl], res["off"][sl], res["w"][sl]
+            si = res["ids"][sl] if has_ids else None
+            sb = sd // p3
+            for grp in np.split(np.arange(ns), np.flatnonzero(np.diff(sb)) + 1):
+                args = (sd[grp], so[grp], sw[grp], None if si is None else si[grp])
+                if spill_sink is None:
+                    self._to_arena(*args)
+                else:
+                    spill_sink(int(sb[grp[0]]), *args)
+        return int(ns)
 
     def _write_brick(self, b, dest, off, w, ids=None, spill_sink=None):
         """Counting-sort one brick's members by bucket and write the run.
