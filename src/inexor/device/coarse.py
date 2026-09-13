@@ -29,28 +29,31 @@ from __future__ import annotations
 import numpy as np
 
 
-def shard_coarse_meshes(g_coarse, x0, nx):
-    """Place x-planes `x0 .. x0 + nx - 1` (mod n) of each host coarse mesh on the
-    device, as a shard dict: `meshes` (three (nx, n, n) device arrays), `x0`,
-    `nx`, `n`. Copies; blocks until placed."""
+def shard_coarse_meshes(g_coarse, x0, nx, device=None):
+    """Place x-planes `x0 .. x0 + nx - 1` (mod n) of each host coarse mesh on
+    `device` (None: jax's default), as a shard dict: `meshes` (three (nx, n, n)
+    device arrays), `x0`, `nx`, `n`. Copies; blocks until placed."""
     import jax
     import jax.numpy as jnp
 
     n = int(np.asarray(g_coarse[0]).shape[0])
     planes = (int(x0) + np.arange(int(nx), dtype=np.int64)) % n
-    meshes = tuple(jax.block_until_ready(jnp.array(np.take(np.asarray(g), planes, axis=0),
-                                                   copy=True))
-                   for g in g_coarse)
+
+    def place(g):
+        a = np.take(np.asarray(g), planes, axis=0)  # a fresh buffer either way
+        return jnp.array(a, copy=True) if device is None else jax.device_put(a, device)
+
+    meshes = tuple(jax.block_until_ready(place(g)) for g in g_coarse)
     return dict(meshes=meshes, x0=int(x0), nx=int(nx), n=n)
 
 
-def whole_mesh_shard(g_coarse, halo=None):
+def whole_mesh_shard(g_coarse, halo=None, device=None):
     """The whole mesh as one card's shard, `halo` planes wrapped onto each end."""
     from ..forces import COARSE_HALO
 
     h = COARSE_HALO if halo is None else int(halo)
     n = int(np.asarray(g_coarse[0]).shape[0])
-    return shard_coarse_meshes(g_coarse, -h, n + 2 * h)
+    return shard_coarse_meshes(g_coarse, -h, n + 2 * h, device)
 
 
 def check_covers(shard, origin_cells, extent):

@@ -487,9 +487,14 @@ def arm_split(args):
     st, C = s["st"], s["C"]
     tiles = _part(list(s["ec"].tiles), args.part)
     ds = dtile.stage_state_on_device(st)
+    shard = None
+    if args.coarse_device:
+        from inexor.device import coarse as dcoarse
+
+        shard = dcoarse.whole_mesh_shard(s["g_coarse"])
     t0 = time.perf_counter()
     dtile.tile_loop_device(st, s["one_tile"], C, s["g_coarse"], s["members"], s["shapes"],
-                           tiles=tiles, device_state=ds, write_host=False)
+                           tiles=tiles, device_state=ds, write_host=False, coarse_shard=shard)
     warm_s = time.perf_counter() - t0
     tag = f"[split {args.label} part {args.part}]"
     _say(f"{tag} {len(tiles)} tiles, warm step {warm_s:.1f}s, receipt {receipt}")
@@ -502,17 +507,110 @@ def arm_split(args):
     for _ in range(int(args.steps)):
         t0 = time.perf_counter()
         dtile.tile_loop_device(st, s["one_tile"], C, s["g_coarse"], s["members"],
-                               s["shapes"], tiles=tiles, device_state=ds, write_host=False)
+                               s["shapes"], tiles=tiles, device_state=ds, write_host=False,
+                               coarse_shard=shard)
         walls.append(time.perf_counter() - t0)
     total = time.perf_counter() - t_all
     n = int(args.steps) * len(tiles)
     _say(f"{tag} {int(args.steps)} steps x {len(tiles)} tiles in {total:.3f}s = "
          f"{n / total:.2f} tiles/s ({total / n * 1e3:.1f} ms/tile); median step "
-         f"{np.median(walls):.3f}s")
+         f"{np.median(walls):.3f}s; coarse on {'device' if shard else 'host'}")
     return dict(arm="split", label=args.label, part=args.part, platform=platform,
                 receipt=receipt, P=s["P"], cap=s["cap"], tiles=[list(t) for t in tiles],
+                coarse="device" if shard else "host",
                 steps=int(args.steps), warm_s=warm_s, step_walls=walls, total_s=total,
                 tiles_per_s=n / total), 0
+
+
+def arm_split_threads(args):
+    """The four-card tile loop as ONE process with a thread per card -- the
+    engine's form -- against a one-card reference in the same process. Each card
+    gets its own state copy, coarse shard (with `--coarse-device`) and part of
+    the tiles; results on the device, no copy-back. Warm steps, then a barrier so
+    every thread's timed steps start together."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    from inexor.device import coarse as dcoarse
+    from inexor.device import tile as dtile
+
+    platform = _require_device(args.allow_cpu)
+    W = int(args.gpus)
+    visible = jax.devices()
+    if len(visible) < W and not args.allow_cpu:
+        raise RuntimeError(f"{W} cards asked for and {len(visible)} devices visible")
+    devs = [visible[i % len(visible)] for i in range(W)]
+    receipt = _placement_receipt()
+    g = _geometry(args.tile_preset, args.tile, args.buf)
+    s = _setup(g, arena=False)
+    st, C = s["st"], s["C"]
+    tiles_all = list(s["ec"].tiles)
+    steps = int(args.steps)
+
+    def place(dev):
+        ds = dtile.stage_state_on_device(st, dev)
+        sh = dcoarse.whole_mesh_shard(s["g_coarse"], device=dev) if args.coarse_device else None
+        return ds, sh
+
+    def loop(dev, tiles, ds, sh):
+        dtile.tile_loop_device(st, s["one_tile"], C, s["g_coarse"], s["members"], s["shapes"],
+                               tiles=tiles, device_state=ds, write_host=False,
+                               coarse_shard=sh, device=dev)
+
+    ds0, sh0 = place(devs[0])
+    t0 = time.perf_counter()
+    loop(devs[0], tiles_all, ds0, sh0)
+    ref_warm = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    for _ in range(steps):
+        loop(devs[0], tiles_all, ds0, sh0)
+    ref_total = time.perf_counter() - t0
+    ref_rate = steps * len(tiles_all) / ref_total
+    ds0 = sh0 = None
+    _say(f"[split-threads] one card: {steps} steps x {len(tiles_all)} tiles in "
+         f"{ref_total:.3f}s = {ref_rate:.2f} tiles/s (warm {ref_warm:.1f}s)")
+
+    parts = [_part(tiles_all, f"{i}/{W}") for i in range(W)]
+    placed = [place(devs[i]) for i in range(W)]
+    used = len({str(next(iter(ds["w"].devices()))) for ds, _sh in placed})
+    barrier = threading.Barrier(W)
+    per = [None] * W
+
+    def run(i):
+        ds, sh = placed[i]
+        t0 = time.perf_counter()
+        loop(devs[i], parts[i], ds, sh)
+        warm = time.perf_counter() - t0
+        barrier.wait()
+        t0 = time.perf_counter()
+        for _ in range(steps):
+            loop(devs[i], parts[i], ds, sh)
+        total = time.perf_counter() - t0
+        per[i] = dict(tiles=len(parts[i]), warm_s=warm, total_s=total,
+                      tiles_per_s=steps * len(parts[i]) / total)
+
+    with ThreadPoolExecutor(max_workers=W) as ex:
+        for f in [ex.submit(run, i) for i in range(W)]:
+            f.result()
+    sum_rate = sum(p["tiles_per_s"] for p in per)
+    # a step ends when its slowest card does
+    wall_rate = steps * len(tiles_all) / max(p["total_s"] for p in per)
+    _say(f"[split-threads] {W} cards, one thread each ({used} devices used): "
+         f"{sum_rate:.2f} tiles/s summed = {sum_rate / ref_rate:.2f}x; by the slowest card "
+         f"{wall_rate:.2f} tiles/s = {wall_rate / ref_rate:.2f}x; per card "
+         f"{[round(p['tiles_per_s'], 2) for p in per]}; coarse on "
+         f"{'device' if args.coarse_device else 'host'}")
+    rc = 0 if (used == W or args.allow_cpu) else 3
+    return dict(arm="split-threads", platform=platform, receipt=receipt, P=s["P"],
+                cap=s["cap"], cards=W, devices_used=used, steps=steps,
+                coarse="device" if args.coarse_device else "host",
+                ref_warm_s=ref_warm, ref_total_s=ref_total, ref_tiles_per_s=ref_rate,
+                per_card=per, sum_tiles_per_s=sum_rate, wall_tiles_per_s=wall_rate,
+                split_efficiency_sum=sum_rate / ref_rate,
+                split_efficiency_wall=wall_rate / ref_rate), rc
 
 
 def arm_stage(args):
@@ -704,7 +802,7 @@ def arm_numa(args):
 
 ARMS = {"xback-cpu": arm_xback_cpu, "xback-gpu": arm_xback_gpu, "short": arm_short,
         "tile": arm_tile, "loop": arm_loop, "split": arm_split, "stage": arm_stage,
-        "dgather": arm_dgather, "numa": arm_numa}
+        "dgather": arm_dgather, "numa": arm_numa, "split-threads": arm_split_threads}
 
 
 def _pin_prefix(socket, socket_cores):
@@ -824,6 +922,10 @@ def main(argv=None):
     ap.add_argument("--coarse-device", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--stage-n", type=int, default=2048, help="coarse mesh side, stage arm")
     ap.add_argument("--stage-tiles", type=int, default=32)
+    ap.add_argument("--split-modes", default="pinned,unpinned",
+                    help="which process-split legs to run")
+    ap.add_argument("--split-coarse-device", action="store_true",
+                    help="split legs hold the coarse meshes on each card")
     ap.add_argument("--allow-cpu", action="store_true")
     ap.add_argument("--smoke", action="store_true",
                     help="smoke geometry everywhere, CPU allowed: exercises the apparatus only")
@@ -892,12 +994,27 @@ def main(argv=None):
             card["arms"].append(res)
             write()
             worst = max(worst, rc)
+    coarse_flag = ["--coarse-device"] if args.split_coarse_device else []
+
+    def threads_leg(tag):
+        nonlocal worst
+        res, rc = _run_worker(["--arm", "split-threads", *common, "--steps", str(args.steps),
+                               "--gpus", str(args.gpus), *coarse_flag], {},
+                              f"split-threads {tag}")
+        card["arms"].append(res)
+        write()
+        worst = max(worst, rc)
+
+    # threads BRACKET the process legs, so node drift over the job shows as a
+    # difference between the two threads readings rather than inside the ratio
+    if "split-threads" in arms:
+        threads_leg("before")
     if "split" in arms:
         sockets = [int(x) for x in args.gpu_sockets.split(",")]
         cores = args.socket_cores.split(",")
-        split_common = [*common, "--steps", str(args.steps)]
-        for pinned in (True, False):
-            mode = "pinned" if pinned else "unpinned"
+        split_common = [*common, "--steps", str(args.steps), *coarse_flag]
+        for mode in args.split_modes.split(","):
+            pinned = mode == "pinned"
             prefix0, method = _pin_prefix(sockets[0], cores) if pinned else ([], "none")
             card.setdefault("pinning_method", {})[mode] = method
             ref = [(["--arm", "split", "--label", f"ref-{mode}", "--part", "0/1",
@@ -922,6 +1039,8 @@ def main(argv=None):
                      f"= {r4 / r1:.2f}x (method {method})")
             write()
             worst = max(worst, rc)
+    if "split-threads" in arms and "split" in arms:
+        threads_leg("after")
     if "numa" in arms:
         cores = args.socket_cores.split(",")
         prefix1, method = _pin_prefix(1, cores)

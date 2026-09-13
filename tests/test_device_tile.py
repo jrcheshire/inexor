@@ -363,6 +363,62 @@ def test_a_device_coarse_shard_step_writes_the_host_staged_state():
     assert np.array_equal(st_d.vel_scale, st_h.vel_scale), "per-brick scales differ"
 
 
+# ------------------------------------------------ one thread per card
+
+
+def _devices(w):
+    """`w` device handles, replicating if the backend has fewer (as in
+    `test_ooc_fft._devices`); with `--xla_force_host_platform_device_count=4`
+    they are distinct devices."""
+    import jax
+
+    devs = jax.devices()
+    return [devs[i % len(devs)] for i in range(w)]
+
+
+@pytest.mark.parametrize("coarse_on_cards", [False, True])
+def test_a_threaded_four_card_step_writes_the_one_device_state(coarse_on_cards):
+    """One thread per card -- its own device, state copy, coarse shard and part of
+    the tiles -- writes, merged, exactly the state one device writes. A tile
+    writes only rows and bricks it owns, so the cards' writes are disjoint."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from inexor.device import coarse as dcoarse
+
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = dtile.tile_step_shapes(st)
+    st_ref = copy.deepcopy(st)
+    sh = dcoarse.whole_mesh_shard(g_coarse) if coarse_on_cards else None
+    dtile.tile_loop_device(st_ref, one_tile, C, g_coarse, members, shapes, coarse_shard=sh)
+    assert not np.array_equal(st_ref.w, st.w), "vacuous: the step wrote nothing"
+
+    devs = _devices(4)
+    parts = [[cfg.tiles[i] for i in p] for p in np.array_split(np.arange(len(cfg.tiles)), 4)]
+
+    def run(k):
+        ds = dtile.stage_state_on_device(st, devs[k])
+        shk = (dcoarse.whole_mesh_shard(g_coarse, device=devs[k]) if coarse_on_cards
+               else None)
+        out = dtile.tile_loop_device(st, one_tile, C, g_coarse, members, shapes,
+                                     tiles=parts[k], device_state=ds, write_host=False,
+                                     coarse_shard=shk, device=devs[k])
+        assert ds["w"].devices() == {devs[k]}, "the card's state left its device"
+        return out["n_owned"], np.asarray(ds["w"]), np.asarray(ds["vel_scale"])
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        results = list(ex.map(run, range(4)))
+    w, vs = st.w.copy(), st.vel_scale.copy()
+    for k, (_n, wk, vk) in enumerate(results):
+        changed = wk != st.w
+        assert changed.any(), f"vacuous: card {k} wrote nothing"
+        w[changed] = wk[changed]
+        vchanged = vk != st.vel_scale
+        vs[vchanged] = vk[vchanged]
+    assert sum(r[0] for r in results) == st.n_particles
+    assert np.array_equal(w, st_ref.w), "velocity codes differ"
+    assert np.array_equal(vs, st_ref.vel_scale), "per-brick scales differ"
+
+
 def test_the_jit_floor_can_fail():
     """Anti-vacuity: coarse meshes moved by 1e-13 relative (~450 f64 eps) must
     exceed the floor."""

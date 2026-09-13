@@ -22,8 +22,9 @@ WHAT MOVES AND WHAT DOES NOT, relative to the host form.
   promotion of an f32 force arm is the host's and not a cast of this module's
   choosing. `device.kick.kick_and_quantize` casts both arms to f64 first, which
   differs from the host whenever the fine arm is f32.
-- The coarse sub-blocks are still staged on the host (`stage_coarse_subblock`)
-  and copied per tile. That is a seam: where the coarse mesh lives is undecided.
+- The coarse sub-blocks are staged on the host (`stage_coarse_subblock`) and
+  copied per tile, unless `coarse_shard=` holds the meshes on the card, where the
+  design keeps them (record sec. 23).
 - D-007's int16 range refusal is not on this path, as in D2b: by construction
   the extremes land on +-32767, and `kick.assert_int16_range_device` is the
   explicit check for gates.
@@ -59,14 +60,17 @@ Nothing here is wired into `engine.step`.
 
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
 
 # One compiled tile program per set of static parameters, and a count of
-# traces: the receipt that one executable served every tile.
+# traces: the receipt that one executable served every tile. The lock guards
+# the cache when one thread per card asks for the program first.
 _KERNELS = {}
 _TRACES = [0]
+_KERNEL_LOCK = threading.Lock()
 
 STATE_FIELDS = ("off", "w", "vel_scale", "arena_bucket")
 
@@ -103,9 +107,9 @@ def tile_step_shapes(st, floor=None):
         floor_shape=int(floor.get("arena_rect", 0)))))
 
 
-def stage_state_on_device(st):
-    """The state arrays the jitted tile decodes against, COPIED onto the device
-    once, for `device_state=`. Blocks until placed.
+def stage_state_on_device(st, device=None):
+    """The state arrays the jitted tile decodes against, COPIED onto `device`
+    (None: jax's default device) once, for `device_state=`. Blocks until placed.
 
     A copy on every backend, never a view of the host arrays: `tile_loop_device`
     donates `w` and `vel_scale` to its program, and a donated buffer that aliased
@@ -114,7 +118,11 @@ def stage_state_on_device(st):
     import jax
     import jax.numpy as jnp
 
-    return {k: jax.block_until_ready(jnp.array(getattr(st, k), copy=True))
+    if device is None:
+        return {k: jax.block_until_ready(jnp.array(getattr(st, k), copy=True))
+                for k in STATE_FIELDS}
+    return {k: jax.block_until_ready(jax.device_put(np.array(getattr(st, k), copy=True),
+                                                    device))
             for k in STATE_FIELDS}
 
 
@@ -193,8 +201,8 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
         return w_new, vs_new, {k: out[k] for k in ("n_own", "n_out", "lo", "hi")}
 
     fn = jax.jit(body_write, donate_argnums=(7, 8)) if write else jax.jit(body)
-    _KERNELS[key] = fn
-    return fn
+    with _KERNEL_LOCK:
+        return _KERNELS.setdefault(key, fn)
 
 
 def tile_task_device(st, one_tile, C, g_coarse, t, bricks, jit=False, shapes=None,
@@ -335,15 +343,15 @@ def _clock(timings, accumulate=False):
 
 
 def _jit_inputs(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells, extent,
-                shapes, with_forces, write, mark, coarse_shard=None):
+                shapes, with_forces, write, mark, coarse_shard=None, device=None):
     """(program, leading args, trailing args) for one tile; the state arrays go
     between them. Host work and the per-tile upload, marked `stage` and
     `h2d_tile`. With `coarse_shard` (`device.coarse`), the shard meshes go in
-    place of host-staged blocks and the program gathers them."""
-    import jax.numpy as jnp
-
+    place of host-staged blocks and the program gathers them; they must already
+    be on `device`, where every other input is placed (None: jax's default)."""
     from ..forces import stage_coarse_subblock
     from .coarse import check_covers
+    from .paint import _on
 
     nb = int(C["n_fine"]) // int(C["n_brick"])
     n_b = len(bricks)
@@ -361,30 +369,30 @@ def _jit_inputs(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells, ext
         n_brick=int(C["n_brick"]), n_coarse=int(C["n_coarse"]),
         coarse_cell=C["coarse_cell"], box=C["box"], t9=st.t9, with_forces=with_forces,
         write=write, coarse_extent=None if coarse_shard is None else int(extent))
+    d = device
     if coarse_shard is None:
-        sub = [stage_coarse_subblock(g, o_cells, extent) for g in g_coarse]
+        sub = [_on(stage_coarse_subblock(g, o_cells, extent), d) for g in g_coarse]
         extra = []
     else:
         if int(coarse_shard["n"]) != int(C["n_coarse"]):
             raise ValueError(f"coarse shard n={coarse_shard['n']} against n_coarse "
                              f"{C['n_coarse']}")
         check_covers(coarse_shard, o_cells, extent)
-        sub = list(coarse_shard["meshes"])
-        extra = [jnp.asarray(int(coarse_shard["x0"]), dtype=jnp.int64)]
+        sub = list(coarse_shard["meshes"])  # already resident; never pulled back
+        extra = [_on(int(coarse_shard["x0"]), d, np.int64)]
     mark("stage")
 
-    head = [jnp.asarray(plan["starts"]), jnp.asarray(plan["occ"]),
-            jnp.asarray(plan["live_counts"]), jnp.asarray(rect),
-            jnp.asarray(plan["row_offsets"]), jnp.asarray(bricks)]
-    tail = [jnp.asarray(int(st.arena_base), dtype=jnp.int64),
-            jnp.asarray(int(plan["n_rows"]), dtype=jnp.int64),
-            jnp.asarray(origin, dtype=jnp.float64),
-            jnp.asarray(np.asarray(t, dtype=np.int64)),
-            jnp.asarray(np.asarray(o_cells), dtype=jnp.int32),
-            *(jnp.asarray(s) for s in sub),
-            jnp.asarray(C["alpha_k"], dtype=jnp.float64),
-            jnp.asarray(C["bcoef"], dtype=jnp.float64),
-            jnp.full((n_b,), 32767.0, dtype=jnp.float64), *extra]
+    head = [_on(plan["starts"], d), _on(plan["occ"], d), _on(plan["live_counts"], d),
+            _on(rect, d), _on(plan["row_offsets"], d), _on(bricks, d)]
+    tail = [_on(int(st.arena_base), d, np.int64),
+            _on(int(plan["n_rows"]), d, np.int64),
+            _on(origin, d, np.float64),
+            _on(np.asarray(t, dtype=np.int64), d),
+            _on(np.asarray(o_cells), d, np.int32),
+            *sub,
+            _on(C["alpha_k"], d, np.float64),
+            _on(C["bcoef"], d, np.float64),
+            _on(np.full((n_b,), 32767.0), d, np.float64), *extra]
     mark("h2d_tile", *head, *tail)
     return fn, head, tail
 
@@ -428,7 +436,8 @@ def _tile_task_jit(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells,
 
 
 def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
-                     device_state=None, write_host=True, timings=None, coarse_shard=None):
+                     device_state=None, write_host=True, timings=None, coarse_shard=None,
+                     device=None):
     """One step's tile loop on the device, writing the kick into the device state.
 
     `members` maps tile -> bricks (`SlotState.tile_bricks`) and `tiles` selects
@@ -447,6 +456,11 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
     dict, accumulates synced phase seconds over the loop (`plan`, `stage`,
     `h2d_tile`, `compute`) plus `d2h_state` once. `coarse_shard`, as in
     `tile_task_device`, gathers the coarse sub-blocks on the device.
+
+    `device` places every per-tile input, and a default `device_state`, on that
+    device (None: jax's default); a caller-supplied `device_state` and
+    `coarse_shard` must already live there. One thread per card, each with its
+    own `device`, state copy and tiles, is the four-card form.
     """
     import jax.numpy as jnp
 
@@ -462,7 +476,7 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
     require_x64()
     full_step = tiles is None
     tiles = list(members) if full_step else list(tiles)
-    ds = stage_state_on_device(st) if device_state is None else device_state
+    ds = stage_state_on_device(st, device) if device_state is None else device_state
     mark = _clock(timings, accumulate=True)
     cap = int(C["cap"])
     los, his, extents, owns, outs = [], [], [], [], []
@@ -481,7 +495,7 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
         mark("plan")
         fn, head, tail = _jit_inputs(st, one_tile, C, g_coarse, t, bricks, plan, origin,
                                      o_cells, extent, shapes, False, True, mark,
-                                     coarse_shard)
+                                     coarse_shard, device)
         w_new, vs_new, sc = fn(*head, ds["off"], ds["w"], ds["vel_scale"],
                                ds["arena_bucket"], *tail)
         ds["w"], ds["vel_scale"] = w_new, vs_new

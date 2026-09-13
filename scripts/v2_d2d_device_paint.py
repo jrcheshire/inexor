@@ -500,24 +500,38 @@ def arm_cards_scale(args):
     shards = [dict(lo=a.lo, hi=a.hi, device=d, delta=x)
               for a, d, x in zip(accs, devs, deltas)]
     accs = deltas = None  # free the accumulators on the cards before the transforms
-    tc = {}
-    t0 = time.perf_counter()
-    spec_c = ooc_fft.forward_from_card_planes(shards, n, timings=tc)
-    cards_fwd_s = time.perf_counter() - t0
     t0 = time.perf_counter()
     dh = dpaint.gather_card_delta(shards)
     gather_s = time.perf_counter() - t0
-    del shards
-    th = {}
-    t0 = time.perf_counter()
-    spec_h = ooc_fft.forward_from_slabs_device(lambda lo, hi: dh[lo:hi], n,
-                                               devices=devs, timings=th)
-    host_fwd_s = time.perf_counter() - t0
-    spec_ok = bool(np.array_equal(spec_c, spec_h))
-    _say(f"[cards-scale] forward from the cards {cards_fwd_s:.2f}s (pass 1 "
-         f"{tc['pass1_s']:.2f}, pass 2 {tc['pass2_s']:.2f}) vs from host slabs "
-         f"{host_fwd_s:.2f}s (pass 1 {th['pass1_s']:.2f}, pass 2 {th['pass2_s']:.2f}); "
-         f"density to host {gather_s:.2f}s; spectra BITWISE = {spec_ok}")
+
+    def fwd(leg):
+        t = {}
+        t0 = time.perf_counter()
+        if leg == "cards":
+            spec = ooc_fft.forward_from_card_planes(shards, n, timings=t)
+        else:
+            spec = ooc_fft.forward_from_slabs_device(lambda lo, hi: dh[lo:hi], n,
+                                                     devices=devs, timings=t)
+        return spec, dict(total_s=time.perf_counter() - t0, pass1_s=t["pass1_s"],
+                          pass2_s=t["pass2_s"])
+
+    # one warm call per leg, then ABBA, so neither leg carries compilation or the
+    # position in the job
+    warm = {leg: fwd(leg)[1] for leg in ("cards", "host")}
+    reps, last = {"cards": [], "host": []}, {}
+    for leg in ("cards", "host", "host", "cards"):
+        last[leg] = None
+        last[leg], r = fwd(leg)
+        reps[leg].append(r)
+    spec_ok = bool(np.array_equal(last["cards"], last["host"]))
+    med = {leg: {k: float(np.median([r[k] for r in reps[leg]]))
+                 for k in ("total_s", "pass1_s", "pass2_s")} for leg in reps}
+    _say(f"[cards-scale] forward, warm then ABBA, medians: from the cards "
+         f"{med['cards']['total_s']:.2f}s (pass 1 {med['cards']['pass1_s']:.2f}, pass 2 "
+         f"{med['cards']['pass2_s']:.2f}) vs from host slabs {med['host']['total_s']:.2f}s "
+         f"(pass 1 {med['host']['pass1_s']:.2f}, pass 2 {med['host']['pass2_s']:.2f}); warm "
+         f"{warm['cards']['total_s']:.2f} / {warm['host']['total_s']:.2f}s; density to host "
+         f"{gather_s:.2f}s; spectra BITWISE = {spec_ok}")
 
     rec = dict(arm="cards-scale", platform=platform, n_coarse=n, bricks_per_side=nb,
                cards=W, ranges=ranges, chunk_bricks=L, block_extent=list(extent),
@@ -526,15 +540,72 @@ def arm_cards_scale(args):
                ghost_planes_nonzero=fs["coarse_ghost_planes_nonzero"], mass=mass,
                want_mass=want_mass, mass_exact=mass_ok, decode_s=decode_s, peak_int=peak,
                decode_bitwise_numpy=decode_ok, device_peaks=peaks,
-               cards_forward_s=cards_fwd_s, cards_pass1_s=tc["pass1_s"],
-               cards_pass2_s=tc["pass2_s"], host_forward_s=host_fwd_s,
-               host_pass1_s=th["pass1_s"], host_pass2_s=th["pass2_s"],
-               gather_to_host_s=gather_s, spectra_bitwise=spec_ok)
+               forward_warm=warm, forward_reps=reps, forward_order="warm each, then ABBA",
+               forward_median=med, gather_to_host_s=gather_s, spectra_bitwise=spec_ok)
     return rec, 0 if (mass_ok and decode_ok and spec_ok) else 3
 
 
+def arm_cards_paint(args):
+    """The paint's split across cards at real per-chunk row counts:
+    `coarse_delta_cards` on one card and on four, same state and process, one
+    warm call per width then 1-4-4-1-1-4, the density hash-equal across widths."""
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    from inexor.device import paint as dpaint
+
+    platform = _require_device(args.allow_cpu)
+    g = _geometry(args.n_part)
+    ec = _engine_config(g)
+    t0 = time.perf_counter()
+    st = _build_state(g, ec, seed=0, arena=False)
+    build_s = time.perf_counter() - t0
+    widths = {1: _card_devices(1, args.allow_cpu), 4: _card_devices(4, args.allow_cpu)}
+    rec = dict(arm="cards-paint", platform=platform, n_part=g["n_part"],
+               bricks_per_side=int(st.bricks_per_side), build_s=build_s, chunks={})
+    _say(f"[cards-paint] n_part={g['n_part']} state built in {build_s:.1f}s on {platform}")
+    rc = 0
+
+    def call(w, L):
+        s = {}
+        t0 = time.perf_counter()
+        shards = dpaint.coarse_delta_cards(st, ec, devices=widths[w], chunk_bricks=L,
+                                           stats=s)
+        jax.block_until_ready([x["delta"] for x in shards])
+        return time.perf_counter() - t0, shards, s
+
+    for spec in args.paint_chunks.split("+"):
+        L = int(spec)
+        rows = int(dpaint.chunk_rows(st, L).max())
+        shas, warm, stats = {}, {}, {}
+        for w in (1, 4):
+            warm[w], shards, stats[w] = call(w, L)
+            shas[w] = _sha(dpaint.gather_card_delta(shards))
+            shards = None
+        times = {1: [], 4: []}
+        for w in (1, 4, 4, 1, 1, 4):
+            dt, shards, _s = call(w, L)
+            shards = None
+            times[w].append(dt)
+        m1, m4 = float(np.median(times[1])), float(np.median(times[4]))
+        equal = shas[1] == shas[4]
+        rec["chunks"][str(L)] = dict(
+            chunk_bricks=L, rows_per_chunk=rows, pad=stats[1]["coarse_pad"],
+            chunks=stats[1]["coarse_device_chunks"], card_chunks=stats[4]["coarse_card_chunks"],
+            warm_s=warm, times_s=times, median_1_s=m1, median_4_s=m4, split=m1 / m4,
+            density_equal_across_widths=equal, device_peaks=_peaks(widths[4]))
+        _say(f"[cards-paint] chunk {L} bricks ({rows:,} rows, pad {stats[1]['coarse_pad']:,}, "
+             f"{stats[1]['coarse_device_chunks']} chunks): one card {m1:.2f}s, four {m4:.2f}s "
+             f"= {m1 / m4:.2f}x (medians of 3 after warm {warm[1]:.1f} / {warm[4]:.1f}s); "
+             f"density equal across widths = {equal}")
+        if not equal:
+            rc = 3
+    return rec, rc
+
+
 ARMS = {"xback-host": arm_xback_host, "xback-dev": arm_xback_dev, "chunk": arm_chunk,
-        "xback-cards": arm_xback_cards, "cards-scale": arm_cards_scale}
+        "xback-cards": arm_xback_cards, "cards-scale": arm_cards_scale,
+        "cards-paint": arm_cards_paint}
 
 
 # ------------------------------------------------------------ the orchestrator
@@ -590,6 +661,10 @@ def main(argv=None):
     ap.add_argument("--scale", action="store_true", help="run the cards-scale arm, last")
     ap.add_argument("--scale-n-part", type=int, default=4096)
     ap.add_argument("--scale-cards", type=int, default=4)
+    ap.add_argument("--paint-n-part", type=int, default=0,
+                    help="run the cards-paint arm on a state of this many particles per side")
+    ap.add_argument("--paint-chunks", default="16384+1024",
+                    help="'+'-separated chunk lengths in bricks for cards-paint")
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args(argv)
 
@@ -601,6 +676,8 @@ def main(argv=None):
     if args.smoke:
         args.xback_n, args.chunks, args.reps = 32, "32:64:eager,32:64:jit", 1
         args.scale_n_part = 32
+        if args.paint_n_part:
+            args.paint_n_part, args.paint_chunks = 32, "16+64"
     common = ["--reps", str(args.reps)] + (["--allow-cpu"] if args.allow_cpu or args.smoke
                                            else [])
     out = os.path.join(REPO, "runs", "v2", f"d2d_device_paint{args.out_suffix}.json")
@@ -657,6 +734,13 @@ def main(argv=None):
                                "--chunk-bricks", str(L), *common,
                                *(["--jit"] if mode == "jit" else []), *pad_arg,
                                *dead_arg], {}, f"chunk {spec}")
+        card["arms"].append(res)
+        write()
+        worst = max(worst, rc)
+    if args.paint_n_part:
+        res, rc = _run_worker(["--arm", "cards-paint", "--n-part", str(args.paint_n_part),
+                               "--paint-chunks", args.paint_chunks, *common], {},
+                              "cards-paint")
         card["arms"].append(res)
         write()
         worst = max(worst, rc)
