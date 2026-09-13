@@ -1266,9 +1266,62 @@ residents present:
 
 ### Owed
 
-1. **A gb timing job** of this loop at P=576 (its own proposal): which phases
-   remain per tile once results stay on the device.
+1. ~~A gb timing job~~ DONE, sec. 21.
 2. Carried from sec. 19: the four-card split of the tile loop; the GPU-vs-CPU
    floor at P=576; the short kernels as program arguments; `tile_workspace` in
    the planner; the `codec` division exposure for D3; a per-tile slab window;
    coarse mesh placement.
+
+## 21. D2e step loop on a GB200, Vista 993837 -- 110 ms per P=576 tile with results kept on the device, against 389
+
+`7b0d059`, 2026-09-12, gb node c672-016, COMPLETED rc=0 in 3:18, ~0.1 SU.
+Submitted with `D2E_ARMS=tile-staged+loop`; cards
+`runs/v2/d2e_device_tile_loop_{gb,gbsmoke}.json` (force-added), log copied to
+`runs/v2/d2e-tile-993837.log`. P=576, cap 26,632,171, 8 tiles of a 512^3
+state, one GB200, state placed on the device once in both arms.
+
+**The baseline reproduces on a different node**: the per-tile path with host
+results reads 389 ms untimed (993817: 389), with the same phases (compute 72,
+readback 61, host result assembly 213 ms).
+
+| whole step of 8 tiles, `tile_loop_device` | reading |
+|---|---|
+| warm step (compile) | 23.06 s |
+| **untimed step** | **0.883 s = 110 ms per tile**, one copy-back included |
+| synced timed step | 1.142 s |
+| timed, per tile: plan / staging / per-tile upload / compute | 6.6 / 22.6 / 8.8 / **76.3 ms** |
+| timed, once per step: copy-back of `w` + `vel_scale` (1.02 GB) | **226.8 ms** |
+| owned rows | 134,217,728 of 134,217,728 |
+| device peak over baseline | 17.57 GB (per-tile path: 17.56) |
+
+### What it establishes
+
+- **389 -> 110 ms per tile, 3.5x, with results written into the device state.**
+  The readback of padded rows and the host result assembly are gone, as
+  intended, and nothing else grew to replace them.
+- **The write costs ~4 ms of device compute**: 76.3 ms against the per-tile
+  program's 72 in the same job.
+- **Donation holds on the card**: the peak is the per-tile path's to 0.01 GB,
+  so no second copy of `w` or `vel_scale` exists.
+- **The synced timings are NOT neutral here**, unlike the per-tile arm (sec.
+  19): the timed step is 259 ms (29%) slower than the untimed one. A sync after
+  every tile evidently stops the host from preparing the next tile while the
+  device computes the last. So the phase split gives proportions, and the
+  untimed 110 ms is the per-tile cost to quote. How the untimed step divides
+  between host prep, compute and the copy-back is not measured.
+- **The copy-back is per step, not per tile**: 227 ms for 1.02 GB here. At
+  4096^3 the state returns as a streamed window, so this figure prices the
+  development path's whole-state copy, not the design's.
+- **The largest per-tile term that is not compute is the host coarse
+  sub-block staging, 22.6 ms**, the seam for where the coarse mesh lives.
+
+### Owed
+
+1. How the untimed step divides (host prep overlapping device compute), if a
+   per-step projection ever needs it.
+2. The coarse sub-block staging (22.6 ms per tile) once the coarse mesh's
+   placement is decided.
+3. Carried: the four-card split of the tile loop; the GPU-vs-CPU floor at
+   P=576; the short kernels as program arguments; `tile_workspace` in the
+   planner; `JIT_LONG_FORCE_EPS` on one state; the `codec` division exposure for
+   D3; a per-tile slab window.
