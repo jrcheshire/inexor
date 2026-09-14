@@ -54,7 +54,7 @@ from v2_r2_device_engine import _coeffs, _hashes, _json_ready, _Phases, _preset_
 CARDS = 4
 LANE = dict(coarse_backend="device", tile_backend="device", migrate_backend="device")
 ENGINE_ARMS = {
-    "window-off": dict(LANE),
+    "window-off": dict(LANE, device_tile_window=False),
     "window-on": dict(LANE, device_tile_window=True),
     "cards": dict(LANE, device_tile_window=True, device_cards=CARDS),
     "slack0-eager": dict(coarse_backend="device", tile_backend="device",
@@ -118,14 +118,14 @@ def arm_engine(args):
     calls0 = (paint.CALLS, tile.CALLS, window.CALLS, migrate.CALLS, repack.CALLS)
     _say(f"[{args.arm}] {preset}: n_part={n} nb={nb} slack={cfg.brick_slack} built in "
          f"{build_s:.1f}s on {platform}; K={args.steps}; tile jit={cfg.device_tile_jit} "
-         f"window={cfg.device_tile_window} cards={cfg.device_cards}")
+         f"window={cfg.tile_window} cards={cfg.device_cards}")
     t1 = time.perf_counter()
     out = engine.run(st, cfg, co, phase=hook)
     run_s = time.perf_counter() - t1
     calls = [b - a for a, b in zip(calls0, (paint.CALLS, tile.CALLS, window.CALLS,
                                              migrate.CALLS, repack.CALLS))]
     rc = 0
-    if cfg.device_tile_window and calls[2] == 0:
+    if cfg.tile_window and calls[2] == 0:
         _say(f"FATAL: [{args.arm}] the window never ran")
         rc = 3
     split = []

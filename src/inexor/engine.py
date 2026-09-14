@@ -186,7 +186,7 @@ class EngineConfig:
         tile_backend="host",
         device_tile_jit=True,
         device_paint_chunk_bricks=None,
-        device_tile_window=False,
+        device_tile_window=None,
         device_cards=1,
     ):
         self.box_size = float(box_size)
@@ -319,10 +319,15 @@ class EngineConfig:
             None if device_paint_chunk_bricks is None else int(device_paint_chunk_bricks))
         # E2: the compiled tile loop against a window of x-slabs on the card
         # (`device.window.tile_loop_windowed`) instead of the whole state -- the
-        # only form that fits a card at 4096^3. Bitwise the whole-state loop by
-        # construction and by gate; False is E1's whole-state path, kept as the
-        # A/B arm until the window's GPU gate reads.
-        self.device_tile_window = bool(device_tile_window)
+        # only form that fits a card at 4096^3. Bitwise the whole-state loop on a
+        # GB200 (Vista 996857, record sec. 35). TRI-STATE, the `migrate_pooled`
+        # pattern:
+        #   None  = AUTO, the default -- windowed wherever the compiled device tile
+        #           runs, inert on every other lane;
+        #   True  = REQUIRE it; refuses at validate() where it cannot apply;
+        #   False = E1's whole-state path, the A/B arm.
+        # `tile_window` is the resolved value every reader uses.
+        self.device_tile_window = None if device_tile_window is None else bool(device_tile_window)
         # E3 + R3: how many cards the device step splits across -- the coarse paint
         # and solve by x-planes, the tile loop by tile planes, one thread per card
         # walking its own planes through its own window, and, under
@@ -336,6 +341,13 @@ class EngineConfig:
     @property
     def np_fine_dtype(self):
         return np.dtype(self.fine_dtype)
+
+    @property
+    def tile_window(self):
+        """Whether the compiled device tile loop runs against the x-slab window:
+        `device_tile_window` resolved (None = wherever the compiled device tile runs)."""
+        compiled_device = self.tile_backend == "device" and self.device_tile_jit
+        return compiled_device and self.device_tile_window is not False
 
     @property
     def n_total(self):
@@ -742,8 +754,8 @@ class EngineConfig:
             raise ValueError(
                 "device_tile_jit=False selects the eager DEVICE tile, but tile_backend is "
                 f"{self.tile_backend!r}; the knob could not apply.")
-        if self.device_tile_window and not (self.tile_backend == "device"
-                                            and self.device_tile_jit):
+        if self.device_tile_window is True and not (self.tile_backend == "device"
+                                                    and self.device_tile_jit):
             raise ValueError(
                 "device_tile_window=True windows the COMPILED device tile loop, but "
                 f"tile_backend={self.tile_backend!r}, device_tile_jit={self.device_tile_jit}; "
@@ -752,7 +764,7 @@ class EngineConfig:
             raise ValueError(f"device_cards must be >= 1, got {self.device_cards}")
         if self.device_cards > 1:
             if not (self.coarse_backend == "device" and self.tile_backend == "device"
-                    and self.device_tile_jit and self.device_tile_window):
+                    and self.device_tile_jit and self.tile_window):
                 raise ValueError(
                     f"device_cards={self.device_cards} splits the device step across cards: "
                     "it needs coarse_backend='device', tile_backend='device', the compiled "
@@ -1562,7 +1574,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         # the force meshes are already on the card (the solve wrote them there);
         # each tile's program gathers its own sub-blocks from the shard (record
         # sec. 23), and no host mesh exists to pass
-        if cfg.device_tile_window:
+        if cfg.tile_window:
             from .device.window import tile_loop_windowed, window_shapes
 
             # E2: one tile plane's x-slabs on the card at a time, not the state.

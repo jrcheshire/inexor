@@ -251,7 +251,8 @@ def test_the_compiled_run_is_one_program_per_shape():
     from inexor.device import tile as dtile
 
     co = _coeffs(2)
-    cfg = _cfg(tile_backend="device", coarse_backend="device")
+    # the whole-state loop, named: the default windows the compiled lane
+    cfg = _cfg(tile_backend="device", coarse_backend="device", device_tile_window=False)
     st = _state(cfg)
     dtile._KERNELS.clear()
     t0, c0 = dtile._TRACES[0], dtile.CALLS

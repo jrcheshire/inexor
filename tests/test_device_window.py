@@ -119,7 +119,7 @@ def test_a_windowed_engine_run_is_bitwise_the_whole_state_run():
 
     co = _coeffs(3)
     kw = dict(coarse_backend="device", tile_backend="device", migrate_backend="device")
-    cfg_a, cfg_b = _ecfg(**kw), _ecfg(device_tile_window=True, **kw)
+    cfg_a, cfg_b = _ecfg(device_tile_window=False, **kw), _ecfg(device_tile_window=True, **kw)
     st_a, st_b = _state(cfg_a), _state(cfg_b)
     c0 = window.CALLS
     out_a = engine.run(st_a, cfg_a, co)
@@ -155,3 +155,12 @@ def test_validate_refuses_a_window_without_the_compiled_device_tile():
         _ecfg(device_tile_window=True).validate()
     with pytest.raises(ValueError, match="device_tile_window"):
         _ecfg(device_tile_window=True, tile_backend="device", device_tile_jit=False).validate()
+
+
+def test_the_window_is_the_default_for_the_compiled_device_tile_and_inert_elsewhere():
+    assert _ecfg().validate() is True, "the default refused a host-lane config"
+    assert _ecfg().tile_window is False
+    assert _ecfg(tile_backend="device", device_tile_jit=False).tile_window is False
+    assert _ecfg(tile_backend="device").tile_window is True
+    assert _ecfg(tile_backend="device", device_tile_window=False).tile_window is False
+    assert _ecfg(tile_backend="device", device_tile_window=True).validate() is True
