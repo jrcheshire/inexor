@@ -2092,3 +2092,79 @@ brick, census off by one, one extra written row).
    demand, stage only what the insert reads), with a refusal naming the envelope.
 2. The cgh64 step wall split by phase (upload, device programs, readback, host
    index work, replay), which a 4096^3 projection needs.
+
+## 31. D3b R1 re-run, Vista 995638 -- still bitwise; the cgh64 peak is 320 B per slab row after the retention cuts; the step splits 65% device, 32% bus and host
+
+`2e8ce24`, 2026-09-13, gb node c672-002, COMPLETED rc=0 in 4:04. Sbatch
+`v2_d3_r1_device_migrate_vista.sbatch` (re-run); cards
+`runs/v2/d3_device_migrate_r1cut_{gbsmoke,gb}.json`, log copied to
+`runs/v2/d3-r1-migrate-995638.log`. Sec. 30's `_r1_*` cards are the before.
+
+**What changed since sec. 30.** Retention cuts (`7ccfd95`, laptop probe
+`scripts/v2_d3_retention.py`: held 248 / 287 / 324 -> 150 / 181 / 169 B per slab
+row at the eject / insert / write-back calls at 256^3): row buffers freed after
+the eject, destination slabs computed on demand, a staged slab cut to its
+emigrants after its own insert, the insert's compacted inputs freed before the
+write-back. `timings=` synced phase split and spill rows gathered on the ladder
+(`2e8ce24`). Laptop gate 5 passed and the five mutants caught after each change.
+
+### Identity on the GPU: PASS
+
+GPU-backend pytest (device migrate + insert/eject gates) **21 passed**; smoke
+bitwise; both long arms **bitwise at all three steps**, the synced one included.
+
+| arm | step | numpy | device | new programs | device peak (sec. 30) |
+|---|---|---|---|---|---|
+| cdev, zero slack, 30% arena, reach 2, ids | 0 | 4.52 s | 5.90 s | 10 | |
+| | 1 | 4.61 s | 1.74 s | 4 | |
+| | timed | 4.64 s | 1.05 s | -- | **0.77 GiB** (0.99) |
+| cgh64, slack 0.10, 1% arena, reach 1 | 0 | 27.14 s | 6.42 s | 8 | |
+| | 1 | 27.19 s | **1.63 s** | 0 | |
+| | timed | 27.28 s | 1.66 s | -- | **1.25 GiB = 320 B/slab row** (1.71, 438) |
+
+- **The cgh64 peak fell 27% (438 -> 320 B per slab row)** and the steady step
+  1.72 -> 1.63 s. Synced timing moved the cgh64 step by 0.03 s.
+- The cdev arena arm is not comparable per row (ids, reach 2 so five source slabs,
+  30% arena) and was still compiling at step 1; its synced step is 1.05 s.
+
+### Where the cgh64 step goes (synced, 1.66 s, 32 slabs)
+
+| phase | s | share |
+|---|---|---|
+| insert kernel | 0.477 | 29% |
+| insert: compact inputs | 0.215 | 13% |
+| insert: slot range to host | 0.213 | 13% |
+| eject: upload | 0.163 | 10% |
+| eject: host index + window | 0.134 | 8% |
+| insert: census (per-source counts) | 0.118 | 7% |
+| insert: shrink staged | 0.076 | 5% |
+| eject: reach + scalars | 0.071 | 4% |
+| eject: rows program | 0.063 | 4% |
+| write program + scalars | 0.037 | 2% |
+| occupancy + scales to host | 0.027 | 2% |
+| setup, eject kernel, final census, replay, spills | 0.063 | 4% |
+
+- **Device programs 1.07 s (65%); host and bus 0.54 s (32%); replay and
+  bookkeeping 0.05 s (3%).**
+- **The insert kernel is 28x the eject kernel** (0.477 vs 0.017 s), as at c-hero
+  (sec. 27: 0.63 vs 0.015 s per slab).
+- **Census and reach (0.19 s together) are eager counts each ended by a host
+  readback**, three per insert and one per eject; folding them into the programs
+  is a candidate saving, not measured.
+
+### At 4096^3 -- arithmetic, not a measurement
+
+- **Memory: 320 B x 268M rows = ~86 GB per card, inside the ~112 GB envelope**
+  (sec. 29 as revised), if the peak scales with slab rows.
+- **Wall, one card:** the insert kernel measured at a c-hero slab is 0.63 s
+  (sec. 27), 256 slabs = ~160 s; every other cgh64 phase scaled x512 (rows per
+  slab x64, slabs x8) is ~600 s. Order **~500-800 s/step on one card**; the
+  device-program phases below 4.2M rows per slab are unlikely to scale linearly,
+  so the upper end is the linear bound. Four cards are unmeasured.
+
+### Status of R1
+
+Done: the bitwise gate on a GB200, cgh64 wall against 15.2 s (1.63 s), device
+peak against R0 and the envelope (320 B/slab row, ~86 GB by arithmetic).
+**Not done, from the plan's R1:** a refusal that names the envelope, and the
+permuted-slab-order arm of the gate.
