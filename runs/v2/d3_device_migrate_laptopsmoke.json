@@ -5,10 +5,10 @@
   "--out-suffix",
   "_laptopsmoke"
  ],
- "started": "2026-09-13T16:27:34",
+ "started": "2026-09-13T17:13:26",
  "job": null,
  "node": "andromeda",
- "commit": "bf4dec8",
+ "commit": "040f4f5",
  "arms": [
   {
    "arm": "xback",
@@ -20,11 +20,11 @@
     "nb": 8,
     "c_drift": 1.770387489869264,
     "drift_frac": 1.9,
-    "build_s": 0.005899957999645267,
+    "build_s": 0.004448374998901272,
     "steps": [
      {
-      "numpy_s": 0.03801633300099638,
-      "jax_s": 0.3867180829984136,
+      "numpy_s": 0.03657283400025335,
+      "jax_s": 0.41347120799764525,
       "stats_equal": true,
       "field_diffs": {},
       "stats": {
@@ -40,8 +40,8 @@
       }
      },
      {
-      "numpy_s": 0.03750716699869372,
-      "jax_s": 0.03098241699990467,
+      "numpy_s": 0.0399916669994127,
+      "jax_s": 0.03449483299846179,
       "stats_equal": true,
       "field_diffs": {},
       "stats": {
@@ -76,16 +76,16 @@
     "rows_per_slab": 65536,
     "c_drift": 1.6252523727362762,
     "drift_frac": 0.5,
-    "build_s": 0.03451795900036814,
+    "build_s": 0.03666029200030607,
     "steps": [
      {
-      "numpy_s": 0.03537437499835505,
-      "compiled_s": 0.40707875000225613,
-      "eject_calls_s": 0.2247449169990432,
-      "insert_calls_s": 0.16823504200147,
+      "numpy_s": 0.03833991599822184,
+      "compiled_s": 0.45037395899998955,
+      "eject_calls_s": 0.2458262080035638,
+      "insert_calls_s": 0.19002733399611316,
       "eject_calls": 4,
       "insert_calls": 4,
-      "host_s": 0.014098791001742939,
+      "host_s": 0.014520417000312591,
       "new_eject_shapes": 2,
       "new_insert_shapes": 1,
       "field_diffs": {},
@@ -103,13 +103,13 @@
       }
      },
      {
-      "numpy_s": 0.035611666997283464,
-      "compiled_s": 0.06406566599980579,
-      "eject_calls_s": 0.00551366700528888,
-      "insert_calls_s": 0.04545979199974681,
+      "numpy_s": 0.04034158400099841,
+      "compiled_s": 0.07121695800015004,
+      "eject_calls_s": 0.005094040996482363,
+      "insert_calls_s": 0.05176175000087824,
       "eject_calls": 4,
       "insert_calls": 4,
-      "host_s": 0.013092206994770095,
+      "host_s": 0.014361167002789443,
       "new_eject_shapes": 0,
       "new_insert_shapes": 0,
       "field_diffs": {},
@@ -128,7 +128,7 @@
      }
     ],
     "device_peak": null,
-    "host_maxrss_gb": 0.4611663818359375
+    "host_maxrss_gb": 0.487152099609375
    }
   },
   {
@@ -142,20 +142,20 @@
     "bricks": 64,
     "drift_frac": 0.5,
     "c_drift": 8.225727207963125e-05,
-    "gen_s": 0.00761712500025169,
+    "gen_s": 0.008064416000706842,
     "reps": 1,
     "eject": {
-     "warm_s": 0.11943008299931535,
+     "warm_s": 0.12912108300224645,
      "public_s": [
-      0.0025035840008058585
+      0.004025415997602977
      ],
-     "public_median_s": 0.0025035840008058585,
+     "public_median_s": 0.004025415997602977,
      "split": [
       {
-       "prep_s": 1.1000000085914508e-05,
-       "upload_s": 0.0008100830018520355,
-       "compute_s": 0.0019554579994292,
-       "readback_s": 5.545800013351254e-05
+       "prep_s": 1.2958000297658145e-05,
+       "upload_s": 0.0006328339986794163,
+       "compute_s": 0.0024898329975258093,
+       "readback_s": 8.304199945996515e-05
       }
      ],
      "public_repeat_equal": true,
@@ -165,17 +165,17 @@
      "device_peak": null
     },
     "insert": {
-     "warm_s": 0.13897125000221422,
+     "warm_s": 0.1472066669994092,
      "public_s": [
-      0.039354167001874885
+      0.039946500000951346
      ],
-     "public_median_s": 0.039354167001874885,
+     "public_median_s": 0.039946500000951346,
      "split": [
       {
-       "prep_s": 5.620800220640376e-05,
-       "upload_s": 0.00508037499821512,
-       "compute_s": 0.03759358400202473,
-       "readback_s": 5.541700011235662e-05
+       "prep_s": 2.3874999897088856e-05,
+       "upload_s": 0.005560500001593027,
+       "compute_s": 0.03890916599993943,
+       "readback_s": 0.00013041700003668666
       }
      ],
      "public_repeat_equal": true,
@@ -184,9 +184,9 @@
      "n_spill": 0,
      "device_peak_after": null
     },
-    "host_maxrss_gb": 0.4536285400390625
+    "host_maxrss_gb": 0.481353759765625
    }
   }
  ],
- "finished": "2026-09-13T16:27:37"
+ "finished": "2026-09-13T17:13:29"
 }

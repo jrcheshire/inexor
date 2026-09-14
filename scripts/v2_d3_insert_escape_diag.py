@@ -18,7 +18,13 @@ program returned a wrong value; this script finds which, on the captured inputs.
            per-brick max, abs_max). Each compared to numpy. Then scatter-max
            alone on random duplicate indices (the kernel's form, int64 indices
            into a zeros init, and `segment_max` with int32 indices as the GPU
-           kick uses it), unsorted and sorted.
+           kick uses it), unsorted and sorted. Then the row magnitude piece by
+           piece (int16 abs, max, cast, times scale; int32- and f64-widened
+           forms), each jitted alone, with and without the sort gather.
+
+Vista 995228 read the scatter clean and the jitted int16 row magnitude wrong in
+5,293 of 15,898 rows (eager exact); `insert_jax` now widens to f64 first, so
+`prod_jit` here is the FIXED program and `_ops_program` the pre-fix one.
 
 Prints the first disagreement and writes a card plus the inputs npz.
 """
@@ -154,6 +160,8 @@ def _np_kernel(dest, w, s_old, lo_b, p3, nb2):
 
 
 def _ops_program(p3, nb2, n_pad):
+    # the PRE-FIX kernel's arithmetic, kept as it was (int16 row magnitude): it is
+    # the program 995228 caught, and the reading the fix is compared against
     import jax
     import jax.numpy as jnp
 
@@ -256,6 +264,50 @@ def analyze(args):
     inter["vmax_vs_numpy_scatter_of_own_inputs_differ"] = _neq(o["vmax"], v_from_own)
     rec["intermediates"] = inter
     _say(f"[analyze {platform}] intermediates: {inter}")
+
+    # the row magnitude, piece by piece, each its own jitted program on the same
+    # inputs, with and without the sort gather in front of it. Numpy is exact for
+    # every form (no code is -32768), so each count is that form's error here.
+    w_pad, s_pad = jnp.asarray(padded(w, 0)), jnp.asarray(padded(s_old, 1.0))
+    ord_dev = jnp.asarray(np.concatenate([ref["order"], np.arange(n, n_pad)]))
+    w_ref_s = padded(w, 0)[np.asarray(ord_dev)]
+    s_ref_s = padded(s_old, 1.0)[np.asarray(ord_dev)]
+    forms = {
+        "int16 abs": (lambda a, s: jnp.abs(a), lambda a, s: np.abs(a)),
+        "int16 abs.max(1)": (lambda a, s: jnp.abs(a).max(axis=1),
+                             lambda a, s: np.abs(a).max(axis=1)),
+        "int16 abs.max(1).astype(f64)": (
+            lambda a, s: jnp.abs(a).max(axis=1).astype(jnp.float64),
+            lambda a, s: np.abs(a).max(axis=1).astype(np.float64)),
+        "int16 form x s (old kernel)": (
+            lambda a, s: jnp.abs(a).max(axis=1).astype(jnp.float64) * s,
+            lambda a, s: np.abs(a).max(axis=1).astype(np.float64) * s),
+        "int32 widened x s": (
+            lambda a, s: jnp.abs(a.astype(jnp.int32)).max(axis=1).astype(jnp.float64) * s,
+            lambda a, s: np.abs(a.astype(np.int32)).max(axis=1).astype(np.float64) * s),
+        "f64 widened x s (fix)": (
+            lambda a, s: jnp.abs(a.astype(jnp.float64)).max(axis=1) * s,
+            lambda a, s: np.abs(a.astype(np.float64)).max(axis=1) * s),
+    }
+    mags = []
+    saved = {}
+    for name, (jf, nf) in forms.items():
+        for gathered in (False, True):
+            if gathered:
+                prog = jax.jit(lambda a, s, o, f=jf: f(a[o], s[o]))
+                got = np.asarray(prog(w_pad, s_pad, ord_dev))
+                want = nf(w_ref_s, s_ref_s)
+            else:
+                got = np.asarray(jax.jit(jf)(w_pad, s_pad))
+                want = nf(padded(w, 0), padded(s_old, 1.0))
+            row = dict(form=name, gathered=gathered, differ=_neq(got, want))
+            mags.append(row)
+            if name == "int16 form x s (old kernel)":
+                saved[f"gpu_mag_{'gathered' if gathered else 'direct'}"] = got
+            _say(f"[analyze {platform}] magnitude {row}")
+    rec["magnitude_forms"] = mags
+    if saved:
+        np.savez(args.npz.replace(".npz", f"_mags_{platform}.npz"), **saved)
 
     # scatter-max alone
     rng = np.random.default_rng(3)

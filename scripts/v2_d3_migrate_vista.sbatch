@@ -12,10 +12,11 @@
 # Submit from the Vista checkout:
 #   sbatch scripts/v2_d3_migrate_vista.sbatch
 #
-# TIME ASK: ~9 min estimated, 45 min wall, one gb node, billed at the 15 min
+# TIME ASK: ~10 min estimated, 45 min wall, one gb node, billed at the 15 min
 # minimum (~0.25 SU).
 #
 #   phase                          each (source)                               total
+#   escape-forms, 32^3 inputs      995228's whole GPU leg incl. start ~25 s    ~0.5 min
 #   smoke, 3 arms at 32-64^3       3 processes, ~10 s start each (993849);
 #                                  laptop smoke ran in ~2 s of compute         ~0.5 min
 #   xback, cdev, 2 steps           build ~4 s (1024^3 built in 244 s, 994675,
@@ -89,6 +90,15 @@ run_leg () {
   [ $rc -ne 0 ] && rc_total=$((rc_total + 1))
   return $rc
 }
+
+# 995067 died in this smoke on an int16 escape; 995228 put it inside the jitted
+# row magnitude. This leg reads each piece of that expression on the captured
+# inputs, the f64-widened fix among them. Reported, not gating: the smoke's
+# xback below is the gate on the fixed kernel.
+run_leg escape-forms \
+  pixi run -e gpu python scripts/v2_d3_insert_escape_diag.py analyze \
+    --npz runs/v2/d3_insert_escape_inputs_gb.npz --out-suffix _gb_forms
+rc_total=0
 
 # the smoke runs on the GPU (no --allow-cpu), so a CPU fallback fails it here
 run_leg smoke \

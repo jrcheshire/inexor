@@ -78,9 +78,13 @@ def _build(p3, nb2, n_pad, has_ids):
         write = in_s & fits
         spill = in_s & jnp.logical_not(fits)
 
-        # the scale over the union, as `_insert_slab`: |w| max per row in the
-        # codes' own int16, as float, times the row's source scale
-        m_row = jnp.abs(w_s).max(axis=1).astype(jnp.float64) * s_s
+        # the scale over the union, as `_insert_slab`: |w| max per row times the
+        # row's source scale. Widened to f64 BEFORE abs and max: every int16 is
+        # exact in f64, so the value is numpy's, and the int16 form
+        # `abs(w).max(1).astype(f64)` came back wrong in 5,293 of 15,898 rows
+        # jitted on a GB200 (eager and CPU XLA exact; Vista 995228), shrinking
+        # 27 of 64 brick scales until the rescale escaped int16
+        m_row = jnp.abs(w_s.astype(jnp.float64)).max(axis=1) * s_s
         vmax = jnp.zeros(nb2, dtype=jnp.float64).at[bl].max(jnp.where(in_s, m_row, 0.0))
         s_b = vmax / div
         s_b = jnp.where(s_b > 0.0, s_b, 1.0)

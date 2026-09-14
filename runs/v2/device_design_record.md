@@ -1707,3 +1707,65 @@ Spectra bitwise. Density to the host for the second leg: 4.64 s.
    program arguments (the 4.60 GB executables, which also defeat the persistent
    cache); `tile_workspace` in the planner; the `codec` division exposure; a
    per-tile slab window; the inverse transforms still read and write host slabs.
+
+## 26. The compiled insert escapes int16 on a GB200, Vista 995067 + 995228 -- the jitted int16 row magnitude is wrong; the scatter is not
+
+`e74c23e` (995067, gb node c672-002, FAILED rc=1 in 0:40) and `040f4f5` (995228,
+c672-018, COMPLETED rc=0 in 0:54). Logs copied to `runs/v2/d3-migrate-995067.log`
+and `runs/v2/d3-escape-995228.log`; cards `runs/v2/d3_insert_escape_diag_{gb,gb_cpu}.json`,
+captured inputs `runs/v2/d3_insert_escape_inputs_gb.npz`.
+
+### What failed
+
+995067 (the D3 migrate job, `scripts/v2_d3_migrate_vista.sbatch`) stopped in its
+GPU smoke, in the first arm: `drift_and_migrate` on the 32^3 xback state with the
+compiled eject and insert raised the int16 guard in `_insert_slab_jax`, **code
+49424 against 32767**. The same state reads exactly 32767 in numpy and under CPU
+XLA. The smoke gate held: no timing leg ran, nothing was written past the guard.
+
+**The escape could not come from the inputs.** The kernel's brick scale is
+max(|w| * s_old) / 32767 over the rows it then rescales by s_old / s_b, so every
+rescaled code is <= 32767 for ANY inputs unless an operation in the program
+returns a wrong value.
+
+### Where, measured on the captured call (995228)
+
+The first escaping call (call 0, 15,898 rows, 4,091 bound for the slab, 64 bricks)
+captured on the GPU; no code is -32768.
+
+| reading | GPU | CPU XLA, same inputs, same node |
+|---|---|---|
+| inputs from the jax eject vs the numpy eject | **identical** (both escape) | -- |
+| production program, jit | **abs_max 49424; 27 of 64 scales differ** | 32767; 0 |
+| production program, eager body | 32767; 0 | 32767; 0 |
+| sort order / brick index | equal / equal | equal / equal |
+| **row magnitude `abs(w).max(1).astype(f64) * s_old`** | **5,293 of 15,898 rows differ** | 0 |
+| per-brick max | 27 differ | 0 |
+| per-brick max recomputed in numpy from the program's OWN brick index and magnitudes | **0 differ** | 0 |
+| scatter-max alone (int64 `.at[].max` eager and jit, `segment_max` int32; 4,096-1M rows, sorted and not) | 0 in every form | 0 |
+
+- **The scatter is clean; the jitted int16 row magnitude is not.** Every
+  downstream error (27 scales too small, the escape) follows from it.
+- **Not identified: the operation inside that expression, or the mechanism.** No
+  simple wrong formula reproduces the GPU's counts on these inputs (tested on the
+  laptop: one component's |w|, signed max, |min|, int8 truncation, min of |w| --
+  nearest 7,933 and 7,965 rows against 5,293). The GPU's magnitude values were
+  not saved by this job.
+- Every other abs/max reduction on the device path is over floats (`kick`,
+  `codec`) or an int64 count (`paint`); the insert was the only int16 one.
+
+### The fix
+
+`insert_jax` widens the codes to f64 before abs and max:
+`jnp.abs(w_s.astype(jnp.float64)).max(axis=1) * s_s`. Every int16 is exact in f64,
+so the value is numpy's by construction. `tests/test_insert_jax.py` +
+`tests/test_eject_jax.py` 16 passed; the D3 probe's laptop smoke passes all three
+arms; the diagnostic on the GPU-captured inputs under CPU XLA reads 0 in every
+form. **Not yet shown on a GPU**: the next D3 job runs the magnitude piece by piece
+(int16 abs, max, cast, times scale; int32- and f64-widened; with and without the
+sort gather) on the captured inputs first, then the unchanged smoke gate.
+
+### Owed
+
+1. The GPU reading of the fixed program (the xback gate in the next D3 job) and
+   of the magnitude pieces, which names the operation if one piece fails alone.
