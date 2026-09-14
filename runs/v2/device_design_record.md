@@ -1879,3 +1879,42 @@ Device peak 30.75 GiB after both kernels (the insert's own peak is not separated
 2. The end-to-end eject gap to 5y (0.94 vs 0.528 s).
 3. `idx_all` as a traced `arange` rather than a 2.15 GB captured constant.
 4. Carried from sec. 25.
+
+## 28. The compiled migrate's host share is mostly per-row, laptop profile at 256^3
+
+`scripts/v2_d3_host_profile.py`, M4 laptop, CPU XLA, card
+`runs/v2/d3_host_profile_laptop.json`. Particles FIXED at 256^3 (16.7M), bricks
+varied, drift half a brick (reach 1 at every rung). One warm compiled migrate,
+then one under cProfile with `eject_rows` / `insert_rows` timed; host = step minus
+those calls. Profiled walls: cProfile inflates Python-call-heavy code, so the
+per-brick term below is an upper bound.
+
+| bricks per side | bricks | rows per brick | step | kernel calls | **host** |
+|---|---|---|---|---|---|
+| 8 | 512 | 32,768 | 3.86 s | 3.16 s | **0.71 s** |
+| 16 (production 4096 rows/brick) | 4,096 | 4,096 | 4.02 s | 3.19 s | **0.83 s** |
+| 32 | 32,768 | 512 | 4.37 s | 2.85 s | **1.52 s** |
+
+- **Per-brick slope, each segment separately: 33 us/brick (512 -> 4,096) and
+  24 us/brick (4,096 -> 32,768).** Not fitted as one line.
+- **At production geometry the per-brick term is ~0.10-0.14 s of the 0.83 s
+  host**; the rest, ~0.7 s or ~42 ns/row, does not move with the brick count.
+- Largest own times in the host (nb=16): `_insert_slab_jax` 0.26 s (flat across
+  rungs), `_eject_slab_jax` 0.23 s (0.21 / 0.23 / 0.38 s), `bucket_ijk_from_key`
+  0.15 s over 4,096 calls (0.12 / 0.15 / 0.34 s). Both slab functions' own time is
+  their numpy array work (gathers from and writes into the state, concatenations);
+  which lines, not resolved. `numpy.asarray`'s 2.4-3.1 s is the kernels' results
+  being forced, inside the timed calls.
+- **At 4096^3 on these rates** (laptop, not Grace): per row ~6.9e10 x 42 ns =
+  ~2,900 s/step, per brick 1.68e7 x 24-33 us = ~400-550 s/step. Against cgh64 on
+  the GB200's Grace (sec. 27), the same rates give ~6.6 s where 9.84 s was
+  measured: same order, different machine and occupancy.
+- **Reading:** vectorizing the per-brick Python would remove at most ~15% of the
+  host share at production geometry. The bulk is per-row movement of the state in
+  and out of the kernels -- the host side of the same traffic the transfers carry.
+
+### Owed
+
+1. Line-level attribution inside `_insert_slab_jax` / `_eject_slab_jax` if the
+   host path is kept.
+2. The same rungs on Grace, if the laptop rates are ever used for a bill.
