@@ -2516,3 +2516,68 @@ windowed, 3.69 on four cards. Lead drift once: 5.6-6.5 s.
 1. The `device_tile_window` default flips to True (bitwise on the GPU, as planned).
 2. The 4096^3 smoke (D7), which needs 4096^3 ICs (D6, unbuilt).
 3. The windowed step 1's extra ~8 s, if a run's compile budget ever needs it.
+
+## 36. D6 on the laptop -- the IC stage on the cards: kernels folded into the axis-0 pass, the 2LPT source accumulated on the cards; within one code of the host generator; one bundled gb job proposed
+
+JC, 2026-09-14: bitwise agreement is a nice-to-have and never stands in the way of
+performance here; as much on the cards as possible, staging on disk only where capacity
+forces it. The host generator is the oracle and is unchanged (its bitwise gate, 19/19,
+confirms the emission move).
+
+### What was built
+
+- `ooc_fft.kspace_pass_device`: each y-pencil block `sum(coef * spec)` goes to a card,
+  where a `KSpaceKernel` (grad, second derivative, colour, Poisson or 1/Poisson, products)
+  is built from (kx, ky, kz) and applied after the axis-0 fft (forward) or before the
+  ifft (inverse). No host kernel pass and no host spectrum copy exist.
+- `noise_forward_cards`: plane i drawn as `normal(fold_in(key, i))` and `rfft2`d on the
+  card that owns it; stream `ic.IC_STREAM_DEVICE`.
+- `inverse_accumulate_cards`: the kernel pass into a host work buffer, then each plane's
+  `irfft2` and weighted square added on its card.
+- `icgen.generate_t9_slabs_device`. 15 transforms (host: 18). At f_NL = 0 the phi round
+  trip is skipped (colour x 1/M x M = colour); the delta inverse-then-forward round trip
+  is gone at every f_NL. The source is `1/2 (delta^2 - sum phi_ii^2) - sum_{i<j} phi_ij^2`
+  (sum phi_ii = -delta), one field at a time on the cards. U and V are inverted from
+  k-space combinations; V is staged (3 fields; host: 20), U_x lives on the cards, U_y and
+  U_z on the host. Emission is the host generator's.
+- `plan.ic_device_stages`, printed in the device report; `ics --generator device`;
+  `scripts/v2_d6_device_ics{.py,_vista.sbatch}`.
+
+Correction to what JC was told before the build: velocities cannot be quantized to int16
+before emission. Slabs carry one scale per brick (`t9-slabs-2`), and a brick's scale
+needs its particles' displaced positions; quantizing early would round twice.
+
+### Measured (four forced host devices, CPU XLA)
+
+| | reading |
+|---|---|
+| single kernels vs numpy, x64 | bitwise (grad, deriv2, colour, Poisson, 1/Poisson) |
+| kernel product vs numpy | bitwise ONE pass with the product function; ~73 eps x rms off the two-cast chain (rounds once, not twice) |
+| kernels with x64 off | 5-65 eps x rms (colour worst) -> the generator requires x64 |
+| trace source vs six-field source, f64 | identical |
+| trace source, f32, vs f64 reference | 80-91 eps32 x rms (six-field f32: 49-61); a float64 accumulator: 81-87 -> float32 |
+| device vs host generator, 32^3 f32, f_NL 0 / 10 | occupancy exact; 1 position code and 210 / 185 of 120,033 velocity codes differ, each by 1; per-brick scales <= 4.8e-7 / 5.1e-7 relative |
+| same, f64 | identical codes; scales <= 5.6e-16 |
+| 4 cards vs 1 card; card noise vs CPU stream (CPU backend) | bitwise; bitwise |
+| numpy peak (tracemalloc, warmed) vs planner host column | 1.06x at 128^3, 1.02x at 256^3 |
+| mutations | wrong index (755 buckets), weight (999), dropped term (210), velocity coefficient sign (11,319 codes): all caught |
+
+A derivative kernel's SIGN is invisible by construction (the source is quadratic in
+every phi_ij); that mutation was replaced rather than counted. RSS on CPU devices is
+1.8-3.6x numpy's peak and is not attributed here: those "cards" are host memory.
+
+Planner at 4096^3 (float32 fields, 256 brick slabs): host 827.7 GB (0.81x of 1026),
+per card 69.7 GB (0.35x of 199), disk 1,443 GB (825 staging + 618 slabs).
+
+### What this does NOT establish
+
+- Anything on a GPU: kernel parity against numpy, the card noise stream's bits, card
+  peaks, every wall. The smoke leg reports the first two.
+- The emission wall at scale (host numpy, unpriced), and the 4096^3 host peak (the
+  planner is a lower bound; the job's 2048^3 rung reads the real one).
+
+### Owed
+
+1. JC: the proposed parity bars (codes within 1, occupancy exact at the 32^3 fixture,
+   scales within 2x the measured floor; numpy peak within [0.9, 1.2] of the planner).
+2. The gb job (`scripts/v2_d6_device_ics_vista.sbatch`): proposal to JC, then push and submit.
