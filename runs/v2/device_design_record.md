@@ -1918,3 +1918,100 @@ per-brick term below is an upper bound.
 1. Line-level attribution inside `_insert_slab_jax` / `_eject_slab_jax` if the
    host path is kept.
 2. The same rungs on Grace, if the laptop rates are ever used for a bill.
+
+## 29. D3b R0 -- the insert holds ~80 B per padded input row on a GB200, the eject 114; repack projects to 430-630 s/step at 4096^3
+
+Plan `~/.claude/plans/serene-nibbling-sparrow.md`, rung R0. Kernel change
+`9b1c3d6`; probes `bef34e0`. GPU readings Vista 995435 (gb node c672-008,
+COMPLETED rc=0 in 3:56), cards `runs/v2/d3_device_migrate_r0_peaks_{gbsmoke,gb}.json`,
+log `runs/v2/d3-r0-peaks-995435.log`. Host readings laptop, card
+`runs/v2/d3_replay_cost_laptop.json`. Each GPU arm its own process, so each peak
+belongs to one kernel; the GPU smoke passed all three arms first.
+
+### The kernels (`9b1c3d6`)
+
+- **`_padded(n)` is `capacity_shape(n + 1)` at 12 rungs per octave** (<= 6%
+  extra rows) instead of a multiple of 4096; the `+ 1` keeps a padded row in
+  every call. `idx_all` is traced inside both kernels, not a captured constant:
+  no captured-constant warning at 1M rows, where the old closure form warns
+  (control run in the same process). Eject/insert/slot_state/executor tests 87
+  passed, 1 skipped.
+
+### Device peaks at a 4096^3 slab (65,536 bricks, 268,435,456 rows)
+
+**Eject alone:** 30.30 GiB = **121.2 B/row = 114.4 B per padded row**
+(284,397,459 padded rows).
+
+| row count | padded to | new program | wall |
+|---|---|---|---|
+| 268,435,456 (the slab) | 284,397,459 | yes | 2.84 s |
+| 267,630,149 (-0.3%) | 268,435,456 | yes | 2.30 s |
+| 265,751,101 (-1%) | 268,435,456 | no | 1.89 s |
+
+- **The nominal c-hero slab is exactly 2^28 rows, a rung of the ladder, so the
+  `+ 1` pushes it one rung up and slabs just under it take the rung below: two
+  programs.** Slab counts that straddle 2^28 will compile both; nothing more.
+- **The walls are ~2x sec. 27's 0.94 s eject**, including the call that
+  compiled nothing (1.89 s). A candidate, not traced: every call now pads, so
+  `eject_rows` concatenates a full copy of each input on the host, where at an
+  exact multiple of 4096 sec. 27's call padded nothing. Irrelevant to R1 (inputs
+  built on the device); owed if the host path's wall is ever quoted.
+
+**Insert alone**, input = keepers (1 - share) of a slab + (2r+1) x share of
+emigrants:
+
+| share | reach | input rows (slabs) | device peak | **B / padded input row** | B / slab row | 2nd call |
+|---|---|---|---|---|---|---|
+| 0.05 | 1 | 295,278,999 (1.10) | 22.28 GiB | 79.4 | 89.1 | 2.41 s |
+| 0.05 | 2 | 322,122,543 (1.20) | 26.08 GiB | 82.8 | 104.3 | 2.75 s |
+| 0.20 | 1 | 375,809,637 (1.40) | 29.36 GiB | 83.0 | 117.4 | 2.85 s |
+| 0.20 | 2 | 483,183,819 (1.80) | 38.48 GiB | 81.5 | 153.9 | 3.73 s |
+| 0.40 | 1 | 483,183,819 (1.80) | 38.48 GiB | 81.5 | 153.9 | 3.75 s |
+| 0.40 | 2 | 697,932,183 (2.60) | **52.31 GiB** | 78.4 | 209.2 | 5.39 s |
+
+- **The insert's peak is linear in its input: 78-83 B per padded input row**
+  over 1.1-2.6 slabs. The 0.20/2 and 0.40/1 specs are the same input size and
+  seed and read identical peaks.
+- **The inputs are the host kernel's expanded form** (int64 destination, f64
+  per-row scale). An on-device core with slab-local narrower indices (R1) is a
+  candidate to lower both kernels' B/row; not measured.
+- The emigrant share and reach at 4096^3 are NOT measured; the table brackets
+  them. Both grow with box size and step size.
+
+### Host: arena replay and repack (laptop, 256^3, bricks varied, arena-occupied)
+
+| | 512 bricks | 4,096 (production 4096 rows/brick) | 32,768 |
+|---|---|---|---|
+| arena residents (bricks holding them) | 31,499 (243) | 90,268 (2,016) | 247,431 (15,344) |
+| releases, every brick | 0.63 us/brick | 0.54 | 0.49 |
+| claims, one call per spilling brick | 13.2 us/brick | 8.3 | 6.3 |
+| **repack** | 0.095 s (5.7 ns/row) | **0.152 s (9.1 ns/row)** | 0.302 s (18.0 ns/row) |
+
+- Built at zero brick slack with one numpy migrate so residents exist; wall
+  clock, no profiler.
+- **Claims were timed after all releases.** The real replay alternates them slab
+  by slab, and each alternation dirties `_arena_free`, whose rebuild is a scan of
+  the whole arena. That term is NOT in these numbers.
+- Repack's per-brick slope, each segment separately: 16 us/brick (512 -> 4,096)
+  and 5.2 us/brick (4,096 -> 32,768).
+
+### At 4096^3 -- arithmetic, not a measurement
+
+- **Repack: ~430-630 s/step** (Grace C16 cgh64 0.85 s/step / 134M rows = 6.3
+  ns/row, and the laptop's 9.1 ns/row, each x 6.87e10). **5-7 h of a 40-step run
+  on the host**, whatever the migrate does.
+- Releases ~8 s/step (0.5 us x 1.68e7 bricks). Claims 6-13 us per spilling brick;
+  the number of spilling bricks at 4096^3 is unmeasured. The free-list rebuild
+  per alternation, at ~1 ns per arena slot (6.9e8 slots at 1%) x 256 slabs, could
+  reach ~180 s/step -- the reason R1's replay must not rebuild it per slab.
+- **Per-GPU envelope, one slab at a time, staging not included:** eject 32.5 GB;
+  insert 23.9-56.2 GB across the bracket. Beside the tile window (~54 GB free per
+  card) the eject and every insert up to share 0.20 / reach 2 (41.3 GB) fit, and
+  share 0.40 / reach 2 (56.2 GB) does not. With the tile window freed (~170 GB)
+  every bracketed case fits.
+
+### Owed
+
+1. The emigrant share and reach at production step size (they size the insert).
+2. The replay with releases and claims interleaved, and its free-list rebuild.
+3. The host pad copy in `eject_rows` / `insert_rows` (candidate for the ~2x wall).
