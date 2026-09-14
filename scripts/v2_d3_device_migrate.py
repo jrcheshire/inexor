@@ -555,8 +555,57 @@ def arm_peak_insert(args):
     return rec, 0
 
 
+def arm_device_migrate(args):
+    """`device.migrate.drift_and_migrate_device` against the serial numpy migrate of
+    an identical copy: bitwise per step, walls, programs compiled, device peak.
+
+    `device-xback`: zero slack, 30% arena, drift 1.9 bricks (reach 2, overflow);
+    `device-real`: production slack 0.10, 1% arena, drift `--real-frac`."""
+    _x64()
+    from inexor import state
+    from inexor.device import migrate
+
+    platform = _require_device(args.allow_cpu)
+    heavy = args.arm == "device-xback"
+    n, nb = args.n_part, args.nb or _nb_of(args.n_part)
+    t0 = time.perf_counter()
+    st = _build_state(n, nb, seed=11 if heavy else 13, brick_slack=0.0 if heavy else 0.10,
+                      arena_frac=0.30 if heavy else 0.01, with_ids=heavy)
+    build_s = time.perf_counter() - t0
+    ref = copy.deepcopy(st)
+    frac = args.xback_frac if heavy else args.real_frac
+    c = _c_drift(st, frac)
+    rec = dict(arm=args.arm, platform=platform, n_part=n, nb=nb, rows_per_slab=n**3 // nb,
+               c_drift=c, drift_frac=frac, build_s=build_s, steps=[])
+    _say(f"[{args.arm}] n_part={n} nb={nb} ({n**3 // nb:,} rows per slab) built in "
+         f"{build_s:.1f}s on {platform}")
+    rc = 0
+    for k in range(args.steps):
+        t1 = time.perf_counter()
+        r_ref = state.drift_and_migrate(ref, c)
+        t2 = time.perf_counter()
+        p0 = len(migrate._PROGRAMS)
+        r = migrate.drift_and_migrate_device(st, c)
+        t3 = time.perf_counter()
+        receipt = r.pop("migrate_device")
+        diff = _diff_fields(ref, st)
+        step = dict(numpy_s=t2 - t1, device_s=t3 - t2, new_programs=len(migrate._PROGRAMS) - p0,
+                    field_diffs=diff, stats_equal=r == r_ref, stats=r, receipt=receipt)
+        rec["steps"].append(step)
+        _say(f"[{args.arm}] step {k}: numpy {t2 - t1:.2f}s | device {t3 - t2:.2f}s; new "
+             f"programs {step['new_programs']}; BITWISE numpy = {not diff and r == r_ref} "
+             f"{diff or ''}; reach {r['brick_reach']} (realized {r['brick_reach_realized']}), "
+             f"overflow {r['n_arena_overflow']}, arena_used {r['arena_used']}")
+        if diff or r != r_ref:
+            rc = 3
+    rec.update(device_peak=_peak(), host_maxrss_gb=_maxrss_gb())
+    _say(f"[{args.arm}] device peak {(rec['device_peak'] or 0) / 2**30:.2f} GiB")
+    return rec, rc
+
+
 ARMS = {"xback": arm_xback, "slab-real": arm_slab_real, "slab-shape": arm_slab_shape,
-        "peak-eject": arm_peak_eject, "peak-insert": arm_peak_insert}
+        "peak-eject": arm_peak_eject, "peak-insert": arm_peak_insert,
+        "device-xback": arm_device_migrate, "device-real": arm_device_migrate}
 
 
 # ------------------------------------------------------------ the orchestrator
@@ -660,6 +709,16 @@ def main(argv=None):
         card["arms"].append(res)
         write()
         worst = max(worst, rc)
+    for name, n_arm, frac_flag in (
+            ("device-xback", args.xback_n, ["--xback-frac", str(args.xback_frac)]),
+            ("device-real", args.real_n, ["--real-frac", str(args.real_frac)])):
+        if name in arms:
+            res, rc = _run_worker(["--arm", name, "--n-part", str(n_arm),
+                                   *(xb_nb if name == "device-xback" else []), *frac_flag,
+                                   *common], {}, name)
+            card["arms"].append(res)
+            write()
+            worst = max(worst, rc)
     # peak arms run even if one before them fails: an out-of-memory at a large
     # share is itself the reading, and the smaller specs are still worth having
     for spec in [s for s in args.peaks.split("+") if s]:
