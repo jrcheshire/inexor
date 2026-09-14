@@ -2178,3 +2178,87 @@ and reports its estimate (7 passed; the five mutants still caught).
 **Not validated: the estimate against a measured device peak** -- owed to the next
 GPU job, which reads both in one process. **Moved to R3 (JC):** the permuted
 slab-order arm, which the four-card boundary-first schedule is what needs.
+
+## 32. D3b R1b + R2 on the laptop -- the repack on the device and the engine routed to the device passes, both bitwise; one bundled gb job proposed
+
+`f593d9c` (R1b), `e888ec8` (R2), `bffd8dd` (empty-slab skip), 2026-09-13. Laptop
+only (CPU XLA); the GPU readings ride ONE job, `scripts/v2_r2_device_engine_vista.sbatch`
+(JC, 2026-09-13: stop profiling one rung per job).
+
+### R1b: `device.repack.repack_device`
+
+Per x-slab: the slab's old slot range and its arena residents go up once; one
+program computes every row's destination WITHOUT a sort (a live row of rank i in
+bucket w lands at `new_start[b] + i + n_res(b, bucket < w)`, a resident at
+`new_start[b] + occ_cum[b, w] + j` with j its rank among the brick's residents
+sorted by (bucket, slot), both from one searchsorted over the residents sorted by
+bucket), scatters the slab's whole new block (spare zeroed, ids -1), bincounts the
+new occupancy, and the block comes back as one slice. A block write can overrun a
+later slab's OLD range, so every later slab it intersects is uploaded first (a
+read-ahead window, on the receipt). The arena cannot be overrun: the allocation
+refusal bounds `n_alloc_new` by the old `arena_base`. Empty slabs are skipped
+(`empty_slabs` on the receipt); a one-slab probe state has 255.
+
+**Gate** (`tests/test_repack_device.py`, 7): bitwise the host `repack` on every
+field and its return dict (`bricks_fast` / `bricks_merged` included) with a
+populated arena, an overrunning write (read-ahead fired), repeated migrate+repack
+steps without ids, a quarter-filled box (empty slabs), and residents PLANTED
+below their brick's live rows -- the engine's own spill only ever parks a brick's
+highest-bucket rows, so no migrated fixture exercises the lower-bucket term, and
+the first mutant (dropping it) survived until that fixture existed. Three mutants
+caught after it.
+
+**Unmeasured:** device bytes per row of the program (the receipt reports what the
+driver holds: windows + block), and the wall at a 4096^3 slab.
+
+### R2: `EngineConfig(migrate_backend="device")`
+
+One router each for the migrate (step and lead drift) and the repack; receipts
+`migrate_backend`, `migrate_device` (None on the host) and `repack["repack_device"]`
+on every card; `migrate_device_budget_bytes` reaches the envelope refusal;
+`validate()` refuses an explicit `migrate_pooled=True` beside it and the device
+backend without x64. A tile pool may still drive the tile loop; the device pass
+ignores it (on a GPU node the pool refuses anyway).
+
+**Gate** (`tests/test_engine_device_backend.py`, 6): a K=3 run bitwise the host
+run with a repack every step and the receipts in both directions (device passes
+ran 4 + 3 times, the host arm touched none); the same beside a two-worker tile
+pool; a split-run resume bitwise the uninterrupted device run and the host run;
+the budget knob reaching the pass and refusing; the three refusals.
+
+Side change, bitwise: the lead drift's pooled call now forwards
+`migrate_eject_inflight` like the step's.
+
+### Planner: the device passes priced, the summed convention untouched
+
+Under `--backend device`, `step_bytes` charges the HOST for what the device
+passes actually build there -- two slab-sized numpy buffers each (window +
+block, 9 B/row, from the code) -- instead of the host migrate staging and
+repack scratch. The per-GPU column gains an AFTER-THE-TILE-LOOP table held
+apart from the in-step phases (JC, sec. 29: the migrate runs after paint, solve
+and tile loop have released their transients): the migrate at 320 B per slab
+row (sec. 31) and the repack at 3 slab windows (program scratch UNMEASURED,
+labelled so), max of the two, with its own verdict against `resident` alone.
+
+| c-hero on a gb node | before (sec. 11) | now |
+|---|---|---|
+| host, lower bound on the run's peak | 956.3 GB (0.93x), binding | **874.2 GB (0.85x)** |
+| the LOAD stage | 892.0 GB (0.87x) | 892.0 GB (0.87x), **binding again** |
+| per GPU, resident + worst in-step phase | 144.8 GB (0.73x) | 144.8 GB (0.73x) |
+| per GPU, resident + after-the-loop | -- | **172.9 GB (0.87x)**, migrate 85.9 |
+
+The host drop is the 51.0 GB migrate staging and the 40.6 GB repack scratch
+leaving, less 2 x 4.8 GB of windows. The after-the-loop figure is ARITHMETIC on
+320 B/slab row; sec. 31 says the device-program phases below 4.2M rows per slab
+are unlikely to scale linearly, in either direction.
+
+### The bundled job (proposal, not submitted)
+
+`scripts/v2_r2_device_engine.py` + `_vista.sbatch`: GPU pytest (5 files); the
+probe smoke; engine A/B at cgh64 K=2 (device backend first, host second, each
+its own process, every state field hashed and the stripped stats compared by the
+orchestrator); migrate-budget (R1's owed estimate-vs-measured, one process);
+repack-slab (a 268M-row slab at nb=256 with 4,096 residents planted, device
+repack bitwise the host, synced phases, device peak). Laptop smoke: all four
+arms rc=0, R2 gate hashes and stats equal. Time ask in the sbatch header: ~25
+min, 45 min wall, the tile loop at cgh64 the unmeasured bound.
