@@ -2362,3 +2362,73 @@ R1b and R2 CLOSED on a GB200. Owed: the c-hero migrate pass's estimate ratio
 (above); the arena fold-in at cgh64 (a spilling fixture, e.g. brick slack 0);
 and the device step executor, which is where the 87 s/step host coarse paint and
 the 30 s/step of host tile passes go.
+
+## 34. E1 on a GB200, Vista 996685 -- the device step executor is bitwise the host engine at cgh64, spills included; the compiled step is 8.2 s against 175 s
+
+`7cdd92a`, 2026-09-14, gb node c672-017, COMPLETED rc=0 in 42:57 of 50:00. Sbatch
+`v2_e1_device_step_vista.sbatch`; cards `runs/v2/e1_device_step_{gb,gbsmoke}.json`,
+log `runs/v2/e1-device-step-996685.log`. The executor (`caa2533`):
+`EngineConfig(coarse_backend=, tile_backend=, device_tile_jit=,
+device_paint_chunk_bricks=)` routes `engine.step` through `coarse_delta_cards` + the
+solve from the card and through `tile_loop_device` (compiled) or `tile_task_device`
+(eager); one card, the whole state on it. Five cgh64 arms (512^3, nb=32, 64 tiles,
+K=2 + lead drift, repack every step), each its own process; the device paint at its
+default quarter-slab chunk (the host at `chunk_bricks` 64), so the chunk-shaped
+stats (`coarse_pad`, `coarse_pad_true`, `coarse_subblock_chunks`) are not compared.
+
+### Gates on the GPU: PASS
+
+| comparison | final state hashes | host stats | step 1 at `tile_loop_end` |
+|---|---|---|---|
+| eager lane vs host, slack 0.10 (0 spills) | equal | equal | codes 0 of 491,285,406 differ; scales 0 of 32,768 |
+| eager lane vs host, slack 0 (483,879 spills) | equal | equal | codes 0 of 463,159,299; scales 0 of 32,768 |
+| compiled vs eager, slack 0.10 | -- | -- | **codes 0 of 491,285,406; scales 0 of 32,768** |
+
+- Receipts per arm (paint, tile loop, migrate, repack calls): compiled (2, 2, 3, 2),
+  eager (2, 0, 3, 2), host (0, 0, 0, 0).
+- **Brick slack 0 exercised the arena on the card at cgh64**, which 995813 could not:
+  290,384 and 193,495 spills on steps 1 and 2, up to 41 residents in one brick
+  (`arena_rect`), 1,291 in one paint chunk. Owed item of sec. 33 CLOSED.
+- **On the GB200 the compiled tile loop is bitwise the eager tile** at cgh64. On CPU
+  XLA it is not (sec. 17; the laptop smoke of this job moved 1 of 120,885 codes by
+  one), so `JIT_LONG_FORCE_EPS` stays the CPU-backend gate. Not read on the GPU: the
+  compiled lane WITH arena residents at cgh64 (no compiled slack-0 arm; the 32^3
+  smoke and the pytest leg only).
+- GPU pytest, 4 files (executor, migrate backend, card paint, device tile): 60 passed,
+  1 skipped (the CPU-lane pool test) in 17:40 -- 2.5x the ~7 min priced. It ran last.
+
+### The cgh64 step, per phase (one card; step 2 is steady, step 1 carries compiles)
+
+| s/step | compiled lane, step 1 | compiled lane, step 2 | eager lane, step 2 | host, step 2 |
+|---|---|---|---|---|
+| coarse_paint | 2.63 | **0.85** | 0.81 | 103.10 |
+| coarse_solve | 2.52 | 2.21 | 2.04 | 1.96 |
+| tile loop | 12.32 | **1.18** | 34.55 | 51.49 (decode 21.42 + long 19.16 + reduce 9.44 + short 1.47) |
+| migrate | 3.10 | **2.72** | 2.45 | 18.28 (jax eject) |
+| repack | 1.34 | 1.06 | 0.78 | 0.43 |
+| membership | 0.16 | 0.14 | 0.17 | 0.18 |
+| **step** | 22.08 | **8.17** | 40.80 | **175.43** |
+
+Lead drift once: 6.0 s device, 19.0 s host. Device peak: compiled 4.78 GiB, eager
+3.21, host 2.83. Host maxrss 24.6 GB on every arm.
+
+- **The steady compiled step is 21x the host step.** Its largest terms are now the
+  migrate (2.72) and the coarse solve (2.21, the host-resident spectrum path, the same
+  on both lanes); the tile loop is 1.18 s including one 1.4 GB state upload and one
+  copy back, and the paint 0.85 s.
+- The step-1 tile loop's extra ~11 s is the compile (step 2 kept the same shapes:
+  `device_shapes` identical across steps on every arm).
+- Host coarse paint 103-105 s/step here against 86 in 995813 (c672-006): node
+  spread, the 1.22x this record has seen before (secs. 9-10).
+- **What this does NOT project.** The whole state crosses the bus every step and fits
+  the card only at this size; at 4096^3 the tile loop needs the slab window (E2), the
+  force meshes land on the host before being re-uploaded (E4, ~103 GB of host at
+  c-hero, uncharged by the planner), and the step is on one card (E3).
+
+### Owed
+
+1. E2 (the tile state window), E3 (four cards in the step), E4 (the inverse written
+   into the card shards): plan `~/.claude/plans/prancy-scribbling-canyon.md`.
+2. The compiled lane with arena residents on the GPU at cgh64, if the claim above is
+   to cover spills.
+3. Carried: the c-hero migrate estimate ratio (sec. 33).
