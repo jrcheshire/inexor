@@ -2024,3 +2024,63 @@ emigrants:
 1. The emigrant share and reach at production step size (they size the insert).
 2. The replay with releases and claims interleaved, and its free-list rebuild.
 3. The host pad copy in `eject_rows` / `insert_rows` (candidate for the ~2x wall).
+
+## 30. D3b R1 on a GB200, Vista 995602 -- the device migrate is bitwise numpy's; a cgh64 step is 1.72 s against 27.6; its device peak is 438 B per slab row
+
+`55bdbfb`, 2026-09-13, gb node c672-005, COMPLETED rc=0 in 3:38. Sbatch
+`v2_d3_r1_device_migrate_vista.sbatch`; cards
+`runs/v2/d3_device_migrate_r1_{gbsmoke,gb}.json`, log copied to
+`runs/v2/d3-r1-migrate-995602.log`.
+
+**What was built** (`eca3529`, `1f221b3`): `state._replay_arena_pass`, the pooled
+migrate's replay moved verbatim and shared; `device.migrate.drift_and_migrate_device`
+-- per slab one upload of the slot range, its arena residents and occupancy, a
+device program enumerating rows in the reference order, the unchanged compiled
+eject/insert kernels on device arrays, keepers/emigrants staged on the device,
+written rows scattered into the slab's original bytes and one slice copied back,
+releases and claims replayed on the host. Laptop gate 5 passed with five mutants
+caught (skipped write-back, reversed source order, residents descending within a
+brick, census off by one, one extra written row).
+
+### Identity on the GPU: PASS
+
+- `tests/test_migrate_device.py` + `test_insert_jax.py` + `test_eject_jax.py` on
+  the GPU backend: **21 passed**.
+- Probe smoke (32^3 arena state, 64^3): bitwise at both steps.
+
+| arm | step | numpy | device | new programs | state and stats |
+|---|---|---|---|---|---|
+| cdev, zero slack, 30% arena, reach 2, ids | 0 | 4.41 s | 8.46 s | 5 | **bitwise** (overflow 89,782) |
+| | 1 | 4.52 s | 4.31 s | 3 | **bitwise** (overflow 98,397) |
+| cgh64, slack 0.10, 1% arena, reach 1 | 0 | 27.38 s | 6.36 s | 5 | **bitwise** |
+| | 1 | 27.61 s | **1.72 s** | 0 | **bitwise** |
+
+- **The steady cgh64 step is 1.72 s: 16x the serial numpy migrate and 8.8x sec.
+  27's compiled-kernel host path (15.17 s)**, 54 ms per slab of 4.19M rows, on one
+  card. Not attributed by phase.
+- The cdev arena arm's step 1 still compiled 3 programs (the arena grew onto new
+  ladder rungs), so neither of its readings is steady.
+- **Device peak: 0.99 GiB (cdev), 1.71 GiB (cgh64) = 438 B per slab row at
+  cgh64.** R0 put the kernels at 114 (eject) and ~80 (insert) B per padded row,
+  so most of the peak is arrays the driver holds at once. Candidates, by
+  arithmetic on the code and NOT measured: the rows program's outputs kept alive
+  through the eject (~50 B/row), three staged slabs of eject outputs at reach 1
+  (dest, off, w, src, plus a retained int64 `d_slab`: ~33 B/row each), the
+  windows of pending inserts (~9 B/row each), and the insert's compacted buffers
+  (~25 B/row) beside its workspace.
+
+### At 4096^3 -- arithmetic, not a measurement
+
+- **Memory: 438 B x 268M rows = ~117 GB per card if the peak scales with slab
+  rows, against the ~54 GB beside the tile window (JC's envelope, sec. 29).** R1
+  does not fit the envelope as built.
+- **Wall: 1.72 s x 512 = ~880 s/step on one card if linear in rows.** Per-slab
+  fixed costs and per-row costs are not separated, so this is not a projection.
+
+### Owed (R1 does not close until these are read)
+
+1. The device peak attributed by what is held, then the driver's retention cut to
+   the envelope (free rows outputs after the eject, compute destination slabs on
+   demand, stage only what the insert reads), with a refusal naming the envelope.
+2. The cgh64 step wall split by phase (upload, device programs, readback, host
+   index work, replay), which a 4096^3 projection needs.
