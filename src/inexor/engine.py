@@ -180,6 +180,8 @@ class EngineConfig:
         migrate_window=None,
         checkpoint_dir=None,
         checkpoint_every=1,
+        migrate_backend="host",
+        migrate_device_budget_bytes=None,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -278,6 +280,19 @@ class EngineConfig:
         # the per-step stats is what proves it applied.
         self.checkpoint_dir = None if checkpoint_dir is None else str(checkpoint_dir)
         self.checkpoint_every = int(checkpoint_every)
+        # D3b R2: where the migrate and the repack run. "host" is everything
+        # above (serial or pooled by `migrate_pooled`); "device" routes both
+        # through `device.migrate.drift_and_migrate_device` and
+        # `device.repack.repack_device`, each gated bitwise against the serial
+        # host pass, on the parent's jax backend (one device, R1/R1b scope).
+        # A pool may still run the tile loop; the device pass ignores it, and
+        # an EXPLICIT `migrate_pooled=True` beside it refuses at validate().
+        # `migrate_device_budget_bytes` is the per-slab device envelope the
+        # device migrate refuses above (record sec. 29: ~112 GB per card at
+        # c-hero); None = no limit, the estimate is on the receipt either way.
+        self.migrate_backend = str(migrate_backend)
+        self.migrate_device_budget_bytes = (
+            None if migrate_device_budget_bytes is None else int(migrate_device_budget_bytes))
 
     @property
     def np_coarse_dtype(self):
@@ -597,6 +612,20 @@ class EngineConfig:
         # 77.3 / 92.7 B on the same basis; it is not added here because it
         # completes before the step's peak and so is never co-resident with it.
         nb = max(1, self.n_fine // self.n_brick)
+        if self.migrate_backend == "device":
+            # The device passes hold HOST scratch of their own: each builds one
+            # slab's numpy window (slot range + residents) to upload and copies one
+            # block back -- two slab-sized numpy buffers, 9 B/row (+4 with ids),
+            # by construction of `device.migrate._eject_slab` and
+            # `device.repack.repack_device`. Unmeasured on a node; charged from the
+            # code. The device-side terms live in `plan.device_budget`.
+            host_window = int(round(2 * 9.0 * n / nb))
+            out = dict(kick_pending=0, repack_scratch=host_window,
+                       migrate_staging=host_window)
+            if cap is not None:
+                out["tile_buffers"] = (max(int(self.tile_workers), 1) * int(cap)
+                                       * (8 + 1 + 24 + 24 + 1 + 8 + 24 + 24))
+            return out
         out = dict(
             kick_pending=0,
             # 0.49 MEASURED (2.135/2.066 -> 0.490/0.490 at 2.1M and 16.8M
@@ -647,6 +676,21 @@ class EngineConfig:
             raise ValueError(
                 f"migrate_pooled needs a pool: tile_workers is {self.tile_workers}"
             )
+        if self.migrate_backend not in ("host", "device"):
+            raise ValueError(
+                f"migrate_backend must be 'host' or 'device', got {self.migrate_backend!r}")
+        if self.migrate_backend == "device":
+            if self.migrate_pooled is True:
+                raise ValueError(
+                    "migrate_pooled=True and migrate_backend='device' name two different "
+                    "migrates; the device pass does not use the pool. Drop one.")
+            import jax
+
+            if not jax.config.jax_enable_x64:
+                raise ValueError(
+                    "migrate_backend='device' needs jax_enable_x64 (the compiled kernels' "
+                    "int64 lattice index is silently int32 without it). Enable it in the "
+                    "driver; the library never does.")
         self._refuse_f64_without_x64()
         return True
 
@@ -1179,6 +1223,33 @@ def apply_result(st, res):
     st.vel_scale[res["run_bricks"]] = res["run_scales"]
 
 
+def _migrate_pass(st, cfg, c_drift, pool):
+    """ONE router for the step's migrate and the lead drift: host (serial or
+    pooled, exactly as before) or the device pass. Returns the stats dict; the
+    device pass's `migrate_device` receipt rides in it."""
+    if cfg.migrate_backend == "device":
+        from .device.migrate import drift_and_migrate_device
+
+        return drift_and_migrate_device(
+            st, c_drift, device_budget_bytes=cfg.migrate_device_budget_bytes)
+    if pool is not None and cfg.migrate_pooled is not False:
+        return drift_and_migrate_pooled(
+            st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window,
+            eject_inflight=cfg.migrate_eject_inflight,
+        )
+    return drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel)
+
+
+def _repack_pass(st, cfg):
+    """The repack, routed like the migrate. Returns the host repack's dict; the
+    device pass adds its `repack_device` receipt."""
+    if cfg.migrate_backend == "device":
+        from .device.repack import repack_device
+
+        return repack_device(st, brick_slack=cfg.brick_slack)
+    return st.repack(brick_slack=cfg.brick_slack)
+
+
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
          phase=None, tile_force=None, pool=None, coarse_parts=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
@@ -1375,16 +1446,15 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # a peak comparison against every card on record is still like-for-like.
     ph("reconcile")
 
-    if pool is not None and cfg.migrate_pooled is not False:
-        stats = drift_and_migrate_pooled(
-            st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window,
-            eject_inflight=cfg.migrate_eject_inflight,
-        )
-    else:
-        stats = drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel)
+    stats = _migrate_pass(st, cfg, c_drift, pool)
     # the knob's receipt, in BOTH directions: 0 on every serial card, W on
     # every pooled one (the reach fallback reports 0 through migrate_pool)
     stats["migrate_pooled_workers"] = int(stats.get("migrate_pool", {}).get("workers", 0))
+    # the backend's receipt: the name, and on the device the pass's own dict
+    # (slabs, programs, peak estimate); None on the host so every card carries
+    # the key
+    stats["migrate_backend"] = cfg.migrate_backend
+    stats.setdefault("migrate_device", None)
     # PEAK ARENA RESIDENCY, so `arena_frac` stops being chosen by argument.
     # The 6% on record is CLAIMS across a migrate pass, not residency: the
     # arena is a revolving door (`_release_arena_of_brick` frees slots as
@@ -1455,6 +1525,9 @@ def fused_drifts(coeffs):
 #     policy; the pooled migrate is bitwise the serial one (C14) and W is
 #     exactly the thing you want to change when resuming onto another node.
 #   eject_kernel -- both kernels are bitwise on arm64/x86/CUDA (record 5s).
+#   migrate_backend, migrate_device_budget_bytes -- execution policy; the device
+#     migrate and repack are bitwise the serial host passes (D3b R1/R1b gates),
+#     and a resume onto a node with a different backend is the point.
 #   repack_every, chunk_bricks, brick_slack -- move the LAYOUT, and the layout
 #     carries no physics: both paints are integer and so order-independent
 #     (D-v2-21), which is also why this checkpoint does not preserve
@@ -1694,11 +1767,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         # The phase boundary still fires so a resumed run's phase table keeps
         # the same shape as an uninterrupted one (the `reconcile` precedent).
         if resume is None:
-            if pool is not None and cfg.migrate_pooled is not False:
-                drift_and_migrate_pooled(st, lead, pool, kernel=cfg.eject_kernel,
-                                         window=cfg.migrate_window)
-            else:
-                drift_and_migrate(st, lead, kernel=cfg.eject_kernel)
+            _migrate_pass(st, cfg, lead, pool)
         ph("lead_drift")
         out = []
         # both buffer shapes are carried ACROSS steps and only ever grow, so the
@@ -1745,7 +1814,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             cap_shape = int(stats["cap"])
             pad_shape = int(stats["coarse_pad"])
             if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
-                stats["repack"] = st.repack(brick_slack=cfg.brick_slack)
+                stats["repack"] = _repack_pass(st, cfg)
                 ph("repack")
             # AFTER the repack, so the checkpoint is the step's settled state.
             # The receipt goes on every step in both directions, `None` when

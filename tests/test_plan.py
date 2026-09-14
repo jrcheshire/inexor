@@ -755,7 +755,7 @@ def test_one_gpu_charges_every_surviving_term_in_full():
     ec = _ec("cgh64")
     mesh = ec.mesh_bytes()
     halo = shard_halo_planes()
-    resident, transient, _phases, _worst, _slabs, host_mesh = device_budget(
+    resident, transient, _phases, _worst, _slabs, host_mesh, _after = device_budget(
         ec, n=ec.n_total, n_gpus=1)
     got = {**resident, **transient}
     kept = {k: v for k, v in mesh.items()
@@ -782,8 +782,8 @@ def test_the_shard_is_a_quarter_plus_its_ghost_planes_across_four_cards():
     ec = _ec("cgh64")
     mesh = ec.mesh_bytes()
     halo = shard_halo_planes()
-    r1, t1, _p, _w, _s, _h = device_budget(ec, n=ec.n_total, n_gpus=1)
-    r4, t4, _p, _w, _s, _h = device_budget(ec, n=ec.n_total, n_gpus=4)
+    r1, t1, _p, _w, _s, _h, _a = device_budget(ec, n=ec.n_total, n_gpus=1)
+    r4, t4, _p, _w, _s, _h, _a = device_budget(ec, n=ec.n_total, n_gpus=4)
     one, four = {**r1, **t1}, {**r4, **t4}
     sharded = [k for k, v in DEVICE_PLACEMENT.items()
                if v == "shard" and k in mesh]

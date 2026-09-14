@@ -241,6 +241,19 @@ PAINT_CHUNK_TRACED_B_PER_ROW = 125
 # is derived at <= 26.0%
 PAINT_PAD_BOUND = 1.26
 
+# THE DEVICE MIGRATE'S PEAK PER SLAB ROW, MEASURED on a GB200 after the R1
+# retention cuts (Vista 995638, record sec. 31): 1.25 GiB at cgh64 = 320 B per
+# slab row, `device.migrate.drift_and_migrate_device` on one card. Charged at
+# the slab's rows x this. It scales with slab rows by ARITHMETIC (~86 GB at
+# c-hero); the 4096^3 reading is owed to the R2 job.
+MIGRATE_DEVICE_B_PER_SLAB_ROW = 320
+# THE DEVICE REPACK holds two slab windows (the slab and one read-ahead) plus
+# one output block, by construction of `device.repack.repack_device`
+# (`windows_peak` / `held_peak_bytes` on its receipt); its program's own
+# scratch per row is UNMEASURED and NOT charged here. Ladder padding <= 6%.
+REPACK_DEVICE_WINDOWS = 3
+REPACK_DEVICE_PAD_BOUND = 1.06
+
 
 def device_window_slabs(ec):
     """x-slabs of bricks that must be resident to serve one plane of tiles.
@@ -362,7 +375,20 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
     in_step = sum(v for k, v in phases.items() if k not in ONCE_PER_RUN_PHASES)
     once = max((v for k, v in phases.items() if k in ONCE_PER_RUN_PHASES),
                default=0)
-    return resident, transient, phases, max(in_step, once), slabs, host_mesh
+    # AFTER THE TILE LOOP, and deliberately NOT summed into the in-step phases:
+    # the migrate and the repack run after the paint, the solve and the tile
+    # loop have released their transients (JC, record sec. 29: the envelope is
+    # the card less the RESIDENT terms, ~112 GB at c-hero). They are held apart
+    # so the summed convention above is unchanged and the second verdict is
+    # read against `resident` alone. The two do not coexist either: max.
+    slab_rows = n / nb
+    after_loop = {
+        "migrate_device_pass (320 B/slab row, sec. 31)": int(
+            MIGRATE_DEVICE_B_PER_SLAB_ROW * slab_rows),
+        "repack_device_pass (3 slab windows held; program scratch UNMEASURED)": int(
+            REPACK_DEVICE_WINDOWS * REPACK_DEVICE_PAD_BOUND * slab_rows * row_bytes),
+    }
+    return resident, transient, phases, max(in_step, once), slabs, host_mesh, after_loop
 
 
 def _device_main(args, ec, t9, n, rows, arena, state):
@@ -380,14 +406,14 @@ def _device_main(args, ec, t9, n, rows, arena, state):
     ec_dev, _ = build(dev_args)
     n_gpus = max(1, int(args.n_gpus))
 
-    resident, transient, phases, worst_phase, slabs, host_mesh = device_budget(
+    resident, transient, phases, worst_phase, slabs, host_mesh, after_loop = device_budget(
         ec_dev, n=n, n_gpus=n_gpus, paint_chunk_bricks=args.paint_chunk_bricks)
 
     step = ec_dev.step_bytes(n, n_rows=rows, cap=args.cap)
     host = dict(state)
     for k, v in step.items():
         if v:
-            host[f"{k} (host until D3/D4)"] = v
+            host[f"{k} (host window of the device pass)"] = v
     # The mesh terms the design puts in HOST memory ON PURPOSE -- the factorized
     # coarse solve's spectrum and its per-component work buffer. They are the
     # design working as intended, not a port debt like the two above, so they
@@ -397,10 +423,10 @@ def _device_main(args, ec, t9, n, rows, arena, state):
             host[f"{k} (host by design)"] = v
     _table("HOST: the state, plus the per-step terms nothing has moved yet", host)
     print(f"  state alone: {sum(state.values()) / n:6.2f} B/p")
-    print("  `migrate_staging` and `repack_scratch` are exactly the terms the "
-          "device\n  migrate and repack delete. They are charged to the host "
-          "because nothing\n  has moved them, not because the design wants them "
-          "there.")
+    print("  `migrate_staging` and `repack_scratch` are the HOST windows the device "
+          "migrate\n  and repack build per slab (two slab-sized numpy buffers each, "
+          "from the code);\n  their device-side terms are in the AFTER-THE-LOOP "
+          "table below.")
 
     _table(f"PER GPU (of {n_gpus}), resident through the tile loop", resident)
     if transient:
@@ -408,6 +434,9 @@ def _device_main(args, ec, t9, n, rows, arena, state):
                transient)
     _table(f"PER GPU (of {n_gpus}), BY PHASE", phases,
            total_label="sum of ALL phases listed")
+    _table(f"PER GPU (of {n_gpus}), AFTER THE TILE LOOP (migrate, then repack; "
+           "not co-resident with the phases above, JC sec. 29)", after_loop,
+           total_label="max (the two do not coexist)", reduce=max)
     print(f"  the verdict below charges {_fmt(worst_phase).strip()}, which is "
           "max(the in-step\n  phases summed, the largest once-per-run phase) -- "
           "`kernel_build` runs before\n  the loop and is never co-resident with "
@@ -435,10 +464,15 @@ def _device_main(args, ec, t9, n, rows, arena, state):
               f"{'FITS' if rl < 1.0 else 'DOES NOT FIT'} ({rl:.2f}x)")
     else:
         print("  no --host-gb given, so no host verdict (a Vista gb node is 1026)")
+    after_peak = sum(resident.values()) + max(after_loop.values())
+    print(f"  per GPU, resident + after-the-loop:    {_fmt(after_peak)}")
     if args.device_gb is not None:
         r = dev_peak / (args.device_gb * GB)
         print(f"  against --device-gb {args.device_gb} per card: "
               f"{'FITS' if r < 1.0 else 'DOES NOT FIT'} ({r:.2f}x)")
+        ra = after_peak / (args.device_gb * GB)
+        print(f"    and after the tile loop:          "
+              f"{'FITS' if ra < 1.0 else 'DOES NOT FIT'} ({ra:.2f}x)")
     else:
         print("  no --device-gb given, so no per-card verdict (a GB200 detected "
               "185 GiB = 199 GB)")
@@ -465,6 +499,7 @@ def build(args):
         tile_workers=max(int(args.workers), 1) if args.workers else 1,
         eject_kernel=args.eject_kernel,
         migrate_eject_inflight=args.eject_inflight,
+        migrate_backend="device" if getattr(args, "backend", "cpu") == "device" else "host",
     )
     t9 = T9Layout(box_size=args.box, n_part=args.n_part, bucket_cells=args.bucket_cells)
     return ec, t9

@@ -261,7 +261,6 @@ def test_the_factorized_coarse_solve_agrees_with_monolithic_at_roundoff(fdtype):
     """
     import jax
 
-    from inexor import forces
 
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", fdtype is np.float64)
