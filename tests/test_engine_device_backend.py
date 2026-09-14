@@ -103,7 +103,12 @@ def test_a_device_backend_run_is_bitwise_the_host_run_with_receipts():
 
 
 def test_the_device_backend_beside_a_tile_pool_still_runs_the_device_pass():
-    """A pool may drive the tile loop; the migrate is the device's, not the pool's."""
+    """A pool may drive the tile loop; the migrate is the device's, not the pool's.
+
+    CPU backend only: `TilePool` is the CPU lane and refuses a GPU parent by
+    design (995764 found this test asking it to)."""
+    if jax.devices()[0].platform != "cpu":
+        pytest.skip("TilePool is the CPU lane; no pool beside a GPU parent")
     co = _coeffs(2)
     cfg_h, cfg_d = _cfg(), _cfg(migrate_backend="device", tile_workers=2)
     st_h, st_d = _state(cfg_h), _state(cfg_d)

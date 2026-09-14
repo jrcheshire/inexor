@@ -21,7 +21,7 @@
 # Submit from the Vista checkout:
 #   sbatch scripts/v2_r2_device_engine_vista.sbatch
 #
-# TIME ASK: ~25 min estimated, 45 min wall, one gb node (~0.75 SU at the wall,
+# TIME ASK: ~28 min estimated, 45 min wall, one gb node (~0.75 SU at the wall,
 # ~0.4 at the estimate). The tile loop at cgh64 on one card is UNMEASURED and is
 # the largest term; bounded from cdev's serial 22.1 s/step on a B200 (sec. 5y) x8
 # in particles. The unpriced leg (repack-slab) runs LAST.
@@ -29,7 +29,7 @@
 #   phase                          each (source)                                total
 #   pytest on the GPU              995638: migrate+insert+eject ~1.5 min; the
 #                                  repack and engine-backend gates add ~1 min
-#                                  of laptop time, compiles on top             ~3 min
+#                                  of laptop time; 995764 MEASURED 5:49        ~6 min
 #   probe smoke, 4 arms            laptop 25 s; GPU compiles                   ~1 min
 #   engine-device, cgh64, K=2      build 31 s (995602); lead drift 6.4 s (device,
 #                                  compiles); 2 x (tile loop <= ~180 s bound +
