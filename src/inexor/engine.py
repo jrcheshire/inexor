@@ -182,6 +182,10 @@ class EngineConfig:
         checkpoint_every=1,
         migrate_backend="host",
         migrate_device_budget_bytes=None,
+        coarse_backend="host",
+        tile_backend="host",
+        device_tile_jit=True,
+        device_paint_chunk_bricks=None,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -293,6 +297,24 @@ class EngineConfig:
         self.migrate_backend = str(migrate_backend)
         self.migrate_device_budget_bytes = (
             None if migrate_device_budget_bytes is None else int(migrate_device_budget_bytes))
+        # The device step executor: where the coarse paint + solve and the tile
+        # loop run. TWO knobs beside `migrate_backend`, one per phase, so a phase
+        # table or an identity gate can move one phase at a time (the
+        # `fine_dtype` / `coarse_dtype` rule). "device" coarse is
+        # `device.paint.coarse_delta_cards` + the solve from the cards; "device"
+        # tile is `device.tile.tile_loop_device`, one compiled program writing
+        # into device state, accepted at a measured floor against the eager tile
+        # (record sec. 17). `device_tile_jit=False` is the eager per-tile arm,
+        # bitwise `tile_task` on the CPU backend -- the oracle arm, not an
+        # operating point (the `pad_ladder=False` precedent).
+        # `device_paint_chunk_bricks` is the device paint's own chunk length;
+        # None = `device.paint.default_chunk_bricks` (a quarter x-slab), because
+        # `chunk_bricks`' 64 is 262,144 device launches per step at 4096^3.
+        self.coarse_backend = str(coarse_backend)
+        self.tile_backend = str(tile_backend)
+        self.device_tile_jit = bool(device_tile_jit)
+        self.device_paint_chunk_bricks = (
+            None if device_paint_chunk_bricks is None else int(device_paint_chunk_bricks))
 
     @property
     def np_coarse_dtype(self):
@@ -684,13 +706,39 @@ class EngineConfig:
                 raise ValueError(
                     "migrate_pooled=True and migrate_backend='device' name two different "
                     "migrates; the device pass does not use the pool. Drop one.")
+        for name in ("coarse_backend", "tile_backend"):
+            if getattr(self, name) not in ("host", "device"):
+                raise ValueError(
+                    f"{name} must be 'host' or 'device', got {getattr(self, name)!r}")
+        if self.coarse_backend == "device":
+            if not self.paint_subblock:
+                # the A/B arm restores a full-mesh paint per chunk; the device paint
+                # has no full-mesh form, so the knob could not apply
+                raise ValueError(
+                    "paint_subblock=False asks for the full-mesh paint, which "
+                    "coarse_backend='device' does not have. Drop one.")
+            if self.device_paint_chunk_bricks is not None and self.device_paint_chunk_bricks < 1:
+                raise ValueError(
+                    f"device_paint_chunk_bricks must be >= 1, got {self.device_paint_chunk_bricks}")
+        if self.tile_backend == "device" and self.tile_workers > 1:
+            raise ValueError(
+                f"tile_backend='device' with tile_workers={self.tile_workers}: the pool is "
+                "the CPU lane and refuses a GPU parent. The device tile loop is one program "
+                "per card; set tile_workers=1.")
+        if not self.device_tile_jit and self.tile_backend != "device":
+            raise ValueError(
+                "device_tile_jit=False selects the eager DEVICE tile, but tile_backend is "
+                f"{self.tile_backend!r}; the knob could not apply.")
+        on_device = [n for n in ("migrate_backend", "coarse_backend", "tile_backend")
+                     if getattr(self, n) == "device"]
+        if on_device:
             import jax
 
             if not jax.config.jax_enable_x64:
                 raise ValueError(
-                    "migrate_backend='device' needs jax_enable_x64 (the compiled kernels' "
-                    "int64 lattice index is silently int32 without it). Enable it in the "
-                    "driver; the library never does.")
+                    f"{' and '.join(on_device)}='device' needs jax_enable_x64 (the compiled "
+                    "kernels' int64 lattice index is silently int32 without it). Enable it "
+                    "in the driver; the library never does.")
         self._refuse_f64_without_x64()
         return True
 
@@ -1251,7 +1299,7 @@ def _repack_pass(st, cfg):
 
 
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
-         phase=None, tile_force=None, pool=None, coarse_parts=None):
+         phase=None, tile_force=None, pool=None, coarse_parts=None, device_shapes=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1 and
@@ -1285,6 +1333,18 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     `(None, geom)`: the parent never runs a tile itself, so it needs the
     geometry but not the kernels.
 
+    THE DEVICE LANE (`cfg.coarse_backend` / `cfg.tile_backend`, the executor
+    of `runs/v2/device_design_record.md`). "device" coarse paints, accumulates
+    and decodes the density on the card and solves from it; "device" tile runs
+    the whole loop as one compiled program writing into device state
+    (`device.tile.tile_loop_device`), or the eager per-tile oracle arm under
+    `device_tile_jit=False`. The migrate and repack follow `migrate_backend`.
+    `device_shapes` is the previous step's compiled shapes (`stats
+    ["device_shapes"]`), carried by `run` so they stay monotone and restored
+    from a checkpoint so a resumed run compiles the programs the uninterrupted
+    one did. The compiled tile loop has one boundary, `tile_loop`, in place of
+    the per-tile ones: a synced per-tile timing is not neutral (record sec. 20).
+
     `phase`, if given, is called with a boundary NAME after each phase of the
     step completes. It exists because a peak is a max and a max carries no
     timestamp: M-v2-6 Stage 0 attributed the peak by differencing whole-run
@@ -1305,21 +1365,41 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
 
     # --- long arm: solve once, globally, on the coarse mesh
     mesh_stats = {}
-    delta = coarse_delta_streamed(st, cfg, stats=mesh_stats, census=census,
-                                  pad_shape=pad_shape, pool=pool)
+    shapes_in = device_shapes or {}
+    shapes_out = {}
+    if cfg.coarse_backend == "device":
+        from .device.paint import coarse_delta_cards
+
+        # The density painted, accumulated and decoded ON THE CARD, never on the
+        # host: `coarse_force_meshes` takes the shards and transforms each card's
+        # planes where they sit. One card (jax's default device) here.
+        delta = coarse_delta_cards(
+            st, cfg, stats=mesh_stats, pad_shape=pad_shape,
+            chunk_bricks=cfg.device_paint_chunk_bricks, census=census,
+            shape_floor=shapes_in.get("paint"))
+        shapes_out["paint"] = {k: int(v) for k, v in mesh_stats["coarse_jit_shapes"].items()}
+        # the host path's keys, on every card: each device chunk IS a sub-block
+        # paint, and no pool painted it
+        mesh_stats["coarse_subblock_chunks"] = int(mesh_stats["coarse_device_chunks"])
+        mesh_stats["coarse_pooled_workers"] = 0
+    else:
+        delta = coarse_delta_streamed(st, cfg, stats=mesh_stats, census=census,
+                                      pad_shape=pad_shape, pool=pool)
     ph("coarse_paint")
     # HAND THE FIELD OVER AND LET GO OF IT. `delta` is a full coarse mesh (4.3 GB
     # at C-gh) and the solve reads only the jax copy, so holding the numpy name
     # bound through the solve keeps a dead mesh alive across the phase where the
-    # peak is. Costs nothing when the jax copy aliases the host buffer.
-    dj = jnp.asarray(delta)
+    # peak is. Costs nothing when the jax copy aliases the host buffer. Card
+    # shards are handed over as they are.
+    dj = delta if cfg.coarse_backend == "device" else jnp.asarray(delta)
     # read the REALIZED dtype off the decoded field before letting go of it: the
     # receipt at the end of the step is the check that the coarse knob applied,
     # and it has to come from the array the paint produced. The force meshes
     # cannot serve -- with `out=` they are the pool's preallocated views, whose
     # dtype comes from the config, so a receipt read there would echo what it
     # was told, which is exactly the failure this milestone exists to catch.
-    coarse_dtype_seen = np.dtype(delta.dtype).name
+    coarse_dtype_seen = np.dtype(
+        delta[0]["delta"].dtype if cfg.coarse_backend == "device" else delta.dtype).name
     del delta
     # `coarse_force_meshes` infers from delta.dtype and REFUSES a mismatch, so
     # the dtype cannot silently disagree with what the config asked for.
@@ -1393,8 +1473,37 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # TWO executors of ONE function. Serial: task and apply inline, in tile
     # order. Pool: the same `tile_task` from workers, applied in arrival order.
     # The bitwise executor-identity gate compares the two.
+    #
+    # THE DEVICE LANE is a third executor. Compiled (`device_tile_jit`), the whole
+    # loop is `device.tile.tile_loop_device`: every tile writes its codes and
+    # scales into device state, guards and the partition are resolved after the
+    # loop, the host state is written once, and only counts come back -- so
+    # nothing reaches the per-result loop below. Eager, `tile_task_device` returns
+    # the `tile_task` dict and `apply_result` lands it, the bitwise oracle arm.
     tasks = [(t, members[t]) for t in cfg.tiles]
-    if pool is not None:
+    if cfg.tile_backend == "device" and cfg.device_tile_jit:
+        from .device.coarse import whole_mesh_shard
+        from .device.tile import tile_loop_device, tile_step_shapes
+
+        shapes = tile_step_shapes(st, floor=shapes_in.get("tile"))
+        shapes_out["tile"] = {k: int(v) for k, v in shapes.items()}
+        # the force meshes placed on the card once per step; each tile's program
+        # gathers its own sub-blocks there (record sec. 23)
+        shard = whole_mesh_shard(g_coarse)
+        loop = tile_loop_device(st, one_tile, C, g_coarse, members, shapes,
+                                coarse_shard=shard)
+        del shard
+        n_owned, n_overhang = int(loop["n_owned"]), int(loop["n_out"])
+        if loop["vel_scale_kick_max"] is not None:
+            tile_scales.append(float(loop["vel_scale_kick_max"]))
+        ph("tile_loop")
+        results = ()
+    elif cfg.tile_backend == "device":
+        from .device.tile import tile_task_device
+
+        results = (tile_task_device(st, one_tile, C, g_coarse, t, bricks)
+                   for t, bricks in tasks)
+    elif pool is not None:
         pool.stage_step(g_coarse, C)
         results = pool.imap(tasks)
     else:
@@ -1494,6 +1603,14 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # against
     stats["coarse_dtype"] = coarse_dtype_seen
     stats["fine_dtype"] = str(geom["fdtype"])
+    # the executor's receipts, on every card in both directions. The calls
+    # themselves are counted in `device.paint.CALLS` / `device.tile.CALLS`;
+    # `device_shapes` is what the device programs were compiled at, carried by
+    # `run` across steps and into checkpoints ({} on the host lane)
+    stats["coarse_backend"] = cfg.coarse_backend
+    stats["tile_backend"] = (cfg.tile_backend if cfg.tile_backend == "host"
+                             else ("device" if cfg.device_tile_jit else "device-eager"))
+    stats["device_shapes"] = shapes_out
     stats.update(mesh_stats)
     stats["repack"] = None
     if collect is not None:
@@ -1550,13 +1667,15 @@ def checkpoint_fingerprint(cfg, coeffs):
     return h.hexdigest()
 
 
-def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=None):
+def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=None,
+                      device_shapes=None):
     """One generation of a rolling pair. Returns the directory, which is the
     receipt: a run that believed it was checkpointing and was not has `None`
     on every step.
 
     `epoch` is the optional `(a_steps, cosmo)` from `run`; see `epoch_record`
-    for what it writes and why it is not in the fingerprint."""
+    for what it writes and why it is not in the fingerprint. `device_shapes` is
+    the device lane's compiled shapes, restored on resume (see `run`)."""
     from . import icgen
 
     prov = dict(
@@ -1565,6 +1684,8 @@ def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=No
         n_steps=int(len(coeffs)),
         cap_shape=int(cap_shape),
         pad_shape=int(pad_shape),
+        device_shapes={name: {k: int(v) for k, v in s.items()}
+                       for name, s in (device_shapes or {}).items()},
         n_arena=int(st.n_arena),
         fingerprint=checkpoint_fingerprint(cfg, coeffs),
     )
@@ -1775,6 +1896,9 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         # Stage 0, `coarse_pad` from Stage 0b, which measured it still churning
         cap_shape = 0
         pad_shape = 0
+        # the device lane's compiled shapes (`step`'s `device_shapes`), carried the
+        # same way; {} on the host lane
+        device_shapes = {}
         k0 = 0
         if resume is not None:
             # Both shapes are RESTORED rather than re-laddered from zero, so a
@@ -1786,9 +1910,16 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             # split-run gate therefore cannot see this and does not claim to;
             # what it does catch is the lead drift being reapplied. Not
             # generalized to GPU, where XLA reassociates by shape.
+            #
+            # The device shapes are restored for the stronger reason that
+            # sentence names: on a GPU a program compiled at another shape may
+            # round differently, so a resumed run is only the uninterrupted one if
+            # it compiles the same programs. A checkpoint written before the
+            # executor has none, and a host-lane run needs none.
             k0 = int(resume["step"])
             cap_shape = int(resume["cap_shape"])
             pad_shape = int(resume["pad_shape"])
+            device_shapes = dict(resume.get("device_shapes") or {})
         k_end = len(fused)
         if stop_at is not None:
             k_end = min(k_end, int(stop_at))
@@ -1810,9 +1941,10 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
                          census=census, cap_shape=cap_shape, pad_shape=pad_shape,
                          phase=phase, tile_force=tile_force, pool=pool,
-                         coarse_parts=coarse_parts)
+                         coarse_parts=coarse_parts, device_shapes=device_shapes)
             cap_shape = int(stats["cap"])
             pad_shape = int(stats["coarse_pad"])
+            device_shapes = stats["device_shapes"]
             if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
                 stats["repack"] = _repack_pass(st, cfg)
                 ph("repack")
@@ -1822,7 +1954,8 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             stats["checkpoint"] = None
             if ckpt_on and (k + 1) % cfg.checkpoint_every == 0:
                 stats["checkpoint"] = _write_checkpoint(
-                    st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2, epoch=epoch
+                    st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2, epoch=epoch,
+                    device_shapes=device_shapes,
                 )
                 n_ckpt += 1
                 ph("checkpoint")

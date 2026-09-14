@@ -55,7 +55,8 @@ ownership partition checked. Order cannot matter: a tile writes only rows it
 owns, and a later tile reads those rows only as buffer, whose velocities are
 decoded and never used.
 
-Nothing here is wired into `engine.step`.
+`engine.step` calls `tile_loop_device` under `EngineConfig(tile_backend="device")`,
+and the eager `tile_task_device` under `device_tile_jit=False`.
 """
 
 from __future__ import annotations
@@ -71,6 +72,9 @@ import numpy as np
 _KERNELS = {}
 _TRACES = [0]
 _KERNEL_LOCK = threading.Lock()
+
+#: RECEIPT: step-level tile loops run through this module (see `migrate.CALLS`).
+CALLS = 0
 
 STATE_FIELDS = ("off", "w", "vel_scale", "arena_bucket")
 
@@ -198,7 +202,12 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
         keep_old = out["counts"] == 0
         vs_new = vel_scale.at[bricks].set(
             jnp.where(keep_old, vel_scale[bricks], out["scales"]), mode="promise_in_bounds")
-        return w_new, vs_new, {k: out[k] for k in ("n_own", "n_out", "lo", "hi")}
+        sc = {k: out[k] for k in ("n_own", "n_out", "lo", "hi")}
+        # the largest scale this tile WROTE (-inf when it wrote none): the host
+        # loop's `vel_scale_kick_max` is a max over exactly these values, so a max
+        # of them is the same float
+        sc["scale_max"] = jnp.max(jnp.where(keep_old, -jnp.inf, out["scales"]))
+        return w_new, vs_new, sc
 
     fn = jax.jit(body_write, donate_argnums=(7, 8)) if write else jax.jit(body)
     with _KERNEL_LOCK:
@@ -452,7 +461,9 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
     used. Then, if `write_host`, `st.w` and `st.vel_scale` are overwritten from
     the device once.
 
-    Returns `n_owned`, `n_out`, `tiles_run` and `device_state`. `timings`, if a
+    Returns `n_owned`, `n_out`, `tiles_run`, `device_state` and
+    `vel_scale_kick_max` (the largest per-brick scale written, None when no tile
+    wrote; the host loop's statistic of the same name). `timings`, if a
     dict, accumulates synced phase seconds over the loop (`plan`, `stage`,
     `h2d_tile`, `compute`) plus `d2h_state` once. `coarse_shard`, as in
     `tile_task_device`, gathers the coarse sub-blocks on the device.
@@ -473,13 +484,15 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
     )
     from .decode import tile_decode_plan
 
+    global CALLS
     require_x64()
+    CALLS += 1
     full_step = tiles is None
     tiles = list(members) if full_step else list(tiles)
     ds = stage_state_on_device(st, device) if device_state is None else device_state
     mark = _clock(timings, accumulate=True)
     cap = int(C["cap"])
-    los, his, extents, owns, outs = [], [], [], [], []
+    los, his, extents, owns, outs, smax = [], [], [], [], [], []
     mark("h2d_state_once", *ds.values())
     for t in tiles:
         bricks = np.asarray(members[t], dtype=np.int64)
@@ -505,13 +518,18 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
         extents.append(int(extent))
         owns.append(sc["n_own"])
         outs.append(sc["n_out"])
+        smax.append(sc["scale_max"])
 
+    kick_max = None
     if los:
         lo_h = np.asarray(jnp.stack(los))
         hi_h = np.asarray(jnp.stack(his))
         check_stencil_guard([(lo_h[i], hi_h[i], extents[i], "tsc") for i in range(len(los))])
         n_owned = int(np.asarray(jnp.sum(jnp.stack(owns))))
         n_out = int(np.asarray(jnp.sum(jnp.stack(outs))))
+        # a max of maxima is the max: no reduction order can move it
+        m = float(np.asarray(jnp.max(jnp.stack(smax))))
+        kick_max = m if np.isfinite(m) else None
     else:
         n_owned = n_out = 0
     if full_step and n_owned != st.n_particles:
@@ -522,4 +540,5 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
         st.w[...] = np.asarray(ds["w"])
         st.vel_scale[...] = np.asarray(ds["vel_scale"])
         mark("d2h_state")
-    return dict(n_owned=n_owned, n_out=n_out, tiles_run=len(los), device_state=ds)
+    return dict(n_owned=n_owned, n_out=n_out, tiles_run=len(los), device_state=ds,
+                vel_scale_kick_max=kick_max)

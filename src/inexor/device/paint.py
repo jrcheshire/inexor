@@ -45,8 +45,8 @@ card. Integer addition makes every split bitwise the host mesh.
 
 SCOPE. The containment check comes back as device scalars and is resolved at
 the sync the accumulator performs anyway, before the block is added -- the same
-arrangement as the tile gather's deferred guard. Nothing here is wired into
-`engine.step`; the device executor that would call it does not exist yet.
+arrangement as the tile gather's deferred guard. `engine.step` calls
+`coarse_delta_cards` under `EngineConfig(coarse_backend="device")`.
 """
 
 from __future__ import annotations
@@ -64,6 +64,9 @@ _TRACES = [0]
 # both caches, since each card's thread may ask for a program first
 _CARD_KERNELS = {}
 _KERNEL_LOCK = threading.Lock()
+
+#: RECEIPT: card paints run through this module (see `migrate.CALLS`).
+CALLS = 0
 
 
 def default_chunk_bricks(bricks_per_side):
@@ -745,7 +748,9 @@ def coarse_delta_cards(st, cfg, devices=None, stats=None, pad_shape=0, chunk_bri
     from ..engine import _chunk_cuboid
     from ..forces import capacity_shape
 
+    global CALLS
     require_x64()  # before an int64 accumulator exists: without x64 it would be int32
+    CALLS += 1
     n_b, L = _chunking(st, cfg, chunk_bricks)
     devs = [None] if devices is None else list(devices)
     if not devs:
