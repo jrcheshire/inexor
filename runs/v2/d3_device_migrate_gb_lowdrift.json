@@ -1,0 +1,104 @@
+{
+ "argv": [
+  "scripts/v2_d3_device_migrate.py",
+  "--arms",
+  "slab-shape",
+  "--shape-frac",
+  "0.13",
+  "--reps",
+  "3",
+  "--out-suffix",
+  "_gb_lowdrift"
+ ],
+ "started": "2026-09-13T19:20:10",
+ "job": "995264",
+ "node": "c672-018.vista.tacc.utexas.edu",
+ "commit": "d461cbe",
+ "arms": [
+  {
+   "arm": "slab-shape",
+   "rc": 0,
+   "record": {
+    "arm": "slab-shape",
+    "platform": "gpu",
+    "nb": 256,
+    "rows": 268435456,
+    "bricks": 65536,
+    "drift_frac": 0.13,
+    "c_drift": 2.1160125905707024e-05,
+    "gen_s": 12.316291136085056,
+    "reps": 3,
+    "eject": {
+     "warm_s": 3.584984095999971,
+     "public_s": [
+      0.9470146540552378,
+      0.9755148489493877,
+      0.9469263660721481
+     ],
+     "public_median_s": 0.9470146540552378,
+     "split": [
+      {
+       "prep_s": 0.011318086995743215,
+       "upload_s": 0.5519329420058057,
+       "compute_s": 0.014306896948255599,
+       "readback_s": 0.3743174810661003
+      },
+      {
+       "prep_s": 0.013205453986302018,
+       "upload_s": 0.556957726017572,
+       "compute_s": 0.014100657077506185,
+       "readback_s": 0.39291082497220486
+      },
+      {
+       "prep_s": 0.01327419001609087,
+       "upload_s": 0.545773720019497,
+       "compute_s": 0.014111793017946184,
+       "readback_s": 0.4014599110232666
+      }
+     ],
+     "public_repeat_equal": true,
+     "split_equal_public": true,
+     "n_keep": 255088653,
+     "leaver_frac": 0.04972071573138237,
+     "device_peak": 33017562880
+    },
+    "insert": {
+     "warm_s": 3.200545361964032,
+     "public_s": [
+      1.217664194991812,
+      1.253709087963216,
+      1.2572201390285045
+     ],
+     "public_median_s": 1.253709087963216,
+     "split": [
+      {
+       "prep_s": 0.01278938795439899,
+       "upload_s": 0.22795899398624897,
+       "compute_s": 0.606095208087936,
+       "readback_s": 0.44025732506997883
+      },
+      {
+       "prep_s": 0.013361069955863059,
+       "upload_s": 0.2002435380127281,
+       "compute_s": 0.6064179929671809,
+       "readback_s": 0.43938925792463124
+      },
+      {
+       "prep_s": 0.013305198051966727,
+       "upload_s": 0.20791524497326463,
+       "compute_s": 0.6052837809547782,
+       "readback_s": 0.4393563289195299
+      }
+     ],
+     "public_repeat_equal": true,
+     "split_equal_public": true,
+     "n_write": 263902910,
+     "n_spill": 0,
+     "device_peak_after": 33017562880
+    },
+    "host_maxrss_gb": 66.8558349609375
+   }
+  }
+ ],
+ "finished": "2026-09-13T19:20:51"
+}

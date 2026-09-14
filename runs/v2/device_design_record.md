@@ -1767,5 +1767,115 @@ sort gather) on the captured inputs first, then the unchanged smoke gate.
 
 ### Owed
 
-1. The GPU reading of the fixed program (the xback gate in the next D3 job) and
-   of the magnitude pieces, which names the operation if one piece fails alone.
+1. [DONE, sec. 27] The GPU reading of the fixed program and of the magnitude
+   pieces.
+
+## 27. D3 on a GB200, Vista 995264 -- the compiled migrate is bitwise numpy's; at a 4096^3 slab the eject is transfer and the insert is half compute; at cgh64 the host is 65% of the step
+
+`d461cbe`, 2026-09-13, gb node c672-018, COMPLETED rc=0 in 5:08. Sbatch
+`v2_d3_migrate_vista.sbatch`; cards `runs/v2/d3_insert_escape_diag_gb_forms.json`,
+`runs/v2/d3_device_migrate_{gbsmoke,gb,gb_lowdrift}.json`, log copied to
+`runs/v2/d3-migrate-995264.log`. Every arm its own process; the GPU smoke passed
+all three arms before the long legs.
+
+### The int16 magnitude, piece by piece (sec. 26's inputs, one GPU)
+
+Rows differing from numpy of 15,898, each form its own jitted program:
+
+| form | alone | after the sort gather |
+|---|---|---|
+| `abs(w)`, int16 | 0 | 0 |
+| `abs(w).max(1)`, int16 | 0 | **5,293** |
+| `... .astype(f64)` | 0 | **5,293** |
+| `... * s_old` (the pre-fix kernel) | **5,293** | **5,293** |
+| int32-widened `* s_old` | 0 | 0 |
+| **f64-widened `* s_old` (the fix)** | **0** | **0** |
+
+- **The int16 max over axis 1 is exact alone and wrong once another operation is
+  compiled beside it** (a gather in front, or a multiply after), always the same
+  5,293 rows. Widening to int32 or f64 first is exact in every arrangement. What
+  the compiler does to the fused int16 reduction is not identified.
+- **The fixed production program reads 0 scales different and abs_max 32767** on
+  the inputs that escaped in 995067.
+
+### Identity: PASS
+
+`xback` at cdev (256^3, nb=16, drift 1.9 bricks), numpy eject + insert against
+the compiled pair on the GPU:
+
+| step | numpy | compiled | state and stats |
+|---|---|---|---|
+| 0 | 4.5 s | 5.7 s (compiles) | **bitwise** |
+| 1 | 4.6 s | 2.8 s | **bitwise** |
+
+Receipts: 32 eject and 32 insert calls; realized reach 2 on a non-all-to-all
+schedule; 188,179 rows overflowed into the arena; 89,782 residents re-homed.
+**The first GPU reading of the migrate against numpy.**
+
+### cgh64, one compiled migrate step divided (nb=32, 4,194,304 rows per slab)
+
+`eject_rows` / `insert_rows` return numpy, so each call's wall is upload + compute
++ readback, synchronous; host = step minus calls. Built in 30.8 s.
+
+| step | numpy | compiled | eject calls (32) | insert calls (32) | **host** | new shapes (eject / insert) |
+|---|---|---|---|---|---|---|
+| 0 | 26.87 s | 17.51 s | 3.47 s | 4.12 s | 9.92 s | 2 / 2 |
+| 1 | 27.14 s | **15.17 s** | 1.94 s | 3.39 s | **9.84 s** | 0 / 1 |
+
+- **Bitwise the numpy migrate at both steps.** Reach 1, no overflow.
+- **Steady, the compiled step is 1.79x the serial numpy one, and the host is 65%
+  of it**: 308 ms per slab of host work against 61 ms of eject and 106 ms of
+  insert calls. What the host 9.8 s is made of is NOT measured here; the per-brick
+  Python loops in `_eject_slab_jax` (slot resolution, arena lookups, 32,768 bricks
+  at ~300 us each) are a candidate, not a finding.
+- A padded row count is a new shape: step 1 still compiled one insert program.
+
+### One 4096^3 slab (65,536 bricks, 268,435,456 rows), synthetic rows
+
+Medians of three; the split program's outputs equal the public call's, repeats
+equal.
+
+| | drift 0.5 brick (18.1% leavers) | drift 0.13 brick (5.0% leavers) |
+|---|---|---|
+| **eject, public call** | **0.941 s** | 0.947 s |
+| prep / upload / compute / readback | 0.013 / 0.518 / **0.015** / 0.396 | 0.013 / 0.552 / 0.014 / 0.393 |
+| **insert, public call** | **1.269 s** | 1.254 s |
+| prep / upload / compute / readback | 0.013 / 0.202 / **0.628** / 0.437 | 0.013 / 0.208 / 0.606 / 0.439 |
+| first call (compile) eject / insert | 11.2 / 11.0 s | 3.6 / 3.2 s (cache) |
+| rows written by the insert, spilled | 251,015,983, 0 | 263,902,910, 0 |
+
+Device peak 30.75 GiB after both kernels (the insert's own peak is not separated).
+
+- **The eject is transfer: 15 ms of compute in a 0.94 s call.** The insert is
+  half compute (0.61-0.63 s of 1.25-1.27).
+- **The leaver fraction moves neither kernel** (0.941 vs 0.947; 1.269 vs 1.254).
+- **Reproduction of the gb probe's eject (5y):** compute 14-15 ms (14.0), peak
+  30.75 GiB (30.8), first call 11.2 s (10.6) reproduce. **End to end does not:
+  0.94 s against 0.528 s**, with the upload alone 0.52-0.55 s. Not attributed.
+- Each kernel captures a 2.15 GB constant (JAX warning at lowering). That is
+  exactly `idx_all = jnp.arange(n_pad)` at 268,439,552 rows x 8 B, built outside
+  the traced function in both kernels; a candidate for the warning, not traced.
+
+### What this prices at c-hero -- arithmetic, not a measurement
+
+- **Kernel calls from host-resident state, one GPU:** 256 slabs x (0.94 + 1.27 s)
+  = **~566 s/step**, of which compute ~163 s and transfers ~400 s.
+- **Host bookkeeping, if linear in rows:** cgh64's 9.84 s x 512 = **~5,000 s/step**
+  serial. Linearity is not measured; rows and bricks both scale 512x at fixed
+  4096 rows per brick, so a per-brick and a per-row cost cannot be told apart
+  from this pair.
+- Together ~5,600 s/step serial, against ~1,900 s/step for the pooled numpy
+  migrate scaled the same way (cgh64 3.78 s x 512, scaling record). The compiled
+  kernels inside the pool are unmeasured.
+- **The migrate at 4096^3 is not a GPU-compute problem.** Its cost sits in the
+  host bookkeeping and in moving slabs across the bus; GPU compute is ~3% of the
+  serial projection.
+
+### Owed
+
+1. The composition of cgh64's 9.8 s host share (a profile of one compiled step),
+   which decides between vectorizing the bookkeeping on the host and moving it
+   onto the cards with the slab window.
+2. The end-to-end eject gap to 5y (0.94 vs 0.528 s).
+3. `idx_all` as a traced `arange` rather than a 2.15 GB captured constant.
+4. Carried from sec. 25.
