@@ -2005,17 +2005,25 @@ emigrants:
   per alternation, at ~1 ns per arena slot (6.9e8 slots at 1%) x 256 slabs, could
   reach ~180 s/step -- the reason R1's replay must not rebuild it per slab.
 - **Per-GPU envelope, one slab at a time, staging not included:** eject 32.5 GB;
-  insert 23.9-56.2 GB across the bracket. Beside the tile window (~54 GB free per
-  card) the eject and every insert up to share 0.20 / reach 2 (41.3 GB) fit, and
-  share 0.40 / reach 2 (56.2 GB) does not. With the tile window freed (~170 GB)
-  every bracketed case fits.
+  insert 23.9-56.2 GB across the bracket. Within the ~112 GB left beside the
+  planner's resident terms (the envelope JC set, decision 2 below) every bracketed
+  case fits. Within the planner's ~54 GB verdict headroom, which also charges the
+  in-step phases summed, share 0.40 / reach 2 (56.2 GB) would not.
 
 ### Decided at the R0 checkpoint (JC, 2026-09-13)
 
 1. **A GPU repack is high priority**, next after R1 and ahead of four cards and
    fusion.
-2. **The device migrate is designed to fit beside the tile window** (~54 GB per
-   card), refusing by name when a slab's input exceeds it.
+2. ~~The device migrate is designed to fit beside the tile window (~54 GB per
+   card).~~ **Revised the same day (JC): the envelope is ~112 GB per card**, 199 GB
+   less the planner's resident terms (87.0 GB: slab window 43.5, coarse force
+   shard 26.0, tile kernels 4.6, coarse prefactor 4.3, match factor 4.3, stream
+   chunks 4.3). The ~54 GB offered first was the planner's verdict headroom,
+   which also charges the coarse paint (32.0), coarse solve (17.4) and tile loop
+   (8.4) transients summed; none of them coexists with the migrate, which runs
+   after all three. The design still refuses by name above its envelope. The
+   verdict's summed-phase convention and the underpriced `tile_workspace` (8.4
+   charged, 13-16 measured) are unchanged in `inexor.plan`.
 3. **The device and pooled migrates share one arena-replay helper**, both gated
    against the serial numpy migrate.
 
@@ -2072,8 +2080,8 @@ brick, census off by one, one extra written row).
 ### At 4096^3 -- arithmetic, not a measurement
 
 - **Memory: 438 B x 268M rows = ~117 GB per card if the peak scales with slab
-  rows, against the ~54 GB beside the tile window (JC's envelope, sec. 29).** R1
-  does not fit the envelope as built.
+  rows, against the ~112 GB envelope (JC, sec. 29 as revised).** R1 does not fit
+  the envelope as built.
 - **Wall: 1.72 s x 512 = ~880 s/step on one card if linear in rows.** Per-slab
   fixed costs and per-row costs are not separated, so this is not a projection.
 
