@@ -2262,3 +2262,103 @@ repack-slab (a 268M-row slab at nb=256 with 4,096 residents planted, device
 repack bitwise the host, synced phases, device peak). Laptop smoke: all four
 arms rc=0, R2 gate hashes and stats equal. Time ask in the sbatch header: ~25
 min, 45 min wall, the tile loop at cgh64 the unmeasured bound.
+
+## 33. R1b + R2 on a GB200, Vista 995813 -- the engine on the device backend is bitwise the host engine at cgh64; the migrate estimate reads 0.76 of its measured peak; a 268M-row slab repacks in ~1.3 s of slab work at 70 B/row
+
+`28e23ae`, 2026-09-13, gb node c672-006, COMPLETED rc=0 in 24:48 (995764, same
+node, stopped at 8 min on a test of mine that asked `TilePool` for a GPU parent;
+its 35 other gates and its smoke were green). Sbatch
+`v2_r2_device_engine_vista.sbatch`; cards `runs/v2/r2_device_engine_{gb,slab_gb,gbsmoke}.json`,
+log `runs/v2/r2-device-engine-995813.log`.
+
+### Gates on the GPU: PASS
+
+- pytest, GPU backend: **35 passed, 1 skipped** (the pool test, CPU lane only) in 5:24.
+- Probe smoke (32^3): all four arms rc=0; R2 gate hashes and stats equal.
+- **Engine A/B at cgh64 (512^3, nb=32, K=2 + lead drift, repack every step),
+  device backend and host engine in separate processes: every state field's
+  hash equal, stripped stats equal.** Receipts: 3 device migrates + 2 device
+  repacks on one arm, none on the other.
+- Repack of a production-shape slab: bitwise the host repack (`slots_used`,
+  `bricks_fast` 102,892, `bricks_merged` 4,096 equal).
+
+**What the cgh64 A/B did NOT exercise:** at brick slack 0.10 and this drift no
+brick overflowed (`n_arena_overflow` 0, `arena_used` 0, `bricks_merged` 0 on
+both steps), so the arena fold-in and the resident re-homing ran on the GPU only
+in the pytest gates (32^3 fixtures), not at cgh64.
+
+### The cgh64 step, per phase (one card, serial tile loop, synced by the phase hook)
+
+| phase, s/step (step 1) | device backend | host |
+|---|---|---|
+| coarse_paint (HOST decode + paint) | 86.2 | 86.3 |
+| tile_decode (host) | 20.5 | 20.7 |
+| tile_long | 15.0 | 15.4 |
+| tile_reduce (host apply) | 9.1 | 9.3 |
+| **migrate** | **2.2** | **17.4** |
+| coarse_solve | 1.6 | 1.8 |
+| tile_short | 1.1 | 1.5 |
+| **repack** | 0.6 | 0.4 |
+| lead drift (once) | 6.2 (compiles) | 17.3 |
+| whole run, K=2 | 287.4 | 336.2 |
+
+- The device migrate is 7.9x the serial numpy migrate inside the engine (2.2 vs
+  17.4 s), consistent with sec. 31 (1.63 vs 27.2 s standalone; the engine's
+  host arm here ran the `jax` eject kernel, `EngineConfig`'s default).
+- **The step is dominated by HOST passes the engine still runs: `coarse_paint`
+  (the host decode + sub-block paint, 62% of the step) and `tile_decode` +
+  `tile_reduce` (21%).** The device paint (secs. 12-15, 24) and the device tile
+  loop (secs. 16-23) exist beside the engine and are not routed into it. That
+  routing -- the device step executor -- is what the projection of sec. 25
+  assumed and is the remaining build.
+- The device repack is SLOWER than the host at cgh64 (0.6 vs 0.4 s): 32 slabs of
+  4.2M rows, each paying two crossings; the win is at slab sizes where the host's
+  per-row loop dominates (below).
+- Device peak 2.83 GiB on both arms (the tile loop's; not the migrate's).
+
+### migrate-budget: the estimate reads 0.76 of the measured peak
+
+cgh64, one process, two passes: estimate 1.004 GB (0.935 GiB) against a measured
+device peak of 1.318 / 1.321 GB (1.227 / 1.230 GiB): **estimate / measured =
+0.762, 0.760**. The kernel coefficients (sec. 29) were measured alone; the pass
+holds ~32% more around them than `_Budget.held()` counts. `ESTIMATE_OVER_MEASURED
+= 0.76` now divides every estimate (`device.migrate`), so the envelope refusal
+fires at the measured footprint rather than 24% above it. One configuration, one
+node; whether the ratio holds at c-hero slab sizes is owed to the first c-hero
+pass.
+
+### repack-slab: nb=256, 268,439,552 rows in one slab, 4,096 residents planted
+
+| | reading |
+|---|---|
+| state build (host, 268M rows in slab 0) | 130.9 s, host maxrss 135 GB |
+| host `repack` | **15.79 s** (102,892 fast bricks, 4,096 merged, 16.7M empty) |
+| device `repack_device`, first call | 10.59 s incl. 2 compiles; BITWISE host |
+| device, second call (synced phases) | 8.99 s: setup + arena lift 6.50, tail 1.10, **write-back 0.48, own-slab upload 0.47, block program 0.30**, empty slabs 0.09 (254 of 256), index upload 0.04 |
+| device peak | 18.75 GB = **69.9 B per slab row** (held windows + block 6.09 GB) |
+
+- **The slab's own work is ~1.25 s: two pageable crossings of ~2.4 GB (0.47 up,
+  0.48 down, ~5 GB/s each way) around a 0.30 s program over 268M rows.** The
+  6.5 s setup and 1.1 s tail are per PASS, not per slab: the per-brick census over
+  16.8M bricks and the 8.6e9-bucket occupancy (34 GB) read twice.
+- **At c-hero by arithmetic, 256 full slabs: ~320 s + ~8 s = ~330 s/step on one
+  card**, against the host's 430-630 s/step (sec. 29). A 1.3-1.9x, not the
+  migrate's 8-16x, because this pass is TRANSFER-bound: every slab crosses the
+  bus twice at pageable rates. The lever is the one D1 left standing -- the
+  bytes already on the card. R4's fusion with the tile window (the slab is
+  resident for the tile loop) removes both crossings; four cards (R3) divide the
+  rest by ~2.9 (sec. 10).
+- 254 empty slabs cost 0.09 s together (the skip, `bffd8dd`).
+
+### Planner (`--backend device`, c-hero)
+
+`repack_device_pass` now 70 B/slab row MEASURED (18.79 GB) in place of the
+3-window arithmetic (7.68 GB); the after-the-loop verdict is unchanged at
+resident + migrate 85.9 = 172.9 GB (0.87x), the migrate being the larger.
+
+### Status
+
+R1b and R2 CLOSED on a GB200. Owed: the c-hero migrate pass's estimate ratio
+(above); the arena fold-in at cgh64 (a spilling fixture, e.g. brick slack 0);
+and the device step executor, which is where the 87 s/step host coarse paint and
+the 30 s/step of host tile passes go.

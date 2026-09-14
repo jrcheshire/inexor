@@ -57,6 +57,11 @@ INT16_MAX = 32767
 #: insert 78.4-83.0 over the bracket, the largest taken). Estimate only.
 EJECT_B_PER_PADDED_ROW = 114.4
 INSERT_B_PER_PADDED_ROW = 83.0
+#: The estimate read against the MEASURED device peak in one process, cgh64 on a
+#: GB200 (Vista 995813, record sec. 33): estimate / measured = 0.762 and 0.760 on
+#: two passes. The kernel coefficients above were measured alone; what the pass
+#: holds around them under-reads by this factor. Applied to every estimate.
+ESTIMATE_OVER_MEASURED = 0.76
 
 _PROGRAMS: dict = {}
 
@@ -111,7 +116,7 @@ class _Budget:
 
     def check(self, what, extra_bytes, coef, padded_rows):
         held = self.held()
-        est = held + int(extra_bytes) + int(coef * padded_rows)
+        est = int((held + int(extra_bytes) + int(coef * padded_rows)) / ESTIMATE_OVER_MEASURED)
         self.peak = max(self.peak, est)
         if self.limit is not None and est > self.limit:
             raise ValueError(

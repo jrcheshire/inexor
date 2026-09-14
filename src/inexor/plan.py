@@ -247,12 +247,11 @@ PAINT_PAD_BOUND = 1.26
 # the slab's rows x this. It scales with slab rows by ARITHMETIC (~86 GB at
 # c-hero); the 4096^3 reading is owed to the R2 job.
 MIGRATE_DEVICE_B_PER_SLAB_ROW = 320
-# THE DEVICE REPACK holds two slab windows (the slab and one read-ahead) plus
-# one output block, by construction of `device.repack.repack_device`
-# (`windows_peak` / `held_peak_bytes` on its receipt); its program's own
-# scratch per row is UNMEASURED and NOT charged here. Ladder padding <= 6%.
-REPACK_DEVICE_WINDOWS = 3
-REPACK_DEVICE_PAD_BOUND = 1.06
+# THE DEVICE REPACK'S PEAK PER SLAB ROW, MEASURED at a production-shape slab
+# (nb=256, 268,439,552 rows, 4,096 residents) on a GB200: 18.75 GB device peak
+# = 69.9 B per slab row, windows and program included (Vista 995813, record
+# sec. 33). Charged at the slab's rows x this.
+REPACK_DEVICE_B_PER_SLAB_ROW = 70
 
 
 def device_window_slabs(ec):
@@ -385,8 +384,8 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
     after_loop = {
         "migrate_device_pass (320 B/slab row, sec. 31)": int(
             MIGRATE_DEVICE_B_PER_SLAB_ROW * slab_rows),
-        "repack_device_pass (3 slab windows held; program scratch UNMEASURED)": int(
-            REPACK_DEVICE_WINDOWS * REPACK_DEVICE_PAD_BOUND * slab_rows * row_bytes),
+        "repack_device_pass (70 B/slab row, sec. 33)": int(
+            REPACK_DEVICE_B_PER_SLAB_ROW * slab_rows),
     }
     return resident, transient, phases, max(in_step, once), slabs, host_mesh, after_loop
 
