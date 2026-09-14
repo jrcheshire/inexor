@@ -624,6 +624,7 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab):
     it is host work; this is where that term comes from.
     """
     from inexor import ooc_fft
+    from inexor.device.coarse import CardShards
 
     n = int(n_mesh)
     if isinstance(delta, (list, tuple)):
@@ -631,15 +632,22 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab):
     else:
         spec = ooc_fft.forward_from_slabs_device(
             lambda lo, hi: delta[lo:hi], n, slab=slab)
+    # `out` as `CardShards`: each component's planes land on the cards that hold
+    # them and no host mesh exists (`ooc_fft.inverse_to_card_shards`)
+    per_card = [[] for _ in out.ranges] if isinstance(out, CardShards) else None
     for axis in range(3):
         work = np.empty_like(spec)
         for lo in range(0, spec.shape[0], slab):
             hi = min(lo + slab, spec.shape[0])
             work[lo:hi] = spec[lo:hi] * coarse_kernel_slab(parts, axis, lo, hi, cdtype)
-        for lo, block in ooc_fft.inverse_to_slabs_device(work, n, slab=slab):
-            out[axis][lo:lo + block.shape[0]] = block
+        if per_card is not None:
+            for k, m in enumerate(ooc_fft.inverse_to_card_shards(work, n, out.ranges)):
+                per_card[k].append(m)
+        else:
+            for lo, block in ooc_fft.inverse_to_slabs_device(work, n, slab=slab):
+                out[axis][lo:lo + block.shape[0]] = block
         del work
-    return out
+    return out.assemble(per_card) if per_card is not None else out
 
 
 def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None,
@@ -722,6 +730,12 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
         raise ValueError(
             "coarse_force_meshes: a density on the cards has only the factorized "
             "solve; a monolithic transform would need the whole mesh on one device")
+    from inexor.device.coarse import CardShards
+
+    if isinstance(out, CardShards):
+        raise ValueError(
+            "coarse_force_meshes: force meshes written onto the cards have only the "
+            "factorized solve; the monolithic transform returns whole host meshes")
     if transform != "monolithic":
         raise ValueError(
             f"transform must be 'monolithic' or 'factorized', got {transform!r}")

@@ -56,6 +56,35 @@ def whole_mesh_shard(g_coarse, halo=None, device=None):
     return shard_coarse_meshes(g_coarse, -h, n + 2 * h, device)
 
 
+class CardShards:
+    """Where the coarse solve writes its force meshes when they live on the cards.
+
+    `ranges` is `(x0, nx, device)` per card, the planes that card holds (mod
+    `n`), halo included. Passed as `out=` to `forces.coarse_force_meshes`, which
+    then writes each component's planes straight onto the cards
+    (`ooc_fft.inverse_to_card_shards`) and returns `assemble`'s shard dicts --
+    the same dicts `shard_coarse_meshes` builds from host meshes, bitwise.
+    """
+
+    def __init__(self, ranges, n):
+        self.ranges = [(int(x0), int(nx), dev) for x0, nx, dev in ranges]
+        self.n = int(n)
+
+    @classmethod
+    def whole_mesh(cls, n, halo=None, device=None):
+        """One card holding the whole mesh, `halo` planes wrapped onto each end:
+        the card-side twin of `whole_mesh_shard`."""
+        from ..forces import COARSE_HALO
+
+        h = COARSE_HALO if halo is None else int(halo)
+        return cls([(-h, int(n) + 2 * h, device)], n)
+
+    def assemble(self, per_card):
+        """Shard dicts from `per_card[k]` = card k's three meshes, in axis order."""
+        return [dict(meshes=tuple(ms), x0=x0, nx=nx, n=self.n, device=dev)
+                for (x0, nx, dev), ms in zip(self.ranges, per_card)]
+
+
 def check_covers(shard, origin_cells, extent):
     """Refuse a sub-block whose x planes are not all in the shard."""
     lx = int(origin_cells[0]) - int(shard["x0"])

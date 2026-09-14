@@ -186,6 +186,8 @@ class EngineConfig:
         tile_backend="host",
         device_tile_jit=True,
         device_paint_chunk_bricks=None,
+        device_tile_window=False,
+        device_cards=1,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -315,6 +317,17 @@ class EngineConfig:
         self.device_tile_jit = bool(device_tile_jit)
         self.device_paint_chunk_bricks = (
             None if device_paint_chunk_bricks is None else int(device_paint_chunk_bricks))
+        # E2: the compiled tile loop against a window of x-slabs on the card
+        # (`device.window.tile_loop_windowed`) instead of the whole state -- the
+        # only form that fits a card at 4096^3. Bitwise the whole-state loop by
+        # construction and by gate; False is E1's whole-state path, kept as the
+        # A/B arm until the window's GPU gate reads.
+        self.device_tile_window = bool(device_tile_window)
+        # E3: how many cards the device step splits across -- the coarse paint and
+        # solve by x-planes, the tile loop by tile planes, one thread per card
+        # walking its own planes through its own window. The migrate and repack
+        # stay on one card (D3b R3 is their split).
+        self.device_cards = int(device_cards)
 
     @property
     def np_coarse_dtype(self):
@@ -729,6 +742,25 @@ class EngineConfig:
             raise ValueError(
                 "device_tile_jit=False selects the eager DEVICE tile, but tile_backend is "
                 f"{self.tile_backend!r}; the knob could not apply.")
+        if self.device_tile_window and not (self.tile_backend == "device"
+                                            and self.device_tile_jit):
+            raise ValueError(
+                "device_tile_window=True windows the COMPILED device tile loop, but "
+                f"tile_backend={self.tile_backend!r}, device_tile_jit={self.device_tile_jit}; "
+                "the knob could not apply.")
+        if self.device_cards < 1:
+            raise ValueError(f"device_cards must be >= 1, got {self.device_cards}")
+        if self.device_cards > 1:
+            if not (self.coarse_backend == "device" and self.tile_backend == "device"
+                    and self.device_tile_jit and self.device_tile_window):
+                raise ValueError(
+                    f"device_cards={self.device_cards} splits the device step across cards: "
+                    "it needs coarse_backend='device', tile_backend='device', the compiled "
+                    "tile (device_tile_jit) and the window (device_tile_window).")
+            if self.device_cards > self.tiles_side:
+                raise ValueError(
+                    f"device_cards={self.device_cards} > {self.tiles_side} tile planes: a card "
+                    "would run no tiles.")
         on_device = [n for n in ("migrate_backend", "coarse_backend", "tile_backend")
                      if getattr(self, n) == "device"]
         if on_device:
@@ -739,6 +771,11 @@ class EngineConfig:
                     f"{' and '.join(on_device)}='device' needs jax_enable_x64 (the compiled "
                     "kernels' int64 lattice index is silently int32 without it). Enable it "
                     "in the driver; the library never does.")
+            if self.device_cards > len(jax.devices()):
+                raise ValueError(
+                    f"device_cards={self.device_cards} but this process sees "
+                    f"{len(jax.devices())} jax devices; more threads than cards would run "
+                    "on one card while reading as a split.")
         self._refuse_f64_without_x64()
         return True
 
@@ -1367,14 +1404,21 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     mesh_stats = {}
     shapes_in = device_shapes or {}
     shapes_out = {}
+    # E3: the cards the device step splits across; None is one card, jax's default
+    # device, exactly as before
+    devs = None
+    if cfg.device_cards > 1:
+        import jax
+
+        devs = list(jax.devices()[: cfg.device_cards])
     if cfg.coarse_backend == "device":
         from .device.paint import coarse_delta_cards
 
-        # The density painted, accumulated and decoded ON THE CARD, never on the
+        # The density painted, accumulated and decoded ON THE CARDS, never on the
         # host: `coarse_force_meshes` takes the shards and transforms each card's
-        # planes where they sit. One card (jax's default device) here.
+        # planes where they sit.
         delta = coarse_delta_cards(
-            st, cfg, stats=mesh_stats, pad_shape=pad_shape,
+            st, cfg, devices=devs, stats=mesh_stats, pad_shape=pad_shape,
             chunk_bricks=cfg.device_paint_chunk_bricks, census=census,
             shape_floor=shapes_in.get("paint"))
         shapes_out["paint"] = {k: int(v) for k, v in mesh_stats["coarse_jit_shapes"].items()}
@@ -1406,6 +1450,24 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # `out=` is the pool's own shm views: the workers read them anyway, so
     # solving into them removes the parent-side triple AND the copy stage_step
     # would otherwise make.
+    # Under the compiled device tile the force meshes are written straight onto
+    # the card they are read on (`device.coarse.CardShards`): no host mesh, and no
+    # re-upload. `g_coarse` is then the card shard dicts, not three host arrays.
+    if cfg.tile_backend == "device" and cfg.device_tile_jit:
+        from .device.coarse import CardShards
+        from .ooc_fft import partition_units
+
+        # one shard per card: the coarse x-planes under the tile planes that card
+        # runs, COARSE_HALO each side. One card is the whole mesh, wrapped, which
+        # is `CardShards.whole_mesh` exactly.
+        per_tile = cfg.n_tile // (cfg.n_fine // cfg.n_coarse)
+        plane_parts = partition_units(cfg.tiles_side, cfg.device_cards, 1)
+        solve_out = CardShards(
+            [(a * per_tile - COARSE_HALO, (b - a) * per_tile + 2 * COARSE_HALO,
+              None if devs is None else devs[k]) for k, (a, b) in enumerate(plane_parts)],
+            cfg.n_coarse)
+    else:
+        solve_out = None if pool is None else pool.g_views()
     g_coarse = coarse_force_meshes(
         dj,
         cfg.n_coarse,
@@ -1415,7 +1477,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         match=(cfg.coarse_cell, cfg.fine_cell),
         fdtype=cfg.np_coarse_dtype,
         parts=coarse_parts,
-        out=None if pool is None else pool.g_views(),
+        out=solve_out,
     )
     del dj
     ph("coarse_solve")
@@ -1482,20 +1544,46 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # the `tile_task` dict and `apply_result` lands it, the bitwise oracle arm.
     tasks = [(t, members[t]) for t in cfg.tiles]
     if cfg.tile_backend == "device" and cfg.device_tile_jit:
-        from .device.coarse import whole_mesh_shard
         from .device.tile import tile_loop_device, tile_step_shapes
 
         shapes = tile_step_shapes(st, floor=shapes_in.get("tile"))
         shapes_out["tile"] = {k: int(v) for k, v in shapes.items()}
-        # the force meshes placed on the card once per step; each tile's program
-        # gathers its own sub-blocks there (record sec. 23)
-        shard = whole_mesh_shard(g_coarse)
-        loop = tile_loop_device(st, one_tile, C, g_coarse, members, shapes,
-                                coarse_shard=shard)
-        del shard
-        n_owned, n_overhang = int(loop["n_owned"]), int(loop["n_out"])
-        if loop["vel_scale_kick_max"] is not None:
-            tile_scales.append(float(loop["vel_scale_kick_max"]))
+        # the force meshes are already on the card (the solve wrote them there);
+        # each tile's program gathers its own sub-blocks from the shard (record
+        # sec. 23), and no host mesh exists to pass
+        if cfg.device_tile_window:
+            from .device.window import tile_loop_windowed, window_shapes
+
+            # E2: one tile plane's x-slabs on the card at a time, not the state.
+            # E3: one thread per card, each walking the tile planes its shard
+            # covers; their host write-backs are disjoint core slabs
+            wsh = window_shapes(st, cfg.n_tile, b_real, cfg.n_brick,
+                                floor=shapes_in.get("window"))
+            shapes_out["window"] = wsh
+            wshapes = dict(shapes, window=wsh)
+
+            def run_card(k):
+                a, b = plane_parts[k]
+                return tile_loop_windowed(
+                    st, one_tile, C, None, members, wshapes, planes=range(a, b),
+                    coarse_shard=g_coarse[k], device=None if devs is None else devs[k])
+
+            if devs is None:
+                loops = [run_card(0)]
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=len(devs)) as ex:
+                    loops = list(ex.map(run_card, range(len(devs))))
+        else:
+            loops = [tile_loop_device(st, one_tile, C, None, members, shapes,
+                                      coarse_shard=g_coarse[0])]
+        n_owned = sum(int(lp["n_owned"]) for lp in loops)
+        n_overhang = sum(int(lp["n_out"]) for lp in loops)
+        tile_scales.extend(float(lp["vel_scale_kick_max"]) for lp in loops
+                           if lp["vel_scale_kick_max"] is not None)
+        tile_cards = [dict(planes=int(lp.get("planes_run", cfg.tiles_side)),
+                           tiles_run=int(lp["tiles_run"])) for lp in loops]
         ph("tile_loop")
         results = ()
     elif cfg.tile_backend == "device":
@@ -1611,6 +1699,10 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     stats["tile_backend"] = (cfg.tile_backend if cfg.tile_backend == "host"
                              else ("device" if cfg.device_tile_jit else "device-eager"))
     stats["device_shapes"] = shapes_out
+    if cfg.tile_backend == "device" and cfg.device_tile_jit:
+        # the split's receipt: cards asked for, and what each card's tile loop ran
+        stats["device_cards"] = cfg.device_cards
+        stats["tile_cards"] = tile_cards
     stats.update(mesh_stats)
     stats["repack"] = None
     if collect is not None:

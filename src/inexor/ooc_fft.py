@@ -37,6 +37,7 @@ Spectral multipliers reuse `forces.k_components`' conventions exactly
 very term D-v2-15 clause 2 retires.
 """
 
+import threading
 import time as _time
 
 import numpy as np
@@ -661,6 +662,94 @@ def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
             timings["pass1_s"] = _p1
             timings["pass2_s"] = _p2
         yield lo, out
+
+
+_CARD_PROGRAMS = {}
+_CARD_LOCK = threading.Lock()
+
+
+def _card_program(key, build):
+    with _CARD_LOCK:
+        fn = _CARD_PROGRAMS.get(key)
+        if fn is None:
+            fn = _CARD_PROGRAMS[key] = build()
+    return fn
+
+
+def inverse_to_card_shards(spec, n_mesh, shards, plane_batch=1, pencil_batch=1,
+                           timings=None, transfer="pageable"):
+    """`inverse_to_slabs_device` with the real-space planes written onto the cards.
+
+    `shards` is `(x0, nx, device)` per card: that card receives global x-planes
+    `x0 .. x0 + nx - 1` (mod n) as one `(nx, n, n)` device array, in that order.
+    Ranges may overlap and may wrap -- a halo plane is simply transformed on
+    every card that holds it. Returns the arrays, one per shard. MUTATES spec,
+    exactly as `inverse_to_slabs_device` does.
+
+    Pass 2 is that function's, split across the shards' devices. Pass 1 runs one
+    thread per card: each plane's `irfft2` is computed on the card that holds it
+    and written into its array there by a donated plane-set program, so no
+    real-space plane crosses back to the host and no host mesh is assembled.
+
+    BITWISE `device.coarse.shard_coarse_meshes` of the host-slab path's mesh at
+    the same `pencil_batch`: every plane is its own batch on both paths. That is
+    also why `plane_batch` must be 1 -- a plane held by two cards would otherwise
+    be transformed in two different batches.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    if int(plane_batch) != 1:
+        raise ValueError(
+            f"plane_batch={plane_batch}: the card inverse transforms each plane on its "
+            "own, because a plane held by two cards would otherwise sit in two "
+            "different batches and come back as two different planes")
+    n = int(n_mesh)
+    ranges = [(int(x0), int(nx), dev) for x0, nx, dev in shards]
+    if not ranges:
+        raise ValueError("shards= was empty")
+    for x0, nx, _dev in ranges:
+        if nx < 1:
+            raise ValueError(f"shard at x0={x0} holds {nx} planes")
+    rdtype = np.dtype(np.float64 if spec.dtype == np.complex128 else np.float32)
+    refuse_oversize_device_transform(n * n, "device irfft2 plane")
+    devs = [dev for _x0, _nx, dev in ranges]
+
+    def pass2(a, b, dev):
+        fft_axis0_device_inplace(spec[:, a:b, :], inverse=True,
+                                 pencil_batch=pencil_batch, device=dev,
+                                 transfer=transfer)
+
+    _t0 = _time.perf_counter()
+    _run_parts(pass2, partition_units(spec.shape[1], len(devs), pencil_batch), devs)
+    _p2 = _time.perf_counter() - _t0
+
+    put = _card_program(("plane_set",), lambda: jax.jit(
+        lambda m, i, p: m.at[i].set(p), donate_argnums=0))
+    out = [None] * len(ranges)
+
+    def pass1(k, _k1, dev):
+        x0, nx, _ = ranges[k]
+        shape = (nx, n, n)
+        zeros = _card_program(("zeros", shape, rdtype.str), lambda: jax.jit(
+            lambda z: jnp.broadcast_to(z, shape)))
+        z = np.zeros((), dtype=rdtype)
+        m = zeros(jnp.asarray(z) if dev is None else jax.device_put(z, dev))
+        for i in range(nx):
+            g = (x0 + i) % n
+            d = jnp.fft.irfft2(_to_device(spec[g:g + 1], dev, transfer), s=(n, n),
+                               axes=(-2, -1))
+            _check_spectral_dtype(d.dtype, rdtype, "device irfft2")
+            idx = np.int64(i)
+            m = put(m, jnp.asarray(idx) if dev is None else jax.device_put(idx, dev), d[0])
+        out[k] = jax.block_until_ready(m)
+
+    _t0 = _time.perf_counter()
+    _run_parts(pass1, [(k, k + 1) for k in range(len(ranges))], devs)
+    if timings is not None:
+        timings["pass1_s"] = _time.perf_counter() - _t0
+        timings["pass2_s"] = _p2
+    return out
 
 
 # ---------------------------------------------------------------------------

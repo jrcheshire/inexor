@@ -352,12 +352,15 @@ def _clock(timings, accumulate=False):
 
 
 def _jit_inputs(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells, extent,
-                shapes, with_forces, write, mark, coarse_shard=None, device=None):
+                shapes, with_forces, write, mark, coarse_shard=None, device=None,
+                arena_base=None):
     """(program, leading args, trailing args) for one tile; the state arrays go
     between them. Host work and the per-tile upload, marked `stage` and
     `h2d_tile`. With `coarse_shard` (`device.coarse`), the shard meshes go in
     place of host-staged blocks and the program gathers them; they must already
-    be on `device`, where every other input is placed (None: jax's default)."""
+    be on `device`, where every other input is placed (None: jax's default).
+    `arena_base` is where the state arrays' arena rows start (None: the whole
+    state's `st.arena_base`; a `device.window` passes its own)."""
     from ..forces import stage_coarse_subblock
     from .coarse import check_covers
     from .paint import _on
@@ -393,7 +396,7 @@ def _jit_inputs(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells, ext
 
     head = [_on(plan["starts"], d), _on(plan["occ"], d), _on(plan["live_counts"], d),
             _on(rect, d), _on(plan["row_offsets"], d), _on(bricks, d)]
-    tail = [_on(int(st.arena_base), d, np.int64),
+    tail = [_on(int(st.arena_base if arena_base is None else arena_base), d, np.int64),
             _on(int(plan["n_rows"]), d, np.int64),
             _on(origin, d, np.float64),
             _on(np.asarray(t, dtype=np.int64), d),
