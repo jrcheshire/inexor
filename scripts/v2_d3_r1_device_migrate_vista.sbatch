@@ -8,13 +8,17 @@
 #SBATCH -o d3-r1-migrate-%j.log
 # D3b R1 on a gb node: is `device.migrate.drift_and_migrate_device` bitwise the
 # serial numpy migrate ON A GB200, and what does a cgh64 step cost on one card?
+# RE-RUN after 995602 with the retention cuts (`7ccfd95`) and a synced phase
+# split: each device arm now runs a third, timed step after the two untimed ones.
+# Output suffixes `_r1cut_*`; 995602's `_r1_*` cards are the before.
 # The laptop gate (CPU XLA) passed with five mutants caught; the int16 fault of
 # 995067 is why no device gate closes on CPU alone.
 # Submit from the Vista checkout:
 #   sbatch scripts/v2_d3_r1_device_migrate_vista.sbatch
 #
-# TIME ASK: ~10 min estimated, 45 min wall, one gb node, billed at the 15 min
-# minimum (~0.25 SU).
+# TIME ASK: ~9 min estimated, 45 min wall, one gb node, billed at the 15 min
+# minimum (~0.25 SU). 995602 ran the same legs in 3:38; the third, timed step adds
+# one numpy migrate per arm (4.5 s cdev, 27.6 s cgh64) plus a device step.
 #
 #   phase                          each (source)                               total
 #   pytest on the GPU: device      laptop 8 s + 2 s (CPU); GPU compiles of the
@@ -76,7 +80,7 @@ run_leg pytest-gpu-gates \
     tests/test_eject_jax.py
 run_leg smoke \
   pixi run -e gpu python scripts/v2_d3_device_migrate.py --arms device-xback,device-real \
-    --xback-n 32 --real-n 64 --steps 2 --reps 1 --out-suffix _r1_gbsmoke
+    --xback-n 32 --real-n 64 --steps 2 --reps 1 --out-suffix _r1cut_gbsmoke
 if [ $rc_total -ne 0 ]; then
   echo "FATAL: a GPU gate or the smoke failed, not spending the node on the long legs"
   exit 1
@@ -84,7 +88,7 @@ fi
 
 run_leg device-migrate \
   pixi run -e gpu python scripts/v2_d3_device_migrate.py --arms device-xback,device-real \
-    --xback-n 256 --real-n 512 --steps 2 --out-suffix _r1_gb
+    --xback-n 256 --real-n 512 --steps 2 --out-suffix _r1cut_gb
 
 echo ""
 echo "=== rc_total=$rc_total ==="

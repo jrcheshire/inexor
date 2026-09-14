@@ -598,6 +598,26 @@ def arm_device_migrate(args):
              f"overflow {r['n_arena_overflow']}, arena_used {r['arena_used']}")
         if diff or r != r_ref:
             rc = 3
+    # one more step with synced phase timers, AFTER the untimed ones: syncing moves
+    # the wall (record sec. 21), so the untimed walls above are the step's cost and
+    # this one is its breakdown
+    phases = {}
+    t4 = time.perf_counter()
+    r_ref = state.drift_and_migrate(ref, c)
+    t5 = time.perf_counter()
+    r = migrate.drift_and_migrate_device(st, c, timings=phases)
+    t6 = time.perf_counter()
+    r.pop("migrate_device")
+    diff = _diff_fields(ref, st)
+    rec["timed_step"] = dict(numpy_s=t5 - t4, device_s=t6 - t5, phases=phases,
+                             phases_sum_s=sum(phases.values()), field_diffs=diff,
+                             stats_equal=r == r_ref)
+    _say(f"[{args.arm}] timed step: numpy {t5 - t4:.2f}s | device {t6 - t5:.2f}s (synced; "
+         f"phases sum {sum(phases.values()):.2f}s); BITWISE numpy = {not diff and r == r_ref}")
+    for k, v in sorted(phases.items(), key=lambda kv: -kv[1]):
+        _say(f"    {v:8.3f} s  {k}")
+    if diff or r != r_ref:
+        rc = 3
     rec.update(device_peak=_peak(), host_maxrss_gb=_maxrss_gb())
     _say(f"[{args.arm}] device peak {(rec['device_peak'] or 0) / 2**30:.2f} GiB")
     return rec, rc
