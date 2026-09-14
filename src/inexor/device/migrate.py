@@ -243,17 +243,20 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks):
     fn = _eject_kernel(st.t9, nb, cap, has_ids)
     dest, off_new, w_out, ids_out, src_out, n_keep = fn(
         off, bijk, w, ids, scale, float(c_drift), brick, real)
+    # the row buffers are the kernel's input only; release them before staging
+    off = bijk = w = ids = scale = brick = real = None
     n_keep = int(n_keep)
 
     # realized x-reach over this slab's emigrants, as the serial pass reports it
-    idx = jnp.arange(cap, dtype=jnp.int64)
-    em = (idx >= n_keep) & (idx < n_rows)
-    d_slab = dest // (p3 * nb2)
-    disp = (d_slab - s + nb // 2) % nb - nb // 2
-    rr = int(jnp.max(jnp.where(em, jnp.abs(disp), 0))) if n_rows > n_keep else 0
+    rr = 0
+    if n_rows > n_keep:
+        idx = jnp.arange(cap, dtype=jnp.int64)
+        em = (idx >= n_keep) & (idx < n_rows)
+        disp = (dest // (p3 * nb2) - s + nb // 2) % nb - nb // 2
+        rr = int(jnp.max(jnp.where(em, jnp.abs(disp), 0)))
 
     return dict(dest=dest, off=off_new, w=w_out, ids=ids_out, src=src_out, cap=cap,
-                n_keep=n_keep, n_rows=n_rows, d_slab=d_slab, rr=rr,
+                n_keep=n_keep, n_rows=n_rows, rr=rr,
                 win=(off_win, w_win, ids_win), s0=s0, s1=s1, span=span, w_cap=w_cap)
 
 
@@ -276,7 +279,7 @@ def _insert_slab(st, d, reach, staged, scales_dev):
         if e["n_rows"] > e["n_keep"]:
             idx = jnp.arange(e["cap"], dtype=jnp.int64)
             em = (idx >= e["n_keep"]) & (idx < e["n_rows"])
-            consumed[s] = int(jnp.sum(em & (e["d_slab"] == d)))
+            consumed[s] = int(jnp.sum(em & (e["dest"] // (p3 * nb2) == d)))
             segs.append((e, e["n_keep"], e["n_rows"], False))
     n_in = sum(hi - lo for _e, lo, hi, _k in segs)
 
@@ -310,6 +313,8 @@ def _insert_slab(st, d, reach, staged, scales_dev):
             "over the rows it is about to write. D-007 forbids the clamp."
         )
     nw, ns = int(out["n_write"]), int(out["n_spill"])
+    # the compacted inputs are not read past the kernel; only its outputs are
+    bufs = b_dest = b_off = b_w = b_ids = b_src = s_old = real = None
 
     e = staged[d]
     write = _write_program(cap_i, e["w_cap"], has_ids)
@@ -335,6 +340,31 @@ def _insert_slab(st, d, reach, staged, scales_dev):
             spills.append((int(sb[grp[0]]), sd[grp], so[grp], sw[grp],
                            None if si is None else si[grp]))
     return dict(consumed=consumed, spills=spills, n_over=ns)
+
+
+def _emigrants_only(e, has_ids):
+    """A staged slab cut to its emigrants once its own insert has run.
+
+    Its keepers and its window are read by that insert alone; later inserts read
+    only rows [n_keep, n_rows). Those rows are compacted in order onto the ladder,
+    so the staged slab shrinks to the emigrant share.
+    """
+    import jax.numpy as jnp
+
+    n_emig = e["n_rows"] - e["n_keep"]
+    if n_emig <= 0:
+        return dict(dest=None, off=None, w=None, ids=None, src=None, cap=0, n_keep=0,
+                    n_rows=0, rr=e["rr"])
+    cap_e = _ladder(n_emig)
+    bufs = (jnp.zeros(cap_e, jnp.int64), jnp.zeros((cap_e, 3), jnp.uint8),
+            jnp.zeros((cap_e, 3), jnp.int16),
+            jnp.zeros(cap_e, jnp.int32) if has_ids else None, jnp.zeros(cap_e, jnp.int64))
+    put = _put_program(e["cap"], cap_e, has_ids)
+    dest, off, w, ids, src = put(bufs, e["dest"], e["off"], e["w"], e["ids"], e["src"],
+                                 jnp.asarray(e["n_keep"], jnp.int64),
+                                 jnp.asarray(e["n_rows"], jnp.int64), jnp.asarray(0, jnp.int64))
+    return dict(dest=dest, off=off, w=w, ids=ids, src=src, cap=cap_e, n_keep=0,
+                n_rows=n_emig, rr=e["rr"])
 
 
 def drift_and_migrate_device(st, c_drift, max_staged_slabs=None):
@@ -373,6 +403,7 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None):
             if all(((d + o) % nb) in staged for o in reach):
                 insert_res[d] = _insert_slab(st, d, reach, staged, scales_dev)
                 inserted.add(d)
+                staged[d] = _emigrants_only(staged[d], st.ids is not None)
         for s2 in list(staged):
             if all(((s2 + o) % nb) in inserted for o in reach):
                 del staged[s2]
