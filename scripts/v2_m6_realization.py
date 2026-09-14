@@ -300,7 +300,14 @@ def _newest_checkpoint_step(args):
 
 
 def cmd_ics(args):
-    jax = _require_cpu()
+    if args.generator == "device":
+        # the device generator's host peak is still ru_maxrss; its card peak is read
+        # by the job's nvidia-smi sampler, not here
+        import jax
+
+        jax.config.update("jax_enable_x64", True)
+    else:
+        jax = _require_cpu()
     g = _geom(args.config)
     from inexor import icgen
 
@@ -308,14 +315,23 @@ def cmd_ics(args):
     key = jax.random.PRNGKey(args.seed)
     ec_nb = _engine_config(g, args, None)
     nb = g["n_fine"] // ec_nb.n_brick
-    print(f"== ICs {args.config}: n_part={g['n_part']} L={g['L']} "
-          f"bricks_per_side={nb} ({nb ** 3:,} bricks) -> {args.workdir}")
+    print(f"== ICs {args.config} ({args.generator} generator): n_part={g['n_part']} "
+          f"L={g['L']} bricks_per_side={nb} ({nb ** 3:,} bricks) -> {args.workdir}",
+          flush=True)
 
     t0 = time.perf_counter()
-    man = icgen.generate_t9_slabs(
-        args.workdir, key, g["n_part"], g["L"], _cosmo(), m3.A_INIT, nb,
-        fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
-    )
+    if args.generator == "device":
+        man = icgen.generate_t9_slabs_device(
+            args.workdir, key, g["n_part"], g["L"], _cosmo(), m3.A_INIT, nb,
+            fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
+            pencil_batch=args.pencil_batch, noise=args.noise,
+            log=lambda line: print(line, flush=True),
+        )
+    else:
+        man = icgen.generate_t9_slabs(
+            args.workdir, key, g["n_part"], g["L"], _cosmo(), m3.A_INIT, nb,
+            fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
+        )
     wall = time.perf_counter() - t0
     peak = _maxrss_bytes()
     clean = man.get("stage_cleanup")
@@ -331,6 +347,7 @@ def cmd_ics(args):
         wall_s=wall, peak_rss_bytes=peak,
         bytes_per_particle=peak / g["n_part"] ** 3,
         bricks_per_side=int(nb), manifest=man, seed=args.seed, slab=args.slab,
+        generator=args.generator, n_part=g["n_part"],
     )) and 0
 
 
@@ -612,6 +629,13 @@ def main():
     ap.add_argument("--slab", type=int, default=32)
     ap.add_argument("--keep-stage", action="store_true",
                     help="keep the IC intermediates (~687 GB at 2048^3)")
+    ap.add_argument("--generator", default="host", choices=("host", "device"),
+                    help="ics: the host generator, or the IC stage on the cards (D6)")
+    ap.add_argument("--noise", default="device", choices=("device", "host"),
+                    help="ics --generator device: draw the noise on the cards "
+                         "(IC_STREAM_DEVICE) or on the CPU (IC_STREAM)")
+    ap.add_argument("--pencil-batch", type=int, default=1,
+                    help="ics --generator device: y-pencil planes per card program")
     ap.add_argument("--slack", type=float, default=0.20)
     ap.add_argument("--arena-frac", type=float, default=0.20)
     ap.add_argument("--alloc-margin", type=float, default=0.10)

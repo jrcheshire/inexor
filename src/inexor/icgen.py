@@ -34,6 +34,7 @@ would catch a violation anyway, and the two failing together is the design.
 
 import json
 import os
+import time
 import zlib
 
 import numpy as np
@@ -42,7 +43,7 @@ from . import ic, ooc_fft
 from .codec import INT16_MAX, T9Layout
 from .cosmology import growth_factor_2, growth_factor_a, growth_rate_2, growth_rate_a, ic_k_table
 from .layout import DEFAULT_INDEX_DTYPE, _stable_sort_index, _to_index
-from .lpt import lpt2_source_from_spec
+from .lpt import _DIAG, _OFFDIAG, lpt2_source_from_spec
 from .state import (
     SlotState,
     _alloc_geometry,
@@ -267,14 +268,71 @@ def generate_t9_slabs(
         )
 
     # --- emission: brick-aligned x-slabs through the sliding window --------
-    per = t9.n_buckets_side // nb
-    per3 = per**3
-    planes = n // nb  # particle planes per brick slab
-    coords = np.arange(n, dtype=dt) * dt.type(box / n)  # lagrangian_grid's exact values
     u_ro = [ooc_fft.StagedArray.open(os.path.join(stage, f"u_{ax}.npy"), dt, (n, n, n))
             for ax in range(3)]
     v_ro = [ooc_fft.StagedArray.open(os.path.join(stage, f"v_{ax}.npy"), dt, (n, n, n))
             for ax in range(3)]
+    written, n_total = _emit_t9_slabs(workdir, u_ro, v_ro, t9, n, box, nb, dt, slab, window)
+
+    manifest = dict(
+        schema=SCHEMA,
+        files=written,
+        n_particles=n_total,
+        vel_scale=float(scale),
+        max_displacement=float(umax),
+        window=window,
+        box_size=box,
+        n_part=n,
+        bucket_cells=int(bucket_cells),
+        bricks_per_side=nb,
+        a_init=float(a_init),
+        order=order,
+        f_NL=float(f_NL),
+        fdtype=dt.name,
+        slab=int(slab),
+        ic_stream=ic.IC_STREAM,
+        backend=backend,
+        table_n_points=int(len(tab.k)),
+        mean_phi2=float(mean_phi2),
+        provenance=provenance or {},
+    )
+    return _write_manifest(workdir, manifest, keep_stage)
+
+
+def _write_manifest(workdir, manifest, keep_stage):
+    """Clean the stage (unless kept), then write the manifest carrying the report."""
+    # AFTER the manifest, and the manifest is rewritten to carry the report:
+    # cleaning first would delete the working set of a generation that then
+    # failed to complete, and reporting nothing would leave "was it cleaned?"
+    # answerable only by looking at a directory that may since have been reused.
+    if keep_stage:
+        manifest["stage_cleanup"] = dict(kept=True, reason="keep_stage=True")
+    else:
+        try:
+            manifest["stage_cleanup"] = cleanup_stage(workdir)
+        except OSError as e:
+            # Housekeeping must never cost a completed generation its manifest.
+            # At C-hero this is a multi-hour product and the intermediates are
+            # a disk bill; an unwritable stage directory is the wrong reason to
+            # lose the run. Recorded loudly instead.
+            manifest["stage_cleanup"] = dict(error=str(e), removed=[], bytes=0)
+    with open(os.path.join(workdir, MANIFEST), "w") as fh:
+        json.dump(manifest, fh, indent=1)
+    return manifest
+
+
+def _emit_t9_slabs(workdir, u_ro, v_ro, t9, n, box, nb, dt, slab, window):
+    """Emission: Lagrangian x-slabs through a sliding window into per-destination T9 files.
+
+    `u_ro` / `v_ro` are three readers each (`read_slab(lo, hi)` -> (hi-lo, N, N)
+    displacement / velocity planes, any storage). Returns `(written, n_total)`.
+    Shared by both generators; the op sequence is the one the bitwise gate
+    against `SlotState.build` was established on.
+    """
+    per = t9.n_buckets_side // nb
+    per3 = per**3
+    planes = n // nb  # particle planes per brick slab
+    coords = np.arange(n, dtype=dt) * dt.type(box / n)  # lagrangian_grid's exact values
 
     staged = {d: {} for d in range(nb)}  # dest slab -> {src slab: contribution}
     done_src = np.zeros(nb, dtype=bool)
@@ -375,6 +433,238 @@ def generate_t9_slabs(
     assert finalized.all()
     if n_total != n**3:
         raise RuntimeError(f"emitted {n_total} particles, expected {n**3}")
+    return written, n_total
+
+
+class _HostField:
+    """`read_slab` over a host (N, N, N) array."""
+
+    def __init__(self, arr):
+        self.arr = arr
+
+    def read_slab(self, lo, hi):
+        return self.arr[lo:hi]
+
+
+class _CardField:
+    """`read_slab` over card shards tiling x-planes [0, N) (`{lo, hi, delta}` dicts)."""
+
+    def __init__(self, shards):
+        self.shards = sorted(shards, key=lambda s: int(s["lo"]))
+
+    def read_slab(self, lo, hi):
+        parts = []
+        for s in self.shards:
+            s_lo, s_hi = int(s["lo"]), int(s["hi"])
+            a, b = max(lo, s_lo), min(hi, s_hi)
+            if a < b:
+                parts.append(np.asarray(s["delta"][a - s_lo:b - s_lo]))
+        return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+
+def generate_t9_slabs_device(
+    workdir,
+    key,
+    n_part,
+    box_size,
+    cosmo,
+    a_init,
+    bricks_per_side,
+    bucket_cells=2,
+    f_NL=0.0,
+    order=2,
+    fdtype=np.float32,
+    slab=32,
+    backend="eh98",
+    table=None,
+    window=1,
+    provenance=None,
+    keep_stage=False,
+    devices=None,
+    pencil_batch=1,
+    noise="device",
+    log=None,
+):
+    """`generate_t9_slabs` with the IC stage on the cards (D6). Same arguments and output format.
+
+    Extra arguments: `devices` (default every jax device), `pencil_batch`,
+    `noise` ("device": drawn on the cards, stream `ic.IC_STREAM_DEVICE`; "host":
+    the CPU stream `ic.IC_STREAM`, for parity against the host generator), and
+    `log` (a callable taking one line, called as each stage ends).
+
+    What differs from the host generator, all for wall and host memory:
+    - every kernel is applied on the card inside the axis-0 pass
+      (`ooc_fft.kspace_pass_device`), so there is no host kernel pass or copy;
+    - at f_NL = 0 the phi round trip is skipped (colour x (1/M) x M = colour), and
+      the delta inverse-then-forward round trip is gone at every f_NL;
+    - the 2LPT source is 1/2 (delta^2 - sum phi_ii^2) - sum_{i<j} phi_ij^2
+      (sum phi_ii = -delta), accumulated on the cards one field at a time;
+    - U and V are inverted from k-space combinations (linear, so exact up to
+      roundoff): V is staged to disk, U_x lives on the cards, U_y and U_z on the
+      host -- at 4096^3 the host peak is ~3 fields (825 GB) and a card holds ~69 GB.
+    Emission is the host generator's (`_emit_t9_slabs`).
+
+    NOT bitwise the host generator; parity is gated in eps and code units.
+    Requires x64: kernels are built in float64 (bitwise the host kernels);
+    float32 kernels were measured 5-65 eps x rms off.
+    """
+    import jax
+
+    if not jax.config.jax_enable_x64:
+        raise RuntimeError(
+            "generate_t9_slabs_device needs jax_enable_x64: its k-space kernels are built "
+            "in float64 on the card (bitwise the host kernels); in float32 they move 5-65 "
+            "eps x rms. Enable x64 in the caller (the fields stay float32).")
+    if noise not in ("device", "host"):
+        raise ValueError(f"noise must be 'device' or 'host', got {noise!r}")
+    t9 = T9Layout(box_size, n_part, bucket_cells)
+    n, box = int(n_part), float(box_size)
+    nb = int(bricks_per_side)
+    if t9.n_buckets_side % nb:
+        raise ValueError(f"bricks_per_side {nb} must divide the bucket grid {t9.n_buckets_side}")
+    if n % nb:
+        raise ValueError(f"bricks_per_side {nb} must divide n_part {n}")
+    if order != 2:
+        raise ValueError(f"the streamed generator is order=2 only, got {order}")
+    dt = np.dtype(fdtype)
+    ic._require_stream_config(dt)
+    devs = list(jax.devices()) if devices is None else list(devices)
+    if n % len(devs):
+        raise ValueError(f"n_part {n} must be a multiple of the card count {len(devs)}")
+    # A pure memory knob, rounded up to a multiple of the card count so every slab
+    # (the tail included, since n is one too) splits across all of them.
+    slab = -(-int(slab) // len(devs)) * len(devs)
+    os.makedirs(workdir, exist_ok=True)
+    stage = os.path.join(workdir, "stage")
+    os.makedirs(stage, exist_ok=True)
+    K = ooc_fft.KSpaceKernel
+    kw = dict(devices=devs, pencil_batch=pencil_batch)
+    timings = {}
+
+    def _lap(name, t0):
+        timings[name] = time.perf_counter() - t0
+        if log is not None:
+            log(f"  ic stage {name}: {timings[name]:.1f} s")
+
+    tab = ic_k_table(cosmo, n, box, backend=backend, table=table)
+    colour = K.colour(tab, n, box)
+
+    # --- 1. white noise -> delta's spectrum --------------------------------
+    t0 = time.perf_counter()
+    first = colour if f_NL == 0.0 else colour * K.poisson(cosmo, tab, n, box, inverse=True)
+    if noise == "device":
+        spec = ooc_fft.noise_forward_cards(key, n, devs, dt, kernel=first, box_size=box,
+                                           pencil_batch=pencil_batch)
+    else:
+        spec = ooc_fft.forward_from_slabs_device(
+            lambda lo, hi: ic.white_slab(key, lo, hi, n, dt), n, slab=slab, kernel=first,
+            box_size=box, **kw)
+    mean_phi2 = None
+    if f_NL != 0.0:
+        phi = np.empty((n, n, n), dtype=dt)
+        tot = 0.0
+        for lo, s in ooc_fft.inverse_to_slabs_device(spec, n, slab=slab, **kw):
+            phi[lo:lo + s.shape[0]] = s
+            tot = ic.sq_sum_by_plane(s, tot)
+        del spec
+        mean_phi2 = tot / n**3
+
+        def _png_slab(lo, hi):
+            p = phi[lo:hi]
+            return p + np.asarray(f_NL, dtype=p.dtype) * (p * p - np.asarray(mean_phi2, p.dtype))
+
+        spec = ooc_fft.forward_from_slabs_device(
+            _png_slab, n, slab=slab, kernel=K.poisson(cosmo, tab, n, box), box_size=box, **kw)
+        del phi
+    _lap("delta", t0)
+
+    # --- 2. the 2LPT source, accumulated on the cards ----------------------
+    t0 = time.perf_counter()
+    acc = ooc_fft.zeros_card_shards(n, devs, dt)
+    work = None
+    terms = ([(None, 0.5)] + [(K.deriv2(i, j), -0.5) for i, j in _DIAG]
+             + [(K.deriv2(i, j), -1.0) for i, j in _OFFDIAG])
+    for kern, weight in terms:
+        acc, work = ooc_fft.inverse_accumulate_cards([(1.0, spec)], n, acc, weight, kernel=kern,
+                                                     box_size=box, work=work,
+                                                     pencil_batch=pencil_batch)
+    _lap("source", t0)
+
+    t0 = time.perf_counter()
+    spec2 = ooc_fft.forward_from_card_planes(acc, n, pencil_batch=pencil_batch)
+    del acc
+    _lap("source_forward", t0)
+
+    D1 = growth_factor_a(a_init, cosmo)
+    f1 = growth_rate_a(a_init, cosmo)
+    D2 = growth_factor_2(a_init, cosmo)
+    f2 = growth_rate_2(a_init, cosmo)
+    v_coef2 = -(D2 * f2) / (D1 * f1)
+
+    # --- 3. V = grad(delta + c S_2), staged to disk -------------------------
+    t0 = time.perf_counter()
+    vmax = 0.0
+    for ax in range(3):
+        ooc_fft.kspace_pass_device([(1.0, spec), (v_coef2, spec2)], n, box,
+                                   kernel=K.grad_invk2(ax), out=work, inverse=True, **kw)
+        v_sa = ooc_fft.StagedArray.create(os.path.join(stage, f"v_{ax}.npy"), dt, (n, n, n))
+        for lo, s in ooc_fft.inverse_to_slabs_device(work, n, slab=slab, pass2=False, **kw):
+            v_sa.write_slab(lo, s)
+            vmax = max(vmax, float(np.max(np.abs(np.asarray(s, np.float64)))))
+    _lap("velocities", t0)
+
+    # --- 4. U = grad(D1 delta - D2 S_2): x on the cards, y and z on the host --
+    t0 = time.perf_counter()
+    ooc_fft.kspace_pass_device([(D1, spec), (-D2, spec2)], n, box, out=spec, transform=False,
+                               **kw)
+    del spec2
+    ranges = ooc_fft.partition_units(n, len(devs), 1)
+    ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(0), out=work,
+                               inverse=True, **kw)
+    ux = ooc_fft.inverse_to_card_shards(work, n, [(lo, hi - lo, d) for (lo, hi), d
+                                                  in zip(ranges, devs)],
+                                        pencil_batch=pencil_batch, pass2=False)
+    ux = [dict(lo=lo, hi=hi, device=d, delta=a) for ((lo, hi), d), a in zip(zip(ranges, devs), ux)]
+    umax = max(float(np.asarray(jax.numpy.max(jax.numpy.abs(s["delta"])))) for s in ux)
+
+    uy = np.empty((n, n, n), dtype=dt)
+    ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(1), out=work,
+                               inverse=True, **kw)
+    for lo, s in ooc_fft.inverse_to_slabs_device(work, n, slab=slab, pass2=False, **kw):
+        uy[lo:lo + s.shape[0]] = s
+        umax = max(umax, float(np.max(np.abs(s))))
+    del work
+
+    uz = np.empty((n, n, n), dtype=dt)
+    ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(2), out=spec,
+                               inverse=True, **kw)
+    for lo, s in ooc_fft.inverse_to_slabs_device(spec, n, slab=slab, pass2=False, **kw):
+        uz[lo:lo + s.shape[0]] = s
+        umax = max(umax, float(np.max(np.abs(s))))
+    del spec
+    _lap("displacements", t0)
+
+    scale = vmax / INT16_MAX
+    if scale <= 0.0:
+        scale = 1.0
+    brick_depth = box / nb
+    if umax >= window * brick_depth:
+        raise ValueError(
+            f"max displacement {umax:.3f} reaches the sliding window's depth "
+            f"({window} brick slab(s) = {window * brick_depth:.3f} Mpc/h); a particle "
+            "could leave the window and the streamed build would misplace it. "
+            "Raise `window` (and re-derive the staging cost) rather than widening silently."
+        )
+
+    # --- 5. emission -------------------------------------------------------
+    t0 = time.perf_counter()
+    v_ro = [ooc_fft.StagedArray.open(os.path.join(stage, f"v_{ax}.npy"), dt, (n, n, n))
+            for ax in range(3)]
+    written, n_total = _emit_t9_slabs(
+        workdir, [_CardField(ux), _HostField(uy), _HostField(uz)], v_ro, t9, n, box, nb, dt,
+        slab, window)
+    del ux, uy, uz
+    _lap("emission", t0)
 
     manifest = dict(
         schema=SCHEMA,
@@ -392,30 +682,17 @@ def generate_t9_slabs(
         f_NL=float(f_NL),
         fdtype=dt.name,
         slab=int(slab),
-        ic_stream=ic.IC_STREAM,
+        ic_stream=ic.IC_STREAM_DEVICE if noise == "device" else ic.IC_STREAM,
         backend=backend,
         table_n_points=int(len(tab.k)),
-        mean_phi2=float(mean_phi2),
+        mean_phi2=None if mean_phi2 is None else float(mean_phi2),
+        generator="device",
+        n_devices=len(devs),
+        pencil_batch=int(pencil_batch),
+        stage_s=timings,
         provenance=provenance or {},
     )
-    # AFTER the manifest, and the manifest is rewritten to carry the report:
-    # cleaning first would delete the working set of a generation that then
-    # failed to complete, and reporting nothing would leave "was it cleaned?"
-    # answerable only by looking at a directory that may since have been reused.
-    if keep_stage:
-        manifest["stage_cleanup"] = dict(kept=True, reason="keep_stage=True")
-    else:
-        try:
-            manifest["stage_cleanup"] = cleanup_stage(workdir)
-        except OSError as e:
-            # Housekeeping must never cost a completed generation its manifest.
-            # At C-hero this is a multi-hour product and the intermediates are
-            # a disk bill; an unwritable stage directory is the wrong reason to
-            # lose the run. Recorded loudly instead.
-            manifest["stage_cleanup"] = dict(error=str(e), removed=[], bytes=0)
-    with open(os.path.join(workdir, MANIFEST), "w") as fh:
-        json.dump(manifest, fh, indent=1)
-    return manifest
+    return _write_manifest(workdir, manifest, keep_stage)
 
 
 def _shared_like(arr, alloc, tag):

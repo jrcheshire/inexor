@@ -485,8 +485,11 @@ def _devices_or_default(devices):
 
 def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
                               pencil_batch=1, devices=None, timings=None,
-                              transfer="pageable"):
+                              transfer="pageable", kernel=None, box_size=1.0):
     """Device twin of `forward_from_slabs`; identical structure, identical contract.
+
+    `kernel` (a `KSpaceKernel`) is applied on the card inside pass 2
+    (`kspace_pass_device`); None leaves pass 2 exactly as it was.
 
     `devices` is a sequence of jax devices to split each pass across, or None
     for jax's own placement on one device. The split is contiguous and
@@ -533,7 +536,11 @@ def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
                                  device=dev, transfer=transfer)
 
     _t0 = _time.perf_counter()
-    _run_parts(pass2, partition_units(n, len(devs), pencil_batch), devs)
+    if kernel is None:
+        _run_parts(pass2, partition_units(n, len(devs), pencil_batch), devs)
+    else:
+        kspace_pass_device([(1.0, spec)], n, box_size, kernel=kernel, out=spec,
+                           devices=devices, pencil_batch=pencil_batch, transfer=transfer)
     if timings is not None:
         timings["pass1_s"] = _p1
         timings["pass2_s"] = _time.perf_counter() - _t0
@@ -614,13 +621,16 @@ def forward_from_card_planes(shards, n_mesh, plane_batch=1, pencil_batch=1,
 
 def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
                             pencil_batch=1, devices=None, timings=None,
-                            transfer="pageable"):
+                            transfer="pageable", pass2=True):
     """Device twin of `inverse_to_slabs`. MUTATES spec, exactly as that one does.
 
     `devices` splits both passes as in `forward_from_slabs_device`, bitwise
     identically to the one-device path. This is the leg the coarse solve pays
     three times per step, and the only one that generates no field, so it is the
     clean thing to time: a forward's wall carries host RNG that does NOT split.
+
+    `pass2=False` skips the axis-0 pass, for a buffer `kspace_pass_device`
+    already took through it (inverse=True).
     """
     import jax.numpy as jnp
 
@@ -628,14 +638,15 @@ def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
     n = int(n_mesh)
     slab = n if slab is None else int(slab)
 
-    def pass2(a, b, dev):
+    def _pass2(a, b, dev):
         fft_axis0_device_inplace(spec[:, a:b, :], inverse=True,
                                  pencil_batch=pencil_batch, device=dev,
                                  transfer=transfer)
 
     _t0 = _time.perf_counter()
-    _run_parts(pass2, partition_units(spec.shape[1], len(devs), pencil_batch),
-               devs)
+    if pass2:
+        _run_parts(_pass2, partition_units(spec.shape[1], len(devs), pencil_batch),
+                   devs)
     _p2 = _time.perf_counter() - _t0
     _p1 = 0.0
 
@@ -677,7 +688,7 @@ def _card_program(key, build):
 
 
 def inverse_to_card_shards(spec, n_mesh, shards, plane_batch=1, pencil_batch=1,
-                           timings=None, transfer="pageable"):
+                           timings=None, transfer="pageable", pass2=True):
     """`inverse_to_slabs_device` with the real-space planes written onto the cards.
 
     `shards` is `(x0, nx, device)` per card: that card receives global x-planes
@@ -695,6 +706,8 @@ def inverse_to_card_shards(spec, n_mesh, shards, plane_batch=1, pencil_batch=1,
     the same `pencil_batch`: every plane is its own batch on both paths. That is
     also why `plane_batch` must be 1 -- a plane held by two cards would otherwise
     be transformed in two different batches.
+
+    `pass2=False` skips the axis-0 pass, as in `inverse_to_slabs_device`.
     """
     import jax
     import jax.numpy as jnp
@@ -715,13 +728,14 @@ def inverse_to_card_shards(spec, n_mesh, shards, plane_batch=1, pencil_batch=1,
     refuse_oversize_device_transform(n * n, "device irfft2 plane")
     devs = [dev for _x0, _nx, dev in ranges]
 
-    def pass2(a, b, dev):
+    def _pass2(a, b, dev):
         fft_axis0_device_inplace(spec[:, a:b, :], inverse=True,
                                  pencil_batch=pencil_batch, device=dev,
                                  transfer=transfer)
 
     _t0 = _time.perf_counter()
-    _run_parts(pass2, partition_units(spec.shape[1], len(devs), pencil_batch), devs)
+    if pass2:
+        _run_parts(_pass2, partition_units(spec.shape[1], len(devs), pencil_batch), devs)
     _p2 = _time.perf_counter() - _t0
 
     put = _card_program(("plane_set",), lambda: jax.jit(
@@ -750,6 +764,364 @@ def inverse_to_card_shards(spec, n_mesh, shards, plane_batch=1, pencil_batch=1,
         timings["pass1_s"] = _time.perf_counter() - _t0
         timings["pass2_s"] = _p2
     return out
+
+
+# ---------------------------------------------------------------------------
+# k-space kernels folded into the device axis-0 pass (D6)
+# ---------------------------------------------------------------------------
+#
+# The host IC generator multiplies each spectrum by its kernel in a
+# single-threaded numpy pass, and copies the spectrum first whenever it is
+# needed again: at 4096^3 that is a 275 GB host pass per kernel plus a 275 GB
+# copy. Here the multiply rides the y-pencil block the axis-0 pass already
+# sends to a card, so neither the host multiply nor the host copy exists, and
+# the host builds nothing O(N^3).
+#
+# With x64 on, each single kernel is BITWISE its host twin (float64 multiplier,
+# one cast to the spectrum dtype, on both sides; measured 2026-09-14). A product
+# of kernels rounds ONCE here where the host chain rounds after every factor, so
+# it is bitwise one host pass with the product function, not the chain (~73
+# eps x rms apart at 64^3 f32). With x64 off the multiplier is built in float32
+# and moves 5-65 eps x rms (colour worst: log/exp interpolation). Performance
+# over bitwise is JC's call for this path (2026-09-14).
+
+
+class KSpaceKernel:
+    """A multiplier on the rfft half-grid, evaluated per pencil block on a card.
+
+    Build with the classmethods and combine with `*` (factors multiply in
+    order). Conventions are `_ik_over_k2_slab`, `deriv2_spec` and
+    `mul_radial_inplace`'s: fftfreq-signed k, k^2 -> 1 at k = 0 for the
+    derivative kernels (whose numerators vanish there), and radial kernels
+    evaluated at the grid's smallest nonzero |k| at k = 0 and then overwritten
+    with their `dc_value`.
+    """
+
+    __slots__ = ("factors", "consts")
+
+    def __init__(self, factors, consts):
+        self.factors = tuple(factors)
+        self.consts = tuple(consts)
+
+    def __mul__(self, other):
+        return KSpaceKernel(self.factors + other.factors, self.consts + other.consts)
+
+    @property
+    def key(self):
+        return self.factors
+
+    @classmethod
+    def grad_invk2(cls, axis):
+        """ik_axis / k^2 -- `grad_invk2_spec`'s kernel."""
+        return cls([("grad", int(axis))], [None])
+
+    @classmethod
+    def deriv2(cls, i, j):
+        """(ik_i)(ik_j) / k^2 = -k_i k_j / k^2 -- `deriv2_spec`'s kernel."""
+        return cls([("deriv2", int(i), int(j))], [None])
+
+    @classmethod
+    def colour(cls, table, n_mesh, box_size, dc_value=0.0):
+        """sqrt(P(|k|) N^3 / L^3) from an ICKTable -- `ic._colour_fn`'s kernel."""
+        n, box = int(n_mesh), float(box_size)
+        k_min = _refuse_off_table(table, n, box)
+        return cls([("colour", float(n**3 / box**3), k_min, float(dc_value))],
+                   [(np.log(table.k), np.log(table.P))])
+
+    @classmethod
+    def poisson(cls, cosmo, table, n_mesh, box_size, inverse=False, z=0.0, dc_value=1.0):
+        """M(|k|, z), or 1/M -- `ic._poisson_fn`'s kernel on the table transfer."""
+        from .ic import C_OVER_H0
+        from .cosmology import growth_factor_md
+
+        n, box = int(n_mesh), float(box_size)
+        k_min = _refuse_off_table(table, n, box)
+        amp = (2.0 / 3.0) * C_OVER_H0**2 * growth_factor_md(1.0 / (1.0 + z), cosmo) / cosmo.Omega_m
+        return cls([("poisson", float(amp), bool(inverse), k_min, float(dc_value))],
+                   [(np.log(table.k), np.asarray(table.T, dtype=np.float64))])
+
+
+def _refuse_off_table(table, n, box):
+    """The realized |k| range must sit inside the table: the card does not refuse."""
+    k_min = abs(float(_kz(n, box)[1]))
+    k_max = float(np.sqrt(3.0) * np.pi * n / box)
+    if k_min < table.k[0] or k_max > table.k[-1]:
+        raise ValueError(
+            f"grid |k| range [{k_min:.3g}, {k_max:.3g}] is outside the table's "
+            f"[{table.k[0]:.3g}, {table.k[-1]:.3g}]; the device kernel would extrapolate")
+    return k_min
+
+
+def _kernel_on_card(factors, consts, kx, ky, kz):
+    """The multiplier for one pencil block, shape broadcastable to (N, b, M)."""
+    import jax.numpy as jnp
+
+    kxs, kys, kzs = kx[:, None, None], ky[None, :, None], kz[None, None, :]
+    k2 = kxs**2 + kys**2 + kzs**2
+    origin = (kx == 0)[:, None, None] & (ky == 0)[None, :, None] & (kz == 0)[None, None, :]
+    k2_1 = jnp.where(origin, jnp.ones_like(k2), k2)
+    comps = (kxs, kys, kzs)
+    m = None
+    for f, c in zip(factors, consts):
+        kind = f[0]
+        if kind == "grad":
+            v = (1j * comps[f[1]]) / k2_1
+        elif kind == "deriv2":
+            v = -(comps[f[1]] * comps[f[2]]) / k2_1
+        else:
+            k_min, dc = f[-2], f[-1]
+            kk = jnp.where(origin, jnp.full_like(k2, k_min), jnp.sqrt(k2))
+            lnk = jnp.log(kk)
+            if kind == "colour":
+                v = jnp.sqrt(jnp.exp(jnp.interp(lnk, c[0], c[1])) * f[1])
+            elif kind == "poisson":
+                v = f[1] * kk**2 * jnp.interp(lnk, c[0], c[1])
+                if f[2]:
+                    v = 1.0 / v
+            else:
+                raise ValueError(f"unknown kernel factor {kind!r}")
+            v = jnp.where(origin, jnp.full_like(v, dc), v)
+        m = v if m is None else m * v
+    return m
+
+
+def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inverse=False,
+                       transform=True, devices=None, pencil_batch=1, timings=None,
+                       transfer="pageable"):
+    """Combine spectra, apply a k-space kernel and run the axis-0 (i)fft, on the cards.
+
+    `sources` is a sequence of `(coef, spec)`, every spec an (N, N, M) host array
+    of one complex dtype. Each y-pencil block `sum(coef * spec[:, y0:y1, :])` is
+    sent to a card, where the kernel is applied AFTER the axis-0 fft (forward:
+    the array is pass 1's output) or BEFORE the axis-0 ifft (inverse), and the
+    result is written into `out[:, y0:y1, :]`. `transform=False` applies the
+    combination and kernel only. `kernel=None` is the identity.
+
+    `out` defaults to a new array and MAY be one of the sources: each thread
+    reads and writes only its own y range, so the pass is in place. `devices`
+    and `pencil_batch` split exactly as in `forward_from_slabs_device`, and the
+    result is bitwise the same at every card count.
+
+    Replaces, for the device IC generator, `mul_radial_inplace` /
+    `grad_invk2_spec` / `deriv2_spec` followed by `fft_axis0_inplace`, and the
+    host spectrum copies those require.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    srcs = [(float(c), s) for c, s in sources]
+    if not srcs:
+        raise ValueError("sources= was empty")
+    shape, cdt = srcs[0][1].shape, np.dtype(srcs[0][1].dtype)
+    n = int(n_mesh)
+    if shape != _spec_shape(n):
+        raise ValueError(f"source shape {shape} is not the (N, N, N//2+1) half-grid for N={n}")
+    for _c, s in srcs:
+        if s.shape != shape or np.dtype(s.dtype) != cdt:
+            raise ValueError("sources disagree on shape or dtype")
+    if cdt not in (np.dtype(np.complex64), np.dtype(np.complex128)):
+        raise TypeError(f"sources must be complex spectra, got {cdt.name}")
+    rdt = np.dtype(np.float64 if cdt == np.complex128 else np.float32)
+    _require_x64_for(rdt)
+    if out is None:
+        out = np.empty(shape, dtype=cdt)
+    elif out.shape != shape or np.dtype(out.dtype) != cdt:
+        raise ValueError("out must match the sources' shape and dtype")
+    b = max(1, int(pencil_batch))
+    refuse_oversize_device_transform(b * shape[0] * shape[2], "device k-space pass batch")
+
+    kd = np.float64 if jax.config.jax_enable_x64 else np.float32
+    kx = _kx(n, box_size).astype(kd)
+    kz = _kz(n, box_size).astype(kd)
+    factors = () if kernel is None else kernel.factors
+    consts = () if kernel is None else kernel.consts
+    n_src = len(srcs)
+
+    def build():
+        def fn(coefs, blocks, kxd, kyd, kzd, cst):
+            acc = coefs[0] * blocks[0]
+            for c, blk in zip(coefs[1:], blocks[1:]):
+                acc = acc + c * blk
+            if transform and not inverse:
+                acc = jnp.fft.fft(acc, axis=0)
+            if factors:
+                m = _kernel_on_card(factors, cst, kxd, kyd, kzd)
+                acc = acc * m.astype(acc.dtype)
+            if transform and inverse:
+                acc = jnp.fft.ifft(acc, axis=0)
+            return acc
+
+        return jax.jit(fn)
+
+    prog = _card_program(("kspace", factors, n_src, bool(inverse), bool(transform)), build)
+    devs = _devices_or_default(devices)
+
+    def part(a, z, dev):
+        put = (lambda x: jnp.asarray(x)) if dev is None else (lambda x: jax.device_put(x, dev))
+        kxd, kzd = put(kx), put(kz)
+        cst = tuple(None if c is None else (put(c[0].astype(kd)), put(c[1].astype(kd)))
+                    for c in consts)
+        coefs = tuple(put(np.asarray(c, dtype=rdt)) for c, _s in srcs)
+        for lo in range(a, z, b):
+            hi = min(lo + b, z)
+            blocks = tuple(_to_device(np.ascontiguousarray(s[:, lo:hi, :]), dev, transfer)
+                           for _c, s in srcs)
+            d = _from_device(prog(coefs, blocks, kxd, put(kx[lo:hi]), kzd, cst), transfer)
+            _check_spectral_dtype(d.dtype, cdt, "device k-space pass")
+            out[:, lo:hi, :] = d
+
+    _t0 = _time.perf_counter()
+    _run_parts(part, partition_units(shape[1], len(devs), b), devs)
+    if timings is not None:
+        timings["kspace_s"] = timings.get("kspace_s", 0.0) + _time.perf_counter() - _t0
+    return out
+
+
+# ---------------------------------------------------------------------------
+# pass 1 on the cards for the IC stage: noise drawn where it is transformed, and
+# squares accumulated where they are inverse-transformed (D6)
+# ---------------------------------------------------------------------------
+
+
+def zeros_card_shards(n_mesh, devices, dtype=np.float32):
+    """Card shards of zeros tiling x-planes [0, N): `[{lo, hi, device, delta}]`.
+
+    The shard format `forward_from_card_planes` consumes, one contiguous run of
+    x-planes per device (`partition_units` at unit 1).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    n = int(n_mesh)
+    dt = np.dtype(dtype)
+    _require_x64_for(dt)
+    shards = []
+    for (lo, hi), dev in zip(partition_units(n, len(devices), 1), devices):
+        shape = (hi - lo, n, n)
+        zeros = _card_program(("zeros", shape, dt.str), lambda shape=shape: jax.jit(
+            lambda z: jnp.broadcast_to(z, shape)))
+        z = np.zeros((), dtype=dt)
+        shards.append(dict(lo=lo, hi=hi, device=dev,
+                           delta=zeros(jnp.asarray(z) if dev is None else jax.device_put(z, dev))))
+    return shards
+
+
+def noise_forward_cards(key, n_mesh, devices, fdtype=np.float32, kernel=None, box_size=1.0,
+                        pencil_batch=1, timings=None, transfer="pageable"):
+    """Plane-keyed white noise drawn ON the cards, forward-transformed, kernel applied.
+
+    Plane i is `jax.random.normal(fold_in(key, i), (N, N))`, drawn and `rfft2`d on
+    the card that owns x-plane i; only its 2-D spectrum crosses to the host. Then
+    pass 2 with `kernel` folded in (`kspace_pass_device`, in place). Returns the
+    host (N, N, N//2+1) spectrum.
+
+    The same construction as `ic.white_plane`, but drawn on the card's backend:
+    the normal transform's bits are not specified across backends, so the result
+    is a DIFFERENT stream from `ic.IC_STREAM` on a GPU and carries
+    `ic.IC_STREAM_DEVICE`. Bitwise the same at every card count (each plane is
+    drawn and transformed on its own).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    n = int(n_mesh)
+    dt = np.dtype(fdtype)
+    _require_x64_for(dt)
+    refuse_oversize_device_transform(n * n, "device noise plane")
+    devs = list(devices)
+    cd = _cdtype_for(dt)
+    spec = np.empty(_spec_shape(n), dtype=cd)
+    jdt = jnp.dtype(dt)
+    draw = _card_program(("noise_rfft2", n, dt.str), lambda: jax.jit(
+        lambda k, i: jnp.fft.rfft2(jax.random.normal(jax.random.fold_in(k, i), (n, n),
+                                                     dtype=jdt))))
+
+    def pass1(k, _k1, dev):
+        lo, hi = parts[k]
+        kd = jnp.asarray(key) if dev is None else jax.device_put(key, dev)
+        for i in range(lo, hi):
+            idx = np.uint32(i)
+            d = _from_device(draw(kd, jnp.asarray(idx) if dev is None
+                                  else jax.device_put(idx, dev)), transfer)
+            _check_spectral_dtype(d.dtype, cd, "device noise rfft2")
+            spec[i] = d
+
+    parts = partition_units(n, len(devs), 1)
+    _t0 = _time.perf_counter()
+    _run_parts(pass1, [(k, k + 1) for k in range(len(devs))], devs)
+    _p1 = _time.perf_counter() - _t0
+    _t0 = _time.perf_counter()
+    kspace_pass_device([(1.0, spec)], n, box_size, kernel=kernel, out=spec, inverse=False,
+                       devices=devs, pencil_batch=pencil_batch, transfer=transfer)
+    if timings is not None:
+        timings["pass1_s"] = _p1
+        timings["pass2_s"] = _time.perf_counter() - _t0
+    return spec
+
+
+def inverse_accumulate_cards(sources, n_mesh, acc_shards, weight, kernel=None, box_size=1.0,
+                             work=None, pencil_batch=1, timings=None, transfer="pageable"):
+    """acc += weight * (inverse transform of kernel * sum(coef * spec))**2, on the cards.
+
+    Pass 2 (`kspace_pass_device`, kernel folded in) writes into the host buffer
+    `work`, which may not alias a source and is returned for reuse; the sources
+    are left intact. Pass 1 runs one thread per card: each x-plane's `irfft2` is
+    computed on the card that owns it and its weighted square is added into that
+    card's shard of `acc_shards` (`zeros_card_shards` format) by a donated
+    program, so no real-space plane crosses to the host. The square is taken in
+    the accumulator's dtype. Returns `(acc_shards, work)` -- the shards hold new
+    arrays; the old ones are donated.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    n = int(n_mesh)
+    srcs = [(c, s) for c, s in sources]
+    shape, cdt = srcs[0][1].shape, np.dtype(srcs[0][1].dtype)
+    if work is None:
+        work = np.empty(shape, dtype=cdt)
+    if any(np.shares_memory(work, s) for _c, s in srcs):
+        raise ValueError("work aliases a source; the sources must survive the pass")
+    acc_shards = sorted(acc_shards, key=lambda s: int(s["lo"]))
+    edge = 0
+    for s in acc_shards:
+        if int(s["lo"]) != edge or tuple(s["delta"].shape) != (int(s["hi"]) - edge, n, n):
+            raise ValueError("acc_shards must tile [0, N) with (hi - lo, N, N) arrays")
+        edge = int(s["hi"])
+    if edge != n:
+        raise ValueError(f"acc_shards end at {edge}, not {n}")
+    adt = np.dtype(acc_shards[0]["delta"].dtype)
+    _require_x64_for(adt)
+    refuse_oversize_device_transform(n * n, "device irfft2 plane")
+    devs = [s["device"] for s in acc_shards]
+
+    _t0 = _time.perf_counter()
+    kspace_pass_device(srcs, n, box_size, kernel=kernel, out=work, inverse=True, devices=devs,
+                       pencil_batch=pencil_batch, transfer=transfer)
+    _p2 = _time.perf_counter() - _t0
+
+    add = _card_program(("acc_sq", n, adt.str), lambda: jax.jit(
+        lambda m, i, spec_plane, w: m.at[i].add(
+            w * jnp.square(jnp.fft.irfft2(spec_plane, s=(n, n), axes=(-2, -1))[0]
+                           .astype(m.dtype))),
+        donate_argnums=0))
+
+    def pass1(k, _k1, dev):
+        s = acc_shards[k]
+        lo, hi = int(s["lo"]), int(s["hi"])
+        put = (lambda x: jnp.asarray(x)) if dev is None else (lambda x: jax.device_put(x, dev))
+        m = s["delta"]
+        w = put(np.asarray(weight, dtype=adt))
+        for g in range(lo, hi):
+            m = add(m, put(np.int64(g - lo)), _to_device(work[g:g + 1], dev, transfer), w)
+        s["delta"] = jax.block_until_ready(m)
+
+    _t0 = _time.perf_counter()
+    _run_parts(pass1, [(k, k + 1) for k in range(len(acc_shards))], devs)
+    if timings is not None:
+        timings["pass1_s"] = timings.get("pass1_s", 0.0) + _time.perf_counter() - _t0
+        timings["pass2_s"] = timings.get("pass2_s", 0.0) + _p2
+    return acc_shards, work
 
 
 # ---------------------------------------------------------------------------

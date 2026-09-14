@@ -299,6 +299,53 @@ def _print_load_and_ic(args, ec, t9, n, rows, arena, shared):
     return max(ld.values())
 
 
+def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1, png=False):
+    """Host, per-card and disk bytes at each stage of `icgen.generate_t9_slabs_device`.
+
+    Returns `(host, card, disk)`: dicts of stage -> bytes. Within a stage the
+    co-resident terms are summed; stages do not coexist, so a generation's peak is
+    the max over stages. Mirrors the generator's allocation order (its docstring
+    and stage comments). A LOWER BOUND: numpy and XLA temporaries at or below
+    pencil/plane size are charged roughly and the page cache not at all.
+    `png` charges the f_NL != 0 phi round trip in stage 1.
+    """
+    n, W = int(n), max(1, int(n_gpus))
+    w = np.dtype(fdtype).itemsize
+    m = n // 2 + 1
+    field = n**3 * w
+    spec = n * n * m * 2 * w
+    pencil_host = 2 * W * n * m * 2 * w  # a block and its result, per card thread
+    slab_real = int(slab) * n * n * w
+    nb = int(nb) if nb else max(1, n // 16)
+    rows_slab = n**3 // nb
+    chunk_rows = min(int(slab), n // nb) * n * n
+    emission = ((2 * window + 1) * rows_slab * 35  # staged keys, offsets, float64 velocities
+                + rows_slab * 80                   # a destination slab's finalize copies
+                + chunk_rows * 80)                 # one chunk's float64 positions/velocities, keys
+    host = {
+        "1 noise -> delta spectrum": (spec + field if png else spec) + pencil_host,
+        "2 2LPT source (accumulated on the cards)": 2 * spec + pencil_host,
+        "3 source forward": 3 * spec + pencil_host,
+        "4 velocities (to disk)": 3 * spec + pencil_host + slab_real,
+        "5 displacements (x on the cards, y/z host)": (max(3 * spec, 2 * spec + field,
+                                                           spec + 2 * field)
+                                                       + pencil_host + slab_real),
+        "6 emission": 2 * field + emission,
+    }
+    quarter = -(-n // W) * n * n * w
+    work = 6 * n * m * 2 * w + 4 * n * n * 2 * w  # a pencil block's program + a plane's, rough
+    card = {
+        "1 noise -> delta spectrum": work,
+        "2 2LPT source (accumulated on the cards)": quarter + work,
+        "3 source forward": quarter + work,
+        "4 velocities (to disk)": work,
+        "5 displacements (x on the cards, y/z host)": quarter + work,
+        "6 emission": quarter,
+    }
+    disk = {"velocity staging (3 fields)": 3 * field, "T9 slabs written": 9 * n**3}
+    return host, card, disk
+
+
 def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
     """Per-GPU bytes for the host-state / device-step design.
 
@@ -446,6 +493,22 @@ def _device_main(args, ec, t9, n, rows, arena, state):
           "It is not a tuning knob.")
 
     load_peak = _print_load_and_ic(args, ec, t9, n, rows, arena, shared=True)
+
+    # the generator runs float32 fields (the driver's GEN_FDTYPE), whatever the mesh dtypes
+    # `n` here is the particle COUNT; the stage table wants particles per side
+    ic_host, ic_card, ic_disk = ic_device_stages(
+        args.n_part, n_gpus=n_gpus, fdtype=np.float32, nb=max(1, ec.n_fine // ec.n_brick))
+    _table("IC GENERATION ON THE CARDS (its own job), HOST by stage", ic_host,
+           total_label="PEAK (max, not sum)", reduce=max)
+    _table(f"IC GENERATION ON THE CARDS, PER GPU (of {n_gpus}) by stage", ic_card,
+           total_label="PEAK (max, not sum)", reduce=max)
+    _table("IC GENERATION, DISK", ic_disk)
+    for label, peak, budget in (("host", max(ic_host.values()), args.host_gb),
+                                ("per GPU", max(ic_card.values()), args.device_gb)):
+        if budget is not None:
+            r = peak / (budget * GB)
+            print(f"  IC generation {label} against {budget} GB: "
+                  f"{'FITS' if r < 1.0 else 'DOES NOT FIT'} ({r:.2f}x)")
 
     print("\nBINDING TERMS")
     host_peak = sum(host.values())
