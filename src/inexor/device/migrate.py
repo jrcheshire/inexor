@@ -40,12 +40,19 @@ SHAPES. Row buffers use each kernel's `_padded`; the slab window, arena arrays a
 staged emigrants use `forces.capacity_shape`, so slabs of nearby size share every
 program.
 
-SCOPE (R1): one device, host-resident state, the serial slab schedule. A permuted
-schedule and the four-card split are R3.
+SEVERAL CARDS (R3, `devices=`). Because every order-dependent arena change is
+replayed at the end and a slab's work touches only its own rows, slabs may run on
+any card in any order. Card k owns a contiguous run of slabs. It first ejects its
+`r` lowest and `r` highest slabs and hands emigrant-only copies to the neighbour
+that inserts from them; then each card sweeps its own slabs as the one-card pass
+does, one thread per card, and the parent replays the arena once. A card holding
+fewer than `2r + 1` slabs cannot separate its boundaries, and the pass falls back
+to one card (on the receipt).
 """
 
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
@@ -64,6 +71,7 @@ INSERT_B_PER_PADDED_ROW = 83.0
 ESTIMATE_OVER_MEASURED = 0.76
 
 _PROGRAMS: dict = {}
+_PROGRAM_LOCK = threading.Lock()
 
 #: RECEIPT: passes run through this module (see `eject_jax.CALLS`).
 CALLS = 0
@@ -135,6 +143,43 @@ def _ladder(n):
     return int(capacity_shape(max(1, int(n))))
 
 
+def _put(a, dev, dtype=None):
+    """`a` as a device array on `dev`; None is jax's default device via
+    `jnp.asarray`, exactly the one-card pass's call."""
+    import jax
+    import jax.numpy as jnp
+
+    if dev is None:
+        return jnp.asarray(a, dtype=dtype)
+    if isinstance(a, jax.Array) and dtype is None:
+        return jax.device_put(a, dev)
+    return jax.device_put(np.asarray(a, dtype=dtype), dev)
+
+
+def _zeros(shape, dtype, dev):
+    """Zeros built on `dev` (None: `jnp.zeros`, the one-card pass's call)."""
+    import jax.numpy as jnp
+
+    if dev is None:
+        return jnp.zeros(shape, dtype)
+    from .paint import _zeros_on
+
+    shape = (int(shape),) if np.isscalar(shape) else tuple(shape)
+    return _zeros_on(shape, dtype, dev)
+
+
+def _arange(n, dev):
+    """`jnp.arange(n, dtype=int64)` on `dev`, built by a program placed there."""
+    import jax
+    import jax.numpy as jnp
+
+    if dev is None:
+        return jnp.arange(n, dtype=jnp.int64)
+    n = int(n)
+    fn = _program(("arange", n), lambda: jax.jit(lambda z: jnp.arange(n, dtype=jnp.int64) + z))
+    return fn(jax.device_put(np.int64(0), dev))
+
+
 def pass_arena_index(st):
     """(slots, bricks): arena residents ordered by brick, ascending slot within.
 
@@ -150,9 +195,10 @@ def pass_arena_index(st):
 
 
 def _program(key, make):
-    fn = _PROGRAMS.get(key)
-    if fn is None:
-        fn = _PROGRAMS[key] = make()
+    with _PROGRAM_LOCK:
+        fn = _PROGRAMS.get(key)
+        if fn is None:
+            fn = _PROGRAMS[key] = make()
     return fn
 
 
@@ -259,9 +305,10 @@ def _eject_kernel(t9, nb, cap, has_ids):
     from .. import eject_jax
 
     key = (int(t9.n_buckets_side), float(t9.quantum), int(nb), int(cap), has_ids)
-    fn = eject_jax._CACHE.get(key)
-    if fn is None:
-        fn = eject_jax._CACHE[key] = eject_jax._build(t9, int(nb), int(cap), has_ids)
+    with _PROGRAM_LOCK:
+        fn = eject_jax._CACHE.get(key)
+        if fn is None:
+            fn = eject_jax._CACHE[key] = eject_jax._build(t9, int(nb), int(cap), has_ids)
     return fn
 
 
@@ -269,14 +316,15 @@ def _insert_kernel(p3, nb2, cap, has_ids):
     from .. import insert_jax
 
     key = (int(p3), int(nb2), int(cap), has_ids)
-    fn = insert_jax._CACHE.get(key)
-    if fn is None:
-        fn = insert_jax._CACHE[key] = insert_jax._build(int(p3), int(nb2), int(cap), has_ids)
+    with _PROGRAM_LOCK:
+        fn = insert_jax._CACHE.get(key)
+        if fn is None:
+            fn = insert_jax._CACHE[key] = insert_jax._build(int(p3), int(nb2), int(cap), has_ids)
     return fn
 
 
-def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget):
-    """Upload slab s's window, build its rows and eject them. Returns the staged slab."""
+def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=None):
+    """Upload slab s's window to `dev`, build its rows and eject them. Returns the staged slab."""
     import jax.numpy as jnp
 
     from .. import eject_jax
@@ -320,22 +368,22 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget):
     ids_np = window(st.ids) if has_ids else None
     clock.mark("eject: host index + window")
 
-    off_win = jnp.asarray(off_np)
-    w_win = jnp.asarray(w_np)
-    ids_win = jnp.asarray(ids_np) if has_ids else None
+    off_win = _put(off_np, dev)
+    w_win = _put(w_np, dev)
+    ids_win = _put(ids_np, dev) if has_ids else None
     off_np = w_np = ids_np = None
-    index_dev = (jnp.asarray(occ), jnp.asarray(live), jnp.asarray(np.asarray(
-        st.brick_start[lo_b:hi_b], dtype=np.int64) - s0), jnp.asarray(row_offsets),
-        jnp.asarray(ar_offsets), jnp.asarray(ar_bucket),
-        jnp.asarray(np.asarray(scales[lo_b:hi_b], dtype=np.float64)))
+    index_dev = (_put(occ, dev), _put(live, dev), _put(np.asarray(
+        st.brick_start[lo_b:hi_b], dtype=np.int64) - s0, dev), _put(row_offsets, dev),
+        _put(ar_offsets, dev), _put(ar_bucket, dev),
+        _put(np.asarray(scales[lo_b:hi_b], dtype=np.float64), dev))
     clock.mark("eject: upload", off_win, w_win, ids_win, index_dev)
 
     rows = _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids)
     occ_d, live_d, starts_d, row_off_d, ar_off_d, ar_bucket_d, scales_d = index_dev
     off, bijk, w, ids, scale, brick, real = rows(
         occ_d, live_d, starts_d, row_off_d, ar_off_d, ar_bucket_d, off_win, w_win, ids_win,
-        scales_d, jnp.asarray(n_rows, dtype=jnp.int64), jnp.asarray(span, dtype=jnp.int64),
-        jnp.asarray(lo_b, dtype=jnp.int64))
+        scales_d, _put(n_rows, dev, jnp.int64), _put(span, dev, jnp.int64),
+        _put(lo_b, dev, jnp.int64))
     index_dev = occ_d = live_d = starts_d = row_off_d = ar_off_d = ar_bucket_d = scales_d = None
     clock.mark("eject: rows program", off, bijk, w, ids, scale, brick, real)
 
@@ -350,7 +398,7 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget):
     # realized x-reach over this slab's emigrants, as the serial pass reports it
     rr = 0
     if n_rows > n_keep:
-        idx = jnp.arange(cap, dtype=jnp.int64)
+        idx = _arange(cap, dev)
         em = (idx >= n_keep) & (idx < n_rows)
         disp = (dest // (p3 * nb2) - s + nb // 2) % nb - nb // 2
         rr = int(jnp.max(jnp.where(em, jnp.abs(disp), 0)))
@@ -361,8 +409,8 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget):
                 win=(off_win, w_win, ids_win), s0=s0, s1=s1, span=span, w_cap=w_cap)
 
 
-def _insert_slab(st, d, reach, staged, scales_dev, clock, budget):
-    """Insert slab d on the device and write its slot range back. Returns insert_res."""
+def _insert_slab(st, d, reach, staged, scales_dev, clock, budget, dev=None):
+    """Insert slab d on `dev` and write its slot range back. Returns insert_res."""
     import jax.numpy as jnp
 
     from .. import insert_jax
@@ -379,7 +427,7 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget):
     for s in sources:
         e = staged[s]
         if e["n_rows"] > e["n_keep"]:
-            idx = jnp.arange(e["cap"], dtype=jnp.int64)
+            idx = _arange(e["cap"], dev)
             em = (idx >= e["n_keep"]) & (idx < e["n_rows"])
             consumed[s] = int(jnp.sum(em & (e["dest"] // (p3 * nb2) == d)))
             segs.append((e, e["n_keep"], e["n_rows"], False))
@@ -388,26 +436,26 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget):
 
     cap_i = insert_jax._padded(n_in)
     budget.check(f"inserting slab {d}", 0, INSERT_B_PER_PADDED_ROW, cap_i)
-    bufs = (jnp.zeros(cap_i, jnp.int64), jnp.zeros((cap_i, 3), jnp.uint8),
-            jnp.zeros((cap_i, 3), jnp.int16),
-            jnp.zeros(cap_i, jnp.int32) if has_ids else None, jnp.zeros(cap_i, jnp.int64))
+    bufs = (_zeros(cap_i, jnp.int64, dev), _zeros((cap_i, 3), jnp.uint8, dev),
+            _zeros((cap_i, 3), jnp.int16, dev),
+            _zeros(cap_i, jnp.int32, dev) if has_ids else None, _zeros(cap_i, jnp.int64, dev))
     base = 0
     for e, lo, hi, is_keep in segs:
         src_brick = e["dest"] // p3 if is_keep else e["src"]
         put = _put_program(e["cap"], cap_i, has_ids)
         bufs = put(bufs, e["dest"], e["off"], e["w"], e["ids"], src_brick,
-                   jnp.asarray(lo, jnp.int64), jnp.asarray(hi, jnp.int64),
-                   jnp.asarray(base, jnp.int64))
+                   _put(lo, dev, jnp.int64), _put(hi, dev, jnp.int64),
+                   _put(base, dev, jnp.int64))
         base += hi - lo
     b_dest, b_off, b_w, b_ids, b_src = bufs
-    real = jnp.arange(cap_i, dtype=jnp.int64) < n_in
+    real = _arange(cap_i, dev) < n_in
     s_old = jnp.where(real, scales_dev[b_src], 1.0)
     clock.mark("insert: compact inputs", b_dest, b_off, b_w, b_ids, s_old, real)
 
     fn = _insert_kernel(p3, nb2, cap_i, has_ids)
-    out = fn(b_dest, b_off, b_w, b_ids, s_old, real, jnp.asarray(lo_b, dtype=jnp.int64),
-             jnp.asarray(np.asarray(st.brick_start[lo_b:hi_b + 1], dtype=np.int64)),
-             jnp.asarray(np.full(nb2, 32767.0, dtype=np.float64)))
+    out = fn(b_dest, b_off, b_w, b_ids, s_old, real, _put(lo_b, dev, jnp.int64),
+             _put(np.asarray(st.brick_start[lo_b:hi_b + 1], dtype=np.int64), dev),
+             _put(np.full(nb2, 32767.0, dtype=np.float64), dev))
     clock.mark("insert: kernel", out)
     if float(out["abs_max"]) > INT16_MAX:
         raise ValueError(
@@ -423,7 +471,7 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget):
     e = staged[d]
     write = _write_program(cap_i, e["w_cap"], has_ids)
     off_win, w_win, ids_win = write(*e["win"], out["pos"], out["off"], out["w"], out["ids"],
-                                    jnp.asarray(nw, jnp.int64), jnp.asarray(e["s0"], jnp.int64))
+                                    _put(nw, dev, jnp.int64), _put(e["s0"], dev, jnp.int64))
     clock.mark("insert: scalars + write program", off_win, w_win, ids_win)
     s0, s1, span = e["s0"], e["s1"], e["span"]
     st.off[s0:s1] = np.asarray(off_win)[:span]
@@ -441,14 +489,15 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget):
         # rows [nw, nw + ns) gathered onto the ladder by the compaction program: a
         # device slice sized by the spill count keys a new op on every slab
         cap_s = _ladder(ns)
-        sbufs = (jnp.zeros(cap_s, jnp.int64), jnp.zeros((cap_s, 3), jnp.uint8),
-                 jnp.zeros((cap_s, 3), jnp.int16),
-                 jnp.zeros(cap_s, jnp.int32) if has_ids else None, jnp.zeros(cap_s, jnp.int64))
+        sbufs = (_zeros(cap_s, jnp.int64, dev), _zeros((cap_s, 3), jnp.uint8, dev),
+                 _zeros((cap_s, 3), jnp.int16, dev),
+                 _zeros(cap_s, jnp.int32, dev) if has_ids else None,
+                 _zeros(cap_s, jnp.int64, dev))
         take = _put_program(cap_i, cap_s, has_ids)
         g_dest, g_off, g_w, g_ids, _ = take(sbufs, out["dest"], out["off"], out["w"], out["ids"],
-                                            out["dest"], jnp.asarray(nw, jnp.int64),
-                                            jnp.asarray(nw + ns, jnp.int64),
-                                            jnp.asarray(0, jnp.int64))
+                                            out["dest"], _put(nw, dev, jnp.int64),
+                                            _put(nw + ns, dev, jnp.int64),
+                                            _put(0, dev, jnp.int64))
         sd = np.asarray(g_dest)[:ns]
         so = np.asarray(g_off)[:ns]
         sw = np.asarray(g_w)[:ns]
@@ -461,7 +510,7 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget):
     return dict(consumed=consumed, spills=spills, n_over=ns)
 
 
-def _emigrants_only(e, has_ids):
+def _emigrants_only(e, has_ids, dev=None):
     """A staged slab cut to its emigrants once its own insert has run.
 
     Its keepers and its window are read by that insert alone; later inserts read
@@ -475,44 +524,90 @@ def _emigrants_only(e, has_ids):
         return dict(dest=None, off=None, w=None, ids=None, src=None, cap=0, n_keep=0,
                     n_rows=0, rr=e["rr"])
     cap_e = _ladder(n_emig)
-    bufs = (jnp.zeros(cap_e, jnp.int64), jnp.zeros((cap_e, 3), jnp.uint8),
-            jnp.zeros((cap_e, 3), jnp.int16),
-            jnp.zeros(cap_e, jnp.int32) if has_ids else None, jnp.zeros(cap_e, jnp.int64))
+    bufs = (_zeros(cap_e, jnp.int64, dev), _zeros((cap_e, 3), jnp.uint8, dev),
+            _zeros((cap_e, 3), jnp.int16, dev),
+            _zeros(cap_e, jnp.int32, dev) if has_ids else None, _zeros(cap_e, jnp.int64, dev))
     put = _put_program(e["cap"], cap_e, has_ids)
     dest, off, w, ids, src = put(bufs, e["dest"], e["off"], e["w"], e["ids"], e["src"],
-                                 jnp.asarray(e["n_keep"], jnp.int64),
-                                 jnp.asarray(e["n_rows"], jnp.int64), jnp.asarray(0, jnp.int64))
+                                 _put(e["n_keep"], dev, jnp.int64),
+                                 _put(e["n_rows"], dev, jnp.int64), _put(0, dev, jnp.int64))
     return dict(dest=dest, off=off, w=w, ids=ids, src=src, cap=cap_e, n_keep=0,
                 n_rows=n_emig, rr=e["rr"])
 
 
+def _moved(e, dev):
+    """An emigrant-only staged slab copied onto `dev`; (copy, bytes moved)."""
+    moved, nbytes = dict(e), 0
+    for k in ("dest", "off", "w", "ids", "src"):
+        a = e.get(k)
+        if a is not None:
+            moved[k] = _put(a, dev)
+            nbytes += int(a.nbytes)
+    return moved, nbytes
+
+
+def _sweep(st, lo, hi, reach, c_drift, scales, ar_slots, ar_bricks, dev, staged, ejected,
+           clock, budget):
+    """One card's pass over its own slabs [lo, hi): today's schedule, with any
+    slabs already in `staged` (its boundary ejects, the neighbours' emigrants)
+    used as they are. Returns (insert_res, peak staged)."""
+    nb = int(st.bricks_per_side)
+    has_ids = st.ids is not None
+    scales_dev = budget.fixed[0]
+    own = range(lo, hi)
+    inserted, insert_res, peak = set(), {}, 0
+    for s in own:
+        if s not in ejected:
+            staged[s] = _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget,
+                                    dev)
+            ejected[s] = (staged[s]["n_rows"] - staged[s]["n_keep"], staged[s]["rr"])
+        for d in own:
+            if d in inserted:
+                continue
+            if all(((d + o) % nb) in staged for o in reach):
+                insert_res[d] = _insert_slab(st, d, reach, staged, scales_dev, clock, budget, dev)
+                inserted.add(d)
+                staged[d] = _emigrants_only(staged[d], has_ids, dev)
+                clock.mark("insert: shrink staged", staged[d]["dest"])
+        # release what no insert of THIS card can still need
+        for s2 in list(staged):
+            if all(((s2 + o) % nb) in inserted for o in reach if lo <= (s2 + o) % nb < hi):
+                del staged[s2]
+        peak = max(peak, len(staged))
+    return insert_res, peak
+
+
 def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
-                             device_budget_bytes=None):
+                             device_budget_bytes=None, devices=None):
     """`state.drift_and_migrate` with every slab's row work on the device.
 
     Same contract, mutations and stats dict (plus a `migrate_device` receipt),
-    gated bitwise against the serial numpy pass (`tests/test_migrate_device.py`).
-    Needs `jax_enable_x64`. Arena-full and census refusals raise from the end-of-
-    pass replay rather than mid-pass, as the pooled migrate's do.
+    gated bitwise against the serial numpy pass (`tests/test_migrate_device.py`,
+    and `tests/test_migrate_device_cards.py` across cards). Needs `jax_enable_x64`.
+    Arena-full and census refusals raise from the end-of-pass replay rather than
+    mid-pass, as the pooled migrate's do.
 
-    `timings`, if a dict, accumulates synced wall per phase (see `_Clock`); the
-    phases sum to the pass.
+    `timings`, if a dict, accumulates synced wall per phase (see `_Clock`); on
+    several cards each key is prefixed with its card.
 
     `device_budget_bytes` refuses a slab whose estimated device footprint exceeds
-    it (see THE BUDGET above). The check runs before each slab's eject and insert;
-    a refusal after the first slab has been written leaves the state invalid, as
-    the serial pass's mid-pass refusals do. `migrate_device["peak_estimate_bytes"]`
-    reports the largest estimate with or without a budget.
+    it (see THE BUDGET above), per card. A refusal after the first slab has been
+    written leaves the state invalid, as the serial pass's mid-pass refusals do.
+    `migrate_device["peak_estimate_bytes"]` reports the largest estimate.
+
+    `devices` is a sequence of jax devices, one per card (None: one card, jax's
+    default device). See SEVERAL CARDS above; `migrate_device` then also reports
+    `cards`, `slabs_per_card`, `cross_card_segments` / `_bytes` and `fallback`.
     """
-    import jax.numpy as jnp
+    from concurrent.futures import ThreadPoolExecutor
 
     from .. import state as _state
     from ..eject_jax import require_x64
+    from ..ooc_fft import partition_units
 
     global CALLS
     require_x64()
     CALLS += 1
-    clock = _Clock(timings)
     nb = int(st.bricks_per_side)
     has_ids = st.ids is not None
     n_before = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
@@ -521,27 +616,72 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
     r = min(r_raw, nb // 2)
     reach = range(-r, r + 1)
     ar_slots, ar_bricks = pass_arena_index(st)
-    scales_dev = jnp.asarray(scales)
-    clock.mark("pass: setup", scales_dev)
 
-    staged, inserted, insert_res, n_emig, rr_by_slab = {}, set(), {}, {}, {}
-    budget = _Budget(device_budget_bytes, staged, [scales_dev])
-    for s in range(nb):
-        staged[s] = _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget)
-        n_emig[s] = staged[s]["n_rows"] - staged[s]["n_keep"]
-        rr_by_slab[s] = staged[s]["rr"]
-        for d in range(nb):
-            if d in inserted:
-                continue
-            if all(((d + o) % nb) in staged for o in reach):
-                insert_res[d] = _insert_slab(st, d, reach, staged, scales_dev, clock, budget)
-                inserted.add(d)
-                staged[d] = _emigrants_only(staged[d], has_ids)
-                clock.mark("insert: shrink staged", staged[d]["dest"])
-        for s2 in list(staged):
-            if all(((s2 + o) % nb) in inserted for o in reach):
-                del staged[s2]
+    devs = [None] if devices is None else list(devices)
+    if not devs:
+        raise ValueError("devices= was an empty sequence; pass None for one card")
+    fallback = None
+    if len(devs) > 1 and nb // len(devs) < 2 * r + 1:
+        fallback = (f"a card would hold {nb // len(devs)} slabs, fewer than 2r + 1 = "
+                    f"{2 * r + 1}: one card")
+        devs = devs[:1]
+    W = len(devs)
+    parts = [(0, nb)] if W == 1 else partition_units(nb, W, 1)
 
+    t_card = [None] * W if timings is None else [({} if W > 1 else timings) for _ in range(W)]
+    clocks = [_Clock(t) for t in t_card]
+    staged = [dict() for _ in range(W)]
+    ejected = [dict() for _ in range(W)]
+    budgets = [_Budget(device_budget_bytes, staged[k], [_put(scales, devs[k])])
+               for k in range(W)]
+    clocks[0].mark("pass: setup", budgets[0].fixed[0])
+
+    def run(fn):
+        if W == 1:
+            return [fn(0)]
+        with ThreadPoolExecutor(max_workers=W) as ex:
+            return list(ex.map(fn, range(W)))
+
+    segments = moved_bytes = 0
+    if W > 1:
+        # PHASE 1: every card ejects its r lowest and r highest slabs, and cuts
+        # emigrant-only copies for the neighbours that insert from them
+        def boundary(k):
+            lo, hi = parts[k]
+            out = {}
+            for s in sorted(set(range(lo, lo + r)) | set(range(hi - r, hi))):
+                e = _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clocks[k],
+                                budgets[k], devs[k])
+                staged[k][s] = e
+                ejected[k][s] = (e["n_rows"] - e["n_keep"], e["rr"])
+                out[s] = _emigrants_only(e, has_ids, devs[k])
+            return out
+
+        exports = run(boundary)
+        for k in range(W):
+            lo, hi = parts[k]
+            for s, e in exports[k].items():
+                for j in {(k - 1) % W, (k + 1) % W} - {k}:
+                    jlo, jhi = parts[j]
+                    if any(jlo <= (s + o) % nb < jhi for o in reach):
+                        staged[j][s], nbytes = _moved(e, devs[j])
+                        segments += 1
+                        moved_bytes += nbytes
+        exports = None
+        clocks[0].mark("pass: boundary ejects + hand-off")
+
+    # PHASE 2: each card sweeps its own slabs
+    swept = run(lambda k: _sweep(st, parts[k][0], parts[k][1], reach, c_drift, scales,
+                                 ar_slots, ar_bricks, devs[k], staged[k], ejected[k],
+                                 clocks[k], budgets[k]))
+    staged = None
+    insert_res, n_emig, rr_by_slab = {}, {}, {}
+    for k in range(W):
+        insert_res.update(swept[k][0])
+        for s, (ne, rr) in ejected[k].items():
+            n_emig[s], rr_by_slab[s] = ne, rr
+
+    clock = clocks[0]
     rep = _state._replay_arena_pass(
         st, reach, r, r_raw, c_drift, scales, n_emig=n_emig, rr_by_slab=rr_by_slab,
         insert_res=insert_res, max_staged_slabs=max_staged_slabs,
@@ -556,13 +696,21 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
             f"arena {st.arena_used}/{st.n_arena} (device pass)"
         )
     clock.mark("pass: final census")
+    if timings is not None and W > 1:
+        for k, t in enumerate(t_card):
+            for key, v in t.items():
+                timings[f"card {k}: {key}"] = timings.get(f"card {k}: {key}", 0.0) + v
+    receipt = dict(slabs=nb, programs=len(_PROGRAMS), spill_rows=rep["spill_rows"],
+                   peak_estimate_bytes=max(b.peak for b in budgets),
+                   budget_bytes=device_budget_bytes)
+    if devices is not None:
+        receipt.update(cards=W, slabs_per_card=[hi - lo for lo, hi in parts],
+                       cross_card_segments=segments, cross_card_bytes=moved_bytes,
+                       fallback=fallback)
     return dict(n_arena_overflow=rep["n_over"], arena_used=st.arena_used,
                 vel_scale=float(np.max(st.vel_scale)),
                 vel_scale_min=float(np.min(st.vel_scale)),
                 n_migrated_checked=n_after, brick_reach=r, brick_reach_raw=r_raw,
                 brick_reach_realized=rep["realized_reach"],
                 peak_staged_slabs=rep["peak_staged"],
-                migrate_device=dict(slabs=nb, programs=len(_PROGRAMS),
-                                    spill_rows=rep["spill_rows"],
-                                    peak_estimate_bytes=budget.peak,
-                                    budget_bytes=device_budget_bytes))
+                migrate_device=receipt)

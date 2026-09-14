@@ -323,10 +323,10 @@ class EngineConfig:
         # construction and by gate; False is E1's whole-state path, kept as the
         # A/B arm until the window's GPU gate reads.
         self.device_tile_window = bool(device_tile_window)
-        # E3: how many cards the device step splits across -- the coarse paint and
-        # solve by x-planes, the tile loop by tile planes, one thread per card
-        # walking its own planes through its own window. The migrate and repack
-        # stay on one card (D3b R3 is their split).
+        # E3 + R3: how many cards the device step splits across -- the coarse paint
+        # and solve by x-planes, the tile loop by tile planes, one thread per card
+        # walking its own planes through its own window, and, under
+        # `migrate_backend="device"`, the migrate and repack by x-slabs.
         self.device_cards = int(device_cards)
 
     @property
@@ -1316,7 +1316,8 @@ def _migrate_pass(st, cfg, c_drift, pool):
         from .device.migrate import drift_and_migrate_device
 
         return drift_and_migrate_device(
-            st, c_drift, device_budget_bytes=cfg.migrate_device_budget_bytes)
+            st, c_drift, device_budget_bytes=cfg.migrate_device_budget_bytes,
+            devices=_cards(cfg))
     if pool is not None and cfg.migrate_pooled is not False:
         return drift_and_migrate_pooled(
             st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window,
@@ -1331,8 +1332,18 @@ def _repack_pass(st, cfg):
     if cfg.migrate_backend == "device":
         from .device.repack import repack_device
 
-        return repack_device(st, brick_slack=cfg.brick_slack)
+        return repack_device(st, brick_slack=cfg.brick_slack, devices=_cards(cfg))
     return st.repack(brick_slack=cfg.brick_slack)
+
+
+def _cards(cfg):
+    """The cards the device passes split across (`cfg.device_cards`), or None for
+    one card on jax's default device."""
+    if cfg.device_cards <= 1:
+        return None
+    import jax
+
+    return list(jax.devices()[: cfg.device_cards])
 
 
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,

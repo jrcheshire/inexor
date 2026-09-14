@@ -64,6 +64,10 @@ def test_a_run_on_w_cards_is_bitwise_the_run_on_one(w):
         assert sum(c["tiles_run"] for c in cards) == n_tiles
         assert o["coarse_cards"] == w and all(ch > 0 for ch in o["coarse_card_chunks"]), (
             "a card painted no chunk")
+        # the migrate and repack split too, or say why not
+        md = o["migrate_device"]
+        assert md["cards"] == w or md["fallback"], "the migrate did not use the cards"
+        assert o["repack"]["repack_device"]["cards"] == w
     assert all(o["device_cards"] == 1 and len(o["tile_cards"]) == 1 for o in o1)
 
 

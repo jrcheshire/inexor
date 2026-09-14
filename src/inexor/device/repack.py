@@ -29,15 +29,19 @@ arena rows cannot be overrun: the allocation refusal bounds `n_alloc_new` by the
 old `arena_base`. Their payload is still lifted once up front, grouped by brick,
 so each slab's window is two contiguous copies.
 
-SCOPE (R1b): one device, host-resident state. Device peak per row is UNMEASURED
-until the gb job reads it; the receipt reports the bytes this driver holds.
+SEVERAL CARDS (R3, `devices=`). Card k owns a contiguous run of slabs and sweeps
+them ascending as above, one thread per card; the new ranges are disjoint, so the
+writes are. The hazard then crosses cards: a block write can overlap the old range
+of a slab ANOTHER card has not read yet. So before any card writes, every slab
+whose old range intersects a new range owned by a different card is uploaded by
+its own card (`cross_card_early_uploads` on the receipt).
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from .migrate import _Clock, _ladder, _program, pass_arena_index
+from .migrate import _Clock, _ladder, _program, _put, pass_arena_index
 
 #: RECEIPT: passes run through this module.
 CALLS = 0
@@ -141,26 +145,55 @@ def repack_geometry(st, brick_slack):
     return run_counts, counts, new_start, n_alloc
 
 
-def repack_device(st, brick_slack=0.10, timings=None):
+def _cross_card_slabs(old_start, new_start, parts, nb2):
+    """Per card, the slabs whose OLD range intersects a NEW range another card writes."""
+    nb = len(parts) and parts[-1][1]
+    owner = np.empty(nb, dtype=np.int64)
+    for k, (lo, hi) in enumerate(parts):
+        owner[lo:hi] = k
+    e = np.arange(nb + 1) * nb2
+    o_lo, o_hi = old_start[e[:-1]], old_start[e[1:]]
+    n_lo, n_hi = new_start[e[:-1]], new_start[e[1:]]
+    early = [[] for _ in parts]
+    for t in range(nb):
+        if o_hi[t] <= o_lo[t]:
+            continue
+        hit = (owner != owner[t]) & (n_lo < o_hi[t]) & (o_lo[t] < n_hi) & (n_hi > n_lo)
+        if hit.any():
+            early[owner[t]].append(t)
+    return early
+
+
+def repack_device(st, brick_slack=0.10, timings=None, devices=None):
     """`SlotState.repack` with every slab's row work on the device.
 
     Same contract, mutations and return dict (`scratch_bytes` is the HOST bytes
     this driver holds: the lifted arena payload, one slab's window and one
     block), plus a `repack_device` receipt. Gated bitwise against the host
-    repack (`tests/test_repack_device.py`). Needs `jax_enable_x64`.
+    repack (`tests/test_repack_device.py`, and `tests/test_repack_device_cards.py`
+    across cards). Needs `jax_enable_x64`.
+
+    `devices` is a sequence of jax devices, one per card (None: one card, jax's
+    default device); see SEVERAL CARDS above.
     """
-    import jax.numpy as jnp
+    from concurrent.futures import ThreadPoolExecutor
 
     from ..eject_jax import require_x64
+    from ..ooc_fft import partition_units
 
     global CALLS
     require_x64()
     CALLS += 1
-    clock = _Clock(timings)
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
     nb2 = nb * nb
     has_ids = st.ids is not None
     run_counts, counts, new_start, n_alloc = repack_geometry(st, brick_slack)
+    devs = [None] if devices is None else list(devices)
+    if not devs:
+        raise ValueError("devices= was an empty sequence; pass None for one card")
+    W = len(devs)
+    parts = [(0, nb)] if W == 1 else partition_units(nb, W, 1)
+    clock = _Clock(timings if W == 1 else None)
 
     # the residents' payload, lifted once and grouped by brick
     ar_slots, ar_bricks = pass_arena_index(st)
@@ -169,19 +202,16 @@ def repack_device(st, brick_slack=0.10, timings=None):
     a_ids = st.ids[ar_slots].copy() if has_ids else None
     a_bucket = st.arena_bucket[ar_slots - int(st.arena_base)]
     a_edge = np.searchsorted(ar_bricks, np.arange(st.n_bricks + 1))
-    scratch = a_off.nbytes + a_w.nbytes + (0 if a_ids is None else a_ids.nbytes)
+    lifted = a_off.nbytes + a_w.nbytes + (0 if a_ids is None else a_ids.nbytes)
     k_per_brick = np.diff(a_edge)
     n_fast = int(np.count_nonzero((k_per_brick == 0) & (run_counts > 0)))
     n_merge = int(np.count_nonzero(k_per_brick > 0))
     old_start = np.asarray(st.brick_start, dtype=np.int64)
     new_occ = np.zeros(st.n_buckets, dtype=st.index_dtype)
     clock.mark("pass: setup + arena lift")
+    programs0 = len(_repack_programs())
 
-    windows = {}
-    peak_windows, readahead, empty, programs0 = 0, 0, 0, len(_repack_programs())
-    held_peak = 0
-
-    def upload(t):
+    def upload(t, windows, dev, acc):
         lo_b, hi_b = st.slab_bricks(t)
         s0, s1 = int(old_start[lo_b]), int(old_start[hi_b])
         span = s1 - s0
@@ -198,77 +228,99 @@ def repack_device(st, brick_slack=0.10, timings=None):
 
         off_np, w_np = window(st.off, a_off), window(st.w, a_w)
         ids_np = window(st.ids, a_ids) if has_ids else None
-        nonlocal scratch
-        scratch = max(scratch, a_off.nbytes + a_w.nbytes + off_np.nbytes + w_np.nbytes
-                      + (0 if ids_np is None else ids_np.nbytes))
-        off_win, w_win = jnp.asarray(off_np), jnp.asarray(w_np)
-        ids_win = jnp.asarray(ids_np) if has_ids else None
+        acc["scratch"] = max(acc["scratch"], lifted + off_np.nbytes + w_np.nbytes
+                             + (0 if ids_np is None else ids_np.nbytes) - (
+                                 0 if a_ids is None else a_ids.nbytes))
+        off_win, w_win = _put(off_np, dev), _put(w_np, dev)
+        ids_win = _put(ids_np, dev) if has_ids else None
         ar_bucket = np.full(a_cap, nb2 * p3, dtype=np.int64)
         ar_bucket[:n_ar] = a_bucket[a0:a1] - lo_b * p3
         windows[t] = dict(off=off_win, w=w_win, ids=ids_win, s0=s0, s1=s1, span=span,
                           n_ar=n_ar, a_cap=a_cap, w_cap=w_cap, ar_bucket=ar_bucket,
                           lo_b=lo_b, hi_b=hi_b)
 
-    for s in range(nb):
-        if s not in windows:
-            upload(s)
-        clock.mark("upload: own slab", windows[s]["off"])
-        e = windows[s]
-        lo_b, hi_b = e["lo_b"], e["hi_b"]
-        n_lo, n_hi = int(new_start[lo_b]), int(new_start[hi_b])
-        occ = np.asarray(st.occupancy)[lo_b * p3: hi_b * p3].reshape(nb2, p3)
-        live = run_counts[lo_b:hi_b]
-        ar_counts = k_per_brick[lo_b:hi_b]
-        ar_offsets = np.zeros(nb2 + 1, dtype=np.int64)
-        np.cumsum(ar_counts, out=ar_offsets[1:])
-        row_offsets = np.zeros(nb2 + 1, dtype=np.int64)
-        np.cumsum(live + ar_counts, out=row_offsets[1:])
-        n_rows = int(row_offsets[-1])
-        if n_rows == 0 and n_hi == n_lo:
-            # an EMPTY slab: no row to place, no block to write, its occupancy
-            # slice already zero -- exactly what the program would produce, at
-            # the cost of nothing (a one-slab probe state has 255 of these)
-            empty += 1
+    def sweep(k, windows, acc):
+        lo, hi = parts[k]
+        dev = devs[k]
+        for s in range(lo, hi):
+            if s not in windows:
+                upload(s, windows, dev, acc)
+            clock.mark("upload: own slab", windows[s]["off"])
+            e = windows[s]
+            lo_b, hi_b = e["lo_b"], e["hi_b"]
+            n_lo, n_hi = int(new_start[lo_b]), int(new_start[hi_b])
+            occ = np.asarray(st.occupancy)[lo_b * p3: hi_b * p3].reshape(nb2, p3)
+            live = run_counts[lo_b:hi_b]
+            ar_counts = k_per_brick[lo_b:hi_b]
+            ar_offsets = np.zeros(nb2 + 1, dtype=np.int64)
+            np.cumsum(ar_counts, out=ar_offsets[1:])
+            row_offsets = np.zeros(nb2 + 1, dtype=np.int64)
+            np.cumsum(live + ar_counts, out=row_offsets[1:])
+            n_rows = int(row_offsets[-1])
+            if n_rows == 0 and n_hi == n_lo:
+                # an EMPTY slab: no row to place, no block to write, its occupancy
+                # slice already zero -- exactly what the program would produce, at
+                # the cost of nothing (a one-slab probe state has 255 of these)
+                acc["empty"] += 1
+                del windows[s]
+                clock.mark("empty slab")
+                continue
+            cap = _ladder(n_rows)
+            out_cap = _ladder(n_hi - n_lo)
+            index_dev = (_put(occ, dev), _put(live, dev), _put(old_start[lo_b:hi_b] - e["s0"], dev),
+                         _put(row_offsets, dev), _put(ar_offsets, dev),
+                         _put(e["ar_bucket"], dev), _put(new_start[lo_b:hi_b] - n_lo, dev))
+            clock.mark("upload: index", index_dev)
+            block = _repack_program(cap, e["w_cap"], e["a_cap"], out_cap, nb2, p3, has_ids,
+                                    st.off.dtype, st.w.dtype,
+                                    None if not has_ids else st.ids.dtype)
+            out_off, out_w, out_ids, occ_s = block(
+                *index_dev, e["off"], e["w"], e["ids"], _put(n_rows, dev, np.int64),
+                _put(e["span"], dev, np.int64))
+            index_dev = None
+            clock.mark("block program", out_off, out_w, out_ids, occ_s)
+            # THE hazard: read every later slab of this card this write would overrun
+            # (another card's were read before any card wrote)
+            t = s + 1
+            while t < hi and int(old_start[t * nb2]) < n_hi:
+                if t not in windows:
+                    upload(t, windows, dev, acc)
+                    acc["readahead"] += 1
+                t += 1
+            acc["peak_windows"] = max(acc["peak_windows"], len(windows))
+            acc["held_peak"] = max(acc["held_peak"], sum(
+                int(v["off"].nbytes) + int(v["w"].nbytes)
+                + (0 if v["ids"] is None else int(v["ids"].nbytes))
+                for v in windows.values()) + int(out_off.nbytes) + int(out_w.nbytes)
+                + (0 if out_ids is None else int(out_ids.nbytes)))
+            clock.mark("upload: read-ahead", *[windows[u]["off"] for u in windows])
+            m = n_hi - n_lo
+            st.off[n_lo:n_hi] = np.asarray(out_off)[:m]
+            st.w[n_lo:n_hi] = np.asarray(out_w)[:m]
+            if has_ids:
+                st.ids[n_lo:n_hi] = np.asarray(out_ids)[:m]
+            new_occ[lo_b * p3: hi_b * p3] = np.asarray(occ_s)
+            acc["scratch"] = max(acc["scratch"], lifted + m * (
+                st.off.itemsize * 3 + st.w.itemsize * 3 + (st.ids.itemsize if has_ids else 0)))
+            out_off = out_w = out_ids = occ_s = None
             del windows[s]
-            clock.mark("empty slab")
-            continue
-        cap = _ladder(n_rows)
-        out_cap = _ladder(n_hi - n_lo)
-        index_dev = (jnp.asarray(occ), jnp.asarray(live), jnp.asarray(old_start[lo_b:hi_b] - e["s0"]),
-                     jnp.asarray(row_offsets), jnp.asarray(ar_offsets),
-                     jnp.asarray(e["ar_bucket"]), jnp.asarray(new_start[lo_b:hi_b] - n_lo))
-        clock.mark("upload: index", index_dev)
-        block = _repack_program(cap, e["w_cap"], e["a_cap"], out_cap, nb2, p3, has_ids,
-                                st.off.dtype, st.w.dtype, None if not has_ids else st.ids.dtype)
-        out_off, out_w, out_ids, occ_s = block(
-            *index_dev, e["off"], e["w"], e["ids"], jnp.asarray(n_rows, dtype=jnp.int64),
-            jnp.asarray(e["span"], dtype=jnp.int64))
-        index_dev = None
-        clock.mark("block program", out_off, out_w, out_ids, occ_s)
-        # THE hazard: read every later slab this write would overrun
-        t = s + 1
-        while t < nb and int(old_start[t * nb2]) < n_hi:
-            if t not in windows:
-                upload(t)
-                readahead += 1
-            t += 1
-        peak_windows = max(peak_windows, len(windows))
-        held_peak = max(held_peak, sum(
-            int(v["off"].nbytes) + int(v["w"].nbytes) + (0 if v["ids"] is None else int(v["ids"].nbytes))
-            for v in windows.values()) + int(out_off.nbytes) + int(out_w.nbytes)
-            + (0 if out_ids is None else int(out_ids.nbytes)))
-        clock.mark("upload: read-ahead", *[windows[u]["off"] for u in windows])
-        m = n_hi - n_lo
-        st.off[n_lo:n_hi] = np.asarray(out_off)[:m]
-        st.w[n_lo:n_hi] = np.asarray(out_w)[:m]
-        if has_ids:
-            st.ids[n_lo:n_hi] = np.asarray(out_ids)[:m]
-        new_occ[lo_b * p3: hi_b * p3] = np.asarray(occ_s)
-        scratch = max(scratch, a_off.nbytes + a_w.nbytes + m * (
-            st.off.itemsize * 3 + st.w.itemsize * 3 + (st.ids.itemsize if has_ids else 0)))
-        out_off = out_w = out_ids = occ_s = None
-        del windows[s]
-        clock.mark("write-back")
+            clock.mark("write-back")
+
+    wins = [dict() for _ in range(W)]
+    accs = [dict(scratch=lifted, readahead=0, empty=0, peak_windows=0, held_peak=0)
+            for _ in range(W)]
+    early = [[] for _ in range(W)]
+
+    def run(fn):
+        if W == 1:
+            return [fn(0)]
+        with ThreadPoolExecutor(max_workers=W) as ex:
+            return list(ex.map(fn, range(W)))
+
+    if W > 1:
+        early = _cross_card_slabs(old_start, new_start, parts, nb2)
+        run(lambda k: [upload(t, wins[k], devs[k], accs[k]) for t in early[k]])
+    run(lambda k: sweep(k, wins[k], accs[k]))
 
     # everything past the new allocation, arena included, reads empty
     st.off[n_alloc:] = 0
@@ -282,16 +334,20 @@ def repack_device(st, brick_slack=0.10, timings=None):
     st.arena_bucket[:] = -1
     st._invalidate_arena_index()
     clock.mark("pass: tail")
+    receipt = dict(slabs=nb, programs=len(_repack_programs()) - programs0,
+                   windows_peak=int(max(a["peak_windows"] for a in accs)),
+                   readahead_uploads=int(sum(a["readahead"] for a in accs)),
+                   empty_slabs=int(sum(a["empty"] for a in accs)),
+                   held_peak_bytes=int(max(a["held_peak"] for a in accs)))
+    if devices is not None:
+        receipt.update(cards=W, cross_card_early_uploads=int(sum(len(e) for e in early)))
     return dict(
         slots_used=n_alloc,
         slots_per_particle=n_alloc / max(st.n_particles, 1),
-        scratch_bytes=int(scratch),
+        scratch_bytes=int(max(a["scratch"] for a in accs)),
         bricks_fast=n_fast,
         bricks_merged=n_merge,
-        repack_device=dict(slabs=nb, programs=len(_repack_programs()) - programs0,
-                           windows_peak=int(peak_windows), readahead_uploads=int(readahead),
-                           empty_slabs=int(empty),
-                           held_peak_bytes=int(held_peak)),
+        repack_device=receipt,
     )
 
 
