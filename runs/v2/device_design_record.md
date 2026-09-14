@@ -2010,6 +2010,15 @@ emigrants:
   share 0.40 / reach 2 (56.2 GB) does not. With the tile window freed (~170 GB)
   every bracketed case fits.
 
+### Decided at the R0 checkpoint (JC, 2026-09-13)
+
+1. **A GPU repack is high priority**, next after R1 and ahead of four cards and
+   fusion.
+2. **The device migrate is designed to fit beside the tile window** (~54 GB per
+   card), refusing by name when a slab's input exceeds it.
+3. **The device and pooled migrates share one arena-replay helper**, both gated
+   against the serial numpy migrate.
+
 ### Owed
 
 1. The emigrant share and reach at production step size (they size the insert).
