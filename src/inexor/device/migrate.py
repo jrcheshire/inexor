@@ -30,12 +30,18 @@ insert, then its emigrants alone; row buffers and the insert's compacted inputs
 are released as soon as their kernel returns (retention probe
 `scripts/v2_d3_retention.py`).
 
+THE BUDGET. `device_budget_bytes` refuses a slab whose estimated footprint --
+every array the pass already holds, plus the kernel's measured bytes per padded
+row (`EJECT_B_PER_PADDED_ROW`, `INSERT_B_PER_PADDED_ROW`) -- exceeds it. The
+largest estimate is on the receipt either way, so a device run can compare it
+with the measured peak.
+
 SHAPES. Row buffers use each kernel's `_padded`; the slab window, arena arrays and
 staged emigrants use `forces.capacity_shape`, so slabs of nearby size share every
 program.
 
-SCOPE (R1): one device, host-resident state, the serial slab schedule. The
-memory-envelope refusal, a permuted schedule and the four-card split are later.
+SCOPE (R1): one device, host-resident state, the serial slab schedule. A permuted
+schedule and the four-card split are R3.
 """
 
 from __future__ import annotations
@@ -45,6 +51,12 @@ import time
 import numpy as np
 
 INT16_MAX = 32767
+
+#: Device bytes per PADDED row of one kernel call, its uploaded inputs included:
+#: the peaks Vista 995435 measured at a 4096^3 slab (record sec. 29 -- eject 114.4,
+#: insert 78.4-83.0 over the bracket, the largest taken). Estimate only.
+EJECT_B_PER_PADDED_ROW = 114.4
+INSERT_B_PER_PADDED_ROW = 83.0
 
 _PROGRAMS: dict = {}
 
@@ -74,6 +86,42 @@ class _Clock:
         now = time.perf_counter()
         self.t[key] = self.t.get(key, 0.0) + now - self.last
         self.last = now
+
+
+class _Budget:
+    """Per-slab device footprint estimate against `device_budget_bytes` (None: no limit)."""
+
+    def __init__(self, limit, staged, fixed):
+        self.limit = None if limit is None else int(limit)
+        self.staged = staged
+        self.fixed = fixed
+        self.peak = 0
+
+    def held(self):
+        total = sum(int(a.nbytes) for a in self.fixed)
+        for e in self.staged.values():
+            for k in ("dest", "off", "w", "ids", "src"):
+                a = e.get(k)
+                if a is not None:
+                    total += int(a.nbytes)
+            for a in e.get("win", ()):
+                if a is not None:
+                    total += int(a.nbytes)
+        return total
+
+    def check(self, what, extra_bytes, coef, padded_rows):
+        held = self.held()
+        est = held + int(extra_bytes) + int(coef * padded_rows)
+        self.peak = max(self.peak, est)
+        if self.limit is not None and est > self.limit:
+            raise ValueError(
+                f"{what} needs an estimated {est / 1e9:.2f} GB on the device against a "
+                f"budget of {self.limit / 1e9:.2f} GB: {held / 1e9:.2f} GB already held, "
+                f"{extra_bytes / 1e9:.2f} GB of window, and {coef:g} B x {padded_rows:,} "
+                "padded rows of kernel. The envelope is what a card has beside the tile "
+                "loop's resident terms (record sec. 29). Use fewer rows per slab or a "
+                "smaller drift (fewer staged slabs), or raise the budget deliberately."
+            )
 
 
 def _ladder(n):
@@ -222,9 +270,11 @@ def _insert_kernel(p3, nb2, cap, has_ids):
     return fn
 
 
-def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock):
+def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget):
     """Upload slab s's window, build its rows and eject them. Returns the staged slab."""
     import jax.numpy as jnp
+
+    from .. import eject_jax
 
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
     nb2 = nb * nb
@@ -248,6 +298,10 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock):
 
     a_cap = _ladder(n_ar)
     w_cap = _ladder(span + a_cap)
+    cap = eject_jax._padded(n_rows)
+    row_bytes = st.off.itemsize * 3 + st.w.itemsize * 3 + (st.ids.itemsize if has_ids else 0)
+    budget.check(f"ejecting slab {s}", w_cap * row_bytes, EJECT_B_PER_PADDED_ROW, cap)
+
     ar_bucket = np.zeros(a_cap, dtype=np.int64)
     ar_bucket[:n_ar] = np.asarray(st.arena_bucket)[rows_a - int(st.arena_base)]
 
@@ -271,9 +325,6 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock):
         jnp.asarray(np.asarray(scales[lo_b:hi_b], dtype=np.float64)))
     clock.mark("eject: upload", off_win, w_win, ids_win, index_dev)
 
-    from .. import eject_jax
-
-    cap = eject_jax._padded(n_rows)
     rows = _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids)
     occ_d, live_d, starts_d, row_off_d, ar_off_d, ar_bucket_d, scales_d = index_dev
     off, bijk, w, ids, scale, brick, real = rows(
@@ -305,10 +356,11 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock):
                 win=(off_win, w_win, ids_win), s0=s0, s1=s1, span=span, w_cap=w_cap)
 
 
-def _insert_slab(st, d, reach, staged, scales_dev, clock):
+def _insert_slab(st, d, reach, staged, scales_dev, clock, budget):
     """Insert slab d on the device and write its slot range back. Returns insert_res."""
     import jax.numpy as jnp
 
+    from .. import insert_jax
     from ..layout import _to_index
 
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
@@ -329,9 +381,8 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock):
     n_in = sum(hi - lo for _e, lo, hi, _k in segs)
     clock.mark("insert: census")
 
-    from .. import insert_jax
-
     cap_i = insert_jax._padded(n_in)
+    budget.check(f"inserting slab {d}", 0, INSERT_B_PER_PADDED_ROW, cap_i)
     bufs = (jnp.zeros(cap_i, jnp.int64), jnp.zeros((cap_i, 3), jnp.uint8),
             jnp.zeros((cap_i, 3), jnp.int16),
             jnp.zeros(cap_i, jnp.int32) if has_ids else None, jnp.zeros(cap_i, jnp.int64))
@@ -430,7 +481,8 @@ def _emigrants_only(e, has_ids):
                 n_rows=n_emig, rr=e["rr"])
 
 
-def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None):
+def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
+                             device_budget_bytes=None):
     """`state.drift_and_migrate` with every slab's row work on the device.
 
     Same contract, mutations and stats dict (plus a `migrate_device` receipt),
@@ -440,6 +492,12 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None):
 
     `timings`, if a dict, accumulates synced wall per phase (see `_Clock`); the
     phases sum to the pass.
+
+    `device_budget_bytes` refuses a slab whose estimated device footprint exceeds
+    it (see THE BUDGET above). The check runs before each slab's eject and insert;
+    a refusal after the first slab has been written leaves the state invalid, as
+    the serial pass's mid-pass refusals do. `migrate_device["peak_estimate_bytes"]`
+    reports the largest estimate with or without a budget.
     """
     import jax.numpy as jnp
 
@@ -462,15 +520,16 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None):
     clock.mark("pass: setup", scales_dev)
 
     staged, inserted, insert_res, n_emig, rr_by_slab = {}, set(), {}, {}, {}
+    budget = _Budget(device_budget_bytes, staged, [scales_dev])
     for s in range(nb):
-        staged[s] = _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock)
+        staged[s] = _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget)
         n_emig[s] = staged[s]["n_rows"] - staged[s]["n_keep"]
         rr_by_slab[s] = staged[s]["rr"]
         for d in range(nb):
             if d in inserted:
                 continue
             if all(((d + o) % nb) in staged for o in reach):
-                insert_res[d] = _insert_slab(st, d, reach, staged, scales_dev, clock)
+                insert_res[d] = _insert_slab(st, d, reach, staged, scales_dev, clock, budget)
                 inserted.add(d)
                 staged[d] = _emigrants_only(staged[d], has_ids)
                 clock.mark("insert: shrink staged", staged[d]["dest"])
@@ -499,4 +558,6 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None):
                 brick_reach_realized=rep["realized_reach"],
                 peak_staged_slabs=rep["peak_staged"],
                 migrate_device=dict(slabs=nb, programs=len(_PROGRAMS),
-                                    spill_rows=rep["spill_rows"]))
+                                    spill_rows=rep["spill_rows"],
+                                    peak_estimate_bytes=budget.peak,
+                                    budget_bytes=device_budget_bytes))

@@ -146,6 +146,30 @@ def test_the_device_pass_proves_it_ran(x64):
     assert out["migrate_device"]["slabs"] == 4 and out["migrate_device"]["programs"] > 0
 
 
+def test_a_pass_over_the_device_budget_refuses_before_writing(x64):
+    from inexor.device.migrate import drift_and_migrate_device
+
+    st = _state()
+    before = copy.deepcopy(st)
+    with pytest.raises(ValueError, match="budget of"):
+        drift_and_migrate_device(st, _c_drift(st, 1.9), device_budget_bytes=1024)
+    _same_state(before, st, "after the refusal")
+
+
+def test_the_budget_estimate_is_reported_and_a_generous_budget_is_bitwise(x64):
+    from inexor.device.migrate import drift_and_migrate_device
+
+    st_a, st_b = _state(), _state()
+    c = _c_drift(st_a, 1.9)
+    r_a = state.drift_and_migrate(st_a, c)
+    r_b = drift_and_migrate_device(st_b, c, device_budget_bytes=10**12)
+    receipt = r_b.pop("migrate_device")
+    assert receipt["budget_bytes"] == 10**12
+    assert 0 < receipt["peak_estimate_bytes"] < 10**12
+    assert r_a == r_b
+    _same_state(st_a, st_b, "generous budget")
+
+
 def test_pass_arena_index_is_the_state_grouping(x64):
     from inexor.device.migrate import pass_arena_index
 

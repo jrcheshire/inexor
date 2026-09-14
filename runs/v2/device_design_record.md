@@ -2166,5 +2166,15 @@ bitwise; both long arms **bitwise at all three steps**, the synced one included.
 
 Done: the bitwise gate on a GB200, cgh64 wall against 15.2 s (1.63 s), device
 peak against R0 and the envelope (320 B/slab row, ~86 GB by arithmetic).
-**Not done, from the plan's R1:** a refusal that names the envelope, and the
-permuted-slab-order arm of the gate.
+
+**The envelope refusal, added after this job (laptop only).**
+`drift_and_migrate_device(device_budget_bytes=)` estimates each slab's device
+footprint before its eject and its insert -- every array the pass already holds,
+plus 114.4 (eject) or 83.0 (insert) B per padded row, the R0 kernel peaks with
+inputs included -- and refuses with the budget, the held bytes and the kernel term
+named. The largest estimate is reported on the receipt with or without a budget.
+Tests: a 1 KB budget refuses with the state untouched; a generous budget is bitwise
+and reports its estimate (7 passed; the five mutants still caught).
+**Not validated: the estimate against a measured device peak** -- owed to the next
+GPU job, which reads both in one process. **Moved to R3 (JC):** the permuted
+slab-order arm, which the four-card boundary-first schedule is what needs.
