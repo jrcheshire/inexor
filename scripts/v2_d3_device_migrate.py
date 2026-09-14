@@ -467,7 +467,96 @@ def arm_slab_shape(args):
     return rec, rc
 
 
-ARMS = {"xback": arm_xback, "slab-real": arm_slab_real, "slab-shape": arm_slab_shape}
+def arm_peak_eject(args):
+    """Device peak of the compiled eject alone at one 4096^3-geometry slab, and
+    whether row counts a fraction of a percent apart share its program."""
+    _x64()
+    from inexor import eject_jax
+
+    platform = _require_device(args.allow_cpu)
+    nb = args.shape_nb
+    R = _shape_rows(nb, seed=17, drift_frac=args.shape_frac)
+    n, t9 = R["n"], R["t9"]
+    calls = []
+    for frac in (1.0, 0.997, 0.99):
+        m = int(n * frac)
+        n_shapes = len(eject_jax._CACHE)
+        t = time.perf_counter()
+        eject_jax.eject_rows(t9, nb, R["off"][:m], R["bijk"][:m], R["w"][:m], None,
+                             R["scale"][:m], R["c_drift"], R["brick"][:m])
+        calls.append(dict(rows=m, padded=eject_jax._padded(m), wall_s=time.perf_counter() - t,
+                          new_program=len(eject_jax._CACHE) > n_shapes))
+    peak = _peak()
+    rec = dict(arm="peak-eject", platform=platform, nb=nb, rows=n, calls=calls,
+               programs=len(eject_jax._CACHE), device_peak=peak,
+               b_per_row=None if peak is None else peak / n,
+               b_per_padded_row=None if peak is None else peak / calls[0]["padded"],
+               host_maxrss_gb=_maxrss_gb())
+    _say(f"[peak-eject] nb={nb} {n:,} rows (padded {calls[0]['padded']:,}): device peak "
+         f"{(peak or 0) / 2**30:.2f} GiB = {(peak or 0) / n:.1f} B/row; programs "
+         f"{len(eject_jax._CACHE)} over row counts "
+         f"{[c['rows'] for c in calls]}; walls {[round(c['wall_s'], 2) for c in calls]} s")
+    return rec, 0
+
+
+def _insert_input(nb, share, reach, seed):
+    """Insert rows for slab 0 at 4096^3 brick geometry: a slab's keepers, then the
+    emigrants of 2 * reach + 1 source slabs, each `share` of a slab. Emigrant
+    destinations are spread evenly over the slabs within reach of their source,
+    so the kernel's in-slab mask sees the realistic mix of bound and not bound.
+    Rows are not pre-sorted (the kernel sorts them)."""
+    rng = np.random.default_rng(seed)
+    nb2, p3, rows_b = nb * nb, 512, 4096
+    n_slab = nb2 * rows_b
+    n_keep = int(n_slab * (1.0 - share))
+    n_emig = (2 * reach + 1) * int(n_slab * share)
+    dest = np.empty(n_keep + n_emig, dtype=np.int64)
+    dest[:n_keep] = rng.integers(0, nb2 * p3, n_keep)
+    to_slab = rng.integers(-reach, reach + 1, n_emig) % nb
+    dest[n_keep:] = (to_slab * nb2 + rng.integers(0, nb2, n_emig)) * p3 + \
+        rng.integers(0, p3, n_emig)
+    n = len(dest)
+    off = rng.integers(0, 256, size=(n, 3), dtype=np.uint8)
+    w = np.clip(rng.normal(scale=8000.0, size=(n, 3)), -INT16_MAX, INT16_MAX).astype(np.int16)
+    s_old = rng.uniform(0.5, 1.5, size=n)
+    starts = np.arange(nb2 + 1, dtype=np.int64) * int(rows_b * 1.10)
+    return dest, off, w, s_old, starts, p3, n_slab
+
+
+def arm_peak_insert(args):
+    """Device peak of the compiled insert alone at a given emigrant share and reach."""
+    _x64()
+    from inexor import insert_jax
+
+    platform = _require_device(args.allow_cpu)
+    nb, share, reach = args.shape_nb, args.emig_share, args.reach
+    t0 = time.perf_counter()
+    dest, off, w, s_old, starts, p3, n_slab = _insert_input(nb, share, reach, seed=23)
+    gen_s = time.perf_counter() - t0
+    n = len(dest)
+    walls = []
+    out = None
+    for _ in range(2):
+        t = time.perf_counter()
+        out = insert_jax.insert_rows(dest, off, w, None, s_old, 0, starts, p3)
+        walls.append(time.perf_counter() - t)
+    peak = _peak()
+    rec = dict(arm="peak-insert", platform=platform, nb=nb, emig_share=share, reach=reach,
+               slab_rows=n_slab, rows=n, padded=insert_jax._padded(n), gen_s=gen_s,
+               walls_s=walls, n_write=out["n_write"], n_spill=out["n_spill"],
+               device_peak=peak, b_per_row=None if peak is None else peak / n,
+               b_per_slab_row=None if peak is None else peak / n_slab,
+               host_maxrss_gb=_maxrss_gb())
+    _say(f"[peak-insert] share {share:.2f} reach {reach}: {n:,} input rows "
+         f"({n / n_slab:.2f} slabs): device peak {(peak or 0) / 2**30:.2f} GiB = "
+         f"{(peak or 0) / n:.1f} B/input row = {(peak or 0) / n_slab:.1f} B/slab row; "
+         f"walls {[round(x, 2) for x in walls]} s; written {out['n_write']:,} spilled "
+         f"{out['n_spill']:,}")
+    return rec, 0
+
+
+ARMS = {"xback": arm_xback, "slab-real": arm_slab_real, "slab-shape": arm_slab_shape,
+        "peak-eject": arm_peak_eject, "peak-insert": arm_peak_insert}
 
 
 # ------------------------------------------------------------ the orchestrator
@@ -508,6 +597,11 @@ def main(argv=None):
     ap.add_argument("--real-frac", type=float, default=0.5)
     ap.add_argument("--shape-nb", type=int, default=256, help="bricks per side (c-hero 256)")
     ap.add_argument("--shape-frac", type=float, default=0.5)
+    ap.add_argument("--emig-share", type=float, default=0.05, help=argparse.SUPPRESS)
+    ap.add_argument("--reach", type=int, default=1, help=argparse.SUPPRESS)
+    ap.add_argument("--peaks", default="",
+                    help="'+'-separated peak arms, each its own process: 'eject' and/or "
+                         "'insert:SHARE:REACH' (e.g. eject+insert:0.05:1+insert:0.2:2)")
     ap.add_argument("--steps", type=int, default=2)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--allow-cpu", action="store_true")
@@ -563,6 +657,20 @@ def main(argv=None):
         res, rc = _run_worker(["--arm", "slab-shape", "--shape-nb", str(args.shape_nb),
                                "--shape-frac", str(args.shape_frac), *common], {},
                               "slab-shape")
+        card["arms"].append(res)
+        write()
+        worst = max(worst, rc)
+    # peak arms run even if one before them fails: an out-of-memory at a large
+    # share is itself the reading, and the smaller specs are still worth having
+    for spec in [s for s in args.peaks.split("+") if s]:
+        if spec == "eject":
+            argv_p = ["--arm", "peak-eject", "--shape-nb", str(args.shape_nb),
+                      "--shape-frac", str(args.shape_frac)]
+        else:
+            _, share, reach = spec.split(":")
+            argv_p = ["--arm", "peak-insert", "--shape-nb", str(args.shape_nb),
+                      "--emig-share", share, "--reach", reach]
+        res, rc = _run_worker([*argv_p, *common], {}, f"peak {spec}")
         card["arms"].append(res)
         write()
         worst = max(worst, rc)
