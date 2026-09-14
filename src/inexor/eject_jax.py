@@ -31,10 +31,13 @@ changes the state's physical layout and breaks the bitwise chain even though no
 particle is lost.
 
 **Padding.** Row counts per slab drift as occupancy evolves, and a fresh shape is
-a fresh XLA compilation (umbrella `jax_shape_recompile_cache`). Rows are padded
-to a multiple of `PAD_MULTIPLE`; padded rows are marked not-real, are counted as
-neither keepers nor leavers, and are parked at output positions the host slice
-never reads.
+a fresh XLA compilation (umbrella `jax_shape_recompile_cache`). `n + 1` rows are
+padded up onto `forces.capacity_shape`'s global ladder at `PAD_RUNGS_PER_OCTAVE`
+(<= 6% extra rows), so slabs whose counts differ by a fraction of a percent share
+one program -- a multiple of 4096 gave nearly every 4096^3 slab its own. The `+ 1`
+keeps at least one padded row in every call, so the masking is never dead code.
+Padded rows are marked not-real, are counted as neither keepers nor leavers, and
+are parked at output positions the host slice never reads.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ import numpy as np
 
 from .codec import LEVELS_PER_BUCKET
 
-PAD_MULTIPLE = 4096
+PAD_RUNGS_PER_OCTAVE = 12
 
 _CACHE: dict = {}
 
@@ -56,7 +59,9 @@ CALLS = 0
 
 
 def _padded(n):
-    return int(PAD_MULTIPLE * int(np.ceil(max(1, n) / PAD_MULTIPLE)))
+    from .forces import capacity_shape
+
+    return int(capacity_shape(max(1, int(n)) + 1, rungs=PAD_RUNGS_PER_OCTAVE))
 
 
 def require_x64():
@@ -88,10 +93,12 @@ def _build(t9, nb, n_pad, has_ids):
     per = int(t9.n_buckets_side) // int(nb)
     p3 = per**3
     nbi = int(nb)
-    idx_all = jnp.arange(n_pad, dtype=jnp.int64)
 
     @jax.jit
     def kernel(off, bijk, w, ids, scale, c_drift, brick_id, real):
+        # built INSIDE the trace: outside, it is a captured constant of n_pad
+        # int64s baked into the executable (2.15 GB at a 4096^3 slab)
+        idx_all = jnp.arange(n_pad, dtype=jnp.int64)
         # --- the drift, in the integer domain (D-007). The expression SHAPE is
         # held identical to state._eject_slab's so equality is by construction
         # rather than by an exponent coincidence ---

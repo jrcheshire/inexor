@@ -104,10 +104,9 @@ def test_one_slab_insert_is_bitwise_including_its_arena_claims(x64):
     assert spilled > 0, "VACUOUS: no slab spilled into the arena"
 
 
-def test_the_padding_path_is_exercised_and_bitwise(x64, monkeypatch):
+def test_the_padding_path_is_exercised_and_bitwise(x64):
     from inexor import insert_jax
 
-    monkeypatch.setattr(insert_jax, "PAD_MULTIPLE", 3000)
     insert_jax._CACHE.clear()
     st_a, st_b = _state(), _state()
     c = _c_drift(st_a, 1.9)

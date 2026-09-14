@@ -124,18 +124,17 @@ def test_whole_migration_is_bitwise(x64):
         assert n_diff == 0, f"state.{name}: {n_diff} of {np.asarray(a).size} elements differ"
 
 
-def test_padding_path_is_exercised_and_bitwise(x64, monkeypatch):
-    """The pad was DEAD in every other test here, and a mutation proved it.
+def test_padding_path_is_exercised_and_bitwise(x64):
+    """The pad was once DEAD in every test here, and a mutation proved it.
 
-    A slab of this fixture holds exactly 8,192 rows, which is a multiple of
-    `PAD_MULTIPLE`, so `pad` was 0 everywhere and corrupting the padded rows'
-    brick id changed nothing. Shrinking the multiple to a value that cannot
-    divide the row count forces a real pad, which is the configuration
-    production hits constantly (occupancy moves the row count every step).
+    A slab of this fixture holds exactly 8,192 rows, a multiple of the old
+    4096 pad multiple, so `pad` was 0 everywhere and corrupting the padded rows'
+    brick id changed nothing. `_padded` now pads `n + 1` onto the capacity
+    ladder, so every call carries at least one padded row; this asserts that
+    stays true for this fixture and that the result is bitwise with it.
     """
     from inexor import eject_jax
 
-    monkeypatch.setattr(eject_jax, "PAD_MULTIPLE", 3000)
     eject_jax._CACHE.clear()
 
     st = _state()
@@ -146,8 +145,8 @@ def test_padding_path_is_exercised_and_bitwise(x64, monkeypatch):
     a_keep, a_emig = copy.deepcopy(st)._eject_slab(bx, c, scales)
     n_rows = len(a_keep["dest"]) + len(a_emig["dest"])
     assert eject_jax._padded(n_rows) != n_rows, (
-        f"{n_rows} rows still needs no padding at PAD_MULTIPLE=3000 -- this test "
-        "would be asserting the same thing as the others"
+        f"{n_rows} rows needs no padding -- this test would be asserting the same "
+        "thing as the others"
     )
 
     b_keep, b_emig = copy.deepcopy(st)._eject_slab(bx, c, scales, kernel="jax")

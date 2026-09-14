@@ -33,8 +33,8 @@ census, each row's old-scale gather, the writes into the state, and every arena
 claim, replayed brick by brick in the numpy path's order -- claims take the
 lowest free slots, so their order IS the arena layout.
 
-**Padding.** As in `eject_jax`: rows are padded to a multiple of `PAD_MULTIPLE`,
-marked not real, and can be neither written nor spilled.
+**Padding.** As in `eject_jax`: `n + 1` rows padded onto the capacity ladder at
+`PAD_RUNGS_PER_OCTAVE`, marked not real, and neither written nor spilled.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ import numpy as np
 
 from .eject_jax import require_x64
 
-PAD_MULTIPLE = 4096
+PAD_RUNGS_PER_OCTAVE = 12
 
 _CACHE: dict = {}
 
@@ -53,7 +53,9 @@ CALLS = 0
 
 
 def _padded(n):
-    return int(PAD_MULTIPLE * int(np.ceil(max(1, n) / PAD_MULTIPLE)))
+    from .forces import capacity_shape
+
+    return int(capacity_shape(max(1, int(n)) + 1, rungs=PAD_RUNGS_PER_OCTAVE))
 
 
 def _build(p3, nb2, n_pad, has_ids):
@@ -61,10 +63,11 @@ def _build(p3, nb2, n_pad, has_ids):
     import jax.numpy as jnp
 
     big = int(np.iinfo(np.int64).max)
-    idx_all = jnp.arange(n_pad, dtype=jnp.int64)
 
     @jax.jit
     def kernel(dest, off, w, ids, s_old, real, lo_b, starts, div):
+        # inside the trace, not a captured constant (see `eject_jax._build`)
+        idx_all = jnp.arange(n_pad, dtype=jnp.int64)
         brick = dest // p3
         inslab = real & (brick >= lo_b) & (brick < lo_b + nb2)
         order = jnp.argsort(jnp.where(inslab, dest, big), stable=True)
