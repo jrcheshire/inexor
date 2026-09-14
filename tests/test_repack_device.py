@@ -198,3 +198,26 @@ def test_a_resident_below_its_bricks_live_rows_is_folded_in_bitwise(x64):
     _same_state(st_a, st_b, "repack")
     _same_stats(r_a, r_b, "repack")
     assert st_b.check() is True
+
+
+def test_empty_slabs_are_skipped_and_the_result_is_still_bitwise(x64):
+    """Particles in a quarter of the box along x: six of eight slabs hold nothing.
+    The skip must produce what the program would have (zero block, zero
+    occupancy) and the receipt must say it fired."""
+    rng = np.random.default_rng(21)
+    n, box, nb = 32**3, 16.0, 8
+    x = rng.uniform(0.0, box, size=(n, 3))
+    x[:, 0] *= 0.25
+    v = rng.normal(scale=1.0, size=(n, 3))
+    t9 = T9Layout(box, 32, 2)
+    st_a = state.SlotState.build(x, v, t9, nb, brick_slack=0.0, arena_frac=0.25, with_ids=True)
+    # residents planted rather than migrated: the host migrate is not part of
+    # this gate, and the fold-in is what the populated slabs must still do
+    st_b = copy.deepcopy(st_a)
+    assert _plant_low_bucket_residents(st_a) == _plant_low_bucket_residents(st_b) > 0
+    r_a = st_a.repack(brick_slack=0.10)
+    r_b, receipt = _device(st_b, 0.10)
+    assert receipt["empty_slabs"] >= 5, receipt
+    _same_state(st_a, st_b, "empty slabs")
+    _same_stats(r_a, r_b, "empty slabs")
+    assert st_b.check() is True

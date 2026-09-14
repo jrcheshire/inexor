@@ -178,7 +178,7 @@ def repack_device(st, brick_slack=0.10, timings=None):
     clock.mark("pass: setup + arena lift")
 
     windows = {}
-    peak_windows, readahead, programs0 = 0, 0, len(_repack_programs())
+    peak_windows, readahead, empty, programs0 = 0, 0, 0, len(_repack_programs())
     held_peak = 0
 
     def upload(t):
@@ -224,6 +224,14 @@ def repack_device(st, brick_slack=0.10, timings=None):
         row_offsets = np.zeros(nb2 + 1, dtype=np.int64)
         np.cumsum(live + ar_counts, out=row_offsets[1:])
         n_rows = int(row_offsets[-1])
+        if n_rows == 0 and n_hi == n_lo:
+            # an EMPTY slab: no row to place, no block to write, its occupancy
+            # slice already zero -- exactly what the program would produce, at
+            # the cost of nothing (a one-slab probe state has 255 of these)
+            empty += 1
+            del windows[s]
+            clock.mark("empty slab")
+            continue
         cap = _ladder(n_rows)
         out_cap = _ladder(n_hi - n_lo)
         index_dev = (jnp.asarray(occ), jnp.asarray(live), jnp.asarray(old_start[lo_b:hi_b] - e["s0"]),
@@ -282,6 +290,7 @@ def repack_device(st, brick_slack=0.10, timings=None):
         bricks_merged=n_merge,
         repack_device=dict(slabs=nb, programs=len(_repack_programs()) - programs0,
                            windows_peak=int(peak_windows), readahead_uploads=int(readahead),
+                           empty_slabs=int(empty),
                            held_peak_bytes=int(held_peak)),
     )
 
