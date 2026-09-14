@@ -565,6 +565,85 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert
                 brick_reach_realized=realized_reach, peak_staged_slabs=peak_staged)
 
 
+def _replay_arena_pass(st, reach, r, r_raw, c_drift, scales, n_emig, rr_by_slab, insert_res,
+                       max_staged_slabs=None, census_note=""):
+    """Replay a migrate pass's arena mutations and bookkeeping in serial order.
+
+    For a pass whose ejects and inserts ran out of order, or elsewhere, with every
+    ORDER-DEPENDENT arena mutation deferred: releases (`_release_brick_arena`) at
+    each slab's eject point, claims (`_to_arena`, spilled bricks ascending) at each
+    destination's insert point, and the census and staging accounting at the same
+    schedule points `drift_and_migrate` runs them. Shared by the pooled and device
+    migrates; each is gated bitwise against the serial pass.
+
+    `n_emig[s]` is slab s's emigrant row count; `rr_by_slab[s]` its realized
+    reach; `insert_res[d]` a dict with `consumed` (source slab -> rows taken),
+    `spills` ((brick, dest, off, w, ids) in ascending brick order) and `n_over`.
+    `census_note` is appended to the census failure message.
+
+    Returns `n_over`, `peak_staged`, `realized_reach`, `spill_rows`, `spill_bytes`.
+    """
+    nb = st.bricks_per_side
+    staged_sym, emig_sym, inserted = set(), set(), set()
+    consumed = {}
+    n_over, peak_staged, realized_reach = 0, 0, 0
+    spill_rows = spill_bytes = 0
+    for s in range(nb):
+        lo_b, hi_b = st.slab_bricks(s)
+        for b in range(lo_b, hi_b):
+            st._release_brick_arena(b)
+        staged_sym.add(s)
+        emig_sym.add(s)
+        consumed[s] = 0
+        realized_reach = max(realized_reach, rr_by_slab[s])
+        for d in range(nb):
+            if d in inserted:
+                continue
+            if all(((d + o) % nb) in emig_sym for o in reach):
+                res = insert_res[d]
+                for src, c in res["consumed"].items():
+                    consumed[src] += int(c)
+                for _b, dest_r, off_r, w_r, ids_r in res["spills"]:
+                    spill_rows += len(dest_r)
+                    spill_bytes += dest_r.nbytes + off_r.nbytes + w_r.nbytes
+                    spill_bytes += 0 if ids_r is None else ids_r.nbytes
+                    st._to_arena(dest_r, off_r, w_r, ids_r)
+                n_over += int(res["n_over"])
+                inserted.add(d)
+        for s2 in list(staged_sym):
+            if s2 in inserted:
+                staged_sym.discard(s2)
+        for s2 in list(emig_sym):
+            if all(((s2 + o) % nb) in inserted for o in reach):
+                n_rows = n_emig[s2]
+                if consumed[s2] != n_rows:
+                    raise AssertionError(
+                        f"releasing emig slab {s2} with {n_rows - consumed[s2]} of "
+                        f"{n_rows} rows unconsumed (reach {r}, consumption offsets "
+                        f"{sorted({int(o) for o in reach})}). D-007 forbids "
+                        "dropping; an unconsumed emigrant is a particle about to "
+                        "be destroyed." + census_note
+                    )
+                emig_sym.discard(s2)
+        peak_staged = max(peak_staged, len(staged_sym))
+        if max_staged_slabs is not None and peak_staged > int(max_staged_slabs):
+            raise ValueError(
+                f"the migration is holding {peak_staged} slabs against a budget of "
+                f"{max_staged_slabs}. The drift reaches {r_raw} bricks on a "
+                f"{nb}-brick grid, so {2 * r + 1} slabs must be in flight.\n"
+                f"  c_drift={c_drift:.6g}, max vel_scale={float(np.max(scales)):.6g}, "
+                f"max |dx| = {abs(float(c_drift)) * float(np.max(scales)) * INT16_MAX:.6g} against a "
+                f"brick of {float(st.t9.box_size) / nb:.6g}.\n"
+                "  Reduce the step size, use a coarser brick, or raise the budget "
+                "deliberately -- staging is bounded by (2 * reach + 1) slabs, so "
+                "this is a real memory cost and not a formality."
+            )
+    if len(inserted) != nb:
+        raise AssertionError(f"{nb - len(inserted)} slabs were never written back")
+    return dict(n_over=n_over, peak_staged=peak_staged, realized_reach=realized_reach,
+                spill_rows=spill_rows, spill_bytes=spill_bytes, n_inserted=len(inserted))
+
+
 def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
                              max_staged_slabs=None, eject_inflight=None):
     """`drift_and_migrate` on the worker pool, BITWISE the serial pass.
@@ -708,76 +787,25 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
                     free_slots.append(slot_of.pop(s2))
     assert len(ejected) == nb, f"{nb - len(ejected)} slabs were never ejected"
 
-    # THE REPLAY: the serial pass's arena interleave and bookkeeping, re-run
-    # exactly. `_release_brick_arena` at each slab's eject point, `_to_arena`
-    # at each destination's insert point (spilled bricks arrive ascending from
-    # `_insert_slab`'s own loop), and the census/peak accounting at the same
-    # schedule points the serial loop runs them.
-    staged_sym, emig_sym, inserted = set(), set(), set()
-    consumed = {}
-    n_over, peak_staged, realized_reach = 0, 0, 0
-    spill_rows = spill_bytes = 0
-    for s in range(nb):
-        lo_b, hi_b = st.slab_bricks(s)
-        for b in range(lo_b, hi_b):
-            st._release_brick_arena(b)
-        staged_sym.add(s)
-        emig_sym.add(s)
-        consumed[s] = 0
-        realized_reach = max(realized_reach, rr_by_slab[s])
-        for d in range(nb):
-            if d in inserted:
-                continue
-            if all(((d + o) % nb) in emig_sym for o in reach):
-                res = insert_res[d]
-                for src, c in res["consumed"].items():
-                    consumed[src] += int(c)
-                for _b, dest_r, off_r, w_r, ids_r in res["spills"]:
-                    spill_rows += len(dest_r)
-                    spill_bytes += dest_r.nbytes + off_r.nbytes + w_r.nbytes
-                    spill_bytes += 0 if ids_r is None else ids_r.nbytes
-                    st._to_arena(dest_r, off_r, w_r, ids_r)
-                n_over += int(res["n_over"])
-                inserted.add(d)
-        for s2 in list(staged_sym):
-            if s2 in inserted:
-                staged_sym.discard(s2)
-        for s2 in list(emig_sym):
-            if all(((s2 + o) % nb) in inserted for o in reach):
-                n_rows = ejected[s2][2]
-                if consumed[s2] != n_rows:
-                    raise AssertionError(
-                        f"releasing emig slab {s2} with {n_rows - consumed[s2]} of "
-                        f"{n_rows} rows unconsumed (reach {r}, consumption offsets "
-                        f"{sorted({int(o) for o in reach})}). D-007 forbids "
-                        "dropping; an unconsumed emigrant is a particle about to "
-                        "be destroyed. (Pooled pass: the displacement histogram "
-                        "the serial census prints needs rows whose scratch slot "
-                        "may be reused -- re-run serial for the full census.)"
-                    )
-                emig_sym.discard(s2)
-        peak_staged = max(peak_staged, len(staged_sym))
-        if max_staged_slabs is not None and peak_staged > int(max_staged_slabs):
-            raise ValueError(
-                f"the migration is holding {peak_staged} slabs against a budget of "
-                f"{max_staged_slabs}. The drift reaches {r_raw} bricks on a "
-                f"{nb}-brick grid, so {2 * r + 1} slabs must be in flight.\n"
-                f"  c_drift={c_drift:.6g}, max vel_scale={float(np.max(scales)):.6g}, "
-                f"max |dx| = {abs(float(c_drift)) * float(np.max(scales)) * INT16_MAX:.6g} against a "
-                f"brick of {float(st.t9.box_size) / nb:.6g}.\n"
-                "  Reduce the step size, use a coarser brick, or raise the budget "
-                "deliberately -- staging is bounded by (2 * reach + 1) slabs, so "
-                "this is a real memory cost and not a formality."
-            )
-    if len(inserted) != nb:
-        raise AssertionError(f"{nb - len(inserted)} slabs were never written back")
+    # THE REPLAY, shared with the device migrate (`_replay_arena_pass`).
+    rep = _replay_arena_pass(
+        st, reach, r, r_raw, c_drift, scales,
+        n_emig={s: ejected[s][2] for s in ejected}, rr_by_slab=rr_by_slab,
+        insert_res=insert_res, max_staged_slabs=max_staged_slabs,
+        census_note=(" (Pooled pass: the displacement histogram the serial census "
+                     "prints needs rows whose scratch slot may be reused -- re-run "
+                     "serial for the full census.)"),
+    )
+    n_over, peak_staged = rep["n_over"], rep["peak_staged"]
+    realized_reach = rep["realized_reach"]
+    spill_rows, spill_bytes = rep["spill_rows"], rep["spill_bytes"]
     n_after = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
     if n_after != n_before:
         raise ValueError(
             f"the migration lost {n_before - n_after} particles ({n_before} -> "
             f"{n_after} against {st.n_particles} stored). D-007 forbids dropping, "
             "so this is corruption, not imprecision.\n"
-            f"  {len(inserted)} of {nb} slabs inserted, arena {st.arena_used}/"
+            f"  {rep['n_inserted']} of {nb} slabs inserted, arena {st.arena_used}/"
             f"{st.n_arena} (pooled pass)\n"
             "  LEADING CAUSE: the slab schedule releases a staged row once its "
             "destination is written, which assumes a particle moves at most ONE "
