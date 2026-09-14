@@ -1,0 +1,303 @@
+=== c672-006.vista.tacc.utexas.edu: commit 4a48c6e, job 996857 ===
+0, NVIDIA GB200, 189471 MiB
+1, NVIDIA GB200, 189471 MiB
+2, NVIDIA GB200, 189471 MiB
+3, NVIDIA GB200, 189471 MiB
+               total        used        free      shared  buff/cache   available
+Mem:            1691          67        1655           3           4        1623
+
+=== LEG jax-devices ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+jax devices: [CudaDevice(id=0), CudaDevice(id=1), CudaDevice(id=2), CudaDevice(id=3)]
+--- LEG jax-devices rc=0 ---
+
+=== LEG smoke ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm solve-cards: --arm solve-cards --n-part 32 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gbsmoke --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[solve-cards] smoke n_coarse=16: BITWISE = True (0 elements differ); warm wall host 0.08s vs cards 0.10s; host tracemalloc peak host 0.2 MiB vs cards 0.1 MiB
+--- arm solve-cards: rc=0
+
+--- arm window-off: --arm window-off --n-part 32 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gbsmoke --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[window-off] smoke: n_part=32 nb=8 slack=0.1 built in 0.0s on gpu; K=2; tile jit=True window=False cards=1
+[window-off] run 20.3s; spills 112; split {'tile_cards': [{'planes': 4, 'tiles_run': 64}], 'coarse_card_chunks': [32], 'migrate_cards': None, 'migrate_fallback': None, 'cross_card_bytes': None, 'repack_cards': None, 'cross_card_early_uploads': None}; phases: migrate 7.3, lead_drift 6.0, repack 2.9, coarse_paint 1.7, tile_loop 1.4, coarse_solve 0.8, kernel_build 0.2, membership 0.0, tile_loop_end 0.0, reconcile 0.0
+[window-off] device peak 0.01 GiB, host maxrss 2.3 GB
+--- arm window-off: rc=0
+
+--- arm window-on: --arm window-on --n-part 32 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gbsmoke --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[window-on] smoke: n_part=32 nb=8 slack=0.1 built in 0.0s on gpu; K=2; tile jit=True window=True cards=1
+[window-on] run 20.1s; spills 112; split {'tile_cards': [{'planes': 4, 'tiles_run': 64}], 'coarse_card_chunks': [32], 'migrate_cards': None, 'migrate_fallback': None, 'cross_card_bytes': None, 'repack_cards': None, 'cross_card_early_uploads': None}; phases: migrate 7.3, lead_drift 5.3, repack 2.7, tile_loop 2.3, coarse_paint 1.7, coarse_solve 0.8, kernel_build 0.2, membership 0.0, tile_loop_end 0.0, reconcile 0.0
+[window-on] device peak 0.01 GiB, host maxrss 2.3 GB
+--- arm window-on: rc=0
+
+--- arm r3-w1: --arm r3-w1 --n-part 32 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gbsmoke --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[r3-w1] pass 0: migrate 7.22s (untimed), repack 1.52s; spills 80; migrate receipt cards 1 cross-card bytes None fallback None; repack early uploads None
+[r3-w1] pass 1: migrate 2.58s (timed), repack 1.43s; spills 133; migrate receipt cards 1 cross-card bytes None fallback None; repack early uploads None
+       0.763 s  insert: compact inputs
+       0.657 s  insert: kernel
+       0.514 s  insert: spills to host
+       0.329 s  insert: census
+       0.201 s  insert: shrink staged
+       0.071 s  insert: scalars + write program
+       0.014 s  eject: reach + scalars
+       0.011 s  eject: upload
+       0.008 s  eject: rows program
+       0.002 s  eject: kernel
+       0.002 s  insert: slot range to host
+       0.002 s  insert: occupancy + scales to host
+--- arm r3-w1: rc=0
+
+--- arm r3-w4: --arm r3-w4 --n-part 32 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gbsmoke --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[r3-w4] pass 0: migrate 6.83s (untimed), repack 0.73s; spills 80; migrate receipt cards 1 cross-card bytes 0 fallback a card would hold 2 slabs, fewer than 2r + 1 = 3: one card; repack early uploads 3
+[r3-w4] pass 1: migrate 2.68s (timed), repack 0.58s; spills 133; migrate receipt cards 1 cross-card bytes 0 fallback a card would hold 2 slabs, fewer than 2r + 1 = 3: one card; repack early uploads 3
+       0.814 s  insert: compact inputs
+       0.666 s  insert: kernel
+       0.533 s  insert: spills to host
+       0.351 s  insert: census
+       0.198 s  insert: shrink staged
+       0.074 s  insert: scalars + write program
+       0.014 s  eject: reach + scalars
+       0.008 s  eject: upload
+       0.007 s  eject: rows program
+       0.002 s  eject: kernel
+       0.002 s  insert: slot range to host
+       0.002 s  insert: occupancy + scales to host
+--- arm r3-w4: rc=0
+
+--- arm cards: --arm cards --n-part 32 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gbsmoke --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[cards] smoke: n_part=32 nb=8 slack=0.1 built in 0.0s on gpu; K=2; tile jit=True window=True cards=4
+[cards] run 19.8s; spills 112; split {'tile_cards': [{'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}], 'coarse_card_chunks': [8, 8, 8, 8], 'migrate_cards': 1, 'migrate_fallback': 'a card would hold 2 slabs, fewer than 2r + 1 = 3: one card', 'cross_card_bytes': 0, 'repack_cards': 4, 'cross_card_early_uploads': 2}; phases: migrate 7.6, lead_drift 5.3, coarse_paint 2.8, tile_loop 2.1, repack 1.1, coarse_solve 0.8, kernel_build 0.2, membership 0.0, tile_loop_end 0.0, reconcile 0.0
+[cards] device peak 0.01 GiB, host maxrss 2.4 GB
+--- arm cards: rc=0
+
+--- arm slack0-eager: --arm slack0-eager --n-part 32 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gbsmoke --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[slack0-eager] smoke: n_part=32 nb=8 slack=0.0 built in 0.0s on gpu; K=2; tile jit=False window=False cards=1
+[slack0-eager] run 48.4s; spills 1294; split {'tile_cards': None, 'coarse_card_chunks': [32], 'migrate_cards': None, 'migrate_fallback': None, 'cross_card_bytes': None, 'repack_cards': None, 'cross_card_early_uploads': None}; phases: tile_reduce 31.4, migrate 7.0, lead_drift 6.0, repack 1.6, coarse_paint 1.5, coarse_solve 0.6, kernel_build 0.2, membership 0.0, reconcile 0.0, tile_loop_end 0.0
+[slack0-eager] device peak 0.00 GiB, host maxrss 2.4 GB
+--- arm slack0-eager: rc=0
+
+--- arm slack0-cards: --arm slack0-cards --n-part 32 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gbsmoke --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[slack0-cards] smoke: n_part=32 nb=8 slack=0.0 built in 0.0s on gpu; K=2; tile jit=True window=True cards=4
+[slack0-cards] run 20.9s; spills 1294; split {'tile_cards': [{'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}], 'coarse_card_chunks': [8, 8, 8, 8], 'migrate_cards': 1, 'migrate_fallback': 'a card would hold 2 slabs, fewer than 2r + 1 = 3: one card', 'cross_card_bytes': 0, 'repack_cards': 4, 'cross_card_early_uploads': 3}; phases: migrate 7.9, lead_drift 6.3, coarse_paint 2.6, tile_loop 2.1, repack 1.1, coarse_solve 0.7, kernel_build 0.2, membership 0.0, tile_loop_end 0.0, reconcile 0.0
+[slack0-cards] device peak 0.01 GiB, host maxrss 2.3 GB
+--- arm slack0-cards: rc=0
+
+=== window-on vs window-off: hashes equal = True; stats differing 0 []; tile_loop_end None; run 20.1 vs 20.3s ===
+
+=== cards vs window-on: hashes equal = True; stats differing 0 []; tile_loop_end None; run 19.8 vs 20.1s ===
+
+=== slack0-cards vs slack0-eager: hashes equal = True; stats differing 0 []; tile_loop_end {'same_shape': True, 'max_abs': 0, 'n_diff': 0, 'n': 114741}; run 20.9 vs 48.4s (smoke: reported, not gated) ===
+
+=== r3-w4 vs r3-w1: hashes equal = True; stats equal = True; migrate s (4 cards, 1 card) [(6.832052084151655, 7.218277039006352), (2.675182593986392, 2.577983594033867)]; repack s [(0.7288623689673841, 1.5218230998143554), (0.5781477172859013, 1.43229854805395)] ===
+
+=== phases, s over the run (cards | window-on) ===
+  migrate               7.6 |      7.3
+  lead_drift            5.3 |      5.3
+  coarse_paint          2.8 |      1.7
+  repack                1.1 |      2.7
+  tile_loop             2.1 |      2.3
+  coarse_solve          0.8 |      0.8
+  kernel_build          0.2 |      0.2
+  membership            0.0 |      0.0
+  tile_loop_end         0.0 |      0.0
+  reconcile             0.0 |      0.0
+
+=== phases, s over the run (window-on | window-off) ===
+  migrate               7.3 |      7.3
+  lead_drift            5.3 |      6.0
+  repack                2.7 |      2.9
+  tile_loop             2.3 |      1.4
+  coarse_paint          1.7 |      1.7
+  coarse_solve          0.8 |      0.8
+  kernel_build          0.2 |      0.2
+  membership            0.0 |      0.0
+  tile_loop_end         0.0 |      0.0
+  reconcile             0.0 |      0.0
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_device_cards_gbsmoke.json
+rc=0
+--- LEG smoke rc=0 ---
+
+=== LEG arms ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm solve-cards: --arm solve-cards --n-part 512 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gb
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[solve-cards] cgh64 n_coarse=256: BITWISE = True (0 elements differ); warm wall host 1.48s vs cards 1.15s; host tracemalloc peak host 345.4 MiB vs cards 145.4 MiB
+--- arm solve-cards: rc=0
+
+--- arm window-off: --arm window-off --n-part 512 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gb
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[window-off] cgh64: n_part=512 nb=32 slack=0.1 built in 31.7s on gpu; K=2; tile jit=True window=False cards=1
+[window-off] run 25.3s; spills 0; split {'tile_cards': [{'planes': 4, 'tiles_run': 64}], 'coarse_card_chunks': [128], 'migrate_cards': None, 'migrate_fallback': None, 'cross_card_bytes': None, 'repack_cards': None, 'cross_card_early_uploads': None}; phases: lead_drift 5.8, tile_loop 5.6, migrate 4.2, coarse_solve 4.2, coarse_paint 2.8, repack 1.7, kernel_build 0.6, membership 0.3, tile_loop_end 0.0, reconcile 0.0
+[window-off] device peak 4.84 GiB, host maxrss 24.7 GB
+--- arm window-off: rc=0
+
+--- arm window-on: --arm window-on --n-part 512 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gb
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[window-on] cgh64: n_part=512 nb=32 slack=0.1 built in 31.3s on gpu; K=2; tile jit=True window=True cards=1
+[window-on] run 33.6s; spills 0; split {'tile_cards': [{'planes': 4, 'tiles_run': 64}], 'coarse_card_chunks': [128], 'migrate_cards': None, 'migrate_fallback': None, 'cross_card_bytes': None, 'repack_cards': None, 'cross_card_early_uploads': None}; phases: tile_loop 14.3, lead_drift 5.6, coarse_solve 4.2, migrate 4.2, coarse_paint 2.8, repack 1.6, kernel_build 0.6, membership 0.3, tile_loop_end 0.0, reconcile 0.0
+[window-on] device peak 4.29 GiB, host maxrss 24.7 GB
+--- arm window-on: rc=0
+
+--- arm r3-w1: --arm r3-w1 --n-part 512 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gb
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[r3-w1] pass 0: migrate 6.44s (untimed), repack 1.01s; spills 0; migrate receipt cards 1 cross-card bytes None fallback None; repack early uploads None
+[r3-w1] pass 1: migrate 1.54s (timed), repack 0.60s; spills 0; migrate receipt cards 1 cross-card bytes None fallback None; repack early uploads None
+       0.472 s  insert: kernel
+       0.206 s  insert: slot range to host
+       0.179 s  insert: compact inputs
+       0.150 s  eject: upload
+       0.130 s  eject: host index + window
+       0.092 s  insert: census
+       0.068 s  insert: shrink staged
+       0.060 s  eject: rows program
+       0.050 s  eject: reach + scalars
+       0.034 s  insert: scalars + write program
+       0.026 s  insert: occupancy + scales to host
+       0.019 s  pass: final census
+--- arm r3-w1: rc=0
+
+--- arm r3-w4: --arm r3-w4 --n-part 512 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gb
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[r3-w4] pass 0: migrate 6.42s (untimed), repack 0.65s; spills 0; migrate receipt cards 4 cross-card bytes 166451200 fallback None; repack early uploads 3
+[r3-w4] pass 1: migrate 0.55s (timed), repack 0.21s; spills 0; migrate receipt cards 4 cross-card bytes 166451200 fallback None; repack early uploads 3
+       0.124 s  card 2: insert: kernel
+       0.124 s  card 3: insert: kernel
+       0.123 s  card 0: insert: kernel
+       0.121 s  card 1: insert: kernel
+       0.070 s  card 0: insert: compact inputs
+       0.069 s  card 1: insert: compact inputs
+       0.069 s  card 3: insert: compact inputs
+       0.063 s  card 2: insert: compact inputs
+       0.063 s  card 2: eject: host index + window
+       0.062 s  card 2: insert: slot range to host
+       0.062 s  card 3: eject: host index + window
+       0.061 s  card 3: insert: slot range to host
+--- arm r3-w4: rc=0
+
+--- arm cards: --arm cards --n-part 512 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gb
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[cards] cgh64: n_part=512 nb=32 slack=0.1 built in 31.4s on gpu; K=2; tile jit=True window=True cards=4
+[cards] run 35.8s; spills 0; split {'tile_cards': [{'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}], 'coarse_card_chunks': [32, 32, 32, 32], 'migrate_cards': 4, 'migrate_fallback': None, 'cross_card_bytes': 13107200, 'repack_cards': 4, 'cross_card_early_uploads': 3}; phases: tile_loop 19.5, lead_drift 5.8, coarse_paint 3.4, coarse_solve 2.7, migrate 2.5, repack 0.9, kernel_build 0.6, membership 0.3, tile_loop_end 0.0, reconcile 0.0
+[cards] device peak 3.69 GiB, host maxrss 24.7 GB
+--- arm cards: rc=0
+
+--- arm slack0-eager: --arm slack0-eager --n-part 512 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gb
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[slack0-eager] cgh64: n_part=512 nb=32 slack=0.0 built in 31.5s on gpu; K=2; tile jit=False window=False cards=1
+[slack0-eager] run 84.7s; spills 483879; split {'tile_cards': None, 'coarse_card_chunks': [128], 'migrate_cards': None, 'migrate_fallback': None, 'cross_card_bytes': None, 'repack_cards': None, 'cross_card_early_uploads': None}; phases: tile_reduce 58.8, lead_drift 6.5, migrate 6.4, repack 4.7, coarse_solve 3.7, coarse_paint 2.9, kernel_build 0.7, membership 0.3, reconcile 0.0, tile_loop_end 0.0
+[slack0-eager] device peak 3.14 GiB, host maxrss 24.6 GB
+--- arm slack0-eager: rc=0
+
+--- arm slack0-cards: --arm slack0-cards --n-part 512 --steps 2 --real-frac 0.5 --slack0-arena 0.05 --snap-dir /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_snap --out-suffix _gb
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[slack0-cards] cgh64: n_part=512 nb=32 slack=0.0 built in 31.4s on gpu; K=2; tile jit=True window=True cards=4
+[slack0-cards] run 41.2s; spills 483879; split {'tile_cards': [{'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}, {'planes': 1, 'tiles_run': 16}], 'coarse_card_chunks': [32, 32, 32, 32], 'migrate_cards': 4, 'migrate_fallback': None, 'cross_card_bytes': 13107200, 'repack_cards': 4, 'cross_card_early_uploads': 3}; phases: tile_loop 19.1, lead_drift 6.2, migrate 4.3, repack 3.7, coarse_paint 3.3, coarse_solve 2.7, kernel_build 0.6, membership 0.3, tile_loop_end 0.0, reconcile 0.0
+[slack0-cards] device peak 3.63 GiB, host maxrss 24.7 GB
+--- arm slack0-cards: rc=0
+
+=== window-on vs window-off: hashes equal = True; stats differing 0 []; tile_loop_end None; run 33.6 vs 25.3s ===
+
+=== cards vs window-on: hashes equal = True; stats differing 0 []; tile_loop_end None; run 35.8 vs 33.6s ===
+
+=== slack0-cards vs slack0-eager: hashes equal = True; stats differing 0 []; tile_loop_end {'same_shape': True, 'max_abs': 0, 'n_diff': 0, 'n': 463159299}; run 41.2 vs 84.7s ===
+
+=== r3-w4 vs r3-w1: hashes equal = True; stats equal = True; migrate s (4 cards, 1 card) [(6.4240269819274545, 6.440375415142626), (0.550439699087292, 1.5357459229417145)]; repack s [(0.6547991870902479, 1.0106390612199903), (0.20578492619097233, 0.5964969862252474)] ===
+
+=== phases, s over the run (cards | window-on) ===
+  tile_loop            19.5 |     14.3
+  lead_drift            5.8 |      5.6
+  coarse_solve          2.7 |      4.2
+  migrate               2.5 |      4.2
+  coarse_paint          3.4 |      2.8
+  repack                0.9 |      1.6
+  kernel_build          0.6 |      0.6
+  membership            0.3 |      0.3
+  tile_loop_end         0.0 |      0.0
+  reconcile             0.0 |      0.0
+
+=== phases, s over the run (window-on | window-off) ===
+  tile_loop            14.3 |      5.6
+  lead_drift            5.6 |      5.8
+  migrate               4.2 |      4.2
+  coarse_solve          4.2 |      4.2
+  coarse_paint          2.8 |      2.8
+  repack                1.6 |      1.7
+  kernel_build          0.6 |      0.6
+  membership            0.3 |      0.3
+  tile_loop_end         0.0 |      0.0
+  reconcile             0.0 |      0.0
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/e2e4_device_cards_gb.json
+rc=0
+--- LEG arms rc=0 ---
+
+=== LEG pytest-gpu ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+..........................................                               [100%]
+42 passed in 618.93s (0:10:18)
+--- LEG pytest-gpu rc=0 ---
+
+=== rc_total=0 ===

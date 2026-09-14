@@ -2432,3 +2432,87 @@ Lead drift once: 6.0 s device, 19.0 s host. Device peak: compiled 4.78 GiB, eage
 2. The compiled lane with arena residents on the GPU at cgh64, if the claim above is
    to cover spills.
 3. Carried: the c-hero migrate estimate ratio (sec. 33).
+
+## 35. E2-E4 + R3 on a GB200, Vista 996857 -- the whole step on four cards is bitwise one card at cgh64, spills included; the steady step is 3.54 s against 6.60 s on one card
+
+`4a48c6e`, 2026-09-14, gb node c672-006, COMPLETED rc=0 in 23:35 of 50:00. Sbatch
+`v2_e2e4_device_cards_vista.sbatch`; cards `runs/v2/e2e4_device_cards_{gb,gbsmoke}.json`,
+log `runs/v2/e2e4-device-cards-996857.log`. What ran (`f1348b2`, `f3f5ca5`):
+
+- **E4:** `ooc_fft.inverse_to_card_shards` writes the solve's force meshes onto the
+  cards (`device.coarse.CardShards`); no host mesh exists.
+- **E2:** `device.window.tile_loop_windowed`, one tile plane's x-slabs on the card
+  at a time (`device_tile_window`).
+- **E3:** `EngineConfig(device_cards=W)` splits paint, solve and tile loop across
+  cards.
+- **R3:** `drift_and_migrate_device` / `repack_device(devices=)` split the migrate
+  and repack by x-slabs.
+
+Eight cgh64 arms (512^3, nb=32, 64 tiles), each its own process, K=2 + lead drift
+where it steps.
+
+### Gates on the GPU: PASS
+
+| comparison | final state hashes | stats | other |
+|---|---|---|---|
+| solve into four card shards vs host meshes sharded (cgh64 density) | -- | -- | 0 elements differ |
+| window on vs window off, one card | equal | equal | |
+| migrate + repack on four cards vs one, two passes | equal | equal | 166 MB of emigrant segments crossed cards; 3 cross-card early uploads |
+| whole step on four cards vs window on, one card | equal | equal (split receipts aside) | |
+| compiled lane on four cards, slack 0, vs eager lane on one card | equal | equal | step 1 at `tile_loop_end`: 0 of 463,159,299 codes, 0 of 32,768 scales differ; 483,879 spills |
+
+- **The compiled lane with arena residents on the GPU is bitwise the eager lane**,
+  which is bitwise the host engine (sec. 34). Owed item 2 of sec. 34 CLOSED.
+- GPU pytest (the six executor, window, card, migrate-card and repack-card files):
+  42 passed in 10:18.
+- The 32^3 smoke ran every arm on the GPUs; there the four-card migrate fell back to
+  one card as designed (2 slabs per card < 2r + 1), and the slack-0 pair was already
+  bitwise.
+
+### The cgh64 step, per phase (step 1 carries the compiles; step 2 is steady)
+
+| s/step, step 2 | one card, whole state | one card, window | four cards | four cards, slack 0 | eager, one card, slack 0 |
+|---|---|---|---|---|---|
+| migrate | 2.13 | 2.09 | **1.29** | 1.71 | 2.61 |
+| coarse_solve | 1.76 | 1.76 | **1.04** | 1.01 | 1.61 |
+| tile loop | 0.98 | 1.37 | **0.48** | 0.40 | 24.98 |
+| coarse_paint | 0.64 | 0.65 | **0.36** | 0.34 | 0.66 |
+| repack | 0.59 | 0.58 | **0.22** | 2.15 | 2.68 |
+| membership | 0.16 | 0.16 | 0.16 | 0.17 | 0.16 |
+| **step** | 6.27 | 6.60 | **3.54** | 5.77 | 32.70 |
+
+Step 1's tile loop: 4.63 s whole state, 12.92 s windowed, 18.99 s on four cards (the
+windowed step 1 is 8.3 s above the whole-state one and is not attributed; four cards
+compile the tile program concurrently). Device peak: 4.84 GiB whole state, 4.29
+windowed, 3.69 on four cards. Lead drift once: 5.6-6.5 s.
+
+- **Four cards take the steady step 1.86x under one windowed card.** The split is
+  not uniform: tile loop 2.9x, repack 2.6x, paint 1.8x, solve 1.7x, migrate 1.6x.
+  The migrate and the solve are now the two largest terms (1.29 + 1.04 of 3.54 s).
+- **The migrate alone** (R3 arms, second pass, synced): 0.55 s on four cards against
+  1.54 s on one (2.8x); repack 0.21 against 0.60 (2.9x). Each card's synced phases
+  sum to 0.48-0.53 s.
+- **The window costs 0.39 s of steady tile loop on one card** (1.37 vs 0.98 s): four
+  window stagings and write-backs of 10 of 32 slabs, where the whole-state path
+  uploads the state once per step.
+- **E4 alone** (solve-cards, warm): 1.15 s into the card shards against 1.48 s into
+  host meshes; host tracemalloc peak 145 MiB against 345. The whole-state one-card
+  step here (6.27 s, solve 1.76) sits below sec. 34's 8.17 s (solve 2.21, tile loop
+  1.18 with the host-mesh re-upload) on a different node; how much of that is E4
+  and how much the node is not separated.
+- At slack 0 the four-card repack is 2.15 s of 5.77 (483,879 spills folded in), the
+  largest term there.
+
+### What this does NOT establish
+
+- The 4096^3 step. The window's staging cost is read at 10 of 32 slabs, not 18 of
+  256; per-card memory at 4096^3 shapes is not read; the migrate's cross-card
+  hand-off is 13-26 MB per step here.
+- Pageable vs anything else on the cross-card hand-off: `jax.device_put` between
+  cards, route not measured.
+
+### Owed
+
+1. The `device_tile_window` default flips to True (bitwise on the GPU, as planned).
+2. The 4096^3 smoke (D7), which needs 4096^3 ICs (D6, unbuilt).
+3. The windowed step 1's extra ~8 s, if a run's compile budget ever needs it.
