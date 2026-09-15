@@ -2581,3 +2581,76 @@ per card 69.7 GB (0.35x of 199), disk 1,443 GB (825 staging + 618 slabs).
 1. JC: the proposed parity bars (codes within 1, occupancy exact at the 32^3 fixture,
    scales within 2x the measured floor; numpy peak within [0.9, 1.2] of the planner).
 2. The gb job (`scripts/v2_d6_device_ics_vista.sbatch`): proposal to JC, then push and submit.
+
+## 37. D6 on a GB200 (Vista 997280) and D6b on the laptop -- everything before emission is 51 min at 4096^3; emission, still host numpy, was the wall and failed on a sort-key overflow; emission now runs on the cards, bitwise the host emission
+
+### 997280 read out (gb c672-007, 4 h 53 min, rc 1)
+
+| leg | reading |
+|---|---|
+| smoke, 32^3 on the GB200s | device vs host generator: occupancy exact, positions identical, 252 / 274 of 120,033 velocity codes by 1, scales <= 5.5e-7 relative; kernels 0.0 eps x rms vs numpy; 4 cards == 1 card |
+| 2048^3 generation | 40.3 min: delta 7.8, source 41.3, source forward 7.1, velocities 195.8, displacements 48.4, **emission 2115 s**; host peak 109.4 GB (planner 103.9, 1.05x); nvidia-smi 18.2 GB per card |
+| projection to 4096^3 | 5.86 h, host 875 GB (both under the stops, so the job went on) |
+| 4096^3 generation | delta 58, source 370, source forward 93, velocities 1979, displacements 549 s (51 min; within 1.0-1.5x of the projection); emission ran 3 h 20 min and failed on destination slab 128 of 256 |
+| card memory, whole job | nvidia-smi 139 GB per card (0.70 of 199; planner 70) -- allocator-held, not attributed |
+| GPU pytest | 18 passed, 18 skipped |
+
+**The failure**: `_emit_t9_slabs` sorted each destination slab by the GLOBAL bucket
+ordinal; at 4096^3 that reaches 2048^3 = 8.6e9, past `_stable_sort_index`'s two-digit
+radix (2^32), first at slab 128. Only this emission sort takes global keys at that size
+(`SlotState.build` does too but is never called at 4096^3; the loader does not sort).
+**Fixed** by sorting slab-relative keys (`_sort_slab_rows`; order unchanged, host generator
+bitwise).
+
+**The wall**: emission was ~250 ns/particle at 2048^3 and ~350 at 4096^3 (the time ask
+had guessed 30-60); unbroken, the 4096^3 generation would have been ~7.5 h, ~6.6 of it
+emission. The failed run's partial output (127 slabs, 769 GB of staging) was removed by
+name (JC's OK).
+
+**SU correction**: the D6 proposal quoted ~0.8 SU for a 10 h gb wall. The rate on record
+(996685 + 996857: ~1.2 SU over 66.5 min) is ~1.08 SU per node-hour, so that wall was
+~11 SU and 997280 cost ~5.3 SU.
+
+### D6b built (laptop)
+
+A 256^3 profile of the host emission had no hot spot -- ~10 full-size numpy passes. So
+`device/emit.py` moves the per-slab work onto the cards, one thread per card:
+- per SOURCE slab (plane chunks): positions to codes, the brick-major key, destination
+  and ring-window check, kept on the card with per-destination counts;
+- per DESTINATION slab: gather from its window in ascending source index (seam
+  included), stable sort by slab-relative key, occupancy, per-brick scale, codes;
+- the host writes through `icgen._write_t9_slab`, the one writer both paths use.
+The position quantum is an exact power of two at every preset, so `x / q == x * (1/q)`
+(refused otherwise); every velocity division is by a full-shape program array. u_x
+shards carry `window` brick slabs of halo (`card_slab_ranges`). `emission="host"` stays
+as the oracle.
+
+| gate (four forced host devices) | reading |
+|---|---|
+| card vs host emission, 32^3 and 64^3, f32 and f64, 1/2/4 cards | slab payloads and metadata bitwise |
+| plane chunk size, card count | bitwise |
+| whole generator, emission cards vs host, f_NL 0 and 10 | loaded state bitwise |
+| keys above 2^32 | slab-relative order == stable argsort; the radix still refuses the global keys |
+| mutations: seam sources in ring order, a dropped source, scale divisor 32766 | all caught |
+| emission wall at 256^3 (CPU devices, direction only) | 0.50 s warm vs host 1.97 s |
+
+**A host-memory finding the card path uncovered.** The planner's host column had matched
+numpy within 2-6% only because the host emission stage WAS its peak, hiding the stages
+below. With card emission the displacements stage read 4.17 fields at 256^3 and 4.07 at
+512^3 against a 3-field design. Localized per call: after `del work`, u_z's allocation
+landed while `work` was still alive -- on the CPU backend `jax.device_put` of a numpy
+slice aliases the buffer (measured), and the runtime released those device arrays a call
+later (`gc.collect` freed 0 objects; not a cycle). 997280's 2048^3 host peak (109.4 GB
+vs 103.9) says it did not happen on the GB200, but it is timing-dependent, so u_z now
+reuses `work`'s bytes: displacements 1.04x / 1.02x the planner at 256^3 / 512^3. The
+velocities stage's 1.16x / 1.08x is slab-sized float64 copies and vanishes at 4096^3.
+
+Planner, card emission at 4096^3: host 828 GB (0.81x); per card 146 GB in emission
+(0.74x of 199; u_x halo 71 GB + three source windows + the destination program, the
+program terms CHARGED from their array inventories, not measured).
+
+### Owed
+
+1. The gb job with an `emit-shape` leg (one 4096^3 destination slab on one card:
+   `memory_stats` peak, per-slab seconds, projected to four cards; stops above 0.9 x 199
+   GB), then the 2048^3 rung (stop: 4096^3 projected over 6 h), then 4096^3.
