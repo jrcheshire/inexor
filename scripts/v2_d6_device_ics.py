@@ -57,6 +57,12 @@ def cmd_preflight(args):
 
     rc = 0
     print(f"jax devices: {jax.devices()}")
+    # the allocator knobs must show they applied: bytes_limit is fraction x card total
+    for dev in jax.devices():
+        stats = dev.memory_stats() or {}
+        lim = stats.get("bytes_limit")
+        print(f"  {dev}: allocator bytes_limit "
+              f"{'unreported' if lim is None else f'{lim / 2**30:,.1f} GiB'}")
     os.makedirs(args.root, exist_ok=True)
     free = shutil.disk_usage(args.root).free / GB
     quota, raw = _quota_remaining_gb(args.root)

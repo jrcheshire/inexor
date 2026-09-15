@@ -21,7 +21,13 @@
 # Submit from the Vista checkout, after JC approves the time ask:
 #   sbatch scripts/v2_d6_device_ics_vista.sbatch
 #
-# TIME ASK (DRAFT, for JC): ~2 h estimated, 8 h wall, one gb node (~1.08 SU per
+# RERUN after 997814 (OOM at the 4096^3 u_x shard: BFC capped at the default 0.75 of
+# the card, card 2 fragmented). Changes: XLA_CLIENT_MEM_FRACTION=0.95 and the
+# cuda_async allocator; code unchanged. Approved by JC at the same 8 h wall.
+# Estimate ~1.3 h from 997814 + 997280 (legs 1-5 ~9 min, 4096^3 before emission ~52 min,
+# 4096^3 emission ~14 min projected), ~1.4 SU; ~8.6 SU at the wall.
+#
+# ORIGINAL TIME ASK (997814): ~2 h estimated, 8 h wall, one gb node (~1.08 SU per
 # node-hour from 996685/996857: ~2.2 SU at the estimate, ~8.6 at the wall). Everything
 # before emission is MEASURED (997280); card emission has not run on a GB200.
 #
@@ -40,7 +46,9 @@
 #   - smoke gates: 4 cards == 1 card bitwise; occupancy exact, position and velocity
 #     codes within 1 of the host generator (JC-proposed bars); scales reported, not gated;
 #   - projected 4096^3 wall > 9 h or host peak > 923 GB stops the job before leg 6;
-#   - walls, peaks and per-stage splits are reported, not gated.
+#   - walls, peaks and per-stage splits are reported, not gated;
+#   - allocator slowdown, reported not gated: smoke leg, emit-shape split_s, ics-2048
+#     stage_s and ics-4096 delta/source/source_forward/velocities vs 997814 (BFC).
 #
 # ENV copied verbatim from v2_e2e4_device_cards_vista.sbatch.
 
@@ -50,6 +58,15 @@ cd "$SCRATCH/src/inexor" 2>/dev/null || cd "$HOME/src/inexor" || {
   echo "FATAL: no inexor checkout"; exit 1; }
 export PYTHONUNBUFFERED=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+# The allocator caps its growth at XLA_CLIENT_MEM_FRACTION of the card even with
+# preallocation off, and the compiled default is 0.75 (138.8 GiB of a GB200):
+# 997814 OOMed on a 66 GiB u_x shard at that cap. Preallocation stays off.
+export XLA_CLIENT_MEM_FRACTION=0.95
+# CUDA's own pool rather than BFC: freed blocks can coalesce, where BFC never merges
+# across its growth regions (997814's card 2 held two 64 GiB regions and could not
+# serve 66 GiB). Stage and leg seconds are compared against 997814 (BFC, same commit
+# code) to see whether per-plane allocation got slower.
+export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
 export JAX_COMPILATION_CACHE_DIR=$SCRATCH/inexor-xla-cache
 export XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=900
 unset JAX_PLATFORMS
@@ -64,6 +81,7 @@ GPU_LOG=$CARDS/d6-gpu-mem-$SLURM_JOB_ID.csv
 echo "=== $(hostname): commit $(git rev-parse --short HEAD), job $SLURM_JOB_ID ==="
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || echo "no nvidia-smi"
 free -g | head -2
+env | grep -E '^XLA_' | sort
 
 rc_total=0
 run_leg () {
