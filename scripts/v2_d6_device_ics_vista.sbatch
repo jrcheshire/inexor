@@ -3,33 +3,37 @@
 #SBATCH -p gb
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 10:00:00
+#SBATCH -t 08:00:00
 #SBATCH -A JPL-SPHEREx
 #SBATCH -o d6-device-ics-%j.log
 # D6 on a gb node, ONE bundled job: the IC stage on the cards, timed at 2048^3,
 # then the 4096^3 ICs.
 #   1. preflight: devices, scratch space + quota (~1.5 TB), planner verdicts (stops the job);
-#   2. smoke at 32^3 on the GPUs: device vs host generator, 4 cards == 1 card (stops the job);
+#   2. smoke at 32^3 on the GPUs: device generator (card emission) vs host generator,
+#      4 cards == 1 card (stops the job);
+#   2b. emit-shape: ONE 4096^3 emission slab on one card -- card peak (memory_stats) and
+#      per-slab seconds, projected to four cards (stops the job: card peak > 0.9 x 199 GB);
 #   3. 2048^3 device generation, per-stage wall + host peak; nvidia-smi sampled throughout;
-#   4. projection to 4096^3 (stops the job: wall > 9 h or host peak > 0.9 x 1026 GB);
+#   4. projection to 4096^3 (stops the job: wall > 6 h or host peak > 0.9 x 1026 GB);
 #   5. the 2048^3 output removed by name;
 #   6. the 4096^3 device generation -> /scratch/10303/jrc4/inexor_runs/c-hero-r0 (UNPRICED);
 #   7. the GPU pytest set for the new files (LAST: unpriced).
 # Submit from the Vista checkout, after JC approves the time ask:
 #   sbatch scripts/v2_d6_device_ics_vista.sbatch
 #
-# TIME ASK (DRAFT, for JC): ~3.5 h estimated, 10 h wall, one gb node. Every generation
-# term is ARITHMETIC; nothing about the device generator has run on a GB200.
+# TIME ASK (DRAFT, for JC): ~2 h estimated, 8 h wall, one gb node (~1.08 SU per
+# node-hour from 996685/996857: ~2.2 SU at the estimate, ~8.6 at the wall). Everything
+# before emission is MEASURED (997280); card emission has not run on a GB200.
 #
 #   phase                   each (source)                                          total
-#   preflight + smoke       996685's GPU smoke ~4.5 min (compiles); 32^3 x 6 gens     ~8 min
-#   2048^3 transforms       15 passes x ~9 s (D5: 2048^3 inverse at W=4, 28.2 s/3)    ~3 min
-#   2048^3 source/noise     on the cards, one plane at a time; UNPRICED              ~3 min
-#   2048^3 V staging        103 GB at 0.96 GB/s write + 1.76 GB/s read (C11)         ~3 min
-#   2048^3 emission         host numpy, 8.6e9 rows; UNPRICED, 30-60 ns/row guessed  ~5-9 min
+#   preflight + smoke       997280: 33 s (32^3 x 6 generations on the cards)          ~2 min
+#   emit-shape, 4096^3 slab 16 GB of host fields + 3 sources + 1 destination; UNPRICED ~10 min
+#   2048^3 before emission  997280 MEASURED: 7.8 + 41 + 7 + 196 + 48 s                 ~5 min
+#   2048^3 emission         cards; UNPRICED (host was 2115 s); emit-shape reprices    ~5 min
 #   projection + cleanup                                                             ~1 min
-#   4096^3 generation       2048^3 x 8.73 (n^3 log n); the projection leg reprices  ~2.5 h
-#   pytest, 2 files, GPU    UNPRICED; 996857's 6 files took 10:18                    ~10 min
+#   4096^3 before emission  997280 MEASURED: 58 + 370 + 93 + 1979 + 549 s             ~51 min
+#   4096^3 emission         cards; UNPRICED (host ~6.6 h); the projection reprices   ~30 min
+#   pytest, 5 files, GPU    997280's 2 files took 35 s                               ~3 min
 #
 # PRE-REGISTERED:
 #   - preflight or smoke failure stops the job before any generation;
@@ -77,6 +81,10 @@ run_leg preflight \
 run_leg smoke \
   pixi run -e gpu python scripts/v2_d6_device_ics.py smoke --out $CARDS/d6_smoke_gb.json \
   || { echo "FATAL: the smoke missed, not spending the node on the generations"; exit 1; }
+run_leg emit-shape \
+  pixi run -e gpu python scripts/v2_d6_device_ics.py emit-shape --n 4096 --nb 256 \
+    --out $CARDS/d6b_emit_shape_gb.json --tmp "$RUNS" \
+  || { echo "STOP: one 4096^3 emission slab projects past the card budget"; exit 1; }
 
 # card memory, sampled for the whole generation (inside this job; dies with it)
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader -l 10 > "$GPU_LOG" 2>/dev/null &
@@ -102,7 +110,8 @@ run_leg ics-4096 \
 kill $SAMPLER 2>/dev/null
 
 run_leg pytest-gpu \
-  pixi run -e gpu python -m pytest -q tests/test_ooc_fft_device_kernels.py tests/test_icgen_device.py
+  pixi run -e gpu python -m pytest -q tests/test_ooc_fft_device_kernels.py tests/test_icgen_device.py \
+    tests/test_device_emit.py tests/test_icgen.py tests/test_plan.py
 
 echo ""
 echo "=== rc_total=$rc_total ==="

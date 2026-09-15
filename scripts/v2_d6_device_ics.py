@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 import numpy as np
 
@@ -31,7 +32,7 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 
 GB = 1e9
 GB_HOST, GB_CARD = 1026.0, 199.0
-STOP_WALL_H, STOP_HOST_FRAC = 9.0, 0.9
+STOP_WALL_H, STOP_HOST_FRAC, STOP_CARD_FRAC = 6.0, 0.9, 0.9
 
 
 def _quota_remaining_gb(path):
@@ -152,6 +153,85 @@ def cmd_smoke(args):
     return rc
 
 
+class _Window:
+    """A host field that holds only planes [g0, g0 + len) of a larger box, indexed globally."""
+
+    def __init__(self, arr, g0):
+        self.arr, self.g0 = arr, g0
+
+    def __getitem__(self, sl):
+        return self.arr[sl.start - self.g0:sl.stop - self.g0]
+
+    def read_slab(self, lo, hi):
+        return self.arr[lo - self.g0:hi - self.g0]
+
+
+def cmd_emit_shape(args):
+    """One destination slab of the card emission at production shapes, on ONE card.
+
+    Synthetic fields over its three source slabs only (u within the window, v ~ N(0,1)).
+    Reports the card's peak (`memory_stats`, never reset -- hence its own process), the
+    per-source and per-destination seconds, and projects the whole emission on four
+    cards: the peak with this process's 3-slab u_x shard swapped for the real halo shard,
+    and nb destinations over the cards. rc 3 if the projected card peak exceeds
+    STOP_CARD_FRAC x GB_CARD.
+    """
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    from inexor.codec import T9Layout
+    from inexor.device import emit
+    from inexor.plan import ic_device_stages
+
+    n, nb, window, W = args.n, args.nb, 1, 4
+    box, dt = n / 2, np.dtype(np.float32)
+    p = n // nb
+    d = nb // 2
+    g0, g1 = (d - window) * p, (d + window + 1) * p
+    t9 = T9Layout(box, n, 2)
+    rng = np.random.default_rng(0)
+    depth = box / nb
+    shape = (g1 - g0, n, n)
+    t0 = time.perf_counter()
+    u = [(rng.random(shape, dtype=np.float32) * 1.8 - 0.9) * np.float32(depth) for _ in range(3)]
+    v = [rng.standard_normal(shape, dtype=np.float32) for _ in range(3)]
+    print(f"fields for {g1 - g0} planes of {n}^2: {time.perf_counter() - t0:.0f} s", flush=True)
+    dev = jax.devices()[0]
+    shard = dict(lo=d, hi=d + 1, x0=g0, nx=g1 - g0, device=dev,
+                 delta=jax.device_put(u[0], dev))
+    t = {}
+    out = tempfile.mkdtemp(dir=args.tmp)
+    t0 = time.perf_counter()
+    names, rows = emit.emit_t9_slabs_cards(out, [shard], _Window(u[1], g0), _Window(u[2], g0),
+                                           [_Window(a, g0) for a in v], t9, n, box, nb, dt,
+                                           window, timings=t, complete=False)
+    wall = time.perf_counter() - t0
+    peak = (dev.memory_stats() or {}).get("peak_bytes_in_use")
+    shard_b = (g1 - g0) * n * n * dt.itemsize
+    halo_b = (nb // W + 2 * window) * p * n * n * dt.itemsize
+    proj_peak = None if peak is None else peak - shard_b + halo_b
+    _h, card, _d = ic_device_stages(n, n_gpus=W, nb=nb)
+    # per card: nb/W destinations and nb/W + 2*window sources; the first call compiled
+    dest_each = t["dest_s"] + t["write_s"]
+    src_each = (t["source_s"] + t["upload_s"]) / (2 * window + 1)
+    proj_s = (nb // W) * dest_each + (nb // W + 2 * window) * src_each
+    res = dict(n=n, nb=nb, slab=d, rows=rows, wall_s=wall, split_s=t,
+               card_peak_gb=None if peak is None else peak / GB,
+               card_peak_projected_gb=None if proj_peak is None else proj_peak / GB,
+               planner_card_emission_gb=card["6 emission"] / GB,
+               emission_projected_s_per_card=proj_s, cold_includes_compile=True)
+    print(json.dumps(res, indent=2))
+    with open(args.out, "w") as fh:
+        json.dump(res, fh, indent=2)
+    for f in names:
+        os.remove(os.path.join(out, f))
+    if proj_peak is not None and proj_peak / GB > STOP_CARD_FRAC * GB_CARD:
+        print(f"STOP: projected card peak {proj_peak / GB:.0f} GB > "
+              f"{STOP_CARD_FRAC} x {GB_CARD} GB")
+        return 3
+    return 0
+
+
 def cmd_project(args):
     with open(args.card) as fh:
         c = json.load(fh)
@@ -217,6 +297,11 @@ def main():
     p = sub.add_parser("smoke")
     p.add_argument("--out", required=True)
     p.add_argument("--tmp", default=None)
+    p = sub.add_parser("emit-shape")
+    p.add_argument("--n", type=int, default=4096)
+    p.add_argument("--nb", type=int, default=256)
+    p.add_argument("--out", required=True)
+    p.add_argument("--tmp", default=None)
     p = sub.add_parser("project")
     p.add_argument("--card", required=True)
     p.add_argument("--gpu-log", default=None)
@@ -224,8 +309,8 @@ def main():
     p = sub.add_parser("cleanup")
     p.add_argument("--workdir", required=True)
     args = ap.parse_args()
-    return dict(preflight=cmd_preflight, smoke=cmd_smoke, project=cmd_project,
-                cleanup=cmd_cleanup)[args.cmd](args)
+    return {"preflight": cmd_preflight, "smoke": cmd_smoke, "emit-shape": cmd_emit_shape,
+            "project": cmd_project, "cleanup": cmd_cleanup}[args.cmd](args)
 
 
 if __name__ == "__main__":

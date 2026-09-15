@@ -57,6 +57,18 @@ def test_the_device_generation_loads_checks_and_says_what_it_is(tmp_path):
     assert st.vel_scale.min() < st.vel_scale.max()
 
 
+@pytest.mark.parametrize("f_NL", [0.0, 10.0])
+def test_card_emission_is_bitwise_host_emission_in_the_generator(tmp_path, f_NL):
+    if jax.devices()[0].platform != "cpu":
+        pytest.skip("a CPU-backend gate; the GPU reading is the D6 smoke's report")
+    mh, host, _ = _gen(tmp_path, "host", f_NL=f_NL, noise="device", devices=_devices(4),
+                       emission="host")
+    mc, cards, _ = _gen(tmp_path, "cards", f_NL=f_NL, noise="device", devices=_devices(4))
+    assert mh["emission"] == "host" and mc["emission"] == "cards"
+    assert set(mc["emission_s"]) == {"upload_s", "source_s", "dest_s", "write_s"}
+    assert _same_payload(host, cards)
+
+
 def test_card_noise_carries_its_own_stream_tag(tmp_path):
     man, _st, _d = _gen(tmp_path, "g", noise="device", devices=_devices(1))
     assert man["ic_stream"] == ic.IC_STREAM_DEVICE != ic.IC_STREAM
@@ -168,8 +180,15 @@ def test_host_allocation_is_what_the_planner_charges():
 def test_the_planner_stage_table_prices_4096_on_a_gb_node():
     host, card, disk = plan.ic_device_stages(4096, n_gpus=4, nb=256)
     field = 4096**3 * 4
-    # the design: at most three full-size arrays on the host, a quarter field per card
+    # the design: at most three full-size arrays on the host; on a card, a quarter field
+    # through the transforms and, in card emission, the u_x halo shard plus the source
+    # window and the larger emission program (charged, not measured: the gb emit-shape
+    # leg reads it)
     assert 3 * field <= max(host.values()) < 3.3 * field
-    assert max(card.values()) < 0.26 * field
+    halo = (256 // 4 + 2) * 16 * 4096**2 * 4
+    assert card["6 emission"] >= halo + 3 * 16 * 4096**2 * plan.EMIT_KEPT_B_PER_ROW
+    assert max(card[k] for k in card if not k.startswith("6")) < 0.27 * field
     assert disk["velocity staging (3 fields)"] == 3 * field
-    assert max(host.values()) < 1026e9 and max(card.values()) < 199e9
+    assert max(host.values()) < 1026e9 and max(card.values()) < 0.9 * 199e9
+    host_h, card_h, _ = plan.ic_device_stages(4096, n_gpus=4, nb=256, emission="host")
+    assert card_h["6 emission"] < card["6 emission"] and host_h["6 emission"] > host["6 emission"]

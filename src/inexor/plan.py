@@ -299,7 +299,17 @@ def _print_load_and_ic(args, ec, t9, n, rows, arena, shared):
     return max(ld.values())
 
 
-def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1, png=False):
+#: Card bytes per row of the emission programs (`device.emit`), from their array
+#: inventories, NOT measured: source program per plane-chunk row (float32/float64
+#: positions, int64 lattice/bucket/brick/key arrays), destination program per padded
+#: row (concatenated window, gather/sort indices, float64 velocities and codes).
+EMIT_SOURCE_B_PER_ROW = 150
+EMIT_DEST_B_PER_ROW = 200
+EMIT_KEPT_B_PER_ROW = 23  # key int64 + off uint8 x 3 + v float32 x 3, per live source row
+
+
+def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1, png=False,
+                     emission="cards", planes_per_call=4):
     """Host, per-card and disk bytes at each stage of `icgen.generate_t9_slabs_device`.
 
     Returns `(host, card, disk)`: dicts of stage -> bytes. Within a stage the
@@ -307,7 +317,8 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
     the max over stages. Mirrors the generator's allocation order (its docstring
     and stage comments). A LOWER BOUND: numpy and XLA temporaries at or below
     pencil/plane size are charged roughly and the page cache not at all.
-    `png` charges the f_NL != 0 phi round trip in stage 1.
+    `png` charges the f_NL != 0 phi round trip in stage 1. `emission` prices stage 6
+    for `device.emit` ("cards") or `icgen._emit_t9_slabs` ("host").
     """
     n, W = int(n), max(1, int(n_gpus))
     w = np.dtype(fdtype).itemsize
@@ -319,9 +330,9 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
     nb = int(nb) if nb else max(1, n // 16)
     rows_slab = n**3 // nb
     chunk_rows = min(int(slab), n // nb) * n * n
-    emission = ((2 * window + 1) * rows_slab * 35  # staged keys, offsets, float64 velocities
-                + rows_slab * 80                   # a destination slab's finalize copies
-                + chunk_rows * 80)                 # one chunk's float64 positions/velocities, keys
+    emission_b = ((2 * window + 1) * rows_slab * 35  # staged keys, offsets, float64 velocities
+                  + rows_slab * 80                   # a destination slab's finalize copies
+                  + chunk_rows * 80)                 # one chunk's float64 positions/velocities
     host = {
         "1 noise -> delta spectrum": (spec + field if png else spec) + pencil_host,
         "2 2LPT source (accumulated on the cards)": 2 * spec + pencil_host,
@@ -330,7 +341,7 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
         "5 displacements (x on the cards, y/z host)": (max(3 * spec, 2 * spec + field,
                                                            spec + 2 * field)
                                                        + pencil_host + slab_real),
-        "6 emission": 2 * field + emission,
+        "6 emission": 2 * field + emission_b,
     }
     quarter = -(-n // W) * n * n * w
     work = 6 * n * m * 2 * w + 4 * n * n * 2 * w  # a pencil block's program + a plane's, rough
@@ -342,6 +353,25 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
         "5 displacements (x on the cards, y/z host)": quarter + work,
         "6 emission": quarter,
     }
+    if emission == "cards":
+        p = n // nb
+        c = max(1, min(int(planes_per_call), p))
+        halo = (-(-nb // W) + 2 * window) * p * n * n * w
+        rows_src = p * n * n
+        cap = int(rows_src * 1.06)  # the capacity ladder's padding, ~one rung
+        per3 = (n // 2 // nb) ** 3  # bucket_cells 2: n / 2 buckets per side
+        host["6 emission"] = (2 * field
+                              + W * c * n * n * 5 * w                  # u_y, u_z, v uploads
+                              + W * (cap * 9 + nb * nb * per3 * 8))  # D2H off/w + occupancy
+        halo5 = 2 * window * p * n * n * w
+        card["5 displacements (x on the cards, y/z host)"] = quarter + halo5 + work
+        card["6 emission"] = (halo
+                              + (2 * window + 1) * rows_src * EMIT_KEPT_B_PER_ROW
+                              + max(c * n * n * EMIT_SOURCE_B_PER_ROW
+                                    + rows_src * EMIT_KEPT_B_PER_ROW,  # chunk concat
+                                    cap * EMIT_DEST_B_PER_ROW))
+    elif emission != "host":
+        raise ValueError(f"emission must be 'cards' or 'host', got {emission!r}")
     disk = {"velocity staging (3 fields)": 3 * field, "T9 slabs written": 9 * n**3}
     return host, card, disk
 

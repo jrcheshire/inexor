@@ -77,6 +77,19 @@ def test_streamed_build_is_bitwise_the_monolithic_one(tmp_path, f_NL):
     )
 
 
+def test_slab_rows_sort_relative_to_their_slab_past_2_to_the_32():
+    """Vista 997280: slab 128 of 256 at 4096^3 carried keys from 2^32; the radix refuses them."""
+    from inexor.layout import _stable_sort_index
+
+    rng = np.random.default_rng(0)
+    lo = 2**32 + 12345
+    rel = rng.integers(0, 50_000, size=20_000)
+    order = icgen._sort_slab_rows(lo + rel, lo)
+    assert np.array_equal(order, np.argsort(rel, kind="stable"))
+    with pytest.raises(ValueError, match="2\\^32"):
+        _stable_sort_index(lo + rel)
+
+
 def test_streamed_build_identity_can_fail(tmp_path):
     """Anti-vacuity: a different seed's slabs must NOT reproduce the build."""
     cosmo = Cosmology()

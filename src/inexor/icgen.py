@@ -321,6 +321,37 @@ def _write_manifest(workdir, manifest, keep_stage):
     return manifest
 
 
+def _sort_slab_rows(keyf, lo_bucket):
+    """Stable brick-major order of one destination slab's rows, keyed RELATIVE to the slab.
+
+    The global bucket ordinal reaches 2048^3 = 8.6e9 at 4096^3, past
+    `_stable_sort_index`'s 2^32 (Vista 997280 died on slab 128 of 256); a slab's
+    own span is nb^2 * per3. Subtracting a constant keeps the order.
+    """
+    return _stable_sort_index(np.asarray(keyf, dtype=np.int64) - int(lo_bucket))
+
+
+def _write_t9_slab(workdir, d, occ, off, w, scale_d, lo_bucket, lo_brick):
+    """Write destination slab `d` as `t9_slab_{d:04d}.npz` (schema `SCHEMA`, crc32 per
+    array); returns the file name. The ONE writer both emissions use."""
+    meta = dict(
+        schema=SCHEMA,
+        bx=int(d),
+        n_rows=int(len(off)),
+        bucket_lo=int(lo_bucket),
+        brick_lo=int(lo_brick),
+        crc32=dict(
+            occupancy=zlib.crc32(occ.tobytes()),
+            off=zlib.crc32(off.tobytes()),
+            w=zlib.crc32(w.tobytes()),
+            scale=zlib.crc32(scale_d.tobytes()),
+        ),
+    )
+    path = os.path.join(workdir, f"t9_slab_{int(d):04d}.npz")
+    np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w, scale=scale_d)
+    return os.path.basename(path)
+
+
 def _emit_t9_slabs(workdir, u_ro, v_ro, t9, n, box, nb, dt, slab, window):
     """Emission: Lagrangian x-slabs through a sliding window into per-destination T9 files.
 
@@ -352,9 +383,9 @@ def _emit_t9_slabs(workdir, u_ro, v_ro, t9, n, box, nb, dt, slab, window):
                else np.empty((0, 3), np.uint8))
         v = (np.concatenate([p[2] for p in parts]) if parts
              else np.empty((0, 3), np.float64))
-        order = _stable_sort_index(keyf)
-        keyf, off, v = keyf[order], off[order], v[order]
         lo_bucket = d * nb * nb * per3
+        order = _sort_slab_rows(keyf, lo_bucket)
+        keyf, off, v = keyf[order], off[order], v[order]
         occ = np.bincount(keyf - lo_bucket, minlength=nb * nb * per3).astype(np.int64)
         # ONE SCALE PER BRICK, over this slab's bricks only -- which is sound
         # because a brick belongs to exactly one x-slab, so no other slab can
@@ -367,23 +398,8 @@ def _emit_t9_slabs(workdir, u_ro, v_ro, t9, n, box, nb, dt, slab, window):
         bcounts = occ.reshape(nb * nb, per3).sum(axis=1)
         scale_d = _scales_from_sorted(np.abs(v).max(axis=1), bcounts)
         w = _encode_at(v, scale_d[keyf // per3 - lo_brick])
-        meta = dict(
-            schema=SCHEMA,
-            bx=d,
-            n_rows=int(len(keyf)),
-            bucket_lo=int(lo_bucket),
-            brick_lo=int(lo_brick),
-            crc32=dict(
-                occupancy=zlib.crc32(occ.tobytes()),
-                off=zlib.crc32(off.tobytes()),
-                w=zlib.crc32(w.tobytes()),
-                scale=zlib.crc32(scale_d.tobytes()),
-            ),
-        )
-        path = os.path.join(workdir, f"t9_slab_{d:04d}.npz")
-        np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w, scale=scale_d)
         staged[d].clear()
-        written.append(os.path.basename(path))
+        written.append(_write_t9_slab(workdir, d, occ, off, w, scale_d, lo_bucket, lo_brick))
         return len(keyf)
 
     finalized = np.zeros(nb, dtype=bool)
@@ -484,13 +500,16 @@ def generate_t9_slabs_device(
     pencil_batch=1,
     noise="device",
     log=None,
+    emission="cards",
 ):
     """`generate_t9_slabs` with the IC stage on the cards (D6). Same arguments and output format.
 
     Extra arguments: `devices` (default every jax device), `pencil_batch`,
     `noise` ("device": drawn on the cards, stream `ic.IC_STREAM_DEVICE`; "host":
-    the CPU stream `ic.IC_STREAM`, for parity against the host generator), and
-    `log` (a callable taking one line, called as each stage ends).
+    the CPU stream `ic.IC_STREAM`, for parity against the host generator), `log`
+    (a callable taking one line, called as each stage ends), and `emission`
+    ("cards": `device.emit.emit_t9_slabs_cards`; "host": `_emit_t9_slabs`, the
+    oracle -- the two write bitwise-identical slabs on the CPU backend).
 
     What differs from the host generator, all for wall and host memory:
     - every kernel is applied on the card inside the axis-0 pass
@@ -517,6 +536,8 @@ def generate_t9_slabs_device(
             "eps x rms. Enable x64 in the caller (the fields stay float32).")
     if noise not in ("device", "host"):
         raise ValueError(f"noise must be 'device' or 'host', got {noise!r}")
+    if emission not in ("cards", "host"):
+        raise ValueError(f"emission must be 'cards' or 'host', got {emission!r}")
     t9 = T9Layout(box_size, n_part, bucket_cells)
     n, box = int(n_part), float(box_size)
     nb = int(bricks_per_side)
@@ -618,13 +639,26 @@ def generate_t9_slabs_device(
     ooc_fft.kspace_pass_device([(D1, spec), (-D2, spec2)], n, box, out=spec, transform=False,
                                **kw)
     del spec2
-    ranges = ooc_fft.partition_units(n, len(devs), 1)
     ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(0), out=work,
                                inverse=True, **kw)
-    ux = ooc_fft.inverse_to_card_shards(work, n, [(lo, hi - lo, d) for (lo, hi), d
-                                                  in zip(ranges, devs)],
-                                        pencil_batch=pencil_batch, pass2=False)
-    ux = [dict(lo=lo, hi=hi, device=d, delta=a) for ((lo, hi), d), a in zip(zip(ranges, devs), ux)]
+    if emission == "cards":
+        # each card's own destination slabs plus `window` brick slabs of halo either side
+        from .device import emit as demit
+
+        ux = demit.card_slab_ranges(n, nb, devs, window)
+        arrays = ooc_fft.inverse_to_card_shards(
+            work, n, [(r["x0"], r["nx"], r["device"]) for r in ux],
+            pencil_batch=pencil_batch, pass2=False)
+        for r, a in zip(ux, arrays):
+            r["delta"] = a
+    else:
+        ranges = ooc_fft.partition_units(n, len(devs), 1)
+        arrays = ooc_fft.inverse_to_card_shards(
+            work, n, [(lo, hi - lo, d) for (lo, hi), d in zip(ranges, devs)],
+            pencil_batch=pencil_batch, pass2=False)
+        ux = [dict(lo=lo, hi=hi, device=d, delta=a)
+              for ((lo, hi), d), a in zip(zip(ranges, devs), arrays)]
+    del arrays
     umax = max(float(np.asarray(jax.numpy.max(jax.numpy.abs(s["delta"])))) for s in ux)
 
     uy = np.empty((n, n, n), dtype=dt)
@@ -633,9 +667,14 @@ def generate_t9_slabs_device(
     for lo, s in ooc_fft.inverse_to_slabs_device(work, n, slab=slab, pass2=False, **kw):
         uy[lo:lo + s.shape[0]] = s
         umax = max(umax, float(np.max(np.abs(s))))
-    del work
 
-    uz = np.empty((n, n, n), dtype=dt)
+    # U_z takes the work buffer's own bytes (n^2 (n/2+1) x 2w >= n^3 x w) rather than a new
+    # field after `del work`: a device array uploaded from a slice of `work` can keep the
+    # whole buffer alive until the runtime releases it, and an allocation inside that window
+    # held a 4th field on the host (measured on CPU devices, 2026-09-15: 4.17 fields where
+    # the design is 3). Reuse makes the peak independent of when that happens.
+    uz = work.reshape(-1).view(np.uint8)[:n**3 * dt.itemsize].view(dt).reshape(n, n, n)
+    del work
     ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(2), out=spec,
                                inverse=True, **kw)
     for lo, s in ooc_fft.inverse_to_slabs_device(spec, n, slab=slab, pass2=False, **kw):
@@ -660,9 +699,14 @@ def generate_t9_slabs_device(
     t0 = time.perf_counter()
     v_ro = [ooc_fft.StagedArray.open(os.path.join(stage, f"v_{ax}.npy"), dt, (n, n, n))
             for ax in range(3)]
-    written, n_total = _emit_t9_slabs(
-        workdir, [_CardField(ux), _HostField(uy), _HostField(uz)], v_ro, t9, n, box, nb, dt,
-        slab, window)
+    emission_s = {}
+    if emission == "cards":
+        written, n_total = demit.emit_t9_slabs_cards(
+            workdir, ux, uy, uz, v_ro, t9, n, box, nb, dt, window, timings=emission_s)
+    else:
+        written, n_total = _emit_t9_slabs(
+            workdir, [_CardField(ux), _HostField(uy), _HostField(uz)], v_ro, t9, n, box, nb,
+            dt, slab, window)
     del ux, uy, uz
     _lap("emission", t0)
 
@@ -687,6 +731,8 @@ def generate_t9_slabs_device(
         table_n_points=int(len(tab.k)),
         mean_phi2=None if mean_phi2 is None else float(mean_phi2),
         generator="device",
+        emission=emission,
+        emission_s=emission_s,
         n_devices=len(devs),
         pencil_batch=int(pencil_batch),
         stage_s=timings,
