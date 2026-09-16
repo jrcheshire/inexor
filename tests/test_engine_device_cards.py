@@ -67,7 +67,10 @@ def test_a_run_on_w_cards_is_bitwise_the_run_on_one(w):
         # the migrate and repack split too, or say why not
         md = o["migrate_device"]
         assert md["cards"] == w or md["fallback"], "the migrate did not use the cards"
-        assert o["repack"]["repack_device"]["cards"] == w
+        # fused, the repack runs inside the migrate's pass and takes its split
+        # (a fallback included); separate, it splits by itself
+        want = md["cards"] if o["migrate_repack_fused"] else w
+        assert o["repack"]["repack_device"]["cards"] == want
     assert all(o["device_cards"] == 1 and len(o["tile_cards"]) == 1 for o in o1)
 
 

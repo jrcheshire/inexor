@@ -188,6 +188,7 @@ class EngineConfig:
         device_paint_chunk_bricks=None,
         device_tile_window=None,
         device_cards=1,
+        migrate_repack_fused=None,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -333,6 +334,15 @@ class EngineConfig:
         # walking its own planes through its own window, and, under
         # `migrate_backend="device"`, the migrate and repack by x-slabs.
         self.device_cards = int(device_cards)
+        # M4: on a step whose repack is due, the device migrate and repack as ONE
+        # visit per slab (`device.fused.migrate_repack_device`), sized by the
+        # destination census the windowed tile loop takes. Bitwise the two passes.
+        # TRI-STATE, the `device_tile_window` pattern: None = AUTO, fused wherever
+        # the device migrate and the tile window both run; True = REQUIRE it,
+        # refused at validate() where it cannot apply; False = the separate passes,
+        # the A/B arm. `fused_pass` is the resolved value.
+        self.migrate_repack_fused = (
+            None if migrate_repack_fused is None else bool(migrate_repack_fused))
 
     @property
     def np_coarse_dtype(self):
@@ -341,6 +351,14 @@ class EngineConfig:
     @property
     def np_fine_dtype(self):
         return np.dtype(self.fine_dtype)
+
+    @property
+    def fused_pass(self):
+        """Whether a step with a repack due runs the fused migrate + repack:
+        `migrate_repack_fused` resolved (None = wherever the device migrate and the
+        tile window both run)."""
+        applies = self.migrate_backend == "device" and self.tile_window
+        return applies and self.migrate_repack_fused is not False
 
     @property
     def tile_window(self):
@@ -773,6 +791,13 @@ class EngineConfig:
                 raise ValueError(
                     f"device_cards={self.device_cards} > {self.tiles_side} tile planes: a card "
                     "would run no tiles.")
+        if self.migrate_repack_fused is True and not (
+                self.migrate_backend == "device" and self.tile_window):
+            raise ValueError(
+                "migrate_repack_fused=True fuses the DEVICE migrate with the repack and "
+                "sizes it from the tile window's census, but migrate_backend="
+                f"{self.migrate_backend!r}, tile_window={self.tile_window}; the knob could "
+                "not apply.")
         on_device = [n for n in ("migrate_backend", "coarse_backend", "tile_backend")
                      if getattr(self, n) == "device"]
         if on_device:
@@ -1359,7 +1384,8 @@ def _cards(cfg):
 
 
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
-         phase=None, tile_force=None, pool=None, coarse_parts=None, device_shapes=None):
+         phase=None, tile_force=None, pool=None, coarse_parts=None, device_shapes=None,
+         repack_due=False):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1 and
@@ -1404,6 +1430,11 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     from a checkpoint so a resumed run compiles the programs the uninterrupted
     one did. The compiled tile loop has one boundary, `tile_loop`, in place of
     the per-tile ones: a synced per-tile timing is not neutral (record sec. 20).
+
+    `repack_due` says this step's repack follows it (`run` passes it). Where
+    `cfg.fused_pass`, the tile loop then takes the destination census and the
+    migrate and repack run fused (`device.fused`), and `stats["repack"]` is filled
+    here; otherwise it is None and the caller repacks.
 
     `phase`, if given, is called with a boundary NAME after each phase of the
     step completes. It exists because a peak is a max and a max carries no
@@ -1582,6 +1613,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
             # covers; their host write-backs are disjoint core slabs
             wsh = window_shapes(st, cfg.n_tile, b_real, cfg.n_brick,
                                 floor=shapes_in.get("window"))
+            # M4: the census the fused migrate + repack sizes its new ranges from
+            fused_now = bool(repack_due) and cfg.fused_pass
             shapes_out["window"] = wsh
             wshapes = dict(shapes, window=wsh)
 
@@ -1589,7 +1622,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
                 a, b = plane_parts[k]
                 return tile_loop_windowed(
                     st, one_tile, C, None, members, wshapes, planes=range(a, b),
-                    coarse_shard=g_coarse[k], device=None if devs is None else devs[k])
+                    coarse_shard=g_coarse[k], device=None if devs is None else devs[k],
+                    census=float(c_drift) if fused_now else None)
 
             if devs is None:
                 loops = [run_card(0)]
@@ -1666,7 +1700,19 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # a peak comparison against every card on record is still like-for-like.
     ph("reconcile")
 
-    stats = _migrate_pass(st, cfg, c_drift, pool)
+    fused_now = bool(repack_due) and cfg.fused_pass
+    repack_stats = None
+    if fused_now:
+        from .device.fused import migrate_repack_device
+
+        census_counts = sum(lp["census_counts"] for lp in loops)
+        stats, repack_stats = migrate_repack_device(
+            st, c_drift, census_counts, brick_slack=cfg.brick_slack,
+            device_budget_bytes=cfg.migrate_device_budget_bytes, devices=_cards(cfg))
+    else:
+        stats = _migrate_pass(st, cfg, c_drift, pool)
+    # the knob's receipt, on every card in both directions
+    stats["migrate_repack_fused"] = fused_now
     # the knob's receipt, in BOTH directions: 0 on every serial card, W on
     # every pooled one (the reach fallback reports 0 through migrate_pool)
     stats["migrate_pooled_workers"] = int(stats.get("migrate_pool", {}).get("workers", 0))
@@ -1727,7 +1773,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         stats["device_cards"] = cfg.device_cards
         stats["tile_cards"] = tile_cards
     stats.update(mesh_stats)
-    stats["repack"] = None
+    stats["repack"] = repack_stats
     if collect is not None:
         collect(stats)
     return stats
@@ -1757,9 +1803,10 @@ def fused_drifts(coeffs):
 #     policy; the pooled migrate is bitwise the serial one (C14) and W is
 #     exactly the thing you want to change when resuming onto another node.
 #   eject_kernel -- both kernels are bitwise on arm64/x86/CUDA (record 5s).
-#   migrate_backend, migrate_device_budget_bytes -- execution policy; the device
-#     migrate and repack are bitwise the serial host passes (D3b R1/R1b gates),
-#     and a resume onto a node with a different backend is the point.
+#   migrate_backend, migrate_device_budget_bytes, migrate_repack_fused -- execution
+#     policy; the device migrate and repack, separate or fused, are bitwise the
+#     serial host passes (D3b R1/R1b, M4 gates), and a resume onto a node with a
+#     different backend is the point.
 #   repack_every, chunk_bricks, brick_slack -- move the LAYOUT, and the layout
 #     carries no physics: both paints are integer and so order-independent
 #     (D-v2-21), which is also why this checkpoint does not preserve
@@ -2053,15 +2100,19 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                 )
         n_ckpt = 0
         for k in range(k0, k_end):
+            repack_due = bool(cfg.repack_every and (k + 1) % cfg.repack_every == 0)
             stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
                          census=census, cap_shape=cap_shape, pad_shape=pad_shape,
                          phase=phase, tile_force=tile_force, pool=pool,
-                         coarse_parts=coarse_parts, device_shapes=device_shapes)
+                         coarse_parts=coarse_parts, device_shapes=device_shapes,
+                         repack_due=repack_due)
             cap_shape = int(stats["cap"])
             pad_shape = int(stats["coarse_pad"])
             device_shapes = stats["device_shapes"]
-            if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
-                stats["repack"] = _repack_pass(st, cfg)
+            if repack_due:
+                # the fused pass has already repacked, inside the migrate phase
+                if stats["repack"] is None:
+                    stats["repack"] = _repack_pass(st, cfg)
                 ph("repack")
             # AFTER the repack, so the checkpoint is the step's settled state.
             # The receipt goes on every step in both directions, `None` when

@@ -212,3 +212,47 @@ def test_the_fused_pass_does_not_cross_twice():
     assert reads.get("insert: occupancy", 0) == 0, reads
     assert reads.get("fused: occupancy") == nb, reads
     assert drepack.CALLS == calls, "the device repack ran"
+
+
+# ------------------------------------------------------------------ through the engine
+
+
+def _engine_kw(**kw):
+    return dict(coarse_backend="device", tile_backend="device", migrate_backend="device", **kw)
+
+
+@pytest.mark.parametrize("cards", [1, 4])
+def test_a_fused_engine_run_is_bitwise_the_separate_passes(cards):
+    from inexor import engine
+    from inexor.device import fused
+    from tests.test_engine_device_backend import _coeffs, _same
+    from tests.test_engine_device_backend import _state as _estate
+    from tests.test_engine_device_step import _cfg, _same_stats
+
+    if cards > 1:
+        _devices(cards)
+    co = _coeffs(3)
+    cfg_s = _cfg(**_engine_kw(migrate_repack_fused=False, device_cards=cards))
+    cfg_f = _cfg(**_engine_kw(device_cards=cards))
+    assert cfg_f.fused_pass and not cfg_s.fused_pass
+    st_s, st_f = _estate(cfg_s), _estate(cfg_f)
+    out_s = engine.run(st_s, cfg_s, co)
+    c0 = fused.CALLS
+    out_f = engine.run(st_f, cfg_f, co)
+    assert fused.CALLS - c0 == len(co), "the fused pass did not run every step"
+    _same(st_s, st_f, "fused vs separate")
+    _same_stats(out_s, out_f, drop=("migrate_repack_fused", "coarse_jit_traces"))
+    assert all(o["migrate_repack_fused"] for o in out_f)
+    assert not any(o["migrate_repack_fused"] for o in out_s)
+    assert all(o["repack"]["repack_device"].get("fused") for o in out_f)
+    assert sum(o["n_arena_overflow"] for o in out_f) > 0, "VACUOUS: nothing spilled"
+
+
+def test_validate_refuses_fused_where_it_cannot_apply():
+    from tests.test_engine_device_step import _cfg
+
+    for kw in (dict(migrate_backend="host"), dict(device_tile_window=False)):
+        cfg = _cfg(**dict(_engine_kw(migrate_repack_fused=True), **kw))
+        with pytest.raises(ValueError, match="migrate_repack_fused=True"):
+            cfg.validate()
+        assert not cfg.fused_pass
