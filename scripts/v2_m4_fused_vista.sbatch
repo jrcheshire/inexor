@@ -25,7 +25,7 @@
 #
 #   phase                          each (source)                               total
 #   jax devices + GPU pytest,      1001060: 8 files 7:30; this set adds engine
-#   10 files                       runs and cards (996857's 6 engine/card files
+#   11 files                       runs and cards (996857's 6 engine/card files
 #                                  took 10:18), so both classes              ~20 min
 #   smokes, 32^3 / 64^3            1001060 smoke 26 s; engine smoke ~1 min     ~2 min
 #   engine cgh64 K=2: window-sep,  996857: 8 engine arms + solve in 13 min after
@@ -92,7 +92,8 @@ run_leg pytest-gpu \
     tests/test_migrate_device.py tests/test_migrate_device_cards.py \
     tests/test_migrate_device_stalls.py tests/test_device_census.py \
     tests/test_fused_migrate_repack.py tests/test_repack_device.py \
-    tests/test_device_window.py tests/test_engine_device_cards.py
+    tests/test_device_window.py tests/test_engine_device_backend.py \
+    tests/test_engine_device_cards.py
 run_leg smoke-migrate \
   pixi run -e gpu python scripts/v2_d3_device_migrate.py --arms device-fused --real-n 64 \
     --steps 2 --reps 1 --pass fused --out-suffix _m4_gbsmoke
