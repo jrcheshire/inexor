@@ -2787,3 +2787,85 @@ enough for the answer to matter.
 4. Carried from sec. 36: JC to confirm the proposed IC parity bars. Against them this
    run reads occupancy exact, codes within 1, scales 5.5e-7, numpy host peak 1.01x the
    planner at 4096^3 and 1.04x at 2048^3 -- all inside the proposed brackets.
+
+## 39. M2 on a GB200 (Vista 999779) -- the rewritten insert is identical to the frozen pre-`cba30c3` insert at 4096^3 slab shape; 1.25x on the warm wall, 1.9% off the device peak
+
+`b679ada`, 2026-09-16, gb node c672-011, COMPLETED rc=0 in 12:14 of 1:30:00 (~0.2 SU).
+Sbatch `v2_m2_insert_ab_vista.sbatch`; cards
+`runs/v2/d3_device_migrate_m2ab_{gbsmoke,gb,parity_gb,peak_gb}.json`, log copied to
+`runs/v2/m2-insert-ab-999779.log`. What ran (`cba30c3`, `1ecae62`): the compiled
+insert's slab-relative uint32 sort key with an int32 index (`narrow_key_ok` guards it),
+an exclusive-prefix partition in place of the second argsort, and the int32 index
+family. The before is `scripts/v2_d3_insert_legacy.py`, a frozen copy of
+`insert_jax` at `cba30c3~1`, so both arms ran in one job on one node.
+
+### Gates on the GPU: PASS
+
+| comparison | reading |
+|---|---|
+| GPU pytest | 83 passed, 1 skipped in 7:47 |
+| compiled migrate vs numpy, 32^3 smoke, 2 steps | state bitwise, stats equal; 2,647 arena overflows exercised |
+| compiled migrate vs numpy, 256^3 (`xback`), 2 steps | state bitwise, stats equal; 188,179 overflows, 89,782 residents re-homed, realized reach 2; no vacuous receipts |
+| device migrate vs numpy, cgh64 shape (`device-real`, 512^3, nb=32), 2 steps + timed | bitwise every step |
+| current vs frozen insert, 32^3 smoke | 288,357 rows, all 9 output fields 0 differences |
+| **current vs frozen insert, nb=256 (268,435,456 slab rows), share 0.05, reach 1** | **295,278,999 rows, all 9 output fields (`abs_max`, `dest`, `n_spill`, `n_write`, `occupancy`, `off`, `pos`, `scales`, `w`) 0 differences** |
+
+### The CUB premise: supported, by a string receipt
+
+The optimized, compiled HLO of the CURRENT insert at production shape contains `cub` and
+`sort` (and neither `radix` nor `bitonic`). The sort does lower to a CUB call on this
+stack, which is the premise that made the key's width the lever. The receipt is a
+substring search of the compiled text, not an identification of which CUB routine ran,
+and the frozen insert's HLO was not dumped, so it does not show the width change is
+where the time went.
+
+### Speed and memory: the A/B at production slab shape, one node, separate processes
+
+`peak-insert --insert-impl {legacy,current}`, share 0.05, reach 1, 295,278,999 input
+rows (1.10 slabs), 301,308,612 padded; 268,439,125 written, 0 spilled in both. Wall is
+the public `insert_rows` call: host padding, upload, compute, readback.
+
+| | legacy (pre-`cba30c3`) | current | ratio |
+|---|---|---|---|
+| wall, call 1 (compiles) | 3.79 s | 3.26 s | 1.16x |
+| **wall, call 2** | **2.38 s** | **1.90 s** | **1.25x** |
+| device peak | 22.28 GiB | 21.86 GiB | 0.981 |
+| B per padded row | 79.41 | 77.91 | -1.50 |
+| B per slab row | 89.13 | 87.45 | |
+
+- **Both pre-registered directions hold: faster and lower.** The wall reading is one
+  warm call per arm, legacy run first; order and repeat spread are not separated. The
+  kernel's own share of the 0.48 s is not split out from transfers, which are the same
+  size in both arms.
+- **The peak moved far less than the CPU compile predicted.** CPU XLA
+  `memory_analysis` read the kernel temp at 71.0 -> 63.0 B per padded row (8.0,
+  ~2.4 GB at this n_pad); the GPU peak moved 1.50 B per padded row (0.42 GiB). Whether
+  the peak at this shape is set by inputs and outputs rather than temp, or the GPU
+  compile plans temp differently, is not separated.
+
+### The cgh64-shape migrate against sec. 31 (cross-job, cross-node)
+
+`device-real` timed step: 1.72 s here (c672-011) against 1.66 s in 995638 (c672-002).
+`insert: kernel` 0.477 -> 0.336 s; `eject: upload` 0.163 -> 0.254 and `insert: slot
+range to host` 0.213 -> 0.299, the two bus-bound phases, account for the rest. Node
+spread on transfer work is measured at 1.28-1.36x (secs. 9-10), so this pair cannot
+read the rewrite's step-level effect in either direction. The same-node A/B above is
+the measurement. Device peak 1.23 GiB here against 1.25 GiB.
+
+### At 4096^3
+
+0.48 s saved per slab-shape insert x 256 slabs = ~123 s per step on one card, ~44 s at
+R3's 2.8x across four cards, against the ~304 s/step the migrate was carried to by
+linear scaling from cgh64 (12.4 ns/row). That carry is itself in question: 256 inserts
+at the measured 1.90-2.38 s are 490-610 s of the carried ~852 s one-card migrate, where
+the kernel was 28.8% of the migrate at cgh64. Either the insert scales worse than
+linearly from cgh64 to slab shape, or the linear carry under-reads. The D7 smoke reads
+the migrate at 4096^3 directly.
+
+### Owed
+
+1. M3, the host stalls: `window()`'s host copy of already-contiguous slab rows, and
+   `insert: census`'s blocking device-scalar read per source slab.
+2. The migrate at 4096^3 shape per phase, which resolves the linear-carry question
+   above; the D7 smoke reads it.
+3. M4 = R4 fusion, on JC's reach-rule call.

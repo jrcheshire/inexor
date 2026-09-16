@@ -1,0 +1,170 @@
+{
+ "argv": [
+  "scripts/v2_d3_device_migrate.py",
+  "--arms",
+  "xback,device-real",
+  "--xback-n",
+  "256",
+  "--real-n",
+  "512",
+  "--steps",
+  "2",
+  "--out-suffix",
+  "_m2ab_gb"
+ ],
+ "started": "2026-09-16T01:29:59",
+ "job": "999779",
+ "node": "c672-011.vista.tacc.utexas.edu",
+ "commit": "b679ada",
+ "arms": [
+  {
+   "arm": "xback",
+   "rc": 0,
+   "record": {
+    "arm": "xback",
+    "platform": "gpu",
+    "n_part": 256,
+    "nb": 16,
+    "c_drift": 5.301646762279934,
+    "drift_frac": 1.9,
+    "build_s": 4.125211559992749,
+    "steps": [
+     {
+      "numpy_s": 4.446371786005329,
+      "jax_s": 4.296149599016644,
+      "stats_equal": true,
+      "field_diffs": {},
+      "stats": {
+       "n_arena_overflow": 89782,
+       "arena_used": 89782,
+       "vel_scale": 8.749759552740715e-05,
+       "vel_scale_min": 5.126865552267096e-05,
+       "n_migrated_checked": 16777216,
+       "brick_reach": 2,
+       "brick_reach_raw": 2,
+       "brick_reach_realized": 2,
+       "peak_staged_slabs": 4
+      }
+     },
+     {
+      "numpy_s": 4.608534397033509,
+      "jax_s": 2.8246500690001994,
+      "stats_equal": true,
+      "field_diffs": {},
+      "stats": {
+       "n_arena_overflow": 98397,
+       "arena_used": 98397,
+       "vel_scale": 8.749759552740715e-05,
+       "vel_scale_min": 5.1430809184914184e-05,
+       "n_migrated_checked": 16777216,
+       "brick_reach": 2,
+       "brick_reach_raw": 2,
+       "brick_reach_realized": 2,
+       "peak_staged_slabs": 4
+      }
+     }
+    ],
+    "eject_calls": 32,
+    "insert_calls": 32,
+    "overflow": 188179,
+    "residents_rehomed": 89782,
+    "realized_reach": 2,
+    "vacuous": []
+   }
+  },
+  {
+   "arm": "device-real",
+   "rc": 0,
+   "record": {
+    "arm": "device-real",
+    "platform": "gpu",
+    "n_part": 512,
+    "nb": 32,
+    "rows_per_slab": 4194304,
+    "c_drift": 1.2993772982005518,
+    "drift_frac": 0.5,
+    "build_s": 31.442818634037394,
+    "steps": [
+     {
+      "numpy_s": 28.18347246601479,
+      "device_s": 6.422768473974429,
+      "new_programs": 8,
+      "field_diffs": {},
+      "stats_equal": true,
+      "stats": {
+       "n_arena_overflow": 0,
+       "arena_used": 0,
+       "vel_scale": 9.394810735345579e-05,
+       "vel_scale_min": 5.093777194760437e-05,
+       "n_migrated_checked": 134217728,
+       "brick_reach": 1,
+       "brick_reach_raw": 1,
+       "brick_reach_realized": 1,
+       "peak_staged_slabs": 2
+      },
+      "receipt": {
+       "slabs": 32,
+       "programs": 8,
+       "spill_rows": 0,
+       "peak_estimate_bytes": 1320954821,
+       "budget_bytes": null
+      }
+     },
+     {
+      "numpy_s": 27.61330835800618,
+      "device_s": 1.7105694139609113,
+      "new_programs": 0,
+      "field_diffs": {},
+      "stats_equal": true,
+      "stats": {
+       "n_arena_overflow": 0,
+       "arena_used": 0,
+       "vel_scale": 9.394810735345579e-05,
+       "vel_scale_min": 5.053445927946704e-05,
+       "n_migrated_checked": 134217728,
+       "brick_reach": 1,
+       "brick_reach_raw": 1,
+       "brick_reach_realized": 1,
+       "peak_staged_slabs": 2
+      },
+      "receipt": {
+       "slabs": 32,
+       "programs": 8,
+       "spill_rows": 0,
+       "peak_estimate_bytes": 1320954821,
+       "budget_bytes": null
+      }
+     }
+    ],
+    "timed_step": {
+     "numpy_s": 27.580728304048534,
+     "device_s": 1.7233537609572522,
+     "phases": {
+      "pass: setup": 0.0005316159804351628,
+      "eject: host index + window": 0.13311633985722438,
+      "eject: upload": 0.25392913806717843,
+      "eject: rows program": 0.06565863505238667,
+      "eject: kernel": 0.019209338002838194,
+      "eject: reach + scalars": 0.06637937400955707,
+      "insert: census": 0.12055852019693702,
+      "insert: compact inputs": 0.22330792987486348,
+      "insert: kernel": 0.33585791097721085,
+      "insert: scalars + write program": 0.04364590294426307,
+      "insert: slot range to host": 0.2987155569717288,
+      "insert: occupancy + scales to host": 0.03838949219789356,
+      "insert: spills to host": 4.995078779757023e-05,
+      "insert: shrink staged": 0.08330979704624042,
+      "pass: arena replay": 0.011503900052048266,
+      "pass: final census": 0.01329708396224305
+     },
+     "phases_sum_s": 1.707460485980846,
+     "field_diffs": {},
+     "stats_equal": true
+    },
+    "device_peak": 1320669696,
+    "host_maxrss_gb": 24.6568603515625
+   }
+  }
+ ],
+ "finished": "2026-09-16T01:32:33"
+}
