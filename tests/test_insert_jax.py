@@ -118,6 +118,54 @@ def test_the_padding_path_is_exercised_and_bitwise(x64):
     insert_jax._CACHE.clear()
 
 
+def test_the_sort_key_sees_rows_on_both_sides_of_the_slab(x64):
+    """ANTI-VACUITY for the narrowed key: the sentinel path must be exercised.
+
+    The key is slab-relative and every row bound elsewhere collapses onto ONE
+    sentinel above the in-slab range. If a fixture's immigrant buffer only ever
+    held rows for the slab being written, that collapse would never run and the
+    narrowing would be untested -- so assert the buffer carries destinations
+    BELOW `lo_b` and ABOVE `hi_b`, including the periodic wrap at slab 0.
+    """
+    st = _state()
+    c = _c_drift(st, 1.9)
+    nb = int(st.bricks_per_side)
+    p3 = int(st.buckets_per_brick)
+    scales = np.array(st.vel_scale, dtype=np.float64, copy=True)
+    r = min(state.brick_reach(st, c, scales), nb // 2)
+    staged, emig = {}, {}
+    for s in range(nb):
+        staged[s], emig[s] = st._eject_slab(s, c, scales)
+    below = above = 0
+    for bx in range(nb):
+        lo_b, hi_b = st.slab_bricks(bx)
+        sources = sorted({(bx + o) % nb for o in range(-r, r + 1)})
+        dest = np.concatenate([emig[s]["dest"] for s in sources if len(emig[s]["dest"])])
+        brick = dest // p3
+        below += int((brick < lo_b).sum())
+        above += int((brick >= hi_b).sum())
+    assert below > 0, "VACUOUS: no immigrant was bound below its slab"
+    assert above > 0, "VACUOUS: no immigrant was bound above its slab"
+
+
+def test_the_narrow_key_guard_refuses_shapes_that_would_wrap():
+    """The guarded branch is unrunnable, so pin the DECISION instead.
+
+    Tripping the wide path needs `nb2 * p3 >= 2**32`, whose occupancy array alone
+    is 34 GB, so no test can exercise it -- which is exactly why the predicate is
+    separate and tested here. At `nb2 * p3 == 2**32` the sentinel wraps to 0 and
+    out-of-slab rows sort FIRST, measured on a scratch reproduction.
+    """
+    from inexor.insert_jax import narrow_key_ok
+
+    assert narrow_key_ok(512, 65536, 300_000_000), "production 4096^3 must narrow"
+    assert narrow_key_ok(512, 1024, 5_000_000), "production cgh64 must narrow"
+    assert not narrow_key_ok(512, 2**23, 1024), "nb2 * p3 == 2**32 must fall back"
+    assert not narrow_key_ok(512, 2**24, 1024), "past the ceiling must fall back"
+    assert not narrow_key_ok(512, 1024, 2**31), "n_pad at the int32 ceiling must fall back"
+    assert narrow_key_ok(512, 1024, 2**31 - 1), "just under it must still narrow"
+
+
 # ------------------------------------------------- the contracts around it
 
 

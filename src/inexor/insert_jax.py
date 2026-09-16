@@ -58,11 +58,40 @@ def _padded(n):
     return int(capacity_shape(max(1, int(n)) + 1, rungs=PAD_RUNGS_PER_OCTAVE))
 
 
+def narrow_key_ok(p3, nb2, n_pad):
+    """May this slab's sort use the uint32 key and int32 index?
+
+    Separated from `_build` because THE BRANCH IT GUARDS CANNOT BE RUN at any
+    testable size -- tripping it needs `nb2 * p3 >= 2**32`, whose occupancy array
+    alone is 34 GB -- so a test of the wide path would be a test no machine can
+    fail. The decision is testable even though the branch is not, which is the
+    part worth pinning.
+
+    Production is nowhere near either bound: at 4096^3 `nb2 * p3` is 33,554,432
+    (128x under) and `n_pad` is ~7e8 (3x under).
+    """
+    return int(nb2) * int(p3) < 2**32 and int(n_pad) < 2**31
+
+
 def _build(p3, nb2, n_pad, has_ids):
     import jax
     import jax.numpy as jnp
 
     big = int(np.iinfo(np.int64).max)
+    # THE SORT KEY IS SLAB-RELATIVE, AND NARROW. A destination inside this slab is
+    # bounded by `nb2 * p3` -- 33,554,432 at 4096^3, 128x under the uint32 ceiling
+    # -- and a narrow integer key is what puts a sort on a radix path instead of a
+    # comparison path. The permutation is IDENTICAL, not merely equivalent:
+    # subtracting a constant is order-preserving on the in-slab rows, every other
+    # row takes ONE sentinel strictly above all of them, and a stable sort agrees
+    # on ties. That is the same argument, and the same checked-range-with-fallback
+    # policy, as `state._stable_order`, where the identical change bought migrate's
+    # numpy sort 5.3x and the phase 1.67x end to end.
+    #
+    # Both bounds are STATIC and the fallback is the wide form, never a refusal.
+    # What they prevent is measured rather than asserted: at `nb2 * p3 == 2**32`
+    # the sentinel itself wraps to 0 and the out-of-slab rows sort FIRST.
+    narrow = narrow_key_ok(p3, nb2, n_pad)
 
     @jax.jit
     def kernel(dest, off, w, ids, s_old, real, lo_b, starts, div):
@@ -70,7 +99,13 @@ def _build(p3, nb2, n_pad, has_ids):
         idx_all = jnp.arange(n_pad, dtype=jnp.int64)
         brick = dest // p3
         inslab = real & (brick >= lo_b) & (brick < lo_b + nb2)
-        order = jnp.argsort(jnp.where(inslab, dest, big), stable=True)
+        if narrow:
+            # the `where` runs in int64 and both of its branches already sit in
+            # [0, nb2 * p3], so the cast can never see a value that wraps
+            key = jnp.where(inslab, dest - lo_b * p3, nb2 * p3).astype(jnp.uint32)
+            order = jnp.argsort(key, stable=True, dtype=jnp.int32)
+        else:
+            order = jnp.argsort(jnp.where(inslab, dest, big), stable=True)
         dest_s, off_s, w_s = dest[order], off[order], w[order]
         s_s, in_s = s_old[order], inslab[order]
 
@@ -98,8 +133,26 @@ def _build(p3, nb2, n_pad, has_ids):
 
         occ = jnp.zeros(nb2 * p3, dtype=jnp.int64).at[
             jnp.where(write, dest_s - lo_b * p3, 0)].add(write.astype(jnp.int64))
-        # written rows first, then spills, each in brick-then-rank order
-        o2 = jnp.argsort(jnp.where(write, 0, jnp.where(spill, 1, 2)), stable=True)
+        # Written rows first, then spills, each in brick-then-rank order. This is a
+        # THREE-CLASS STABLE PARTITION, and `jnp.argsort` charged a full radix sort
+        # for it -- eight passes over a 64-bit key and a 64-bit payload to separate
+        # three values. The exclusive-prefix form is the SAME PERMUTATION by
+        # construction, not merely an equivalent one: a stable sort lists class 0 in
+        # input order, then class 1, then class 2, which is exactly what placing
+        # each row at its rank within its own class produces. It is also the form
+        # `eject_jax._build` already uses for its keeper/leaver partition.
+        # Counts are taken in int64 explicitly -- a bool reduction promotes to
+        # float32 on this stack, and these become scatter indices.
+        w_i = write.astype(jnp.int64)
+        s_i = spill.astype(jnp.int64)
+        ex_w = jnp.cumsum(w_i) - w_i
+        ex_s = jnp.cumsum(s_i) - s_i
+        nw_t = ex_w[-1] + w_i[-1]
+        ns_t = ex_s[-1] + s_i[-1]
+        pos2 = jnp.where(write, ex_w,
+                         jnp.where(spill, nw_t + ex_s,
+                                   nw_t + ns_t + (idx_all - ex_w - ex_s)))
+        o2 = jnp.zeros(n_pad, dtype=jnp.int64).at[pos2].set(idx_all)
         return dict(pos=(starts[bl] + rank)[o2], dest=dest_s[o2], off=off_s[o2],
                     w=w_new[o2], ids=ids[order][o2] if has_ids else None,
                     n_write=jnp.sum(write), n_spill=jnp.sum(spill), occupancy=occ,
