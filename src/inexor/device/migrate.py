@@ -444,9 +444,10 @@ def _eject_rows(st, ix, c_drift, off_win, w_win, ids_win, ar_rows, starts_rel, s
 
 def _upload_slab(st, s, ar_slots, ar_bricks, clock, dev=None, block=False):
     """Slab s's index and its window on `dev`: the slot range as a view of the host
-    state (see THE WINDOW) and the arena residents as their own array. `block`
-    waits for the transfer, for a caller about to write host rows the view covers.
-    Returns a dict for `_eject_slab(pre=)`."""
+    state (see THE WINDOW) and the arena residents as their own array. `block` is
+    for a caller about to write host rows this window covers: the slot range is
+    COPIED (a CPU-backend upload of a view aliases the host) and the transfer is
+    waited for. Returns a dict for `_eject_slab(pre=)`."""
     import jax
 
     has_ids = st.ids is not None
@@ -456,7 +457,7 @@ def _upload_slab(st, s, ar_slots, ar_bricks, clock, dev=None, block=False):
     w_cap = _ladder(span + a_cap)
     clock.mark("eject: host index")
 
-    direct = _window_fits(len(st.off), s0, w_cap)
+    direct = not block and _window_fits(len(st.off), s0, w_cap)
 
     def window(src):
         if direct:

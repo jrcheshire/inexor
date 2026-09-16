@@ -124,6 +124,14 @@ def repack_geometry(st, brick_slack):
     counts = run_counts.copy()
     if len(arena_live):
         counts += np.bincount(st.arena_bucket[arena_live] // p3, minlength=st.n_bricks)
+    new_start, n_alloc = capacity_from_counts(st, counts, brick_slack)
+    return run_counts, counts, new_start, n_alloc
+
+
+def capacity_from_counts(st, counts, brick_slack):
+    """`repack_geometry`'s capacity arithmetic from per-brick member counts:
+    (new_start, n_alloc), with the index-ceiling and allocation refusals. The fused
+    migrate + repack calls it with the destination census before any row moves."""
     _limit = int(np.iinfo(st.index_dtype).max)
     _hot = int(counts.max()) if counts.size else 0
     if _hot > _limit:
@@ -142,7 +150,7 @@ def repack_geometry(st, brick_slack):
             f"repack needs {n_alloc} slots plus a {st.n_arena}-slot arena against an "
             f"allocation of {st.off.shape[0]}. Raise alloc_margin at build."
         )
-    return run_counts, counts, new_start, n_alloc
+    return new_start, n_alloc
 
 
 def _cross_card_slabs(old_start, new_start, parts, nb2):
