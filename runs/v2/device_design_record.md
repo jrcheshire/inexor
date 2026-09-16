@@ -2772,10 +2772,15 @@ enough for the answer to matter.
 
 ### Owed
 
-1. `manifest.provenance` is `{}` on the c-hero card. Every other instrument in this
-   project stamps backend / device_kind / jax version / XLA_FLAGS (sec. 61 of the
-   threads record; `_provenance()` in the M-v2-4 gate), and these ICs are the input to
-   every 4096^3 run that follows. Fill it before the D7 smoke consumes them.
+1. ~~`manifest.provenance` is `{}` on the c-hero card.~~ **FIXED for every future
+   generation** (`_ic_provenance` in `v2_m6_realization.py`, passed to both generators):
+   commit, host, machine, jax, x64, device kinds, and the allocator / fraction /
+   preallocate / host-limit environment verbatim. **c-hero-r0's own manifest keeps its
+   empty provenance.** Backfilling an inferred one is worse than leaving it empty
+   (the M-v2-4 precedent: the 14 deneb cards stay UNKNOWN rather than get a guessed
+   backend), and regenerating to fill a metadata field costs 67 min for no physics.
+   What produced those slabs is on the record instead: commit `3891c8d`, c672-017,
+   four GB200s, cuda_async at fraction 0.95, this section.
 2. The knob receipt: replace `bytes_limit` with something both allocators answer.
 3. A split of the `velocities` stage into compute and staging write, so the largest term
    in the IC wall has a cause rather than a size.
