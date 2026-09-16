@@ -178,9 +178,20 @@ else
   fi
 fi
 
-run_leg ics-4096 \
-  pixi run -e gpu python scripts/v2_m6_realization.py ics --config c-hero --workdir "$HERO" \
-    --generator device
+# 998798 wrote these and they are the input to every 4096^3 run. A regeneration is
+# NOT idempotent from the reader's side: `write_t9_slabs` unlinks the manifest before
+# it rewrites (that unlink is what makes a torn write refuse), so a resubmit deletes
+# 641 GB of ICs and 67 min later has replaced them -- or, if the job dies in between,
+# has not. Overwriting is an explicit request, never the default.
+if [ -f "$HERO/manifest.json" ] && [ "${D6_REGEN_HERO:-0}" != "1" ]; then
+  echo ""
+  echo "=== LEG ics-4096 SKIPPED: $HERO already holds a manifest ==="
+  echo "    Pass D6_REGEN_HERO=1 to overwrite it deliberately."
+else
+  run_leg ics-4096 \
+    pixi run -e gpu python scripts/v2_m6_realization.py ics --config c-hero --workdir "$HERO" \
+      --generator device
+fi
 [ -f "$HERO/realization_ics.json" ] && cp "$HERO/realization_ics.json" $CARDS/d6_ics_c-hero_gb.json
 kill $SAMPLER 2>/dev/null
 
