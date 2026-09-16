@@ -702,10 +702,87 @@ def arm_device_migrate(args):
     return rec, rc
 
 
+def arm_device_fused(args):
+    """M4: the device migrate + repack at `device-real`'s state, `--pass separate`
+    (`drift_and_migrate_device` then `repack_device`) or `--pass fused`
+    (`device.fused.migrate_repack_device`), each against the serial numpy migrate +
+    repack of an identical copy: bitwise per step, walls, device peak, and one
+    synced per-phase step. The census is the numpy migrate's per-brick membership
+    (the engine takes it from the tile loop; `tests/test_device_census.py` gates
+    the two equal)."""
+    _x64()
+    from inexor import state
+    from inexor.device import fused, migrate, repack
+
+    platform = _require_device(args.allow_cpu)
+    n, nb = args.n_part, args.nb or _nb_of(args.n_part)
+    slack = 0.10
+    t0 = time.perf_counter()
+    st = _build_state(n, nb, seed=13, brick_slack=slack, arena_frac=0.01, with_ids=False)
+    build_s = time.perf_counter() - t0
+    ref = copy.deepcopy(st)
+    c = _c_drift(st, args.real_frac)
+    rec = dict(arm=args.arm, impl=args.pass_, platform=platform, n_part=n, nb=nb,
+               rows_per_slab=n**3 // nb, c_drift=c, drift_frac=args.real_frac,
+               build_s=build_s, steps=[])
+    _say(f"[{args.arm}/{args.pass_}] n_part={n} nb={nb} ({n**3 // nb:,} rows per slab) "
+         f"built in {build_s:.1f}s on {platform}")
+
+    def one(timings=None):
+        t1 = time.perf_counter()
+        r_ref = state.drift_and_migrate(ref, c)
+        census = repack.repack_geometry(ref, slack)[1]
+        p_ref = ref.repack(brick_slack=slack)
+        t2 = time.perf_counter()
+        if args.pass_ == "fused":
+            m, r = fused.migrate_repack_device(st, c, census, brick_slack=slack, timings=timings)
+            t3 = time.perf_counter()
+            t_m, t_r = t3 - t2, 0.0
+        else:
+            tm = None if timings is None else {}
+            tr = None if timings is None else {}
+            m = migrate.drift_and_migrate_device(st, c, timings=tm)
+            t_mid = time.perf_counter()
+            r = repack.repack_device(st, brick_slack=slack, timings=tr)
+            t3 = time.perf_counter()
+            t_m, t_r = t_mid - t2, t3 - t_mid
+            if timings is not None:
+                timings.update({f"migrate | {k}": v for k, v in tm.items()})
+                timings.update({f"repack | {k}": v for k, v in tr.items()})
+        m.pop("migrate_device")
+        r = {k: v for k, v in r.items() if k not in ("repack_device", "scratch_bytes")}
+        p_ref = {k: v for k, v in p_ref.items() if k != "scratch_bytes"}
+        diff = _diff_fields(ref, st)
+        equal = m == r_ref and r == p_ref and not diff and st.arena_base == ref.arena_base
+        return dict(numpy_s=t2 - t1, device_s=t3 - t2, migrate_s=t_m, repack_s=t_r,
+                    field_diffs=diff, stats_equal=m == r_ref and r == p_ref, bitwise=equal)
+
+    rc = 0
+    for k in range(args.steps):
+        stp = one()
+        rec["steps"].append(stp)
+        _say(f"[{args.arm}/{args.pass_}] step {k}: numpy {stp['numpy_s']:.2f}s | device "
+             f"{stp['device_s']:.2f}s (migrate {stp['migrate_s']:.2f}, repack "
+             f"{stp['repack_s']:.2f}); BITWISE numpy = {stp['bitwise']} {stp['field_diffs'] or ''}")
+        rc = rc if stp["bitwise"] else 3
+    phases = {}
+    stp = one(phases)
+    rec["timed_step"] = dict(stp, phases=phases, phases_sum_s=sum(phases.values()))
+    _say(f"[{args.arm}/{args.pass_}] timed step: device {stp['device_s']:.2f}s (synced; phases "
+         f"sum {sum(phases.values()):.2f}s); BITWISE numpy = {stp['bitwise']}")
+    for key, v in sorted(phases.items(), key=lambda kv: -kv[1]):
+        _say(f"    {v:8.3f} s  {key}")
+    rc = rc if stp["bitwise"] else 3
+    rec.update(device_peak=_peak(), host_maxrss_gb=_maxrss_gb())
+    _say(f"[{args.arm}/{args.pass_}] device peak {(rec['device_peak'] or 0) / 2**30:.2f} GiB")
+    return rec, rc
+
+
 ARMS = {"xback": arm_xback, "slab-real": arm_slab_real, "slab-shape": arm_slab_shape,
         "peak-eject": arm_peak_eject, "peak-insert": arm_peak_insert,
         "insert-parity": arm_insert_parity,
-        "device-xback": arm_device_migrate, "device-real": arm_device_migrate}
+        "device-xback": arm_device_migrate, "device-real": arm_device_migrate,
+        "device-fused": arm_device_fused}
 
 
 # ------------------------------------------------------------ the orchestrator
@@ -751,6 +828,8 @@ def main(argv=None):
     ap.add_argument("--insert-impl", choices=("current", "legacy"), default="current",
                     help="which insert kernel `peak-insert` times: the live one, or "
                          "the frozen pre-cba30c3 oracle in v2_d3_insert_legacy.py")
+    ap.add_argument("--pass", dest="pass_", choices=("separate", "fused"), default="fused",
+                    help="device-fused: the separate device migrate + repack, or the fused")
     ap.add_argument("--peaks", default="",
                     help="'+'-separated peak arms, each its own process: 'eject' and/or "
                          "'insert:SHARE:REACH' (e.g. eject+insert:0.05:1+insert:0.2:2)")
@@ -822,6 +901,13 @@ def main(argv=None):
             card["arms"].append(res)
             write()
             worst = max(worst, rc)
+    if "device-fused" in arms:
+        res, rc = _run_worker(["--arm", "device-fused", "--n-part", str(args.real_n),
+                               "--real-frac", str(args.real_frac), "--pass", args.pass_,
+                               *common], {}, f"device-fused/{args.pass_}")
+        card["arms"].append(res)
+        write()
+        worst = max(worst, rc)
     if "insert-parity" in arms:
         res, rc = _run_worker(["--arm", "insert-parity", "--shape-nb", str(args.shape_nb),
                                "--emig-share", str(args.emig_share),

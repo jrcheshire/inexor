@@ -22,6 +22,11 @@ arm. State: the cgh64-family perturbed lattice of `v2_e1_device_step._state`.
   slack0-cards   `cards` at brick slack 0. PRE-REGISTERED: hashes and stats equal
                  slack0-eager, and step 1's codes and scales at `tile_loop_end`
                  equal (the compiled lane with arena residents on the GPU).
+  window-sep / cards-sep
+                 M4: `window-on` / `cards` with `migrate_repack_fused=False`. Since M4
+                 `window-on` and `cards` run the fused migrate + repack (auto); these
+                 are the separate passes. PRE-REGISTERED: hashes and stats (the
+                 knob's receipt aside) equal their fused arm.
 
 Device arms record their platform and refuse `cpu` unless `--allow-cpu` (the
 laptop smoke, which needs four forced host devices for the card arms). Output
@@ -60,15 +65,20 @@ ENGINE_ARMS = {
     "slack0-eager": dict(coarse_backend="device", tile_backend="device",
                          device_tile_jit=False, migrate_backend="device", brick_slack=0.0),
     "slack0-cards": dict(LANE, device_tile_window=True, device_cards=CARDS, brick_slack=0.0),
+    "window-sep": dict(LANE, device_tile_window=True, migrate_repack_fused=False),
+    "cards-sep": dict(LANE, device_tile_window=True, device_cards=CARDS,
+                      migrate_repack_fused=False),
 }
 SNAP_ARMS = ("slack0-eager", "slack0-cards")
 #: keys that describe the card split, the lane or the compile history, not the step
 SPLIT_KEYS = ("coarse_card_chunks", "coarse_cards", "coarse_card_ranges",
               "coarse_ghost_planes_nonzero", "device_cards", "tile_cards",
-              "coarse_jit_traces", "coarse_jit_shapes", "coarse_device_jit")
+              "coarse_jit_traces", "coarse_jit_shapes", "coarse_device_jit",
+              "migrate_repack_fused")
 #: (arm, reference) pairs gated on hashes + stats
 ENGINE_GATES = (("window-on", "window-off"), ("cards", "window-on"),
-                ("slack0-cards", "slack0-eager"))
+                ("slack0-cards", "slack0-eager"), ("window-on", "window-sep"),
+                ("cards", "cards-sep"))
 
 
 def _devices(n):
@@ -132,7 +142,8 @@ def arm_engine(args):
     for o in out:
         md = o.get("migrate_device") or {}
         rd = (o.get("repack") or {}).get("repack_device") or {}
-        split.append(dict(tile_cards=o.get("tile_cards"), coarse_card_chunks=o.get(
+        split.append(dict(fused=o.get("migrate_repack_fused"),
+                          tile_cards=o.get("tile_cards"), coarse_card_chunks=o.get(
             "coarse_card_chunks"), migrate_cards=md.get("cards"), migrate_fallback=md.get(
             "fallback"), cross_card_bytes=md.get("cross_card_bytes"), repack_cards=rd.get(
             "cards"), cross_card_early_uploads=rd.get("cross_card_early_uploads")))
@@ -360,9 +371,10 @@ def main(argv=None):
     for arm, ref in ENGINE_GATES:
         if arm not in recs or ref not in recs:
             continue
+        gate_key = arm if arm not in card["gates"] else f"{arm} vs {ref}"
         d, h = recs[arm], recs[ref]
         if d is None or h is None:
-            card["gates"][arm] = "MISSING an arm"
+            card["gates"][gate_key] = "MISSING an arm"
             worst = max(worst, 1)
             continue
         hashes_equal = d["hashes"] == h["hashes"]
@@ -384,7 +396,7 @@ def main(argv=None):
         # not the apparatus: a mismatch there must not stop the job that asks it.
         reading_only = args.smoke and arm == "slack0-cards"
         gate["reading_only"] = reading_only
-        card["gates"][arm] = gate
+        card["gates"][gate_key] = gate
         _say(f"\n=== {arm} vs {ref}: hashes equal = {hashes_equal}; stats differing "
              f"{len(diffs)} {diffs[:5]}; tile_loop_end {gate.get('tile_loop_end_codes')}; "
              f"run {d['run_s']:.1f} vs {h['run_s']:.1f}s"
@@ -408,7 +420,8 @@ def main(argv=None):
         if not (hashes_equal and stats_equal):
             worst = max(worst, 3)
 
-    for pair in (("cards", "window-on"), ("window-on", "window-off")):
+    for pair in (("cards", "window-on"), ("window-on", "window-off"),
+                 ("window-on", "window-sep"), ("cards", "cards-sep")):
         if recs.get(pair[0]) and recs.get(pair[1]):
             a, b = recs[pair[0]]["phases_total"], recs[pair[1]]["phases_total"]
             _say(f"\n=== phases, s over the run ({pair[0]} | {pair[1]}) ===")
