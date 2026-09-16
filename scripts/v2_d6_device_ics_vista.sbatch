@@ -16,6 +16,9 @@
 #   3. 2048^3 device generation, per-stage wall + host peak; nvidia-smi sampled throughout;
 #   4. projection to 4096^3 (stops the job: wall > 6 h or host peak > 0.9 x 1026 GB);
 #   5. the 2048^3 output removed by name;
+#   5b. the allocator A/B: the same 2048^3 generation again under BFC (the leg above is
+#      the cuda_async control), both arms in ONE job on ONE node, then the per-stage
+#      ratio. Its own receipt gates it and a refusal skips the arm, not the job;
 #   6. the 4096^3 device generation -> /scratch/10303/jrc4/inexor_runs/c-hero-r0 (UNPRICED);
 #   7. the GPU pytest set for the new files (LAST: unpriced).
 # Submit from the Vista checkout, after JC approves the time ask:
@@ -49,6 +52,12 @@
 #   - walls, peaks and per-stage splits are reported, not gated;
 #   - allocator slowdown, reported not gated: smoke leg, emit-shape split_s, ics-2048
 #     stage_s and ics-4096 delta/source/source_forward/velocities vs 997814 (BFC).
+#   - the allocator A/B (leg 5b) is REPORTED, NOT GATED and decides nothing on its
+#     own: it measures a wall at 2048^3, where per-card peak is ~18 GB and BFC
+#     fragmentation cannot be exercised. 998798 read 1.15x across jobs; this reads
+#     it within one. The arm identifies itself from manifest provenance, not from
+#     its label, and the comparison REFUSES (rc 3) on two same-allocator arms or on
+#     any other axis moving -- a vacuous A/B must not read as a null.
 #
 # ENV copied verbatim from v2_e2e4_device_cards_vista.sbatch.
 
@@ -64,8 +73,11 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_CLIENT_MEM_FRACTION=0.95
 # CUDA's own pool rather than BFC: freed blocks can coalesce, where BFC never merges
 # across its growth regions (997814's card 2 held two 64 GiB regions and could not
-# serve 66 GiB). Stage and leg seconds are compared against 997814 (BFC, same commit
-# code) to see whether per-plane allocation got slower.
+# serve 66 GiB).
+# 998798 measured the cost of that choice at 1.15x on the 2048^3 leg, but against
+# 997814 -- a different job on a different allocation, which is the comparison shape
+# that cost record 5h a chase. ALLOC is per leg so both arms can run in ONE job;
+# the default stays cuda_async (no-worse-defaults: it is what wrote c-hero-r0).
 export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
 export JAX_COMPILATION_CACHE_DIR=$SCRATCH/inexor-xla-cache
 export XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=900
@@ -74,6 +86,7 @@ unset CUDA_VISIBLE_DEVICES
 
 RUNS=/scratch/10303/jrc4/inexor_runs
 PROBE=$RUNS/d6-c-gh-probe
+PROBE_BFC=$RUNS/d6-c-gh-probe-bfc
 HERO=$RUNS/c-hero-r0
 CARDS=runs/v2
 GPU_LOG=$CARDS/d6-gpu-mem-$SLURM_JOB_ID.csv
@@ -91,6 +104,19 @@ run_leg () {
   echo "--- LEG $name rc=$rc ($(date +%H:%M:%S)) ---"
   [ $rc -ne 0 ] && rc_total=$((rc_total + 1))
   return $rc
+}
+
+# An allocator is chosen when jax initialises, so an arm needs its own PROCESS with
+# its own environment -- setting it inside the child is too late. `bfc` is spelled by
+# UNSETTING the variable, which is what the compiled default does, so passing the
+# literal string would be a different (and unsupported) request.
+run_leg_alloc () {
+  local alloc="$1"; local name="$2"; shift 2
+  if [ "$alloc" = "bfc" ]; then
+    run_leg "$name" env -u XLA_PYTHON_CLIENT_ALLOCATOR "$@"
+  else
+    run_leg "$name" env XLA_PYTHON_CLIENT_ALLOCATOR="$alloc" "$@"
+  fi
 }
 
 run_leg preflight \
@@ -120,6 +146,37 @@ run_leg project \
 cp "$PROBE/realization_ics.json" $CARDS/d6_ics_c-gh_gb.json
 run_leg cleanup-2048 \
   pixi run -e gpu python scripts/v2_d6_device_ics.py cleanup --workdir "$PROBE"
+
+# --- the allocator A/B, both arms in THIS job on THIS node -------------------
+# 998798 bought its capacity with cuda_async and paid 1.15x on the 2048^3 leg for
+# it, measured against 997814 across two jobs. The 4096^3 peak has since been read
+# at 100-105 GiB per card -- under the 138.8 GiB the DEFAULT fraction allows -- so
+# BFC at 0.95 has ~75 GiB of headroom over the working set and the wall may be
+# recoverable. The arm above is the cuda_async control; this is the BFC one.
+# What this leg does NOT settle: BFC ratchets toward whatever ceiling it is given,
+# which is how 997814 died, and 2048^3 peaks ~18 GB/card -- far too low to
+# exercise fragmentation. This measures the WALL only. The safety question is a
+# 4096^3 generation and nothing smaller answers it.
+run_leg_alloc bfc preflight-bfc \
+  pixi run -e gpu python scripts/v2_d6_device_ics.py preflight --root "$RUNS" --need-gb 100
+AB_OK=$?
+if [ $AB_OK -ne 0 ]; then
+  echo "SKIP allocator A/B: the BFC arm's own receipt refused (rc=$AB_OK); the arm"
+  echo "cannot prove which allocator ran, so its seconds are not attributable."
+else
+  run_leg_alloc bfc ics-2048-bfc \
+    pixi run -e gpu python scripts/v2_m6_realization.py ics --config c-gh \
+      --workdir "$PROBE_BFC" --generator device
+  if [ -f "$PROBE_BFC/realization_ics.json" ]; then
+    cp "$PROBE_BFC/realization_ics.json" $CARDS/d6_ics_c-gh_bfc_gb.json
+    run_leg allocator-ab \
+      pixi run -e gpu python scripts/v2_d6_device_ics.py allocator-ab \
+        --a $CARDS/d6_ics_c-gh_gb.json --b $CARDS/d6_ics_c-gh_bfc_gb.json \
+        --out $CARDS/d6_allocator_ab_gb.json
+    run_leg cleanup-2048-bfc \
+      pixi run -e gpu python scripts/v2_d6_device_ics.py cleanup --workdir "$PROBE_BFC"
+  fi
+fi
 
 run_leg ics-4096 \
   pixi run -e gpu python scripts/v2_m6_realization.py ics --config c-hero --workdir "$HERO" \

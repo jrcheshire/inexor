@@ -222,6 +222,37 @@ def _git_commit():
         return "unknown"
 
 
+def _ic_provenance(generator):
+    """What produced these ICs, stored IN THE MANIFEST beside the slabs.
+
+    The run card carries commit/host/machine already, but the card is a separate
+    file and the slabs outlive it -- 998798's 4096^3 manifest went to disk with
+    `provenance: {}` and nothing in c-hero-r0 says which backend, jax or allocator
+    wrote it. Every 4096^3 run reads these slabs, and D-v2-23's `ic_stream` only
+    separates the noise streams, not the rest. Also the allocator receipt for an
+    A/B: the manifest, not a job label, says which arm an arm was.
+    """
+    prov = dict(generator=generator, commit=_git_commit(), host=platform.node(),
+                machine=platform.machine(), numpy=np.__version__,
+                when=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    try:
+        import jax
+
+        prov["jax"] = jax.__version__
+        prov["x64"] = bool(jax.config.read("jax_enable_x64"))
+        prov["devices"] = sorted({d.device_kind for d in jax.devices()})
+        prov["n_devices"] = len(jax.devices())
+    except Exception as e:  # a CPU generator on a node with no jax device
+        prov["jax"] = f"unread ({e.__class__.__name__})"
+    # the two knobs 997814 -> 998798 turned, verbatim, so a wall comparison across
+    # generations can refuse rather than guess
+    prov["allocator"] = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc") or "bfc"
+    for var in ("XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE",
+                "XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB", "XLA_FLAGS"):
+        prov[var] = os.environ.get(var, "(unset)")
+    return prov
+
+
 def _cosmo():
     from inexor.config import Cosmology
 
@@ -319,18 +350,22 @@ def cmd_ics(args):
           f"L={g['L']} bricks_per_side={nb} ({nb ** 3:,} bricks) -> {args.workdir}",
           flush=True)
 
+    prov = _ic_provenance(args.generator)
+    print(f"  provenance: allocator={prov['allocator']} "
+          f"fraction={prov['XLA_CLIENT_MEM_FRACTION']} jax={prov.get('jax')}", flush=True)
     t0 = time.perf_counter()
     if args.generator == "device":
         man = icgen.generate_t9_slabs_device(
             args.workdir, key, g["n_part"], g["L"], _cosmo(), m3.A_INIT, nb,
             fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
-            pencil_batch=args.pencil_batch, noise=args.noise,
+            pencil_batch=args.pencil_batch, noise=args.noise, provenance=prov,
             log=lambda line: print(line, flush=True),
         )
     else:
         man = icgen.generate_t9_slabs(
             args.workdir, key, g["n_part"], g["L"], _cosmo(), m3.A_INIT, nb,
             fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
+            provenance=prov,
         )
     wall = time.perf_counter() - t0
     peak = _maxrss_bytes()

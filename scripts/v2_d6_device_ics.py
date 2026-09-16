@@ -9,6 +9,11 @@
     project    the 2048^3 card -> a 4096^3 projection (every stage x8 log-scaled wall,
                host peak x8). rc 3 past the pre-registered stop: wall > 9 h or host peak
                > 0.9 x 1026 GB.
+    allocator-ab
+               two IC cards whose manifests record DIFFERENT allocators and the same
+               everything else -> per-stage seconds ratio. Reported, not gated; rc 3
+               if an arm cannot identify itself or an axis other than the allocator
+               moved.
     cleanup    remove a generation by NAME (manifest files, manifest, card), then rmdir,
                which refuses if anything else is inside.
 
@@ -57,12 +62,37 @@ def cmd_preflight(args):
 
     rc = 0
     print(f"jax devices: {jax.devices()}")
-    # the allocator knobs must show they applied: bytes_limit is fraction x card total
-    for dev in jax.devices():
+    # The allocator must show WHICH one is running, not merely that a knob was set.
+    # 998798 printed `bytes_limit 0.0 GiB` on all four cards and that read as a
+    # failure to apply the fraction; it is how cuda_async reports -- BFC sets
+    # bytes_limit to fraction x card, CUDA's pool reports none and keeps
+    # peak_bytes_in_use (compute_stats=true). So derive the allocator from the stats
+    # and REFUSE when it disagrees with the one the environment asked for.
+    asked = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc").strip().lower() or "bfc"
+    frac = os.environ.get("XLA_CLIENT_MEM_FRACTION", "(unset, compiled default 0.75)")
+    print(f"  allocator asked: {asked}; XLA_CLIENT_MEM_FRACTION={frac}")
+    limit_gb = None
+    gpus = [d for d in jax.devices() if d.platform in ("gpu", "cuda", "rocm")]
+    if not gpus:
+        # a CPU device reports no allocator stats at all, so every card would read
+        # "cuda_async" and an unset variable would refuse against itself
+        print("  no GPU device: the allocator discrimination does not apply; "
+              "the per-card ceiling falls back to the card size")
+    for dev in gpus:
         stats = dev.memory_stats() or {}
-        lim = stats.get("bytes_limit")
-        print(f"  {dev}: allocator bytes_limit "
-              f"{'unreported' if lim is None else f'{lim / 2**30:,.1f} GiB'}")
+        lim = stats.get("bytes_limit") or 0
+        seen = "bfc" if lim else "cuda_async"
+        if lim:
+            limit_gb = min(lim / GB, limit_gb if limit_gb is not None else lim / GB)
+        print(f"  {dev}: reports {seen}; bytes_limit "
+              f"{'none' if not lim else f'{lim / 2**30:,.1f} GiB ({lim / GB:,.1f} GB)'}"
+              f"; keys {sorted(stats)[:6]}")
+        if seen != asked:
+            print(f"REFUSE: asked for {asked}, the runtime reports {seen} on {dev}")
+            rc = 2
+    # Only ever tightens: the card's own size stays the bound when no limit is reported.
+    ceiling = min(GB_CARD, limit_gb) if limit_gb else GB_CARD
+    print(f"  per-card ceiling used for the planner verdict: {ceiling:,.1f} GB")
     os.makedirs(args.root, exist_ok=True)
     free = shutil.disk_usage(args.root).free / GB
     quota, raw = _quota_remaining_gb(args.root)
@@ -80,9 +110,9 @@ def cmd_preflight(args):
         host, card, disk = plan.ic_device_stages(n, n_gpus=len(jax.devices()), nb=nb)
         hp, cp = max(host.values()), max(card.values())
         print(f"planner {n}^3: host peak {hp / GB:,.1f} GB ({hp / GB / GB_HOST:.2f}x), "
-              f"per card {cp / GB:,.1f} GB ({cp / GB / GB_CARD:.2f}x), disk "
-              f"{sum(disk.values()) / GB:,.0f} GB")
-        if hp / GB > GB_HOST or cp / GB > GB_CARD:
+              f"per card {cp / GB:,.1f} GB ({cp / GB / ceiling:.2f}x of {ceiling:,.0f}), "
+              f"disk {sum(disk.values()) / GB:,.0f} GB")
+        if hp / GB > GB_HOST or cp / GB > ceiling:
             print(f"REFUSE: the planner says {n}^3 does not fit")
             rc = 2
     return rc
@@ -275,6 +305,94 @@ def cmd_project(args):
     return rc
 
 
+def cmd_allocator_ab(args):
+    """Two IC generations, one per allocator, SAME job and same node -> stage ratios.
+
+    998798's 1.15x against 997814 crossed two jobs and two node allocations, which is
+    the shape that produced the 8.6% cross-job drift record 5h had to chase down. Both
+    arms here run back to back in one job, so the ratio is the allocator.
+
+    The arms must differ in the allocator and NOTHING else: `manifest.provenance`
+    carries the allocator, so the arm is identified by what the generator recorded
+    rather than by the label the sbatch passed. rc 3 on a mismatched axis or on two
+    arms that turn out to be the same allocator -- a vacuous A/B must not read as a
+    null result.
+    """
+    arms = []
+    for path in (args.a, args.b):
+        with open(path) as fh:
+            c = json.load(fh)
+        prov = (c.get("manifest", {}) or {}).get("provenance") or {}
+        arms.append(dict(path=path, card=c, prov=prov,
+                         allocator=prov.get("allocator", "unrecorded")))
+    a, b = arms
+    rc = 0
+    if a["allocator"] == "unrecorded" or b["allocator"] == "unrecorded":
+        print("REFUSE: an arm's manifest carries no provenance.allocator -- it was "
+              "generated before the provenance fix and cannot identify itself")
+        rc = 3
+    elif a["allocator"] == b["allocator"]:
+        print(f"REFUSE: both arms report allocator {a['allocator']} -- not an A/B")
+        rc = 3
+    # `allocator` is the environment verbatim, which is the right thing to store and
+    # the wrong thing to trust alone: a CPU-backend generation records the variable it
+    # was handed while no GPU allocator ever ran, so the label would be live and the
+    # quantity vacuous. Caught on the laptop, where exactly that happened.
+    for arm in arms:
+        devs = arm["prov"].get("devices")
+        if devs is not None and all(d == "cpu" for d in devs):
+            print(f"REFUSE: {arm['path']} ran on {devs} -- no GPU allocator was "
+                  f"exercised, so its {arm['allocator']} label means nothing")
+            rc = 3
+    # everything that is not the allocator must match, or the ratio is not about it
+    for key, get in (("n_part", lambda c: c["n_part"]),
+                     ("generator", lambda c: c["generator"]),
+                     ("commit", lambda c: c.get("commit")),
+                     ("host", lambda c: c.get("host")),
+                     ("emission", lambda c: c["manifest"].get("emission")),
+                     ("ic_stream", lambda c: c["manifest"].get("ic_stream")),
+                     ("n_devices", lambda c: c["manifest"].get("n_devices"))):
+        va, vb = get(a["card"]), get(b["card"])
+        if va != vb:
+            print(f"REFUSE: arms differ on {key}: {va!r} vs {vb!r}")
+            rc = 3
+    sa = a["card"]["manifest"]["stage_s"]
+    sb = b["card"]["manifest"]["stage_s"]
+    ratios = {stage: sb[stage] / sa[stage] for stage in sa
+              if stage in sb and sa[stage]}
+    wall = b["card"]["wall_s"] / a["card"]["wall_s"]
+    host = b["card"]["peak_rss_bytes"] / a["card"]["peak_rss_bytes"]
+    # A refused comparison keeps its numbers on the card for the audit trail and OFF
+    # the screen: a ratio printed under a REFUSE line is still the thing a reader
+    # carries away, and these ratios are exactly the shape of a real result.
+    if rc:
+        print(f"\nWITHHELD: {len(ratios)} stage ratios computed and written to "
+              f"{args.out}, not printed -- the comparison above is refused, so they "
+              f"are not attributable to the allocator.")
+    else:
+        print(f"\n{'stage':<16}{a['allocator']:>14}{b['allocator']:>14}{'b/a':>9}")
+        for stage, r in ratios.items():
+            print(f"{stage:<16}{sa[stage]:>14.1f}{sb[stage]:>14.1f}{r:>9.2f}")
+        print(f"{'wall':<16}{a['card']['wall_s']:>14.1f}"
+              f"{b['card']['wall_s']:>14.1f}{wall:>9.2f}")
+        print(f"{'host peak GB':<16}{a['card']['peak_rss_bytes'] / GB:>14.1f}"
+              f"{b['card']['peak_rss_bytes'] / GB:>14.1f}{host:>9.2f}")
+    out = dict(a=dict(path=a["path"], allocator=a["allocator"], provenance=a["prov"],
+                      stage_s=sa, wall_s=a["card"]["wall_s"],
+                      peak_rss_bytes=a["card"]["peak_rss_bytes"]),
+               b=dict(path=b["path"], allocator=b["allocator"], provenance=b["prov"],
+                      stage_s=sb, wall_s=b["card"]["wall_s"],
+                      peak_rss_bytes=b["card"]["peak_rss_bytes"]),
+               stage_ratio_b_over_a=ratios, wall_ratio_b_over_a=wall,
+               host_peak_ratio_b_over_a=host, n_part=a["card"]["n_part"], rc=rc)
+    with open(args.out, "w") as fh:
+        json.dump(out, fh, indent=2)
+    # reported, not gated: this measures a wall, and which allocator to run is a
+    # capacity question the 4096^3 peak decides, not this ratio
+    print(f"\ncard -> {args.out}")
+    return rc
+
+
 def cmd_cleanup(args):
     man_path = os.path.join(args.workdir, "manifest.json")
     with open(man_path) as fh:
@@ -312,11 +430,16 @@ def main():
     p.add_argument("--card", required=True)
     p.add_argument("--gpu-log", default=None)
     p.add_argument("--out", required=True)
+    p = sub.add_parser("allocator-ab")
+    p.add_argument("--a", required=True, help="IC card for arm A")
+    p.add_argument("--b", required=True, help="IC card for arm B")
+    p.add_argument("--out", required=True)
     p = sub.add_parser("cleanup")
     p.add_argument("--workdir", required=True)
     args = ap.parse_args()
     return {"preflight": cmd_preflight, "smoke": cmd_smoke, "emit-shape": cmd_emit_shape,
-            "project": cmd_project, "cleanup": cmd_cleanup}[args.cmd](args)
+            "project": cmd_project, "allocator-ab": cmd_allocator_ab,
+            "cleanup": cmd_cleanup}[args.cmd](args)
 
 
 if __name__ == "__main__":
