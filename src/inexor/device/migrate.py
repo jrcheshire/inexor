@@ -382,20 +382,17 @@ def _window_fits(n_state_rows, s0, w_cap):
     return s0 + w_cap <= n_state_rows
 
 
-def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=None):
-    """Upload slab s's window to `dev`, build its rows and eject them. Returns the staged slab."""
-    import jax.numpy as jnp
-
+def _slab_index(st, s, ar_slots, ar_bricks):
+    """Slab s's host index for its eject rows, O(bricks + arena): the per-brick
+    occupancy, live and resident counts and prefix sums, its arena residents in
+    `pass_arena_index` order, and the padded shapes. Shared by the eject and the
+    destination census (`device.window`), so both build identical kernel inputs."""
     from .. import eject_jax
 
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
     nb2 = nb * nb
-    per = int(st.t9.n_buckets_side) // nb
-    has_ids = st.ids is not None
     lo_b, hi_b = st.slab_bricks(s)
     s0, s1 = int(st.brick_start[lo_b]), int(st.brick_start[hi_b])
-    span = s1 - s0
-
     occ = np.asarray(st.occupancy)[lo_b * p3: hi_b * p3].reshape(nb2, p3)
     live = occ.sum(axis=1, dtype=np.int64)
     a0, a1 = np.searchsorted(ar_bricks, [lo_b, hi_b])
@@ -407,15 +404,57 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=
     np.cumsum(live + ar_counts, out=row_offsets[1:])
     n_rows = int(row_offsets[-1])
     n_ar = int(a1 - a0)
-
     a_cap = _ladder(n_ar)
-    w_cap = _ladder(span + a_cap)
-    cap = eject_jax._padded(n_rows)
-    row_bytes = st.off.itemsize * 3 + st.w.itemsize * 3 + (st.ids.itemsize if has_ids else 0)
-    budget.check(f"ejecting slab {s}", w_cap * row_bytes, EJECT_B_PER_PADDED_ROW, cap)
-
     ar_bucket = np.zeros(a_cap, dtype=np.int64)
     ar_bucket[:n_ar] = np.asarray(st.arena_bucket)[rows_a - int(st.arena_base)]
+    return dict(lo_b=lo_b, hi_b=hi_b, s0=s0, s1=s1, span=s1 - s0, occ=occ, live=live,
+                rows_a=rows_a, ar_offsets=ar_offsets, row_offsets=row_offsets, n_rows=n_rows,
+                n_ar=n_ar, a_cap=a_cap, ar_bucket=ar_bucket, cap=eject_jax._padded(n_rows))
+
+
+def _eject_rows(st, ix, c_drift, off_win, w_win, ids_win, ar_rows, starts_rel, scales_d, w_cap,
+                clock, dev):
+    """The rows program and the eject kernel on `dev` for one slab indexed by `ix`
+    (`_slab_index`), against a window whose rows `starts_rel` are relative to and
+    whose residents are `ar_rows`. `scales_d` is the slab's per-brick scales on
+    `dev`. Returns the kernel's outputs."""
+    import jax.numpy as jnp
+
+    nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
+    per = int(st.t9.n_buckets_side) // nb
+    has_ids = st.ids is not None
+    cap, lo_b = ix["cap"], ix["lo_b"]
+    index_dev = (_put(ix["occ"], dev), _put(ix["live"], dev), starts_rel,
+                 _put(ix["row_offsets"], dev), _put(ix["ar_offsets"], dev),
+                 _put(ix["ar_bucket"], dev))
+    clock.mark("eject: upload", index_dev, off_win, w_win, ids_win, ar_rows, scales_d)
+    rows = _rows_program(cap, w_cap, ix["a_cap"], nb, p3, per, has_ids)
+    off, bijk, w, ids, scale, brick, real = rows(
+        *index_dev, off_win, w_win, ids_win, *ar_rows, scales_d,
+        _put(ix["n_rows"], dev, jnp.int64), _put(lo_b, dev, jnp.int64))
+    index_dev = None
+    clock.mark("eject: rows program", off, bijk, w, ids, scale, brick, real)
+    fn = _eject_kernel(st.t9, nb, cap, has_ids)
+    out = fn(off, bijk, w, ids, scale, float(c_drift), brick, real)
+    # the row buffers are the kernel's input only; release them before staging
+    off = bijk = w = ids = scale = brick = real = None
+    clock.mark("eject: kernel", *out)
+    return out
+
+
+def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=None):
+    """Upload slab s's window to `dev`, build its rows and eject them. Returns the staged slab."""
+    import jax.numpy as jnp
+
+    nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
+    has_ids = st.ids is not None
+    ix = _slab_index(st, s, ar_slots, ar_bricks)
+    lo_b, hi_b, s0, s1, span = ix["lo_b"], ix["hi_b"], ix["s0"], ix["s1"], ix["span"]
+    n_rows, n_ar, a_cap, cap = ix["n_rows"], ix["n_ar"], ix["a_cap"], ix["cap"]
+    rows_a = ix["rows_a"]
+    w_cap = _ladder(span + a_cap)
+    row_bytes = st.off.itemsize * 3 + st.w.itemsize * 3 + (st.ids.itemsize if has_ids else 0)
+    budget.check(f"ejecting slab {s}", w_cap * row_bytes, EJECT_B_PER_PADDED_ROW, cap)
     clock.mark("eject: host index")
 
     direct = _window_fits(len(st.off), s0, w_cap)
@@ -442,27 +481,11 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=
     ids_win = _put(ids_np, dev) if has_ids else None
     ar_rows = tuple(None if a is None else _put(a, dev) for a in ar_np)
     off_np = w_np = ids_np = ar_np = None
-    index_dev = (_put(occ, dev), _put(live, dev), _put(np.asarray(
-        st.brick_start[lo_b:hi_b], dtype=np.int64) - s0, dev), _put(row_offsets, dev),
-        _put(ar_offsets, dev), _put(ar_bucket, dev),
-        _put(np.asarray(scales[lo_b:hi_b], dtype=np.float64), dev))
-    clock.mark("eject: upload", off_win, w_win, ids_win, ar_rows, index_dev)
-
-    rows = _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids)
-    occ_d, live_d, starts_d, row_off_d, ar_off_d, ar_bucket_d, scales_d = index_dev
-    off, bijk, w, ids, scale, brick, real = rows(
-        occ_d, live_d, starts_d, row_off_d, ar_off_d, ar_bucket_d, off_win, w_win, ids_win,
-        *ar_rows, scales_d, _put(n_rows, dev, jnp.int64), _put(lo_b, dev, jnp.int64))
-    index_dev = occ_d = live_d = starts_d = row_off_d = ar_off_d = ar_bucket_d = scales_d = None
-    ar_rows = None
-    clock.mark("eject: rows program", off, bijk, w, ids, scale, brick, real)
-
-    fn = _eject_kernel(st.t9, nb, cap, has_ids)
-    dest, off_new, w_out, ids_out, src_out, n_keep = fn(
-        off, bijk, w, ids, scale, float(c_drift), brick, real)
-    # the row buffers are the kernel's input only; release them before staging
-    off = bijk = w = ids = scale = brick = real = None
-    clock.mark("eject: kernel", dest, off_new, w_out, ids_out, src_out, n_keep)
+    starts_d = _put(np.asarray(st.brick_start[lo_b:hi_b], dtype=np.int64) - s0, dev)
+    scales_d = _put(np.asarray(scales[lo_b:hi_b], dtype=np.float64), dev)
+    dest, off_new, w_out, ids_out, src_out, n_keep = _eject_rows(
+        st, ix, c_drift, off_win, w_win, ids_win, ar_rows, starts_d, scales_d, w_cap, clock, dev)
+    ar_rows = starts_d = scales_d = None
 
     # n_keep, the realized x-reach over this slab's emigrants (as the serial pass
     # reports it) and where they go, in one read: the inserts' census reads `to`

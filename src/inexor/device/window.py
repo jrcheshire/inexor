@@ -32,6 +32,14 @@ buffer velocities, which are never used.
 SHAPES. The window is padded to per-step `rows` and `arena` on
 `forces.capacity_shape`'s ladder (`window_shapes`), so every plane of a step runs
 one program.
+
+THE DESTINATION CENSUS (`census=c_drift`). After a plane's tiles have kicked and
+before its write-back, every core slab's rows go through the migrate's own rows
+program and compiled eject kernel (`migrate._slab_index`, `migrate._eject_rows`)
+against the window, and each real row's destination brick is counted on the card.
+Same executable, same values in every row it reads, so the counts are the
+post-migrate per-brick membership the migrate will produce, before it runs: what
+a fused migrate + repack needs for the repack's `new_start`.
 """
 
 from __future__ import annotations
@@ -191,8 +199,72 @@ def _write_core(st, win, wh, plane, per, nb):
         st.w[win["res_slots"][k]] = wh[win["W"] + k]
 
 
+def _census_programs(n_bricks, nb2, cap):
+    """(slice the whole-grid scales at a runtime brick offset, add a slab's
+    destination bricks into the card's per-brick accumulator)."""
+    import jax
+    import jax.numpy as jnp
+
+    from .migrate import _program
+
+    def make_slice():
+        return jax.jit(lambda vs, lo: jax.lax.dynamic_slice(vs, (lo,), (nb2,)))
+
+    def make_add():
+        def add(acc, dest, n_rows, p3):
+            real = jnp.arange(cap, dtype=jnp.int64) < n_rows
+            return acc.at[jnp.where(real, dest // p3, n_bricks)].add(1, mode="drop")
+
+        return jax.jit(add, donate_argnums=0)
+
+    return (_program(("census_slice", nb2), make_slice),
+            _program(("census_add", n_bricks, cap), make_add))
+
+
+def _census_plane(st, win, wd, vs, plane, per, c_drift, ar_index, acc, device):
+    """Count the destination bricks of tile plane `plane`'s core slabs into `acc`."""
+    import jax
+    import jax.numpy as jnp
+
+    from . import migrate
+
+    nb = int(st.bricks_per_side)
+    nb2, p3 = nb * nb, int(st.buckets_per_brick)
+    has_ids = st.ids is not None
+    ar_slots, ar_bricks = ar_index
+    rows_win = int(wd["off"].shape[0])
+    ids_win = migrate._zeros(rows_win, st.ids.dtype, device) if has_ids else None
+    no_clock = migrate._Clock(None)
+    n_slabs = 0
+    for s in range(plane * per, (plane + 1) * per):
+        ix = migrate._slab_index(st, s, ar_slots, ar_bricks)
+        if ix["n_rows"] == 0:
+            continue
+        k = np.searchsorted(win["res_slots"], ix["rows_a"])
+        if ix["n_ar"] and not np.array_equal(
+                win["res_slots"][np.minimum(k, len(win["res_slots"]) - 1)], ix["rows_a"]):
+            raise ValueError(f"slab {s}'s arena residents were not staged in its window")
+        take = np.full(ix["a_cap"], win["W"], dtype=np.int64)
+        take[:ix["n_ar"]] = win["W"] + k
+        take_d = migrate._put(take, device)
+        ar_rows = (jnp.take(wd["off"], take_d, axis=0), jnp.take(wd["w"], take_d, axis=0),
+                   migrate._zeros(ix["a_cap"], st.ids.dtype, device) if has_ids else None)
+        starts = (np.asarray(st.brick_start[ix["lo_b"]:ix["hi_b"]], dtype=np.int64)
+                  - int(win["edges"][s]) + int(win["slab_win"][s]))
+        sl, add = _census_programs(int(st.n_bricks), nb2, ix["cap"])
+        scales_d = sl(vs, migrate._put(ix["lo_b"], device, jnp.int64))
+        dest, *_rest = migrate._eject_rows(
+            st, ix, c_drift, wd["off"], wd["w"], ids_win, ar_rows, migrate._put(starts, device),
+            scales_d, rows_win, no_clock, device)
+        _rest = None
+        acc = add(acc, dest, migrate._put(ix["n_rows"], device, jnp.int64),
+                  migrate._put(p3, device, jnp.int64))
+        n_slabs += 1
+    return jax.block_until_ready(acc), n_slabs
+
+
 def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
-                       coarse_shard=None, device=None, write_host=True):
+                       coarse_shard=None, device=None, write_host=True, census=None):
     """`tile.tile_loop_device` over tile planes, one window of x-slabs on the card
     at a time. Bitwise that loop; see the module docstring.
 
@@ -203,6 +275,10 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
     BEFORE its rows return to the host. `coarse_shard` and `device` as in
     `tile_loop_device`; one thread per card, each with its own planes, is the
     four-card form.
+
+    `census`, if given, is the step's fused drift `c_drift`: see THE DESTINATION
+    CENSUS above. It adds `census_counts` (int64 per brick, this call's core slabs
+    only) and `census_slabs`.
 
     Returns `n_owned`, `n_out`, `tiles_run`, `planes_run`, `vel_scale_kick_max`
     and the window receipts `wrapped`, `window_live_rows_max`, `residents_staged`,
@@ -235,6 +311,12 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
     vs = (jax.block_until_ready(jnp.array(st.vel_scale, copy=True)) if device is None
           else jax.block_until_ready(jax.device_put(np.array(st.vel_scale, copy=True), device)))
     no_mark = dtile._clock(None)
+    if census is not None:
+        from .migrate import _zeros, pass_arena_index
+
+        census_acc = _zeros(int(st.n_bricks), jnp.int64, device)
+        census_index = pass_arena_index(st)
+        census_slabs = 0
     n_owned = n_out = tiles_run = 0
     smax_all, wrapped, live_max, residents = [], False, 0, 0
 
@@ -283,6 +365,10 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
                 f"tile plane {i} owned {own_i} rows against {want} stored in its core slabs; "
                 "nothing of this plane was written to the host")
         n_owned += own_i
+        if census is not None:
+            census_acc, n_c = _census_plane(st, win, wd, vs, i, per, float(census),
+                                            census_index, census_acc, device)
+            census_slabs += n_c
         if write_host:
             _write_core(st, win, np.asarray(wd["w"]), i, per, nb)
         del win, wd
@@ -295,7 +381,13 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
     if smax_all:
         mx = float(np.asarray(jnp.max(jnp.stack(smax_all))))
         kick_max = mx if np.isfinite(mx) else None
-    return dict(n_owned=n_owned, n_out=n_out, tiles_run=tiles_run, planes_run=len(planes),
-                vel_scale_kick_max=kick_max, wrapped=wrapped,
-                window_live_rows_max=live_max, residents_staged=residents,
-                window_slabs=span)
+    out = dict(n_owned=n_owned, n_out=n_out, tiles_run=tiles_run, planes_run=len(planes),
+               vel_scale_kick_max=kick_max, wrapped=wrapped,
+               window_live_rows_max=live_max, residents_staged=residents,
+               window_slabs=span)
+    if census is not None:
+        from .migrate import _host
+
+        out.update(census_counts=_host(census_acc, "window: destination counts"),
+                   census_slabs=census_slabs)
+    return out
