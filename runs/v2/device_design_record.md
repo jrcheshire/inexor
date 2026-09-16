@@ -2654,3 +2654,131 @@ program terms CHARGED from their array inventories, not measured).
 1. The gb job with an `emit-shape` leg (one 4096^3 destination slab on one card:
    `memory_stats` peak, per-slab seconds, projected to four cards; stops above 0.9 x 199
    GB), then the 2048^3 rung (stop: 4096^3 projected over 6 h), then 4096^3.
+
+## 38. D6 rerun on a GB200 (Vista 998798) -- the 4096^3 ICs are on disk in 66.7 min; the allocator, not the memory fraction, is what 997814 needed; cuda_async costs 1.15x on the transform stages
+
+### The two runs this section closes
+
+997814 (gb c672-017, 52:57, rc 1, ~1 SU) priced card emission and then OOMed at the
+4096^3 displacements. 998798 (gb c672-017, 1:16:50, rc 0, ~1.4 SU) is the same commit's
+work at `XLA_CLIENT_MEM_FRACTION=0.95` + `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async`,
+`3891c8d`, code otherwise unchanged.
+
+### 998798, leg by leg
+
+| leg | reading |
+|---|---|
+| preflight | four GB200s, 189,471 MiB each; host 1691 GB; **allocator `bytes_limit` 0.0 GiB on all four cards** (see the receipt defect below) |
+| smoke, 32^3 | occupancy exact, positions identical, 252 / 274 of 120,033 velocity codes by 1 at f_NL 0 / 10, scales <= 5.5e-7 relative, kernels 0.0 eps x rms vs numpy, 4 cards == 1 card -- **reproducing 997280's smoke digit for digit**, so the allocator moves no number |
+| emit-shape, one 4096^3 destination slab on one card | 7.88 s cold (upload 0.647, source 1.106, dest 1.384, write 4.292); card peak 35.17 GB; projected 401.9 s per card |
+| 2048^3 | 7.7 min: delta 10.8, source 75.8, source forward 11.1, velocities 211.3, displacements 54.3, emission 97.5 s; host peak 108.3 GB (planner 103.9, 1.04x) |
+| projection to 4096^3 | 1.119 h, host 866 GB, per card 130 GB |
+| **4096^3** | **66.7 min (1.112 h): delta 108.6, source 555.3, source forward 126.3, velocities 1767.5, displacements 629.1, emission 814.4 s; host peak 839.1 GB (0.82x the node, 12.21 B/p); 256 slabs + manifest, 641 GB** |
+| card memory, whole job | nvidia-smi max 100.9 / 104.7 / 100.0 / 100.9 GiB |
+| GPU pytest | 92 passed, 29 skipped |
+
+The projection leg read the 4096^3 wall as 1.119 h off the job's own 2048^3 card and the
+run took 1.112 h (0.99x), and its host figure 866 GB against 839 measured (1.03x). The
+n^3 scaling of this generator is now checked end to end at the size it will be used at.
+
+The manifest is `t9-slabs-2`, 68,719,476,736 particles, `ic_stream = m5-foldin-1-card`
+(distinct from the host stream's `m5-foldin-1` per D-v2-23, so no readout pools across
+the two generators), `vel_scale` 1.0953e-3, `max_displacement` 4.496, window 1.
+`/scratch/10303/jrc4/inexor_runs/c-hero-r0`.
+
+### THE ATTRIBUTION: it was the allocator, and the memory trace separates the two knobs
+
+The rerun moved two things at once, which on its own would leave the cause confounded.
+The per-card trace decides it. **998798 peaks at 100.0-104.7 GiB per card -- below the
+OLD default cap of 0.75 x 185.0 = 138.8 GiB**, where 997814 had three cards pinned at
+exactly 138.8 and card 2 stuck at 129.3 when it failed to place a 66 GiB halo shard.
+
+So the generator's true working set was ~101 GiB all along and **the 0.95 fraction was
+never load-bearing**; what ended 997814 was BFC growing regions it then could not merge
+or return. Under `cuda_async` the trace oscillates 82-101 GiB for the whole run with no
+card diverging from the others, i.e. the 64 GiB source-stage region that sec. 37 left
+unattributed does not recur -- it was BFC retention, not a live array and not a
+Python-side leak (the laptop weakref census had already ruled that out).
+
+Consequence for the planner and the stop bars: `GB_CARD = 199` and `plan.py --device-gb`
+compare against the whole card, which is right for `cuda_async` and wrong by the fraction
+for BFC. The measured per-card peak is 108 GB against the planner's charged 146.3 GB for
+the emission stage, so the planner is conservative there by 1.35x.
+
+### THE RECEIPT DEFECT: `bytes_limit` proves nothing under this allocator
+
+The preflight line added in `3891c8d` to show the fraction had applied printed **0.0 GiB
+on all four cards**. `cuda_async` does not report a `bytes_limit` through
+`memory_stats()` -- that field belongs to BFC -- so the knob receipt is void, and the
+attribution above rests entirely on the nvidia-smi CSV sampler. The same class as the
+D5b transfer proxy (sec. 11): a receipt that cannot fail is not a receipt. Either read
+`pool_bytes` / the allocator name, or gate on the sampled high-water, which is the thing
+the bar is actually about.
+
+### JC's pre-registered question: does cuda_async cost wall? Yes, on the transforms
+
+Stage seconds against 997814, same code, same node type, BFC vs cuda_async:
+
+| stage | 2048^3 997814 | 2048^3 998798 | ratio | 4096^3 997814 | 4096^3 998798 | ratio |
+|---|---|---|---|---|---|---|
+| delta | 9.0 | 10.8 | 1.20 | 83 | 108.6 | 1.31 |
+| source | 49.8 | 75.8 | 1.52 | 388 | 555.3 | 1.43 |
+| source forward | 7.1 | 11.1 | 1.56 | 108 | 126.3 | 1.17 |
+| velocities | 193.6 | 211.3 | 1.09 | 1931 | 1767.5 | 0.92 |
+| displacements | 48.3 | 54.3 | 1.12 | -- | 629.1 | -- |
+| emission | 96.4 | 97.5 | 1.01 | -- | 814.4 | -- |
+| whole leg | 6.7 min | 7.7 min | **1.15** | | | |
+
+The cost lands on the transform-heavy stages (source, source forward, delta) and not on
+the staged or write-bound ones (velocities, emission). Reported, not gated. Since the
+capacity argument for `cuda_async` is now known to be unnecessary -- the peak clears the
+unraised cap by 38 GiB -- BFC at fraction 0.95 is worth an A/B leg rather than a blind
+flip back: the risk is precisely that BFC ratchets to whatever ceiling it is given,
+which is the failure 997814 died of, and a higher ceiling does not by itself stop it.
+
+### Emission cost 2.0x its own projection, and the emit-shape leg is why
+
+Measured per card (`manifest.emission_s`, summed over four cards, divided): upload
+314.2, source 30.0, dest 96.6, write 355.7 = **796.4 s per card** against the emit-shape
+leg's projected 401.9.
+
+Per destination slab that is 12.44 s against the leg's 7.43, and the whole miss is the
+UPLOAD term: 4.91 s per slab against 0.647, 7.6x. The leg's own card says why -- it
+peaked at 35.17 GB and reported 102.8 GB as the projection "with the real halo shard", so
+it uploaded a reduced source window and its upload leg was never the production one.
+Write transferred honestly (5.56 vs 4.292, 1.29x) and dest nearly so (1.51 vs 1.384).
+
+The general form is the one sec. 37's own SU note is about: a per-row or per-slab term
+measured on a leg that does not carry the production shape prices the shape it ran, not
+the one that bills the job. The leg was built to read CARD MEMORY, which it did
+correctly; it was the seconds that did not transfer.
+
+### Where the 4096^3 wall actually sits
+
+| stage | s | share |
+|---|---|---|
+| velocities | 1767.5 | 44.2% |
+| emission | 814.4 | 20.3% |
+| displacements | 629.1 | 15.7% |
+| source | 555.3 | 13.9% |
+| source forward | 126.3 | 3.2% |
+| delta | 108.6 | 2.7% |
+
+`velocities` stages three 275 GB f32 fields to Lustre (825 GB, confirmed by the cleanup's
+824,633,721,216 B) because six emission fields do not fit host plus cards with work room,
+and emission reads them back -- which is what the 314 s per card of upload is. Whether
+that stage is write-bound or compute-bound is UNMEASURED and it is the only term large
+enough for the answer to matter.
+
+### Owed
+
+1. `manifest.provenance` is `{}` on the c-hero card. Every other instrument in this
+   project stamps backend / device_kind / jax version / XLA_FLAGS (sec. 61 of the
+   threads record; `_provenance()` in the M-v2-4 gate), and these ICs are the input to
+   every 4096^3 run that follows. Fill it before the D7 smoke consumes them.
+2. The knob receipt: replace `bytes_limit` with something both allocators answer.
+3. A split of the `velocities` stage into compute and staging write, so the largest term
+   in the IC wall has a cause rather than a size.
+4. Carried from sec. 36: JC to confirm the proposed IC parity bars. Against them this
+   run reads occupancy exact, codes within 1, scales 5.5e-7, numpy host peak 1.01x the
+   planner at 4096^3 and 1.04x at 2048^3 -- all inside the proposed brackets.
