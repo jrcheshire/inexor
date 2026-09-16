@@ -523,10 +523,88 @@ def _insert_input(nb, share, reach, seed):
     return dest, off, w, s_old, starts, p3, n_slab
 
 
+def _insert_impl(which):
+    """The live kernel, or the frozen pre-cba30c3 one for the A/B.
+
+    Separate MODULES with separate caches on purpose: both key on
+    `(p3, nb2, n_pad, has_ids)`, so a shared cache would hand one arm the other's
+    kernel and the comparison would be a thing against itself.
+    """
+    if which == "legacy":
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import v2_d3_insert_legacy as mod
+        return mod
+    from inexor import insert_jax
+    return insert_jax
+
+
+def arm_insert_parity(args):
+    """Frozen pre-cba30c3 insert vs the live one: elementwise, plus an HLO receipt.
+
+    The speed and memory arms are `peak-insert --insert-impl`, run as SEPARATE
+    processes because a device peak never resets and one process would conflate
+    them. This arm is about agreement, so it runs both here and reports no peak.
+
+    The HLO receipt exists because the whole rung rests on a premise a CPU-only
+    jaxlib cannot check: that a stable `argsort` over a simple comparator lowers
+    to a CUB radix sort, which is what makes the key's WIDTH the thing that
+    mattered. Reported, not gated -- if it is absent the change is still
+    permutation-identical, it just means the win has a different explanation.
+    """
+    _x64()
+    import jax
+    import jax.numpy as jnp
+
+    platform = _require_device(args.allow_cpu)
+    nb, share, reach = args.shape_nb, args.emig_share, args.reach
+    dest, off, w, s_old, starts, p3, n_slab = _insert_input(nb, share, reach, seed=23)
+    n = len(dest)
+    outs = {}
+    for which in ("legacy", "current"):
+        mod = _insert_impl(which)
+        outs[which] = mod.insert_rows(dest, off, w, None, s_old, 0, starts, p3)
+    a, b = outs["legacy"], outs["current"]
+    diffs = {}
+    for k in sorted(a):
+        va, vb = a[k], b[k]
+        if va is None and vb is None:
+            continue
+        va, vb = np.asarray(va), np.asarray(vb)
+        diffs[k] = int((va != vb).sum()) if va.shape == vb.shape else -1
+    identical = all(v == 0 for v in diffs.values())
+
+    # the receipt: what the sort actually lowered to on THIS backend
+    hlo_hit, hlo_err = None, None
+    try:
+        nb2 = int(len(starts)) - 1
+        n_pad = _insert_impl("current")._padded(n)
+        fn = _insert_impl("current")._build(int(p3), nb2, n_pad, False)
+        argv = (jnp.zeros(n_pad, jnp.int64), jnp.zeros((n_pad, 3), jnp.uint8),
+                jnp.zeros((n_pad, 3), jnp.int16), None,
+                jnp.ones(n_pad, jnp.float64), jnp.ones(n_pad, bool),
+                jnp.asarray(0, jnp.int64),
+                jnp.asarray(np.asarray(starts, dtype=np.int64)),
+                jnp.full(nb2, 32767.0))
+        text = jax.jit(fn).lower(*argv).compile().as_text().lower()
+        hlo_hit = sorted({t for t in ("cub", "radix", "bitonic", "sort") if t in text})
+    except Exception as e:  # a receipt must never be the reason a leg dies
+        hlo_err = f"{e.__class__.__name__}: {e}"
+
+    rec = dict(arm="insert-parity", platform=platform, nb=nb, emig_share=share,
+               reach=reach, slab_rows=n_slab, rows=n, field_diffs=diffs,
+               identical=identical, hlo_tokens=hlo_hit, hlo_error=hlo_err,
+               host_maxrss_gb=_maxrss_gb())
+    _say(f"[insert-parity] {n:,} rows: identical={identical} diffs={diffs}")
+    _say(f"[insert-parity] HLO tokens {hlo_hit}" + (f" (receipt failed: {hlo_err})"
+                                                    if hlo_err else ""))
+    # rc 3 = the arms disagree, which stops adoption; a failed receipt does not
+    return rec, 0 if identical else 3
+
+
 def arm_peak_insert(args):
     """Device peak of the compiled insert alone at a given emigrant share and reach."""
     _x64()
-    from inexor import insert_jax
+    insert_jax = _insert_impl(args.insert_impl)
 
     platform = _require_device(args.allow_cpu)
     nb, share, reach = args.shape_nb, args.emig_share, args.reach
@@ -541,13 +619,14 @@ def arm_peak_insert(args):
         out = insert_jax.insert_rows(dest, off, w, None, s_old, 0, starts, p3)
         walls.append(time.perf_counter() - t)
     peak = _peak()
-    rec = dict(arm="peak-insert", platform=platform, nb=nb, emig_share=share, reach=reach,
+    rec = dict(arm="peak-insert", impl=args.insert_impl, platform=platform, nb=nb,
+               emig_share=share, reach=reach,
                slab_rows=n_slab, rows=n, padded=insert_jax._padded(n), gen_s=gen_s,
                walls_s=walls, n_write=out["n_write"], n_spill=out["n_spill"],
                device_peak=peak, b_per_row=None if peak is None else peak / n,
                b_per_slab_row=None if peak is None else peak / n_slab,
                host_maxrss_gb=_maxrss_gb())
-    _say(f"[peak-insert] share {share:.2f} reach {reach}: {n:,} input rows "
+    _say(f"[peak-insert/{args.insert_impl}] share {share:.2f} reach {reach}: {n:,} input rows "
          f"({n / n_slab:.2f} slabs): device peak {(peak or 0) / 2**30:.2f} GiB = "
          f"{(peak or 0) / n:.1f} B/input row = {(peak or 0) / n_slab:.1f} B/slab row; "
          f"walls {[round(x, 2) for x in walls]} s; written {out['n_write']:,} spilled "
@@ -625,6 +704,7 @@ def arm_device_migrate(args):
 
 ARMS = {"xback": arm_xback, "slab-real": arm_slab_real, "slab-shape": arm_slab_shape,
         "peak-eject": arm_peak_eject, "peak-insert": arm_peak_insert,
+        "insert-parity": arm_insert_parity,
         "device-xback": arm_device_migrate, "device-real": arm_device_migrate}
 
 
@@ -668,6 +748,9 @@ def main(argv=None):
     ap.add_argument("--shape-frac", type=float, default=0.5)
     ap.add_argument("--emig-share", type=float, default=0.05, help=argparse.SUPPRESS)
     ap.add_argument("--reach", type=int, default=1, help=argparse.SUPPRESS)
+    ap.add_argument("--insert-impl", choices=("current", "legacy"), default="current",
+                    help="which insert kernel `peak-insert` times: the live one, or "
+                         "the frozen pre-cba30c3 oracle in v2_d3_insert_legacy.py")
     ap.add_argument("--peaks", default="",
                     help="'+'-separated peak arms, each its own process: 'eject' and/or "
                          "'insert:SHARE:REACH' (e.g. eject+insert:0.05:1+insert:0.2:2)")
@@ -739,6 +822,15 @@ def main(argv=None):
             card["arms"].append(res)
             write()
             worst = max(worst, rc)
+    if "insert-parity" in arms:
+        res, rc = _run_worker(["--arm", "insert-parity", "--shape-nb", str(args.shape_nb),
+                               "--emig-share", str(args.emig_share),
+                               "--reach", str(args.reach), *common],
+                              {}, "insert-parity")
+        card["arms"].append(res)
+        write()
+        worst = max(worst, rc)
+
     # peak arms run even if one before them fails: an out-of-memory at a large
     # share is itself the reading, and the smaller specs are still worth having
     for spec in [s for s in args.peaks.split("+") if s]:
@@ -746,9 +838,13 @@ def main(argv=None):
             argv_p = ["--arm", "peak-eject", "--shape-nb", str(args.shape_nb),
                       "--shape-frac", str(args.shape_frac)]
         else:
-            _, share, reach = spec.split(":")
+            # insert:SHARE:REACH[:IMPL] -- IMPL defaults to the live kernel, so
+            # every spec written before the A/B existed keeps its meaning
+            parts = spec.split(":")
+            _, share, reach = parts[:3]
+            impl = parts[3] if len(parts) > 3 else "current"
             argv_p = ["--arm", "peak-insert", "--shape-nb", str(args.shape_nb),
-                      "--emig-share", share, "--reach", reach]
+                      "--emig-share", share, "--reach", reach, "--insert-impl", impl]
         res, rc = _run_worker([*argv_p, *common], {}, f"peak {spec}")
         card["arms"].append(res)
         write()
