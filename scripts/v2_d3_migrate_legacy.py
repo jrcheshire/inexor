@@ -1,4 +1,17 @@
-"""D3b R1: the migrate on the device, slab by slab, bitwise the serial numpy pass.
+"""FROZEN copy of `inexor.device.migrate` as it stood at 6d882b1, for the M3 A/B only.
+
+Vendored so the host-stall removal (the slab window uploaded without a host copy;
+the census counts read once at eject) runs against its before-state in ONE job on
+ONE node, as `v2_d3_insert_legacy.py` did for M2. Relative imports rewritten to
+absolute; nothing else changed. The kernels (`eject_jax`, `insert_jax`) are the
+live ones in both arms, so the A/B isolates the pass around them.
+
+An ORACLE, not a path anything runs, and it does not move. Delete it once the
+GB200 A/B is read out and recorded.
+
+The original module docstring follows.
+
+D3b R1: the migrate on the device, slab by slab, bitwise the serial numpy pass.
 
 WHAT MOVES. `state.drift_and_migrate` ejects and inserts each x-slab with numpy
 (or with the compiled kernels fed and emptied by per-row host work). Here each
@@ -39,17 +52,6 @@ with the measured peak.
 SHAPES. Row buffers use each kernel's `_padded`; the slab window, arena arrays and
 staged emigrants use `forces.capacity_shape`, so slabs of nearby size share every
 program.
-
-THE WINDOW is the slot range uploaded straight from the host state: `w_cap` rows
-from the slab's first slot, a view, so no host copy. Rows past the slab's own
-belong to later slabs (or another card's thread may be writing them); nothing
-reads them. Arena residents go up as their own `a_cap` array. Only where the view
-would run off the end of the state is the slot range copied into a padded buffer
-(`window_copied_slabs` on the receipt).
-
-READS. Every device-to-host read goes through `_host`, counted in `READS` by
-phase. The eject reads `n_keep`, its realized reach and its emigrants' count per
-destination slab in one read; the insert's census is host arithmetic on those.
 
 SEVERAL CARDS (R3, `devices=`). Because every order-dependent arena change is
 replayed at the end and a slab's work touches only its own rows, slabs may run on
@@ -149,7 +151,7 @@ class _Budget:
 
 
 def _ladder(n):
-    from ..forces import capacity_shape
+    from inexor.forces import capacity_shape
 
     return int(capacity_shape(max(1, int(n))))
 
@@ -173,7 +175,7 @@ def _zeros(shape, dtype, dev):
 
     if dev is None:
         return jnp.zeros(shape, dtype)
-    from .paint import _zeros_on
+    from inexor.device.paint import _zeros_on
 
     shape = (int(shape),) if np.isscalar(shape) else tuple(shape)
     return _zeros_on(shape, dtype, dev)
@@ -189,22 +191,6 @@ def _arange(n, dev):
     n = int(n)
     fn = _program(("arange", n), lambda: jax.jit(lambda z: jnp.arange(n, dtype=jnp.int64) + z))
     return fn(jax.device_put(np.int64(0), dev))
-
-
-#: RECEIPT: device-to-host reads by phase (see READS above).
-READS: dict = {}
-_READS_LOCK = threading.Lock()
-
-
-def _host(x, what):
-    """`np.asarray(x)`, counted in `READS[what]`; allowed under a disallowing transfer guard."""
-    import jax
-
-    with jax.transfer_guard_device_to_host("allow"):
-        a = np.asarray(x)
-    with _READS_LOCK:
-        READS[what] = READS.get(what, 0) + 1
-    return a
 
 
 def pass_arena_index(st):
@@ -241,7 +227,7 @@ def _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids):
 
         @jax.jit
         def rows(occ, live, starts_rel, row_offsets, ar_offsets, ar_bucket, off_win, w_win,
-                 ids_win, ar_off, ar_w, ar_ids, scales_s, n_rows, lo_b):
+                 ids_win, scales_s, n_rows, span, lo_b):
             r = jnp.arange(cap, dtype=jnp.int64)
             real = r < n_rows
             bi = jnp.clip(jnp.searchsorted(row_offsets[1:], r, side="right"),
@@ -257,10 +243,9 @@ def _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids):
             within = jnp.searchsorted(keys, bi * lift + rank, side="right").astype(jnp.int64)
             within = jnp.clip(within - bi * p3, 0, p3 - 1)
             bucket_live = (lo_b + bi) * p3 + within
-            # arena rows: the residents array, in index order
+            # arena rows: appended to the window after the slot range, in index order
             k = jnp.clip(ar_offsets[bi] + rank - lc, 0, a_cap - 1)
-            slot = jnp.where(real & ~is_ar, starts_rel[bi] + rank, 0)
-            a = is_ar[:, None]
+            slot = jnp.where(real, jnp.where(is_ar, span + k, starts_rel[bi] + rank), 0)
             bucket = jnp.where(is_ar, ar_bucket[k], bucket_live)
             # brick-major ordinal -> per-axis bucket index (`layout.bucket_ijk_from_key`)
             brick_flat, within_flat = jnp.divmod(bucket, per**3)
@@ -271,43 +256,17 @@ def _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids):
             bijk = jnp.stack([bx * per + wx, by * per + wy, bz * per + wz], axis=-1)
             # pad rows carry the fills `eject_rows` pads with
             m = real[:, None]
-            off = jnp.where(m, jnp.where(a, ar_off[k], off_win[slot]), jnp.zeros((), off_win.dtype))
-            w = jnp.where(m, jnp.where(a, ar_w[k], w_win[slot]), jnp.zeros((), w_win.dtype))
+            off = jnp.where(m, off_win[slot], jnp.zeros((), off_win.dtype))
+            w = jnp.where(m, w_win[slot], jnp.zeros((), w_win.dtype))
             bijk = jnp.where(m, bijk, 0)
             scale = jnp.where(real, scales_s[bi], 1.0)[:, None]
             brick = jnp.where(real, lo_b + bi, -1)
-            ids = (jnp.where(real, jnp.where(is_ar, ar_ids[k], ids_win[slot]),
-                             jnp.zeros((), ids_win.dtype)) if has_ids else None)
+            ids = jnp.where(real, ids_win[slot], jnp.zeros((), ids_win.dtype)) if has_ids else None
             return off, bijk, w, ids, scale, brick, real
 
         return rows
 
     return _program(("rows", cap, w_cap, a_cap, nb, p3, per, has_ids), make)
-
-
-def _eject_scalars_program(cap, nb, p3):
-    """(n_keep, realized x-reach, emigrant count per destination slab) as one int64 vector."""
-
-    def make():
-        import jax
-        import jax.numpy as jnp
-
-        per_slab = p3 * nb * nb
-
-        @jax.jit
-        def scalars(dest, n_keep, n_rows, s):
-            idx = jnp.arange(cap, dtype=jnp.int64)
-            n_keep = n_keep.astype(jnp.int64)
-            em = (idx >= n_keep) & (idx < n_rows)
-            to = dest // per_slab
-            disp = (to - s + nb // 2) % nb - nb // 2
-            rr = jnp.max(jnp.where(em, jnp.abs(disp), 0))
-            counts = jnp.zeros(nb, jnp.int64).at[jnp.where(em, to, nb)].add(1, mode="drop")
-            return jnp.concatenate([n_keep[None], rr[None].astype(jnp.int64), counts])
-
-        return scalars
-
-    return _program(("eject_scalars", cap, nb, p3), make)
 
 
 def _put_program(seg_cap, cap_i, has_ids):
@@ -356,7 +315,7 @@ def _write_program(cap_i, w_cap, has_ids):
 
 
 def _eject_kernel(t9, nb, cap, has_ids):
-    from .. import eject_jax
+    from inexor import eject_jax
 
     key = (int(t9.n_buckets_side), float(t9.quantum), int(nb), int(cap), has_ids)
     with _PROGRAM_LOCK:
@@ -367,7 +326,7 @@ def _eject_kernel(t9, nb, cap, has_ids):
 
 
 def _insert_kernel(p3, nb2, cap, has_ids):
-    from .. import insert_jax
+    from inexor import insert_jax
 
     key = (int(p3), int(nb2), int(cap), has_ids)
     with _PROGRAM_LOCK:
@@ -377,16 +336,11 @@ def _insert_kernel(p3, nb2, cap, has_ids):
     return fn
 
 
-def _window_fits(n_state_rows, s0, w_cap):
-    """True when `w_cap` rows from slot `s0` lie inside the state: the window is a view."""
-    return s0 + w_cap <= n_state_rows
-
-
 def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=None):
     """Upload slab s's window to `dev`, build its rows and eject them. Returns the staged slab."""
     import jax.numpy as jnp
 
-    from .. import eject_jax
+    from inexor import eject_jax
 
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
     nb2 = nb * nb
@@ -416,45 +370,34 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=
 
     ar_bucket = np.zeros(a_cap, dtype=np.int64)
     ar_bucket[:n_ar] = np.asarray(st.arena_bucket)[rows_a - int(st.arena_base)]
-    clock.mark("eject: host index")
-
-    direct = _window_fits(len(st.off), s0, w_cap)
 
     def window(src):
-        if direct:
-            return src[s0:s0 + w_cap]
         out = np.zeros((w_cap,) + src.shape[1:], dtype=src.dtype)
         out[:span] = src[s0:s1]
-        return out
-
-    def residents(src):
-        out = np.zeros((a_cap,) + src.shape[1:], dtype=src.dtype)
-        out[:n_ar] = src[rows_a]
+        out[span:span + n_ar] = src[rows_a]
         return out
 
     off_np, w_np = window(st.off), window(st.w)
     ids_np = window(st.ids) if has_ids else None
-    ar_np = (residents(st.off), residents(st.w), residents(st.ids) if has_ids else None)
-    clock.mark("eject: window")
+    clock.mark("eject: host index + window")
 
     off_win = _put(off_np, dev)
     w_win = _put(w_np, dev)
     ids_win = _put(ids_np, dev) if has_ids else None
-    ar_rows = tuple(None if a is None else _put(a, dev) for a in ar_np)
-    off_np = w_np = ids_np = ar_np = None
+    off_np = w_np = ids_np = None
     index_dev = (_put(occ, dev), _put(live, dev), _put(np.asarray(
         st.brick_start[lo_b:hi_b], dtype=np.int64) - s0, dev), _put(row_offsets, dev),
         _put(ar_offsets, dev), _put(ar_bucket, dev),
         _put(np.asarray(scales[lo_b:hi_b], dtype=np.float64), dev))
-    clock.mark("eject: upload", off_win, w_win, ids_win, ar_rows, index_dev)
+    clock.mark("eject: upload", off_win, w_win, ids_win, index_dev)
 
     rows = _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids)
     occ_d, live_d, starts_d, row_off_d, ar_off_d, ar_bucket_d, scales_d = index_dev
     off, bijk, w, ids, scale, brick, real = rows(
         occ_d, live_d, starts_d, row_off_d, ar_off_d, ar_bucket_d, off_win, w_win, ids_win,
-        *ar_rows, scales_d, _put(n_rows, dev, jnp.int64), _put(lo_b, dev, jnp.int64))
+        scales_d, _put(n_rows, dev, jnp.int64), _put(span, dev, jnp.int64),
+        _put(lo_b, dev, jnp.int64))
     index_dev = occ_d = live_d = starts_d = row_off_d = ar_off_d = ar_bucket_d = scales_d = None
-    ar_rows = None
     clock.mark("eject: rows program", off, bijk, w, ids, scale, brick, real)
 
     fn = _eject_kernel(st.t9, nb, cap, has_ids)
@@ -463,16 +406,19 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=
     # the row buffers are the kernel's input only; release them before staging
     off = bijk = w = ids = scale = brick = real = None
     clock.mark("eject: kernel", dest, off_new, w_out, ids_out, src_out, n_keep)
+    n_keep = int(n_keep)
 
-    # n_keep, the realized x-reach over this slab's emigrants (as the serial pass
-    # reports it) and where they go, in one read: the inserts' census reads `to`
-    sc = _host(_eject_scalars_program(cap, nb, p3)(
-        dest, n_keep, _put(n_rows, dev, jnp.int64), _put(s, dev, jnp.int64)), "eject: scalars")
-    n_keep, rr, to = int(sc[0]), int(sc[1]), sc[2:]
+    # realized x-reach over this slab's emigrants, as the serial pass reports it
+    rr = 0
+    if n_rows > n_keep:
+        idx = _arange(cap, dev)
+        em = (idx >= n_keep) & (idx < n_rows)
+        disp = (dest // (p3 * nb2) - s + nb // 2) % nb - nb // 2
+        rr = int(jnp.max(jnp.where(em, jnp.abs(disp), 0)))
     clock.mark("eject: reach + scalars")
 
     return dict(dest=dest, off=off_new, w=w_out, ids=ids_out, src=src_out, cap=cap,
-                n_keep=n_keep, n_rows=n_rows, rr=rr, to=to, direct=direct,
+                n_keep=n_keep, n_rows=n_rows, rr=rr,
                 win=(off_win, w_win, ids_win), s0=s0, s1=s1, span=span, w_cap=w_cap)
 
 
@@ -480,8 +426,8 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget, dev=None):
     """Insert slab d on `dev` and write its slot range back. Returns insert_res."""
     import jax.numpy as jnp
 
-    from .. import insert_jax
-    from ..layout import _to_index
+    from inexor import insert_jax
+    from inexor.layout import _to_index
 
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
     nb2 = nb * nb
@@ -494,7 +440,9 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget, dev=None):
     for s in sources:
         e = staged[s]
         if e["n_rows"] > e["n_keep"]:
-            consumed[s] = int(e["to"][d])
+            idx = _arange(e["cap"], dev)
+            em = (idx >= e["n_keep"]) & (idx < e["n_rows"])
+            consumed[s] = int(jnp.sum(em & (e["dest"] // (p3 * nb2) == d)))
             segs.append((e, e["n_keep"], e["n_rows"], False))
     n_in = sum(hi - lo for _e, lo, hi, _k in segs)
     clock.mark("insert: census")
@@ -522,15 +470,14 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget, dev=None):
              _put(np.asarray(st.brick_start[lo_b:hi_b + 1], dtype=np.int64), dev),
              _put(np.full(nb2, 32767.0, dtype=np.float64), dev))
     clock.mark("insert: kernel", out)
-    if float(_host(out["abs_max"], "insert: scalars")) > INT16_MAX:
+    if float(out["abs_max"]) > INT16_MAX:
         raise ValueError(
             f"velocity code {float(out['abs_max']):.0f} escapes int16 under a rescale to a "
             "scale that does not cover it. Per-brick scales make this reachable where a "
             "global scale made it impossible; the caller must fix the destination scale "
             "over the rows it is about to write. D-007 forbids the clamp."
         )
-    nw = int(_host(out["n_write"], "insert: scalars"))
-    ns = int(_host(out["n_spill"], "insert: scalars"))
+    nw, ns = int(out["n_write"]), int(out["n_spill"])
     # the compacted inputs are not read past the kernel; only its outputs are
     bufs = b_dest = b_off = b_w = b_ids = b_src = s_old = real = None
 
@@ -540,14 +487,14 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget, dev=None):
                                     _put(nw, dev, jnp.int64), _put(e["s0"], dev, jnp.int64))
     clock.mark("insert: scalars + write program", off_win, w_win, ids_win)
     s0, s1, span = e["s0"], e["s1"], e["span"]
-    st.off[s0:s1] = _host(off_win, "insert: slot range")[:span]
-    st.w[s0:s1] = _host(w_win, "insert: slot range")[:span]
+    st.off[s0:s1] = np.asarray(off_win)[:span]
+    st.w[s0:s1] = np.asarray(w_win)[:span]
     if has_ids:
-        st.ids[s0:s1] = _host(ids_win, "insert: slot range")[:span]
+        st.ids[s0:s1] = np.asarray(ids_win)[:span]
     clock.mark("insert: slot range to host")
-    st.occupancy[lo_b * p3: hi_b * p3] = _to_index(_host(out["occupancy"], "insert: occupancy"),
+    st.occupancy[lo_b * p3: hi_b * p3] = _to_index(np.asarray(out["occupancy"]),
                                                     st.index_dtype, "migrated")
-    st.vel_scale[lo_b:hi_b] = _host(out["scales"], "insert: scales")
+    st.vel_scale[lo_b:hi_b] = np.asarray(out["scales"])
     clock.mark("insert: occupancy + scales to host")
 
     spills = []
@@ -564,10 +511,10 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget, dev=None):
                                             out["dest"], _put(nw, dev, jnp.int64),
                                             _put(nw + ns, dev, jnp.int64),
                                             _put(0, dev, jnp.int64))
-        sd = _host(g_dest, "insert: spills")[:ns]
-        so = _host(g_off, "insert: spills")[:ns]
-        sw = _host(g_w, "insert: spills")[:ns]
-        si = _host(g_ids, "insert: spills")[:ns] if has_ids else None
+        sd = np.asarray(g_dest)[:ns]
+        so = np.asarray(g_off)[:ns]
+        sw = np.asarray(g_w)[:ns]
+        si = np.asarray(g_ids)[:ns] if has_ids else None
         sb = sd // p3
         for grp in np.split(np.arange(ns), np.flatnonzero(np.diff(sb)) + 1):
             spills.append((int(sb[grp[0]]), sd[grp], so[grp], sw[grp],
@@ -588,7 +535,7 @@ def _emigrants_only(e, has_ids, dev=None):
     n_emig = e["n_rows"] - e["n_keep"]
     if n_emig <= 0:
         return dict(dest=None, off=None, w=None, ids=None, src=None, cap=0, n_keep=0,
-                    n_rows=0, rr=e["rr"], to=e["to"])
+                    n_rows=0, rr=e["rr"])
     cap_e = _ladder(n_emig)
     bufs = (_zeros(cap_e, jnp.int64, dev), _zeros((cap_e, 3), jnp.uint8, dev),
             _zeros((cap_e, 3), jnp.int16, dev),
@@ -598,7 +545,7 @@ def _emigrants_only(e, has_ids, dev=None):
                                  _put(e["n_keep"], dev, jnp.int64),
                                  _put(e["n_rows"], dev, jnp.int64), _put(0, dev, jnp.int64))
     return dict(dest=dest, off=off, w=w, ids=ids, src=src, cap=cap_e, n_keep=0,
-                n_rows=n_emig, rr=e["rr"], to=e["to"])
+                n_rows=n_emig, rr=e["rr"])
 
 
 def _moved(e, dev):
@@ -626,8 +573,7 @@ def _sweep(st, lo, hi, reach, c_drift, scales, ar_slots, ar_bricks, dev, staged,
         if s not in ejected:
             staged[s] = _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget,
                                     dev)
-            ejected[s] = (staged[s]["n_rows"] - staged[s]["n_keep"], staged[s]["rr"],
-                          staged[s]["direct"])
+            ejected[s] = (staged[s]["n_rows"] - staged[s]["n_keep"], staged[s]["rr"])
         for d in own:
             if d in inserted:
                 continue
@@ -668,9 +614,9 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    from .. import state as _state
-    from ..eject_jax import require_x64
-    from ..ooc_fft import partition_units
+    from inexor import state as _state
+    from inexor.eject_jax import require_x64
+    from inexor.ooc_fft import partition_units
 
     global CALLS
     require_x64()
@@ -720,7 +666,7 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
                 e = _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clocks[k],
                                 budgets[k], devs[k])
                 staged[k][s] = e
-                ejected[k][s] = (e["n_rows"] - e["n_keep"], e["rr"], e["direct"])
+                ejected[k][s] = (e["n_rows"] - e["n_keep"], e["rr"])
                 out[s] = _emigrants_only(e, has_ids, devs[k])
             return out
 
@@ -742,12 +688,11 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
                                  ar_slots, ar_bricks, devs[k], staged[k], ejected[k],
                                  clocks[k], budgets[k]))
     staged = None
-    insert_res, n_emig, rr_by_slab, n_direct = {}, {}, {}, 0
+    insert_res, n_emig, rr_by_slab = {}, {}, {}
     for k in range(W):
         insert_res.update(swept[k][0])
-        for s, (ne, rr, direct) in ejected[k].items():
+        for s, (ne, rr) in ejected[k].items():
             n_emig[s], rr_by_slab[s] = ne, rr
-            n_direct += bool(direct)
 
     clock = clocks[0]
     rep = _state._replay_arena_pass(
@@ -770,8 +715,7 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
                 timings[f"card {k}: {key}"] = timings.get(f"card {k}: {key}", 0.0) + v
     receipt = dict(slabs=nb, programs=len(_PROGRAMS), spill_rows=rep["spill_rows"],
                    peak_estimate_bytes=max(b.peak for b in budgets),
-                   budget_bytes=device_budget_bytes, window_direct_slabs=n_direct,
-                   window_copied_slabs=nb - n_direct)
+                   budget_bytes=device_budget_bytes)
     if devices is not None:
         receipt.update(cards=W, slabs_per_card=[hi - lo for lo, hi in parts],
                        cross_card_segments=segments, cross_card_bytes=moved_bytes,

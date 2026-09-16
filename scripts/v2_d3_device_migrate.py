@@ -538,6 +538,20 @@ def _insert_impl(which):
     return insert_jax
 
 
+def _migrate_impl(which):
+    """The live device migrate pass, or the frozen pre-M3 one for the A/B.
+
+    Separate modules with separate program caches; the kernels inside both are the
+    live `eject_jax` / `insert_jax`, so the A/B isolates the pass around them.
+    """
+    if which == "legacy":
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import v2_d3_migrate_legacy as mod
+        return mod
+    from inexor.device import migrate
+    return migrate
+
+
 def arm_insert_parity(args):
     """Frozen pre-cba30c3 insert vs the live one: elementwise, plus an HLO receipt.
 
@@ -639,10 +653,12 @@ def arm_device_migrate(args):
     an identical copy: bitwise per step, walls, programs compiled, device peak.
 
     `device-xback`: zero slack, 30% arena, drift 1.9 bricks (reach 2, overflow);
-    `device-real`: production slack 0.10, 1% arena, drift `--real-frac`."""
+    `device-real`: production slack 0.10, 1% arena, drift `--real-frac`.
+    `--migrate-impl legacy` runs the frozen pre-M3 pass instead of the live one."""
     _x64()
     from inexor import state
-    from inexor.device import migrate
+
+    migrate = _migrate_impl(args.migrate_impl)
 
     platform = _require_device(args.allow_cpu)
     heavy = args.arm == "device-xback"
@@ -654,10 +670,11 @@ def arm_device_migrate(args):
     ref = copy.deepcopy(st)
     frac = args.xback_frac if heavy else args.real_frac
     c = _c_drift(st, frac)
-    rec = dict(arm=args.arm, platform=platform, n_part=n, nb=nb, rows_per_slab=n**3 // nb,
+    rec = dict(arm=args.arm, impl=args.migrate_impl, platform=platform, n_part=n, nb=nb,
+               rows_per_slab=n**3 // nb,
                c_drift=c, drift_frac=frac, build_s=build_s, steps=[])
-    _say(f"[{args.arm}] n_part={n} nb={nb} ({n**3 // nb:,} rows per slab) built in "
-         f"{build_s:.1f}s on {platform}")
+    _say(f"[{args.arm}/{args.migrate_impl}] n_part={n} nb={nb} ({n**3 // nb:,} rows per slab) "
+         f"built in {build_s:.1f}s on {platform}")
     rc = 0
     for k in range(args.steps):
         t1 = time.perf_counter()
@@ -751,6 +768,9 @@ def main(argv=None):
     ap.add_argument("--insert-impl", choices=("current", "legacy"), default="current",
                     help="which insert kernel `peak-insert` times: the live one, or "
                          "the frozen pre-cba30c3 oracle in v2_d3_insert_legacy.py")
+    ap.add_argument("--migrate-impl", choices=("current", "legacy"), default="current",
+                    help="which device migrate pass the device-* arms run: the live one, "
+                         "or the frozen pre-M3 oracle in v2_d3_migrate_legacy.py")
     ap.add_argument("--peaks", default="",
                     help="'+'-separated peak arms, each its own process: 'eject' and/or "
                          "'insert:SHARE:REACH' (e.g. eject+insert:0.05:1+insert:0.2:2)")
@@ -818,7 +838,8 @@ def main(argv=None):
         if name in arms:
             res, rc = _run_worker(["--arm", name, "--n-part", str(n_arm),
                                    *(xb_nb if name == "device-xback" else []), *frac_flag,
-                                   *common], {}, name)
+                                   "--migrate-impl", args.migrate_impl, *common], {},
+                                  f"{name}/{args.migrate_impl}")
             card["arms"].append(res)
             write()
             worst = max(worst, rc)
