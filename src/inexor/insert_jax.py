@@ -92,11 +92,23 @@ def _build(p3, nb2, n_pad, has_ids):
     # What they prevent is measured rather than asserted: at `nb2 * p3 == 2**32`
     # the sentinel itself wraps to 0 and the out-of-slab rows sort FIRST.
     narrow = narrow_key_ok(p3, nb2, n_pad)
+    # THE INDEX FAMILY IS int32 UNDER THE SAME GUARD. Every one of these counts
+    # rows within one slab and is bounded by `n_pad`, so at 4096^3 they are ~2.7e8
+    # and 3x under the int32 ceiling. They are also `n_pad` LONG, which is what
+    # makes the width matter: `idx_all` alone is 2.15 GB per slab at int64, and the
+    # prefix partition above adds four more arrays of the same length.
+    #
+    # `pos` is the one quantity that must stay wide, and it does so by promotion
+    # rather than by luck: it is `starts[bl] + rank`, `starts` holds GLOBAL slot
+    # indices (~7.5e10 at 4096^3, far past int32), and int64 + int32 -> int64 is
+    # verified in `test_the_written_positions_stay_int64`. Narrowing `starts`
+    # would be the silent truncation this comment exists to prevent.
+    idt = jnp.int32 if narrow else jnp.int64
 
     @jax.jit
     def kernel(dest, off, w, ids, s_old, real, lo_b, starts, div):
         # inside the trace, not a captured constant (see `eject_jax._build`)
-        idx_all = jnp.arange(n_pad, dtype=jnp.int64)
+        idx_all = jnp.arange(n_pad, dtype=idt)
         brick = dest // p3
         inslab = real & (brick >= lo_b) & (brick < lo_b + nb2)
         if narrow:
@@ -110,7 +122,7 @@ def _build(p3, nb2, n_pad, has_ids):
         s_s, in_s = s_old[order], inslab[order]
 
         bl = jnp.where(in_s, dest_s // p3 - lo_b, 0)
-        cnt = jnp.zeros(nb2, dtype=jnp.int64).at[bl].add(in_s.astype(jnp.int64))
+        cnt = jnp.zeros(nb2, dtype=idt).at[bl].add(in_s.astype(idt))
         rank = idx_all - (jnp.cumsum(cnt) - cnt)[bl]
         fits = rank < (starts[1:] - starts[:-1])[bl]
         write = in_s & fits
@@ -141,10 +153,10 @@ def _build(p3, nb2, n_pad, has_ids):
         # input order, then class 1, then class 2, which is exactly what placing
         # each row at its rank within its own class produces. It is also the form
         # `eject_jax._build` already uses for its keeper/leaver partition.
-        # Counts are taken in int64 explicitly -- a bool reduction promotes to
-        # float32 on this stack, and these become scatter indices.
-        w_i = write.astype(jnp.int64)
-        s_i = spill.astype(jnp.int64)
+        # Counts are cast explicitly -- a bool reduction promotes to float32 on
+        # this stack, and these become scatter indices.
+        w_i = write.astype(idt)
+        s_i = spill.astype(idt)
         ex_w = jnp.cumsum(w_i) - w_i
         ex_s = jnp.cumsum(s_i) - s_i
         nw_t = ex_w[-1] + w_i[-1]
@@ -152,7 +164,7 @@ def _build(p3, nb2, n_pad, has_ids):
         pos2 = jnp.where(write, ex_w,
                          jnp.where(spill, nw_t + ex_s,
                                    nw_t + ns_t + (idx_all - ex_w - ex_s)))
-        o2 = jnp.zeros(n_pad, dtype=jnp.int64).at[pos2].set(idx_all)
+        o2 = jnp.zeros(n_pad, dtype=idt).at[pos2].set(idx_all)
         return dict(pos=(starts[bl] + rank)[o2], dest=dest_s[o2], off=off_s[o2],
                     w=w_new[o2], ids=ids[order][o2] if has_ids else None,
                     n_write=jnp.sum(write), n_spill=jnp.sum(spill), occupancy=occ,

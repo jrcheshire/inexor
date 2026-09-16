@@ -148,6 +148,37 @@ def test_the_sort_key_sees_rows_on_both_sides_of_the_slab(x64):
     assert above > 0, "VACUOUS: no immigrant was bound above its slab"
 
 
+def test_the_written_positions_stay_int64(x64):
+    """The index family is int32; `pos` must NOT be, and it is the silent one.
+
+    `pos` is `brick_start[bl] + rank`: `rank` counts rows within a slab and is
+    int32, but `brick_start` holds GLOBAL slot indices -- ~7.5e10 at 4096^3, past
+    int32 by an order of magnitude. It stays wide by int64 + int32 -> int64, which
+    is a promotion rule rather than anything this module asserts, so pin it. A
+    truncation here would relocate written rows and nothing at a testable size
+    would notice: the fixtures' slot indices are tiny.
+    """
+    from inexor import insert_jax
+
+    insert_jax._CACHE.clear()
+    p3, nb2, base = 8, 4, 2**35          # base is FAR past int32, as C-hero's are
+    starts = np.arange(nb2 + 1, dtype=np.int64) * 16 + base
+    n = 6
+    dest = np.array([0, 1, 1, 2, 3, 3], dtype=np.int64) * p3 + np.arange(n) % p3
+    res = insert_jax.insert_rows(
+        dest, np.zeros((n, 3), np.uint8), np.ones((n, 3), np.int16),
+        np.arange(n, dtype=np.int32), np.ones(n, np.float64), 0, starts, p3)
+    assert res["pos"].dtype == np.int64, f"pos narrowed to {res['pos'].dtype}"
+    nw = res["n_write"]
+    assert nw > 0, "VACUOUS: nothing was written"
+    # the values, not just the dtype: every written slot must land past int32,
+    # which is exactly what a truncated `starts[bl] + rank` would fail
+    assert res["pos"][:nw].min() >= base, (
+        f"positions truncated: min {int(res['pos'][:nw].min())} < base {base}")
+    assert (res["pos"][:nw] - base).max() < 16 * nb2
+    insert_jax._CACHE.clear()
+
+
 def test_the_narrow_key_guard_refuses_shapes_that_would_wrap():
     """The guarded branch is unrunnable, so pin the DECISION instead.
 
