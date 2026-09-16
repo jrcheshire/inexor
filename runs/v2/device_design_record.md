@@ -2869,3 +2869,122 @@ the migrate at 4096^3 directly.
 2. The migrate at 4096^3 shape per phase, which resolves the linear-carry question
    above; the D7 smoke reads it.
 3. M4 = R4 fusion, on JC's reach-rule call.
+
+## 40. M3 on a GB200 (Vista 1001060) -- the two host stalls are gone, bitwise; the migrate step is 1.18x faster at cgh64 and 1.10x at 1024^3; per-row cost falls with slab size, so the 4096^3 carry drops from ~852 to ~570 s per pass on one card
+
+`65d06fd`, 2026-09-16, gb node c672-007, COMPLETED rc=0 in 48:27 of 1:30:00 (~0.9 SU).
+Sbatch `v2_m3_stalls_ab_vista.sbatch`; cards
+`runs/v2/d3_device_migrate_m3ab_{gbsmoke,gb,512_legacy_gb,512_current_gb,1024_legacy_gb,1024_current_gb}.json`,
+log copied to `runs/v2/m3-stalls-ab-1001060.log`. What ran (`65d06fd`,
+`src/inexor/device/migrate.py`):
+
+- **The window.** The slab's slot range is uploaded as a view of the host state
+  (`w_cap` rows from its first slot); arena residents go up as their own `a_cap` array
+  and the rows program gathers them from it. The zero-padded host copy of `off`, `w`
+  and `ids` is gone. Where the view would run off the end of the state the copy
+  remains (`window_copied_slabs`); no slab here needed it (32 of 32 and 64 of 64
+  direct). Residents are NOT written into the uploaded window: on the CPU backend a
+  device_put of a slice aliases the host state, so an in-place write would have
+  written into it.
+- **The census.** The eject reads `n_keep`, its realized reach and its emigrants' count
+  per destination slab in one read (`_eject_scalars_program`); the inserts' census is a
+  host lookup on those counts. Before: eight eager full-size device ops and one
+  blocking read per source slab per insert, plus eager ops and a second read in the
+  eject.
+
+The before is `scripts/v2_d3_migrate_legacy.py`, a frozen copy of `migrate.py` at
+`6d882b1`, with the live kernels in both arms.
+
+### Gates on the GPU: PASS
+
+| comparison | reading |
+|---|---|
+| GPU pytest (8 files, incl. `test_migrate_device_stalls.py`) | 90 passed, 1 skipped in 7:30; the transfer-guard control ran (the GPU is the only backend where it can) |
+| compiled migrate vs numpy, 32^3 and 256^3 (`xback`) | bitwise, 2 steps each; 188,179 overflows at 256^3, reach 2 |
+| **M3 pass vs numpy with arena residents in the windows (`device-xback` 256^3, 30% arena)** | **bitwise, 2 steps + timed; 89,782 / 98,397 overflows, realized reach 2** |
+| M3 and frozen pass vs numpy, `device-real` 512^3 and 1024^3 | bitwise at every step in all four arms |
+
+The transfer-guard control makes the read count complete on the GPU: the
+test pass runs under `transfer_guard_device_to_host("disallow")` with every read
+through `_host`, and the frozen pass raises under the same guard.
+
+### The A/B, same node, separate processes, legacy first
+
+Untimed steady step (step 2), and the synced timed step:
+
+| | 512^3 legacy | 512^3 current | ratio | 1024^3 legacy | 1024^3 current | ratio |
+|---|---|---|---|---|---|---|
+| rows per slab / slabs | 4,194,304 / 32 | | | 16,777,216 / 64 | | |
+| steady step, s | 1.762 | 1.488 | 1.18x | 9.768 | 8.886 | 1.10x |
+| timed step, s | 1.777 | 1.514 | 1.17x | 9.890 | 9.011 | 1.10x |
+| ns per row, steady | 13.1 | 11.1 | | 9.10 | 8.28 | |
+| device peak, GiB | 1.23 | 1.21 | | 4.92 | 4.71 | |
+
+The timed and untimed steps agree on the saving at both sizes (0.26-0.27 s at 512^3,
+0.88 s at 1024^3). One sample of each per arm.
+
+### Where the time went, per phase (timed step, s)
+
+| phase | 512 legacy | 512 current | 1024 legacy | 1024 current |
+|---|---|---|---|---|
+| insert: kernel | 0.338 | 0.345 | 2.429 | 2.463 |
+| insert: slot range to host | 0.302 | 0.295 | 2.338 | 2.348 |
+| eject: upload | 0.257 | 0.278 | 1.712 | 1.804 |
+| **eject: host index + window** (current: index / window) | **0.135** | **0.018 / 0.000** | **1.030** | **0.112 / 0.001** |
+| insert: compact inputs | 0.245 | 0.242 | 0.513 | 0.596 |
+| **insert: census** | **0.129** | **0.001** | **0.260** | **0.003** |
+| eject: reach + scalars | 0.070 | 0.040 | 0.145 | 0.177 |
+| insert: shrink staged | 0.091 | 0.089 | 0.221 | 0.252 |
+| eject: rows program | 0.068 | 0.061 | 0.361 | 0.356 |
+| insert: occupancy + scales to host | 0.038 | 0.039 | 0.267 | 0.274 |
+| rest | 0.088 | 0.106 | 0.614 | 0.625 |
+
+- **Both removed phases are gone at both sizes**, matching the pre-registered
+  expectation. The window copy was 0.117 s of host work at 512^3 and 0.917 s at
+  1024^3, 7.8x for 8x the rows: row-bound, as read from the code. The census was
+  0.128 and 0.257 s, 2.0x for 8x the rows and 2x the slabs: it was bound by the NUMBER
+  of calls, not their size, i.e. the eager ops' dispatch and syncs.
+- The count program moves 0.03 s into `eject: reach + scalars` at 1024^3 against the
+  0.26 s census it replaces. `eject: upload` (+0.09 s) and `insert: compact inputs`
+  (+0.08 s) read higher at 1024^3 in the current arm; one sample per arm, same node,
+  not separated from order.
+
+### Scaling from 512^3 to 1024^3, and what it does to the 4096^3 carry
+
+At the engine's brick geometry (4096 rows per brick), 1024^3 has 4x the rows per slab
+and 8x the rows per pass. The steady pass cost 5.97x (current), not 8x, so the cost
+per row FALLS with slab size: 11.1 -> 8.28 ns/row. The insert kernel is linear in rows
+(2.57 -> 2.29 ns/row); the per-call terms amortize.
+
+So sec. 39's carry of 12.4 ns/row (cgh64, 995638) OVER-reads. Carried linearly from
+this job's 1024^3 current arm instead: 8.28 ns x 6.87e10 rows = **~570 s per pass on one
+card, ~200 s/step at R3's 2.8x on four**, against ~852 / ~304. This is still a linear
+carry from 4x below the production slab, now from above rather than below; the D7
+smoke measures it.
+
+**Correction to sec. 39's "At 4096^3".** Its 490-610 s multiplied 256 slabs by the
+wall of the PUBLIC `insert_rows` call (host padding, upload, compute, readback), and
+set it against the in-pass migrate carry. Those are not the same quantity: inside
+the pass the transfers are separate phases (`insert: compact inputs`, `insert: slot
+range to host`). The in-pass kernel at 2.29 ns/row carries to ~0.61 s per 4096^3 slab,
+so the tension sec. 39 raised came from the comparison, not from the kernel scaling.
+
+### What the pass is now
+
+At 1024^3 the bus is the largest bucket: `eject: upload` 1.80 + `insert: slot range to
+host` 2.35 + `insert: occupancy + scales to host` 0.27 = 4.42 of 9.01 s (49%). The insert
+kernel is 27%. The first two are the crossings R4 fusion removes, which is blocked on
+JC's reach-rule call (plan `serene-nibbling-sparrow.md`, open question 1).
+
+### Owed
+
+1. ~~M3, the host stalls.~~ **CLOSED by this section.** The frozen pre-M3 pass
+   (`scripts/v2_d3_migrate_legacy.py`) is deleted with this readout, and with it
+   `--migrate-impl` and the three tests that used it as a control. The allocation
+   control is now the pass's own copied-window fallback (laptop: passes), the
+   transfer-guard control a bare device scalar read (GPU only, NOT yet run on a
+   GB200: it rides the next gb job's pytest), and the census-equals-frozen-pass test
+   is dropped (the undercount mutation and the bitwise gates remain).
+2. The migrate at 4096^3 per phase, which the D7 smoke reads (carried from sec. 39,
+   now against a ~570 s one-card carry).
+3. M4 = R4 fusion, on JC's reach-rule call.

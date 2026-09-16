@@ -1,0 +1,279 @@
+{
+ "argv": [
+  "scripts/v2_d3_device_migrate.py",
+  "--arms",
+  "xback,device-xback,device-real",
+  "--xback-n",
+  "32",
+  "--real-n",
+  "64",
+  "--nb",
+  "8",
+  "--steps",
+  "2",
+  "--reps",
+  "1",
+  "--out-suffix",
+  "_m3ab_gbsmoke"
+ ],
+ "started": "2026-09-16T13:25:11",
+ "job": "1001060",
+ "node": "c672-007.vista.tacc.utexas.edu",
+ "commit": "65d06fd",
+ "arms": [
+  {
+   "arm": "xback",
+   "rc": 0,
+   "record": {
+    "arm": "xback",
+    "platform": "gpu",
+    "n_part": 32,
+    "nb": 8,
+    "c_drift": 1.770387489869264,
+    "drift_frac": 1.9,
+    "build_s": 0.006766239181160927,
+    "steps": [
+     {
+      "numpy_s": 0.05700507294386625,
+      "jax_s": 1.8794850381091237,
+      "stats_equal": true,
+      "field_diffs": {},
+      "stats": {
+       "n_arena_overflow": 1249,
+       "arena_used": 1249,
+       "vel_scale": 6.550562330134476e-05,
+       "vel_scale_min": 3.114161432611791e-05,
+       "n_migrated_checked": 32768,
+       "brick_reach": 2,
+       "brick_reach_raw": 2,
+       "brick_reach_realized": 2,
+       "peak_staged_slabs": 4
+      }
+     },
+     {
+      "numpy_s": 0.06452635303139687,
+      "jax_s": 0.07462292490527034,
+      "stats_equal": true,
+      "field_diffs": {},
+      "stats": {
+       "n_arena_overflow": 1398,
+       "arena_used": 1398,
+       "vel_scale": 6.550562330134476e-05,
+       "vel_scale_min": 3.3349782664749764e-05,
+       "n_migrated_checked": 32768,
+       "brick_reach": 2,
+       "brick_reach_raw": 2,
+       "brick_reach_realized": 2,
+       "peak_staged_slabs": 4
+      }
+     }
+    ],
+    "eject_calls": 16,
+    "insert_calls": 16,
+    "overflow": 2647,
+    "residents_rehomed": 1249,
+    "realized_reach": 2,
+    "vacuous": []
+   }
+  },
+  {
+   "arm": "device-xback/current",
+   "rc": 0,
+   "record": {
+    "arm": "device-xback",
+    "impl": "current",
+    "platform": "gpu",
+    "n_part": 32,
+    "nb": 8,
+    "rows_per_slab": 4096,
+    "c_drift": 1.770387489869264,
+    "drift_frac": 1.9,
+    "build_s": 0.006702621933072805,
+    "steps": [
+     {
+      "numpy_s": 0.05806296179071069,
+      "device_s": 4.81473896605894,
+      "new_programs": 12,
+      "field_diffs": {},
+      "stats_equal": true,
+      "stats": {
+       "n_arena_overflow": 1249,
+       "arena_used": 1249,
+       "vel_scale": 6.550562330134476e-05,
+       "vel_scale_min": 3.114161432611791e-05,
+       "n_migrated_checked": 32768,
+       "brick_reach": 2,
+       "brick_reach_raw": 2,
+       "brick_reach_realized": 2,
+       "peak_staged_slabs": 4
+      },
+      "receipt": {
+       "slabs": 8,
+       "programs": 12,
+       "spill_rows": 1249,
+       "peak_estimate_bytes": 3426965,
+       "budget_bytes": null,
+       "window_direct_slabs": 8,
+       "window_copied_slabs": 0
+      }
+     },
+     {
+      "numpy_s": 0.06835921388119459,
+      "device_s": 1.6405332260765135,
+      "new_programs": 5,
+      "field_diffs": {},
+      "stats_equal": true,
+      "stats": {
+       "n_arena_overflow": 1398,
+       "arena_used": 1398,
+       "vel_scale": 6.550562330134476e-05,
+       "vel_scale_min": 3.3349782664749764e-05,
+       "n_migrated_checked": 32768,
+       "brick_reach": 2,
+       "brick_reach_raw": 2,
+       "brick_reach_realized": 2,
+       "peak_staged_slabs": 4
+      },
+      "receipt": {
+       "slabs": 8,
+       "programs": 17,
+       "spill_rows": 1398,
+       "peak_estimate_bytes": 3417655,
+       "budget_bytes": null,
+       "window_direct_slabs": 8,
+       "window_copied_slabs": 0
+      }
+     }
+    ],
+    "timed_step": {
+     "numpy_s": 0.06050455989316106,
+     "device_s": 0.8973854421637952,
+     "phases": {
+      "pass: setup": 0.0002919039689004421,
+      "eject: host index": 0.001355072483420372,
+      "eject: window": 0.00020409561693668365,
+      "eject: upload": 0.1220919699408114,
+      "eject: rows program": 0.28737385058775544,
+      "eject: kernel": 0.004757596179842949,
+      "eject: reach + scalars": 0.010405055712908506,
+      "insert: census": 0.0002835514023900032,
+      "insert: compact inputs": 0.08793927310034633,
+      "insert: kernel": 0.009514590259641409,
+      "insert: scalars + write program": 0.01021346915513277,
+      "insert: slot range to host": 0.004253565799444914,
+      "insert: occupancy + scales to host": 0.002627392765134573,
+      "insert: spills to host": 0.3212705757468939,
+      "insert: shrink staged": 0.030971799977123737,
+      "pass: arena replay": 0.0034897271543741226,
+      "pass: final census": 3.513600677251816e-05
+     },
+     "phases_sum_s": 0.89707862585783,
+     "field_diffs": {},
+     "stats_equal": true
+    },
+    "device_peak": 3381760,
+    "host_maxrss_gb": 1.845703125
+   }
+  },
+  {
+   "arm": "device-real/current",
+   "rc": 0,
+   "record": {
+    "arm": "device-real",
+    "impl": "current",
+    "platform": "gpu",
+    "n_part": 64,
+    "nb": 4,
+    "rows_per_slab": 65536,
+    "c_drift": 1.6252523727362762,
+    "drift_frac": 0.5,
+    "build_s": 0.047379635740071535,
+    "steps": [
+     {
+      "numpy_s": 0.05521947517991066,
+      "device_s": 3.6070941127836704,
+      "new_programs": 10,
+      "field_diffs": {},
+      "stats_equal": true,
+      "stats": {
+       "n_arena_overflow": 0,
+       "arena_used": 0,
+       "vel_scale": 7.51108196805551e-05,
+       "vel_scale_min": 5.396730380492035e-05,
+       "n_migrated_checked": 262144,
+       "brick_reach": 1,
+       "brick_reach_raw": 1,
+       "brick_reach_realized": 1,
+       "peak_staged_slabs": 2
+      },
+      "receipt": {
+       "slabs": 4,
+       "programs": 10,
+       "spill_rows": 0,
+       "peak_estimate_bytes": 20920632,
+       "budget_bytes": null,
+       "window_direct_slabs": 4,
+       "window_copied_slabs": 0
+      }
+     },
+     {
+      "numpy_s": 0.057718546129763126,
+      "device_s": 0.0758677888661623,
+      "new_programs": 0,
+      "field_diffs": {},
+      "stats_equal": true,
+      "stats": {
+       "n_arena_overflow": 0,
+       "arena_used": 0,
+       "vel_scale": 7.51108196805551e-05,
+       "vel_scale_min": 5.421806062950307e-05,
+       "n_migrated_checked": 262144,
+       "brick_reach": 1,
+       "brick_reach_raw": 1,
+       "brick_reach_realized": 1,
+       "peak_staged_slabs": 2
+      },
+      "receipt": {
+       "slabs": 4,
+       "programs": 10,
+       "spill_rows": 0,
+       "peak_estimate_bytes": 20920632,
+       "budget_bytes": null,
+       "window_direct_slabs": 4,
+       "window_copied_slabs": 0
+      }
+     }
+    ],
+    "timed_step": {
+     "numpy_s": 0.05621230602264404,
+     "device_s": 0.06786673469468951,
+     "phases": {
+      "pass: setup": 0.00027020834386348724,
+      "eject: host index": 0.0004744958132505417,
+      "eject: window": 4.9727968871593475e-05,
+      "eject: upload": 0.009272155817598104,
+      "eject: rows program": 0.0038488958962261677,
+      "eject: kernel": 0.0011721602641046047,
+      "eject: reach + scalars": 0.0032016639597713947,
+      "insert: census": 0.00010943971574306488,
+      "insert: compact inputs": 0.026235959958285093,
+      "insert: kernel": 0.0059182713739573956,
+      "insert: scalars + write program": 0.0044282241724431515,
+      "insert: slot range to host": 0.0019346550107002258,
+      "insert: occupancy + scales to host": 0.001307804137468338,
+      "insert: spills to host": 5.152542144060135e-06,
+      "insert: shrink staged": 0.009326944127678871,
+      "pass: arena replay": 0.00014720018953084946,
+      "pass: final census": 6.204796954989433e-05
+     },
+     "phases_sum_s": 0.06776500726118684,
+     "field_diffs": {},
+     "stats_equal": true
+    },
+    "device_peak": 17711360,
+    "host_maxrss_gb": 1.810546875
+   }
+  }
+ ],
+ "finished": "2026-09-16T13:25:36"
+}

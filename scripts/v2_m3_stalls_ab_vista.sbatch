@@ -9,6 +9,10 @@
 # M3 on a gb node: the device migrate pass with its two host stalls removed,
 # against the frozen pre-M3 pass (scripts/v2_d3_migrate_legacy.py), ON A GB200.
 #
+# RAN AS Vista 1001060 at 65d06fd, read out in record sec. 40. The frozen pass and
+# `--migrate-impl` were deleted at that readout, so this file no longer runs as is;
+# `git checkout 65d06fd` to replay it.
+#
 # What changed (src/inexor/device/migrate.py): the slab window is uploaded as a
 # view of the host state instead of a zero-padded host copy, with arena residents
 # as their own array; the eject reads n_keep, its realized reach and its
