@@ -569,11 +569,16 @@ def _device_main(args, ec, t9, n, rows, arena, state):
         print("  no --device-gb given, so no per-card verdict (a GB200 detected "
               "185 GiB = 199 GB)")
     print("\n  NB the same LOWER BOUND caveat as the CPU column, and two more "
-          "that are\n  specific to this one. (1) DEVICE_PLACEMENT is a design "
-          "assertion, not a\n  reading of code -- no device executor exists yet. "
-          "(2) The four-way split\n  is charged as an exact quarter; the probe's "
-          "own 114 s/step floor assumes\n  the same perfect split and says so. "
-          "Neither is measured.")
+          "that are\n  specific to this one. (1) DEVICE_PLACEMENT is still a "
+          "design assertion\n  rather than a reading of the code, but the "
+          "executor it asserts now EXISTS\n  and is bitwise the host engine at "
+          "cgh64 on four GB200s (996685, 996857),\n  so the placements are "
+          "checked against something. What is NOT checked is\n  this table at "
+          "4096^3 shapes: that is the D7 smoke.\n  (2) The four-way split is "
+          "charged as an exact quarter, which is right for\n  MEMORY -- each "
+          "card holds its quarter however the wall splits -- and wrong\n  for "
+          "WALL, where D5 measured 2.8-3.0x rather than 4x. Do not read a "
+          "per-card\n  byte here as licence for a quarter of a second anywhere.")
     return 0
 
 
