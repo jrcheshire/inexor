@@ -2988,3 +2988,108 @@ JC's reach-rule call (plan `serene-nibbling-sparrow.md`, open question 1).
 2. The migrate at 4096^3 per phase, which the D7 smoke reads (carried from sec. 39,
    now against a ~570 s one-card carry).
 3. M4 = R4 fusion, on JC's reach-rule call.
+
+## 41. M4 on a GB200 (Vista 1001688) -- the fused migrate + repack is bitwise the separate passes through the engine on one and four cards; at 1024^3 it takes migrate + repack from 11.1 to 7.6 s; at cgh64 the steady step is 1.05-1.07x after paying the census
+
+`b5f9a3c`, 2026-09-16, gb node c672-010, COMPLETED rc=0 in 47:55 of 2:00:00 (~0.9 SU).
+Sbatch `v2_m4_fused_vista.sbatch`; cards `runs/v2/e2e4_device_cards_m4_{gbsmoke,gb}.json`,
+`runs/v2/d3_device_migrate_m4_{gbsmoke,1024_separate_gb,1024_fused_gb}.json`, log copied to
+`runs/v2/m4-fused-1001688.log`. Plan `~/.claude/plans/frolicking-leaping-whisper.md`.
+
+What ran (`5e7be57`..`5e5130b`):
+- **F1, the destination census** (`device/window.py`): after a tile plane has kicked,
+  each core slab goes through the migrate's own rows program and compiled eject
+  kernel against the window (`migrate._slab_index`, `migrate._eject_rows`) and each
+  real row's destination brick is counted on the card. The SAME executable rather
+  than a factored-out drift function, because two programs sharing the arithmetic
+  may contract floats differently on the GPU, and a wrong count on one card
+  corrupts another card's writes before any check can see it.
+- **F2, the fused pass** (`device/fused.py`): per destination slab, the insert's
+  outputs build the repack program's inputs on the card and the new block is
+  written once, into `new_start` from `repack.capacity_from_counts(census)`.
+  Per-brick self-check against the census before each write; later slabs whose old
+  range a block overlaps are uploaded (copied, transfer completed) first, across
+  cards before any card writes; the migrate's `_replay_arena_pass` runs unchanged
+  for its stats and refusals, with block rows that overlap the old arena saved
+  across it.
+- **F3, the engine** (`engine.py`): `migrate_repack_fused` tri-state, auto where the
+  device migrate and the tile window run, on steps whose repack is due.
+
+### What the laptop found that the plan's argument did not
+
+- **The arena overlap.** Where the new allocation reaches past the old
+  `arena_base`, the separate passes write the replay's claims BEFORE the repack's
+  blocks and the fused pass wrote them after: 21 rows of `off` at step 1 of a
+  no-ids fixture, 6,875 by step 2. Fixed by saving and restoring those rows.
+- **Cross-card overruns are a timing hazard.** Without the cross-card early uploads
+  the laptop tests still passed, because the card threads happened to eject deep
+  slabs before a neighbour wrote over them. The gate now delays exactly those
+  ejects; without the early uploads the self-check then refuses (slab 4, 223 bricks).
+- Mutation-tested, each failing its fixture when removed: read-ahead, cross-card
+  early uploads (under the delay), the arena-overlap restore, the spill order.
+
+### Gates on the GPU: PASS
+
+| comparison | reading |
+|---|---|
+| GPU pytest (11 files incl. census, fused, window, engine backend + cards) | 80 passed, 1 skipped in 8:49 |
+| smokes: fused migrate + repack vs numpy (64^3); engine fused vs separate (32^3, 1 and 4 cards) | bitwise; hashes + stats equal |
+| **engine cgh64 K=2, fused vs separate, one card** | **hashes equal, 0 stats differ** |
+| **engine cgh64 K=2, fused vs separate, four cards** | **hashes equal, 0 stats differ** (migrate on 4 cards, no fallback) |
+| engine cgh64, fused four cards vs fused one card | hashes equal, 0 stats differ |
+| **1024^3 fused migrate + repack vs numpy migrate + repack, 2 steps + timed** | **bitwise every step**; separate arm bitwise too |
+
+The one skip is not identified from `-q` output. The same count of one skip appeared
+in 999779 and 1001060 with `test_engine_device_backend.py` in the set, whose pool test
+skips off CPU; so the GPU-only transfer-guard control most likely ran, but this is an
+inference, not a reading. Next gb job: `pytest -rs`.
+
+The cgh64 engine arms spilled nothing (arena use 0); the fused arena path on the GPU
+rests on the pytest fixtures.
+
+### The cgh64 step, steady (step 2 of K=2; step 1 carries compiles)
+
+| s | 1 card separate | 1 card fused | 4 cards separate | 4 cards fused |
+|---|---|---|---|---|
+| tile_loop (fused: incl. census) | 1.37 | 1.50 | 0.42 | 0.46 |
+| migrate | 1.39 | 1.52 | 0.83 | 0.84 |
+| repack | 0.57 | -- | 0.23 | -- |
+| migrate + repack | 1.96 | 1.52 | 1.05 | 0.84 |
+| coarse_paint + coarse_solve + membership | 2.39 | 2.41 | 1.52 | 1.50 |
+| **step** | **5.72** | **5.43** | **2.99** | **2.80** |
+
+- **Net 1.05x (one card) and 1.07x (four cards) on the step.** Migrate + repack fall by
+  0.44 / 0.21 s; the census costs 0.13 / 0.04 s in the tile loop. One sample per arm,
+  separate first.
+- Device peak unchanged by the census at this shape: 4.29 / 4.29 GiB one card,
+  3.69 / 3.69 four cards.
+- The four-card separate step here (2.99 s) sits below sec. 35's 3.54 s: M2/M3 and a
+  different node, not separated.
+
+### 1024^3 migrate + repack, one card, same node (census NOT charged: numpy's, host-side)
+
+| | separate | fused |
+|---|---|---|
+| steady step (step 2), s | 11.12 (migrate 6.97 + repack 4.16) | **7.55** |
+| timed step, s | 11.42 | 7.98 |
+| device peak, GiB | 4.71 | 4.02 |
+
+Timed phases, the terms that moved: separate `insert: slot range to host` 1.67 +
+`repack | upload: own slab` 1.16 + `upload: read-ahead` 0.64 + `upload: index` 0.11 +
+`insert: occupancy + scales to host` 0.19 (3.77 s) are gone; fused adds `fused: block
+inputs` 0.22 + `self-check` 0.01 and its `pass: tail` 0.21 (vs 0.06). Write-back 1.80 ->
+1.93 s. The eject window no longer rides to the insert, hence the lower peak.
+
+### At 4096^3 (carries, not measurements)
+
+The saving at 1024^3 is 3.33 ns/row; the census at cgh64 cost 0.97 ns/row on one card.
+Carried linearly: net ~2.4 ns/row x 6.87e10 = ~160 s per pass on one card, ~57 s/step at
+R3's 2.8x on four. Planned: ~90 s/step, which did not charge the census. The census at
+4096^3 also runs the eject kernel inside the tile loop's memory envelope, unmeasured.
+
+### Owed
+
+1. `plan.py`'s device budget for the fused pass (and the census in the tile phase)
+   from a peak at production shape; the 1024^3 reading (4.02 GiB) is not one.
+2. The 4096^3 smoke (D7) now reads the fused step at full shape.
+3. `pytest -rs` on the next gb job, to name the skip.

@@ -1,0 +1,93 @@
+{
+ "argv": [
+  "scripts/v2_d3_device_migrate.py",
+  "--arms",
+  "device-fused",
+  "--real-n",
+  "64",
+  "--steps",
+  "2",
+  "--reps",
+  "1",
+  "--pass",
+  "fused",
+  "--out-suffix",
+  "_m4_gbsmoke"
+ ],
+ "started": "2026-09-16T18:03:45",
+ "job": "1001688",
+ "node": "c672-010.vista.tacc.utexas.edu",
+ "commit": "b5f9a3c",
+ "arms": [
+  {
+   "arm": "device-fused/fused",
+   "rc": 0,
+   "record": {
+    "arm": "device-fused",
+    "impl": "fused",
+    "platform": "gpu",
+    "n_part": 64,
+    "nb": 4,
+    "rows_per_slab": 65536,
+    "c_drift": 1.6252523727362762,
+    "drift_frac": 0.5,
+    "build_s": 0.04836281109601259,
+    "steps": [
+     {
+      "numpy_s": 0.05341772688552737,
+      "device_s": 4.526089122984558,
+      "migrate_s": 4.526089122984558,
+      "repack_s": 0.0,
+      "field_diffs": {},
+      "stats_equal": true,
+      "bitwise": true
+     },
+     {
+      "numpy_s": 0.05558931175619364,
+      "device_s": 0.06776726990938187,
+      "migrate_s": 0.06776726990938187,
+      "repack_s": 0.0,
+      "field_diffs": {},
+      "stats_equal": true,
+      "bitwise": true
+     }
+    ],
+    "timed_step": {
+     "numpy_s": 0.05444671818986535,
+     "device_s": 0.06733754277229309,
+     "migrate_s": 0.06733754277229309,
+     "repack_s": 0.0,
+     "field_diffs": {},
+     "stats_equal": true,
+     "bitwise": true,
+     "phases": {
+      "pass: setup": 0.00026268791407346725,
+      "eject: host index": 0.0003663357347249985,
+      "eject: window": 5.0496309995651245e-05,
+      "eject: upload": 0.007018500007688999,
+      "eject: rows program": 0.003154945559799671,
+      "eject: kernel": 0.000944450031965971,
+      "eject: reach + scalars": 0.00258540827780962,
+      "insert: census": 9.318441152572632e-05,
+      "insert: compact inputs": 0.022414795588701963,
+      "insert: kernel": 0.005234947893768549,
+      "insert: occupancy + scales to host": 0.0018954896368086338,
+      "insert: spills to host": 2.1791551262140274e-05,
+      "fused: block inputs": 0.008125252090394497,
+      "fused: self-check": 0.0005718725733458996,
+      "fused: block program": 0.004706819541752338,
+      "fused: read-ahead": 1.3696029782295227e-05,
+      "fused: write-back": 0.0017750398255884647,
+      "insert: shrink staged": 0.007736708968877792,
+      "pass: arena replay": 0.00013798382133245468,
+      "pass: tail": 7.958430796861649e-05
+     },
+     "phases_sum_s": 0.06718999007716775
+    },
+    "device_peak": 41532416,
+    "host_maxrss_gb": 1.84228515625
+   }
+  }
+ ],
+ "finished": "2026-09-16T18:03:54"
+}
