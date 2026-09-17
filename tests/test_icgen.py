@@ -392,3 +392,27 @@ def test_a_failed_generation_keeps_its_working_set(tmp_path):
     stage = os.path.join(str(tmp_path), icgen.STAGE_DIR)
     assert os.path.isdir(stage) and os.listdir(stage)
     assert not os.path.exists(os.path.join(str(tmp_path), icgen.MANIFEST))
+
+
+def test_load_slot_state_drops_the_page_cache_of_every_slab_it_reads(tmp_path, monkeypatch):
+    """The cache competes with the state rather than serving it (gb 1003657), so the
+    loader drops each slab as it goes -- in BOTH passes, which is why the count is twice
+    the file count. Off by default."""
+    st = _evolved_state()
+    d = str(tmp_path)
+    icgen.write_t9_slabs(st, d)
+    n_files = len(icgen.read_manifest(d)["files"])
+    seen = []
+    monkeypatch.setattr(icgen, "drop_file_cache", lambda p: (seen.append(p), True)[1])
+    icgen.load_slot_state(d)
+    assert seen == []
+    st2 = icgen.load_slot_state(d, drop_cache=True)
+    assert len(seen) == 2 * n_files and len(set(seen)) == n_files
+    np.testing.assert_array_equal(_all_rows(st), _all_rows(st2))
+
+
+def test_drop_file_cache_is_best_effort_and_never_raises(tmp_path):
+    assert icgen.drop_file_cache(str(tmp_path / "nope")) is False
+    p = tmp_path / "f"
+    p.write_bytes(b"x" * 4096)
+    assert icgen.drop_file_cache(str(p)) in (True, False)

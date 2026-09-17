@@ -40,9 +40,12 @@ def test_a_timed_step_is_bitwise_and_the_only_one_with_a_breakdown(cards, fused)
     for card in t["tile"].values():
         for key in ("window: stage", "window: tiles", "window: guards", "window: write-back"):
             assert card.get(key, 0) > 0, (key, card)
-    for key in ("forward: pass1", "forward: pass2", "multiply", "inverse: pass1",
-                "inverse: pass2"):
+    # the folded kernel is the default, so the solve's parts are the forward, the
+    # kernel riding the inverse's axis-0 pass, and the inverse's plane pass
+    for key in ("forward: pass1", "forward: pass2", "kernel + axis-0 pass",
+                "inverse: pass1"):
         assert t["solve"].get(key, 0) > 0, (key, t["solve"])
+    assert "multiply" not in t["solve"], t["solve"]
     census = [c.get("window: census", 0) for c in t["tile"].values()]
     if cfg.fused_pass:
         assert all(v > 0 for v in census), census

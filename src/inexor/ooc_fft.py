@@ -841,6 +841,80 @@ class KSpaceKernel:
                    [(np.log(table.k), np.asarray(table.T, dtype=np.float64))])
 
 
+class ArrayKernel:
+    """A multiplier the CALLER already holds as arrays, applied per pencil block.
+
+    `KSpaceKernel` evaluates analytic factors on the card from k alone; the engine's
+    coarse kernel is not analytic here -- `pref` and the CIC match factor are real
+    half-grids built once per run by `forces.coarse_kernel_parts`, and the `ik_j` are
+    low-rank. This carries them into the same pass, so the kernel multiply happens where
+    the axis-0 transform already reads the block instead of in a separate host traversal
+    over the whole half-grid (85 s of a 123 s coarse solve at 4096^3, gb 1003657).
+
+    `halfgrids` are (N, N, M) real arrays sliced on the pencil axis; `lowrank` are arrays
+    broadcastable to a block, each tagged with the axis it varies along (0, 1 or 2), and
+    the axis-1 one is sliced with the block. The product is formed in the order given,
+    left to right, which is how the caller's host expression associates -- `(pref * ik)
+    * mf`, the association `coarse_kernel_parts` refuses to change. `cdtype` is the
+    complex type the product is cast to before it multiplies the spectrum.
+    """
+
+    __slots__ = ("terms", "cdtype")
+
+    def __init__(self, terms, cdtype):
+        self.terms = tuple(terms)
+        self.cdtype = np.dtype(cdtype)
+        for kind, obj, axis in self.terms:
+            if kind not in ("half", "low"):
+                raise ValueError(f"term kind {kind!r} is not 'half' or 'low'")
+            if kind == "low" and axis not in (0, 1, 2):
+                raise ValueError(f"low-rank term varies along axis {axis}, not 0, 1 or 2")
+            if obj is None:
+                raise ValueError("a kernel term is None; drop it instead")
+
+    @classmethod
+    def coarse(cls, pref, ik, axis, mf, cdtype):
+        """`(pref * ik_axis) * mf` -- the engine's coarse kernel, `mf` optional.
+
+        `ik` is cast to `cdtype` HERE, before it meets `pref`, because that is the order
+        `forces.coarse_kernel_slab` casts in and the cast is not associative with the
+        multiply at f32."""
+        terms = [("half", pref, None), ("low", np.asarray(ik).astype(cdtype), axis)]
+        if mf is not None:
+            terms.append(("half", mf, None))
+        return cls(terms, cdtype)
+
+    @property
+    def key(self):
+        """Program cache key: structure and dtypes, never the arrays' contents."""
+        return tuple((kind, None if kind == "half" else axis,
+                      np.dtype(obj.dtype).str, None if kind == "half" else obj.shape)
+                     for kind, obj, axis in self.terms) + (self.cdtype.str,)
+
+    def blocks(self, lo, hi):
+        """The host arrays for pencil block [lo, hi), in term order."""
+        out = []
+        for kind, obj, axis in self.terms:
+            if kind == "half":
+                out.append(np.ascontiguousarray(obj[:, lo:hi, :]))
+            elif axis == 1:
+                out.append(np.ascontiguousarray(np.asarray(obj).reshape(-1)[lo:hi]))
+            else:
+                out.append(np.ascontiguousarray(obj))
+        return tuple(out)
+
+    def on_card(self, blocks):
+        """The product for one block, cast to `cdtype`, from the uploaded `blocks`."""
+        import jax.numpy as jnp
+
+        m = None
+        for (kind, _obj, axis), b in zip(self.terms, blocks):
+            v = b if kind == "half" else jnp.reshape(
+                b, (-1, 1, 1) if axis == 0 else (1, -1, 1) if axis == 1 else (1, 1, -1))
+            m = v.astype(self.cdtype) if m is None else m * v
+        return m
+
+
 def _refuse_off_table(table, n, box):
     """The realized |k| range must sit inside the table: the card does not refuse."""
     k_min = abs(float(_kz(n, box)[1]))
@@ -897,6 +971,9 @@ def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inv
     result is written into `out[:, y0:y1, :]`. `transform=False` applies the
     combination and kernel only. `kernel=None` is the identity.
 
+    `kernel` is a `KSpaceKernel` (analytic, evaluated on the card from k) or an
+    `ArrayKernel` (the caller's own half-grids and low-rank factors, uploaded per block).
+
     `out` defaults to a new array and MAY be one of the sources: each thread
     reads and writes only its own y range, so the pass is in place. `devices`
     and `pencil_batch` split exactly as in `forward_from_slabs_device`, and the
@@ -933,12 +1010,13 @@ def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inv
     kd = np.float64 if jax.config.jax_enable_x64 else np.float32
     kx = _kx(n, box_size).astype(kd)
     kz = _kz(n, box_size).astype(kd)
-    factors = () if kernel is None else kernel.factors
-    consts = () if kernel is None else kernel.consts
+    arr_kernel = kernel if isinstance(kernel, ArrayKernel) else None
+    factors = () if kernel is None or arr_kernel is not None else kernel.factors
+    consts = () if kernel is None or arr_kernel is not None else kernel.consts
     n_src = len(srcs)
 
     def build():
-        def fn(coefs, blocks, kxd, kyd, kzd, cst):
+        def fn(coefs, blocks, kxd, kyd, kzd, cst, kblocks):
             acc = coefs[0] * blocks[0]
             for c, blk in zip(coefs[1:], blocks[1:]):
                 acc = acc + c * blk
@@ -947,13 +1025,16 @@ def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inv
             if factors:
                 m = _kernel_on_card(factors, cst, kxd, kyd, kzd)
                 acc = acc * m.astype(acc.dtype)
+            if arr_kernel is not None:
+                acc = acc * arr_kernel.on_card(kblocks)
             if transform and inverse:
                 acc = jnp.fft.ifft(acc, axis=0)
             return acc
 
         return jax.jit(fn)
 
-    prog = _card_program(("kspace", factors, n_src, bool(inverse), bool(transform)), build)
+    prog = _card_program(("kspace", factors, n_src, bool(inverse), bool(transform),
+                          None if arr_kernel is None else arr_kernel.key), build)
     devs = _devices_or_default(devices)
 
     def part(a, z, dev):
@@ -966,7 +1047,10 @@ def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inv
             hi = min(lo + b, z)
             blocks = tuple(_to_device(np.ascontiguousarray(s[:, lo:hi, :]), dev, transfer)
                            for _c, s in srcs)
-            d = _from_device(prog(coefs, blocks, kxd, put(kx[lo:hi]), kzd, cst), transfer)
+            kblocks = () if arr_kernel is None else tuple(
+                _to_device(x, dev, transfer) for x in arr_kernel.blocks(lo, hi))
+            d = _from_device(prog(coefs, blocks, kxd, put(kx[lo:hi]), kzd, cst, kblocks),
+                             transfer)
             _check_spectral_dtype(d.dtype, cdt, "device k-space pass")
             out[:, lo:hi, :] = d
 

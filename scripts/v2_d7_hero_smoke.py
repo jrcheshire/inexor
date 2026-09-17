@@ -677,6 +677,7 @@ def cmd_run(args):
                   with_numa_maps=args.numa_maps)
     card["plan"] = dict(stop_at=args.stop_at, timed_last=args.timed_last,
                         timed_all=args.timed_all, numa_maps=args.numa_maps,
+                        drop_ic_cache=args.drop_ic_cache,
                         ckpt_probe_slabs=args.ckpt_probe_slabs, trim_probe=args.trim_probe,
                         cards=args.cards,
                         slack=args.slack, alloc_margin=args.alloc_margin,
@@ -700,7 +701,8 @@ def cmd_run(args):
         mon.start()
 
         st = icgen.load_slot_state(args.workdir, brick_slack=args.slack,
-                                   alloc_margin=args.alloc_margin, arena_frac=args.arena_frac)
+                                   alloc_margin=args.alloc_margin, arena_frac=args.arena_frac,
+                                   drop_cache=args.drop_ic_cache)
         card["state"] = dict(n_particles=st.n_particles, n_bricks=st.n_bricks,
                              rows=int(st.off.shape[0]), n_arena=int(st.n_arena))
         mon("load")
@@ -929,6 +931,9 @@ def main(argv=None):
     pr.add_argument("--ckpt-probe-slabs", type=int, default=0,
                     help="after the run, write this many slabs of the state, timed per part")
     pr.add_argument("--ckpt-probe-dir", default=None)
+    pr.add_argument("--drop-ic-cache", action="store_true",
+                    help="drop each IC slab's page cache as it is read, so the steps do "
+                         "not run while the kernel drains it")
     pr.add_argument("--off-node-gb", type=float, default=8.0,
                     help="with --membind-nodes: GB of this process allowed on CPU-less nodes")
     pr.add_argument("--trim-probe", action="store_true",

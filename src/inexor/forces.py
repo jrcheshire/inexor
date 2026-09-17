@@ -598,7 +598,8 @@ def coarse_kernel_slab(parts, axis, lo, hi, cdtype):
     return k
 
 
-def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=None):
+def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=None,
+                             fold_kernel=True):
     """The coarse solve through `ooc_fft`'s canonical factorization.
 
     WHY THIS EXISTS. The monolithic form does not fit at c-hero and is four
@@ -624,9 +625,12 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=No
     it is host work; this is where that term comes from.
 
     `timings`, if a dict, accumulates seconds per part summed over the three
-    components (`forward: pass1/pass2`, `multiply`, `inverse: pass1/pass2`).
-    Every part ends on a host read or a synced card write, so each is its own
-    wall.
+    components (`forward: pass1/pass2`, the kernel/`multiply` part, `inverse:
+    pass1/pass2`). Every part ends on a host read or a synced card write, so each
+    is its own wall.
+
+    `fold_kernel=False` keeps the host multiply as a separate traversal: the arm the
+    folded form is gated against, and the only difference between them.
     """
     import time
 
@@ -653,29 +657,46 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=No
     # `out` as `CardShards`: each component's planes land on the cards that hold
     # them and no host mesh exists (`ooc_fft.inverse_to_card_shards`)
     per_card = [[] for _ in out.ranges] if isinstance(out, CardShards) else None
+    # ONE work buffer for all three components, not one each: at 4096^3 it is
+    # 34.4 GB, and a fresh one per component pays its first-touch faults again
+    # (~5.3M minor faults per solve, gb 1003657).
+    work = np.empty_like(spec)
     for axis in range(3):
-        t0 = time.perf_counter()
-        work = np.empty_like(spec)
-        for lo in range(0, spec.shape[0], slab):
-            hi = min(lo + slab, spec.shape[0])
-            work[lo:hi] = spec[lo:hi] * coarse_kernel_slab(parts, axis, lo, hi, cdtype)
-        _add("multiply", t0)
         it = {}
+        if fold_kernel:
+            # The kernel multiply rides the axis-0 pass the inverse runs anyway:
+            # the block is already on the card, so the host stops traversing the
+            # whole half-grid a second time per component (85 s of a 123 s solve
+            # at 4096^3). `pass2=False` below: this call IS that pass.
+            t0 = time.perf_counter()
+            ooc_fft.kspace_pass_device(
+                [(1.0, spec)], n, kernel=ooc_fft.ArrayKernel.coarse(
+                    parts["pref"], parts["iks"][axis], axis, parts["mf"], cdtype),
+                out=work, inverse=True, timings=it)
+            _add("kernel + axis-0 pass", t0)
+        else:
+            t0 = time.perf_counter()
+            for lo in range(0, spec.shape[0], slab):
+                hi = min(lo + slab, spec.shape[0])
+                work[lo:hi] = spec[lo:hi] * coarse_kernel_slab(parts, axis, lo, hi, cdtype)
+            _add("multiply", t0)
         if per_card is not None:
-            for k, m in enumerate(ooc_fft.inverse_to_card_shards(work, n, out.ranges,
-                                                                 timings=it)):
+            for k, m in enumerate(ooc_fft.inverse_to_card_shards(
+                    work, n, out.ranges, timings=it, pass2=not fold_kernel)):
                 per_card[k].append(m)
         else:
-            for lo, block in ooc_fft.inverse_to_slabs_device(work, n, slab=slab, timings=it):
+            for lo, block in ooc_fft.inverse_to_slabs_device(
+                    work, n, slab=slab, timings=it, pass2=not fold_kernel):
                 out[axis][lo:lo + block.shape[0]] = block
-        _add("inverse", None, it)
-        del work
+        # `it` also carries the folded pass's own seconds, recorded above as its own part
+        _add("inverse", None, {k: v for k, v in it.items() if k in ("pass1_s", "pass2_s")})
+    del work
     return out.assemble(per_card) if per_card is not None else out
 
 
 def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None,
                         fdtype=None, parts=None, out=None, transform="factorized",
-                        slab=None, timings=None):
+                        slab=None, timings=None, fold_kernel=True):
     """The three long-range force meshes from an ALREADY-PAINTED delta.
 
     `force_global` paints from every position AND gathers at every position,
@@ -717,7 +738,7 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
     on the host.
 
     `timings` (factorized only) collects the solve's per-part walls; see
-    `_coarse_solve_factorized`.
+    `_coarse_solve_factorized`, which `fold_kernel` also belongs to.
     """
     on_cards = isinstance(delta, (list, tuple))
     ddt = np.dtype(delta[0]["delta"].dtype if on_cards else delta.dtype)
@@ -751,7 +772,8 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
 
         return _coarse_solve_factorized(
             delta, n_mesh, parts, cdtype, out,
-            ooc_fft._DEF_SLAB if slab is None else int(slab), timings=timings)
+            ooc_fft._DEF_SLAB if slab is None else int(slab), timings=timings,
+            fold_kernel=fold_kernel)
     if on_cards:
         raise ValueError(
             "coarse_force_meshes: a density on the cards has only the factorized "

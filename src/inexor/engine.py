@@ -189,6 +189,7 @@ class EngineConfig:
         device_tile_window=None,
         device_cards=1,
         migrate_repack_fused=None,
+        coarse_fold_kernel=True,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -315,6 +316,11 @@ class EngineConfig:
         # `chunk_bricks`' 64 is 262,144 device launches per step at 4096^3.
         self.coarse_backend = str(coarse_backend)
         self.tile_backend = str(tile_backend)
+        # The coarse kernel multiply rides the inverse's axis-0 pass instead of a
+        # separate host traversal of the half-grid (85 s of a 123 s solve at 4096^3,
+        # gb 1003657). False is the arm it is gated against -- bitwise, because the
+        # association is carried over unchanged -- not an operating point.
+        self.coarse_fold_kernel = bool(coarse_fold_kernel)
         self.device_tile_jit = bool(device_tile_jit)
         self.device_paint_chunk_bricks = (
             None if device_paint_chunk_bricks is None else int(device_paint_chunk_bricks))
@@ -1540,6 +1546,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         parts=coarse_parts,
         out=solve_out,
         timings=None if timings is None else timings.setdefault("solve", {}),
+        fold_kernel=cfg.coarse_fold_kernel,
     )
     del dj
     ph("coarse_solve")

@@ -777,6 +777,28 @@ def read_manifest(workdir):
     return man
 
 
+def drop_file_cache(path):
+    """Drop `path`'s pages from the page cache. True if the call was made.
+
+    A 4096^3 IC set is 641 GB of reads and the host holds ~855 GB of state on a 1026 GB
+    node, so the cache cannot help the second pass and what it does instead is compete:
+    gb 1003657 ran its first steps while the kernel was still draining 91 GB of it, and
+    the tile loop's window staging was 924 s in that step against 55 s once the cache was
+    gone. Best effort -- not every filesystem honours it, and an instrument must never be
+    the failure."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        return True
+    except (AttributeError, OSError):
+        return False
+    finally:
+        os.close(fd)
+
+
 def load_slot_state(
     workdir,
     brick_slack=0.10,
@@ -784,6 +806,7 @@ def load_slot_state(
     arena_frac=0.01,
     index_dtype=DEFAULT_INDEX_DTYPE,
     alloc=None,
+    drop_cache=False,
 ):
     """Reassemble a host-resident SlotState from T9 slabs on disk.
 
@@ -792,6 +815,10 @@ def load_slot_state(
     `brick_start`; spare rows stay zero and the arena starts empty, exactly
     as `build` leaves them. Refuses a missing manifest (incomplete
     generation), a schema it does not know, and any crc mismatch.
+
+    `drop_cache` drops each slab file's page cache as soon as that slab has been read,
+    in both passes (`drop_file_cache`); the loader's own re-read is what the second pass
+    is for, and the cache is too small to serve it anyway.
     """
     man = read_manifest(workdir)
     t9 = T9Layout(man["box_size"], man["n_part"], man["bucket_cells"])
@@ -806,8 +833,11 @@ def load_slot_state(
     # destination arrays, for a loader peak of ~216 GB on a 255 GB node. The
     # re-read is ~81 GB off Lustre against 135 GB of resident payload, and it
     # is the cheaper side of that trade by a wide margin.
+    n_dropped = [0]
+
     def _slab(fname):
-        with np.load(os.path.join(workdir, fname)) as z:
+        path = os.path.join(workdir, fname)
+        with np.load(path) as z:
             meta = json.loads(str(z["meta"]))
             occ, off, w, sc = z["occupancy"], z["off"], z["w"], z["scale"]
         for name, arr in (("occupancy", occ), ("off", off), ("w", w), ("scale", sc)):
@@ -817,6 +847,8 @@ def load_slot_state(
                     f"{fname}:{name} crc mismatch ({crc} != {meta['crc32'][name]}); "
                     "the slab file is corrupt, refusing to load"
                 )
+        if drop_cache:
+            n_dropped[0] += bool(drop_file_cache(path))
         return int(meta["bx"]), off, w, occ, sc
 
     _trace = os.environ.get("INEXOR_LOAD_TRACE")
@@ -878,6 +910,8 @@ def load_slot_state(
         if _i % 32 == 31:
             _say(f"pass 2: {_i + 1}/{len(man['files'])} slabs")
 
+    if drop_cache:
+        _say(f"dropped the page cache of {n_dropped[0]} slab reads")
     _say("payload placed; building SlotState")
     st = SlotState(
         t9=t9,
