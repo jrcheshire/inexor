@@ -886,3 +886,17 @@ def test_the_host_column_charges_the_repacks_second_bucket_index(capsys):
           "--device-gb", "199", "--arena-frac", "0.01", "--separate-passes"])
     sep = capsys.readouterr().out
     assert "census_eject" not in sep and "migrate_device_pass" in sep
+
+
+def test_the_host_column_charges_one_slab_of_w_per_card_for_the_window_write_back(capsys):
+    from inexor.forces import capacity_shape
+    from inexor.plan import PRESETS
+
+    main(["--preset", "c-hero", "--backend", "device", "--host-gb", "1026",
+          "--device-gb", "199", "--arena-frac", "0.01", "--n-gpus", "4"])
+    out = capsys.readouterr().out
+    g = PRESETS["c-hero"]
+    nb = 256
+    want = 4 * int(capacity_shape(g["n_part"] ** 3 // nb)) * 6 / 1e9
+    line = next(ln for ln in out.splitlines() if "tile_window write-back" in ln)
+    assert abs(float(line.split()[-2]) - want) < 1e-3

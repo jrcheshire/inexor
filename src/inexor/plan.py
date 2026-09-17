@@ -525,6 +525,15 @@ def _device_main(args, ec, t9, n, rows, arena, state):
     # both repack paths build the new per-bucket occupancy on the host and copy it
     # in at the end: a second bucket index, live beside the first
     host["repack new_occ (a second bucket index)"] = int(state["bucket_index"])
+    # the windowed tile loop writes each core slab back from its card as one ladder
+    # of `w` rows, every card at once. It downloaded the WHOLE window's `w` and staged
+    # the window as numpy before gb 1002020 (~316 GB over four cards at 4096^3, the
+    # overrun that killed it); the residents it still gathers are O(arena).
+    from .forces import capacity_shape
+
+    nb_dev = max(1, ec.n_fine // ec.n_brick)
+    host["tile_window write-back (one slab of w per card)"] = int(
+        n_gpus * int(capacity_shape(max(1, int(n / nb_dev)))) * 3 * np.dtype(np.int16).itemsize)
     _table("HOST: the state, plus the per-step terms nothing has moved yet", host)
     print(f"  state alone: {sum(state.values()) / n:6.2f} B/p")
     print("  `migrate_staging` and `repack_scratch` are the HOST windows the device "
