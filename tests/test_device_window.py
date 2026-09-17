@@ -225,7 +225,17 @@ def test_the_write_back_downloads_a_slab_at_a_time():
     st_b.w[win["res_slots"][k]] = dwin_rows[win["W"] + k]
     assert np.array_equal(st_a.w, st_b.w), "the per-slab write-back differs"
     assert len(k) > 0, "VACUOUS: no core resident was written back"
-    assert peak < 0.25 * whole, f"write-back held {peak} B against a {whole} B window of w"
+    # THE BOUND IS WHAT THE CODE DOWNLOADS, not a laptop reading: on the CPU backend a
+    # download aliases the device buffer and allocates ~nothing, which is how a bound of
+    # a quarter of the window passed on the laptop and failed on a GB200 (1002227, 43.8
+    # KB). Per plane the write-back holds one core slab's ladder of `w`, then the core
+    # residents' ladder of `w` and its int64 index; 1.5x covers the reading's own copies.
+    slab = max(dwin._ladder(int(edges[s + 1] - edges[s])) for s in range(per))
+    res = dwin._ladder(len(k))
+    expected = slab * st.w.itemsize * 3 + res * (st.w.itemsize * 3 + 8)
+    assert 1.5 * expected < 0.5 * whole, "VACUOUS: a slab is most of this window"
+    assert peak <= 1.5 * expected, (
+        f"write-back held {peak} B against the {expected} B one slab + residents download")
     assert reads == 2 * (per + 1), f"{reads} reads: two write-back passes of {per} slabs + residents"
 
 
