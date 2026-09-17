@@ -252,6 +252,11 @@ MIGRATE_DEVICE_B_PER_SLAB_ROW = 320
 # = 69.9 B per slab row, windows and program included (Vista 995813, record
 # sec. 33). Charged at the slab's rows x this.
 REPACK_DEVICE_B_PER_SLAB_ROW = 70
+# THE FUSED DEVICE MIGRATE + REPACK'S PEAK PER SLAB ROW, MEASURED on one GB200 at
+# 1024^3 (16,777,216 rows per slab): 4.02 GiB = 257 B per slab row
+# (`device.fused.migrate_repack_device`, Vista 1001688, record sec. 41). INTERIM:
+# not a production-shape reading; the 4096^3 smoke replaces it.
+FUSED_DEVICE_B_PER_SLAB_ROW = 257
 
 
 def device_window_slabs(ec):
@@ -376,7 +381,7 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
     return host, card, disk
 
 
-def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
+def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=True):
     """Per-GPU bytes for the host-state / device-step design.
 
     Returns `(resident, transient, phases)` in the shape the CPU column uses, so
@@ -386,7 +391,10 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
     does not fit gets a FITS.
 
     `paint_chunk_bricks` is the device coarse paint's chunk length in bricks;
-    None is `device.paint.default_chunk_bricks`.
+    None is `device.paint.default_chunk_bricks`. `fused` prices the fused migrate +
+    repack (the engine's default on this lane): its destination census runs one
+    slab's eject kernel inside the tile loop, and after the loop one pass replaces
+    the two.
     """
     from .engine import ONCE_PER_RUN_PHASES
 
@@ -448,6 +456,17 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
     transient[key] = paint_b
     phases["coarse_paint"] = phases.get("coarse_paint", 0) + paint_b
 
+    slab_rows = n / nb
+    if fused:
+        # the census: one padded slab through the eject kernel, per card, while
+        # the tile loop's window and workspace are live
+        from .device.migrate import EJECT_B_PER_PADDED_ROW
+        from .eject_jax import _padded
+
+        census_b = int(EJECT_B_PER_PADDED_ROW * _padded(int(slab_rows)))
+        transient["census_eject (fused pass, one padded slab)"] = census_b
+        phases["tile_loop"] = phases.get("tile_loop", 0) + census_b
+
     in_step = sum(v for k, v in phases.items() if k not in ONCE_PER_RUN_PHASES)
     once = max((v for k, v in phases.items() if k in ONCE_PER_RUN_PHASES),
                default=0)
@@ -457,13 +476,18 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None):
     # the card less the RESIDENT terms, ~112 GB at c-hero). They are held apart
     # so the summed convention above is unchanged and the second verdict is
     # read against `resident` alone. The two do not coexist either: max.
-    slab_rows = n / nb
-    after_loop = {
-        "migrate_device_pass (320 B/slab row, sec. 31)": int(
-            MIGRATE_DEVICE_B_PER_SLAB_ROW * slab_rows),
-        "repack_device_pass (70 B/slab row, sec. 33)": int(
-            REPACK_DEVICE_B_PER_SLAB_ROW * slab_rows),
-    }
+    if fused:
+        after_loop = {
+            "migrate_repack_fused_pass (257 B/slab row, sec. 41, 1024^3)": int(
+                FUSED_DEVICE_B_PER_SLAB_ROW * slab_rows),
+        }
+    else:
+        after_loop = {
+            "migrate_device_pass (320 B/slab row, sec. 31)": int(
+                MIGRATE_DEVICE_B_PER_SLAB_ROW * slab_rows),
+            "repack_device_pass (70 B/slab row, sec. 33)": int(
+                REPACK_DEVICE_B_PER_SLAB_ROW * slab_rows),
+        }
     return resident, transient, phases, max(in_step, once), slabs, host_mesh, after_loop
 
 
@@ -483,7 +507,8 @@ def _device_main(args, ec, t9, n, rows, arena, state):
     n_gpus = max(1, int(args.n_gpus))
 
     resident, transient, phases, worst_phase, slabs, host_mesh, after_loop = device_budget(
-        ec_dev, n=n, n_gpus=n_gpus, paint_chunk_bricks=args.paint_chunk_bricks)
+        ec_dev, n=n, n_gpus=n_gpus, paint_chunk_bricks=args.paint_chunk_bricks,
+        fused=not getattr(args, "separate_passes", False))
 
     step = ec_dev.step_bytes(n, n_rows=rows, cap=args.cap)
     host = dict(state)
@@ -497,6 +522,9 @@ def _device_main(args, ec, t9, n, rows, arena, state):
     for k, v in host_mesh.items():
         if v:
             host[f"{k} (host by design)"] = v
+    # both repack paths build the new per-bucket occupancy on the host and copy it
+    # in at the end: a second bucket index, live beside the first
+    host["repack new_occ (a second bucket index)"] = int(state["bucket_index"])
     _table("HOST: the state, plus the per-step terms nothing has moved yet", host)
     print(f"  state alone: {sum(state.values()) / n:6.2f} B/p")
     print("  `migrate_staging` and `repack_scratch` are the HOST windows the device "
@@ -617,6 +645,9 @@ def main(argv=None):
     ap.add_argument("--n-gpus", type=int, default=4,
                     help="accelerators the coarse mesh is sharded across, for "
                          "--backend device. A Vista gb node has 4.")
+    ap.add_argument("--separate-passes", action="store_true",
+                    help="for --backend device: price the migrate and repack as two "
+                         "passes (no census) instead of the fused pass")
     ap.add_argument("--paint-chunk-bricks", type=int, default=None,
                     help="for --backend device: bricks per coarse-paint chunk on a "
                          "card. Default a quarter of an x-slab of bricks; smaller "

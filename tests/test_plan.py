@@ -845,3 +845,44 @@ def test_c_hero_fits_a_gb_node_on_the_device_backend_and_the_cpu_one_does_not(ca
     assert "against --host-gb 1026.0: FITS" in dev
     assert "against --device-gb 199.0 per card: FITS" in dev
     assert "the slab window is 18 x-slabs" in dev
+
+
+def test_the_fused_pass_charges_its_census_in_the_tile_loop_and_one_pass_after():
+    """M4: the fused migrate + repack's census runs one padded slab through the eject
+    kernel inside the tile loop, and one pass replaces the two after it."""
+    from inexor.device.migrate import EJECT_B_PER_PADDED_ROW
+    from inexor.eject_jax import _padded
+    from inexor.plan import (
+        FUSED_DEVICE_B_PER_SLAB_ROW,
+        MIGRATE_DEVICE_B_PER_SLAB_ROW,
+        device_budget,
+    )
+
+    ec = _ec("c-hero")
+    nb = ec.n_fine // ec.n_brick
+    slab_rows = ec.n_total / nb
+    _r, t_f, p_f, _w, _s, _h, a_f = device_budget(ec, n=ec.n_total, n_gpus=4)
+    _r, t_s, p_s, _w, _s, _h, a_s = device_budget(ec, n=ec.n_total, n_gpus=4, fused=False)
+    census = int(EJECT_B_PER_PADDED_ROW * _padded(int(slab_rows)))
+    assert t_f["census_eject (fused pass, one padded slab)"] == census
+    assert p_f["tile_loop"] - p_s["tile_loop"] == census
+    assert not any("census" in k for k in t_s)
+    assert list(a_f.values()) == [int(FUSED_DEVICE_B_PER_SLAB_ROW * slab_rows)]
+    assert max(a_s.values()) == int(MIGRATE_DEVICE_B_PER_SLAB_ROW * slab_rows)
+
+
+def test_the_host_column_charges_the_repacks_second_bucket_index(capsys):
+    from inexor.codec import T9Layout
+    from inexor.plan import PRESETS, BUCKET_CELLS
+
+    main(["--preset", "c-hero", "--backend", "device", "--host-gb", "1026",
+          "--device-gb", "199", "--arena-frac", "0.01"])
+    out = capsys.readouterr().out
+    g = PRESETS["c-hero"]
+    want = T9Layout(g["box"], g["n_part"], BUCKET_CELLS).index_bytes() / 1e9
+    line = next(ln for ln in out.splitlines() if "repack new_occ" in ln)
+    assert abs(float(line.split()[-2]) - want) < 1e-3
+    main(["--preset", "c-hero", "--backend", "device", "--host-gb", "1026",
+          "--device-gb", "199", "--arena-frac", "0.01", "--separate-passes"])
+    sep = capsys.readouterr().out
+    assert "census_eject" not in sep and "migrate_device_pass" in sep
