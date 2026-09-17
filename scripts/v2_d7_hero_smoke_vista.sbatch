@@ -34,6 +34,10 @@
 #     per card 177.3 GB in the step incl. the census, 155.9 GB after the loop.
 #   - Step 1 carries the compiles; step 2 is the steady cost; step 3 is the synced
 #     breakdown (a breakdown, not a cost).
+#   - One checkpoint is written after step 3 (JC: its write time is what decides
+#     whether 40 steps fit one 12 h job). It has no phase boundary of its own: the
+#     driver's card records it as `after_last_boundary_s`, and the checkpoint stays on
+#     scratch as a resumable step-3 state (not deleted by this job).
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
@@ -145,7 +149,8 @@ summarize $CARDS/${TAG}_cgh64.json
 # THE 4096^3 LEG
 run_leg hero-run \
   pixi run -e gpu python $DRIVER run --preset c-hero --workdir "$HERO" \
-    --card $CARDS/${TAG}_hero.json --stop-at 3 --timed-last --beat 60
+    --card $CARDS/${TAG}_hero.json --stop-at 3 --timed-last --beat 60 \
+    --checkpoint-dir "$WORK/hero-ckpt" --checkpoint-every 3
 summarize $CARDS/${TAG}_hero.json
 
 exit $rc_total
