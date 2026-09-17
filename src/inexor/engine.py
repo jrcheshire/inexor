@@ -1345,7 +1345,7 @@ def apply_result(st, res):
     st.vel_scale[res["run_bricks"]] = res["run_scales"]
 
 
-def _migrate_pass(st, cfg, c_drift, pool):
+def _migrate_pass(st, cfg, c_drift, pool, timings=None):
     """ONE router for the step's migrate and the lead drift: host (serial or
     pooled, exactly as before) or the device pass. Returns the stats dict; the
     device pass's `migrate_device` receipt rides in it."""
@@ -1354,7 +1354,7 @@ def _migrate_pass(st, cfg, c_drift, pool):
 
         return drift_and_migrate_device(
             st, c_drift, device_budget_bytes=cfg.migrate_device_budget_bytes,
-            devices=_cards(cfg))
+            devices=_cards(cfg), timings=timings)
     if pool is not None and cfg.migrate_pooled is not False:
         return drift_and_migrate_pooled(
             st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window,
@@ -1363,13 +1363,14 @@ def _migrate_pass(st, cfg, c_drift, pool):
     return drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel)
 
 
-def _repack_pass(st, cfg):
+def _repack_pass(st, cfg, timings=None):
     """The repack, routed like the migrate. Returns the host repack's dict; the
     device pass adds its `repack_device` receipt."""
     if cfg.migrate_backend == "device":
         from .device.repack import repack_device
 
-        return repack_device(st, brick_slack=cfg.brick_slack, devices=_cards(cfg))
+        return repack_device(st, brick_slack=cfg.brick_slack, devices=_cards(cfg),
+                             timings=timings)
     return st.repack(brick_slack=cfg.brick_slack)
 
 
@@ -1385,7 +1386,7 @@ def _cards(cfg):
 
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
          phase=None, tile_force=None, pool=None, coarse_parts=None, device_shapes=None,
-         repack_due=False):
+         repack_due=False, timings=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1 and
@@ -1430,6 +1431,12 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     from a checkpoint so a resumed run compiles the programs the uninterrupted
     one did. The compiled tile loop has one boundary, `tile_loop`, in place of
     the per-tile ones: a synced per-tile timing is not neutral (record sec. 20).
+
+    `timings`, if a dict, collects the device passes' SYNCED per-phase walls: the
+    windowed tile loop's per card (`tile`), and the migrate's, or the fused
+    migrate + repack's (`migrate`). Syncing moves the wall, so a timed step is a
+    breakdown and not the step's cost; `stats["timings"]` carries it (None on an
+    untimed step).
 
     `repack_due` says this step's repack follows it (`run` passes it). Where
     `cfg.fused_pass`, the tile loop then takes the destination census and the
@@ -1615,6 +1622,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
                                 floor=shapes_in.get("window"))
             # M4: the census the fused migrate + repack sizes its new ranges from
             fused_now = bool(repack_due) and cfg.fused_pass
+            tile_timings = [dict() for _ in plane_parts]
             shapes_out["window"] = wsh
             wshapes = dict(shapes, window=wsh)
 
@@ -1623,7 +1631,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
                 return tile_loop_windowed(
                     st, one_tile, C, None, members, wshapes, planes=range(a, b),
                     coarse_shard=g_coarse[k], device=None if devs is None else devs[k],
-                    census=float(c_drift) if fused_now else None)
+                    census=float(c_drift) if fused_now else None,
+                    timings=None if timings is None else tile_timings[k])
 
             if devs is None:
                 loops = [run_card(0)]
@@ -1639,8 +1648,15 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         n_overhang = sum(int(lp["n_out"]) for lp in loops)
         tile_scales.extend(float(lp["vel_scale_kick_max"]) for lp in loops
                            if lp["vel_scale_kick_max"] is not None)
+        # the window's receipts ride with each card's (absent on the whole-state loop)
         tile_cards = [dict(planes=int(lp.get("planes_run", cfg.tiles_side)),
-                           tiles_run=int(lp["tiles_run"])) for lp in loops]
+                           tiles_run=int(lp["tiles_run"]),
+                           **{k: lp[k] for k in ("window_live_rows_max", "residents_staged",
+                                                 "window_slabs", "wrapped", "census_slabs")
+                              if k in lp})
+                      for lp in loops]
+        if timings is not None and cfg.tile_window:
+            timings["tile"] = {f"card {k}": t for k, t in enumerate(tile_timings)}
         ph("tile_loop")
         results = ()
     elif cfg.tile_backend == "device":
@@ -1706,11 +1722,14 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         from .device.fused import migrate_repack_device
 
         census_counts = sum(lp["census_counts"] for lp in loops)
+        mt = None if timings is None else timings.setdefault("migrate", {})
         stats, repack_stats = migrate_repack_device(
             st, c_drift, census_counts, brick_slack=cfg.brick_slack,
-            device_budget_bytes=cfg.migrate_device_budget_bytes, devices=_cards(cfg))
+            device_budget_bytes=cfg.migrate_device_budget_bytes, devices=_cards(cfg),
+            timings=mt)
     else:
-        stats = _migrate_pass(st, cfg, c_drift, pool)
+        stats = _migrate_pass(st, cfg, c_drift, pool,
+                              None if timings is None else timings.setdefault("migrate", {}))
     # the knob's receipt, on every card in both directions
     stats["migrate_repack_fused"] = fused_now
     # the knob's receipt, in BOTH directions: 0 on every serial card, W on
@@ -1774,6 +1793,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         stats["tile_cards"] = tile_cards
     stats.update(mesh_stats)
     stats["repack"] = repack_stats
+    stats["timings"] = timings
     if collect is not None:
         collect(stats)
     return stats
@@ -1953,7 +1973,7 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
     return st, dict(prov)
 
 def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
-        stop_at=None, allocator=None, epoch=None):
+        stop_at=None, allocator=None, epoch=None, timed_steps=()):
     """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`.
 
     `phase` is forwarded to `step`; see its docstring. The boundaries `run`
@@ -1985,8 +2005,13 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     `python -m inexor.export` writing peculiar km/s off a bare directory
     instead of the reader having to supply the epoch by hand and get it right.
     Omitted, everything behaves exactly as before; see `epoch_record`.
+
+    `timed_steps` names ABSOLUTE step indices whose device passes are timed with
+    syncs (see `step`'s `timings`); on those steps the repack, if it runs
+    separately, is timed too, into `stats["timings"]["repack"]`.
     """
     cfg.validate()
+    timed_steps = {int(k) for k in timed_steps}
     ph = phase if phase is not None else _no_phase
     ckpt_on = bool(cfg.checkpoint_dir) and cfg.checkpoint_every > 0
     if ckpt_on and st.ids is not None:
@@ -2101,18 +2126,20 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         n_ckpt = 0
         for k in range(k0, k_end):
             repack_due = bool(cfg.repack_every and (k + 1) % cfg.repack_every == 0)
+            timings = {} if k in timed_steps else None
             stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
                          census=census, cap_shape=cap_shape, pad_shape=pad_shape,
                          phase=phase, tile_force=tile_force, pool=pool,
                          coarse_parts=coarse_parts, device_shapes=device_shapes,
-                         repack_due=repack_due)
+                         repack_due=repack_due, timings=timings)
             cap_shape = int(stats["cap"])
             pad_shape = int(stats["coarse_pad"])
             device_shapes = stats["device_shapes"]
             if repack_due:
                 # the fused pass has already repacked, inside the migrate phase
                 if stats["repack"] is None:
-                    stats["repack"] = _repack_pass(st, cfg)
+                    stats["repack"] = _repack_pass(
+                        st, cfg, None if timings is None else timings.setdefault("repack", {}))
                 ph("repack")
             # AFTER the repack, so the checkpoint is the step's settled state.
             # The receipt goes on every step in both directions, `None` when

@@ -264,7 +264,8 @@ def _census_plane(st, win, wd, vs, plane, per, c_drift, ar_index, acc, device):
 
 
 def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
-                       coarse_shard=None, device=None, write_host=True, census=None):
+                       coarse_shard=None, device=None, write_host=True, census=None,
+                       timings=None):
     """`tile.tile_loop_device` over tile planes, one window of x-slabs on the card
     at a time. Bitwise that loop; see the module docstring.
 
@@ -275,6 +276,10 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
     BEFORE its rows return to the host. `coarse_shard` and `device` as in
     `tile_loop_device`; one thread per card, each with its own planes, is the
     four-card form.
+
+    `timings`, if a dict, accumulates synced wall per part of a plane (`window:
+    stage`, `window: tiles`, `window: guards`, `window: census`, `window: write-back`)
+    and `window: scales to host` (see `migrate._Clock`).
 
     `census`, if given, is the step's fused drift `c_drift`: see THE DESTINATION
     CENSUS above. It adds `census_counts` (int64 per brick, this call's core slabs
@@ -311,6 +316,9 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
     vs = (jax.block_until_ready(jnp.array(st.vel_scale, copy=True)) if device is None
           else jax.block_until_ready(jax.device_put(np.array(st.vel_scale, copy=True), device)))
     no_mark = dtile._clock(None)
+    from .migrate import _Clock
+
+    clock = _Clock(timings)
     if census is not None:
         from .migrate import _zeros, pass_arena_index
 
@@ -326,6 +334,7 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
         live_max = max(live_max, win["live_rows"])
         residents += win["n_res"]
         wd = win["dev"]
+        clock.mark("window: stage", *wd.values())
         los, his, extents, owns, outs = [], [], [], [], []
         for t in (t for t in members if int(t[0]) == i):
             bricks = np.asarray(members[t], dtype=np.int64)
@@ -352,6 +361,7 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
             smax_all.append(sc["scale_max"])
             tiles_run += 1
 
+        clock.mark("window: tiles", wd["w"], vs)
         # the plane's guards and partition, BEFORE anything of it reaches the host
         own_i = 0
         if los:
@@ -365,18 +375,22 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
                 f"tile plane {i} owned {own_i} rows against {want} stored in its core slabs; "
                 "nothing of this plane was written to the host")
         n_owned += own_i
+        clock.mark("window: guards")
         if census is not None:
             census_acc, n_c = _census_plane(st, win, wd, vs, i, per, float(census),
                                             census_index, census_acc, device)
             census_slabs += n_c
+            clock.mark("window: census", census_acc)
         if write_host:
             _write_core(st, win, np.asarray(wd["w"]), i, per, nb)
+            clock.mark("window: write-back")
         del win, wd
 
     if write_host and planes:
         vh = np.asarray(vs)
         for i in planes:
             st.vel_scale[i * per * nb2:(i + 1) * per * nb2] = vh[i * per * nb2:(i + 1) * per * nb2]
+        clock.mark("window: scales to host")
     kick_max = None
     if smax_all:
         mx = float(np.asarray(jnp.max(jnp.stack(smax_all))))
