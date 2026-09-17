@@ -19,19 +19,23 @@
 #   - the driver streams a line per engine phase boundary and a heartbeat every 60 s,
 #     prints STEP_JSON per step, rewrites its card at every boundary, and writes a
 #     failure card (traceback + every card's allocator stats) on any exception;
-#   - nvidia-smi (memory, utilization) and /proc/meminfo sampled every 5 s by THIS
-#     script, epoch-stamped, independent of the Python process (an OOM kill or a hang
-#     cannot silence them), copied into runs/v2 on exit whatever the exit;
+#   - nvidia-smi (memory, utilization) and every NUMA node's MemTotal/MemFree sampled
+#     every 5 s by THIS script, epoch-stamped, independent of the Python process (an OOM
+#     kill or a hang cannot silence them). CPU and GPU (HBM) nodes are separate rows:
+#     gb 1002020's `MemAvailable` summed both and hid the CPU-side limit it died on;
 #   - 15 min before the wall slurm sends USR1; the trap forwards it to the driver,
 #     whose faulthandler dumps every thread's stack, and dumps again 60 s later;
 #   - `summarize` lines the samplers up per phase after each run leg, finished or not;
 #   - sacct for the job at the end.
 #
 # PRE-REGISTERED:
-#   - preflight refusals, the smoke, and the cgh64 control gate the 4096^3 leg.
+#   - preflight refusals (incl. the planner's host peak against the CPU nodes), the GPU
+#     window gates, the smoke, and the cgh64 control gate the 4096^3 leg.
 #   - Nothing at 4096^3 is gated: this job measures. Compared against the planner
-#     (ef62cf9, printed in the preflight card): host 908.6 GB in-step, 892 GB load;
+#     (093aa29, printed in the preflight card): host 915.0 GB in-step, 892 GB load;
 #     per card 177.3 GB in the step incl. the census, 155.9 GB after the loop.
+#   - RERUN of gb 1002020, which died ~7 min into step 1's tile loop on a host overrun
+#     (RSS 1,091 GB) from whole-window numpy staging and downloads (fixed in cec9cbc).
 #   - Step 1 carries the compiles; step 2 is the steady cost; step 3 is the synced
 #     breakdown (a breakdown, not a cost).
 #   - One checkpoint is written after step 3 (JC: its write time is what decides
@@ -76,7 +80,13 @@ env | grep -E '^(XLA_|JAX_|INEXOR_)' | sort
       2>/dev/null | sed "s/^/$t, /"
     sleep 5; done ) > "$GPU_CSV" &
 GPU_SAMPLER=$!
-( while true; do echo "$(date +%s.%N),$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
+# epoch, node, has_cpus (1/0), MemTotal kB, MemFree kB
+( while true; do t=$(date +%s.%N)
+    for d in /sys/devices/system/node/node[0-9]*; do
+      n=${d##*node}; c=0; [ -n "$(tr -d '[:space:]' < $d/cpulist)" ] && c=1
+      awk -v t="$t" -v n="$n" -v c="$c" '/MemTotal:/{tot=$4} /MemFree:/{fr=$4}
+        END{print t "," n "," c "," tot "," fr}' $d/meminfo
+    done
     sleep 5; done ) > "$MEM_CSV" &
 MEM_SAMPLER=$!
 
@@ -123,6 +133,12 @@ run_leg preflight \
   pixi run -e gpu python $DRIVER preflight --preset c-hero --workdir "$HERO" \
     --card $CARDS/${TAG}_preflight.json --scratch "$RUNS" \
   || { echo "FATAL: preflight refused"; exit 1; }
+
+# the changed window staging and write-back, on the GPU backend, before anything runs on it
+run_leg pytest-gpu \
+  pixi run -e gpu python -m pytest -q tests/test_device_window.py tests/test_device_census.py \
+    tests/test_engine_timed_steps.py \
+  || { echo "FATAL: the window gates failed on the GPU"; exit 1; }
 
 # the smoke: the same driver and instruments at 32^3
 run_leg smoke-ics \

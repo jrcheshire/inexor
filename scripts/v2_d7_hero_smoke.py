@@ -90,6 +90,43 @@ def host_memory():
     return (status.get("VmRSS"), status.get("VmHWM", maxrss), meminfo.get("MemAvailable"))
 
 
+def numa_memory():
+    """Per NUMA node (MemTotal, MemFree) in bytes, split into nodes with CPUs and nodes
+    without (a GB200's HBM appears as CPU-less nodes, and `MemAvailable` sums both, which
+    hid the CPU-side limit in gb 1002020). None off Linux."""
+    root = os.environ.get("D7_NUMA_ROOT", "/sys/devices/system/node")
+    if not os.path.isdir(root):
+        return None
+    cpu, gpu = {}, {}
+    for d in sorted(os.listdir(root)):
+        if not re.fullmatch(r"node\d+", d):
+            continue
+        vals = {}
+        try:
+            with open(os.path.join(root, d, "meminfo")) as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[2] in ("MemTotal:", "MemFree:"):
+                        vals[parts[2][:-1]] = int(parts[3]) * 1024
+            with open(os.path.join(root, d, "cpulist")) as fh:
+                has_cpus = bool(fh.read().strip())
+        except OSError:
+            continue
+        (cpu if has_cpus else gpu)[int(d[4:])] = (vals.get("MemTotal"), vals.get("MemFree"))
+    return dict(cpu=cpu, gpu=gpu,
+                cpu_total=sum(t for t, _ in cpu.values() if t),
+                cpu_free=sum(f for _, f in cpu.values() if f),
+                gpu_used={k: (t - f) if t is not None and f is not None else None
+                          for k, (t, f) in gpu.items()})
+
+
+def _numa_text(nm):
+    if not nm:
+        return "numa -"
+    return (f"cpu free {_gb(nm['cpu_free'])}/{_gb(nm['cpu_total']).strip()} GB, gpu-node used "
+            f"{[None if v is None else round(v / GB, 1) for v in nm['gpu_used'].values()]} GB")
+
+
 def reset_hwm():
     """Per-phase host peak: reset VmHWM (Linux clear_refs). False where unavailable."""
     try:
@@ -157,12 +194,13 @@ class Monitor:
         rss, hwm, avail = host_memory()
         self.run_peak = max(self.run_peak, hwm or 0)
         cards = card_memory()
+        nm = numa_memory()
         if name == "coarse_paint":
             self.step += 1
         rec = dict(t=now, name=name, step=self.step, dt=now - self.t_last, rss=rss,
-                   hwm=hwm, avail=avail, cards=cards)
+                   hwm=hwm, avail=avail, cards=cards, numa=nm)
         print(f"[phase] {_stamp(now)} step {self.step:2d} {name:<16} {rec['dt']:9.1f} s | host "
-              f"rss {_gb(rss)} peak {_gb(hwm)} avail {_gb(avail)} GB | cards in_use "
+              f"rss {_gb(rss)} peak {_gb(hwm)} | {_numa_text(nm)} | cards in_use "
               f"{[round((c['in_use'] or 0) / GB, 1) for c in cards]} peak "
               f"{[None if c['peak'] is None else round(c['peak'] / GB, 1) for c in cards]} GB",
               flush=True)
@@ -186,15 +224,18 @@ class Monitor:
         now = time.time()
         rss, hwm, avail = host_memory()
         io = _proc_kv("/proc/self/io")
-        read = (io.get("read_bytes", 0) - self._io0.get("read_bytes", 0)) if io else None
-        wrote = (io.get("write_bytes", 0) - self._io0.get("write_bytes", 0)) if io else None
+        # rchar/wchar: bytes through read()/write(), which is what a Lustre load is;
+        # read_bytes counts block-device I/O only and read 0 through a 31 min load
+        read = (io.get("rchar", 0) - self._io0.get("rchar", 0)) if io else None
+        wrote = (io.get("wchar", 0) - self._io0.get("wchar", 0)) if io else None
         cards = card_memory()
+        nm = numa_memory()
         with self.lock:
             last, since = self.last, now - self.t_last
         rec = dict(t=now, after=last, since=since, rss=rss, hwm=hwm, avail=avail,
-                   read=read, wrote=wrote, cards=cards)
+                   read=read, wrote=wrote, cards=cards, numa=nm)
         print(f"[beat]  {_stamp(now)} +{(now - self.t_start) / 60:6.1f} min, {since:7.0f} s "
-              f"since '{last}' | host rss {_gb(rss)} avail {_gb(avail)} GB | io read "
+              f"since '{last}' | host rss {_gb(rss)} | {_numa_text(nm)} | io read "
               f"{_gb(read)} wrote {_gb(wrote)} GB | cards in_use "
               f"{[round((c['in_use'] or 0) / GB, 1) for c in cards]} GB", flush=True)
         with self.lock:
@@ -207,7 +248,7 @@ class Monitor:
             self.card["failure"] = dict(
                 t=time.time(), after=self.last, error=repr(exc),
                 traceback=traceback.format_exc(), cards=card_memory(full=True),
-                host=host_memory(), last_beat=self.last_beat)
+                host=host_memory(), numa=numa_memory(), last_beat=self.last_beat)
         self.save()
         print(f"[FAIL] {_stamp()} after '{self.last}': {exc!r}; card {self.card_path}",
               flush=True)
@@ -295,10 +336,17 @@ def cmd_preflight(args):
     plan = _planner(args.preset, args.cards, args.slack, args.arena_frac)
     card["planner"] = plan
     _rss, _hwm, avail = host_memory()
+    nm = numa_memory()
     card["host_available"] = avail
-    if avail is not None and plan["load_gb"] and avail < args.host_margin * plan["load_gb"]:
-        refusals.append(f"MemAvailable {avail / GB:.0f} GB < {args.host_margin} x the planner's "
-                        f"load peak {plan['load_gb'] / GB:.0f} GB")
+    card["numa"] = nm
+    if nm and nm["cpu_total"]:
+        # against the CPU-side nodes, not MemAvailable (which includes the cards' HBM)
+        need = max(v for v in (plan["host_gb"], plan["load_gb"]) if v)
+        if need > args.host_margin * nm["cpu_total"]:
+            refusals.append(f"the planner's host peak {need / GB:.0f} GB > {args.host_margin} x "
+                            f"the CPU nodes' {nm['cpu_total'] / GB:.0f} GB")
+        print(f"  numa: {_numa_text(nm)}; planner host peak {_gb(need)} GB = "
+              f"{need / nm['cpu_total']:.2f}x the CPU nodes", flush=True)
     du = shutil.disk_usage(args.scratch)
     card["scratch"] = dict(path=args.scratch, free=du.free, total=du.total)
     print(f"  planner: host {_gb(plan['host_gb'])} load {_gb(plan['load_gb'])} per card in-step "
@@ -445,7 +493,15 @@ def cmd_summarize(args):
     with open(args.card) as fh:
         card = json.load(fh)
     gpu = _read_samples(args.gpu_csv, 4)      # epoch, index, memory.used MiB, util %
-    mem = _read_samples(args.mem_csv, 2)      # epoch, MemAvailable kB
+    # epoch, node, has_cpus (1/0), MemTotal kB, MemFree kB
+    nodes = _read_samples(args.mem_csv, 5)
+    cpu_free = {}
+    for t, _node, has_cpus, _total, free in nodes:
+        if has_cpus:
+            cpu_free[t] = cpu_free.get(t, 0.0) + free * 1024
+    mem = sorted(cpu_free.items())
+    gpu_node_used = [(t, int(node), (total - free) * 1024)
+                     for t, node, has_cpus, total, free in nodes if not has_cpus]
     t0 = card["started"]
     rows, prev = [], t0
     for b in card["boundaries"]:
@@ -456,9 +512,14 @@ def cmd_summarize(args):
             e = per.setdefault(int(idx), dict(mib=0.0, util=[]))
             e["mib"] = max(e["mib"], mib)
             e["util"].append(util)
-        m = [r[1] * 1024 for r in mem if lo <= r[0] <= hi]
+        m = [r[1] for r in mem if lo <= r[0] <= hi]
+        gn = {}
+        for t, node, used in gpu_node_used:
+            if lo <= t <= hi:
+                gn[node] = max(gn.get(node, 0.0), used)
         rows.append(dict(step=b["step"], name=b["name"], dt=b["dt"], host_phase_peak=b["hwm"],
                          host_avail_min=min(m) if m else None,
+                         gpu_node_used_max_gb={k: v / GB for k, v in sorted(gn.items())},
                          card_max_gib={k: v["mib"] / 1024 for k, v in sorted(per.items())},
                          card_util_mean={k: sum(v["util"]) / len(v["util"])
                                          for k, v in sorted(per.items())},
@@ -468,7 +529,7 @@ def cmd_summarize(args):
     if "failure" in card or "finished" not in card:
         last = card["boundaries"][-1]["t"] if card["boundaries"] else t0
         g = [r for r in gpu if r[0] > last]
-        m = [r[1] * 1024 for r in mem if r[0] > last]
+        m = [r[1] for r in mem if r[0] > last]
         tail = dict(after=card["boundaries"][-1]["name"] if card["boundaries"] else "start",
                     seconds=(max(r[0] for r in g) - last) if g else None,
                     card_max_gib={int(i): max(r[2] for r in g if int(r[1]) == int(i)) / 1024
@@ -480,14 +541,16 @@ def cmd_summarize(args):
     done = "FINISHED" if "finished" in card else "DID NOT FINISH"
     print(f"== {card.get('preset')} {card.get('job')}: {done}"
           f"{'; failure ' + out['failure'] if out['failure'] else ''}")
-    print(f"  {'step':>4} {'phase':<16} {'s':>9} {'host peak':>10} {'avail min':>10}  card max GiB")
+    print(f"  {'step':>4} {'phase':<16} {'s':>9} {'host peak':>10} {'cpu free':>10}  card max GiB"
+          "  | gpu-node used max GB")
     for r in rows:
         print(f"  {r['step']:>4} {r['name']:<16} {r['dt']:9.1f} {_gb(r['host_phase_peak']):>10} "
               f"{_gb(r['host_avail_min']):>10}  "
-              f"{[round(v, 1) for v in r['card_max_gib'].values()]}")
+              f"{[round(v, 1) for v in r['card_max_gib'].values()]}  | "
+              f"{[round(v, 1) for v in r['gpu_node_used_max_gb'].values()]}")
     if tail:
         print(f"  UNFINISHED after '{tail['after']}': {tail['seconds']} s more sampled; card max "
-              f"GiB {tail['card_max_gib']}; host avail min {_gb(tail['host_avail_min'])} GB")
+              f"GiB {tail['card_max_gib']}; cpu free min {_gb(tail['host_avail_min'])} GB")
     print(f"  summary {args.out}")
     return 0
 
@@ -506,8 +569,9 @@ def main(argv=None):
         p.add_argument("--arena-frac", type=float, default=0.01)
     pf = sub.choices["preflight"]
     pf.add_argument("--scratch", default=os.environ.get("SCRATCH", "/tmp"))
-    pf.add_argument("--host-margin", type=float, default=1.02,
-                    help="refuse unless MemAvailable >= this x the planner's load peak")
+    pf.add_argument("--host-margin", type=float, default=0.95,
+                    help="refuse if the planner's host or load peak exceeds this x the CPU "
+                         "nodes' MemTotal")
     pf.add_argument("--allow-cpu", action="store_true")
     pr = sub.choices["run"]
     pr.add_argument("--stop-at", type=int, required=True, help="steps to run from the ICs")
