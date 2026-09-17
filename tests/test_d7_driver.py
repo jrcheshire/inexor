@@ -86,3 +86,38 @@ def test_trim_probe_runs_where_there_is_a_glibc():
 
     out = d7.trim_probe(_Mon())
     assert out is not None and out["seconds"] >= 0
+
+
+def _write_maps(tmp_path, monkeypatch, lines):
+    p = tmp_path / "self"
+    p.mkdir(exist_ok=True)
+    (p / "numa_maps").write_text(lines)
+    monkeypatch.setenv("D7_PROC_SELF", str(p))
+    return p
+
+
+def test_membind_refusals_accept_a_binding_to_the_cpu_nodes(tmp_path, monkeypatch):
+    _write_maps(tmp_path, monkeypatch,
+                "aaaa bind:0-1 anon=100 N0=100 kernelpagesize_kB=64\n" * 20)
+    assert d7.membind_refusals({0, 1}) == []
+
+
+def test_membind_refusals_catch_an_unbound_process_and_a_wrong_node(tmp_path, monkeypatch):
+    """gb 1003511: with no binding the kernel put the state on a card's HBM node, and the
+    symptom was a device OOM on a card whose own allocator held 24 GB."""
+    _write_maps(tmp_path, monkeypatch, "aaaa default anon=100 N0=100 kernelpagesize_kB=64\n" * 20)
+    assert any("numactl --membind" in r for r in d7.membind_refusals({0, 1}))
+    _write_maps(tmp_path, monkeypatch, "aaaa bind:0-3 anon=100 N0=100 kernelpagesize_kB=64\n" * 20)
+    assert any("outside" in r for r in d7.membind_refusals({0, 1}))
+    assert d7.membind_refusals({0, 1}, policy={}) , "an unreadable policy must refuse"
+
+
+def test_pages_off_the_cpu_nodes_names_the_hbm_nodes():
+    nm = dict(cpu={0: (1, 1), 1: (1, 1)}, gpu={2: (1, 1), 3: (1, 1)})
+    nmaps = {0: dict(anon=10, file=0), 2: dict(anon=197, file=3), 3: dict(anon=0, file=0)}
+    off, where = d7.pages_off_the_cpu_nodes(nmaps, nm)
+    assert off == 200 and where == {2: 200}
+
+
+def test_node_list_parses_ranges_and_lists():
+    assert d7._node_list("0,1") == {0, 1} and d7._node_list("0-3") == {0, 1, 2, 3}

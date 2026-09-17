@@ -38,6 +38,16 @@
 #   4. Does step 1's tile window upload already cost what steps 2+ do (step 1 carries
 #      the compiles), and does upload time per card follow where its slabs sit by node?
 #   5. Checkpoint seconds per slab by part: is the write or the host work the term?
+#   6. With the binding on, does the load still leave the sockets at their free-memory
+#      floor -- i.e. is the page cache from the ICs the pressure the steps then run in?
+#
+# HOST MEMORY IS BOUND TO THE CPU SOCKETS (`numactl --membind=0,1`, nodes 0 and 1 are the
+# only ones with CPUs; the four ~189 GiB HBM nodes are the cards'). gb 1003511 ran without
+# it: the IC load left both sockets with ~11 GB free and ~690 GB of page cache, and the
+# kernel then placed the process's memory on the CARDS' HBM (197 GB on two of them, 133 on
+# a third) instead of reclaiming that cache. The step's first 2 GiB device allocation then
+# failed on a card whose own allocator held 24 GB. The driver refuses unless the binding
+# applied, and refuses again after the load if any of the state sits on a CPU-less node.
 #
 # RERUN of gb 1003378, which failed in its smoke gate leg: the driver's "not under the
 # IC directory" guard compared path strings, so the probe dir `<ics>-ckpt-probe` looked
@@ -67,6 +77,9 @@ GPU_CSV=$CARDS/${TAG}_gpu.csv
 MEM_CSV=$CARDS/${TAG}_mem.csv
 VMS_CSV=$CARDS/${TAG}_vmstat.csv
 DRIVER=scripts/v2_d7_hero_smoke.py
+# host allocations on the CPU sockets only; device allocations are unaffected
+BIND="numactl --membind=0,1"
+MEMBIND="--membind-nodes 0,1"
 mkdir -p "$WORK"
 
 echo "=== $(hostname): commit $(git rev-parse --short HEAD), job $SLURM_JOB_ID, $(date) ==="
@@ -140,9 +153,10 @@ summarize () {
       --mem-csv "$MEM_CSV" --out "${card%.json}_summary.json"
 }
 
+numactl --hardware | head -4
 run_leg preflight \
-  pixi run -e gpu python $DRIVER preflight --preset c-hero --workdir "$HERO" \
-    --card $CARDS/${TAG}_preflight.json --scratch "$RUNS" \
+  $BIND pixi run -e gpu python $DRIVER preflight --preset c-hero --workdir "$HERO" \
+    --card $CARDS/${TAG}_preflight.json --scratch "$RUNS" $MEMBIND \
   || { echo "FATAL: preflight refused"; exit 1; }
 
 # the timed solve and the writer's probe mode, on the GPU backend, before anything runs on it
@@ -155,11 +169,11 @@ DIAG="--timed-all --numa-maps --trim-probe"
 
 # the smoke: the same driver and instruments at 32^3
 run_leg smoke-ics \
-  pixi run -e gpu python scripts/v2_m6_realization.py ics --config smoke \
+  $BIND pixi run -e gpu python scripts/v2_m6_realization.py ics --config smoke \
     --workdir "$WORK/smoke" --generator device \
   && run_leg smoke-run \
-  pixi run -e gpu python $DRIVER run --preset smoke --workdir "$WORK/smoke" \
-    --card $CARDS/${TAG}_smoke.json --stop-at 2 $DIAG --beat 30 \
+  $BIND pixi run -e gpu python $DRIVER run --preset smoke --workdir "$WORK/smoke" \
+    --card $CARDS/${TAG}_smoke.json --stop-at 2 $DIAG $MEMBIND --beat 30 \
     --ckpt-probe-slabs 2 --ckpt-probe-dir "$WORK/smoke-ckpt-probe"
 rc_smoke=$?
 summarize $CARDS/${TAG}_smoke.json
@@ -167,19 +181,19 @@ summarize $CARDS/${TAG}_smoke.json
 
 # the cgh64 control: a known phase table, same node, same driver
 run_leg cgh64-ics \
-  pixi run -e gpu python scripts/v2_m6_realization.py ics --config cgh64 \
+  $BIND pixi run -e gpu python scripts/v2_m6_realization.py ics --config cgh64 \
     --workdir "$WORK/cgh64" --generator device \
   && run_leg cgh64-run \
-  pixi run -e gpu python $DRIVER run --preset cgh64 --workdir "$WORK/cgh64" \
-    --card $CARDS/${TAG}_cgh64.json --stop-at 3 $DIAG --beat 60
+  $BIND pixi run -e gpu python $DRIVER run --preset cgh64 --workdir "$WORK/cgh64" \
+    --card $CARDS/${TAG}_cgh64.json --stop-at 3 $DIAG $MEMBIND --beat 60
 rc_control=$?
 summarize $CARDS/${TAG}_cgh64.json
 [ $rc_control -ne 0 ] && { echo "FATAL: the cgh64 control failed"; exit 1; }
 
 # THE 4096^3 LEG
 run_leg hero-run \
-  pixi run -e gpu python $DRIVER run --preset c-hero --workdir "$HERO" \
-    --card $CARDS/${TAG}_hero.json --stop-at 4 $DIAG --beat 60 \
+  $BIND pixi run -e gpu python $DRIVER run --preset c-hero --workdir "$HERO" \
+    --card $CARDS/${TAG}_hero.json --stop-at 4 $DIAG $MEMBIND --beat 60 \
     --ckpt-probe-slabs 8 --ckpt-probe-dir "$WORK/hero-ckpt-probe"
 summarize $CARDS/${TAG}_hero.json
 # the probe slabs are a partial state with no manifest: not worth keeping

@@ -210,6 +210,63 @@ def numa_maps():
     return out
 
 
+def memory_policy():
+    """This process's NUMA allocation policy per mapping, counted: `{"bind:0,1": n, ...}`
+    from /proc/self/numa_maps. `Mems_allowed_list` is the CPUSET and does NOT show a
+    `numactl --membind`, so the policy has to be read here."""
+    out = {}
+    try:
+        with open(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "numa_maps")) as fh:
+            for line in fh:
+                toks = line.split()
+                if len(toks) > 1:
+                    out[toks[1]] = out.get(toks[1], 0) + 1
+    except OSError:
+        return None
+    return out
+
+
+def membind_refusals(nodes, policy=None):
+    """Refusals if this process is not bound to `nodes` (a set of NUMA node ids).
+
+    gb 1003511 died here: with the CPU sockets full of page cache from the IC load, the
+    kernel placed 197 GB of the process's memory on a card's HBM node rather than reclaim
+    the cache, and a 2 GiB device allocation then failed on a card whose own allocator
+    held 24 GB. The binding is what keeps host memory on the host, and a knob must prove
+    it applied."""
+    pol = memory_policy() if policy is None else policy
+    if not pol:
+        return ["no /proc/self/numa_maps: the memory policy cannot be read"]
+    total = sum(pol.values())
+    bound = 0
+    bad = []
+    for name, n in pol.items():
+        if not name.startswith("bind:"):
+            continue
+        got = set()
+        for part in name[5:].split(","):
+            a, _, b = part.partition("-")
+            got.update(range(int(a), int(b or a) + 1))
+        if got <= set(nodes):
+            bound += n
+        else:
+            bad.append(f"{n} mappings bound to {sorted(got)}, outside {sorted(nodes)}")
+    if bad:
+        return bad
+    if bound < 0.9 * total:
+        return [f"only {bound} of {total} mappings are bound to {sorted(nodes)}: run under "
+                f"`numactl --membind={','.join(str(n) for n in sorted(nodes))}`"]
+    return []
+
+
+def pages_off_the_cpu_nodes(nmaps, nm):
+    """Bytes of this process sitting on CPU-less (HBM) nodes, and which."""
+    if not nmaps or not nm:
+        return 0, {}
+    off = {n: sum(e.values()) for n, e in nmaps.items() if n in nm["gpu"]}
+    return sum(off.values()), {n: v for n, v in off.items() if v}
+
+
 def _mem_text(pm, dflt, dvm, nm):
     """One line: the process's RSS by kind, this interval's faults and reclaim, and each
     CPU node's page cache."""
@@ -386,6 +443,15 @@ class Monitor:
               flush=True)
 
 
+def _node_list(text):
+    """"0,1" or "0-1" -> {0, 1}."""
+    out = set()
+    for part in str(text).split(","):
+        a, _, b = part.partition("-")
+        out.update(range(int(a), int(b or a) + 1))
+    return out
+
+
 def _nodes_text(nmaps):
     return {n: {k: round(v / GB, 1) for k, v in e.items() if v} for n, e in sorted(nmaps.items())}
 
@@ -556,6 +622,12 @@ def cmd_preflight(args):
                             f"the CPU nodes' {nm['cpu_total'] / GB:.0f} GB")
         print(f"  numa: {_numa_text(nm)}; planner host peak {_gb(need)} GB = "
               f"{need / nm['cpu_total']:.2f}x the CPU nodes", flush=True)
+    card["memory_policy"] = memory_policy()
+    if args.membind_nodes:
+        want = _node_list(args.membind_nodes)
+        refusals += [f"memory policy: {r}" for r in membind_refusals(want)]
+        print(f"  memory policy: {card['memory_policy']} against --membind-nodes "
+              f"{sorted(want)}", flush=True)
     du = shutil.disk_usage(args.scratch)
     card["scratch"] = dict(path=args.scratch, free=du.free, total=du.total)
     print(f"  planner: host {_gb(plan['host_gb'])} load {_gb(plan['load_gb'])} per card in-step "
@@ -587,6 +659,10 @@ def cmd_run(args):
             raise SystemExit(f"FATAL: {what} would be written under the IC directory")
     if args.checkpoint_every and not args.checkpoint_dir:
         raise SystemExit("FATAL: --checkpoint-every needs --checkpoint-dir")
+    if args.membind_nodes:
+        bad = membind_refusals(_node_list(args.membind_nodes))
+        if bad:
+            raise SystemExit("FATAL: " + "; ".join(bad))
     _signals(args.card)
     card = _base_card("run", args)
     if args.ckpt_probe_slabs and not args.ckpt_probe_dir:
@@ -628,6 +704,20 @@ def cmd_run(args):
         card["state"] = dict(n_particles=st.n_particles, n_bricks=st.n_bricks,
                              rows=int(st.off.shape[0]), n_arena=int(st.n_arena))
         mon("load")
+        if args.membind_nodes:
+            # the state is on the host now: prove it is ON THE HOST'S nodes. Without a
+            # binding the kernel put 197 GB of it on a card's HBM (gb 1003511), which
+            # only shows up later as a device OOM on a card holding almost nothing.
+            nmaps, nm = numa_maps(), numa_memory()
+            off, where = pages_off_the_cpu_nodes(nmaps, nm)
+            card["load_pages_off_cpu_nodes"] = dict(bytes=off, by_node=where)
+            print(f"  after the load: {_gb(off)} GB of this process on CPU-less nodes "
+                  f"{ {k: round(v / GB, 1) for k, v in where.items()} }", flush=True)
+            if off > args.off_node_gb * GB:
+                raise RuntimeError(
+                    f"{off / GB:.1f} GB of the loaded state sits on CPU-less (HBM) nodes "
+                    f"{sorted(where)}: those bytes are on the cards, which will OOM in the "
+                    "step. The membind did not hold.")
         co, a_steps = _coeffs(_cosmo())
         timed = (tuple(range(args.stop_at)) if args.timed_all
                  else (args.stop_at - 1,) if args.timed_last else ())
@@ -811,6 +901,10 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("preflight", "run"):
         p = sub.add_parser(name)
+        p.add_argument("--membind-nodes", default=None,
+                       help="the NUMA nodes this process must be bound to (e.g. 0,1): "
+                            "refuse unless `numactl --membind` applied, and after the load "
+                            "refuse if the state sits on CPU-less (HBM) nodes")
         p.add_argument("--preset", required=True)
         p.add_argument("--workdir", required=True, help="the IC directory (read only)")
         p.add_argument("--card", required=True)
@@ -835,6 +929,8 @@ def main(argv=None):
     pr.add_argument("--ckpt-probe-slabs", type=int, default=0,
                     help="after the run, write this many slabs of the state, timed per part")
     pr.add_argument("--ckpt-probe-dir", default=None)
+    pr.add_argument("--off-node-gb", type=float, default=8.0,
+                    help="with --membind-nodes: GB of this process allowed on CPU-less nodes")
     pr.add_argument("--trim-probe", action="store_true",
                     help="after the run (and the probe), gc + malloc_trim(0), RSS either side")
     pr.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
