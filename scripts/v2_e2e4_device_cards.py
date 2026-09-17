@@ -74,7 +74,7 @@ SNAP_ARMS = ("slack0-eager", "slack0-cards")
 SPLIT_KEYS = ("coarse_card_chunks", "coarse_cards", "coarse_card_ranges",
               "coarse_ghost_planes_nonzero", "device_cards", "tile_cards",
               "coarse_jit_traces", "coarse_jit_shapes", "coarse_device_jit",
-              "migrate_repack_fused")
+              "migrate_repack_fused", "census_slabs")
 #: (arm, reference) pairs gated on hashes + stats
 ENGINE_GATES = (("window-on", "window-off"), ("cards", "window-on"),
                 ("slack0-cards", "slack0-eager"), ("window-on", "window-sep"),

@@ -1652,7 +1652,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         tile_cards = [dict(planes=int(lp.get("planes_run", cfg.tiles_side)),
                            tiles_run=int(lp["tiles_run"]),
                            **{k: lp[k] for k in ("window_live_rows_max", "residents_staged",
-                                                 "window_slabs", "wrapped", "census_slabs")
+                                                 "window_slabs", "wrapped")
                               if k in lp})
                       for lp in loops]
         if timings is not None and cfg.tile_window:
@@ -1730,8 +1730,11 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     else:
         stats = _migrate_pass(st, cfg, c_drift, pool,
                               None if timings is None else timings.setdefault("migrate", {}))
-    # the knob's receipt, on every card in both directions
+    # the knob's receipts, on every card in both directions: the census the fused
+    # pass was sized from covered this many slabs (0 when it did not run)
     stats["migrate_repack_fused"] = fused_now
+    stats["census_slabs"] = (int(sum(lp.get("census_slabs", 0) for lp in loops))
+                             if fused_now else 0)
     # the knob's receipt, in BOTH directions: 0 on every serial card, W on
     # every pooled one (the reach fallback reports 0 through migrate_pool)
     stats["migrate_pooled_workers"] = int(stats.get("migrate_pool", {}).get("workers", 0))

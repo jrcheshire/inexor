@@ -241,7 +241,8 @@ def test_a_fused_engine_run_is_bitwise_the_separate_passes(cards):
     out_f = engine.run(st_f, cfg_f, co)
     assert fused.CALLS - c0 == len(co), "the fused pass did not run every step"
     _same(st_s, st_f, "fused vs separate")
-    _same_stats(out_s, out_f, drop=("migrate_repack_fused", "coarse_jit_traces"))
+    _same_stats(out_s, out_f, drop=("migrate_repack_fused", "census_slabs", "coarse_jit_traces"))
+    assert all(o["census_slabs"] == st_f.bricks_per_side for o in out_f)
     assert all(o["migrate_repack_fused"] for o in out_f)
     assert not any(o["migrate_repack_fused"] for o in out_s)
     assert all(o["repack"]["repack_device"].get("fused") for o in out_f)
