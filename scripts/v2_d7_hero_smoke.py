@@ -461,6 +461,16 @@ def _signals(card_path):
           flush=True)
 
 
+def under(path, root):
+    """Is `path` inside directory `root`? By PATH COMPONENT, never by string prefix:
+    prefix matching called `.../smoke-ckpt-probe` a child of `.../smoke` and refused a
+    write that was fine (gb 1003378, a gate leg)."""
+    if not path:
+        return False
+    a, b = os.path.realpath(path), os.path.realpath(root)
+    return a == b or a.startswith(b + os.sep)
+
+
 def _planner(preset, cards, slack, arena):
     cmd = [sys.executable, "-m", "inexor.plan", "--preset", preset, "--backend", "device",
            "--n-gpus", str(cards), "--host-gb", "1026", "--device-gb", "199",
@@ -573,7 +583,7 @@ def cmd_run(args):
     ics = os.path.realpath(args.workdir)
     for what, path in (("the card", os.path.dirname(os.path.abspath(args.card))),
                        ("a checkpoint", args.checkpoint_dir)):
-        if path and os.path.realpath(path).startswith(ics):
+        if under(path, ics):
             raise SystemExit(f"FATAL: {what} would be written under the IC directory")
     if args.checkpoint_every and not args.checkpoint_dir:
         raise SystemExit("FATAL: --checkpoint-every needs --checkpoint-dir")
@@ -581,7 +591,7 @@ def cmd_run(args):
     card = _base_card("run", args)
     if args.ckpt_probe_slabs and not args.ckpt_probe_dir:
         raise SystemExit("FATAL: --ckpt-probe-slabs needs --ckpt-probe-dir")
-    if args.ckpt_probe_dir and os.path.realpath(args.ckpt_probe_dir).startswith(ics):
+    if under(args.ckpt_probe_dir, ics):
         raise SystemExit("FATAL: the checkpoint probe would be written under the IC directory")
     if args.ckpt_probe_dir and os.path.exists(args.ckpt_probe_dir) and os.listdir(
             args.ckpt_probe_dir):
@@ -726,6 +736,11 @@ def _read_samples(path, n_fields):
 
 
 def cmd_summarize(args):
+    if not os.path.exists(args.card):
+        # a leg that died before its first boundary leaves none; say so in one line
+        # rather than a traceback that reads as a second, unrelated failure
+        print(f"== no card at {args.card}: that leg wrote none, nothing to summarize")
+        return 0
     with open(args.card) as fh:
         card = json.load(fh)
     gpu = _read_samples(args.gpu_csv, 4)      # epoch, index, memory.used MiB, util %

@@ -38,6 +38,10 @@
 #   4. Does step 1's tile window upload already cost what steps 2+ do (step 1 carries
 #      the compiles), and does upload time per card follow where its slabs sit by node?
 #   5. Checkpoint seconds per slab by part: is the write or the host work the term?
+#
+# RERUN of gb 1003378, which failed in its smoke gate leg: the driver's "not under the
+# IC directory" guard compared path strings, so the probe dir `<ics>-ckpt-probe` looked
+# like a child of `<ics>` (fixed, `under`, with tests/test_d7_driver.py in the leg below).
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
@@ -143,7 +147,7 @@ run_leg preflight \
 
 # the timed solve and the writer's probe mode, on the GPU backend, before anything runs on it
 run_leg pytest-gpu \
-  pixi run -e gpu python -m pytest -q -rs tests/test_engine_timed_steps.py \
+  pixi run -e gpu python -m pytest -q -rs tests/test_engine_timed_steps.py tests/test_d7_driver.py \
     "tests/test_icgen.py::test_write_t9_slabs_probe_writes_the_same_leading_slabs_and_no_manifest" \
   || { echo "FATAL: the timing gates failed on the GPU"; exit 1; }
 
