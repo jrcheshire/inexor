@@ -323,22 +323,29 @@ def cmd_run(args):
     from v2_m6_realization import _coeffs, _cosmo
 
     jax.config.update("jax_enable_x64", True)
-    card_dir = os.path.realpath(os.path.dirname(os.path.abspath(args.card)))
-    if card_dir.startswith(os.path.realpath(args.workdir)):
-        raise SystemExit("FATAL: the card would be written under the IC directory")
+    ics = os.path.realpath(args.workdir)
+    for what, path in (("the card", os.path.dirname(os.path.abspath(args.card))),
+                       ("a checkpoint", args.checkpoint_dir)):
+        if path and os.path.realpath(path).startswith(ics):
+            raise SystemExit(f"FATAL: {what} would be written under the IC directory")
+    if args.checkpoint_every and not args.checkpoint_dir:
+        raise SystemExit("FATAL: --checkpoint-every needs --checkpoint-dir")
     _signals(args.card)
     card = _base_card("run", args)
     mon = Monitor(args.card, card, beat_s=args.beat, fail_at=os.environ.get("D7_FAIL_AT"))
     card["plan"] = dict(stop_at=args.stop_at, timed_last=args.timed_last, cards=args.cards,
                         slack=args.slack, alloc_margin=args.alloc_margin,
-                        arena_frac=args.arena_frac)
+                        arena_frac=args.arena_frac, checkpoint_dir=args.checkpoint_dir,
+                        checkpoint_every=args.checkpoint_every)
     try:
         devs = jax.devices()
         if len(devs) < args.cards:
             raise RuntimeError(f"{len(devs)} jax devices, {args.cards} asked")
         ec = engine_config(args.preset, coarse_backend="device", tile_backend="device",
                            migrate_backend="device", device_cards=args.cards, tile_workers=1,
-                           brick_slack=args.slack)
+                           brick_slack=args.slack,
+                           checkpoint_dir=args.checkpoint_dir if args.checkpoint_every else None,
+                           checkpoint_every=args.checkpoint_every)
         ec.validate()
         card["config"] = dict(tile_window=ec.tile_window, fused_pass=ec.fused_pass,
                               device_cards=ec.device_cards, checkpoint_dir=ec.checkpoint_dir,
@@ -361,10 +368,16 @@ def cmd_run(args):
             with mon.lock:
                 card["steps"].append(s)
 
-        engine.run(st, ec, co, phase=mon, stop_at=args.stop_at, collect=collect,
-                   timed_steps=timed)
+        out = engine.run(st, ec, co, phase=mon, stop_at=args.stop_at, collect=collect,
+                         timed_steps=timed)
         card["finished"] = time.time()
+        # a checkpoint is written after the last boundary and has none of its own
+        card["after_last_boundary_s"] = card["finished"] - mon.t_last
+        # the receipt lands on the step's stats after `collect` has seen them
+        card["checkpoints"] = [o.get("checkpoint") for o in out]
         card["run_host_peak"] = mon.run_peak
+        print(f"  {card['after_last_boundary_s']:.1f} s after the last boundary; checkpoints "
+              f"{card['checkpoints']}", flush=True)
         mon.save()
         _print_steps(card)
         return 0
@@ -501,6 +514,9 @@ def main(argv=None):
     pr.add_argument("--timed-last", action="store_true",
                     help="synced per-phase breakdown of the device passes on the last step")
     pr.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
+    pr.add_argument("--checkpoint-dir", default=None)
+    pr.add_argument("--checkpoint-every", type=int, default=0,
+                    help="0 = no checkpoints; else every this many steps (--stop-at a multiple)")
     ps = sub.add_parser("summarize")
     ps.add_argument("--card", required=True)
     ps.add_argument("--gpu-csv", default=None)
