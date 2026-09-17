@@ -287,6 +287,25 @@ def test_write_t9_slabs_manifest_is_written_last(tmp_path):
         icgen.load_slot_state(str(tmp_path))
 
 
+def test_write_t9_slabs_probe_writes_the_same_leading_slabs_and_no_manifest(tmp_path):
+    """`max_slabs` is a timing probe: its slabs are byte-identical to a full write's,
+    it never leaves a loadable directory, and a timed write is the untimed one."""
+    st = _evolved_state()
+    full, probe = str(tmp_path / "full"), str(tmp_path / "probe")
+    t_full, t_probe = {}, {}
+    icgen.write_t9_slabs(st, full, timings=t_full)
+    assert icgen.write_t9_slabs(st, probe, timings=t_probe, max_slabs=2) is None
+    _man, crcs = _crcs(full)
+    assert sorted(os.listdir(probe)) == ["t9_slab_0000.npz", "t9_slab_0001.npz"]
+    for f in os.listdir(probe):
+        with open(os.path.join(probe, f), "rb") as a, open(os.path.join(full, f), "rb") as b:
+            assert a.read() == b.read(), f
+    assert t_probe["slabs"] == 2 and t_full["slabs"] == st.bricks_per_side
+    assert all(t_probe[k] > 0 for k in ("index", "gather", "crc32", "write")), t_probe
+    with pytest.raises(FileNotFoundError, match="refusing to load"):
+        icgen.load_slot_state(probe)
+
+
 # ------------------------------------------------- staging cleanup (M-v2-6 S4)
 
 

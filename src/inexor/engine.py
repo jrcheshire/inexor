@@ -1433,8 +1433,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     the per-tile ones: a synced per-tile timing is not neutral (record sec. 20).
 
     `timings`, if a dict, collects the device passes' SYNCED per-phase walls: the
-    windowed tile loop's per card (`tile`), and the migrate's, or the fused
-    migrate + repack's (`migrate`). Syncing moves the wall, so a timed step is a
+    windowed tile loop's per card (`tile`), the migrate's, or the fused
+    migrate + repack's (`migrate`), and the coarse solve's parts (`solve`). Syncing moves the wall, so a timed step is a
     breakdown and not the step's cost; `stats["timings"]` carries it (None on an
     untimed step).
 
@@ -1539,6 +1539,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         fdtype=cfg.np_coarse_dtype,
         parts=coarse_parts,
         out=solve_out,
+        timings=None if timings is None else timings.setdefault("solve", {}),
     )
     del dj
     ph("coarse_solve")

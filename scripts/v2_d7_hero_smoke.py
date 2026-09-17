@@ -3,7 +3,9 @@
     preflight  refuse early: devices, the allocator's receipt, host memory against
                the planner's load peak, the IC manifest, scratch space
     run        load the ICs, run K steps of the 40-step schedule on the device lane
-               (window and fused pass on auto, checkpoints off), last step timed
+               (window and fused pass on auto), the last or every step timed; then,
+               optionally, a partial checkpoint write timed per part and a
+               malloc_trim probe
     summarize  after the fact, no jax: the run card against the job's sampler CSVs,
                per phase (card memory max per GPU, host MemAvailable min, utilization)
 
@@ -15,6 +17,12 @@ WHAT SURVIVES A FAILURE, and why each piece exists:
 - A heartbeat thread prints every `--beat` seconds: the last boundary and the time
   since it, host memory, Lustre bytes read/written, each card's allocator bytes. A
   long compile, a slow phase and a hang look different in it.
+- Each boundary also records where the host memory is and what the kernel did to
+  get it: the process's anon / file / shmem / locked / pinned RSS, page faults
+  (getrusage), `/proc/vmstat` counters (direct-reclaim stalls and scans, compaction
+  stalls, NUMA misses), per NUMA node file pages, dirty and writeback, and with
+  `--numa-maps` the process's pages per node. The instruments' own seconds are
+  recorded per boundary and kept out of the phase's.
 - `STEP_JSON` per step: the engine's stats with every receipt.
 - Any exception writes the traceback, every card's full `memory_stats()` and the last
   heartbeat into the card before re-raising.
@@ -90,14 +98,69 @@ def host_memory():
     return (status.get("VmRSS"), status.get("VmHWM", maxrss), meminfo.get("MemAvailable"))
 
 
+PROC_MEM_KEYS = ("VmRSS", "VmHWM", "RssAnon", "RssFile", "RssShmem", "VmLck", "VmPin", "VmSwap")
+
+
+def proc_memory():
+    """This process's resident memory by kind, bytes: `PROC_MEM_KEYS` from
+    /proc/self/status. Locked (VmLck) and pinned (VmPin) pages are the ones reclaim
+    cannot take. {} off Linux."""
+    status = _proc_kv(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "status"),
+                      1024)
+    return {k: status[k] for k in PROC_MEM_KEYS if k in status}
+
+
+def fault_counts():
+    """(minor, major) page faults and (voluntary, involuntary) context switches of this
+    process so far, all threads."""
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    return dict(minflt=r.ru_minflt, majflt=r.ru_majflt, nvcsw=r.ru_nvcsw, nivcsw=r.ru_nivcsw)
+
+
+# summed over every counter whose name starts with the key (allocstall_normal, ...)
+VMSTAT_PREFIXES = ("allocstall", "pgscan_direct", "pgsteal_direct", "pgscan_kswapd",
+                   "pgsteal_kswapd", "compact_stall", "compact_fail", "pgmajfault",
+                   "thp_fault_alloc", "thp_fault_fallback", "numa_miss", "numa_foreign",
+                   "pgmigrate_success", "workingset_refault_file", "pgpgout")
+
+
+def vmstat():
+    """System-wide /proc/vmstat counters summed by `VMSTAT_PREFIXES` (the node is the
+    job's alone). Monotone, so a phase's value is a difference. {} off Linux."""
+    out = {}
+    try:
+        with open(os.environ.get("D7_VMSTAT", "/proc/vmstat")) as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) != 2 or not parts[1].isdigit():
+                    continue
+                for p in VMSTAT_PREFIXES:
+                    # pgscan_direct_throttle counts throttling events, not pages
+                    if parts[0].startswith(p) and not parts[0].endswith("_throttle"):
+                        out[p] = out.get(p, 0) + int(parts[1])
+    except OSError:
+        pass
+    return out
+
+
+def _delta(now, before):
+    return {k: v - before.get(k, 0) for k, v in (now or {}).items()}
+
+
+# per-node meminfo fields recorded beside MemTotal/MemFree
+NODE_KEYS = ("FilePages", "Active(file)", "Inactive(file)", "AnonPages", "Shmem", "Mlocked",
+             "Unevictable", "Dirty", "Writeback", "AnonHugePages")
+
+
 def numa_memory():
     """Per NUMA node (MemTotal, MemFree) in bytes, split into nodes with CPUs and nodes
     without (a GB200's HBM appears as CPU-less nodes, and `MemAvailable` sums both, which
-    hid the CPU-side limit in gb 1002020). None off Linux."""
+    hid the CPU-side limit in gb 1002020), plus `detail[node]` = the `NODE_KEYS` fields.
+    MemFree excludes page cache; FilePages is the cache. None off Linux."""
     root = os.environ.get("D7_NUMA_ROOT", "/sys/devices/system/node")
     if not os.path.isdir(root):
         return None
-    cpu, gpu = {}, {}
+    cpu, gpu, detail = {}, {}, {}
     for d in sorted(os.listdir(root)):
         if not re.fullmatch(r"node\d+", d):
             continue
@@ -106,18 +169,60 @@ def numa_memory():
             with open(os.path.join(root, d, "meminfo")) as fh:
                 for line in fh:
                     parts = line.split()
-                    if len(parts) >= 4 and parts[2] in ("MemTotal:", "MemFree:"):
+                    if len(parts) >= 4 and parts[3].isdigit():
                         vals[parts[2][:-1]] = int(parts[3]) * 1024
             with open(os.path.join(root, d, "cpulist")) as fh:
                 has_cpus = bool(fh.read().strip())
         except OSError:
             continue
-        (cpu if has_cpus else gpu)[int(d[4:])] = (vals.get("MemTotal"), vals.get("MemFree"))
-    return dict(cpu=cpu, gpu=gpu,
+        node = int(d[4:])
+        (cpu if has_cpus else gpu)[node] = (vals.get("MemTotal"), vals.get("MemFree"))
+        detail[node] = {k: vals[k] for k in NODE_KEYS if k in vals}
+    return dict(cpu=cpu, gpu=gpu, detail=detail,
                 cpu_total=sum(t for t, _ in cpu.values() if t),
                 cpu_free=sum(f for _, f in cpu.values() if f),
                 gpu_used={k: (t - f) if t is not None and f is not None else None
                           for k, (t, f) in gpu.items()})
+
+
+def numa_maps():
+    """This process's resident pages per NUMA node, bytes, split anon / file / other,
+    from /proc/self/numa_maps (a page-table walk: slow at ~850 GB, so boundaries only,
+    and the caller records its seconds). None where unreadable."""
+    out = {}
+    try:
+        with open(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "numa_maps")) as fh:
+            for line in fh:
+                toks = line.split()
+                page = 4096
+                for t in toks:
+                    if t.startswith("kernelpagesize_kB="):
+                        page = int(t.split("=")[1]) * 1024
+                kind = ("anon" if any(t.startswith("anon=") for t in toks)
+                        else "file" if any(t.startswith("file=") for t in toks) else "other")
+                for t in toks:
+                    m = re.fullmatch(r"N(\d+)=(\d+)", t)
+                    if m:
+                        e = out.setdefault(int(m.group(1)), dict(anon=0, file=0, other=0))
+                        e[kind] += int(m.group(2)) * page
+    except OSError:
+        return None
+    return out
+
+
+def _mem_text(pm, dflt, dvm, nm):
+    """One line: the process's RSS by kind, this interval's faults and reclaim, and each
+    CPU node's page cache."""
+    def g(k):
+        return round(pm.get(k, 0) / GB, 1)
+
+    cache = ("" if not nm else " | cpu-node file pages " + str(
+        {n: round(nm["detail"].get(n, {}).get("FilePages", 0) / GB, 1) for n in nm["cpu"]}))
+    return (f"anon {g('RssAnon')} file {g('RssFile')} shmem {g('RssShmem')} lck {g('VmLck')} "
+            f"pin {g('VmPin')} GB | faults min {dflt.get('minflt', 0)} maj "
+            f"{dflt.get('majflt', 0)} | allocstall {dvm.get('allocstall', 0)} pgscan_direct "
+            f"{dvm.get('pgscan_direct', 0)} compact_stall {dvm.get('compact_stall', 0)} "
+            f"numa_miss {dvm.get('numa_miss', 0)}{cache}")
 
 
 def _numa_text(nm):
@@ -160,8 +265,9 @@ def _gb(x):
 class Monitor:
     """`engine.run(phase=)` hook plus heartbeat, both streaming, and the card."""
 
-    def __init__(self, card_path, card, beat_s=60.0, fail_at=None):
+    def __init__(self, card_path, card, beat_s=60.0, fail_at=None, with_numa_maps=False):
         self.card_path = card_path
+        self.with_numa_maps = bool(with_numa_maps)
         self.card = card
         self.lock = threading.Lock()
         self.t_start = time.time()
@@ -174,6 +280,8 @@ class Monitor:
         self.last_beat = None
         card.update(boundaries=[], beats=[], steps=[], hwm_per_phase=self.hwm_resets)
         self._io0 = _proc_kv("/proc/self/io")
+        self._flt_last = fault_counts()
+        self._vm_last = vmstat()
         self._stop = threading.Event()
         self._beat_s = float(beat_s)
         self._thread = threading.Thread(target=self._beat_loop, daemon=True, name="d7-beat")
@@ -189,25 +297,46 @@ class Monitor:
         with self.lock:
             _write_json(self.card_path, self.card)
 
+    def snapshot(self):
+        """Memory, faults and reclaim counters now; faults and vmstat as the change since
+        the previous snapshot."""
+        flt, vm = fault_counts(), vmstat()
+        dflt, dvm = _delta(flt, self._flt_last), _delta(vm, self._vm_last)
+        self._flt_last, self._vm_last = flt, vm
+        return dict(mem=proc_memory(), faults=dflt, vmstat=dvm)
+
     def __call__(self, name):
         now = time.time()
         rss, hwm, avail = host_memory()
         self.run_peak = max(self.run_peak, hwm or 0)
         cards = card_memory()
         nm = numa_memory()
+        snap = self.snapshot()
+        nmaps, nmaps_s = None, None
+        if self.with_numa_maps:
+            t0 = time.time()
+            nmaps = numa_maps()
+            nmaps_s = time.time() - t0
         if name == "coarse_paint":
             self.step += 1
         rec = dict(t=now, name=name, step=self.step, dt=now - self.t_last, rss=rss,
-                   hwm=hwm, avail=avail, cards=cards, numa=nm)
+                   hwm=hwm, avail=avail, cards=cards, numa=nm, numa_maps=nmaps,
+                   numa_maps_s=nmaps_s, **snap)
         print(f"[phase] {_stamp(now)} step {self.step:2d} {name:<16} {rec['dt']:9.1f} s | host "
               f"rss {_gb(rss)} peak {_gb(hwm)} | {_numa_text(nm)} | cards in_use "
               f"{[round((c['in_use'] or 0) / GB, 1) for c in cards]} peak "
               f"{[None if c['peak'] is None else round(c['peak'] / GB, 1) for c in cards]} GB",
               flush=True)
+        print(f"[mem]   {_mem_text(snap['mem'], snap['faults'], snap['vmstat'], nm)}"
+              + ("" if nmaps is None else
+                 f" | process pages by node {_nodes_text(nmaps)} ({nmaps_s:.1f} s)"), flush=True)
         with self.lock:
             self.card["boundaries"].append(rec)
-            self.last, self.t_last = name, now
+            self.last = name
         self.save()
+        # the instruments' own seconds belong to no phase
+        rec["instr_s"] = time.time() - now
+        self.t_last = now + rec["instr_s"]
         if self.hwm_resets:
             reset_hwm()
         if self.fail_at and name == self.fail_at:
@@ -232,8 +361,10 @@ class Monitor:
         nm = numa_memory()
         with self.lock:
             last, since = self.last, now - self.t_last
+        # absolute counters: the boundaries own the per-phase differences
         rec = dict(t=now, after=last, since=since, rss=rss, hwm=hwm, avail=avail,
-                   read=read, wrote=wrote, cards=cards, numa=nm)
+                   read=read, wrote=wrote, cards=cards, numa=nm, mem=proc_memory(),
+                   faults=fault_counts(), vmstat=vmstat())
         print(f"[beat]  {_stamp(now)} +{(now - self.t_start) / 60:6.1f} min, {since:7.0f} s "
               f"since '{last}' | host rss {_gb(rss)} | {_numa_text(nm)} | io read "
               f"{_gb(read)} wrote {_gb(wrote)} GB | cards in_use "
@@ -248,10 +379,78 @@ class Monitor:
             self.card["failure"] = dict(
                 t=time.time(), after=self.last, error=repr(exc),
                 traceback=traceback.format_exc(), cards=card_memory(full=True),
-                host=host_memory(), numa=numa_memory(), last_beat=self.last_beat)
+                host=host_memory(), numa=numa_memory(), mem=proc_memory(),
+                vmstat=vmstat(), last_beat=self.last_beat)
         self.save()
         print(f"[FAIL] {_stamp()} after '{self.last}': {exc!r}; card {self.card_path}",
               flush=True)
+
+
+def _nodes_text(nmaps):
+    return {n: {k: round(v / GB, 1) for k, v in e.items() if v} for n, e in sorted(nmaps.items())}
+
+
+def _probe_record(mon, name):
+    """A boundary-shaped record outside the engine's phases, for the post-run probes."""
+    rss, hwm, avail = host_memory()
+    return dict(t=time.time(), name=name, rss=rss, hwm=hwm, numa=numa_memory(),
+                **mon.snapshot())
+
+
+def checkpoint_probe(st, out_dir, n_slabs, mon):
+    """Write the first `n_slabs` T9 slabs of the evolved state into `out_dir` (fresh,
+    never a manifest) and time each part; the per-slab rate prices a full checkpoint."""
+    from inexor import icgen
+
+    if os.path.exists(out_dir) and os.listdir(out_dir):
+        raise RuntimeError(f"checkpoint probe dir {out_dir} is not empty; refusing to write "
+                           "into it (the writer removes a manifest it finds)")
+    io0 = _proc_kv("/proc/self/io")
+    before = _probe_record(mon, "ckpt_probe_start")
+    t, t0 = {}, time.time()
+    icgen.write_t9_slabs(st, out_dir, timings=t, max_slabs=n_slabs)
+    wall = time.time() - t0
+    io1 = _proc_kv("/proc/self/io")
+    after = _probe_record(mon, "ckpt_probe_end")
+    wrote = io1.get("wchar", 0) - io0.get("wchar", 0) if io1 else None
+    n = int(t.get("slabs", 0)) or 1
+    nb = int(st.bricks_per_side)
+    out = dict(slabs=t.get("slabs", 0), of=nb, wall_s=wall, parts_s=t, wrote=wrote,
+               before=before, after=after, projected_full_s=wall / n * nb)
+    print(f"== checkpoint probe: {out['slabs']} of {nb} slabs in {wall:.1f} s "
+          f"({wall / n:.2f} s/slab -> {out['projected_full_s']:.0f} s for all), "
+          + ", ".join(f"{k} {v:.1f} s" for k, v in t.items() if k != "slabs")
+          + ("" if wrote is None else f"; wrote {wrote / GB:.1f} GB "
+             f"({wrote / max(t.get('write', 0.0), 1e-9) / 1e6:.0f} MB/s over the write part)"),
+          flush=True)
+    print(f"[mem]   {_mem_text(after['mem'], after['faults'], after['vmstat'], after['numa'])}",
+          flush=True)
+    return out
+
+
+def trim_probe(mon):
+    """gc, then glibc `malloc_trim(0)`: how much of the host RSS was freed memory the C
+    allocator still held. None off glibc."""
+    import ctypes
+    import gc
+
+    gc.collect()
+    before = _probe_record(mon, "trim_before")
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+    except OSError:
+        print("== trim probe: no glibc here, skipped", flush=True)
+        return None
+    t0 = time.time()
+    released = int(libc.malloc_trim(0))
+    dt = time.time() - t0
+    after = _probe_record(mon, "trim_after")
+    out = dict(released_flag=released, seconds=dt, before=before, after=after)
+    print(f"== trim probe: malloc_trim(0) returned {released} in {dt:.1f} s; RSS "
+          f"{_gb(before['rss'])} -> {_gb(after['rss'])} GB, anon "
+          f"{_gb(before['mem'].get('RssAnon'))} -> {_gb(after['mem'].get('RssAnon'))} GB",
+          flush=True)
+    return out
 
 
 def _signals(card_path):
@@ -380,8 +579,20 @@ def cmd_run(args):
         raise SystemExit("FATAL: --checkpoint-every needs --checkpoint-dir")
     _signals(args.card)
     card = _base_card("run", args)
-    mon = Monitor(args.card, card, beat_s=args.beat, fail_at=os.environ.get("D7_FAIL_AT"))
-    card["plan"] = dict(stop_at=args.stop_at, timed_last=args.timed_last, cards=args.cards,
+    if args.ckpt_probe_slabs and not args.ckpt_probe_dir:
+        raise SystemExit("FATAL: --ckpt-probe-slabs needs --ckpt-probe-dir")
+    if args.ckpt_probe_dir and os.path.realpath(args.ckpt_probe_dir).startswith(ics):
+        raise SystemExit("FATAL: the checkpoint probe would be written under the IC directory")
+    if args.ckpt_probe_dir and os.path.exists(args.ckpt_probe_dir) and os.listdir(
+            args.ckpt_probe_dir):
+        # here, not after the run: the writer removes a manifest it finds
+        raise SystemExit(f"FATAL: checkpoint probe dir {args.ckpt_probe_dir} is not empty")
+    mon = Monitor(args.card, card, beat_s=args.beat, fail_at=os.environ.get("D7_FAIL_AT"),
+                  with_numa_maps=args.numa_maps)
+    card["plan"] = dict(stop_at=args.stop_at, timed_last=args.timed_last,
+                        timed_all=args.timed_all, numa_maps=args.numa_maps,
+                        ckpt_probe_slabs=args.ckpt_probe_slabs, trim_probe=args.trim_probe,
+                        cards=args.cards,
                         slack=args.slack, alloc_margin=args.alloc_margin,
                         arena_frac=args.arena_frac, checkpoint_dir=args.checkpoint_dir,
                         checkpoint_every=args.checkpoint_every)
@@ -408,7 +619,8 @@ def cmd_run(args):
                              rows=int(st.off.shape[0]), n_arena=int(st.n_arena))
         mon("load")
         co, a_steps = _coeffs(_cosmo())
-        timed = (args.stop_at - 1,) if args.timed_last else ()
+        timed = (tuple(range(args.stop_at)) if args.timed_all
+                 else (args.stop_at - 1,) if args.timed_last else ())
 
         def collect(stats):
             s = {k: v for k, v in stats.items() if k not in ("pool", "busy", "loop_wall")}
@@ -427,6 +639,13 @@ def cmd_run(args):
         print(f"  {card['after_last_boundary_s']:.1f} s after the last boundary; checkpoints "
               f"{card['checkpoints']}", flush=True)
         mon.save()
+        if args.ckpt_probe_slabs:
+            card["ckpt_probe"] = checkpoint_probe(st, args.ckpt_probe_dir,
+                                                  args.ckpt_probe_slabs, mon)
+            mon.save()
+        if args.trim_probe:
+            card["trim_probe"] = trim_probe(mon)
+            mon.save()
         _print_steps(card)
         return 0
     except BaseException as e:
@@ -452,6 +671,23 @@ def _print_steps(card):
         print("  " + f"{n:<16}" + "".join(f"{v:11.1f}" for v in row))
     print("  " + f"{'TOTAL':<16}" + "".join(f"{sum(b['dt'] for b in by[k]):11.1f}"
                                           for k in sorted(by)))
+    print("  " + f"{'(instruments)':<16}" + "".join(
+        f"{sum(b.get('instr_s') or 0.0 for b in by[k]):11.1f}" for k in sorted(by)))
+    if any("mem" in b for b in card["boundaries"]):
+        print("\n== host memory at each boundary; faults and reclaim over the phase")
+        print(f"  {'step':>4} {'phase':<16} {'anon':>6} {'file':>6} {'shmem':>6} {'lck':>6} "
+              f"{'pin':>6} {'minflt':>10} {'majflt':>7} {'allocstall':>10} {'scan_direct':>12} "
+              f"{'compact':>8} {'numa_miss':>10}  cpu-node file pages GB")
+        for b in card["boundaries"]:
+            m, f, v, nm = b.get("mem") or {}, b.get("faults") or {}, b.get("vmstat") or {}, \
+                b.get("numa")
+            cache = ({n: round(nm["detail"].get(n, {}).get("FilePages", 0) / GB, 1)
+                      for n in nm["cpu"]} if nm and "detail" in nm else {})
+            print(f"  {b['step']:>4} {b['name']:<16} {_gb(m.get('RssAnon'))} "
+                  f"{_gb(m.get('RssFile'))} {_gb(m.get('RssShmem'))} {_gb(m.get('VmLck'))} "
+                  f"{_gb(m.get('VmPin'))} {f.get('minflt', 0):>10} {f.get('majflt', 0):>7} "
+                  f"{v.get('allocstall', 0):>10} {v.get('pgscan_direct', 0):>12} "
+                  f"{v.get('compact_stall', 0):>8} {v.get('numa_miss', 0):>10}  {cache}")
     for i, st in enumerate(card["steps"]):
         t = st.get("timings")
         if not t:
@@ -577,6 +813,15 @@ def main(argv=None):
     pr.add_argument("--stop-at", type=int, required=True, help="steps to run from the ICs")
     pr.add_argument("--timed-last", action="store_true",
                     help="synced per-phase breakdown of the device passes on the last step")
+    pr.add_argument("--timed-all", action="store_true",
+                    help="the same breakdown on every step")
+    pr.add_argument("--numa-maps", action="store_true",
+                    help="the process's pages per NUMA node at every boundary (slow walk)")
+    pr.add_argument("--ckpt-probe-slabs", type=int, default=0,
+                    help="after the run, write this many slabs of the state, timed per part")
+    pr.add_argument("--ckpt-probe-dir", default=None)
+    pr.add_argument("--trim-probe", action="store_true",
+                    help="after the run (and the probe), gc + malloc_trim(0), RSS either side")
     pr.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
     pr.add_argument("--checkpoint-dir", default=None)
     pr.add_argument("--checkpoint-every", type=int, default=0,

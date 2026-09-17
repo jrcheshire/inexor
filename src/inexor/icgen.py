@@ -898,7 +898,8 @@ def load_slot_state(
     return st
 
 
-def write_t9_slabs(st, workdir, provenance=None, drop_ids=False):
+def write_t9_slabs(st, workdir, provenance=None, drop_ids=False, timings=None,
+                   max_slabs=None):
     """Write a `SlotState` as T9 slabs: the exact inverse of `load_slot_state`.
 
     Same `t9-slabs-2` schema `generate_t9_slabs` emits, so an evolved state and
@@ -934,6 +935,11 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False):
 
     IDs are not in the schema. A state carrying them refuses rather than
     dropping them silently; pass `drop_ids=True` to say the loss is intended.
+
+    `timings`, if a dict, accumulates seconds per part over the slabs written
+    (`index`, `gather`, `crc32`, `write`) plus `slabs`. `max_slabs` writes only
+    the first that many slabs and returns None: a timing probe, with no manifest
+    and no conservation check, so the directory can never load as a checkpoint.
     """
     if st.ids is not None and not drop_ids:
         raise ValueError(
@@ -954,7 +960,14 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False):
     nbb = nb * nb                      # bricks per x-slab; a brick is in exactly one
     written, n_written = [], 0
 
-    for d in range(nb):
+    clock = time.perf_counter
+
+    def _add(key, t0):
+        if timings is not None:
+            timings[key] = timings.get(key, 0.0) + clock() - t0
+
+    for d in range(nb if max_slabs is None else min(nb, int(max_slabs))):
+        t0 = clock()
         lo_brick = d * nbb
         lo_bucket = lo_brick * p3
         hi_bucket = lo_bucket + nbb * p3
@@ -987,9 +1000,13 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False):
                 slots = np.insert(slots, pos, a_slots)
 
         occ = np.bincount(keys - lo_bucket, minlength=nbb * p3).astype(np.int64)
+        _add("index", t0)
+        t0 = clock()
         off = st.off[slots]
         w = st.w[slots]
         scale_d = np.asarray(st.vel_scale[lo_brick : lo_brick + nbb], dtype=np.float64)
+        _add("gather", t0)
+        t0 = clock()
         meta = dict(
             schema=SCHEMA,
             bx=d,
@@ -1003,10 +1020,18 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False):
                 scale=zlib.crc32(scale_d.tobytes()),
             ),
         )
+        _add("crc32", t0)
+        t0 = clock()
         path = os.path.join(workdir, f"t9_slab_{d:04d}.npz")
         np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w, scale=scale_d)
+        _add("write", t0)
+        if timings is not None:
+            timings["slabs"] = timings.get("slabs", 0) + 1
         written.append(os.path.basename(path))
         n_written += len(slots)
+
+    if max_slabs is not None:
+        return None
 
     # Conservation, not a formality: a dropped arena row is a deleted particle
     # and nothing downstream would raise on it.

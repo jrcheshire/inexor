@@ -40,6 +40,9 @@ def test_a_timed_step_is_bitwise_and_the_only_one_with_a_breakdown(cards, fused)
     for card in t["tile"].values():
         for key in ("window: stage", "window: tiles", "window: guards", "window: write-back"):
             assert card.get(key, 0) > 0, (key, card)
+    for key in ("forward: pass1", "forward: pass2", "multiply", "inverse: pass1",
+                "inverse: pass2"):
+        assert t["solve"].get(key, 0) > 0, (key, t["solve"])
     census = [c.get("window: census", 0) for c in t["tile"].values()]
     if cfg.fused_pass:
         assert all(v > 0 for v in census), census
