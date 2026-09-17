@@ -164,3 +164,77 @@ def test_the_window_is_the_default_for_the_compiled_device_tile_and_inert_elsewh
     assert _ecfg(tile_backend="device").tile_window is True
     assert _ecfg(tile_backend="device", device_tile_window=False).tile_window is False
     assert _ecfg(tile_backend="device", device_tile_window=True).validate() is True
+
+
+# ------------------------------------------------------------------ no host copy of a window
+
+
+def _traced_peak(fn):
+    import tracemalloc
+
+    fn()  # warm: the first call compiles, and compiling allocates on the host
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    base = tracemalloc.get_traced_memory()[0]
+    try:
+        out = fn()
+        return tracemalloc.get_traced_memory()[1] - base, out
+    finally:
+        tracemalloc.stop()
+
+
+def test_staging_a_window_allocates_no_host_window(monkeypatch):
+    """gb 1002020 died with four cards each holding a 45 GiB numpy window on the host.
+    Slabs now go up as views; the copied fallback is the control that must fail."""
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = _shapes(cfg, st)
+    nb, pad, span, per = dwin.plane_geometry(st, cfg.n_tile, cfg._b_realized, cfg.n_brick)
+    slabs = dwin.window_slabs(0, per, pad, span, nb)
+    W, A = shapes["window"]["rows"], shapes["window"]["arena"]
+    window_bytes = (W + A) * (st.off.itemsize * 3 + st.w.itemsize * 3)
+    peak, win = _traced_peak(lambda: dwin.stage_window(st, slabs, shapes["window"]))
+    assert win["copied_slabs"] == 0 and win["n_res"] > 0
+    assert peak < 0.25 * window_bytes, f"staging held {peak} B against a {window_bytes} B window"
+    monkeypatch.setattr(dwin, "_slab_fits", lambda *a: False)
+    ctl, win_c = _traced_peak(lambda: dwin.stage_window(st, slabs, shapes["window"]))
+    assert win_c["copied_slabs"] == len(slabs)
+    assert ctl >= 0.25 * window_bytes, f"CONTROL cannot fail: copied staging held {ctl} B"
+
+
+def test_the_write_back_downloads_a_slab_at_a_time():
+    from inexor.device import migrate
+
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = _shapes(cfg, st)
+    nb, pad, span, per = dwin.plane_geometry(st, cfg.n_tile, cfg._b_realized, cfg.n_brick)
+    win = dwin.stage_window(st, dwin.window_slabs(0, per, pad, span, nb), shapes["window"])
+    w_dev = win["dev"]["w"]
+    whole = int(w_dev.shape[0]) * st.w.itemsize * 3
+    st_a, st_b = copy.deepcopy(st), copy.deepcopy(st)
+    before = migrate.READS.get("window: write-back", 0)
+    peak, _ = _traced_peak(lambda: dwin._write_core(st_a, win, w_dev, 0, per, nb))
+    reads = migrate.READS.get("window: write-back", 0) - before
+    # the whole-window download this replaced, as the reference both must equal
+    dwin_rows = np.asarray(w_dev)
+    edges = win["edges"]
+    for s in range(0, per):
+        lo, hi, r = int(edges[s]), int(edges[s + 1]), int(win["slab_win"][s])
+        st_b.w[lo:hi] = dwin_rows[r:r + hi - lo]
+    b = win["res_bricks"]
+    k = np.flatnonzero((b >= 0) & (b < per * nb * nb))
+    st_b.w[win["res_slots"][k]] = dwin_rows[win["W"] + k]
+    assert np.array_equal(st_a.w, st_b.w), "the per-slab write-back differs"
+    assert len(k) > 0, "VACUOUS: no core resident was written back"
+    assert peak < 0.25 * whole, f"write-back held {peak} B against a {whole} B window of w"
+    assert reads == 2 * (per + 1), f"{reads} reads: two write-back passes of {per} slabs + residents"
+
+
+def test_a_windowed_loop_with_every_slab_copied_is_bitwise_the_whole_state_loop(monkeypatch):
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = _shapes(cfg, st)
+    st_whole, st_win = copy.deepcopy(st), copy.deepcopy(st)
+    dtile.tile_loop_device(st_whole, one_tile, C, g_coarse, members, dtile.tile_step_shapes(st))
+    monkeypatch.setattr(dwin, "_slab_fits", lambda *a: False)
+    dwin.tile_loop_windowed(st_win, one_tile, C, g_coarse, members, shapes)
+    assert np.array_equal(st_win.w, st_whole.w)
+    assert np.array_equal(st_win.vel_scale, st_whole.vel_scale)

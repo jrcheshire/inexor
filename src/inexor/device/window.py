@@ -96,11 +96,46 @@ def window_shapes(st, n_tile, b_real, n_brick, planes=None, floor=None):
     live_max = res_max = 0
     for p in planes:
         s = window_slabs(p, per, pad, span, nb)
-        live_max = max(live_max, int(rows[s].sum()))
+        # the slabs go up as ladder-length chunks and the last one's pad must fit
+        pads = max(_ladder(int(n)) - int(n) for n in rows[s])
+        live_max = max(live_max, int(rows[s].sum()) + pads)
         res_max = max(res_max, int(res[s].sum()))
     floor = floor or {}
     return dict(rows=int(capacity_shape(max(live_max, 1), floor_shape=int(floor.get("rows", 0)))),
                 arena=int(capacity_shape(max(res_max, 1), floor_shape=int(floor.get("arena", 0)))))
+
+
+def _ladder(n):
+    from ..forces import capacity_shape
+
+    return int(capacity_shape(max(1, int(n))))
+
+
+def _slab_fits(n_state_rows, lo, L):
+    """True when `L` rows from slot `lo` lie inside the state: the slab chunk is a view."""
+    return lo + L <= n_state_rows
+
+
+def _window_programs(L, rows, trailing, dtype):
+    """(place an `L`-row chunk into a `rows`-row buffer at a runtime row, donated; read
+    `L` rows back from a runtime row)."""
+    import jax
+
+    from .migrate import _program
+
+    def make_place():
+        def place(buf, chunk, r):
+            return jax.lax.dynamic_update_slice(buf, chunk, (r,) + (0,) * trailing)
+
+        return jax.jit(place, donate_argnums=0)
+
+    def make_take():
+        return jax.jit(lambda buf, r: jax.lax.dynamic_slice(buf, (r,) + (0,) * trailing,
+                                                            (L,) + buf.shape[1:]))
+
+    key = (L, rows, trailing, str(dtype))
+    return (_program(("window_place",) + key, make_place),
+            _program(("window_take",) + key, make_take))
 
 
 def stage_window(st, slabs, shapes, device=None):
@@ -110,28 +145,48 @@ def stage_window(st, slabs, shapes, device=None):
     across x = 0 is two ranges, concatenated), padded to `W = shapes["rows"]`;
     rows `W ..` are the arena residents of the slabs' bricks in ascending slot,
     padded to `shapes["arena"]`. Returns the device arrays (`off`, `w`,
-    `arena_bucket`, copies: the tile program donates `w`) and the host maps
-    `rebase_plan` and the write-back read. Refuses a window past its shapes.
+    `arena_bucket`: the tile program donates `w`) and the host maps `rebase_plan`
+    and the write-back read. Refuses a window past its shapes.
+
+    NO HOST COPY OF THE WINDOW. Each slab goes up as a view of the state `L =
+    capacity_shape(its rows)` long (copied only where that would run off the array)
+    and is written into a device buffer at its window row; the rows past the slab are
+    unread and the next slab overwrites them, which is why `window_shapes` leaves
+    room for the largest pad. The residents are the one host gather, O(arena).
     """
     import jax
-    import jax.numpy as jnp
+
+    from .migrate import _put, _zeros
 
     nb = int(st.bricks_per_side)
     nb2 = nb * nb
     W, A = int(shapes["rows"]), int(shapes["arena"])
     edges = _slab_edges(st)
-    off = np.zeros((W + A, 3), dtype=st.off.dtype)
-    w = np.zeros((W + A, 3), dtype=st.w.dtype)
+    n_state = int(st.off.shape[0])
+    off_d = _zeros((W + A, 3), st.off.dtype, device)
+    w_d = _zeros((W + A, 3), st.w.dtype, device)
     slab_abs = np.full(nb, -1, dtype=np.int64)
     slab_win = np.full(nb, -1, dtype=np.int64)
-    r = 0
+    r = copied = 0
     for s in slabs:
         lo, hi = int(edges[s]), int(edges[s + 1])
-        if r + hi - lo > W:
-            raise ValueError(f"window over slabs {slabs} holds more than rows={W} live rows; "
-                             "rebuild the shapes with window_shapes")
-        off[r:r + hi - lo] = st.off[lo:hi]
-        w[r:r + hi - lo] = st.w[lo:hi]
+        L = _ladder(hi - lo)
+        if r + L > W:
+            raise ValueError(f"window over slabs {slabs} holds more than rows={W} rows with "
+                             "its slabs' pads; rebuild the shapes with window_shapes")
+        direct = _slab_fits(n_state, lo, L)
+        copied += not direct
+        for src, buf in ((st.off, "off"), (st.w, "w")):
+            if direct:
+                chunk = src[lo:lo + L]
+            else:
+                chunk = np.zeros((L,) + src.shape[1:], dtype=src.dtype)
+                chunk[:hi - lo] = src[lo:hi]
+            place, _take = _window_programs(L, W + A, 1, src.dtype)
+            if buf == "off":
+                off_d = place(off_d, _put(chunk, device), _put(r, device, np.int64))
+            else:
+                w_d = place(w_d, _put(chunk, device), _put(r, device, np.int64))
         slab_abs[s], slab_win[s] = lo, r
         r += hi - lo
 
@@ -147,19 +202,22 @@ def stage_window(st, slabs, shapes, device=None):
     res_slots = int(st.arena_base) + rows_a
     arena_bucket = np.zeros(max(A, 1), dtype=st.arena_bucket.dtype)
     if n_res:
-        off[W:W + n_res] = st.off[res_slots]
-        w[W:W + n_res] = st.w[res_slots]
         arena_bucket[:n_res] = st.arena_bucket[rows_a]
-
-    def put(a):
-        if device is None:
-            return jax.block_until_ready(jnp.array(a, copy=True))
-        return jax.block_until_ready(jax.device_put(a, device))
-
-    return dict(dev=dict(off=put(off), w=put(w), arena_bucket=put(arena_bucket)),
+        if A:
+            for src, name in ((st.off, "off"), (st.w, "w")):
+                res = np.zeros((A,) + src.shape[1:], dtype=src.dtype)
+                res[:n_res] = src[res_slots]
+                place, _take = _window_programs(A, W + A, 1, src.dtype)
+                if name == "off":
+                    off_d = place(off_d, _put(res, device), _put(W, device, np.int64))
+                else:
+                    w_d = place(w_d, _put(res, device), _put(W, device, np.int64))
+    ab_d = _put(arena_bucket, device)
+    jax.block_until_ready((off_d, w_d, ab_d))
+    return dict(dev=dict(off=off_d, w=w_d, arena_bucket=ab_d),
                 slabs=list(slabs), slab_abs=slab_abs, slab_win=slab_win, edges=edges,
                 res_slots=res_slots, res_bricks=brick_a, W=W, A=A, live_rows=r,
-                n_res=n_res, wrapped=list(slabs) != sorted(slabs))
+                n_res=n_res, wrapped=list(slabs) != sorted(slabs), copied_slabs=copied)
 
 
 def rebase_plan(plan, win, bricks_per_side):
@@ -184,19 +242,34 @@ def rebase_plan(plan, win, bricks_per_side):
     return dict(plan, starts=starts, arena_slots=rect)
 
 
-def _write_core(st, win, wh, plane, per, nb):
-    """Copy the rows tile plane `plane` owns from the window's `w` (host copy `wh`)
-    into the host state: its core slabs' live runs and their bricks' residents."""
+def _write_core(st, win, w_dev, plane, per, nb, device=None):
+    """Copy the rows tile plane `plane` owns from the window's `w` on the card into the
+    host state: its core slabs' live runs, one slab's ladder of rows downloaded at a
+    time, and their bricks' residents, gathered on the card."""
+    import jax.numpy as jnp
+
+    from .migrate import _host, _put
+
     nb2 = nb * nb
     edges = win["edges"]
+    rows = int(w_dev.shape[0])
     for s in range(plane * per, (plane + 1) * per):
         lo, hi, r = int(edges[s]), int(edges[s + 1]), int(win["slab_win"][s])
-        st.w[lo:hi] = wh[r:r + hi - lo]
+        if hi == lo:
+            continue
+        L = _ladder(hi - lo)
+        _place, take = _window_programs(L, rows, 1, w_dev.dtype)
+        st.w[lo:hi] = _host(take(w_dev, _put(r, device, np.int64)),
+                            "window: write-back")[:hi - lo]
     if win["n_res"]:
         b = win["res_bricks"]
         core = (b >= plane * per * nb2) & (b < (plane + 1) * per * nb2)
         k = np.flatnonzero(core)
-        st.w[win["res_slots"][k]] = wh[win["W"] + k]
+        if len(k):
+            idx = np.full(_ladder(len(k)), win["W"], dtype=np.int64)
+            idx[:len(k)] = win["W"] + k
+            got = _host(jnp.take(w_dev, _put(idx, device), axis=0), "window: write-back")
+            st.w[win["res_slots"][k]] = got[:len(k)]
 
 
 def _census_programs(n_bricks, nb2, cap):
@@ -382,7 +455,7 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
             census_slabs += n_c
             clock.mark("window: census", census_acc)
         if write_host:
-            _write_core(st, win, np.asarray(wd["w"]), i, per, nb)
+            _write_core(st, win, wd["w"], i, per, nb, device)
             clock.mark("window: write-back")
         del win, wd
 
