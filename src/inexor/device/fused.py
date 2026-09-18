@@ -254,7 +254,7 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
             x[a_lo:a_hi] = k
     clock.mark("pass: arena replay")
     n_before = ctx["n_before"]
-    n_after = int(new_occ.astype(np.int64).sum())
+    n_after = _state.occupancy_total(new_occ)
     if n_after != n_before:
         raise ValueError(
             f"the fused migrate + repack lost {n_before - n_after} particles ({n_before} -> "

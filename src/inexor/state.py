@@ -402,6 +402,18 @@ def brick_reach(st, c_drift, vel_scale=None):
     return int(np.ceil(abs(float(c_drift)) * s * INT16_MAX / extent))
 
 
+def occupancy_total(occ):
+    """Rows counted by a per-bucket occupancy index, as a Python int.
+
+    Accumulates in int64 WITHOUT widening the index: `occ.astype(np.int64).sum()`
+    materializes an int64 copy, 68.7 GB of transient at 4096^3 (a 34.4 GB uint32
+    index), which is what took gb 1004113's host to its ceiling at the migrate's
+    start and end. Every whole-index count in a step goes through here;
+    `tests/test_occupancy_total.py` gates the fused pass's host peak on it.
+    """
+    return int(np.sum(occ, dtype=np.int64))
+
+
 def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert_kernel="numpy"):
     # `insert_kernel="jax"` routes every `_insert_slab` through `insert_jax`,
     # independently of the eject's `kernel`; both default to numpy here for the
@@ -454,7 +466,7 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert
     # gone, with every census agreeing, no aliasing and ownership a perfect
     # partition. It surfaced ~200 lines away as the engine's ownership assertion,
     # which cost four wrong diagnoses. A loss must be loud AT THE POINT OF LOSS.
-    n_before = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    n_before = occupancy_total(st.occupancy) + st.arena_used
 
     # THE REACH, and it is a bound rather than an assumption. The schedule below
     # releases a staged row once its destination has been written, so it must know
@@ -538,7 +550,7 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert
             )
     if len(inserted) != nb:
         raise AssertionError(f"{nb - len(inserted)} slabs were never written back")
-    n_after = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    n_after = occupancy_total(st.occupancy) + st.arena_used
     if n_after != n_before:
         left = sum(len(v.get("dest", ())) for v in staged.values()) if staged else 0
         raise ValueError(
@@ -710,7 +722,7 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
         )
     nb = st.bricks_per_side
     p3 = st.buckets_per_brick
-    n_before = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    n_before = occupancy_total(st.occupancy) + st.arena_used
     scales = np.array(st.vel_scale, dtype=np.float64, copy=True)
     r_raw = brick_reach(st, c_drift, scales)
     r = min(r_raw, nb // 2)
@@ -734,7 +746,7 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
 
     # worst-case eject rows per slab = live rows + arena residents, both from
     # the pre-pass state the workers will read
-    occ_slab = st.occupancy.astype(np.int64).reshape(nb, -1).sum(axis=1)
+    occ_slab = st.occupancy.reshape(nb, -1).sum(axis=1, dtype=np.int64)
     arena_slab = np.zeros(nb, dtype=np.int64)
     if st.n_arena:
         keys = st.arena_bucket[st.arena_bucket >= 0]
@@ -799,7 +811,7 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
     n_over, peak_staged = rep["n_over"], rep["peak_staged"]
     realized_reach = rep["realized_reach"]
     spill_rows, spill_bytes = rep["spill_rows"], rep["spill_bytes"]
-    n_after = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    n_after = occupancy_total(st.occupancy) + st.arena_used
     if n_after != n_before:
         raise ValueError(
             f"the migration lost {n_before - n_after} particles ({n_before} -> "
@@ -978,7 +990,7 @@ class SlotState:
     @property
     def n_live(self):
         """Every particle the container holds: brick runs plus arena residents."""
-        return int(np.sum(self.occupancy.astype(np.int64))) + self.arena_used
+        return occupancy_total(self.occupancy) + self.arena_used
 
     def brick_slot_range(self, brick_flat):
         """The brick's ALLOCATION span (live rows plus its spare)."""

@@ -743,7 +743,7 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
     CALLS += 1
     nb = int(st.bricks_per_side)
     has_ids = st.ids is not None
-    n_before = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    n_before = _state.occupancy_total(st.occupancy) + st.arena_used
     scales = np.array(st.vel_scale, dtype=np.float64, copy=True)
     r_raw = _state.brick_reach(st, c_drift, scales)
     r = min(r_raw, nb // 2)
@@ -892,7 +892,7 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
     clock = ctx["clocks"][0]
     clock.mark("pass: arena replay")
     n_before, nb = ctx["n_before"], ctx["nb"]
-    n_after = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    n_after = _state.occupancy_total(st.occupancy) + st.arena_used
     if n_after != n_before:
         raise ValueError(
             f"the migration lost {n_before - n_after} particles ({n_before} -> {n_after} "
