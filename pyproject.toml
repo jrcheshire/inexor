@@ -126,6 +126,8 @@ line-length = 100
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# the repo root on sys.path, so bare `pytest` (the pixi tasks) resolves `from tests.x import`
+pythonpath = ["."]
 markers = [
   "slow: heavy validation / oracle-parity test; run by the full suite, not the fast gate",
   "detflag: asserts BIT equality of a float quantity; needs XLA deterministic ops on GPU (the f32 scatter-add is nondeterministic -- M2 S4). Run by `test-det` in its own process; `test` skips it on GPU. See tests/conftest.py",
