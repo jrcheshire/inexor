@@ -1861,7 +1861,7 @@ def checkpoint_fingerprint(cfg, coeffs):
 
 
 def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=None,
-                      device_shapes=None):
+                      device_shapes=None, timings=None):
     """One generation of a rolling pair. Returns the directory, which is the
     receipt: a run that believed it was checkpointing and was not has `None`
     on every step.
@@ -1884,7 +1884,7 @@ def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=No
     )
     prov.update(epoch_record(epoch, step))
     d = os.path.join(cfg.checkpoint_dir, f"gen{gen}")
-    icgen.write_t9_slabs(st, d, provenance=prov)
+    icgen.write_t9_slabs(st, d, provenance=prov, timings=timings)
     return d
 
 
@@ -2019,7 +2019,9 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
 
     `timed_steps` names ABSOLUTE step indices whose device passes are timed with
     syncs (see `step`'s `timings`); on those steps the repack, if it runs
-    separately, is timed too, into `stats["timings"]["repack"]`.
+    separately, is timed too, into `stats["timings"]["repack"]`, and a
+    checkpoint landing on one reports its own parts into
+    `stats["timings"]["checkpoint"]`.
     """
     cfg.validate()
     timed_steps = {int(k) for k in timed_steps}
@@ -2160,6 +2162,11 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                 stats["checkpoint"] = _write_checkpoint(
                     st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2, epoch=epoch,
                     device_shapes=device_shapes,
+                    # the parts, on a timed step: a real checkpoint at full size
+                    # is a better measurement of them than the driver's few-slab
+                    # probe extrapolated by 32x, which read 3076 s against a
+                    # measured 3757 (job 1002247)
+                    timings=None if timings is None else timings.setdefault("checkpoint", {}),
                 )
                 n_ckpt += 1
                 ph("checkpoint")
