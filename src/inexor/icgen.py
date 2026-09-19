@@ -36,6 +36,7 @@ import json
 import os
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -932,6 +933,18 @@ def load_slot_state(
     return st
 
 
+def _save_slab(path, meta, occ, off, w, scale_d):
+    """Write one T9 slab, returning its own elapsed seconds. Runs on
+    `write_t9_slabs`'s writer thread, so it must touch nothing the next slab
+    will overwrite: every array here is freshly allocated for this slab and
+    never revisited. The elapsed time comes back because once the write
+    overlaps the next gather the caller's blocked time is no longer the write's
+    duration, and a bytes-per-second read off the blocked time is nonsense."""
+    t0 = time.perf_counter()
+    np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w, scale=scale_d)
+    return time.perf_counter() - t0
+
+
 def write_t9_slabs(st, workdir, provenance=None, drop_ids=False, timings=None,
                    max_slabs=None):
     """Write a `SlotState` as T9 slabs: the exact inverse of `load_slot_state`.
@@ -971,7 +984,11 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False, timings=None,
     dropping them silently; pass `drop_ids=True` to say the loss is intended.
 
     `timings`, if a dict, accumulates seconds per part over the slabs written
-    (`index`, `gather`, `crc32`, `write`) plus `slabs`. `max_slabs` writes only
+    (`index`, `gather`, `crc32`, `write`) plus `slabs`, and `arena index` for
+    the one-time grouping before the loop. `write` is the time the main thread
+    spends BLOCKED on the writer thread, so the parts still sum to the wall;
+    `write thread` is the writer's own busy time, which is what a throughput
+    figure has to be taken against. `max_slabs` writes only
     the first that many slabs and returns None: a timing probe, with no manifest
     and no conservation check, so the directory can never load as a checkpoint.
     """
@@ -1000,69 +1017,125 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False, timings=None,
         if timings is not None:
             timings[key] = timings.get(key, 0.0) + clock() - t0
 
-    for d in range(nb if max_slabs is None else min(nb, int(max_slabs))):
-        t0 = clock()
-        lo_brick = d * nbb
-        lo_bucket = lo_brick * p3
-        hi_bucket = lo_bucket + nbb * p3
-        occ_g = st.occupancy[lo_bucket:hi_bucket].astype(np.int64)
+    # Every occupied arena row ONCE, in (bucket, arena row) order, so each slab
+    # takes its residents as a slice. Selecting them inside the slab loop is an
+    # O(n_arena) scan per slab, and the arena is PROVISIONED at 1% of the
+    # particles whatever it holds: 5.5 GB at C-hero, walked twice per slab for
+    # the ~1 resident that lands in it (327 rows in the whole state at step 8).
+    # `SlotState.arena_slots_of_brick` exists to avoid exactly this shape.
+    t0 = clock()
+    if st.n_arena:
+        a_live = np.nonzero(st.arena_bucket >= 0)[0]
+        a_order = np.argsort(st.arena_bucket[a_live], kind="stable")
+        a_bucket_all = st.arena_bucket[a_live][a_order]
+        a_slot_all = st.arena_base + a_live[a_order]
+    else:
+        a_bucket_all = np.empty(0, dtype=np.int64)
+        a_slot_all = np.empty(0, dtype=np.int64)
+    _add("arena index", t0)
 
-        # Every live row of the slab, in (brick, bucket) order. Buckets are
-        # brick-major, so one ascending pass over the slab's occupancy IS brick
-        # order -- no per-brick loop, which at C-gh would be 16,384 iterations
-        # per slab and 2.1e6 per checkpoint.
-        counts = occ_g.reshape(nbb, p3).sum(axis=1)
-        starts = st.brick_start[lo_brick : lo_brick + nbb].astype(np.int64)
-        base = np.concatenate([[0], np.cumsum(counts)[:-1]])
-        slots = np.repeat(starts - base, counts) + np.arange(int(counts.sum()), dtype=np.int64)
-        keys = lo_bucket + np.repeat(np.arange(nbb * p3, dtype=np.int64), occ_g)
+    # One writer thread, depth one: slab k's file write overlaps slab k+1's
+    # gather, and `submit` blocks on the previous write so at most two slabs'
+    # buffers are live at once. The write was 30% of a slab and strictly
+    # serial with host work that does not touch the disk.
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="t9-writer")
+    pending = None
 
-        # Fold this slab's arena residents back into their own buckets. They are
-        # few (0.57% at the operating point, D-v2-19 cl.4) so a searchsorted
-        # merge beats re-sorting the slab; `side="right"` puts them after the
-        # live rows of the same bucket, which is arbitrary but DETERMINISTIC,
-        # and determinism is the whole of what the fixed-point gate needs.
-        if st.n_arena:
-            sel = np.nonzero((st.arena_bucket >= lo_bucket) & (st.arena_bucket < hi_bucket))[0]
-            if len(sel):
-                a_keys = st.arena_bucket[sel]
-                order = np.argsort(a_keys, kind="stable")
-                a_keys = a_keys[order]
-                a_slots = st.arena_base + sel[order]
-                pos = np.searchsorted(keys, a_keys, side="right")
-                keys = np.insert(keys, pos, a_keys)
-                slots = np.insert(slots, pos, a_slots)
+    def _join():
+        nonlocal pending
+        if pending is not None:
+            f, pending = pending, None
+            dt = f.result()            # the only place a write error surfaces
+            if timings is not None:
+                timings["write thread"] = timings.get("write thread", 0.0) + dt
 
-        occ = np.bincount(keys - lo_bucket, minlength=nbb * p3).astype(np.int64)
-        _add("index", t0)
+    try:
+        for d in range(nb if max_slabs is None else min(nb, int(max_slabs))):
+            t0 = clock()
+            lo_brick = d * nbb
+            lo_bucket = lo_brick * p3
+            hi_bucket = lo_bucket + nbb * p3
+
+            # The slab's occupancy IS the array that gets written, widened once
+            # because the schema stores it int64 -- not a widened copy taken in
+            # order to count with, which is the fault `state.occupancy_total`
+            # fixed in the migrate.
+            occ = st.occupancy[lo_bucket:hi_bucket].astype(np.int64)
+            counts = occ.reshape(nbb, p3).sum(axis=1)
+            starts = st.brick_start[lo_brick : lo_brick + nbb].astype(np.int64)
+            base = np.concatenate([[0], np.cumsum(counts)[:-1]])
+            n_live = int(counts.sum())
+
+            # This slab's residents are a contiguous run of the sorted index.
+            alo, ahi = np.searchsorted(a_bucket_all, [lo_bucket, hi_bucket])
+            a_keys, a_slots = a_bucket_all[alo:ahi], a_slot_all[alo:ahi]
+            if len(a_keys):
+                # Where each resident merges among the live rows: the number of
+                # live rows in buckets up to and including its own, which is the
+                # inclusive cumsum of the occupancy at its key. The old form
+                # searched a key array holding one entry PER ROW, and paid an
+                # O(rows) `repeat` to build it and two O(rows) `insert`s to
+                # merge into it, for an answer that is 33.6M-wide at most.
+                a_pos = np.cumsum(occ)[a_keys - lo_bucket]
+                u, c = np.unique(a_keys - lo_bucket, return_counts=True)
+                occ[u] += c
+            else:
+                a_pos = np.empty(0, dtype=np.int64)
+            n_rows = n_live + len(a_slots)
+            _add("index", t0)
+
+            t0 = clock()
+            # Each brick's live rows are a CONTIGUOUS run from `brick_start`, in
+            # ascending bucket order, so the slab's payload is nbb slice copies
+            # rather than a fancy-index gather driven by an O(rows) slot array.
+            off = np.empty((n_live, st.off.shape[1]), dtype=st.off.dtype)
+            w = np.empty((n_live, st.w.shape[1]), dtype=st.w.dtype)
+            for b in range(nbb):
+                m = int(counts[b])
+                if m:
+                    s0, d0 = int(starts[b]), int(base[b])
+                    off[d0 : d0 + m] = st.off[s0 : s0 + m]
+                    w[d0 : d0 + m] = st.w[s0 : s0 + m]
+            if len(a_slots):
+                # Rare enough that the extra pass is paid only by the slabs that
+                # actually hold a resident; `insert` keeps the merge obvious.
+                off = np.insert(off, a_pos, st.off[a_slots], axis=0)
+                w = np.insert(w, a_pos, st.w[a_slots], axis=0)
+            scale_d = np.asarray(st.vel_scale[lo_brick : lo_brick + nbb], dtype=np.float64)
+            _add("gather", t0)
+
+            t0 = clock()
+            # crc32 over the buffers themselves. `.tobytes()` copied the whole
+            # payload -- 2.7 GB a slab at C-hero -- to hash it.
+            meta = dict(
+                schema=SCHEMA,
+                bx=d,
+                n_rows=int(n_rows),
+                bucket_lo=int(lo_bucket),
+                brick_lo=int(lo_brick),
+                crc32=dict(
+                    occupancy=zlib.crc32(occ),
+                    off=zlib.crc32(off),
+                    w=zlib.crc32(w),
+                    scale=zlib.crc32(scale_d),
+                ),
+            )
+            _add("crc32", t0)
+            t0 = clock()
+            path = os.path.join(workdir, f"t9_slab_{d:04d}.npz")
+            _join()                    # blocks only if the previous write is still going
+            pending = pool.submit(_save_slab, path, meta, occ, off, w, scale_d)
+            _add("write", t0)
+            if timings is not None:
+                timings["slabs"] = timings.get("slabs", 0) + 1
+            written.append(os.path.basename(path))
+            n_written += n_rows
+
         t0 = clock()
-        off = st.off[slots]
-        w = st.w[slots]
-        scale_d = np.asarray(st.vel_scale[lo_brick : lo_brick + nbb], dtype=np.float64)
-        _add("gather", t0)
-        t0 = clock()
-        meta = dict(
-            schema=SCHEMA,
-            bx=d,
-            n_rows=int(len(slots)),
-            bucket_lo=int(lo_bucket),
-            brick_lo=int(lo_brick),
-            crc32=dict(
-                occupancy=zlib.crc32(occ.tobytes()),
-                off=zlib.crc32(off.tobytes()),
-                w=zlib.crc32(w.tobytes()),
-                scale=zlib.crc32(scale_d.tobytes()),
-            ),
-        )
-        _add("crc32", t0)
-        t0 = clock()
-        path = os.path.join(workdir, f"t9_slab_{d:04d}.npz")
-        np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w, scale=scale_d)
+        _join()
         _add("write", t0)
-        if timings is not None:
-            timings["slabs"] = timings.get("slabs", 0) + 1
-        written.append(os.path.basename(path))
-        n_written += len(slots)
+    finally:
+        pool.shutdown(wait=True)
 
     if max_slabs is not None:
         return None

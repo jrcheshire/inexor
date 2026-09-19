@@ -481,13 +481,22 @@ def checkpoint_probe(st, out_dir, n_slabs, mon):
     wrote = io1.get("wchar", 0) - io0.get("wchar", 0) if io1 else None
     n = int(t.get("slabs", 0)) or 1
     nb = int(st.bricks_per_side)
+    # the arena grouping is ONE cost for the whole checkpoint. Folding it into a
+    # per-slab rate and multiplying by nb charges it 32x over at an 8-slab probe.
+    once = float(t.get("arena index", 0.0))
+    per_slab = (wall - once) / n
+    # bytes per second belongs against the WRITER's own seconds; `write` is the
+    # main thread's blocked time, which the overlap makes smaller than the write
+    write_s = float(t.get("write thread", t.get("write", 0.0)))
     out = dict(slabs=t.get("slabs", 0), of=nb, wall_s=wall, parts_s=t, wrote=wrote,
-               before=before, after=after, projected_full_s=wall / n * nb)
+               before=before, after=after, once_s=once, per_slab_s=per_slab,
+               projected_full_s=once + per_slab * nb)
     print(f"== checkpoint probe: {out['slabs']} of {nb} slabs in {wall:.1f} s "
-          f"({wall / n:.2f} s/slab -> {out['projected_full_s']:.0f} s for all), "
+          f"({per_slab:.2f} s/slab + {once:.1f} s once -> "
+          f"{out['projected_full_s']:.0f} s for all), "
           + ", ".join(f"{k} {v:.1f} s" for k, v in t.items() if k != "slabs")
           + ("" if wrote is None else f"; wrote {wrote / GB:.1f} GB "
-             f"({wrote / max(t.get('write', 0.0), 1e-9) / 1e6:.0f} MB/s over the write part)"),
+             f"({wrote / max(write_s, 1e-9) / 1e6:.0f} MB/s over the write itself)"),
           flush=True)
     print(f"[mem]   {_mem_text(after['mem'], after['faults'], after['vmstat'], after['numa'])}",
           flush=True)

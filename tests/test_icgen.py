@@ -10,6 +10,7 @@ displacement bound, each proven able to fire.
 import json
 import os
 import zlib
+from unittest import mock
 
 import jax
 import numpy as np
@@ -305,6 +306,74 @@ def test_write_t9_slabs_probe_writes_the_same_leading_slabs_and_no_manifest(tmp_
     with pytest.raises(FileNotFoundError, match="refusing to load"):
         icgen.load_slot_state(probe)
 
+
+class _CountingBuckets(np.ndarray):
+    """An `arena_bucket` that counts whole-array comparisons made against it."""
+
+    calls = 0
+
+    def __ge__(self, other):
+        type(self).calls += 1
+        return np.ndarray.__ge__(self, other)
+
+    def __lt__(self, other):
+        type(self).calls += 1
+        return np.ndarray.__lt__(self, other)
+
+
+def test_write_t9_slabs_groups_the_arena_once_not_once_per_slab(tmp_path):
+    """The arena is PROVISIONED at a fraction of the particles whatever it holds
+    (687M rows = 5.5 GB at C-hero, against 327 actually occupied at step 8), so
+    selecting a slab's residents with `lo <= arena_bucket < hi` inside the slab
+    loop walks that array twice per slab -- 256 times over a checkpoint, for an
+    answer that is one row. This is the defect `arena_slots_of_brick` was
+    written to avoid, and the writer had reintroduced it."""
+    st = _evolved_state()
+    assert st.n_arena and int(np.sum(st.arena_bucket >= 0)) > 0, "vacuous: empty arena"
+    st.arena_bucket = st.arena_bucket.view(_CountingBuckets)
+    _CountingBuckets.calls = 0
+    icgen.write_t9_slabs(st, str(tmp_path / "w"))
+    assert st.bricks_per_side >= 4, "vacuous: too few slabs to tell once from per-slab"
+    assert _CountingBuckets.calls <= 2, (
+        f"{_CountingBuckets.calls} whole-arena comparisons over "
+        f"{st.bricks_per_side} slabs: the grouping is back inside the loop"
+    )
+
+
+def test_write_t9_slabs_hashes_the_buffers_without_copying_them(tmp_path):
+    """`crc32(a.tobytes())` copied the whole payload to hash it -- 2.7 GB a slab
+    at C-hero. `zlib.crc32` takes the buffer itself; this pins that the recorded
+    checksums are unchanged by that, since a wrong one only shows up as a
+    refusal to load much later."""
+    st = _evolved_state()
+    d = str(tmp_path / "w")
+    icgen.write_t9_slabs(st, d)
+    for f in sorted(os.listdir(d)):
+        if not f.startswith("t9_slab_"):
+            continue
+        z = np.load(os.path.join(d, f))
+        meta = json.loads(str(z["meta"]))
+        for key, arr in (("occupancy", z["occupancy"]), ("off", z["off"]),
+                         ("w", z["w"]), ("scale", z["scale"])):
+            assert meta["crc32"][key] == zlib.crc32(arr.tobytes()), (f, key)
+
+
+def test_write_t9_slabs_surfaces_a_failure_from_the_writer_thread(tmp_path):
+    """The write runs on a background thread so it overlaps the next slab's
+    gather. A thread that dies silently would leave a short checkpoint with a
+    manifest standing over it, which loads clean."""
+    st = _evolved_state()
+    calls = []
+
+    def boom(path, *a, **k):
+        calls.append(path)
+        raise OSError("no space left on device")
+
+    with mock.patch.object(icgen, "_save_slab", boom):
+        with pytest.raises(OSError, match="no space left"):
+            icgen.write_t9_slabs(st, str(tmp_path / "w"))
+    assert calls, "the writer thread never ran"
+    assert not os.path.exists(str(tmp_path / "w" / icgen.MANIFEST))
 
 # ------------------------------------------------- staging cleanup (M-v2-6 S4)
 
