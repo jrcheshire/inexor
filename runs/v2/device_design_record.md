@@ -3093,3 +3093,204 @@ R3's 2.8x on four. Planned: ~90 s/step, which did not charge the census. The cen
    from a peak at production shape; the 1024^3 reading (4.02 GiB) is not one.
 2. The 4096^3 smoke (D7) now reads the fused step at full shape.
 3. `pytest -rs` on the next gb job, to name the skip.
+
+## 42. D7 at 4096^3 on four GB200s (Vista 1002247 -> 1009133) -- the 40-step hero realization runs end to end in 9:28:13 on one gb node, rc 0, 951.0 of 1026 GB host peak with zero reclaim; the step creeps 12.8% over the run and the arena is why
+
+`c23effb`..`1084062`, 2026-09-15 .. 2026-09-20, branch `jc/device-step-4096`. Seven gb jobs
+on Vista, four readable. Cards `runs/v2/d7{b,c}_<job>_{preflight,smoke,cgh64,hero}*.json` plus
+`_gpu.csv` / `_mem.csv` / `_vmstat.csv`; logs `d7{b,c,d}-hero-*-<job>.log`. Sbatch
+`scripts/v2_d7{b_hero_diag,c_hero_k8,d_hero_k40}_vista.sbatch`; driver
+`scripts/v2_d7_hero_smoke.py`. ICs `/scratch/10303/jrc4/inexor_runs/c-hero-r0` (sec. 38).
+
+The state is 687,329,530,283 bytes in 256 `t9-slabs-2` slabs; `n_arena` is 687,194,768 rows
+(1% of the particles, D-v2-19); the node is 1026 GB of host across two Grace sockets plus
+four GB200s whose HBM the kernel also sees as allocatable NUMA nodes.
+
+### The job ladder
+
+| job | K | node | outcome | what it settled |
+|---|---|---|---|---|
+| 1002247 | 3 | c672-016 | rc 0, 3 steps | the solve climbs with no recompiles; checkpoint 3757 s |
+| 1003378 | -- | -- | FAILED 1.9 min | my own path guard compared strings |
+| 1003511 | -- | -- | FAILED 35.8 min | device OOM: the kernel put 197 GB on two cards' HBM |
+| 1003657 | 4 | c672-011 | rc 0, 1:32:44 | bound host; migrate halves to 218-244 s |
+| 1004113 | 8 | c672-016 | FAILED 2:15:38 | killed in step 7's migrate at ~950 GB |
+| 1006175 | 8 | c672-015 | rc 0, 2:12:48 | first clean multi-step run; steady step 608 s |
+| **1009133** | **40** | **c672-008** | **rc 0, 9:28:13** | **the realization** |
+
+### The two failures worth keeping
+
+**1003511 is the one that generalizes.** The IC load left both Grace sockets ~11 GB free
+under ~690 GB of page cache, so the kernel placed 197 GB of the process on two cards' HBM
+NUMA nodes, and the first 2 GiB device allocation of step 1 failed on a card whose JAX
+allocator already held 24 GB. **The symptom arrives 30+ minutes after the cause and reads
+like a GPU bug.** Fixed by `numactl --membind=0,1` in the sbatch plus `--membind-nodes`,
+which refuses BEFORE the load unless the policy applied and refuses again AFTER it if state
+landed on a CPU-less node (`553cf74`). The policy of a `numactl --membind` is in
+`/proc/self/numa_maps` as `bind:0-1` per mapping, NOT in `Mems_allowed_list`.
+
+**1004113 was a widened count, not a leak.** `_device_pass` and the fused pass each did
+`int(st.occupancy.astype(np.int64).sum())` on the 34.4 GB uint32 bucket index -- a 68.7 GB
+full copy apiece at 4096^3, on top of `new_occ` filling in. 848 + 34.4 + 68.7 = 951, which is
+the measured peak of 1002247, 1003657 and 1004113 alike. `state.occupancy_total` accumulates
+with `sum(dtype=int64)` instead (`ae51d67`); the migrate peak fell to 906-912 GB in 1006175.
+The gate's control is the widened form monkeypatched back, on an index-heavy 64^3 fixture --
+at stock fixtures the index is ~1/20 of the pass's host peak and the copy is invisible
+(22.6x vs 22.3x).
+
+### The fold is worth ~25 s/step, not the ~85 the design hoped
+
+`ooc_fft.ArrayKernel` + `EngineConfig.coarse_fold_kernel` (`789a75b`) folds the coarse kernel
+multiply into the inverse transform's axis-0 pass, removing a host traversal of the whole
+half-grid per component and reusing one 34.4 GB work buffer for all three. Attributed across
+jobs: 1003657 (pre-fold) spent `multiply` 84.8 + `inverse: pass2` 19.6 = ~104 s, and the
+merged `kernel + axis-0 pass` reads 72.6-91.3 s. **The work moved rather than vanished**, and
+that merged pass is now the solve's largest single term and the source of nearly all its
+jitter. Gated bitwise rather than at a picked tolerance, at f32 and f64, on host meshes and
+card shards, 1 and 4 cards, and through `engine.run`; `coarse_fold_kernel=False` is the oracle
+arm, not an operating point.
+
+### 1009133: the realization
+
+All ten legs rc 0 -- preflight, GPU pytest (**24 passed in 224.3 s**, including the four
+checkpoint-writer gates), smoke ICs + run, cgh64 ICs + run, hero run, three summarize legs.
+K=40, `--checkpoint-every 10`, no IC cache drop, 11 h wall requested against gb's 12 h MaxWall,
+~9.5 SU at 1 SU/node-hr. The deliverable is `hero-ckpt/gen1`: 256 slabs + manifest,
+687,329,530,283 bytes, provenance `step: 40, n_steps: 40`. `gen0` holds step 30.
+
+**The time budget.** Phase seconds sum to 32,993.1 s (9.16 h) inside a 9.47 h job.
+
+| | s | share |
+|---|---|---|
+| load | 1,841.9 | |
+| kernel build | 63.1 | |
+| lead drift (`h[0]`, the schedule's opening half-drift) | 386.1 | |
+| 40 steps, checkpoints excluded | 26,901.7 | 81.5% |
+| 4 checkpoints | 3,800.3 | 11.5% |
+
+Mean step 672.5 s. The `[mem]` boundary line and `numa_maps` walk cost 11-13 s per step and
+are included above; they are what made every one of these jobs readable and stay on.
+
+#### The step creeps 12.8%, and the arena is why
+
+Early steady (steps 4-9) **590.8 s**; late steady (steps 32-39) **666.5 s**. The
++0.8 s/step "settling" read from the first 13 steps of this run was taken before the growth
+started.
+
+`arena_used` (== `n_arena_overflow` == the migrate's `spill_rows`; the arena is released and
+rebuilt every pass, so stock and flow coincide) is zero through step 6, then roughly doubles
+per step to a peak of **222,539,320 rows at step 37 -- 32.4% of the 687.2M provision** -- with
+`repack.bricks_merged` tracking it 0 -> 430,709 of 16,777,216 bricks. That is D-v2-19's spare
+pool absorbing late-time clustering, working as designed, and it is the first time its cost
+has been visible:
+
+| phase, s | step 1 | step 39 | |
+|---|---|---|---|
+| migrate | 205.7 | 245.4 | +19.3% |
+| tile_loop (steady) | ~151 | ~177 | +17.2% |
+| coarse_paint | 69.4 | 75.1 | +8.2% |
+| coarse_solve | 102.0 | 109.3 | +7.2% |
+| membership | 57.9 | 55.8 | flat |
+
+`slots_per_particle` held at 1.1001 throughout, so the slot budget never moved; what moved is
+how much of each brick's membership had to live outside its run.
+
+#### The step-40 arena cliff is the integrator's trailing half-drift, not particle loss
+
+`arena_used` falls 215,962,250 -> 25,139,893 in one step, off a trend that had been smooth for
+thirty, and it does so on the densest state of the run (`coarse_peak_int` 52.5M -> 70.5M).
+**This looks exactly like particles being dropped and is not.** `engine.fused_drifts` builds
+the drift-synchronized schedule as a leading half-drift `h[0]`, then `h[k] + h[k+1]` per step,
+with `h[K-1]` ALONE on the last so the trajectory lands on the same endpoint the boundary form
+does. From this run's own schedule (`a_grid(0.1, 1.0, 40, 'log')`, `Cosmology()`):
+
+    step 39 drift  h[38] + h[39] = 3.108868e-02
+    step 40 drift  h[39]         = 1.530235e-02      ratio 0.492216
+
+Half the displacement, so far fewer particles cross into already-full destination bricks.
+Three corroborations in the same card: `bricks_merged` 419,241 -> 79,682; `cross_card_bytes`
+3,355,443,200 -> 1,677,721,600, **exactly 2.000x**; and the migrate phase 245.4 -> 218.0 s
+against a monotone rise over the preceding thirty steps. `n_migrated_checked` is the full
+68,719,476,736 at every step of the run, and `state.py` raises on any unconsumed emigrant
+(D-007 forbids dropping). `coarse_peak_int` rising while spills fall is not a contradiction:
+the paint is taken before the drift.
+
+**Read the schedule before reading a last-step discontinuity as a defect.** Every
+end-of-run quantity that scales with displacement is halved at 4096^3 the same way.
+
+#### Memory: 951.0 of 1026 GB, and zero reclaim in 9.5 hours
+
+`run_host_peak` 951,015,047,168 bytes = **0.927x the node**, in the coarse solve, which has
+been the binding host phase since the index-count fix. The peak itself creeps with the arena,
+933 GB over steps 4-19 to 951 GB by step 40.
+
+**Zero `allocstall`, zero `pgscan_direct`, zero `compact_stall` across all 327 boundaries of
+the whole job.** Free memory across both sockets sits at 85-99 GB through ordinary steps and
+falls to **24.8-28.5 GB at each checkpoint and the step after it** -- the tightest the run ever
+gets, and the number any future change to the writer has to respect. `numa_miss` totals 159.1M
+pages over 70 boundaries, concentrated at the load (37.8M pages); with `membind=0,1` that is
+cross-socket fallback, not failure.
+
+#### The checkpoint writer in production: 99% writer duty, 706-807 MB/s, NFS-bound
+
+`a2ca5fc` (stage 1, byte-identical to its predecessor) measured at full size for the first
+time, with `1084062` putting the parts on the timed step's receipt. Four full writes:
+
+| step | arena index | index | gather | crc32 | blocked on writer | writer busy | duty | MB/s |
+|---|---|---|---|---|---|---|---|---|
+| 10 | 0.3 | 9.6 | 165.0 | 159.9 | 607.2 | 933.6 | 99.1% | 736 |
+| 20 | 0.3 | 9.8 | 160.5 | 159.8 | 652.0 | 974.3 | 99.2% | 706 |
+| 30 | 0.3 | 14.9 | 188.9 | 161.6 | 619.0 | 974.2 | 98.9% | 706 |
+| 40 | 0.3 | 7.2 | 133.7 | 160.9 | 556.6 | 852.2 | 99.3% | 807 |
+
+**`write` is the main thread's BLOCKED time, not the write's duration** -- the parts sum to the
+phase by construction (the ~8 s residual against the phase timer is the manifest write plus
+instrument). The throughput figure has to be taken against `write thread`, and read that way
+the depth-one writer is busy 99% of every checkpoint: 296-355 s of the main thread's 302-366 s
+of host work is hidden. **Against 3757 s for the same write in 1002247, that is 3.95x.**
+
+Two consequences. Threading the gather (stage 2 as originally scoped) is **retired by
+measurement** -- there is no exposed host work left to hide. And the phase is now exactly what
+JC suspected: NFS write bandwidth at 706-807 MB/s with one writer, so **concurrent writes are
+the only remaining lever**, worth at most the 1.06 h the four checkpoints cost (11.5% of the
+job).
+
+#### Shapes held, which is what `capacity_shape` was built for
+
+`cap` took **two** values over forty steps -- 26,632,171 then 33,554,432, one rung promotion --
+against the ten distinct values in ten steps at cdev8 that motivated the ladder (`forces.py`
+sec. on `capacity_shape`). `coarse_pad` was constant at 84,551,871 for the whole run;
+`peak_staged_slabs` 2 and `brick_reach_raw` 1 at every step. `cap_true` rose 24.80M ->
+31.37M; that is a recompile threshold on a geometric ladder with a sticky floor, **not a
+ceiling being approached**.
+
+#### The staging excess recurs, and the load is not its cause
+
+`tile_loop` reads 370-562 s against a 150-180 s steady at steps 2, 3, 18, 21, 22, 23, 24 and
+31 -- **~2,000 s, 6% of the run**. It does not align with checkpoints (step 11 is clean, step
+21 is not) and it is not a load artifact, which is what the two-step version in every earlier
+job looked like. **The IC page-cache drop is dead** (JC, 2026-09-19): it cost the load ~270 s,
+and removing it here spread the same ~400 s of excess across steps 2 AND 3 (820.6 + 781.6)
+instead of concentrating it in step 2 -- the total excess is invariant, which is the cleanest
+evidence yet that page cache was never the mechanism. `FilePages` stayed at 2-5 GB all of
+1006175, which excludes reclaim as well.
+
+### Owed
+
+1. **Export + P(k) card on `gen1`.** This run produces a checkpoint, not a product.
+   `v2_m6_realization.py`'s `export` and `card` phases both call `_require_cpu()`, so the whole
+   687 GB state sits on the host and the cards idle: it needs a gb node, and the export writes
+   ~1.65 TB of f32 positions + velocities. Neither has ever run at 4096^3; unpriced.
+2. **Concurrent writes**, 2-4 slabs in flight, against the 706-807 MB/s single-writer figure
+   above. JC's call 2026-09-19 was to wait and see.
+3. **The staging excess** (item above) -- eight instances now, mechanism still unknown.
+4. **`plan.py`'s host table is a flat sum and cannot see per-phase transients**, and its interim
+   fused coefficient (257 B/slab row) still wants replacing from the measured per-card peaks
+   this run provides.
+5. **Resume has never been exercised at 4096^3** -- the step-30 generation is the resume point
+   and that path is cdev-tested only.
+6. The 4.6 GB tile executable recompiles every run (135 compiles in 1006175's hero leg).
+7. Carried from earlier sections: `scripts/v2_d3_insert_legacy.py` still vendored (delete? JC
+   not asked); IC parity bars (sec. 36, JC); cross-backend tile tolerance (JC); split IC
+   `velocities` into compute vs staging write; tile->migrate fusion parked (sec. 41); the
+   milestone/ADR number for this build is JC's call and is not to be raised as a debt.
