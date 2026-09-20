@@ -15,8 +15,11 @@
 # script does today, not a choice this job makes.
 #
 # TIME: measured terms x loop counts.
-#   legs (preflight, GPU pytest, cgh64 ICs/run) .................  320 s  measured, 1009133
-#   cgh64 export + card, same NFS ..............................   60 s  carry
+#   fingerprint guard + GPU pytest .............................   33 s  measured, 1010730
+#   cgh64 ICs ..................................................   23 s  measured, 1010730
+#   cgh64 run to step 24 (step 0 10.6, step 1 14.2 compiling,
+#     then ~4.1 s/step and 2.2 s per checkpoint) ...............  140 s  measured, 1010730
+#   cgh64 card + export, same NFS ..............................  120 s  card measured, export carry
 #   hero CARD leg:
 #     load the 687 GB state ..................................... 1842 s  measured, 1009133
 #     decode 16,777,216 bricks @ 133-149 us/brick ............... 2366 s  MEASURED (laptop)
@@ -33,8 +36,8 @@
 #     - the FFT/binning carry comes from the 417 s/step host coarse solve.
 #   Worst plausible 3.8 h. REQUESTED 5:00 against gb's 12 h MaxWall. ~5 SU.
 #   Measured early, not padded: the cgh64 legs below run BOTH products end to
-#   end onto the same NFS at ~second 380, so a broken product path shows up in
-#   six minutes rather than two hours.
+#   end onto the same NFS by ~second 320, so a broken product path shows up in
+#   five minutes rather than two hours.
 #
 # THE LAYOUT PARAMETERS ARE NOT THE SCRIPT'S DEFAULTS AND MUST NOT BE.
 # `load_checkpoint` re-derives the allocation geometry from the occupancy plus
@@ -173,12 +176,24 @@ run_leg pytest-gpu \
 # would exercise the host engine rather than the device lane 1009133 ran. The D7
 # driver is the proven leg; it defaults to the same slack 0.10 / arena-frac 0.01
 # and is pointed at the `ckpt` directory the product subcommands look for.
+#
+# STEP 24, NOT 3, AND THE EPOCH IS THE REASON. The card leg reads the epoch it
+# stops at, and the bins it can compare against linear theory are the ones below
+# the nonlinear scale. At step 3 (a = 0.1189) the linear Delta^2 peaks at 0.26,
+# so there IS no nonlinear scale and the card takes a branch the hero leg never
+# will -- which is how 1010730 shipped a `float(None)` into the guard leg while
+# leaving the hero's own path unexercised. Nothing in this schedule is nonlinear
+# before step 15; by step 24 (a = 0.3981) the scale is 1.34 h/Mpc and falls
+# INSIDE the band, which stops at half Nyquist = 1.57 h/Mpc here, so the smoke
+# splits its bins either side of it exactly as the hero card at a = 1 will
+# (0.2520 h/Mpc against the same 1.57 ceiling). Costs ~100 s of cgh64 stepping.
+# --stop-at must stay a multiple of --checkpoint-every.
 run_leg cgh64-ics \
   $BIND pixi run -e gpu python scripts/v2_m6_realization.py ics --config cgh64 \
     --workdir "$WORK/cgh64" --generator device \
   && run_leg cgh64-run \
   $BIND pixi run -e gpu python $DRIVER run --preset cgh64 --workdir "$WORK/cgh64" \
-    --card $CARDS/${TAG}_cgh64.json --stop-at 3 --membind-nodes 0,1 --beat 60 \
+    --card $CARDS/${TAG}_cgh64.json --stop-at 24 --membind-nodes 0,1 --beat 60 \
     --checkpoint-dir "$WORK/cgh64-ckpt" --checkpoint-every 3
 [ $? -ne 0 ] && { echo "FATAL: the cgh64 control failed"; exit 1; }
 

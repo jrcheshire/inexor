@@ -32,6 +32,11 @@ from .cosmology import growth_factor_a, ic_k_table
 
 CARD = "inexor-pk-summary-1"
 
+# The k range `nonlinear_scale` scans, on the card beside its answer: a None
+# there means "no crossing in here", which a reader cannot act on without
+# knowing what "here" was.
+NL_SCAN_K = (1e-3, 10.0)
+
 
 def _mode_grid(n_mesh, box_size):
     """(kx_1d, kz_1d, hermitian weights along kz) for the rfft half-grid.
@@ -162,7 +167,7 @@ def tsc_window_slab(kx_slab, kx, kz, k_nyq):
     return wx.reshape(-1, 1, 1) * wy.reshape(1, -1, 1) * wz.reshape(1, 1, -1)
 
 
-def nonlinear_scale(p_of_k, k_lo=1e-3, k_hi=10.0, n=4096):
+def nonlinear_scale(p_of_k, k_lo=NL_SCAN_K[0], k_hi=NL_SCAN_K[1], n=4096):
     """The k where the linear dimensionless variance `k^3 P / (2 pi^2)` reaches 1.
 
     Reported, never gated on: it is where the evolved field is EXPECTED to leave
@@ -272,6 +277,7 @@ def pk_summary_card(
         growth_factor=float(growth_factor_a(a_out, cosmo)),
         k_nyquist=float(k_nyq),
         k_nonlinear=k_nl,
+        k_nonlinear_scan=[float(NL_SCAN_K[0]), float(NL_SCAN_K[1])],
         shot_noise=float(shot),
         deconvolved="tsc" if deconvolve_window else None,
         oracle="bin-averaged linear, D(a)^2 P_lin; NEVER a bin centre",

@@ -607,6 +607,24 @@ def cmd_export(args):
     return 0
 
 
+def _linear_band(k, k_nl, scan_hi):
+    """Which bins linear theory applies to, and how to print the nonlinear scale.
+
+    `summary.nonlinear_scale` returns None when the linear Delta^2 never reaches
+    1 anywhere it scanned -- the ordinary state of an early output, and what
+    `float(card["k_nonlinear"])` died on in gb 1010730's cgh64 card leg at
+    a = 0.1189. With no crossing, every bin under the scan ceiling is linear;
+    bins above it were never examined and are left out rather than assumed.
+    Returns (mask, text).
+    """
+    k = np.asarray(k, dtype=float)
+    if k_nl is not None:
+        return k < float(k_nl), f"{float(k_nl):.4f}"
+    if scan_hi is None:
+        return np.zeros(k.shape, dtype=bool), "unknown (the card carries no scan range)"
+    return k <= float(scan_hi), f"none below {float(scan_hi):g} h/Mpc"
+
+
 def cmd_card(args):
     _require_cpu()
     g = _geom(args.config)
@@ -625,10 +643,10 @@ def cmd_card(args):
     wall = time.perf_counter() - t0
     z = np.asarray(card["z_profile"], dtype=float)
     k = np.asarray(card["k_mean"], dtype=float)
-    k_nl = float(card["k_nonlinear"])
-    lin = k < k_nl
+    k_nl = card["k_nonlinear"]
+    lin, k_nl_txt = _linear_band(k, k_nl, card.get("k_nonlinear_scan", [None, None])[1])
     print(f"  wall {wall / 60:.1f} min | {card['n_bins']} bins over "
-          f"k = {k.min():.4f} to {k.max():.4f}, k_nonlinear = {k_nl:.4f}")
+          f"k = {k.min():.4f} to {k.max():.4f}, k_nonlinear = {k_nl_txt}")
     # THE WHOLE-RANGE MEDIAN IS NOT THE NUMBER TO READ, and printing it alone
     # invites the wrong conclusion. The oracle is LINEAR theory, so a bin above
     # k_nonlinear is being compared against a prediction that does not apply
@@ -639,6 +657,10 @@ def cmd_card(args):
     if lin.any():
         print(f"  BELOW k_nonlinear ({int(lin.sum())} bins): |z| median "
               f"{np.median(np.abs(z[lin])):.2f} max {np.max(np.abs(z[lin])):.2f}")
+    elif k_nl is None:
+        print("  The linear Delta^2 never reaches 1 over the range scanned, so "
+              "there is no nonlinear scale to place these bins against, and the "
+              "band runs past the range that was looked at.")
     else:
         print("  NO BIN LIES BELOW k_nonlinear at this geometry, so this card "
               "says nothing about accuracy against linear theory. Every bin is "
