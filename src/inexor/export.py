@@ -35,7 +35,9 @@ converted after the fact without re-deriving it.
 import dataclasses
 import json
 import os
+import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -92,7 +94,11 @@ class _StreamedNpy:
         b = np.ascontiguousarray(block, dtype=self.dtype)
         if b.shape[1:] != self.shape[1:]:
             raise ValueError(f"block shape {b.shape} does not match {self.shape} past axis 0")
-        raw = b.tobytes()
+        # A flat byte VIEW of the cast block, not a second copy of it. `tobytes()`
+        # duplicated every block on its way out -- 1.65 TB of copying over a
+        # C-hero export, for bytes that `write` and `crc32` both take as a buffer.
+        # Same defect, same fix as `crc32(a.tobytes())` in `icgen.write_t9_slabs`.
+        raw = b.reshape(-1).data.cast("B")
         self._fh.write(raw)
         self.crc = zlib.crc32(raw, self.crc)
         self.rows += b.shape[0]
@@ -123,6 +129,7 @@ def write_particles(
     cosmo=None,
     chunk_bricks=1024,
     provenance=None,
+    timings=None,
 ):
     """Write `st` as portable `(x, v)` float arrays under `workdir`.
 
@@ -145,6 +152,21 @@ def write_particles(
     `a` and `cosmo` together convert velocities to peculiar km/s; giving one
     without the other is refused rather than silently ignored, since the failure
     would be a file whose header claims units it does not carry.
+
+    **One writer thread, depth one**, so a chunk's write overlaps the NEXT
+    chunk's decode. The decode is the host term at scale and the write is the
+    disk term, and they were strictly serial: measured 133-149 us per brick at
+    C-hero's 4096 particles/brick, a 16.8M-brick decode is 40-55 min against a
+    ~2,200 s write of 1.65 TB, so overlapping them takes the leg from their sum
+    to their max. Same pattern, and same depth, as `icgen.write_t9_slabs`;
+    `submit` blocks on the previous write, so at most two chunks are live.
+
+    `timings`, if a dict, accumulates seconds per part: `decode` (the main
+    thread's own work), `write` (the time it spends BLOCKED on the writer, so
+    the parts still sum to the wall) and `write thread` (the writer's own busy
+    time, which is what a throughput figure has to be taken against), plus
+    `chunks`. Reading `write` as the write's duration understates the disk by
+    the whole overlap; that misreading cost a wrong NFS rate once already.
 
     Returns the header dict. It is written LAST and removed FIRST, so its
     presence marks a complete export -- the same contract as the T9 manifest,
@@ -177,18 +199,65 @@ def write_particles(
     if st.ids is not None:
         streams["ids"] = _StreamedNpy(os.path.join(workdir, "ids.npy"), (n,), np.int32)
 
-    bricks = range(st.n_bricks)
-    for lo in range(0, st.n_bricks, chunk_bricks):
-        group = list(bricks[lo : lo + chunk_bricks])
-        slots, x, v = st.decode_bricks(group)
-        if not len(slots):
-            continue
+    clock = time.perf_counter
+
+    def _add(key, t0):
+        if timings is not None:
+            timings[key] = timings.get(key, 0.0) + clock() - t0
+
+    def _write_chunk(x, v, ids_block):
+        """The writer thread's whole job: cast, checksum, write, in stream order.
+
+        Row order across chunks is the file's order, so this must run on ONE
+        worker and the caller must not submit chunk k+1 before chunk k is done.
+        """
+        t0 = clock()
         streams["x"].append(x)
         # The scale rides in the f64 decode, so a km/s file is the D-time file
         # times one number and carries no extra rounding beyond the output cast.
-        streams["v"].append(v * vfac if kms else v)
-        if "ids" in streams:
-            streams["ids"].append(st.ids[slots])
+        streams["v"].append(v)
+        if ids_block is not None:
+            streams["ids"].append(ids_block)
+        return clock() - t0
+
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="export-writer")
+    pending = None
+    n_chunks = 0
+
+    def _join():
+        nonlocal pending
+        if pending is None:
+            return
+        f, pending = pending, None
+        t0 = clock()
+        dt = f.result()             # the only place a write error surfaces
+        _add("write", t0)
+        if timings is not None:
+            timings["write thread"] = timings.get("write thread", 0.0) + dt
+
+    try:
+        bricks = range(st.n_bricks)
+        for lo in range(0, st.n_bricks, chunk_bricks):
+            t0 = clock()
+            group = list(bricks[lo : lo + chunk_bricks])
+            slots, x, v = st.decode_bricks(group)
+            if not len(slots):
+                continue
+            if kms:
+                v = v * vfac
+            ids_block = st.ids[slots] if "ids" in streams else None
+            _add("decode", t0)
+            # Wait for the previous chunk BEFORE queueing this one: depth one
+            # keeps two chunks live rather than the whole export.
+            _join()
+            pending = pool.submit(_write_chunk, x, v, ids_block)
+            n_chunks += 1
+        _join()
+    finally:
+        pool.shutdown(wait=True)
+
+    if timings is not None:
+        timings["chunks"] = n_chunks
 
     for s in streams.values():
         s.close()

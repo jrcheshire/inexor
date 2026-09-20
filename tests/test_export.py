@@ -10,6 +10,8 @@ import dataclasses
 import json
 import os
 
+import zlib
+
 import numpy as np
 import pytest
 
@@ -362,3 +364,126 @@ def test_dtime_export_records_no_cosmology(tmp_path):
     k = str(tmp_path / "kms")
     head = export.write_particles(st, k, a=0.5, cosmo=PLANCK)
     assert head["cosmology"] == dataclasses.asdict(PLANCK)
+
+
+# --- the streamed writer: the view-not-copy fix, and the writer thread ---
+
+
+def test_append_writes_the_bytes_the_tobytes_form_wrote(tmp_path):
+    """`append` takes a flat byte VIEW of the cast block instead of copying it.
+
+    The control is the copy it replaced: same file bytes, same running crc32.
+    Chunked in three so the crc is exercised across calls rather than once.
+    """
+    rng = np.random.default_rng(0)
+    block = rng.normal(size=(30, 3))
+    path = tmp_path / "x.npy"
+    s = export._StreamedNpy(str(path), (30, 3), np.float32)
+    for lo in (0, 10, 20):
+        s.append(block[lo : lo + 10])
+    s.close()
+
+    crc, raw = 0, b""
+    for lo in (0, 10, 20):
+        b = np.ascontiguousarray(block[lo : lo + 10], dtype=np.float32).tobytes()
+        raw += b
+        crc = zlib.crc32(b, crc)
+    assert s.crc == crc
+    assert path.read_bytes().endswith(raw)
+    assert np.array_equal(np.load(path), block.astype(np.float32))
+
+
+def test_the_write_runs_off_the_main_thread(tmp_path):
+    """Anti-vacuity: without this the overlap could be absent and every value
+    test above would still pass, because a serial writer is also correct."""
+    import threading
+
+    st = _evolved_state()
+    seen = []
+    real = export._StreamedNpy.append
+
+    def spy(self, block):
+        seen.append(threading.current_thread().name)
+        return real(self, block)
+
+    export._StreamedNpy.append = spy
+    try:
+        export.write_particles(st, str(tmp_path), chunk_bricks=8)
+    finally:
+        export._StreamedNpy.append = real
+    assert seen, "no block was ever appended"
+    assert all(n.startswith("export-writer") for n in seen), sorted(set(seen))
+
+
+def test_a_failure_on_the_writer_thread_surfaces(tmp_path):
+    """A write that raised on the worker must not leave a complete-looking
+    export: the header is the receipt and it is written last."""
+    st = _evolved_state()
+    real = export._StreamedNpy.append
+    calls = []
+
+    def boom(self, block):
+        calls.append(1)
+        if len(calls) > 2:
+            raise OSError("no space left on device")
+        return real(self, block)
+
+    export._StreamedNpy.append = boom
+    try:
+        with pytest.raises(OSError, match="no space left"):
+            export.write_particles(st, str(tmp_path), chunk_bricks=1)
+    finally:
+        export._StreamedNpy.append = real
+    assert not os.path.exists(os.path.join(str(tmp_path), export.HEADER))
+
+
+def test_timings_report_the_parts_and_the_chunk_count(tmp_path):
+    """The parts are what price the leg on a metered node, so they are pinned
+    here rather than trusted. `write` is BLOCKED time and `write thread` is busy
+    time; reading the first as the write's duration understates the disk."""
+    st = _evolved_state()
+    t = {}
+    export.write_particles(st, str(tmp_path), chunk_bricks=8, timings=t)
+    assert set(t) >= {"decode", "write", "write thread", "chunks"}
+    assert t["chunks"] == len(range(0, st.n_bricks, 8))
+    assert t["write thread"] > 0.0
+    assert t["decode"] > 0.0
+
+
+def test_append_does_not_copy_the_block_to_write_it(tmp_path):
+    """The view-not-copy fix has no effect on the BYTES, so the value tests
+    above cannot see it; what it changes is allocation, so that is what this
+    watches. The control is the `tobytes()` form it replaced, run on the same
+    block: the cast to f32 is the one copy the writer must take, and the old
+    form took a second one on top of it.
+    """
+    import tracemalloc
+
+    blk = np.zeros((200_000, 3), dtype=np.float64)   # 2.4 MB of f32 payload
+    payload = blk.shape[0] * 3 * 4
+
+    def _peak(fn):
+        tracemalloc.start()
+        try:
+            fn()
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def fixed():
+        s = export._StreamedNpy(str(tmp_path / "a.npy"), blk.shape, np.float32)
+        s.append(blk)
+        s.close()
+
+    def control():
+        s = export._StreamedNpy(str(tmp_path / "b.npy"), blk.shape, np.float32)
+        b = np.ascontiguousarray(blk, dtype=np.float32)
+        raw = b.tobytes()                      # the copy this fix removed
+        s._fh.write(raw)
+        s.crc = zlib.crc32(raw, s.crc)
+        s.rows += b.shape[0]
+        s.close()
+
+    assert _peak(fixed) < 1.5 * payload
+    assert _peak(control) > 1.9 * payload      # the control IS the defect
+    assert (tmp_path / "a.npy").read_bytes() == (tmp_path / "b.npy").read_bytes()
