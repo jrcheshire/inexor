@@ -87,6 +87,7 @@ CPU="env JAX_PLATFORMS=cpu"
 # 1009133's own layout parameters. See the block above; the defaults are wrong here.
 LAYOUT="--slack 0.10 --arena-frac 0.01"
 mkdir -p "$WORK" "$PROD"
+export PROD
 
 # `_ckpt_dir` is `<workdir>/ckpt` and 1009133 wrote `hero-ckpt`, so point one at
 # the other rather than moving 1.3 TB or touching the source job's directory.
@@ -132,6 +133,35 @@ run_leg () {
   return $rc
 }
 
+# THE FINGERPRINT GUARD, before anything expensive.
+# `load_checkpoint` refuses a fingerprint mismatch, and the fingerprint hashes
+# `coeffs.tobytes()` -- which come from `scipy.integrate.quad` (QUADPACK), so the
+# bytes ride on the platform's libm. It is a SAME-MACHINE contract: the same
+# snippet on the osx-arm64 laptop produces
+# d9adef05b2242df1740a7459fef6974448c7fe5718e4b5d7fd15c42bc52b35cf against this
+# checkpoint's c28f7507..., with all fifteen fingerprinted CONFIG fields identical.
+# The real check therefore has to run here. It costs one import, and it turns a
+# refusal three minutes in (after the cgh64 legs) into one at second 20 that says
+# what is wrong.
+run_leg fingerprint-guard \
+  $CPU pixi run -e gpu python -c '
+import sys, json, argparse
+sys.path.insert(0, "scripts")
+import jax; jax.config.update("jax_enable_x64", True)
+from v2_m6_realization import _cosmo, _coeffs, _engine_config, _geom
+from inexor.engine import checkpoint_fingerprint
+import os
+args = argparse.Namespace(slack=0.10, tile_workers=16, checkpoint_every=10,
+                          migrate_pooled=None, eject_kernel="jax")
+ec = _engine_config(_geom("c-hero"), args, os.environ["PROD"] + "/ckpt")
+co, _ = _coeffs(_cosmo())
+want = checkpoint_fingerprint(ec, co)
+have = json.load(open(os.environ["PROD"] + "/ckpt/gen1/manifest.json"))["provenance"]["fingerprint"]
+print("fingerprint want", want, "\nfingerprint have", have)
+sys.exit(0 if want == have else 1)
+' \
+  || { echo "FATAL: this node computes a different schedule than the one that wrote the checkpoint"; exit 1; }
+
 # The export writer is the newest code in this job (7762c89) and on the hero
 # state it first fires 40 minutes in. Its gates run at second 30.
 run_leg pytest-gpu \
@@ -149,20 +179,28 @@ run_leg cgh64-ics \
   && run_leg cgh64-run \
   $BIND pixi run -e gpu python $DRIVER run --preset cgh64 --workdir "$WORK/cgh64" \
     --card $CARDS/${TAG}_cgh64.json --stop-at 3 --membind-nodes 0,1 --beat 60 \
-    --checkpoint-dir "$WORK/cgh64/ckpt" --checkpoint-every 3
+    --checkpoint-dir "$WORK/cgh64-ckpt" --checkpoint-every 3
 [ $? -ne 0 ] && { echo "FATAL: the cgh64 control failed"; exit 1; }
+
+# The checkpoint dir is a SIBLING of the IC dir, not a child: the D7 driver
+# refuses to write a checkpoint under the ICs (`5322c25`, containment by path
+# component), which is what killed gb 1010700 at second 70. So the product
+# subcommands get their own workdir with `ckpt` pointed at it -- the same shape
+# as $PROD below, for the same reason.
+mkdir -p "$WORK/cgh64-prod"
+ln -sfn "$WORK/cgh64-ckpt" "$WORK/cgh64-prod/ckpt"
 
 run_leg cgh64-card \
   $CPU $BIND pixi run -e gpu python scripts/v2_m6_realization.py card --config cgh64 \
-    --workdir "$WORK/cgh64" $LAYOUT --allow-partial \
+    --workdir "$WORK/cgh64-prod" $LAYOUT --allow-partial \
   || { echo "FATAL: the card path is broken at cgh64; the hero leg would find it 2 h in"; exit 1; }
 
 run_leg cgh64-export \
   $CPU $BIND pixi run -e gpu python scripts/v2_m6_realization.py export --config cgh64 \
-    --workdir "$WORK/cgh64" $LAYOUT --allow-partial \
-    --export-dir "$WORK/cgh64/export" \
+    --workdir "$WORK/cgh64-prod" $LAYOUT --allow-partial \
+    --export-dir "$WORK/cgh64-prod/export" \
   || { echo "FATAL: the export path is broken at cgh64"; exit 1; }
-du -sh "$WORK/cgh64/export"
+du -sh "$WORK/cgh64-prod/export"
 
 # --- THE 4096^3 PRODUCTS. Card first: it is the cheaper leg and it is the one
 # that says whether the realization is right, so a failure in the 1.65 TB write
