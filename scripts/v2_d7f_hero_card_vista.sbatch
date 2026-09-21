@@ -106,7 +106,9 @@ TAG=d7f_$SLURM_JOB_ID
 MEM_CSV=$CARDS/${TAG}_mem.csv
 BIND="numactl --membind=0,1"
 # `_require_cpu` refuses unless jax's first device is CPU, and on this node it is
-# not. Scoped per leg rather than exported, so the pytest leg still sees the cards.
+# not. Scoped per leg rather than exported: the cgh64 ICs and the cgh64 run are
+# the DEVICE engine and must see the cards, and every card leg -- including the
+# gate that certifies them -- must not.
 CPU="env JAX_PLATFORMS=cpu"
 LAYOUT="--slack 0.10 --arena-frac 0.01"
 # W=16 is W2's operating point (W=32 bought 1.2% and broke its own neutrality
@@ -193,8 +195,21 @@ sys.exit(0 if want == have else 1)
 # The pooled paint and the heartbeat are the newest code in this job, and the
 # pooled card's bitwise gate is in here: it runs in 6 s at the smoke rung and
 # the thing it certifies is the whole basis for pooling the hero leg.
-run_leg pytest-gpu \
-  pixi run -e gpu python -m pytest -q -rs tests/test_summary.py tests/test_progress.py \
+#
+# THE GATE RUNS IN THE LANE IT GATES, which is what gb 1011375 got wrong.
+# `TilePool` VOIDS a non-CPU parent by design (`executor.py`, the antares 409
+# precedent; 995764 already found one test asking it to), and `cmd_card` calls
+# `_require_cpu`, so the card is the CPU lane by contract and every card leg
+# below wears $CPU. This leg did not -- it was written to "still see the cards"
+# -- so all six of test_card_pool.py's tests died at second 63 on the same
+# ValueError and the job never reached a card. The laptop gate is structurally
+# blind to it: with no second backend to pick, the wrong lane is unreachable
+# there. JAX_PLATFORMS is process-wide and read at backend init, so the lane is
+# chosen HERE and cannot be set per test. Nothing in these three files wants a
+# card -- no importorskip, no device assertion, no detflag marker -- so forcing
+# the lane changes what runs in exactly one way: it lets the pool exist.
+run_leg pytest-cpu-lane \
+  $CPU pixi run -e gpu python -m pytest -q -rs tests/test_summary.py tests/test_progress.py \
     tests/test_card_pool.py \
   || { echo "FATAL: the card gates failed"; exit 1; }
 

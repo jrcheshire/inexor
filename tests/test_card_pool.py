@@ -26,6 +26,33 @@ L_BOX, N_PART, N_FINE, N_COARSE, N_TILE, B_FINE = 32.0, 32, 64, 16, 16, 8
 FIELDS = ("off", "w", "occupancy", "brick_start", "vel_scale", "arena_bucket")
 
 
+def _require_cpu_lane():
+    """This file is the CPU lane, and it FAILS off it rather than skipping.
+
+    `TilePool` voids a non-CPU parent by design and `cmd_card` calls
+    `_require_cpu`, so every test here needs the same lane the card itself runs
+    in. It does not skip: the bitwise gate is the entire basis for pooling the
+    hero card, and a gate that goes inert on the node that runs the job is no
+    gate -- gb 1011375 put this file in a GPU-backend process and spent 63 s
+    emitting the same ValueError six times. The lane is a property of the
+    PROCESS (`JAX_PLATFORMS` is read at backend init, so it cannot be set per
+    test, same as `XLA_FLAGS` in conftest), which is why the remedy is the
+    invocation and this is only here to name it.
+    """
+    import jax
+
+    if jax.default_backend() != "cpu":
+        raise RuntimeError(
+            f"tests/test_card_pool.py is the CPU lane and this process is "
+            f"{jax.default_backend()!r}: TilePool voids a non-CPU parent and "
+            f"cmd_card calls _require_cpu. Run it as `env JAX_PLATFORMS=cpu "
+            f"pixi run -e gpu python -m pytest tests/test_card_pool.py`."
+        )
+
+
+_require_cpu_lane()
+
+
 @pytest.fixture(autouse=True)
 def _x64():
     import jax
