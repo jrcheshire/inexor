@@ -579,6 +579,7 @@ def cmd_export(args):
         chunk_bricks=args.chunk_bricks,
         provenance=dict(config=args.config, step=step, commit=_git_commit(),
                         workdir=args.workdir),
+        progress=_heartbeat(args),
     )
     wall = time.perf_counter() - t0
     peak = _maxrss_bytes()
@@ -605,6 +606,19 @@ def cmd_export(args):
     _card("export", args, dict(step=step, a_out=a_out, out_dir=out_dir,
                                wall_s=wall, peak_rss_bytes=peak, manifest=man))
     return 0
+
+
+def _heartbeat(args):
+    """The progress callback for the two hour-long product legs, or None.
+
+    Off by `--heartbeat 0`, which is how an A/B keeps the legs comparable; the
+    call itself is a clock read per chunk against a chunk costing ~0.1 s.
+    """
+    if not args.heartbeat:
+        return None
+    from inexor.progress import Heartbeat
+
+    return Heartbeat(every=float(args.heartbeat))
 
 
 def _linear_band(k, k_nl, scan_hi):
@@ -639,7 +653,8 @@ def cmd_card(args):
 
     t0 = time.perf_counter()
     card = summary.pk_summary_card(st, ec, cosmo, a_out, slab=args.slab,
-                                   min_weight=args.min_weight)
+                                   min_weight=args.min_weight,
+                                   progress=_heartbeat(args))
     wall = time.perf_counter() - t0
     z = np.asarray(card["z_profile"], dtype=float)
     k = np.asarray(card["k_mean"], dtype=float)
@@ -713,6 +728,10 @@ def main():
     ap.add_argument("--chunk-bricks", type=int, default=1024)
     ap.add_argument("--allow-partial", action="store_true")
     ap.add_argument("--min-weight", type=float, default=100.0)
+    ap.add_argument("--heartbeat", type=float, default=60.0,
+                    help="seconds between progress lines in the card and export "
+                         "loops; 0 turns them off. gb 1010938 ran 3 h 23 min "
+                         "inside the card with no way to read its progress")
     args = ap.parse_args()
     return {"ics": cmd_ics, "run": cmd_run, "export": cmd_export,
             "card": cmd_card}[args.phase](args)

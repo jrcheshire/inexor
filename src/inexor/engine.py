@@ -907,7 +907,8 @@ def _assert_stencil_contained(x, coarse_cell, origin, extent, n_coarse):
             )
 
 
-def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=None):
+def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=None,
+                          progress=None):
     """delta on the coarse mesh, accumulated brick by brick.
 
     Integer addition is associative, so a chunked accumulation is **bitwise**
@@ -928,6 +929,10 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
     associativity makes arrival order bitwise the serial order. `census=True`
     and the full-mesh A/B arm (`paint_subblock=False`) route serial regardless,
     so the gate instruments never read a pooled mesh.
+
+    `progress(stage, done, total)`, if given, is called once per chunk; see
+    `inexor.progress.Heartbeat`. At 4096^3 this loop is 16,384 chunks and
+    hours long, and it used to report nothing at all.
 
     `census=True` additionally counts cells whose integer sum is NOT exactly
     representable in f32 (`coarse_cells_inexact_f32`). It is OPT-IN because it
@@ -993,7 +998,11 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
                                chunk_bricks=cfg.chunk_bricks, nb_side=nb_side))
         tasks = [(gi, np.asarray(gg, dtype=np.int64))
                  for gi, (gg, m) in enumerate(zip(groups, rows)) if m]
+        n_done = 0
         for res in pool.imap_coarse(tasks):
+            n_done += 1
+            if progress is not None:
+                progress("coarse paint", n_done, len(tasks))
             if res["empty"]:
                 continue
             ax = [(np.arange(int(res["extent"][a]), dtype=np.int64)
@@ -1003,6 +1012,12 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
         pooled_workers = pool.workers
         groups = []  # the serial loop below must not run the chunks again
     for gi, (gg, m) in enumerate(zip(groups, rows)):
+        # `gi` chunks are COMPLETE at the top of iteration gi, and the count
+        # sits before the `continue` so an empty chunk still advances it. The
+        # closing call is after the loop, where the last chunk has actually run
+        # -- reporting done == total on entry to it would print DONE early.
+        if progress is not None:
+            progress("coarse paint", gi, len(groups))
         if m == 0:
             continue
         _, x, _ = st.decode_bricks(gg)
@@ -1037,6 +1052,8 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
               for a in range(3)]
         mesh[np.ix_(*ax)] += sub
         n_sub += 1
+    if progress is not None and groups:
+        progress("coarse paint", len(groups), len(groups))
     out, peak, inexact = _delta_from_accumulated(mesh, cfg, census=census)
     if stats is not None:
         # both, for the same reason `cap`/`cap_true` are both reported: one hides

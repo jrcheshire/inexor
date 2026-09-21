@@ -68,6 +68,7 @@ def binned_power(
     window=None,
     shot_noise=0.0,
     min_weight=100.0,
+    progress=None,
 ):
     """Slab-streamed, hermitian-weighted binned P(k) of an rfft spectrum.
 
@@ -87,6 +88,9 @@ def binned_power(
     `min_weight` drops bins too sparse for the Gaussian sigma to mean anything;
     100 modes puts the fractional error on sigma itself at ~7%.
 
+    `progress(stage, done, total)`, if given, is called once per slab; see
+    `inexor.progress.Heartbeat`.
+
     Returns a dict of parallel arrays: `k_mean` (weighted), `p`, `n_modes`,
     `p_oracle` when `p_of_k` was given, plus the per-bin `window_correction`
     and `shot_fraction` so neither correction is hidden inside `p`.
@@ -102,6 +106,8 @@ def binned_power(
     acc = {k: np.zeros(nb) for k in ("p", "raw", "oracle", "k", "w", "wcorr")}
     for lo in range(0, n, int(slab)):
         hi = min(lo + int(slab), n)
+        if progress is not None:
+            progress("bin power", lo, n)
         kk = np.sqrt(
             kx[lo:hi].reshape(-1, 1, 1) ** 2
             + kx.reshape(1, n, 1) ** 2
@@ -131,6 +137,8 @@ def binned_power(
         np.add.at(acc["wcorr"], i, (1.0 if w2 is None else w2.ravel()[sel]) * wk)
         if p_of_k is not None:
             np.add.at(acc["oracle"], i, p_of_k(flat[sel]) * wk)
+    if progress is not None:
+        progress("bin power", n, n)
 
     good = acc["w"] > float(min_weight)
     w = acc["w"][good]
@@ -199,6 +207,7 @@ def pk_summary_card(
     subtract_shot_noise=True,
     min_weight=100.0,
     provenance=None,
+    progress=None,
 ):
     """The card: measured P(k), the bin-averaged linear oracle, the z profile.
 
@@ -220,6 +229,12 @@ def pk_summary_card(
     falls under the floor. A card of zero bins passes every structural check a
     caller is likely to make while carrying no measurement at all.
 
+    `progress(stage, done, total)`, if given, goes to all three of the long
+    stages -- the streamed paint, the transform and the binning -- each under
+    its own name. At 4096^3 this call is hours long and used to print nothing
+    at all, so an overrun could not be told from a hang; see
+    `inexor.progress.Heartbeat`.
+
     Returns the card dict. Nothing here writes a file or decides a verdict.
     """
     from .engine import coarse_delta_streamed
@@ -227,13 +242,14 @@ def pk_summary_card(
     n = int(cfg.n_coarse)
     box = float(cfg.box_size)
     if delta is None:
-        delta = coarse_delta_streamed(st, cfg)
+        delta = coarse_delta_streamed(st, cfg, progress=progress)
     if delta.shape != (n, n, n):
         raise ValueError(f"delta has shape {delta.shape}, want {(n, n, n)} from cfg.n_coarse")
 
     from . import ooc_fft
 
-    spec = ooc_fft.forward_from_slabs(lambda lo, hi: delta[lo:hi], n, slab=int(slab))
+    spec = ooc_fft.forward_from_slabs(lambda lo, hi: delta[lo:hi], n, slab=int(slab),
+                                      progress=progress)
 
     tab = ic_k_table(cosmo, n, box)
     d2 = growth_factor_a(a_out, cosmo) ** 2
@@ -257,6 +273,7 @@ def pk_summary_card(
         window=_window if deconvolve_window else None,
         shot_noise=shot,
         min_weight=min_weight,
+        progress=progress,
     )
     del spec
     if not len(res["k_mean"]):

@@ -130,6 +130,7 @@ def write_particles(
     chunk_bricks=1024,
     provenance=None,
     timings=None,
+    progress=None,
 ):
     """Write `st` as portable `(x, v)` float arrays under `workdir`.
 
@@ -167,6 +168,10 @@ def write_particles(
     time, which is what a throughput figure has to be taken against), plus
     `chunks`. Reading `write` as the write's duration understates the disk by
     the whole overlap; that misreading cost a wrong NFS rate once already.
+
+    `progress(stage, done, total)`, if given, is called once per chunk; see
+    `inexor.progress.Heartbeat`. At 4096^3 this loop is 16,384 chunks and over
+    an hour long, and it used to report nothing until it returned.
 
     Returns the header dict. It is written LAST and removed FIRST, so its
     presence marks a complete export -- the same contract as the T9 manifest,
@@ -237,7 +242,12 @@ def write_particles(
 
     try:
         bricks = range(st.n_bricks)
-        for lo in range(0, st.n_bricks, chunk_bricks):
+        n_groups = (st.n_bricks + chunk_bricks - 1) // chunk_bricks
+        for gi, lo in enumerate(range(0, st.n_bricks, chunk_bricks)):
+            # `gi` chunks are complete here; the closing call is after the loop,
+            # where the last write has been joined and the count is true
+            if progress is not None:
+                progress("export chunk", gi, n_groups)
             t0 = clock()
             group = list(bricks[lo : lo + chunk_bricks])
             slots, x, v = st.decode_bricks(group)
@@ -253,6 +263,8 @@ def write_particles(
             pending = pool.submit(_write_chunk, x, v, ids_block)
             n_chunks += 1
         _join()
+        if progress is not None:
+            progress("export chunk", n_groups, n_groups)
     finally:
         pool.shutdown(wait=True)
 

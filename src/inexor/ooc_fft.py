@@ -81,16 +81,22 @@ def rfft2_slab(slab, workers=_DEF_WORKERS):
     return out
 
 
-def fft_axis0_inplace(spec, inverse=False, workers=_DEF_WORKERS):
+def fft_axis0_inplace(spec, inverse=False, workers=_DEF_WORKERS, progress=None):
     """Pass 2: (i)fft along axis 0, one y-pencil-plane at a time, in place.
 
     The unit is the contiguous copy of spec[:, y, :] -- a fixed (N, N//2+1)
     shape whatever the caller's streaming looked like, so pass 2 has no knob
     that could move a bit. O(N * M) working memory (~17 MB at 2048^3 c64).
+
+    `progress(stage, done, total)`, if given, is called once per plane; see
+    `inexor.progress.Heartbeat`.
     """
     fn = scipy.fft.ifft if inverse else scipy.fft.fft
-    for y in range(spec.shape[1]):
+    ny = spec.shape[1]
+    for y in range(ny):
         spec[:, y, :] = fn(np.ascontiguousarray(spec[:, y, :]), axis=0, workers=workers)
+        if progress is not None:
+            progress("fft axis0", y + 1, ny)
     return spec
 
 
@@ -99,7 +105,8 @@ def fft_axis0_inplace(spec, inverse=False, workers=_DEF_WORKERS):
 # ---------------------------------------------------------------------------
 
 
-def forward_from_slabs(slab_fn, n_mesh, slab=_DEF_SLAB, workers=_DEF_WORKERS):
+def forward_from_slabs(slab_fn, n_mesh, slab=_DEF_SLAB, workers=_DEF_WORKERS,
+                       progress=None):
     """Forward 3D rfft of a field the caller produces slab-wise.
 
     slab_fn(lo, hi) -> (hi-lo, N, N) real array of axis-0 planes [lo, hi).
@@ -107,6 +114,10 @@ def forward_from_slabs(slab_fn, n_mesh, slab=_DEF_SLAB, workers=_DEF_WORKERS):
     noise -> spectrum) is the design point. Returns the (N, N, N//2+1)
     spectral array, complex64/complex128 following the slabs' dtype. slab is
     a pure memory knob: the compute unit is one plane regardless.
+
+    `progress(stage, done, total)`, if given, reports the two passes
+    separately ("fft plane" then "fft axis0"): they cost differently per unit
+    and one rate over both describes neither.
     """
     n = int(n_mesh)
     slab = n if slab is None else int(slab)
@@ -128,7 +139,9 @@ def forward_from_slabs(slab_fn, n_mesh, slab=_DEF_SLAB, workers=_DEF_WORKERS):
         # rfftn_ooc). Same per-plane transforms, so no bit moves.
         for i in range(hi - lo):
             spec[lo + i] = scipy.fft.rfft2(s[i], workers=workers)
-    fft_axis0_inplace(spec, workers=workers)
+        if progress is not None:
+            progress("fft plane", hi, n)
+    fft_axis0_inplace(spec, workers=workers, progress=progress)
     return spec
 
 
