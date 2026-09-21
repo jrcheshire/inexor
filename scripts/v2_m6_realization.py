@@ -543,14 +543,14 @@ def cmd_run(args):
     return 0
 
 
-def _state_at_head(args, ec, co):
+def _state_at_head(args, ec, co, alloc=None):
     from inexor import engine
 
     have = _newest_checkpoint_step(args)
     if have is None:
         raise SystemExit("no checkpoint to read; run `run` first")
     st, resume = engine.load_checkpoint(_ckpt_dir(args), ec, co,
-                                        arena_frac=args.arena_frac)
+                                        arena_frac=args.arena_frac, alloc=alloc)
     return st, int(resume["step"])
 
 
@@ -643,18 +643,71 @@ def cmd_card(args):
     _require_cpu()
     g = _geom(args.config)
     from inexor import summary
+    from inexor.executor import SharedAllocator, TilePool, malloc_trim
 
     cosmo = _cosmo()
     co, a_steps = _coeffs(cosmo)
     ec = _engine_config(g, args, _ckpt_dir(args))
-    st, step = _state_at_head(args, ec, co)
+
+    # THE PAINT IS THE CARD'S LARGEST STAGE AND IT IS THE ONE THAT POOLS.
+    # `pk_summary_card` is one call: a streamed paint over `n_bricks /
+    # chunk_bricks` chunks, then a transform, then the binning. Only the first
+    # is embarrassingly parallel, and it is the only one of the three that the
+    # engine's own runs have ever parallelised -- the card was the consumer
+    # nobody pooled. Same machinery, same guarantee: workers return bounded
+    # sub-blocks and the parent accumulates, so integer associativity makes the
+    # pooled mesh BITWISE the serial one.
+    #
+    # The pool is `paint_only`: a full TilePool allocates three coarse force
+    # meshes (103.1 GB at c-hero) and builds a tile kernel per worker, and the
+    # card reads neither.
+    #
+    # THE STATE IS LOADED STRAIGHT INTO SHARED MEMORY so it exists once rather
+    # than twice -- without the allocator `TilePool` copies every field and the
+    # 754.6 GB state becomes 1509 GB against a 1026 GB node. Same fault that
+    # OOM-killed job 922723.
+    pooled = args.card_pool
+    if pooled is None:
+        pooled = ec.tile_workers > 1
+    allocator = SharedAllocator() if pooled else None
+
+    t_load = time.perf_counter()
+    st, step = _state_at_head(args, ec, co, alloc=allocator)
+    t_load = time.perf_counter() - t_load
+    # glibc keeps freed arenas and the pool's segments are fresh kernel pages
+    # that cannot be served from them, so the loader's transients and the
+    # pool's demand STACK without this.
+    trimmed = malloc_trim() if pooled else None
+
     a_out = float(a_steps[-1]) if step >= K_STEPS else float(a_steps[step])
     print(f"== P(k) CARD {args.config} at step {step}, a={a_out:.4f}")
+    print(f"  state {st.n_particles:,} particles, {st.n_bricks:,} bricks; "
+          f"load {t_load:.1f} s")
 
+    pool = None
     t0 = time.perf_counter()
-    card = summary.pk_summary_card(st, ec, cosmo, a_out, slab=args.slab,
-                                   min_weight=args.min_weight,
-                                   progress=_heartbeat(args))
+    try:
+        if pooled:
+            t_pool = time.perf_counter()
+            pool = TilePool(st, ec, allocator=allocator, paint_only=True)
+            t_pool = time.perf_counter() - t_pool
+            # A knob must prove it applied: W and the shm actually held, not
+            # the fact that `--card-pool` was passed. Spawn is reported apart
+            # from `wall` because it is FIXED -- 16 interpreters importing jax
+            # -- so it is a large share of a cgh64 card and a rounding error on
+            # a hero one, and a serial-vs-pooled ratio that leaves it inside is
+            # read at the wrong scale.
+            print(f"  paint pool: W={pool.workers}, spawn {t_pool:.1f} s, "
+                  f"state in shared memory {allocator.bytes_held() / 1e9:.1f} GB, "
+                  f"malloc_trim={trimmed}")
+        else:
+            print("  paint pool: none (serial)")
+        card = summary.pk_summary_card(st, ec, cosmo, a_out, slab=args.slab,
+                                       min_weight=args.min_weight,
+                                       progress=_heartbeat(args), pool=pool)
+    finally:
+        if pool is not None:
+            pool.close()
     wall = time.perf_counter() - t0
     z = np.asarray(card["z_profile"], dtype=float)
     k = np.asarray(card["k_mean"], dtype=float)
@@ -687,6 +740,9 @@ def cmd_card(args):
     print("  NO VERDICT is emitted: `band_verdict` takes a band the caller names, "
           "and the k range this run is trusted over is not this script's call.")
     _card("pk", args, dict(step=step, a_out=a_out, wall_s=wall,
+                           load_s=t_load,
+                           card_pool_workers=(0 if pool is None else pool.workers),
+                           pool_spawn_s=(None if pool is None else t_pool),
                            n_bins_below_k_nl=int(lin.sum()),
                            peak_rss_bytes=_maxrss_bytes(), summary=card))
     return 0
@@ -728,6 +784,12 @@ def main():
     ap.add_argument("--chunk-bricks", type=int, default=1024)
     ap.add_argument("--allow-partial", action="store_true")
     ap.add_argument("--min-weight", type=float, default=100.0)
+    ap.add_argument("--card-pool", action="store_true", default=None,
+                    help="card: run the streamed paint on a paint-only TilePool "
+                         "of --tile-workers workers (bitwise the serial mesh). "
+                         "Default: on whenever --tile-workers > 1")
+    ap.add_argument("--serial-card", dest="card_pool", action="store_false",
+                    help="card: force the serial paint (the A/B's other arm)")
     ap.add_argument("--heartbeat", type=float, default=60.0,
                     help="seconds between progress lines in the card and export "
                          "loops; 0 turns them off. gb 1010938 ran 3 h 23 min "

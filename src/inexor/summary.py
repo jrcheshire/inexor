@@ -208,6 +208,7 @@ def pk_summary_card(
     min_weight=100.0,
     provenance=None,
     progress=None,
+    pool=None,
 ):
     """The card: measured P(k), the bin-averaged linear oracle, the z profile.
 
@@ -229,6 +230,13 @@ def pk_summary_card(
     falls under the floor. A card of zero bins passes every structural check a
     caller is likely to make while carrying no measurement at all.
 
+    `pool`, if given, runs the streamed paint's chunks on a `TilePool`
+    (build it `paint_only=True`; the card computes no force). The accumulation
+    stays serial in `coarse_delta_streamed`, where integer associativity makes
+    arrival order BITWISE the serial order, so this is a wall knob that cannot
+    move a number. The transform and the binning are unaffected and stay
+    serial.
+
     `progress(stage, done, total)`, if given, goes to all three of the long
     stages -- the streamed paint, the transform and the binning -- each under
     its own name. At 4096^3 this call is hours long and used to print nothing
@@ -242,7 +250,7 @@ def pk_summary_card(
     n = int(cfg.n_coarse)
     box = float(cfg.box_size)
     if delta is None:
-        delta = coarse_delta_streamed(st, cfg, progress=progress)
+        delta = coarse_delta_streamed(st, cfg, pool=pool, progress=progress)
     if delta.shape != (n, n, n):
         raise ValueError(f"delta has shape {delta.shape}, want {(n, n, n)} from cfg.n_coarse")
 

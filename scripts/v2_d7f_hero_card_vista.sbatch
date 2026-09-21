@@ -3,7 +3,7 @@
 #SBATCH -p gb
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 12:00:00
+#SBATCH -t 08:00:00
 #SBATCH -A JPL-SPHEREx
 #SBATCH -o d7f-hero-card-%j.log
 # D7f: the P(k) card off gb 1009133's step-40 checkpoint, and NOTHING ELSE.
@@ -23,26 +23,41 @@
 #     the same log all along: the cgh64 card took 60 s ON THIS NODE, and c-hero
 #     is exactly 512x it in both particles and coarse cells.
 #
-# TIME: the cgh64 anchor, scaled, with the load measured.
+# TIME: the cgh64 anchor, scaled, with the paint pooled.
 #   legs (fingerprint, pytest, cgh64 ICs, cgh64 run to 24) ......  196 s  measured, 1010730/938
-#   cgh64 card ..................................................   60 s  measured, 1010938
+#   cgh64 card, BOTH arms (serial + pooled) .....................  120 s  serial measured, 1010938
 #   hero: load the 687 GB state ................................. 1663 s  measured, 1010938
-#   hero: the card itself, 512x the cgh64 anchor ................ 30720 s  8.5 h
-#   CENTRAL 9.0 h.
-#   The 512x is a FLOOR on two of the three stages and short on the third: the
-#   paint is per brick and bricks go 32,768 -> 16,777,216 (512x exactly), the
-#   binning is per mode (512x), but the transform carries an extra log N and
-#   scales ~700x, which puts the upper end at 11.7 h + load = 12.2 h.
-#   REQUESTED 12:00, which is gb's MaxWall and the most this partition allows.
-#   ~12 SU. So this run MAY NOT FINISH, and that is a stated bet rather than a
-#   padded estimate: what makes it worth taking is that a non-finish is now
-#   informative. 1010938 could not say which stage it was in or how far; every
-#   loop in the card now reports through `inexor.progress.Heartbeat` and this
-#   job prints the per-stage rate at cgh64 BEFORE the hero leg starts, so even a
-#   killed hero leg leaves measured hero-scale rates for all three stages.
-#   If it does not finish, the lever is not a bigger wall -- 12 h is the cap --
-#   it is pooling the paint loop, which `coarse_delta_streamed` already supports
-#   via `pool=` and the card does not use.
+#   hero: the card itself
+#     serial reference = 512x the cgh64 anchor .................. 30720 s  8.5 h
+#     of which the streamed paint, pooled at W=16 ............... see below
+#   CENTRAL 4.0 h.  REQUESTED 8:00.  ~4 SU at the central.
+#
+#   WHAT THE POOLING DOES AND WHAT IS STILL A GUESS. The card is three stages
+#   and only the first parallelises: the streamed paint over 16,384 chunks,
+#   then the out-of-core transform, then the binning. W2's C5 measured the
+#   engine's coarse paint pooling 8.5-13.0x at W=16 -- better than the tile
+#   loop -- and the card runs the SAME `coarse_delta_streamed` chunks through
+#   the same workers. What is NOT measured anywhere is how the 8.5 h splits
+#   across the three. At a 60-75% paint share, pooling at 8x takes the card to
+#   3.1-4.2 h and the residual is the serial transform and binning; at a 40%
+#   share it takes it to 5.6 h and pooling was the wrong lever. THE SPLIT IS
+#   WHAT THE cgh64 LEGS BELOW MEASURE, both arms, before the hero leg starts --
+#   the heartbeat names the three stages separately, so their ratio is readable
+#   off the log rather than assumed. 8:00 covers the pessimistic branch.
+#
+#   The pooling CANNOT move a number: workers return bounded sub-blocks and the
+#   parent accumulates, so integer associativity makes arrival order bitwise the
+#   serial order. That is gated in `tests/test_card_pool.py`, at the mesh and at
+#   the card, with the dispatch counted so a dropped `pool=` cannot pass.
+#
+#   MEMORY IS WHY THE POOL IS `paint_only`. A full TilePool allocates three
+#   coarse force meshes -- 3 x 2048^3 x f32 = 103.1 GB -- and builds a tile
+#   kernel in every worker, and the card reads neither; the card leg measured
+#   839.5 GB of 1026 on 1010938, so 103 GB is most of what it has left. Two
+#   further conditions, both fixed here rather than hoped for: the state is
+#   loaded THROUGH a SharedAllocator so the pool adopts it instead of copying
+#   754.6 GB, and `TilePool.close()` no longer copies adopted fields back into
+#   private memory on the way out, which was a second 754.6 GB at teardown.
 #
 # THE LAYOUT PARAMETERS ARE NOT THE SCRIPT'S DEFAULTS AND MUST NOT BE.
 # `load_checkpoint` re-derives the allocation geometry from the occupancy plus
@@ -58,8 +73,12 @@
 #   1. What are the three stages' rates at hero scale, and how do they compare
 #      with 512x the cgh64 rates? This is the first time any of them is measured
 #      above cgh64, and it is what prices every later card.
-#   2. Does the card finish inside 12 h, and if not, at what fraction?
-#   3. What does the card say below k_nonlinear (0.2520 h/Mpc at a = 1)? NO
+#   2. What does the paint pool buy at cgh64 (both arms run below), and does
+#      that transport to hero scale, where the chunk count is 512x and the
+#      sub-block each worker ships back is the same shape?
+#   3. Does the card finish inside 8 h, and if not, at what fraction and in
+#      which stage?
+#   4. What does the card say below k_nonlinear (0.2520 h/Mpc at a = 1)? NO
 #      verdict is emitted: the band this run is trusted over is JC's call.
 #
 # Submit from the Vista checkout:
@@ -90,6 +109,10 @@ BIND="numactl --membind=0,1"
 # not. Scoped per leg rather than exported, so the pytest leg still sees the cards.
 CPU="env JAX_PLATFORMS=cpu"
 LAYOUT="--slack 0.10 --arena-frac 0.01"
+# W=16 is W2's operating point (W=32 bought 1.2% and broke its own neutrality
+# bound); named rather than left to the driver default so the receipt the card
+# prints can be read against it.
+W="--tile-workers 16"
 # 60 s between progress lines: at the cgh64 rates that is ~30 lines over a 9 h
 # hero leg, and at 16,384 chunks the throttle is a clock read per chunk against
 # a chunk costing ~0.4 s.
@@ -167,10 +190,12 @@ sys.exit(0 if want == have else 1)
 ' \
   || { echo "FATAL: this node computes a different schedule than the one that wrote the checkpoint"; exit 1; }
 
-# The heartbeat is the newest code in this job and the reason a non-finish is
-# worth anything. Its gates run at second 30, with the card's own.
+# The pooled paint and the heartbeat are the newest code in this job, and the
+# pooled card's bitwise gate is in here: it runs in 6 s at the smoke rung and
+# the thing it certifies is the whole basis for pooling the hero leg.
 run_leg pytest-gpu \
   pixi run -e gpu python -m pytest -q -rs tests/test_summary.py tests/test_progress.py \
+    tests/test_card_pool.py \
   || { echo "FATAL: the card gates failed"; exit 1; }
 
 # --- cgh64: the card end to end, on the same NFS, before the hero leg.
@@ -205,16 +230,26 @@ run_leg cgh64-ics \
 mkdir -p "$WORK/cgh64-prod"
 ln -sfn "$WORK/cgh64-ckpt" "$WORK/cgh64-prod/ckpt"
 
-run_leg cgh64-card \
+# BOTH ARMS. The serial one is the anchor this job's wall is scaled from and
+# the pooled one is what the hero leg will actually run; their ratio is the
+# pooled speedup at a config where both are affordable, and the heartbeat's
+# three stage timings inside each are the split the projection needs. The
+# IDENTITY is gated in pytest above, not here -- these two arms are timing.
+run_leg cgh64-card-serial \
   $CPU $BIND pixi run -e gpu python scripts/v2_m6_realization.py card --config cgh64 \
-    --workdir "$WORK/cgh64-prod" $LAYOUT $HB --allow-partial \
-  || { echo "FATAL: the card path is broken at cgh64; the hero leg would find it 9 h in"; exit 1; }
+    --workdir "$WORK/cgh64-prod" $LAYOUT $HB --serial-card --allow-partial \
+  || { echo "FATAL: the serial card path is broken at cgh64"; exit 1; }
+
+run_leg cgh64-card-pooled \
+  $CPU $BIND pixi run -e gpu python scripts/v2_m6_realization.py card --config cgh64 \
+    --workdir "$WORK/cgh64-prod" $LAYOUT $HB $W --card-pool --allow-partial \
+  || { echo "FATAL: the pooled card path is broken at cgh64; the hero leg would find it 4 h in"; exit 1; }
 
 # --- THE 4096^3 CARD. One call, hours long; the heartbeat is the only thing
 # that will say where it got to.
 run_leg hero-card \
   $CPU $BIND pixi run -e gpu python scripts/v2_m6_realization.py card --config c-hero \
-    --workdir "$PROD" $LAYOUT $HB
+    --workdir "$PROD" $LAYOUT $HB $W --card-pool
 rc_card=$?
 
 echo ""
