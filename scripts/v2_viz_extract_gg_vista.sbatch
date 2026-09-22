@@ -53,6 +53,8 @@ set -u
 export PYTHONUNBUFFERED=1
 export JAX_PLATFORMS=cpu
 export CONDA_OVERRIDE_CUDA=12.0
+export PATH="$HOME/.pixi/bin:$PATH"
+command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
 
 RUNS=/scratch/10303/jrc4/inexor_runs
 EXPORT=$RUNS/d7-1009133-product/export
