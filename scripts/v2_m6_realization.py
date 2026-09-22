@@ -554,6 +554,39 @@ def _state_at_head(args, ec, co, alloc=None):
     return st, int(resume["step"])
 
 
+def _ic_state(args, alloc=None):
+    """The IC slot state in `--ic-dir`, for a card at step 0.
+
+    The ICs are a different artifact from a checkpoint -- `load_checkpoint`
+    refuses them, by their manifest's `provenance.kind` -- so carding them
+    needs `cmd_run`'s own IC branch rather than `_state_at_head`.
+
+    The refusal below is the point of the function. A checkpoint generation
+    loads perfectly well through `load_slot_state`, and `cmd_card` would then
+    take its epoch from the `step = 0` this returns and compare a step-40 state
+    against the a = 0.1 oracle -- a card that is wrong by D(a)^2 and says so
+    nowhere.
+    """
+    from inexor import icgen
+
+    man = os.path.join(args.ic_dir, icgen.MANIFEST)
+    if not os.path.exists(man):
+        raise SystemExit(f"no {icgen.MANIFEST} in --ic-dir {args.ic_dir}")
+    with open(man) as fh:
+        kind = json.load(fh).get("provenance", {}).get("kind")
+    if kind == "inexor-checkpoint":
+        raise SystemExit(
+            f"--ic-dir {args.ic_dir} is a CHECKPOINT, not an IC generation. "
+            "Carding it here would place it at step 0 and score it against the "
+            "a = %.4f oracle. Drop --ic-dir to card the newest checkpoint."
+            % float(_coeffs(_cosmo())[1][0])
+        )
+    return icgen.load_slot_state(
+        args.ic_dir, brick_slack=args.slack, alloc_margin=args.alloc_margin,
+        arena_frac=args.arena_frac, alloc=alloc,
+    )
+
+
 def cmd_export(args):
     _require_cpu()
     g = _geom(args.config)
@@ -672,7 +705,10 @@ def cmd_card(args):
     allocator = SharedAllocator() if pooled else None
 
     t_load = time.perf_counter()
-    st, step = _state_at_head(args, ec, co, alloc=allocator)
+    if args.ic_dir:
+        st, step = _ic_state(args, alloc=allocator), 0
+    else:
+        st, step = _state_at_head(args, ec, co, alloc=allocator)
     t_load = time.perf_counter() - t_load
     # glibc keeps freed arenas and the pool's segments are fresh kernel pages
     # that cannot be served from them, so the loader's transients and the
@@ -744,7 +780,13 @@ def cmd_card(args):
                            card_pool_workers=(0 if pool is None else pool.workers),
                            pool_spawn_s=(None if pool is None else t_pool),
                            n_bins_below_k_nl=int(lin.sum()),
-                           peak_rss_bytes=_maxrss_bytes(), summary=card))
+                           ic_dir=args.ic_dir,
+                           peak_rss_bytes=_maxrss_bytes(), summary=card),
+          # an IC card and a checkpoint card of the same run are two different
+          # epochs of one realization and belong side by side; sharing
+          # `realization_pk.json` would mean the second silently replaced the
+          # first, which is the comparison both exist for
+          tag=("_ics" if args.ic_dir else ""))
     return 0
 
 
@@ -784,6 +826,13 @@ def main():
     ap.add_argument("--chunk-bricks", type=int, default=1024)
     ap.add_argument("--allow-partial", action="store_true")
     ap.add_argument("--min-weight", type=float, default=100.0)
+    ap.add_argument("--ic-dir", default=None,
+                    help="card: read the ICs in this directory at step 0 "
+                         "(a = a_init) instead of the newest checkpoint under "
+                         "--workdir. The card still lands in --workdir, so the "
+                         "IC generation is never written to. Refuses a "
+                         "checkpoint directory, which would be scored against "
+                         "the wrong epoch")
     ap.add_argument("--card-pool", action="store_true", default=None,
                     help="card: run the streamed paint on a paint-only TilePool "
                          "of --tile-workers workers (bitwise the serial mesh). "
