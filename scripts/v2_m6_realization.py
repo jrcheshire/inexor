@@ -57,6 +57,7 @@ Usage (the 2048^3 realization, one phase per job step):
 
 import argparse
 import json
+import math
 import os
 import platform
 import subprocess
@@ -70,7 +71,7 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 
 import v2_m3_engine_gate as m3  # noqa: E402
-from inexor.plan import PRESETS  # noqa: E402
+from inexor.plan import PRESETS, RATIFIED  # noqa: E402
 from v2_m6_engine_peak import _maxrss_bytes, _require_cpu  # noqa: E402
 from v2_m6_peak_trace import PhaseTracer  # noqa: E402
 from v2_m6_phase_time import PhaseTimer  # noqa: E402
@@ -188,8 +189,32 @@ def _print_phase_card(rep, instrument):
         print(f"     unknown boundaries: {rep['unknown_phases']}")
 
 
-def _geom(cfg_name):
+def _split_terms(g):
+    """(alpha, beta, coarse-representation error, buffer-truncation error).
+
+    `forces.py` models both terms of the two-level split analytically:
+    alpha = r_s/d_coarse gives exp(-pi^2 alpha^2) and beta = b/r_s gives
+    erfc(beta/2). RATIFIED alpha is 1.0, so r_s is one coarse cell.
+    """
+    d_coarse = float(g["L"]) / int(g["n_coarse"])
+    d_fine = float(g["L"]) / int(g["n_fine"])
+    alpha = float(RATIFIED["alpha"])
+    r_s = alpha * d_coarse
+    beta = (int(g["buf"]) * d_fine) / r_s
+    return alpha, beta, math.exp(-math.pi**2 * alpha**2), math.erfc(beta / 2.0)
+
+
+def _geom(cfg_name, n_fine=None, buf=None):
     """Geometry from the ratified preset table, CHECKED against the engine gate's.
+
+    `n_fine` overrides the preset's fine mesh, for a force-resolution ladder.
+    THE BUFFER IS THEN DERIVED, not left alone: `buf` is counted in FINE CELLS,
+    so holding it fixed while refining the mesh shrinks the PHYSICAL buffer and
+    blows up the split's truncation error -- at cgh64, erfc(beta/2) runs
+    1.5e-8 -> 4.7e-3 -> 1.6e-1 over a 512..4096 ladder. The finest arm would be
+    16% wrong from truncation alone and would read as convergence going the
+    wrong way. Deriving buf holds beta, so `n_fine` varies force resolution and
+    nothing else. An explicit `buf` still wins, and says what it did to beta.
 
     `plan.PRESETS` is the only table carrying 2048^3; `m3.CONFIGS` is the one
     every engine card was measured through. They agree today, and this asserts it
@@ -210,6 +235,27 @@ def _geom(cfg_name):
                 )
         if float(g["L"]) != float(ref["L"]):
             raise ValueError(f"geometry tables disagree on {cfg_name}.L")
+
+    # the cross-check above is the POINT of this function and must see the
+    # ratified preset, so any override lands after it
+    if n_fine is not None and int(n_fine) != int(g["n_fine"]):
+        _, beta0, _, _ = _split_terms(g)
+        ratio = int(n_fine) // int(g["n_coarse"])
+        g["n_fine"] = int(n_fine)
+        g["buf"] = int(buf) if buf is not None else int(round(ratio * RATIFIED["alpha"] * beta0))
+        if g["tile"] + 2 * g["buf"] > g["n_fine"]:
+            raise SystemExit(
+                f"tile {g['tile']} + 2*buf {g['buf']} exceeds n_fine {g['n_fine']}"
+            )
+    elif buf is not None:
+        g["buf"] = int(buf)
+
+    alpha, beta, e_rep, e_trunc = _split_terms(g)
+    print(f"  geometry {cfg_name}: n_fine={g['n_fine']} n_coarse={g['n_coarse']} "
+          f"T={g['tile']} b={g['buf']} | fine cell "
+          f"{float(g['L']) / g['n_fine']:.4f} Mpc/h")
+    print(f"  split: alpha={alpha:g} beta={beta:g} | coarse repr {e_rep:.2e}, "
+          f"buffer truncation {e_trunc:.2e}")
     return g
 
 
@@ -339,7 +385,7 @@ def cmd_ics(args):
         jax.config.update("jax_enable_x64", True)
     else:
         jax = _require_cpu()
-    g = _geom(args.config)
+    g = _geom(args.config, args.n_fine, args.buf)
     from inexor import icgen
 
     os.makedirs(args.workdir, exist_ok=True)
@@ -388,7 +434,7 @@ def cmd_ics(args):
 
 def cmd_run(args):
     _require_cpu()
-    g = _geom(args.config)
+    g = _geom(args.config, args.n_fine, args.buf)
     from inexor import engine, icgen
 
     cosmo = _cosmo()
@@ -589,7 +635,7 @@ def _ic_state(args, alloc=None):
 
 def cmd_export(args):
     _require_cpu()
-    g = _geom(args.config)
+    g = _geom(args.config, args.n_fine, args.buf)
     from inexor import export
 
     cosmo = _cosmo()
@@ -674,7 +720,7 @@ def _linear_band(k, k_nl, scan_hi):
 
 def cmd_card(args):
     _require_cpu()
-    g = _geom(args.config)
+    g = _geom(args.config, args.n_fine, args.buf)
     from inexor import summary
     from inexor.executor import SharedAllocator, TilePool, malloc_trim
 
@@ -797,6 +843,13 @@ def main():
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--seed", type=int, default=m3.SEED)
     ap.add_argument("--slab", type=int, default=32)
+    ap.add_argument("--n-fine", type=int, default=None,
+                    help="override the preset's fine mesh, for a force-resolution "
+                         "ladder. The buffer is DERIVED to hold the split's beta "
+                         "unless --buf is also given")
+    ap.add_argument("--buf", type=int, default=None,
+                    help="override the buffer in FINE CELLS. Changes beta and the "
+                         "split's truncation error, both of which get printed")
     ap.add_argument("--keep-stage", action="store_true",
                     help="keep the IC intermediates (~687 GB at 2048^3)")
     ap.add_argument("--generator", default="host", choices=("host", "device"),
