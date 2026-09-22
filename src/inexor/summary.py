@@ -307,6 +307,12 @@ def pk_summary_card(
         deconvolved="tsc" if deconvolve_window else None,
         oracle="bin-averaged linear, D(a)^2 P_lin; NEVER a bin centre",
         n_bins=int(len(res["k_mean"])),
+        # the EDGES, not just the weighted centres. Two cards can share
+        # `k_mean` to a few digits and still have been binned differently, and
+        # `k_mean` is weighted so it does not reconstruct them. Without this a
+        # card cannot say what band it measured, which is what makes arms at
+        # different meshes comparable or not.
+        k_edges=[float(v) for v in res["k_edges"]],
         k_mean=[float(v) for v in res["k_mean"]],
         p=[float(v) for v in res["p"]],
         p_oracle=[float(v) for v in res["p_oracle"]],

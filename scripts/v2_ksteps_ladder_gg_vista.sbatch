@@ -3,7 +3,7 @@
 #SBATCH -p gg
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 02:00:00
+#SBATCH -t 05:00:00
 #SBATCH -A JPL-SPHEREx
 #SBATCH -o ksteps-ladder-%j.log
 # Does the step count matter at the configuration we run?
@@ -16,47 +16,58 @@
 # check made at a much smaller one, transporting on the argument that the
 # preset ladder grows volume at fixed resolution. That is an argument.
 #
-# AND IT IS NOT OBVIOUSLY A SMALL EFFECT. At the 64 Mpc/h dev configuration,
-# halving 20 steps to 10 cost power monotonically in k -- 6% at k = 0.5, 15% at
-# k = 1.06, 25% at half Nyquist -- the same sign and shape as the force-
-# resolution deficit. That is a different box and a much coarser step count, so
-# it does not predict 40 versus 80 here; it says the knob is live in exactly
-# the band in question, and that attributing the deficit to the mesh alone
-# without checking this one would be premature.
+# AND IT IS THE LARGEST LEVER WE HAVE FOUND. The first pass of this job
+# measured 40 against 80 at this configuration: P(40)/P(80) is 0.9998 at
+# k = 0.08, 0.9885 at 0.48, 0.9577 at 1.07 and 0.9369 at the band edge. So 40
+# steps is converged to 0.5% only out to k = 0.31, to 1% at 0.45, to 2% at
+# 0.63. For comparison the mesh ladder's 2x refinement moved the band edge by
+# 3.5% and in the WRONG direction; this moves it 6.3% in the direction that
+# closes the gap with the emulator. Steps are also the cheapest lever by a
+# distance: exactly linear in wall (23.98 and 23.70 s/step across the two arms)
+# and ZERO memory, where refining the coarse mesh is disqualifying at 4096^3.
 #
-# ARMS. 20 / 40 / 80 steps at the preset's own mesh, so the ONLY thing varying
-# is the number of steps. Every count ends at a = 1 and the coarse mesh is
-# untouched, so the three cards share their epoch and their k bins and
-# difference with no interpolation -- verified end to end at the dev
-# configuration before this was written.
+# SO THE QUESTION IS NO LONGER "DOES IT MATTER" BUT "HOW MUCH IS ENOUGH", AND
+# THAT NEEDS BRACKETING FROM ABOVE. Quoting "use 80" on the strength of 40-vs-80
+# would just move the arbitrary number, which is the mistake that put 40 on
+# record in the first place. 80 -> 160 sizes 80's own residual error; 60 and 120
+# fill the curve so the answer is a tolerance-versus-cost line rather than a
+# single recommended count.
+#
+# ARMS 40 / 60 / 80 / 120 / 160. NOT 20: that arm failed here, and instructively
+# -- 195 particles overflowed their bricks against 170 free arena slots, because
+# fewer steps means larger displacements per step and the layout sized for 40 is
+# too tight. It raised rather than clamping or dropping, which is the design
+# working. Including it would mean one arm carrying a different arena fraction,
+# i.e. a second axis moving, which is the trap the buffer derivation exists to
+# avoid.
 #
 # ONE IC GENERATION, symlinked into each arm, so the ladder is matched by
 # construction. Arms cannot cross-resume even by accident: the coefficients are
 # hashed into the checkpoint fingerprint, so a checkpoint from one count is
 # refused by another rather than continued onto a different trajectory.
 #
-# TIME. Cost is LINEAR in the step count -- measured, 10.52 vs 10.21 s/step
-# across two dev-configuration arms -- so unlike the mesh ladder there is no
-# scaling uncertainty here. The per-step rate is MEASURED ON THIS NODE CLASS by
-# the mesh ladder that ran first: 24.02 s/step at cgh64 with this exact mesh
-# and worker count. That supersedes the 52 s/step figure carried in the
-# records, which is 2.2x slow for this node and was the basis of the first
-# draft of this script.
+# TIME. Cost is LINEAR in the step count and the rate is MEASURED on this node
+# class at this exact configuration: 23.70-24.02 s/step across three arms and
+# two jobs.
 #
-#   arm 1   20 steps    ~8 min         at the measured 24.02 s/step
-#   arm 2   40 steps    ~16 min        (also the production reference)
-#   arm 3   80 steps    ~32 min
-#   ICs (host generator) + 3 cards     ~5 min
-#                                      --------
-#                                      ~1 h central
+#   arm 1    40 steps   ~16 min      (the current production count)
+#   arm 2    60 steps   ~24 min
+#   arm 3    80 steps   ~32 min
+#   arm 4   120 steps   ~48 min
+#   arm 5   160 steps   ~64 min
+#   ICs (measured 1.4 min) + 5 cards  ~3 min
+#                                     --------
+#                                     ~3.2 h central
 #
-# WALL 2 h, double the central. The rate is measured on this node class rather
-# than inherited, so the remaining uncertainty is node scatter, and the arms
-# are cheap enough that a wide margin costs nothing. If the rate is worse than
-# 2x anyway, arms 1 and 2 are banked and arm 2 IS the production reference,
-# which is the point of running cheapest first.
+# All five run here rather than importing the 40 and 80 cards from job 1016032.
+# Those ARE comparable -- the IC generation is byte-identical across jobs,
+# checked by md5 -- but reusing them saves 48 minutes and makes the deliverable
+# four points plus two imported ones instead of one curve measured under one
+# set of conditions.
 #
-# BUDGET: gg = 0.33 SU/node-hr -> 0.66 SU worst case, ~0.35 SU expected.
+# WALL 5 h against 3.2 h central, on a measured linear rate.
+#
+# BUDGET: gg = 0.33 SU/node-hr -> 1.65 SU worst case, ~1.05 SU expected.
 #
 # OPS (load-bearing on gg): pixi on PATH; JAX_PLATFORMS=cpu (jax 0.10
 # hard-raises on cuInit on a GPU-less node); CONDA_OVERRIDE_CUDA (the gpu env's
@@ -109,7 +120,7 @@ run_leg ics \
 
 # Cheapest first, each carded before the next starts, so a wall kill costs one
 # arm and banks the rest.
-for K in 20 40 80; do
+for K in 40 60 80 120 160; do
   A="$WORK/k$K"
   mkdir -p "$A"
   for f in "$WORK"/ics/*; do ln -sfn "$f" "$A/$(basename "$f")"; done

@@ -201,14 +201,24 @@ def _split_terms(g):
     """
     d_coarse = float(g["L"]) / int(g["n_coarse"])
     d_fine = float(g["L"]) / int(g["n_fine"])
-    alpha = float(RATIFIED["alpha"])
+    alpha = float(g.get("alpha", RATIFIED["alpha"]))
     r_s = alpha * d_coarse
     beta = (int(g["buf"]) * d_fine) / r_s
     return alpha, beta, math.exp(-math.pi**2 * alpha**2), math.erfc(beta / 2.0)
 
 
-def _geom(cfg_name, n_fine=None, buf=None):
+def _geom(cfg_name, n_fine=None, buf=None, n_coarse=None):
     """Geometry from the ratified preset table, CHECKED against the engine gate's.
+
+    `n_coarse` overrides the coarse mesh. THE SPLIT SCALE IS THEN HELD: r_s is
+    `alpha * coarse_cell` and alpha is ratified at 1.0, so refining the coarse
+    mesh at fixed alpha would SHRINK r_s and change the force decomposition
+    between arms -- that is a different experiment (is the ratified split
+    right?) from the convergence one (is the coarse solve resolved?). Deriving
+    alpha to hold r_s physically fixed keeps the decomposition identical, and
+    only ever RAISES alpha, which drives the coarse-representation term
+    exp(-pi^2 alpha^2) further down. Coarsening at fixed r_s would lower alpha
+    instead: at alpha 0.5 that term is 0.085, so it is refused.
 
     `n_fine` overrides the preset's fine mesh, for a force-resolution ladder.
     THE BUFFER IS THEN DERIVED, not left alone: `buf` is counted in FINE CELLS,
@@ -253,12 +263,24 @@ def _geom(cfg_name, n_fine=None, buf=None):
     elif buf is not None:
         g["buf"] = int(buf)
 
+    if n_coarse is not None and int(n_coarse) != int(g["n_coarse"]):
+        r_s = RATIFIED["alpha"] * float(g["L"]) / int(g["n_coarse"])
+        g["n_coarse"] = int(n_coarse)
+        g["alpha"] = r_s / (float(g["L"]) / int(n_coarse))
+        if g["alpha"] < RATIFIED["alpha"]:
+            raise SystemExit(
+                f"holding r_s at {r_s:g} Mpc/h needs alpha={g['alpha']:.3f}, below "
+                f"the ratified {RATIFIED['alpha']:g}. The coarse-representation "
+                f"error exp(-pi^2 alpha^2) would be {math.exp(-math.pi ** 2 * g['alpha'] ** 2):.2e} "
+                "against 5.17e-05, which is larger than anything this is measuring."
+            )
+
     alpha, beta, e_rep, e_trunc = _split_terms(g)
     print(f"  geometry {cfg_name}: n_fine={g['n_fine']} n_coarse={g['n_coarse']} "
           f"T={g['tile']} b={g['buf']} | fine cell "
           f"{float(g['L']) / g['n_fine']:.4f} Mpc/h")
-    print(f"  split: alpha={alpha:g} beta={beta:g} | coarse repr {e_rep:.2e}, "
-          f"buffer truncation {e_trunc:.2e}")
+    print(f"  split: alpha={alpha:g} beta={beta:g} r_s={alpha * float(g['L']) / g['n_coarse']:g} "
+          f"Mpc/h | coarse repr {e_rep:.2e}, buffer truncation {e_trunc:.2e}")
     return g
 
 
@@ -328,6 +350,9 @@ def _engine_config(g, args, checkpoint_dir):
         **({} if args.migrate_pooled is None else
            {"migrate_pooled": args.migrate_pooled}),
         **({} if args.eject_kernel is None else {"eject_kernel": args.eject_kernel}),
+        # a derived alpha is the whole point of --n-coarse; without this the
+        # split scale would silently revert to the ratified default
+        **({} if "alpha" not in g else {"alpha": g["alpha"]}),
     )
     ec.validate()
     return ec
@@ -396,7 +421,7 @@ def cmd_ics(args):
         jax.config.update("jax_enable_x64", True)
     else:
         jax = _require_cpu()
-    g = _geom(args.config, args.n_fine, args.buf)
+    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse)
     from inexor import icgen
 
     os.makedirs(args.workdir, exist_ok=True)
@@ -445,7 +470,7 @@ def cmd_ics(args):
 
 def cmd_run(args):
     _require_cpu()
-    g = _geom(args.config, args.n_fine, args.buf)
+    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse)
     from inexor import engine, icgen
 
     cosmo = _cosmo()
@@ -646,7 +671,7 @@ def _ic_state(args, alloc=None):
 
 def cmd_export(args):
     _require_cpu()
-    g = _geom(args.config, args.n_fine, args.buf)
+    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse)
     from inexor import export
 
     cosmo = _cosmo()
@@ -731,7 +756,7 @@ def _linear_band(k, k_nl, scan_hi):
 
 def cmd_card(args):
     _require_cpu()
-    g = _geom(args.config, args.n_fine, args.buf)
+    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse)
     from inexor import summary
     from inexor.executor import SharedAllocator, TilePool, malloc_trim
 
@@ -795,8 +820,18 @@ def cmd_card(args):
                   f"malloc_trim={trimmed}")
         else:
             print("  paint pool: none (serial)")
+        # EVERY ARM MUST REPORT ON THE SAME BINS. The default band is
+        # [0, half Nyquist] of the CARD'S OWN coarse mesh, so two arms at
+        # different coarse meshes would silently measure different k and the
+        # difference between them would be a resampling, not a result.
+        edges = None
+        if args.k_max:
+            edges = np.linspace(0.0, float(args.k_max), int(args.n_bins) + 1)
+            print(f"  bins PINNED: {int(args.n_bins)} over k = 0 to {float(args.k_max):g}"
+                  f" (the card's own half-Nyquist is "
+                  f"{0.5 * np.pi * ec.n_coarse / ec.box_size:.4f})")
         card = summary.pk_summary_card(st, ec, cosmo, a_out, slab=args.slab,
-                                       min_weight=args.min_weight,
+                                       min_weight=args.min_weight, edges=edges,
                                        progress=_heartbeat(args), pool=pool)
     finally:
         if pool is not None:
@@ -858,6 +893,11 @@ def main():
                     help="override the preset's fine mesh, for a force-resolution "
                          "ladder. The buffer is DERIVED to hold the split's beta "
                          "unless --buf is also given")
+    ap.add_argument("--n-coarse", type=int, default=None,
+                    help="override the coarse mesh. alpha is DERIVED to hold the "
+                         "split scale r_s physically fixed, so the force "
+                         "decomposition is identical across arms and only the "
+                         "coarse solve's resolution varies")
     ap.add_argument("--buf", type=int, default=None,
                     help="override the buffer in FINE CELLS. Changes beta and the "
                          "split's truncation error, both of which get printed")
@@ -895,6 +935,13 @@ def main():
     ap.add_argument("--chunk-bricks", type=int, default=1024)
     ap.add_argument("--allow-partial", action="store_true")
     ap.add_argument("--min-weight", type=float, default=100.0)
+    ap.add_argument("--k-max", type=float, default=None,
+                    help="card: pin the top of the binning instead of taking "
+                         "half the card's own Nyquist. Required to compare arms "
+                         "whose coarse meshes differ, since otherwise each "
+                         "reports on its own band")
+    ap.add_argument("--n-bins", type=int, default=64,
+                    help="card: bins over [0, --k-max]")
     ap.add_argument("--ic-dir", default=None,
                     help="card: read the ICs in this directory at step 0 "
                          "(a = a_init) instead of the newest checkpoint under "
