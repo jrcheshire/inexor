@@ -78,6 +78,9 @@ from v2_m6_phase_time import PhaseTimer  # noqa: E402
 
 # The generator dtype the M-v2-5 record measured the production path at.
 GEN_FDTYPE = np.float32
+# The DEFAULT step count. `--k-steps` overrides it; the module constant stays
+# because `v2_d7_hero_smoke.py` imports `_coeffs` and because every card and
+# checkpoint on record was written at 40.
 K_STEPS = 40
 
 
@@ -330,10 +333,18 @@ def _engine_config(g, args, checkpoint_dir):
     return ec
 
 
-def _coeffs(cosmo):
+def _coeffs(cosmo, k_steps=K_STEPS):
+    """The BullFrog coefficients and the scale-factor grid for `k_steps` steps.
+
+    Every arm ends at A_FINAL whatever `k_steps` is, so cards from different
+    step counts share their epoch and their k bins and difference directly.
+    The checkpoint fingerprint hashes these coefficients, so a run at one step
+    count cannot resume another's checkpoint -- it is refused rather than
+    silently continued onto a different trajectory.
+    """
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
 
-    a_steps = a_grid(m3.A_INIT, m3.A_FINAL, K_STEPS, m3.SPACING)
+    a_steps = a_grid(m3.A_INIT, m3.A_FINAL, int(k_steps), m3.SPACING)
     return bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo)), a_steps
 
 
@@ -341,7 +352,7 @@ def _card(kind, args, body, tag=""):
     card = dict(card=f"inexor-realization-{kind}-1", config=args.config,
                 workdir=args.workdir, commit=_git_commit(), host=platform.node(),
                 machine=platform.machine(), numpy=np.__version__,
-                k_steps=K_STEPS, when=time.strftime("%Y-%m-%dT%H:%M:%S"), **body)
+                k_steps=int(args.k_steps), when=time.strftime("%Y-%m-%dT%H:%M:%S"), **body)
     # the tag keeps a segmented run's cards: without it each segment's card
     # overwrote the last and a multi-day run would end holding only its final leg
     path = os.path.join(args.workdir, f"realization_{kind}{tag}.json")
@@ -438,7 +449,7 @@ def cmd_run(args):
     from inexor import engine, icgen
 
     cosmo = _cosmo()
-    co, a_steps = _coeffs(cosmo)
+    co, a_steps = _coeffs(cosmo, args.k_steps)
     d = _ckpt_dir(args)
     os.makedirs(d, exist_ok=True)
     ec = _engine_config(g, args, d)
@@ -459,9 +470,9 @@ def cmd_run(args):
         st, resume = engine.load_checkpoint(d, ec, co, arena_frac=args.arena_frac,
                                             alloc=allocator)
         src = f"checkpoint at step {int(resume['step'])}"
-        if int(resume["step"]) >= K_STEPS:
+        if int(resume["step"]) >= args.k_steps:
             print(f"  NOTHING TO DO: the checkpoint is already at step "
-                  f"{int(resume['step'])} of {K_STEPS}.")
+                  f"{int(resume['step'])} of {args.k_steps}.")
             return 0
     else:
         st = icgen.load_slot_state(
@@ -476,8 +487,8 @@ def cmd_run(args):
     trimmed = malloc_trim()
 
     k0 = 0 if resume is None else int(resume["step"])
-    stop = args.stop_at if args.stop_at else K_STEPS
-    print(f"== RUN {args.config}: from {src} -> step {stop} of {K_STEPS}")
+    stop = args.stop_at if args.stop_at else args.k_steps
+    print(f"== RUN {args.config}: from {src} -> step {stop} of {args.k_steps}")
     print(f"  state {st.n_particles:,} particles, {st.n_bricks:,} bricks, "
           f"{st.off.shape[0]:,} rows; load {t_load:.1f} s")
     print(f"  W={ec.tile_workers} pooled_migrate={ec.migrate_pooled} "
@@ -581,7 +592,7 @@ def cmd_run(args):
         # rather than ru_maxrss, which clear_refs would have made meaningless.
         phase_instrument=args.phase_instrument,
         phase=rep, per_step_stats=stats, a_steps=list(map(float, a_steps)),
-        projected_full_run_h=per_step * K_STEPS / 3600.0,
+        projected_full_run_h=per_step * args.k_steps / 3600.0,
         worker_rss_bytes=w_rss, total_rss_bytes=peak + w_rss,
         arena_peak_rows=arena_peak, n_arena=int(st.n_arena),
         migrate_pooled_workers=last.get("migrate_pooled_workers"),
@@ -625,7 +636,7 @@ def _ic_state(args, alloc=None):
             f"--ic-dir {args.ic_dir} is a CHECKPOINT, not an IC generation. "
             "Carding it here would place it at step 0 and score it against the "
             "a = %.4f oracle. Drop --ic-dir to card the newest checkpoint."
-            % float(_coeffs(_cosmo())[1][0])
+            % float(m3.A_INIT)
         )
     return icgen.load_slot_state(
         args.ic_dir, brick_slack=args.slack, alloc_margin=args.alloc_margin,
@@ -639,17 +650,17 @@ def cmd_export(args):
     from inexor import export
 
     cosmo = _cosmo()
-    co, a_steps = _coeffs(cosmo)
+    co, a_steps = _coeffs(cosmo, args.k_steps)
     ec = _engine_config(g, args, _ckpt_dir(args))
     st, step = _state_at_head(args, ec, co)
-    if step < K_STEPS and not args.allow_partial:
+    if step < args.k_steps and not args.allow_partial:
         raise SystemExit(
-            f"the checkpoint is at step {step} of {K_STEPS}; exporting now would "
+            f"the checkpoint is at step {step} of {args.k_steps}; exporting now would "
             "produce a mock at the wrong epoch. Pass --allow-partial if that is "
             "deliberate."
         )
     out_dir = args.export_dir or os.path.join(args.workdir, "export")
-    a_out = float(a_steps[-1]) if step >= K_STEPS else float(a_steps[step])
+    a_out = float(a_steps[-1]) if step >= args.k_steps else float(a_steps[step])
     print(f"== EXPORT {args.config} at step {step}, a={a_out:.4f} -> {out_dir}")
 
     t0 = time.perf_counter()
@@ -725,7 +736,7 @@ def cmd_card(args):
     from inexor.executor import SharedAllocator, TilePool, malloc_trim
 
     cosmo = _cosmo()
-    co, a_steps = _coeffs(cosmo)
+    co, a_steps = _coeffs(cosmo, args.k_steps)
     ec = _engine_config(g, args, _ckpt_dir(args))
 
     # THE PAINT IS THE CARD'S LARGEST STAGE AND IT IS THE ONE THAT POOLS.
@@ -761,7 +772,7 @@ def cmd_card(args):
     # pool's demand STACK without this.
     trimmed = malloc_trim() if pooled else None
 
-    a_out = float(a_steps[-1]) if step >= K_STEPS else float(a_steps[step])
+    a_out = float(a_steps[-1]) if step >= args.k_steps else float(a_steps[step])
     print(f"== P(k) CARD {args.config} at step {step}, a={a_out:.4f}")
     print(f"  state {st.n_particles:,} particles, {st.n_bricks:,} bricks; "
           f"load {t_load:.1f} s")
@@ -872,6 +883,11 @@ def main():
                          "(PhaseTracer, Linux only) and costs wall at every "
                          "boundary, so the two are exclusive and a run reports "
                          "one or the other, never both")
+    ap.add_argument("--k-steps", type=int, default=K_STEPS,
+                    help="number of BullFrog steps from a_init to a_final. Every "
+                         "count ends at the same epoch, so cards from different "
+                         "counts share their k bins. Changing it changes the "
+                         "checkpoint fingerprint, so arms cannot cross-resume")
     ap.add_argument("--checkpoint-every", type=int, default=5)
     ap.add_argument("--stop-at", type=int, default=None,
                     help="absolute step to stop before; must be a checkpoint boundary")

@@ -140,3 +140,59 @@ def test_an_ic_card_cannot_overwrite_the_checkpoint_card():
 
     src = inspect.getsource(rlz.cmd_card)
     assert 'tag=("_ics" if args.ic_dir else "")' in src
+
+
+# --- the step count as a knob (`--k-steps`) --------------------------------
+#
+# 40 steps is inherited from the gate config and rests on a convergence check
+# made at a much smaller configuration. It is the one knob on the tradeoff
+# sheet with neither a measured outcome nor an analytic bound, so it has to be
+# variable before it can be measured.
+
+
+def test_every_step_count_ends_at_the_same_epoch():
+    """Cards from different counts are only comparable if they share a_out --
+    and they share k bins anyway, since the coarse mesh is untouched."""
+    ends = {K: rlz._coeffs(rlz._cosmo(), K)[1][-1] for K in (20, 40, 80)}
+    assert len(set(np.round(list(ends.values()), 12))) == 1
+    for K, a in ends.items():
+        assert len(rlz._coeffs(rlz._cosmo(), K)[1]) == K + 1
+
+
+def test_the_default_still_serves_the_importer():
+    """`v2_d7_hero_smoke.py` calls `_coeffs(_cosmo())` with one argument."""
+    assert len(rlz._coeffs(rlz._cosmo())[1]) == rlz.K_STEPS + 1
+
+
+def test_a_different_step_count_is_a_different_fingerprint():
+    """Arms must not cross-resume: the coefficients ARE the trajectory, so a
+    checkpoint from one count continued under another would be half one run
+    and half another, and nothing downstream could see it."""
+    import jax
+
+    # `_engine_config` validates the f64 fine mesh against x64, which the
+    # driver enables and a bare pytest process does not
+    jax.config.update("jax_enable_x64", True)
+    from inexor.engine import checkpoint_fingerprint
+
+    cosmo = rlz._cosmo()
+    import argparse
+
+    a = argparse.Namespace(slack=0.10, tile_workers=1, checkpoint_every=5,
+                           migrate_pooled=None, eject_kernel="jax",
+                           n_fine=None, buf=None)
+    ec = rlz._engine_config(rlz._geom("cdev8"), a, "/tmp/nowhere")
+    f40 = checkpoint_fingerprint(ec, rlz._coeffs(cosmo, 40)[0])
+    f80 = checkpoint_fingerprint(ec, rlz._coeffs(cosmo, 80)[0])
+    assert f40 != f80
+
+
+def test_no_step_count_is_left_hardcoded_in_the_phases():
+    """Vacuity guard. A leftover module-constant reference would make an arm
+    run 80 steps and then score itself as if it had run 40."""
+    import inspect
+
+    for fn in (rlz.cmd_run, rlz.cmd_export, rlz.cmd_card):
+        src = inspect.getsource(fn)
+        assert "K_STEPS" not in src, f"{fn.__name__} still reads the constant"
+        assert "args.k_steps" in src, f"{fn.__name__} never reads the flag"
