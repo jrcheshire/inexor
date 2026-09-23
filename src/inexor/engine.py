@@ -190,6 +190,7 @@ class EngineConfig:
         device_cards=1,
         migrate_repack_fused=None,
         coarse_fold_kernel=True,
+        coarse_match_order=2,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -321,6 +322,16 @@ class EngineConfig:
         # gb 1003657). False is the arm it is gated against -- bitwise, because the
         # association is carried over unchanged -- not an operating point.
         self.coarse_fold_kernel = bool(coarse_fold_kernel)
+        # The assignment order the coarse match factor divides out. The coarse arm
+        # paints and gathers TSC (order 3), but the ratified factor (D-v2-10, the
+        # probe) is built at CIC order, leaving sinc^2 per axis of the coarse
+        # window on the long force: 3-4.5% low at r = 1.6-3.4 Mpc/h at production
+        # cells (`scripts/v2_force_profile.py`). 2 is the ratified arm and stays
+        # the default so every oracle and gate remains bitwise; 3 is the corrected
+        # arm under test.
+        if int(coarse_match_order) not in (2, 3):
+            raise ValueError(f"coarse_match_order must be 2 or 3, got {coarse_match_order}")
+        self.coarse_match_order = int(coarse_match_order)
         self.device_tile_jit = bool(device_tile_jit)
         self.device_paint_chunk_bricks = (
             None if device_paint_chunk_bricks is None else int(device_paint_chunk_bricks))
@@ -384,6 +395,14 @@ class EngineConfig:
     @property
     def fine_cell(self):
         return self.box_size / self.n_fine
+
+    @property
+    def coarse_match(self):
+        """The `match` argument of the coarse solve. The ratified 2-tuple at the
+        default order, so the default path is the expression it always was."""
+        if self.coarse_match_order == 2:
+            return (self.coarse_cell, self.fine_cell)
+        return (self.coarse_cell, self.fine_cell, self.coarse_match_order, 2)
 
     @property
     def r_s(self):
@@ -1558,7 +1577,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         cfg.box_size,
         "long",
         r_s=cfg.r_s,
-        match=(cfg.coarse_cell, cfg.fine_cell),
+        match=cfg.coarse_match,
         fdtype=cfg.np_coarse_dtype,
         parts=coarse_parts,
         out=solve_out,
@@ -1872,7 +1891,12 @@ def checkpoint_fingerprint(cfg, coeffs):
     bytes, so the cosmology, the a-grid and K are all in here without the
     checkpoint having to name them or the caller having to pass a cosmology."""
     h = hashlib.sha256()
-    h.update(json.dumps({k: getattr(cfg, k) for k in _FINGERPRINTED}, sort_keys=True).encode())
+    fp = {k: getattr(cfg, k) for k in _FINGERPRINTED}
+    # added ONLY off the ratified default, so every checkpoint written before the
+    # knob existed keeps its fingerprint and still resumes
+    if getattr(cfg, "coarse_match_order", 2) != 2:
+        fp["coarse_match_order"] = cfg.coarse_match_order
+    h.update(json.dumps(fp, sort_keys=True).encode())
     h.update(np.ascontiguousarray(coeffs, dtype=np.float64).tobytes())
     return h.hexdigest()
 
@@ -2093,7 +2117,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     # build's own 28 B/half peak lands here, before any force mesh exists.
     coarse_parts = coarse_kernel_parts(
         cfg.n_coarse, cfg.box_size, "long", r_s=cfg.r_s,
-        match=(cfg.coarse_cell, cfg.fine_cell), fdtype=cfg.np_coarse_dtype,
+        match=cfg.coarse_match, fdtype=cfg.np_coarse_dtype,
     )
     ph("kernel_build")
     try:

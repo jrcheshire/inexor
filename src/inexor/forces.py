@@ -306,6 +306,20 @@ def cic_match_factor(shape, cell_solve, cell_target, clip=None, order_solve=2, o
     return ratio, max_applied
 
 
+def _match_orders(match):
+    """`match` is (cell_solve, cell_target) or (cell_solve, cell_target,
+    order_solve, order_target). The 2-tuple is the ratified form and means CIC
+    on both sides; the orders exist because the coarse arm paints and gathers
+    with TSC, and a factor built at CIC order leaves sinc^2 per axis of the
+    coarse window uncorrected (`scripts/v2_force_profile.py`)."""
+    if len(match) == 2:
+        return {}
+    if len(match) != 4:
+        raise ValueError(f"match must be (cell_solve, cell_target[, order_solve, order_target]), "
+                         f"got {match!r}")
+    return dict(order_solve=int(match[2]), order_target=int(match[3]))
+
+
 def split_kernels(shape, cell, which, r_s=None, fdtype=np.float64):
     """The (Kx, Ky, Kz) half-grid kernels of the ratified gaussian split.
 
@@ -450,7 +464,8 @@ def _global_delta_and_kernels(
     kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s, fdtype=fdtype)
     max_applied = 1.0
     if match is not None:
-        mf, max_applied = cic_match_factor((n_mesh,) * 3, match[0], match[1], clip=clip)
+        mf, max_applied = cic_match_factor((n_mesh,) * 3, match[0], match[1], clip=clip,
+                                           **_match_orders(match))
         # `mf` is a host f64 half-grid and `k` may be complex64, so an uncast
         # multiply promotes the kernel back to complex128 and silently undoes
         # the narrowing -- at the MATCHED coarse arm specifically, which is the
@@ -528,7 +543,7 @@ def coarse_kernel_parts(n_mesh, box_size, which, r_s=None, match=None, clip=None
     if match is not None:
         # cast for the same reason as in `_global_delta_and_kernels`: an f64
         # match factor would promote a complex64 kernel back to complex128
-        m, _ = cic_match_factor(shape, match[0], match[1], clip=clip)
+        m, _ = cic_match_factor(shape, match[0], match[1], clip=clip, **_match_orders(match))
         mf = m.astype(fdtype, copy=False)
         del m
     return dict(iks=(ikx, iky, ikz), pref=pref, mf=mf,

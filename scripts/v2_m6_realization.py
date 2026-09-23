@@ -369,6 +369,9 @@ def _engine_config(g, args, checkpoint_dir):
         # a derived alpha is the whole point of --n-coarse; without this the
         # split scale would silently revert to the ratified default
         **({} if "alpha" not in g else {"alpha": g["alpha"]}),
+        # getattr: tests build a bare Namespace, and the ratified order is the
+        # default an absent flag must mean
+        coarse_match_order=getattr(args, "coarse_match_order", 2),
     )
     ec.validate()
     return ec
@@ -537,7 +540,8 @@ def cmd_run(args):
     # the dtypes were in no log line, which is most of why the f64 coarse mesh
     # kept being re-found rather than read
     print(f"  coarse={ec.coarse_dtype} fine={ec.fine_dtype} "
-          f"arena_frac={args.arena_frac} alloc_margin={args.alloc_margin}")
+          f"arena_frac={args.arena_frac} alloc_margin={args.alloc_margin} "
+          f"coarse_match={ec.coarse_match}")
     print(f"  state in shared memory: "
           f"{'yes, %.1f GB' % (allocator.bytes_held() / 1e9) if allocator else 'no (serial)'}"
           f"; malloc_trim={trimmed}")
@@ -919,6 +923,11 @@ def main():
                          "ladder. Box and both meshes are held, so only the "
                          "interparticle spacing varies. A different n_part at the "
                          "same seed is an UNRELATED realization")
+    ap.add_argument("--coarse-match-order", type=int, default=2, choices=(2, 3),
+                    help="assignment order the coarse match factor divides out. "
+                         "2 (CIC) is the ratified arm; the coarse arm paints TSC, "
+                         "so 3 is the corrected one. In the checkpoint fingerprint "
+                         "when not 2, so arms cannot cross-resume")
     ap.add_argument("--buf", type=int, default=None,
                     help="override the buffer in FINE CELLS. Changes beta and the "
                          "split's truncation error, both of which get printed")
