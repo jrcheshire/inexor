@@ -207,8 +207,15 @@ def _split_terms(g):
     return alpha, beta, math.exp(-math.pi**2 * alpha**2), math.erfc(beta / 2.0)
 
 
-def _geom(cfg_name, n_fine=None, buf=None, n_coarse=None):
+def _geom(cfg_name, n_fine=None, buf=None, n_coarse=None, n_part=None):
     """Geometry from the ratified preset table, CHECKED against the engine gate's.
+
+    `n_part` overrides the particles per side, for a mass-resolution ladder. The
+    box and both meshes are held, so the force (fine cell, coarse cell, r_s,
+    beta) is identical across arms in physical units and only the interparticle
+    spacing varies. Every preset sits at the same 0.5 Mpc/h spacing, so this is
+    the one resolution axis the table cannot reach. Refused unless a power of
+    two (D-007) that the brick grid divides.
 
     `n_coarse` overrides the coarse mesh. THE SPLIT SCALE IS THEN HELD: r_s is
     `alpha * coarse_cell` and alpha is ratified at 1.0, so refining the coarse
@@ -275,9 +282,18 @@ def _geom(cfg_name, n_fine=None, buf=None, n_coarse=None):
                 "against 5.17e-05, which is larger than anything this is measuring."
             )
 
+    if n_part is not None and int(n_part) != int(g["n_part"]):
+        # brick-grid divisibility is refused by the IC generator and the loader
+        # (`bricks_per_side must divide n_part`), which own that layout
+        n = int(n_part)
+        if n < 2 or n & (n - 1):
+            raise SystemExit(f"n_part {n} is not a power of two (D-007)")
+        g["n_part"] = n
+
     alpha, beta, e_rep, e_trunc = _split_terms(g)
-    print(f"  geometry {cfg_name}: n_fine={g['n_fine']} n_coarse={g['n_coarse']} "
-          f"T={g['tile']} b={g['buf']} | fine cell "
+    print(f"  geometry {cfg_name}: n_part={g['n_part']} n_fine={g['n_fine']} "
+          f"n_coarse={g['n_coarse']} T={g['tile']} b={g['buf']} | spacing "
+          f"{float(g['L']) / g['n_part']:.4f}, fine cell "
           f"{float(g['L']) / g['n_fine']:.4f} Mpc/h")
     print(f"  split: alpha={alpha:g} beta={beta:g} r_s={alpha * float(g['L']) / g['n_coarse']:g} "
           f"Mpc/h | coarse repr {e_rep:.2e}, buffer truncation {e_trunc:.2e}")
@@ -421,7 +437,7 @@ def cmd_ics(args):
         jax.config.update("jax_enable_x64", True)
     else:
         jax = _require_cpu()
-    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse)
+    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse, args.n_part)
     from inexor import icgen
 
     os.makedirs(args.workdir, exist_ok=True)
@@ -470,7 +486,7 @@ def cmd_ics(args):
 
 def cmd_run(args):
     _require_cpu()
-    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse)
+    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse, args.n_part)
     from inexor import engine, icgen
 
     cosmo = _cosmo()
@@ -671,7 +687,7 @@ def _ic_state(args, alloc=None):
 
 def cmd_export(args):
     _require_cpu()
-    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse)
+    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse, args.n_part)
     from inexor import export
 
     cosmo = _cosmo()
@@ -756,7 +772,7 @@ def _linear_band(k, k_nl, scan_hi):
 
 def cmd_card(args):
     _require_cpu()
-    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse)
+    g = _geom(args.config, args.n_fine, args.buf, args.n_coarse, args.n_part)
     from inexor import summary
     from inexor.executor import SharedAllocator, TilePool, malloc_trim
 
@@ -898,6 +914,11 @@ def main():
                          "split scale r_s physically fixed, so the force "
                          "decomposition is identical across arms and only the "
                          "coarse solve's resolution varies")
+    ap.add_argument("--n-part", type=int, default=None,
+                    help="override the particles per side, for a mass-resolution "
+                         "ladder. Box and both meshes are held, so only the "
+                         "interparticle spacing varies. A different n_part at the "
+                         "same seed is an UNRELATED realization")
     ap.add_argument("--buf", type=int, default=None,
                     help="override the buffer in FINE CELLS. Changes beta and the "
                          "split's truncation error, both of which get printed")

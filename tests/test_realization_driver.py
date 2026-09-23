@@ -196,3 +196,69 @@ def test_no_step_count_is_left_hardcoded_in_the_phases():
         src = inspect.getsource(fn)
         assert "K_STEPS" not in src, f"{fn.__name__} still reads the constant"
         assert "args.k_steps" in src, f"{fn.__name__} never reads the flag"
+
+
+# --- the mass-resolution override ------------------------------------------
+# Every preset sits at 0.5 Mpc/h spacing, so `--n-part` is the only way to move
+# it. The contract: only the spacing moves; the force is identical in physical
+# units.
+
+
+def test_n_part_moves_only_the_spacing():
+    base = rlz._geom("cdev8")
+    for n in (64, 256):
+        g = rlz._geom("cdev8", n_part=n)
+        assert g["n_part"] == n
+        assert {k: v for k, v in g.items() if k != "n_part"} == \
+               {k: v for k, v in base.items() if k != "n_part"}
+        assert rlz._split_terms(g) == rlz._split_terms(base)
+
+
+def test_n_part_composes_with_the_mesh_overrides():
+    """The override lands after the mesh ones, so a derived buf / alpha is
+    exactly what it is without it."""
+    g0 = rlz._geom("cdev8", n_fine=512, n_coarse=128)
+    g1 = rlz._geom("cdev8", n_fine=512, n_coarse=128, n_part=256)
+    assert g1["n_part"] == 256
+    assert (g1["buf"], g1["alpha"]) == (g0["buf"], g0["alpha"])
+
+
+def test_n_part_must_be_a_power_of_two():
+    import pytest
+
+    for bad in (96, 1, 0):
+        with pytest.raises(SystemExit) as e:
+            rlz._geom("cdev8", n_part=bad)
+        assert "power of two" in str(e.value)
+
+
+def test_the_preset_n_part_is_not_an_override():
+    assert rlz._geom("cdev8", n_part=128) == rlz._geom("cdev8")
+
+
+def test_a_different_n_part_is_a_different_fingerprint():
+    """Arms must not cross-resume: a checkpoint at one spacing loaded under
+    another would be refused only if n_part is in the fingerprint."""
+    import argparse
+
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    from inexor.engine import checkpoint_fingerprint
+
+    co = rlz._coeffs(rlz._cosmo(), 40)[0]
+    a = argparse.Namespace(slack=0.10, tile_workers=1, checkpoint_every=5,
+                           migrate_pooled=None, eject_kernel="jax")
+    fps = {n: checkpoint_fingerprint(rlz._engine_config(rlz._geom("cdev8", n_part=n),
+                                                        a, "/tmp/nowhere"), co)
+           for n in (64, 128, 256)}
+    assert len(set(fps.values())) == 3
+
+
+def test_every_phase_passes_n_part():
+    """Vacuity guard. A phase that dropped the flag would generate ICs at one
+    spacing and load them under the preset's."""
+    import inspect
+
+    for fn in (rlz.cmd_ics, rlz.cmd_run, rlz.cmd_export, rlz.cmd_card):
+        assert "args.n_part)" in inspect.getsource(fn), fn.__name__
