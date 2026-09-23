@@ -68,6 +68,8 @@ export OMP_NUM_THREADS=1
 export INEXOR_LOAD_TRACE=1
 unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
+export PATH="$HOME/.pixi/bin:$PATH"
+command -v pixi >/dev/null || { rc=$?; echo "FATAL (rc=$rc): pixi not on PATH"; exit 1; }
 
 RUNS=/scratch/10303/jrc4/inexor_runs
 ICS=$RUNS/c-hero-r0                  # the generation gb 1009133 evolved
@@ -145,12 +147,12 @@ print("  NOTE: seed identity is NOT checkable from these manifests; the link is"
       " gb 1009133s run banner.")
 sys.exit(1 if bad else 0)
 ' \
-  || { echo "FATAL: --ic-dir does not match the checkpoint geometry"; exit 1; }
+  || { rc=$?; echo "FATAL (rc=$rc): --ic-dir does not match the checkpoint geometry"; exit 1; }
 
 run_leg pytest-cpu-lane \
   $CPU pixi run -e gpu python -m pytest -q -rs tests/test_summary.py tests/test_progress.py \
     tests/test_card_pool.py tests/test_realization_driver.py \
-  || { echo "FATAL: the card gates failed"; exit 1; }
+  || { rc=$?; echo "FATAL (rc=$rc): the card gates failed"; exit 1; }
 
 # --- cgh64: BOTH LEGS OF THE COMPARISON, in this job, at this commit.
 #
@@ -167,28 +169,28 @@ run_leg pytest-cpu-lane \
 run_leg cgh64-ics \
   $BIND pixi run -e gpu python scripts/v2_m6_realization.py ics --config cgh64 \
     --workdir "$WORK/cgh64" --generator device \
-  || { echo "FATAL: the cgh64 control failed at the ICs"; exit 1; }
+  || { rc=$?; echo "FATAL (rc=$rc): the cgh64 control failed at the ICs"; exit 1; }
 
 mkdir -p "$WORK/cgh64-prod"
 
 run_leg cgh64-ic-card \
   $CPU $BIND pixi run -e gpu python scripts/v2_m6_realization.py card --config cgh64 \
     --workdir "$WORK/cgh64-prod" --ic-dir "$WORK/cgh64" $LAYOUT $HB $W --card-pool \
-  || { echo "FATAL: --ic-dir is broken at cgh64; the hero leg would find it 31 min in"; exit 1; }
+  || { rc=$?; echo "FATAL (rc=$rc): --ic-dir is broken at cgh64; the hero leg would find it 31 min in"; exit 1; }
 
 # The checkpoint dir is a SIBLING of the IC dir, not a child (`5322c25`).
 run_leg cgh64-run \
   $BIND pixi run -e gpu python $DRIVER run --preset cgh64 --workdir "$WORK/cgh64" \
     --card $CARDS/${TAG}_cgh64.json --stop-at 24 --membind-nodes 0,1 --beat 60 \
     --checkpoint-dir "$WORK/cgh64-ckpt" --checkpoint-every 3 \
-  || { echo "FATAL: the cgh64 control failed in the run"; exit 1; }
+  || { rc=$?; echo "FATAL (rc=$rc): the cgh64 control failed in the run"; exit 1; }
 
 ln -sfn "$WORK/cgh64-ckpt" "$WORK/cgh64-prod/ckpt"
 
 run_leg cgh64-ckpt-card \
   $CPU $BIND pixi run -e gpu python scripts/v2_m6_realization.py card --config cgh64 \
     --workdir "$WORK/cgh64-prod" $LAYOUT $HB $W --card-pool --allow-partial \
-  || { echo "FATAL: the checkpoint card path is broken at cgh64"; exit 1; }
+  || { rc=$?; echo "FATAL (rc=$rc): the checkpoint card path is broken at cgh64"; exit 1; }
 
 # --- THE 4096^3 IC CARD. One call, hours long; the heartbeat is the only thing
 # that will say where it got to. Writes realization_pk_ics.json into $PROD,
