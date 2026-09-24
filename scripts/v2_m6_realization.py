@@ -937,7 +937,8 @@ def cmd_card(args):
     return 0
 
 
-def main():
+def build_parser():
+    """The CLI, separately so another driver can build the same configuration."""
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("phase", choices=("ics", "run", "export", "card"))
     ap.add_argument("--config", default="cdev8", choices=sorted(PRESETS))
@@ -1032,7 +1033,11 @@ def main():
                     help="seconds between progress lines in the card and export "
                          "loops; 0 turns them off. gb 1010938 ran 3 h 23 min "
                          "inside the card with no way to read its progress")
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
     return {"ics": cmd_ics, "run": cmd_run, "export": cmd_export,
             "card": cmd_card}[args.phase](args)
 
