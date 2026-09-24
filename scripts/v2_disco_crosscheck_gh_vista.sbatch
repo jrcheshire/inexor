@@ -16,9 +16,10 @@
 # against mo3_1018341_k120 with the seed scatter cancelled.
 #
 # LEGS
-#   setup    build the disco-mocks `gpu` env (absent on Vista: only `default`
-#            is installed) -- pinned jax[cuda12] 0.10.1 + discodj a687972
-#   gate     DISCO-DJ imports and sees the GPU
+#   guards   both checkouts clean; both `gpu` envs installed from their locks
+#            and disco-mocks' pinned pip layer rebuilt in-job (absent on Vista:
+#            only `default` was installed); jax 0.10.1, discodj a687972 and a
+#            GPU device asserted, inexor + the driver importable
 #   smoke    the whole chain at cdev8 (128^3, 256^3 mesh, 120 steps): fresh
 #            ICs, export, evolve, card. Low k must match the local cdev8 run.
 #   export   cgh64 ICs -> (x, v_d), 6.4 GB
@@ -62,8 +63,26 @@ inexor () { (cd "$INEXOR" && JAX_PLATFORMS=cpu pixi run -e gpu python "$@"); }
 disco () { (cd "$INEXOR" && XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
   pixi run --manifest-path "$DISCO/pixi.toml" -e gpu python "$@"); }
 
-leg setup bash -c "cd '$DISCO' && pixi run -e gpu setup-gpu"
-leg gate disco -c "import jax, discodj; print('discodj', discodj.__file__); print('jax', jax.__version__, jax.devices())"
+# ---- guards: nothing about either checkout or env is assumed
+clean_checkout () {  # tracked files must be unmodified; untracked logs are fine
+  git -C "$1" diff --quiet HEAD || { echo "FATAL: $1 has modified tracked files"; git -C "$1" status -s; return 1; }
+  echo "$1 clean at $(git -C "$1" rev-parse --short HEAD)"
+}
+leg checkout-inexor clean_checkout "$INEXOR"
+leg checkout-disco clean_checkout "$DISCO"
+leg env-inexor bash -c "cd '$INEXOR' && pixi install -e gpu"
+leg env-disco bash -c "cd '$DISCO' && pixi install -e gpu && pixi run -e gpu setup-gpu"
+leg gate-disco disco -c "
+import json, importlib.metadata as md, jax, discodj
+url = json.loads(md.distribution('discodj').read_text('direct_url.json') or '{}')
+commit = url.get('vcs_info', {}).get('commit_id', '')
+print('discodj', md.version('discodj'), commit, discodj.__file__)
+print('jax', jax.__version__, jax.devices())
+assert jax.__version__ == '0.10.1', jax.__version__
+assert commit.startswith('a687972'), commit
+assert jax.devices()[0].platform == 'gpu', jax.devices()
+"
+leg gate-inexor inexor -c "import sys; sys.path.insert(0, 'scripts'); import jax, inexor, v2_m6_realization, v2_disco_crosscheck; print('inexor', inexor.__file__, 'jax', jax.__version__, jax.devices())"
 
 # ---- smoke: cdev8 end to end
 S=$WORK/smoke
