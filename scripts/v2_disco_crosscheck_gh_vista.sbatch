@@ -73,6 +73,9 @@ leg smoke-evolve disco $DRV evolve --in "$S/in.npz" --n-mesh 256 --out "$S/out.n
 leg smoke-card inexor $DRV card --in "$S/out.npz" -- --config cdev8 --k-steps 120 \
   --workdir "$S" --coarse-match-order 3 --slack 0.10 --arena-frac 0.01 --min-weight 1
 
+# SMOKE_ONLY=1 (e.g. on gh-dev) stops here: env build, GPU import and the chain
+if [ "${SMOKE_ONLY:-0}" = 1 ]; then echo "=== SMOKE_ONLY: done $(date) ==="; ls -la "$S"; exit 0; fi
+
 # ---- the cross-check
 leg export inexor $DRV export --config cgh64 --ic-dir "$IC" --k-steps 120 --out "$WORK/in.npz"
 leg evolve disco $DRV evolve --in "$WORK/in.npz" --n-mesh 1024 --out "$WORK/out.npz"
