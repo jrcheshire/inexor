@@ -377,8 +377,12 @@ def _engine_config(g, args, checkpoint_dir):
     return ec
 
 
-def _coeffs(cosmo, k_steps=K_STEPS):
+def _coeffs(cosmo, k_steps=K_STEPS, a_init=None):
     """The BullFrog coefficients and the scale-factor grid for `k_steps` steps.
+
+    `a_init` defaults to the ratified start, a = 0.1 (z = 9). It enters the
+    a-grid and so the coefficients, which the checkpoint fingerprint hashes:
+    arms at different starts cannot cross-resume.
 
     Every arm ends at A_FINAL whatever `k_steps` is, so cards from different
     step counts share their epoch and their k bins and difference directly.
@@ -388,8 +392,37 @@ def _coeffs(cosmo, k_steps=K_STEPS):
     """
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
 
-    a_steps = a_grid(m3.A_INIT, m3.A_FINAL, int(k_steps), m3.SPACING)
+    a0 = m3.A_INIT if a_init is None else float(a_init)
+    if not 0.0 < a0 < m3.A_FINAL:
+        raise SystemExit(f"a_init {a0} must lie in (0, {m3.A_FINAL})")
+    a_steps = a_grid(a0, m3.A_FINAL, int(k_steps), m3.SPACING)
     return bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo)), a_steps
+
+
+def _require_ic_epoch(ic_dir, a_init):
+    """Refuse ICs generated at a different epoch from the run's `a_init`.
+
+    The generator bakes a_init into the displacements (D1, D2) and velocities
+    (f1, f2); the run takes it from the a-grid. Evolving one under the other
+    starts the right field at the wrong time and nothing downstream can see it.
+    A manifest from before `a_init` was recorded is accepted only at the
+    ratified start, which is the only one that existed then.
+    """
+    from inexor import icgen
+
+    with open(os.path.join(ic_dir, icgen.MANIFEST)) as fh:
+        have = json.load(fh).get("a_init")
+    want = float(a_init)
+    if have is None:
+        if want != m3.A_INIT:
+            raise SystemExit(
+                f"the ICs in {ic_dir} record no a_init, so they predate the flag and "
+                f"were made at a = {m3.A_INIT}; this run asks for a_init = {want}")
+        return
+    if abs(float(have) - want) > 1e-12 * want:
+        raise SystemExit(
+            f"the ICs in {ic_dir} were generated at a_init = {float(have)!r}, and "
+            f"this run asks for {want!r}. Regenerate them, or pass the matching --a-init.")
 
 
 def _card(kind, args, body, tag=""):
@@ -457,14 +490,14 @@ def cmd_ics(args):
     t0 = time.perf_counter()
     if args.generator == "device":
         man = icgen.generate_t9_slabs_device(
-            args.workdir, key, g["n_part"], g["L"], _cosmo(), m3.A_INIT, nb,
+            args.workdir, key, g["n_part"], g["L"], _cosmo(), args.a_init, nb,
             fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
             pencil_batch=args.pencil_batch, noise=args.noise, provenance=prov,
             log=lambda line: print(line, flush=True),
         )
     else:
         man = icgen.generate_t9_slabs(
-            args.workdir, key, g["n_part"], g["L"], _cosmo(), m3.A_INIT, nb,
+            args.workdir, key, g["n_part"], g["L"], _cosmo(), args.a_init, nb,
             fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
             provenance=prov,
         )
@@ -493,7 +526,7 @@ def cmd_run(args):
     from inexor import engine, icgen
 
     cosmo = _cosmo()
-    co, a_steps = _coeffs(cosmo, args.k_steps)
+    co, a_steps = _coeffs(cosmo, args.k_steps, args.a_init)
     d = _ckpt_dir(args)
     os.makedirs(d, exist_ok=True)
     ec = _engine_config(g, args, d)
@@ -519,6 +552,7 @@ def cmd_run(args):
                   f"{int(resume['step'])} of {args.k_steps}.")
             return 0
     else:
+        _require_ic_epoch(args.workdir, args.a_init)
         st = icgen.load_slot_state(
             args.workdir, brick_slack=args.slack, alloc_margin=args.alloc_margin,
             arena_frac=args.arena_frac, alloc=allocator,
@@ -681,8 +715,9 @@ def _ic_state(args, alloc=None):
             f"--ic-dir {args.ic_dir} is a CHECKPOINT, not an IC generation. "
             "Carding it here would place it at step 0 and score it against the "
             "a = %.4f oracle. Drop --ic-dir to card the newest checkpoint."
-            % float(m3.A_INIT)
+            % float(args.a_init)
         )
+    _require_ic_epoch(args.ic_dir, args.a_init)
     return icgen.load_slot_state(
         args.ic_dir, brick_slack=args.slack, alloc_margin=args.alloc_margin,
         arena_frac=args.arena_frac, alloc=alloc,
@@ -695,7 +730,7 @@ def cmd_export(args):
     from inexor import export
 
     cosmo = _cosmo()
-    co, a_steps = _coeffs(cosmo, args.k_steps)
+    co, a_steps = _coeffs(cosmo, args.k_steps, args.a_init)
     ec = _engine_config(g, args, _ckpt_dir(args))
     st, step = _state_at_head(args, ec, co)
     if step < args.k_steps and not args.allow_partial:
@@ -781,7 +816,7 @@ def cmd_card(args):
     from inexor.executor import SharedAllocator, TilePool, malloc_trim
 
     cosmo = _cosmo()
-    co, a_steps = _coeffs(cosmo, args.k_steps)
+    co, a_steps = _coeffs(cosmo, args.k_steps, args.a_init)
     ec = _engine_config(g, args, _ckpt_dir(args))
 
     # THE PAINT IS THE CARD'S LARGEST STAGE AND IT IS THE ONE THAT POOLS.
@@ -923,6 +958,10 @@ def main():
                          "ladder. Box and both meshes are held, so only the "
                          "interparticle spacing varies. A different n_part at the "
                          "same seed is an UNRELATED realization")
+    ap.add_argument("--a-init", type=float, default=m3.A_INIT,
+                    help="starting scale factor, for ICs and the step grid alike "
+                         "(default the ratified 0.1, z = 9). Loading ICs made at "
+                         "another epoch is refused")
     ap.add_argument("--coarse-match-order", type=int, default=2, choices=(2, 3),
                     help="assignment order the coarse match factor divides out. "
                          "2 (CIC) is the ratified arm; the coarse arm paints TSC, "

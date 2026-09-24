@@ -71,6 +71,7 @@ class _Args:
         self.slack = 0.10
         self.alloc_margin = 0.10
         self.arena_frac = 0.01
+        self.a_init = rlz.m3.A_INIT
 
 
 def _manifest(d, kind):
@@ -262,3 +263,92 @@ def test_every_phase_passes_n_part():
 
     for fn in (rlz.cmd_ics, rlz.cmd_run, rlz.cmd_export, rlz.cmd_card):
         assert "args.n_part)" in inspect.getsource(fn), fn.__name__
+
+
+# --- the starting epoch ------------------------------------------------------
+# Every run on record started at a = 0.1 with 2LPT, the late-start case DISCO-DJ
+# II's Appendix A.2 names. `--a-init` moves it; the guard keeps ICs and the step
+# grid on the same epoch.
+
+
+def _epoch_manifest(d, a_init):
+    import json
+
+    from inexor import icgen
+
+    d.mkdir(parents=True, exist_ok=True)
+    body = {"schema": "t9-slabs-2", "provenance": {}}
+    if a_init is not None:
+        body["a_init"] = a_init
+    (d / icgen.MANIFEST).write_text(json.dumps(body))
+    return d
+
+
+def test_the_default_grid_starts_at_the_ratified_epoch():
+    a = rlz._coeffs(rlz._cosmo(), 40)[1]
+    assert a[0] == rlz.m3.A_INIT and a[-1] == rlz.m3.A_FINAL
+
+
+def test_an_early_start_moves_only_the_start():
+    a = rlz._coeffs(rlz._cosmo(), 160, 1.0 / 51.0)[1]
+    assert np.isclose(a[0], 1.0 / 51.0) and a[-1] == rlz.m3.A_FINAL and len(a) == 161
+
+
+def test_a_different_start_is_a_different_fingerprint():
+    import argparse
+
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    from inexor.engine import checkpoint_fingerprint
+
+    a = argparse.Namespace(slack=0.10, tile_workers=1, checkpoint_every=5,
+                           migrate_pooled=None, eject_kernel="jax")
+    ec = rlz._engine_config(rlz._geom("cdev8"), a, "/tmp/nowhere")
+    f0 = checkpoint_fingerprint(ec, rlz._coeffs(rlz._cosmo(), 40)[0])
+    f1 = checkpoint_fingerprint(ec, rlz._coeffs(rlz._cosmo(), 40, 1.0 / 51.0)[0])
+    assert f0 != f1
+
+
+def test_a_start_outside_the_run_is_refused():
+    import pytest
+
+    for bad in (0.0, 1.0, 1.5):
+        with pytest.raises(SystemExit):
+            rlz._coeffs(rlz._cosmo(), 40, bad)
+
+
+def test_ics_at_the_run_epoch_are_accepted(tmp_path):
+    rlz._require_ic_epoch(str(_epoch_manifest(tmp_path / "a", 1.0 / 51.0)), 1.0 / 51.0)
+    rlz._require_ic_epoch(str(_epoch_manifest(tmp_path / "b", 0.1)), 0.1)
+
+
+def test_ics_at_another_epoch_are_refused(tmp_path):
+    import pytest
+
+    d = str(_epoch_manifest(tmp_path / "a", 0.1))
+    with pytest.raises(SystemExit) as e:
+        rlz._require_ic_epoch(d, 1.0 / 51.0)
+    assert "a_init" in str(e.value)
+
+
+def test_a_manifest_without_an_epoch_is_only_the_ratified_start(tmp_path):
+    import pytest
+
+    d = str(_epoch_manifest(tmp_path / "old", None))
+    rlz._require_ic_epoch(d, rlz.m3.A_INIT)
+    with pytest.raises(SystemExit):
+        rlz._require_ic_epoch(d, 1.0 / 51.0)
+
+
+def test_every_phase_reads_the_start():
+    """Vacuity guard: a phase still reading the constant would build its grid
+    from z = 9 under ICs made at z = 50."""
+    import inspect
+
+    for fn in (rlz.cmd_ics, rlz.cmd_run, rlz.cmd_export, rlz.cmd_card):
+        src = inspect.getsource(fn)
+        assert "m3.A_INIT" not in src, f"{fn.__name__} still reads the constant"
+        assert "args.a_init" in src, f"{fn.__name__} never reads the flag"
+    src = inspect.getsource(rlz.cmd_run)
+    assert "_require_ic_epoch(args.workdir, args.a_init)" in src
