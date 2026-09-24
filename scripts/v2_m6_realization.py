@@ -493,13 +493,13 @@ def cmd_ics(args):
             args.workdir, key, g["n_part"], g["L"], _cosmo(), args.a_init, nb,
             fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
             pencil_batch=args.pencil_batch, noise=args.noise, provenance=prov,
-            log=lambda line: print(line, flush=True),
+            bucket_cells=args.bucket_cells, log=lambda line: print(line, flush=True),
         )
     else:
         man = icgen.generate_t9_slabs(
             args.workdir, key, g["n_part"], g["L"], _cosmo(), args.a_init, nb,
             fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
-            provenance=prov,
+            provenance=prov, bucket_cells=args.bucket_cells,
         )
     wall = time.perf_counter() - t0
     peak = _maxrss_bytes()
@@ -970,6 +970,10 @@ def main():
     ap.add_argument("--buf", type=int, default=None,
                     help="override the buffer in FINE CELLS. Changes beta and the "
                          "split's truncation error, both of which get printed")
+    ap.add_argument("--bucket-cells", type=int, default=2,
+                    help="ics: position bucket side in particle cells (D-v2-14 "
+                         "ratifies 2). The quantum is bucket/256, so 1 halves it. "
+                         "Recorded in the manifest; run and card inherit it")
     ap.add_argument("--keep-stage", action="store_true",
                     help="keep the IC intermediates (~687 GB at 2048^3)")
     ap.add_argument("--generator", default="host", choices=("host", "device"),
