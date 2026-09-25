@@ -1375,7 +1375,7 @@ ratifying it did not measure it.
 
 ## D-v2-25 -- LCDM BullFrog weights and 2LPT growth; the TSC-order coarse match as default
 
-- **Status:** PROPOSED (drafted 2026-09-25; JC ratifies). Supersedes D-013's
+- **Status:** ACCEPTED (JC, 2026-09-25; merged in PR #5). Supersedes D-013's
   convention ledger item (2) as a statement about which convention is correct
   (D-013 itself stands as the record of the v1 parity arms), and D-v2-10's
   CIC-order coarse match as the production default.

@@ -131,7 +131,7 @@ explicit `--mem` (see the umbrella albireo memory).
   the load-bearing novel pieces.
 - `docs/roadmap.md` — master plan M0-M4; M0 is a HARD go/no-go gate; each
   milestone gets a fresh detailed plan at its opening session.
-- `docs/decisions.md` — ADR log (D-001..D-015, D-v2-8..D-v2-24; D-v2-1..7 live
+- `docs/decisions.md` — ADR log (D-001..D-015, D-v2-8..D-v2-25; D-v2-1..7 live
   in the plan-plan table). Locked until re-litigated with JC. Note two ADRs
   supersede parts of D-v2-14: D-v2-19 (clause 3, layout) and D-v2-20 (clause
   2's index term) — read those before quoting a B/p figure.
