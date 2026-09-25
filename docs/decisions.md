@@ -1434,4 +1434,9 @@ ratifying it did not measure it.
     DISCO-DJ's tabulated growth); kick weight -> (3/2) Omega_m/f^2 at first
     order in the step (`tests/test_growth2.py`);
   - full suite 990 passed / 23 skipped after the fixes above.
-  Not yet run: the 512^3 re-score against EE2.
+  512^3 / 256 Mpc/h (Vista gg 1023904 engine, gg 1023911 DISCO-DJ on the
+  same fresh LCDM ICs, CPU backend): engine / DISCO-DJ max |r - 1| = 2.3e-4
+  over all 61 bins (a flat -2e-4 below k ~ 1.2, unattributed); B / B_EE2 =
+  1.030 / 0.995 / 0.966 at k = 0.5 / 1.0 / 1.5, against 1.000 / 0.913 / 0.840
+  with the EdS weights on the same seed (1018341).
+  Figure: `figures/lcdm_weights_512_vs_ee2.png`.
