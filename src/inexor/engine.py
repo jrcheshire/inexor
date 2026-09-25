@@ -1999,7 +1999,7 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
         if prov.get("kind") != "inexor-checkpoint":
             continue
         if best is None or int(prov["step"]) > int(best[1]["step"]):
-            best = (d, prov, man)
+            best = (d, dict(prov, gen=gen), man)
     if best is None:
         raise FileNotFoundError(
             f"no complete inexor checkpoint under {checkpoint_dir}: either nothing ran, or "
@@ -2178,7 +2178,12 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                     f"{k_end % cfg.checkpoint_every} step(s) past its last checkpoint and "
                     "throw that work away. Move the stop onto a checkpoint boundary."
                 )
-        n_ckpt = 0
+        # A resumed run's first write goes to the generation it did NOT load, so
+        # the state it resumed from survives until a newer one is complete; the
+        # write unlinks its target's manifest first, so always starting at gen 0
+        # meant a segment dying mid-write rolled back past its own resume point,
+        # or left nothing loadable when gen 1 was still empty.
+        n_ckpt = 0 if resume is None else 1 - int(resume.get("gen", 1))
         for k in range(k0, k_end):
             repack_due = bool(cfg.repack_every and (k + 1) % cfg.repack_every == 0)
             timings = {} if k in timed_steps else None

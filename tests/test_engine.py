@@ -1,11 +1,12 @@
 """The v2 engine core: BullFrog PM on T9 state in slot order (M-v2-3, S5)."""
 
+import json
 import os
 
 import numpy as np
 import pytest
 
-from inexor import engine, forces, painting, state
+from inexor import engine, forces, icgen, painting, state
 from inexor.codec import T9Layout
 from inexor.config import Cosmology
 from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table, float_step_bullfrog
@@ -903,6 +904,31 @@ def test_a_run_split_into_segments_is_bitwise_the_uninterrupted_one(tmp_path):
         last = st_r
 
     np.testing.assert_array_equal(_rows(ref), _rows(last))
+
+
+def test_a_resumed_segment_writes_first_to_the_generation_it_did_not_load(tmp_path):
+    """A resumed segment must not overwrite its own resume point before a newer
+    state exists. One checkpoint per segment is the case that exposed it: with
+    the counter restarting at gen 0 every segment, each one rewrote the state it
+    had just loaded and gen 1 was never written at all."""
+    co = _coeffs(6)
+    d = str(tmp_path / "seg")
+    cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=2)
+    st = _ck_state(cfg_c)
+    out = engine.run(st, cfg_c, co, stop_at=2)
+    assert out[-1]["checkpoint"].endswith("gen0")
+    del st
+    for stop, want_gen in ((4, "gen1"), (6, "gen0")):
+        st_r, resume = engine.load_checkpoint(d, cfg_c, co, arena_frac=0.05)
+        assert f"gen{resume['gen']}" != want_gen
+        out = engine.run(st_r, cfg_c, co, resume=resume, stop_at=stop)
+        assert out[-1]["checkpoint"].endswith(want_gen), (
+            f"segment to step {stop} wrote {out[-1]['checkpoint']}, over its resume point")
+    steps = {}
+    for g in ("gen0", "gen1"):
+        with open(os.path.join(d, g, icgen.MANIFEST)) as fh:
+            steps[g] = json.load(fh)["provenance"]["step"]
+    assert steps == {"gen0": 6, "gen1": 4}
 
 
 def test_stop_at_refuses_to_discard_a_segments_work(tmp_path):
