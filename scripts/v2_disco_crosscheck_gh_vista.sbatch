@@ -41,11 +41,14 @@ INEXOR=$HOME/src/inexor
 DISCO=$HOME/src/disco-mocks
 RUNS=/scratch/10303/jrc4/inexor_runs
 WORK=$RUNS/disco-xcheck-$SLURM_JOB_ID
-IC=$RUNS/match-order-1018341/ics
+# IC_DIR overrides the realization (e.g. a chained engine job's fresh ICs); the
+# default is the EdS-era corrected-match realization mo3_1018341_k120 carded
+IC=${IC_DIR:-$RUNS/match-order-1018341/ics}
 DRV=scripts/v2_disco_crosscheck.py
 mkdir -p "$WORK"
 
 echo "=== $(hostname) job $SLURM_JOB_ID $(date) ==="
+echo "ICs: $IC"
 git -C "$INEXOR" log --oneline -1
 git -C "$DISCO" log --oneline -1
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
