@@ -74,9 +74,12 @@ unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
 
 RUNS=/scratch/10303/jrc4/inexor_runs
-SRC=$RUNS/d7-1009133
+# SRC_RUN / PROD_DIR / K_STEPS override the run this reads; the defaults are 1009133's
+SRC=${SRC_RUN:-$RUNS/d7-1009133}
+K_STEPS=${K_STEPS:-40}
+export K_STEPS
 WORK=$RUNS/d7g-$SLURM_JOB_ID
-PROD=$RUNS/d7-1009133-product
+PROD=${PROD_DIR:-$RUNS/d7-1009133-product}
 CARDS=runs/v2
 DRIVER=scripts/v2_d7_hero_smoke.py
 TAG=d7g_$SLURM_JOB_ID
@@ -89,7 +92,21 @@ mkdir -p "$WORK" "$PROD"
 export PROD
 
 ln -sfn "$SRC/hero-ckpt" "$PROD/ckpt"
-[ -e "$PROD/ckpt/gen1/manifest.json" ] || { echo "FATAL: no step-40 manifest under $PROD/ckpt"; exit 1; }
+# the NEWEST complete generation must be the schedule's last step; which generation
+# holds it depends on how the run was segmented, so it is read, not assumed
+HEAD_MAN=$(python3 -c "
+import json, os
+best = None
+for g in (0, 1):
+    p = os.path.join('$PROD/ckpt', 'gen%d' % g, 'manifest.json')
+    if os.path.exists(p):
+        s = json.load(open(p))['provenance']['step']
+        if best is None or s > best[0]:
+            best = (s, p)
+print(best[1] if best and best[0] == $K_STEPS else '')
+")
+[ -n "$HEAD_MAN" ] || { echo "FATAL: no step-$K_STEPS manifest under $PROD/ckpt"; exit 1; }
+export HEAD_MAN
 # An export directory left by a killed run holds full-looking, short arrays. The
 # header is written LAST and removed FIRST, so its absence beside data files is
 # exactly that case; refuse rather than write into it.
@@ -102,7 +119,7 @@ fi
 echo "=== $(hostname): commit $(git rev-parse --short HEAD), job $SLURM_JOB_ID, $(date) ==="
 free -g | head -2
 df -h "$RUNS" | tail -1
-python3 -c "import json;d=json.load(open('$PROD/ckpt/gen1/manifest.json'));print('source checkpoint:', d['provenance']['step'], 'of', d['provenance']['n_steps'])"
+python3 -c "import json;d=json.load(open('$HEAD_MAN'));print('source checkpoint:', d['provenance']['step'], 'of', d['provenance']['n_steps'])"
 numactl --hardware | head -4
 
 ( while true; do t=$(date +%s.%N)
@@ -153,9 +170,9 @@ import os
 args = argparse.Namespace(slack=0.10, tile_workers=16, checkpoint_every=10,
                           migrate_pooled=None, eject_kernel="jax")
 ec = _engine_config(_geom("c-hero"), args, os.environ["PROD"] + "/ckpt")
-co, _ = _coeffs(_cosmo())
+co, _ = _coeffs(_cosmo(), int(os.environ["K_STEPS"]))
 want = checkpoint_fingerprint(ec, co)
-have = json.load(open(os.environ["PROD"] + "/ckpt/gen1/manifest.json"))["provenance"]["fingerprint"]
+have = json.load(open(os.environ["HEAD_MAN"]))["provenance"]["fingerprint"]
 print("fingerprint want", want, "\nfingerprint have", have)
 sys.exit(0 if want == have else 1)
 ' \
@@ -192,7 +209,7 @@ du -sh "$WORK/cgh64-prod/export"
 # --- THE 4096^3 EXPORT. 1.65 TB, decode-bound, one call.
 run_leg hero-export \
   $CPU $BIND pixi run -e gpu python scripts/v2_m6_realization.py export --config c-hero \
-    --workdir "$PROD" $LAYOUT $HB --export-dir "$PROD/export"
+    --workdir "$PROD" --k-steps "$K_STEPS" $LAYOUT $HB --export-dir "$PROD/export"
 rc_export=$?
 
 echo ""
