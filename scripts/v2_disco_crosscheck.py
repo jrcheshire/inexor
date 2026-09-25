@@ -139,6 +139,47 @@ def cmd_evolve(args):
     return 0
 
 
+def _two_level_force(meta):
+    """The engine's two-level force on unquantized f64 positions.
+
+    The M-v2-3 gate's never-quantized reference (`v2_m3_engine_gate.leg_accumulated`):
+    coarse long arm + tiled short arm, both integer-painted, at the production
+    config (coarse match order 3). Against the engine it differs only in the T9
+    state codec; against `mono` only in the split.
+    """
+    import jax.numpy as jnp
+
+    import v2_g5_core as probe
+    import v2_m3_engine_gate as m3
+    import v2_m6_realization as R
+    from inexor import engine
+    from inexor import forces as F
+
+    g = R._geom(meta["config"])
+    ec = engine.EngineConfig(
+        box_size=g["L"], n_part=g["n_part"], n_fine=g["n_fine"], n_coarse=g["n_coarse"],
+        n_tile=g["tile"], b_fine=g["buf"], alpha=m3.ALPHA, coarse_match_order=3,
+    )
+    ec.validate()
+    n_tot = g["n_part"] ** 3
+
+    def force_fn(xx):
+        xn = np.asarray(xx, dtype=np.float64)
+        g_long, _ = F.force_global(xn, g["n_coarse"], g["L"], n_tot, "long", r_s=ec.r_s,
+                                   match=ec.coarse_match, assign="tsc", paint="int")
+        b_real, n_brick = ec._b_realized, ec.n_brick
+        order, starts, nbk = probe.brick_buckets(xn, g["n_fine"], n_brick, g["L"] / g["n_fine"])
+        capp, _ = probe.tile_capacity(order, starts, nbk, ec.tiles, g["tile"], b_real, n_brick)
+        g_short, _ = F.force_short_tiled(
+            xn, g["n_fine"], g["L"], n_tot, g["tile"], g["buf"],
+            lambda t: probe.tile_members(order, starts, nbk, t, g["tile"], b_real, n_brick),
+            capp, r_s=ec.r_s, paint="int",
+        )
+        return jnp.asarray(g_long + g_short)
+
+    return force_fn
+
+
 def cmd_evolve_mono(args):
     """Our own single-mesh PM on the same injected (x, v_d): the arm between the two.
 
@@ -147,6 +188,8 @@ def cmd_evolve_mono(args):
     driven by the engine's own BullFrog coefficients through the float reference
     driver. Against DISCO-DJ it differs only in operator and stepper conventions
     (D-013's ledger); against the engine only in the two-level machinery.
+    `--force two-level` swaps in the engine's own split force, unquantized
+    (`_two_level_force`), to separate the split from the state codec.
     """
     os.environ.setdefault("JAX_ENABLE_X64", "1")
     import jax
@@ -170,16 +213,22 @@ def cmd_evolve_mono(args):
         raise SystemExit(f"the export's a-grid is not the one these coefficients were built "
                          f"on (max |da| {da:.3e})")
     n_tot = n_part**3
-    print(f"== evolve inexor mono: {n_part}^3 particles, L={L}, PM mesh {args.n_mesh}^3 "
-          f"(cic, f64), {len(co)} BullFrog steps a={a_steps[0]:.4f}->{a_steps[-1]:.4f}, "
+    fdesc = (f"PM mesh {args.n_mesh}^3 (cic, f64)" if args.force == "mono"
+             else "the engine's two-level force, unquantized")
+    print(f"== evolve inexor {args.force}: {n_part}^3 particles, L={L}, {fdesc}, "
+          f"{len(co)} BullFrog steps a={a_steps[0]:.4f}->{a_steps[-1]:.4f}, "
           f"growth2 {growth2}",
           flush=True)
 
     t_last = [time.perf_counter()]
+    two_level = _two_level_force(meta) if args.force == "two-level" else None
 
     def force_fn(x):
-        g, _ = forces.force_global(np.asarray(x, np.float64), args.n_mesh, L, n_tot, "mono",
-                                   assign="cic", paint="f64")
+        if two_level is not None:
+            g = two_level(x)
+        else:
+            g, _ = forces.force_global(np.asarray(x, np.float64), args.n_mesh, L, n_tot,
+                                       "mono", assign="cic", paint="f64")
         now = time.perf_counter()
         print(f"    force {now - t_last[0]:6.2f}s", flush=True)
         t_last[0] = now
@@ -191,8 +240,10 @@ def cmd_evolve_mono(args):
     wall = time.perf_counter() - t0
     print(f"  evolve wall {wall:.1f} s", flush=True)
     meta.update(n_mesh=args.n_mesh, precision="double", evolve_wall_s=wall,
-                code="inexor-mono",
-                settings="force_global mono, cic, f64 paint, float_run_bullfrog_sync")
+                code=f"inexor-{args.force}",
+                settings=("force_global mono, cic, f64 paint" if two_level is None else
+                          "engine two-level force (order 3), unquantized")
+                + ", float_run_bullfrog_sync")
     _save(args.out, x=np.mod(np.asarray(X, np.float64), L), v_d=np.asarray(V, np.float64),
           a_steps=d["a_steps"], meta=meta)
     return 0
@@ -256,7 +307,9 @@ def main():
     v.add_argument("--out", required=True)
     m = sub.add_parser("evolve-mono")
     m.add_argument("--in", dest="inp", required=True)
-    m.add_argument("--n-mesh", type=int, required=True)
+    m.add_argument("--n-mesh", type=int, required=True,
+                   help="the single mesh; ignored by --force two-level (config meshes)")
+    m.add_argument("--force", default="mono", choices=("mono", "two-level"))
     m.add_argument("--out", required=True)
     c = sub.add_parser("card")
     c.add_argument("--in", dest="inp", required=True)
