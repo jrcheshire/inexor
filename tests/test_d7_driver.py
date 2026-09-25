@@ -123,24 +123,38 @@ def test_node_list_parses_ranges_and_lists():
     assert d7._node_list("0,1") == {0, 1} and d7._node_list("0-3") == {0, 1, 2, 3}
 
 
+@pytest.fixture
+def _restore_x64():
+    """The driver turns x64 on for the process, as its own jobs need; put it back so
+    the tests after these in one pytest leg see the flag they would have seen."""
+    import jax
+
+    prev = jax.config.jax_enable_x64
+    yield
+    jax.config.update("jax_enable_x64", prev)
+
+
 def _slabs(d):
     return {f: open(os.path.join(d, f), "rb").read()
             for f in sorted(os.listdir(d)) if f != "manifest.json"}
 
 
-def test_a_segmented_run_resumes_to_the_uninterrupted_state_and_refuses_misuse(tmp_path):
+def test_a_segmented_run_resumes_to_the_uninterrupted_state_and_refuses_misuse(tmp_path,
+                                                                               _restore_x64):
     """The driver's segment path, which a 120-step 4096^3 realization needs because
     the schedule is longer than a queue's wall: two segments with a resume between
     them land bitwise on the uninterrupted run, and the two ways a batch script can
     get a resume wrong -- restarting from the ICs onto a live checkpoint directory,
     or resuming from a step it was not submitted for -- refuse instead of burning
-    the wall."""
+    the wall. The ICs come from the device generator because the host one refuses a
+    GPU backend, and this file runs in the GPU pytest leg of the hero jobs."""
     import json
 
     import v2_m6_realization as m6
 
     ics = str(tmp_path / "ics")
-    m6.cmd_ics(m6.build_parser().parse_args(["ics", "--config", "smoke", "--workdir", ics]))
+    m6.cmd_ics(m6.build_parser().parse_args(
+        ["ics", "--config", "smoke", "--workdir", ics, "--generator", "device"]))
 
     def run(ckpt, stop, expect=0):
         return d7.main(["run", "--preset", "smoke", "--workdir", ics, "--cards", "1",
@@ -164,13 +178,14 @@ def test_a_segmented_run_resumes_to_the_uninterrupted_state_and_refuses_misuse(t
     assert prov.get("a") is not None, "the checkpoint does not record its epoch"
 
 
-def test_the_driver_refuses_ics_generated_with_another_growth2(tmp_path):
+def test_the_driver_refuses_ics_generated_with_another_growth2(tmp_path, _restore_x64):
     import json
 
     import v2_m6_realization as m6
 
     ics = str(tmp_path / "ics")
-    m6.cmd_ics(m6.build_parser().parse_args(["ics", "--config", "smoke", "--workdir", ics]))
+    m6.cmd_ics(m6.build_parser().parse_args(
+        ["ics", "--config", "smoke", "--workdir", ics, "--generator", "device"]))
     p = os.path.join(ics, "manifest.json")
     with open(p) as fh:
         man = json.load(fh)
