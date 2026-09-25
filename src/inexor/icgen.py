@@ -34,7 +34,9 @@ would catch a violation anyway, and the two failing together is the design.
 
 import json
 import os
+import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -42,7 +44,7 @@ from . import ic, ooc_fft
 from .codec import INT16_MAX, T9Layout
 from .cosmology import growth_factor_2, growth_factor_a, growth_rate_2, growth_rate_a, ic_k_table
 from .layout import DEFAULT_INDEX_DTYPE, _stable_sort_index, _to_index
-from .lpt import lpt2_source_from_spec
+from .lpt import _DIAG, _OFFDIAG, lpt2_source_from_spec
 from .state import (
     SlotState,
     _alloc_geometry,
@@ -156,6 +158,7 @@ def generate_t9_slabs(
     window=1,
     provenance=None,
     keep_stage=False,
+    growth2="lcdm",
 ):
     """Generate T9-encoded initial-condition slabs on disk.
 
@@ -229,8 +232,8 @@ def generate_t9_slabs(
     # --- U/V staging + the exact velocity scale and displacement bound -----
     D1 = growth_factor_a(a_init, cosmo)
     f1 = growth_rate_a(a_init, cosmo)
-    D2 = growth_factor_2(a_init, cosmo)
-    f2 = growth_rate_2(a_init, cosmo)
+    D2 = growth_factor_2(a_init, cosmo, growth2)
+    f2 = growth_rate_2(a_init, cosmo, growth2)
     v_coef2 = -(D2 * f2) / (D1 * f1)
     vmax = 0.0
     umax = 0.0
@@ -267,14 +270,103 @@ def generate_t9_slabs(
         )
 
     # --- emission: brick-aligned x-slabs through the sliding window --------
-    per = t9.n_buckets_side // nb
-    per3 = per**3
-    planes = n // nb  # particle planes per brick slab
-    coords = np.arange(n, dtype=dt) * dt.type(box / n)  # lagrangian_grid's exact values
     u_ro = [ooc_fft.StagedArray.open(os.path.join(stage, f"u_{ax}.npy"), dt, (n, n, n))
             for ax in range(3)]
     v_ro = [ooc_fft.StagedArray.open(os.path.join(stage, f"v_{ax}.npy"), dt, (n, n, n))
             for ax in range(3)]
+    written, n_total = _emit_t9_slabs(workdir, u_ro, v_ro, t9, n, box, nb, dt, slab, window)
+
+    manifest = dict(
+        schema=SCHEMA,
+        files=written,
+        n_particles=n_total,
+        vel_scale=float(scale),
+        max_displacement=float(umax),
+        window=window,
+        box_size=box,
+        n_part=n,
+        bucket_cells=int(bucket_cells),
+        bricks_per_side=nb,
+        a_init=float(a_init),
+        order=order,
+        growth2=growth2,
+        f_NL=float(f_NL),
+        fdtype=dt.name,
+        slab=int(slab),
+        ic_stream=ic.IC_STREAM,
+        backend=backend,
+        table_n_points=int(len(tab.k)),
+        mean_phi2=float(mean_phi2),
+        provenance=provenance or {},
+    )
+    return _write_manifest(workdir, manifest, keep_stage)
+
+
+def _write_manifest(workdir, manifest, keep_stage):
+    """Clean the stage (unless kept), then write the manifest carrying the report."""
+    # AFTER the manifest, and the manifest is rewritten to carry the report:
+    # cleaning first would delete the working set of a generation that then
+    # failed to complete, and reporting nothing would leave "was it cleaned?"
+    # answerable only by looking at a directory that may since have been reused.
+    if keep_stage:
+        manifest["stage_cleanup"] = dict(kept=True, reason="keep_stage=True")
+    else:
+        try:
+            manifest["stage_cleanup"] = cleanup_stage(workdir)
+        except OSError as e:
+            # Housekeeping must never cost a completed generation its manifest.
+            # At C-hero this is a multi-hour product and the intermediates are
+            # a disk bill; an unwritable stage directory is the wrong reason to
+            # lose the run. Recorded loudly instead.
+            manifest["stage_cleanup"] = dict(error=str(e), removed=[], bytes=0)
+    with open(os.path.join(workdir, MANIFEST), "w") as fh:
+        json.dump(manifest, fh, indent=1)
+    return manifest
+
+
+def _sort_slab_rows(keyf, lo_bucket):
+    """Stable brick-major order of one destination slab's rows, keyed RELATIVE to the slab.
+
+    The global bucket ordinal reaches 2048^3 = 8.6e9 at 4096^3, past
+    `_stable_sort_index`'s 2^32 (Vista 997280 died on slab 128 of 256); a slab's
+    own span is nb^2 * per3. Subtracting a constant keeps the order.
+    """
+    return _stable_sort_index(np.asarray(keyf, dtype=np.int64) - int(lo_bucket))
+
+
+def _write_t9_slab(workdir, d, occ, off, w, scale_d, lo_bucket, lo_brick):
+    """Write destination slab `d` as `t9_slab_{d:04d}.npz` (schema `SCHEMA`, crc32 per
+    array); returns the file name. The ONE writer both emissions use."""
+    meta = dict(
+        schema=SCHEMA,
+        bx=int(d),
+        n_rows=int(len(off)),
+        bucket_lo=int(lo_bucket),
+        brick_lo=int(lo_brick),
+        crc32=dict(
+            occupancy=zlib.crc32(occ.tobytes()),
+            off=zlib.crc32(off.tobytes()),
+            w=zlib.crc32(w.tobytes()),
+            scale=zlib.crc32(scale_d.tobytes()),
+        ),
+    )
+    path = os.path.join(workdir, f"t9_slab_{int(d):04d}.npz")
+    np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w, scale=scale_d)
+    return os.path.basename(path)
+
+
+def _emit_t9_slabs(workdir, u_ro, v_ro, t9, n, box, nb, dt, slab, window):
+    """Emission: Lagrangian x-slabs through a sliding window into per-destination T9 files.
+
+    `u_ro` / `v_ro` are three readers each (`read_slab(lo, hi)` -> (hi-lo, N, N)
+    displacement / velocity planes, any storage). Returns `(written, n_total)`.
+    Shared by both generators; the op sequence is the one the bitwise gate
+    against `SlotState.build` was established on.
+    """
+    per = t9.n_buckets_side // nb
+    per3 = per**3
+    planes = n // nb  # particle planes per brick slab
+    coords = np.arange(n, dtype=dt) * dt.type(box / n)  # lagrangian_grid's exact values
 
     staged = {d: {} for d in range(nb)}  # dest slab -> {src slab: contribution}
     done_src = np.zeros(nb, dtype=bool)
@@ -294,9 +386,9 @@ def generate_t9_slabs(
                else np.empty((0, 3), np.uint8))
         v = (np.concatenate([p[2] for p in parts]) if parts
              else np.empty((0, 3), np.float64))
-        order = _stable_sort_index(keyf)
-        keyf, off, v = keyf[order], off[order], v[order]
         lo_bucket = d * nb * nb * per3
+        order = _sort_slab_rows(keyf, lo_bucket)
+        keyf, off, v = keyf[order], off[order], v[order]
         occ = np.bincount(keyf - lo_bucket, minlength=nb * nb * per3).astype(np.int64)
         # ONE SCALE PER BRICK, over this slab's bricks only -- which is sound
         # because a brick belongs to exactly one x-slab, so no other slab can
@@ -309,23 +401,8 @@ def generate_t9_slabs(
         bcounts = occ.reshape(nb * nb, per3).sum(axis=1)
         scale_d = _scales_from_sorted(np.abs(v).max(axis=1), bcounts)
         w = _encode_at(v, scale_d[keyf // per3 - lo_brick])
-        meta = dict(
-            schema=SCHEMA,
-            bx=d,
-            n_rows=int(len(keyf)),
-            bucket_lo=int(lo_bucket),
-            brick_lo=int(lo_brick),
-            crc32=dict(
-                occupancy=zlib.crc32(occ.tobytes()),
-                off=zlib.crc32(off.tobytes()),
-                w=zlib.crc32(w.tobytes()),
-                scale=zlib.crc32(scale_d.tobytes()),
-            ),
-        )
-        path = os.path.join(workdir, f"t9_slab_{d:04d}.npz")
-        np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w, scale=scale_d)
         staged[d].clear()
-        written.append(os.path.basename(path))
+        written.append(_write_t9_slab(workdir, d, occ, off, w, scale_d, lo_bucket, lo_brick))
         return len(keyf)
 
     finalized = np.zeros(nb, dtype=bool)
@@ -375,6 +452,267 @@ def generate_t9_slabs(
     assert finalized.all()
     if n_total != n**3:
         raise RuntimeError(f"emitted {n_total} particles, expected {n**3}")
+    return written, n_total
+
+
+class _HostField:
+    """`read_slab` over a host (N, N, N) array."""
+
+    def __init__(self, arr):
+        self.arr = arr
+
+    def read_slab(self, lo, hi):
+        return self.arr[lo:hi]
+
+
+class _CardField:
+    """`read_slab` over card shards tiling x-planes [0, N) (`{lo, hi, delta}` dicts)."""
+
+    def __init__(self, shards):
+        self.shards = sorted(shards, key=lambda s: int(s["lo"]))
+
+    def read_slab(self, lo, hi):
+        parts = []
+        for s in self.shards:
+            s_lo, s_hi = int(s["lo"]), int(s["hi"])
+            a, b = max(lo, s_lo), min(hi, s_hi)
+            if a < b:
+                parts.append(np.asarray(s["delta"][a - s_lo:b - s_lo]))
+        return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+
+def generate_t9_slabs_device(
+    workdir,
+    key,
+    n_part,
+    box_size,
+    cosmo,
+    a_init,
+    bricks_per_side,
+    bucket_cells=2,
+    f_NL=0.0,
+    order=2,
+    fdtype=np.float32,
+    slab=32,
+    backend="eh98",
+    table=None,
+    window=1,
+    provenance=None,
+    keep_stage=False,
+    growth2="lcdm",
+    devices=None,
+    pencil_batch=1,
+    noise="device",
+    log=None,
+    emission="cards",
+):
+    """`generate_t9_slabs` with the IC stage on the cards (D6). Same arguments and output format.
+
+    Extra arguments: `devices` (default every jax device), `pencil_batch`,
+    `noise` ("device": drawn on the cards, stream `ic.IC_STREAM_DEVICE`; "host":
+    the CPU stream `ic.IC_STREAM`, for parity against the host generator), `log`
+    (a callable taking one line, called as each stage ends), and `emission`
+    ("cards": `device.emit.emit_t9_slabs_cards`; "host": `_emit_t9_slabs`, the
+    oracle -- the two write bitwise-identical slabs on the CPU backend).
+
+    What differs from the host generator, all for wall and host memory:
+    - every kernel is applied on the card inside the axis-0 pass
+      (`ooc_fft.kspace_pass_device`), so there is no host kernel pass or copy;
+    - at f_NL = 0 the phi round trip is skipped (colour x (1/M) x M = colour), and
+      the delta inverse-then-forward round trip is gone at every f_NL;
+    - the 2LPT source is 1/2 (delta^2 - sum phi_ii^2) - sum_{i<j} phi_ij^2
+      (sum phi_ii = -delta), accumulated on the cards one field at a time;
+    - U and V are inverted from k-space combinations (linear, so exact up to
+      roundoff): V is staged to disk, U_x lives on the cards, U_y and U_z on the
+      host -- at 4096^3 the host peak is ~3 fields (825 GB) and a card holds ~69 GB.
+    Emission is the host generator's (`_emit_t9_slabs`).
+
+    NOT bitwise the host generator; parity is gated in eps and code units.
+    Requires x64: kernels are built in float64 (bitwise the host kernels);
+    float32 kernels were measured 5-65 eps x rms off.
+    """
+    import jax
+
+    if not jax.config.jax_enable_x64:
+        raise RuntimeError(
+            "generate_t9_slabs_device needs jax_enable_x64: its k-space kernels are built "
+            "in float64 on the card (bitwise the host kernels); in float32 they move 5-65 "
+            "eps x rms. Enable x64 in the caller (the fields stay float32).")
+    if noise not in ("device", "host"):
+        raise ValueError(f"noise must be 'device' or 'host', got {noise!r}")
+    if emission not in ("cards", "host"):
+        raise ValueError(f"emission must be 'cards' or 'host', got {emission!r}")
+    t9 = T9Layout(box_size, n_part, bucket_cells)
+    n, box = int(n_part), float(box_size)
+    nb = int(bricks_per_side)
+    if t9.n_buckets_side % nb:
+        raise ValueError(f"bricks_per_side {nb} must divide the bucket grid {t9.n_buckets_side}")
+    if n % nb:
+        raise ValueError(f"bricks_per_side {nb} must divide n_part {n}")
+    if order != 2:
+        raise ValueError(f"the streamed generator is order=2 only, got {order}")
+    dt = np.dtype(fdtype)
+    ic._require_stream_config(dt)
+    devs = list(jax.devices()) if devices is None else list(devices)
+    if n % len(devs):
+        raise ValueError(f"n_part {n} must be a multiple of the card count {len(devs)}")
+    # A pure memory knob, rounded up to a multiple of the card count so every slab
+    # (the tail included, since n is one too) splits across all of them.
+    slab = -(-int(slab) // len(devs)) * len(devs)
+    os.makedirs(workdir, exist_ok=True)
+    stage = os.path.join(workdir, "stage")
+    os.makedirs(stage, exist_ok=True)
+    K = ooc_fft.KSpaceKernel
+    kw = dict(devices=devs, pencil_batch=pencil_batch)
+    timings = {}
+
+    def _lap(name, t0):
+        timings[name] = time.perf_counter() - t0
+        if log is not None:
+            log(f"  ic stage {name}: {timings[name]:.1f} s")
+
+    tab = ic_k_table(cosmo, n, box, backend=backend, table=table)
+    colour = K.colour(tab, n, box)
+
+    # --- 1. white noise -> delta's spectrum --------------------------------
+    t0 = time.perf_counter()
+    first = colour if f_NL == 0.0 else colour * K.poisson(cosmo, tab, n, box, inverse=True)
+    if noise == "device":
+        spec = ooc_fft.noise_forward_cards(key, n, devs, dt, kernel=first, box_size=box,
+                                           pencil_batch=pencil_batch)
+    else:
+        spec = ooc_fft.forward_from_slabs_device(
+            lambda lo, hi: ic.white_slab(key, lo, hi, n, dt), n, slab=slab, kernel=first,
+            box_size=box, **kw)
+    mean_phi2 = None
+    if f_NL != 0.0:
+        phi = np.empty((n, n, n), dtype=dt)
+        tot = 0.0
+        for lo, s in ooc_fft.inverse_to_slabs_device(spec, n, slab=slab, **kw):
+            phi[lo:lo + s.shape[0]] = s
+            tot = ic.sq_sum_by_plane(s, tot)
+        del spec
+        mean_phi2 = tot / n**3
+
+        def _png_slab(lo, hi):
+            p = phi[lo:hi]
+            return p + np.asarray(f_NL, dtype=p.dtype) * (p * p - np.asarray(mean_phi2, p.dtype))
+
+        spec = ooc_fft.forward_from_slabs_device(
+            _png_slab, n, slab=slab, kernel=K.poisson(cosmo, tab, n, box), box_size=box, **kw)
+        del phi
+    _lap("delta", t0)
+
+    # --- 2. the 2LPT source, accumulated on the cards ----------------------
+    t0 = time.perf_counter()
+    acc = ooc_fft.zeros_card_shards(n, devs, dt)
+    work = None
+    terms = ([(None, 0.5)] + [(K.deriv2(i, j), -0.5) for i, j in _DIAG]
+             + [(K.deriv2(i, j), -1.0) for i, j in _OFFDIAG])
+    for kern, weight in terms:
+        acc, work = ooc_fft.inverse_accumulate_cards([(1.0, spec)], n, acc, weight, kernel=kern,
+                                                     box_size=box, work=work,
+                                                     pencil_batch=pencil_batch)
+    _lap("source", t0)
+
+    t0 = time.perf_counter()
+    spec2 = ooc_fft.forward_from_card_planes(acc, n, pencil_batch=pencil_batch)
+    del acc
+    _lap("source_forward", t0)
+
+    D1 = growth_factor_a(a_init, cosmo)
+    f1 = growth_rate_a(a_init, cosmo)
+    D2 = growth_factor_2(a_init, cosmo, growth2)
+    f2 = growth_rate_2(a_init, cosmo, growth2)
+    v_coef2 = -(D2 * f2) / (D1 * f1)
+
+    # --- 3. V = grad(delta + c S_2), staged to disk -------------------------
+    t0 = time.perf_counter()
+    vmax = 0.0
+    for ax in range(3):
+        ooc_fft.kspace_pass_device([(1.0, spec), (v_coef2, spec2)], n, box,
+                                   kernel=K.grad_invk2(ax), out=work, inverse=True, **kw)
+        v_sa = ooc_fft.StagedArray.create(os.path.join(stage, f"v_{ax}.npy"), dt, (n, n, n))
+        for lo, s in ooc_fft.inverse_to_slabs_device(work, n, slab=slab, pass2=False, **kw):
+            v_sa.write_slab(lo, s)
+            vmax = max(vmax, float(np.max(np.abs(np.asarray(s, np.float64)))))
+    _lap("velocities", t0)
+
+    # --- 4. U = grad(D1 delta - D2 S_2): x on the cards, y and z on the host --
+    t0 = time.perf_counter()
+    ooc_fft.kspace_pass_device([(D1, spec), (-D2, spec2)], n, box, out=spec, transform=False,
+                               **kw)
+    del spec2
+    ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(0), out=work,
+                               inverse=True, **kw)
+    if emission == "cards":
+        # each card's own destination slabs plus `window` brick slabs of halo either side
+        from .device import emit as demit
+
+        ux = demit.card_slab_ranges(n, nb, devs, window)
+        arrays = ooc_fft.inverse_to_card_shards(
+            work, n, [(r["x0"], r["nx"], r["device"]) for r in ux],
+            pencil_batch=pencil_batch, pass2=False)
+        for r, a in zip(ux, arrays):
+            r["delta"] = a
+    else:
+        ranges = ooc_fft.partition_units(n, len(devs), 1)
+        arrays = ooc_fft.inverse_to_card_shards(
+            work, n, [(lo, hi - lo, d) for (lo, hi), d in zip(ranges, devs)],
+            pencil_batch=pencil_batch, pass2=False)
+        ux = [dict(lo=lo, hi=hi, device=d, delta=a)
+              for ((lo, hi), d), a in zip(zip(ranges, devs), arrays)]
+    del arrays
+    umax = max(float(np.asarray(jax.numpy.max(jax.numpy.abs(s["delta"])))) for s in ux)
+
+    uy = np.empty((n, n, n), dtype=dt)
+    ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(1), out=work,
+                               inverse=True, **kw)
+    for lo, s in ooc_fft.inverse_to_slabs_device(work, n, slab=slab, pass2=False, **kw):
+        uy[lo:lo + s.shape[0]] = s
+        umax = max(umax, float(np.max(np.abs(s))))
+
+    # U_z takes the work buffer's own bytes (n^2 (n/2+1) x 2w >= n^3 x w) rather than a new
+    # field after `del work`: a device array uploaded from a slice of `work` can keep the
+    # whole buffer alive until the runtime releases it, and an allocation inside that window
+    # held a 4th field on the host (measured on CPU devices, 2026-09-15: 4.17 fields where
+    # the design is 3). Reuse makes the peak independent of when that happens.
+    uz = work.reshape(-1).view(np.uint8)[:n**3 * dt.itemsize].view(dt).reshape(n, n, n)
+    del work
+    ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(2), out=spec,
+                               inverse=True, **kw)
+    for lo, s in ooc_fft.inverse_to_slabs_device(spec, n, slab=slab, pass2=False, **kw):
+        uz[lo:lo + s.shape[0]] = s
+        umax = max(umax, float(np.max(np.abs(s))))
+    del spec
+    _lap("displacements", t0)
+
+    scale = vmax / INT16_MAX
+    if scale <= 0.0:
+        scale = 1.0
+    brick_depth = box / nb
+    if umax >= window * brick_depth:
+        raise ValueError(
+            f"max displacement {umax:.3f} reaches the sliding window's depth "
+            f"({window} brick slab(s) = {window * brick_depth:.3f} Mpc/h); a particle "
+            "could leave the window and the streamed build would misplace it. "
+            "Raise `window` (and re-derive the staging cost) rather than widening silently."
+        )
+
+    # --- 5. emission -------------------------------------------------------
+    t0 = time.perf_counter()
+    v_ro = [ooc_fft.StagedArray.open(os.path.join(stage, f"v_{ax}.npy"), dt, (n, n, n))
+            for ax in range(3)]
+    emission_s = {}
+    if emission == "cards":
+        written, n_total = demit.emit_t9_slabs_cards(
+            workdir, ux, uy, uz, v_ro, t9, n, box, nb, dt, window, timings=emission_s)
+    else:
+        written, n_total = _emit_t9_slabs(
+            workdir, [_CardField(ux), _HostField(uy), _HostField(uz)], v_ro, t9, n, box, nb,
+            dt, slab, window)
+    del ux, uy, uz
+    _lap("emission", t0)
 
     manifest = dict(
         schema=SCHEMA,
@@ -389,33 +727,23 @@ def generate_t9_slabs(
         bricks_per_side=nb,
         a_init=float(a_init),
         order=order,
+        growth2=growth2,
         f_NL=float(f_NL),
         fdtype=dt.name,
         slab=int(slab),
-        ic_stream=ic.IC_STREAM,
+        ic_stream=ic.IC_STREAM_DEVICE if noise == "device" else ic.IC_STREAM,
         backend=backend,
         table_n_points=int(len(tab.k)),
-        mean_phi2=float(mean_phi2),
+        mean_phi2=None if mean_phi2 is None else float(mean_phi2),
+        generator="device",
+        emission=emission,
+        emission_s=emission_s,
+        n_devices=len(devs),
+        pencil_batch=int(pencil_batch),
+        stage_s=timings,
         provenance=provenance or {},
     )
-    # AFTER the manifest, and the manifest is rewritten to carry the report:
-    # cleaning first would delete the working set of a generation that then
-    # failed to complete, and reporting nothing would leave "was it cleaned?"
-    # answerable only by looking at a directory that may since have been reused.
-    if keep_stage:
-        manifest["stage_cleanup"] = dict(kept=True, reason="keep_stage=True")
-    else:
-        try:
-            manifest["stage_cleanup"] = cleanup_stage(workdir)
-        except OSError as e:
-            # Housekeeping must never cost a completed generation its manifest.
-            # At C-hero this is a multi-hour product and the intermediates are
-            # a disk bill; an unwritable stage directory is the wrong reason to
-            # lose the run. Recorded loudly instead.
-            manifest["stage_cleanup"] = dict(error=str(e), removed=[], bytes=0)
-    with open(os.path.join(workdir, MANIFEST), "w") as fh:
-        json.dump(manifest, fh, indent=1)
-    return manifest
+    return _write_manifest(workdir, manifest, keep_stage)
 
 
 def _shared_like(arr, alloc, tag):
@@ -454,6 +782,28 @@ def read_manifest(workdir):
     return man
 
 
+def drop_file_cache(path):
+    """Drop `path`'s pages from the page cache. True if the call was made.
+
+    A 4096^3 IC set is 641 GB of reads and the host holds ~855 GB of state on a 1026 GB
+    node, so the cache cannot help the second pass and what it does instead is compete:
+    gb 1003657 ran its first steps while the kernel was still draining 91 GB of it, and
+    the tile loop's window staging was 924 s in that step against 55 s once the cache was
+    gone. Best effort -- not every filesystem honours it, and an instrument must never be
+    the failure."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        return True
+    except (AttributeError, OSError):
+        return False
+    finally:
+        os.close(fd)
+
+
 def load_slot_state(
     workdir,
     brick_slack=0.10,
@@ -461,6 +811,7 @@ def load_slot_state(
     arena_frac=0.01,
     index_dtype=DEFAULT_INDEX_DTYPE,
     alloc=None,
+    drop_cache=False,
 ):
     """Reassemble a host-resident SlotState from T9 slabs on disk.
 
@@ -469,6 +820,10 @@ def load_slot_state(
     `brick_start`; spare rows stay zero and the arena starts empty, exactly
     as `build` leaves them. Refuses a missing manifest (incomplete
     generation), a schema it does not know, and any crc mismatch.
+
+    `drop_cache` drops each slab file's page cache as soon as that slab has been read,
+    in both passes (`drop_file_cache`); the loader's own re-read is what the second pass
+    is for, and the cache is too small to serve it anyway.
     """
     man = read_manifest(workdir)
     t9 = T9Layout(man["box_size"], man["n_part"], man["bucket_cells"])
@@ -483,8 +838,11 @@ def load_slot_state(
     # destination arrays, for a loader peak of ~216 GB on a 255 GB node. The
     # re-read is ~81 GB off Lustre against 135 GB of resident payload, and it
     # is the cheaper side of that trade by a wide margin.
+    n_dropped = [0]
+
     def _slab(fname):
-        with np.load(os.path.join(workdir, fname)) as z:
+        path = os.path.join(workdir, fname)
+        with np.load(path) as z:
             meta = json.loads(str(z["meta"]))
             occ, off, w, sc = z["occupancy"], z["off"], z["w"], z["scale"]
         for name, arr in (("occupancy", occ), ("off", off), ("w", w), ("scale", sc)):
@@ -494,6 +852,8 @@ def load_slot_state(
                     f"{fname}:{name} crc mismatch ({crc} != {meta['crc32'][name]}); "
                     "the slab file is corrupt, refusing to load"
                 )
+        if drop_cache:
+            n_dropped[0] += bool(drop_file_cache(path))
         return int(meta["bx"]), off, w, occ, sc
 
     _trace = os.environ.get("INEXOR_LOAD_TRACE")
@@ -555,6 +915,8 @@ def load_slot_state(
         if _i % 32 == 31:
             _say(f"pass 2: {_i + 1}/{len(man['files'])} slabs")
 
+    if drop_cache:
+        _say(f"dropped the page cache of {n_dropped[0]} slab reads")
     _say("payload placed; building SlotState")
     st = SlotState(
         t9=t9,
@@ -575,7 +937,20 @@ def load_slot_state(
     return st
 
 
-def write_t9_slabs(st, workdir, provenance=None, drop_ids=False):
+def _save_slab(path, meta, occ, off, w, scale_d):
+    """Write one T9 slab, returning its own elapsed seconds. Runs on
+    `write_t9_slabs`'s writer thread, so it must touch nothing the next slab
+    will overwrite: every array here is freshly allocated for this slab and
+    never revisited. The elapsed time comes back because once the write
+    overlaps the next gather the caller's blocked time is no longer the write's
+    duration, and a bytes-per-second read off the blocked time is nonsense."""
+    t0 = time.perf_counter()
+    np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w, scale=scale_d)
+    return time.perf_counter() - t0
+
+
+def write_t9_slabs(st, workdir, provenance=None, drop_ids=False, timings=None,
+                   max_slabs=None):
     """Write a `SlotState` as T9 slabs: the exact inverse of `load_slot_state`.
 
     Same `t9-slabs-2` schema `generate_t9_slabs` emits, so an evolved state and
@@ -611,6 +986,15 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False):
 
     IDs are not in the schema. A state carrying them refuses rather than
     dropping them silently; pass `drop_ids=True` to say the loss is intended.
+
+    `timings`, if a dict, accumulates seconds per part over the slabs written
+    (`index`, `gather`, `crc32`, `write`) plus `slabs`, and `arena index` for
+    the one-time grouping before the loop. `write` is the time the main thread
+    spends BLOCKED on the writer thread, so the parts still sum to the wall;
+    `write thread` is the writer's own busy time, which is what a throughput
+    figure has to be taken against. `max_slabs` writes only
+    the first that many slabs and returns None: a timing probe, with no manifest
+    and no conservation check, so the directory can never load as a checkpoint.
     """
     if st.ids is not None and not drop_ids:
         raise ValueError(
@@ -631,59 +1015,134 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False):
     nbb = nb * nb                      # bricks per x-slab; a brick is in exactly one
     written, n_written = [], 0
 
-    for d in range(nb):
-        lo_brick = d * nbb
-        lo_bucket = lo_brick * p3
-        hi_bucket = lo_bucket + nbb * p3
-        occ_g = st.occupancy[lo_bucket:hi_bucket].astype(np.int64)
+    clock = time.perf_counter
 
-        # Every live row of the slab, in (brick, bucket) order. Buckets are
-        # brick-major, so one ascending pass over the slab's occupancy IS brick
-        # order -- no per-brick loop, which at C-gh would be 16,384 iterations
-        # per slab and 2.1e6 per checkpoint.
-        counts = occ_g.reshape(nbb, p3).sum(axis=1)
-        starts = st.brick_start[lo_brick : lo_brick + nbb].astype(np.int64)
-        base = np.concatenate([[0], np.cumsum(counts)[:-1]])
-        slots = np.repeat(starts - base, counts) + np.arange(int(counts.sum()), dtype=np.int64)
-        keys = lo_bucket + np.repeat(np.arange(nbb * p3, dtype=np.int64), occ_g)
+    def _add(key, t0):
+        if timings is not None:
+            timings[key] = timings.get(key, 0.0) + clock() - t0
 
-        # Fold this slab's arena residents back into their own buckets. They are
-        # few (0.57% at the operating point, D-v2-19 cl.4) so a searchsorted
-        # merge beats re-sorting the slab; `side="right"` puts them after the
-        # live rows of the same bucket, which is arbitrary but DETERMINISTIC,
-        # and determinism is the whole of what the fixed-point gate needs.
-        if st.n_arena:
-            sel = np.nonzero((st.arena_bucket >= lo_bucket) & (st.arena_bucket < hi_bucket))[0]
-            if len(sel):
-                a_keys = st.arena_bucket[sel]
-                order = np.argsort(a_keys, kind="stable")
-                a_keys = a_keys[order]
-                a_slots = st.arena_base + sel[order]
-                pos = np.searchsorted(keys, a_keys, side="right")
-                keys = np.insert(keys, pos, a_keys)
-                slots = np.insert(slots, pos, a_slots)
+    # Every occupied arena row ONCE, in (bucket, arena row) order, so each slab
+    # takes its residents as a slice. Selecting them inside the slab loop is an
+    # O(n_arena) scan per slab, and the arena is PROVISIONED at 1% of the
+    # particles whatever it holds: 5.5 GB at C-hero, walked twice per slab for
+    # the ~1 resident that lands in it (327 rows in the whole state at step 8).
+    # `SlotState.arena_slots_of_brick` exists to avoid exactly this shape.
+    t0 = clock()
+    if st.n_arena:
+        a_live = np.nonzero(st.arena_bucket >= 0)[0]
+        a_order = np.argsort(st.arena_bucket[a_live], kind="stable")
+        a_bucket_all = st.arena_bucket[a_live][a_order]
+        a_slot_all = st.arena_base + a_live[a_order]
+    else:
+        a_bucket_all = np.empty(0, dtype=np.int64)
+        a_slot_all = np.empty(0, dtype=np.int64)
+    _add("arena index", t0)
 
-        occ = np.bincount(keys - lo_bucket, minlength=nbb * p3).astype(np.int64)
-        off = st.off[slots]
-        w = st.w[slots]
-        scale_d = np.asarray(st.vel_scale[lo_brick : lo_brick + nbb], dtype=np.float64)
-        meta = dict(
-            schema=SCHEMA,
-            bx=d,
-            n_rows=int(len(slots)),
-            bucket_lo=int(lo_bucket),
-            brick_lo=int(lo_brick),
-            crc32=dict(
-                occupancy=zlib.crc32(occ.tobytes()),
-                off=zlib.crc32(off.tobytes()),
-                w=zlib.crc32(w.tobytes()),
-                scale=zlib.crc32(scale_d.tobytes()),
-            ),
-        )
-        path = os.path.join(workdir, f"t9_slab_{d:04d}.npz")
-        np.savez(path, meta=json.dumps(meta), occupancy=occ, off=off, w=w, scale=scale_d)
-        written.append(os.path.basename(path))
-        n_written += len(slots)
+    # One writer thread, depth one: slab k's file write overlaps slab k+1's
+    # gather, and `submit` blocks on the previous write so at most two slabs'
+    # buffers are live at once. The write was 30% of a slab and strictly
+    # serial with host work that does not touch the disk.
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="t9-writer")
+    pending = None
+
+    def _join():
+        nonlocal pending
+        if pending is not None:
+            f, pending = pending, None
+            dt = f.result()            # the only place a write error surfaces
+            if timings is not None:
+                timings["write thread"] = timings.get("write thread", 0.0) + dt
+
+    try:
+        for d in range(nb if max_slabs is None else min(nb, int(max_slabs))):
+            t0 = clock()
+            lo_brick = d * nbb
+            lo_bucket = lo_brick * p3
+            hi_bucket = lo_bucket + nbb * p3
+
+            # The slab's occupancy IS the array that gets written, widened once
+            # because the schema stores it int64 -- not a widened copy taken in
+            # order to count with, which is the fault `state.occupancy_total`
+            # fixed in the migrate.
+            occ = st.occupancy[lo_bucket:hi_bucket].astype(np.int64)
+            counts = occ.reshape(nbb, p3).sum(axis=1)
+            starts = st.brick_start[lo_brick : lo_brick + nbb].astype(np.int64)
+            base = np.concatenate([[0], np.cumsum(counts)[:-1]])
+            n_live = int(counts.sum())
+
+            # This slab's residents are a contiguous run of the sorted index.
+            alo, ahi = np.searchsorted(a_bucket_all, [lo_bucket, hi_bucket])
+            a_keys, a_slots = a_bucket_all[alo:ahi], a_slot_all[alo:ahi]
+            if len(a_keys):
+                # Where each resident merges among the live rows: the number of
+                # live rows in buckets up to and including its own, which is the
+                # inclusive cumsum of the occupancy at its key. The old form
+                # searched a key array holding one entry PER ROW, and paid an
+                # O(rows) `repeat` to build it and two O(rows) `insert`s to
+                # merge into it, for an answer that is 33.6M-wide at most.
+                a_pos = np.cumsum(occ)[a_keys - lo_bucket]
+                u, c = np.unique(a_keys - lo_bucket, return_counts=True)
+                occ[u] += c
+            else:
+                a_pos = np.empty(0, dtype=np.int64)
+            n_rows = n_live + len(a_slots)
+            _add("index", t0)
+
+            t0 = clock()
+            # Each brick's live rows are a CONTIGUOUS run from `brick_start`, in
+            # ascending bucket order, so the slab's payload is nbb slice copies
+            # rather than a fancy-index gather driven by an O(rows) slot array.
+            off = np.empty((n_live, st.off.shape[1]), dtype=st.off.dtype)
+            w = np.empty((n_live, st.w.shape[1]), dtype=st.w.dtype)
+            for b in range(nbb):
+                m = int(counts[b])
+                if m:
+                    s0, d0 = int(starts[b]), int(base[b])
+                    off[d0 : d0 + m] = st.off[s0 : s0 + m]
+                    w[d0 : d0 + m] = st.w[s0 : s0 + m]
+            if len(a_slots):
+                # Rare enough that the extra pass is paid only by the slabs that
+                # actually hold a resident; `insert` keeps the merge obvious.
+                off = np.insert(off, a_pos, st.off[a_slots], axis=0)
+                w = np.insert(w, a_pos, st.w[a_slots], axis=0)
+            scale_d = np.asarray(st.vel_scale[lo_brick : lo_brick + nbb], dtype=np.float64)
+            _add("gather", t0)
+
+            t0 = clock()
+            # crc32 over the buffers themselves. `.tobytes()` copied the whole
+            # payload -- 2.7 GB a slab at C-hero -- to hash it.
+            meta = dict(
+                schema=SCHEMA,
+                bx=d,
+                n_rows=int(n_rows),
+                bucket_lo=int(lo_bucket),
+                brick_lo=int(lo_brick),
+                crc32=dict(
+                    occupancy=zlib.crc32(occ),
+                    off=zlib.crc32(off),
+                    w=zlib.crc32(w),
+                    scale=zlib.crc32(scale_d),
+                ),
+            )
+            _add("crc32", t0)
+            t0 = clock()
+            path = os.path.join(workdir, f"t9_slab_{d:04d}.npz")
+            _join()                    # blocks only if the previous write is still going
+            pending = pool.submit(_save_slab, path, meta, occ, off, w, scale_d)
+            _add("write", t0)
+            if timings is not None:
+                timings["slabs"] = timings.get("slabs", 0) + 1
+            written.append(os.path.basename(path))
+            n_written += n_rows
+
+        t0 = clock()
+        _join()
+        _add("write", t0)
+    finally:
+        pool.shutdown(wait=True)
+
+    if max_slabs is not None:
+        return None
 
     # Conservation, not a formality: a dropped arena row is a deleted particle
     # and nothing downstream would raise on it.

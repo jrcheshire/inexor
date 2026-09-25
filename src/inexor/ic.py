@@ -49,6 +49,11 @@ C_OVER_H0 = 299792.458 / 100.0
 # readout can refuse to pool measurements across streams. Bump it if the
 # construction below ever changes in any bit-visible way.
 IC_STREAM = "m5-foldin-1"
+# The same plane-keyed construction drawn on the card that transforms the plane
+# (`ooc_fft.noise_forward_cards`, D6). The normal transform's bits are not
+# specified across backends, so on a GPU it is a DIFFERENT stream and carries
+# its own tag; readouts refuse to pool across the two exactly as across streams.
+IC_STREAM_DEVICE = "m5-foldin-1-card"
 
 # poisson_factor materializes a full (N, N, N//2+1) float64 grid -- exactly
 # the object D-v2-15 clause 2 retires from the production path. It survives

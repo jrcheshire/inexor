@@ -122,6 +122,9 @@ GATE_SIGMA = 2.0
 # than silently reporting a partial decomposition if the engine gains a phase.
 PHASES = (
     "kernel_build", "lead_drift", "coarse_paint", "coarse_solve", "membership",
+    # the device lane's compiled tile loop has ONE boundary where the host lane's
+    # per-tile pipeline has four (caa2533); both lanes appear here
+    "tile_loop",
     "tile_decode", "tile_short", "tile_long", "tile_reduce",
     "tile_loop_end", "reconcile", "migrate", "repack", "checkpoint",
 )

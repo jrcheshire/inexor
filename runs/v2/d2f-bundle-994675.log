@@ -1,0 +1,245 @@
+=== c672-015.vista.tacc.utexas.edu: commit dfd5bfa, job 994675 ===
+XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=900
+0, NVIDIA GB200, 189471 MiB
+1, NVIDIA GB200, 189471 MiB
+2, NVIDIA GB200, 189471 MiB
+3, NVIDIA GB200, 189471 MiB
+               total        used        free      shared  buff/cache   available
+Mem:            1691          65        1657           1           1        1625
+
+=== LEG smoke-tile ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm split-threads before: --arm split-threads --reps 1 --workdir /scratch/10303/jrc4/src/inexor/runs/v2/_d2e_xback --xback-preset smoke --tile-preset smoke --tile 16 --buf 8 --allow-cpu --steps 2 --gpus 4 --coarse-device 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[split-threads] one card: 2 steps x 64 tiles in 0.270s = 474.04 tiles/s (warm 2.6s)
+[split-threads] 4 cards, one thread each (4 devices used): 660.25 tiles/s summed = 1.39x; by the slowest card 642.08 tiles/s = 1.35x; per card [164.82, 172.61, 160.52, 162.3]; coarse on device
+--- arm split-threads before: rc=0
+
+--- group ref-unpinned: 1 workers
+  [ref-unpinned:0] cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+  [ref-unpinned:0] [split ref-unpinned part 0/1] 64 tiles, warm step 2.0s, receipt {'cuda_visible_devices': '0', 'n_devices': 1, 'platform': 'gpu', 'n_cpus': 144, 'cpu_min': 0, 'cpu_max': 143, 'mems_allowed': '0-2,10,18,26'}
+  [ref-unpinned:0] [split ref-unpinned part 0/1] 2 steps x 64 tiles in 0.414s = 309.34 tiles/s (3.2 ms/tile); median step 0.207s; coarse on device
+--- group ref-unpinned: rcs [0]
+
+--- group four-unpinned: 4 workers
+  [four-unpinned:1] cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+  [four-unpinned:3] cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+  [four-unpinned:2] cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+  [four-unpinned:0] cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+  [four-unpinned:0] [split four-unpinned part 0/4] 16 tiles, warm step 1.7s, receipt {'cuda_visible_devices': '0', 'n_devices': 1, 'platform': 'gpu', 'n_cpus': 144, 'cpu_min': 0, 'cpu_max': 143, 'mems_allowed': '0-2,10,18,26'}
+  [four-unpinned:2] [split four-unpinned part 2/4] 16 tiles, warm step 1.8s, receipt {'cuda_visible_devices': '2', 'n_devices': 1, 'platform': 'gpu', 'n_cpus': 144, 'cpu_min': 0, 'cpu_max': 143, 'mems_allowed': '0-2,10,18,26'}
+  [four-unpinned:3] [split four-unpinned part 3/4] 16 tiles, warm step 1.8s, receipt {'cuda_visible_devices': '3', 'n_devices': 1, 'platform': 'gpu', 'n_cpus': 144, 'cpu_min': 0, 'cpu_max': 143, 'mems_allowed': '0-2,10,18,26'}
+  [four-unpinned:1] [split four-unpinned part 1/4] 16 tiles, warm step 1.8s, receipt {'cuda_visible_devices': '1', 'n_devices': 1, 'platform': 'gpu', 'n_cpus': 144, 'cpu_min': 0, 'cpu_max': 143, 'mems_allowed': '0-2,10,18,26'}
+  [four-unpinned:0] [split four-unpinned part 0/4] 2 steps x 16 tiles in 0.099s = 321.69 tiles/s (3.1 ms/tile); median step 0.050s; coarse on device
+  [four-unpinned:1] [split four-unpinned part 1/4] 2 steps x 16 tiles in 0.101s = 316.16 tiles/s (3.2 ms/tile); median step 0.051s; coarse on device
+  [four-unpinned:2] [split four-unpinned part 2/4] 2 steps x 16 tiles in 0.120s = 266.59 tiles/s (3.8 ms/tile); median step 0.060s; coarse on device
+  [four-unpinned:3] [split four-unpinned part 3/4] 2 steps x 16 tiles in 0.126s = 254.44 tiles/s (3.9 ms/tile); median step 0.063s; coarse on device
+--- group four-unpinned: rcs [0, 0, 0, 0]
+--- unpinned: four devices 1158.89 tiles/s against one 309.34 = 3.75x (method none)
+
+--- arm split-threads after: --arm split-threads --reps 1 --workdir /scratch/10303/jrc4/src/inexor/runs/v2/_d2e_xback --xback-preset smoke --tile-preset smoke --tile 16 --buf 8 --allow-cpu --steps 2 --gpus 4 --coarse-device 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[split-threads] one card: 2 steps x 64 tiles in 0.404s = 317.00 tiles/s (warm 0.9s)
+[split-threads] 4 cards, one thread each (4 devices used): 646.40 tiles/s summed = 2.04x; by the slowest card 625.16 tiles/s = 1.97x; per card [170.79, 159.73, 156.29, 159.59]; coarse on device
+--- arm split-threads after: rc=0
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/d2e_device_tile_d2f_bundle_smoke.json
+worst rc 0
+--- LEG smoke-tile rc=0 ---
+
+=== LEG smoke-paint ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm chunk 32:64:eager: --arm chunk --n-part 32 --chunk-bricks 64 --reps 1 --allow-cpu 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[chunk] eager dead=cell0 n_part=32 L=64 bricks rows=4,099 pad=5,161 = 0.0000 of a 4096^3 x-slab; built in 0.0s on gpu
+[chunk]   warm: 4.060s  device peak 0.00 GB
+[chunk]   rep 1: 0.219s  device peak 0.00 GB
+[chunk]   peak over baseline 0.00 GB = 285.4 B/padded row (planner charges 72); at 4096^3 this chunk is 0.0 GB against a charge of 0.0
+[chunk]   median 0.219s/chunk (host window prep 0.000s of it); traces 0; BITWISE vs host decode = True
+--- arm chunk 32:64:eager: rc=0
+
+--- arm chunk 32:64:jit: --arm chunk --n-part 32 --chunk-bricks 64 --reps 1 --allow-cpu --jit 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[chunk] JIT dead=cell0 n_part=32 L=64 bricks rows=4,099 pad=5,161 = 0.0000 of a 4096^3 x-slab; built in 0.0s on gpu
+[chunk]   warm: 0.561s  device peak 0.00 GB
+[chunk]   rep 1: 0.003s  device peak 0.00 GB
+[chunk]   peak over baseline 0.00 GB = 46.7 B/padded row (planner charges 72); at 4096^3 this chunk is 0.0 GB against a charge of 0.0
+[chunk]   median 0.003s/chunk (host window prep 0.000s of it); traces 1; BITWISE vs host decode = True
+--- arm chunk 32:64:jit: rc=0
+
+--- arm cards-paint: --arm cards-paint --n-part 32 --paint-chunks 16+64 --reps 1 --allow-cpu 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[cards-paint] n_part=32 state built in 0.0s on gpu
+[cards-paint] chunk 16 bricks (1,038 rows, pad 1,291, 32 chunks): one card 0.08s, four 0.07s = 1.25x (medians of 3 after warm 2.4 / 2.2s); density equal across widths = True
+[cards-paint] chunk 64 bricks (4,118 rows, pad 5,161, 8 chunks): one card 0.03s, four 0.03s = 0.81x (medians of 3 after warm 0.8 / 0.6s); density equal across widths = True
+--- arm cards-paint: rc=0
+
+--- arm cards-scale: --arm cards-scale --scale-n-part 32 --scale-cards 4 --reps 1 --allow-cpu 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[cards-scale] n_coarse=16 bricks/side=8 chunk 16 bricks -> block (5, 7, 16); 4 cards [(0, 4), (4, 8), (8, 12), (12, 16)]; chunks per card [8, 8, 8, 8]; on gpu
+[cards-scale] accumulators allocated on the cards in 0.39s ([0.0, 0.0, 0.0, 0.0] GB)
+[cards-scale] adds, synced each: 0.10s wall over 4 card threads; per card [(8, 0.09, 1.15), (8, 0.09, 1.22), (8, 0.09, 1.15), (8, 0.09, 1.27)] (chunks, first add s, median ms)
+[cards-scale] fold 0.68s (ghost planes with mass 12); owned mass 17,920 vs blocks x cells 17,920: EXACT = True
+[cards-scale] decode 0.73s; sampled planes BITWISE numpy's decode = True (an overlap cell seen: True); device peaks [0.0, 0.0, 0.0, 0.0] GB
+[cards-scale] forward, warm then ABBA, medians: from the cards 0.01s (pass 1 0.01, pass 2 0.01) vs from host slabs 0.01s (pass 1 0.01, pass 2 0.01); warm 0.31 / 0.01s; density to host 0.00s; spectra BITWISE = True
+--- arm cards-scale: rc=0
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/d2d_device_paint_d2f_bundle_smoke.json
+worst rc 0
+--- LEG smoke-paint rc=0 ---
+
+=== LEG tile-split ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm split-threads before: --arm split-threads --reps 3 --workdir /scratch/10303/jrc4/src/inexor/runs/v2/_d2e_xback --xback-preset cdev --tile-preset cgh64 --tile 512 --buf 32 --steps 30 --gpus 4 --coarse-device 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+/scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/interpreters/mlir.py:1246: UserWarning: A large amount of constants were captured during lowering (4.60GB total). If this is intentional, disable this warning by setting JAX_CAPTURED_CONSTANTS_WARN_BYTES=-1. To obtain a report of where these constants were encountered, set JAX_CAPTURED_CONSTANTS_REPORT_FRAMES=-1.
+  warnings.warn(message)
+/scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/compiler.py:833: UserWarning: Error writing persistent compilation cache entry for 'jit_body_write': JaxRuntimeError: RESOURCE_EXHAUSTED: Failed to serialize message of type xla.gpu.GpuExecutableProto because its size must be smaller than 2GiB: 4603240036; at byte 0; at uncompressed byte 0; at byte 1546
+	failed to serialize the rest of the fields in GpuExecutableProto split proto (all fields except asm_text, binary, dnn_compiled_graphs, and constants)
+  warnings.warn(
+[split-threads] one card: 30 steps x 8 tiles in 18.419s = 13.03 tiles/s (warm 22.7s)
+[split-threads] 4 cards, one thread each (4 devices used): 47.03 tiles/s summed = 3.61x; by the slowest card 46.54 tiles/s = 3.57x; per card [11.64, 11.8, 11.96, 11.64]; coarse on device
+--- arm split-threads before: rc=0
+
+--- group ref-unpinned: 1 workers
+  [ref-unpinned:0] cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+  [ref-unpinned:0] /scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/interpreters/mlir.py:1246: UserWarning: A large amount of constants were captured during lowering (4.60GB total). If this is intentional, disable this warning by setting JAX_CAPTURED_CONSTANTS_WARN_BYTES=-1. To obtain a report of where these constants were encountered, set JAX_CAPTURED_CONSTANTS_REPORT_FRAMES=-1.
+  [ref-unpinned:0]   warnings.warn(message)
+  [ref-unpinned:0] /scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/compiler.py:833: UserWarning: Error writing persistent compilation cache entry for 'jit_body_write': JaxRuntimeError: RESOURCE_EXHAUSTED: Failed to serialize message of type xla.gpu.GpuExecutableProto because its size must be smaller than 2GiB: 4603238614; at byte 0; at uncompressed byte 0; at byte 1546
+  [ref-unpinned:0] 	failed to serialize the rest of the fields in GpuExecutableProto split proto (all fields except asm_text, binary, dnn_compiled_graphs, and constants)
+  [ref-unpinned:0]   warnings.warn(
+  [ref-unpinned:0] [split ref-unpinned part 0/1] 8 tiles, warm step 22.7s, receipt {'cuda_visible_devices': '0', 'n_devices': 1, 'platform': 'gpu', 'n_cpus': 144, 'cpu_min': 0, 'cpu_max': 143, 'mems_allowed': '0-2,10,18,26'}
+  [ref-unpinned:0] [split ref-unpinned part 0/1] 30 steps x 8 tiles in 18.612s = 12.89 tiles/s (77.6 ms/tile); median step 0.620s; coarse on device
+--- group ref-unpinned: rcs [0]
+
+--- group four-unpinned: 4 workers
+  [four-unpinned:0] cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+  [four-unpinned:2] cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+  [four-unpinned:3] cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+  [four-unpinned:1] cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+  [four-unpinned:3] /scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/interpreters/mlir.py:1246: UserWarning: A large amount of constants were captured during lowering (4.60GB total). If this is intentional, disable this warning by setting JAX_CAPTURED_CONSTANTS_WARN_BYTES=-1. To obtain a report of where these constants were encountered, set JAX_CAPTURED_CONSTANTS_REPORT_FRAMES=-1.
+  [four-unpinned:3]   warnings.warn(message)
+  [four-unpinned:1] /scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/interpreters/mlir.py:1246: UserWarning: A large amount of constants were captured during lowering (4.60GB total). If this is intentional, disable this warning by setting JAX_CAPTURED_CONSTANTS_WARN_BYTES=-1. To obtain a report of where these constants were encountered, set JAX_CAPTURED_CONSTANTS_REPORT_FRAMES=-1.
+  [four-unpinned:1]   warnings.warn(message)
+  [four-unpinned:0] /scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/interpreters/mlir.py:1246: UserWarning: A large amount of constants were captured during lowering (4.60GB total). If this is intentional, disable this warning by setting JAX_CAPTURED_CONSTANTS_WARN_BYTES=-1. To obtain a report of where these constants were encountered, set JAX_CAPTURED_CONSTANTS_REPORT_FRAMES=-1.
+  [four-unpinned:0]   warnings.warn(message)
+  [four-unpinned:2] /scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/interpreters/mlir.py:1246: UserWarning: A large amount of constants were captured during lowering (4.60GB total). If this is intentional, disable this warning by setting JAX_CAPTURED_CONSTANTS_WARN_BYTES=-1. To obtain a report of where these constants were encountered, set JAX_CAPTURED_CONSTANTS_REPORT_FRAMES=-1.
+  [four-unpinned:2]   warnings.warn(message)
+  [four-unpinned:3] /scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/compiler.py:833: UserWarning: Error writing persistent compilation cache entry for 'jit_body_write': JaxRuntimeError: RESOURCE_EXHAUSTED: Failed to serialize message of type xla.gpu.GpuExecutableProto because its size must be smaller than 2GiB: 4603238614; at byte 0; at uncompressed byte 0; at byte 1546
+  [four-unpinned:3] 	failed to serialize the rest of the fields in GpuExecutableProto split proto (all fields except asm_text, binary, dnn_compiled_graphs, and constants)
+  [four-unpinned:3]   warnings.warn(
+  [four-unpinned:3] [split four-unpinned part 3/4] 2 tiles, warm step 23.7s, receipt {'cuda_visible_devices': '3', 'n_devices': 1, 'platform': 'gpu', 'n_cpus': 144, 'cpu_min': 0, 'cpu_max': 143, 'mems_allowed': '0-2,10,18,26'}
+  [four-unpinned:1] /scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/compiler.py:833: UserWarning: Error writing persistent compilation cache entry for 'jit_body_write': JaxRuntimeError: RESOURCE_EXHAUSTED: Failed to serialize message of type xla.gpu.GpuExecutableProto because its size must be smaller than 2GiB: 4603238614; at byte 0; at uncompressed byte 0; at byte 1546
+  [four-unpinned:1] 	failed to serialize the rest of the fields in GpuExecutableProto split proto (all fields except asm_text, binary, dnn_compiled_graphs, and constants)
+  [four-unpinned:1]   warnings.warn(
+  [four-unpinned:0] /scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/compiler.py:833: UserWarning: Error writing persistent compilation cache entry for 'jit_body_write': JaxRuntimeError: RESOURCE_EXHAUSTED: Failed to serialize message of type xla.gpu.GpuExecutableProto because its size must be smaller than 2GiB: 4603238614; at byte 0; at uncompressed byte 0; at byte 1546
+  [four-unpinned:0] 	failed to serialize the rest of the fields in GpuExecutableProto split proto (all fields except asm_text, binary, dnn_compiled_graphs, and constants)
+  [four-unpinned:0]   warnings.warn(
+  [four-unpinned:1] [split four-unpinned part 1/4] 2 tiles, warm step 23.5s, receipt {'cuda_visible_devices': '1', 'n_devices': 1, 'platform': 'gpu', 'n_cpus': 144, 'cpu_min': 0, 'cpu_max': 143, 'mems_allowed': '0-2,10,18,26'}
+  [four-unpinned:2] /scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/compiler.py:833: UserWarning: Error writing persistent compilation cache entry for 'jit_body_write': JaxRuntimeError: RESOURCE_EXHAUSTED: Failed to serialize message of type xla.gpu.GpuExecutableProto because its size must be smaller than 2GiB: 4603238614; at byte 0; at uncompressed byte 0; at byte 1546
+  [four-unpinned:2] 	failed to serialize the rest of the fields in GpuExecutableProto split proto (all fields except asm_text, binary, dnn_compiled_graphs, and constants)
+  [four-unpinned:2]   warnings.warn(
+  [four-unpinned:0] [split four-unpinned part 0/4] 2 tiles, warm step 23.5s, receipt {'cuda_visible_devices': '0', 'n_devices': 1, 'platform': 'gpu', 'n_cpus': 144, 'cpu_min': 0, 'cpu_max': 143, 'mems_allowed': '0-2,10,18,26'}
+  [four-unpinned:2] [split four-unpinned part 2/4] 2 tiles, warm step 23.7s, receipt {'cuda_visible_devices': '2', 'n_devices': 1, 'platform': 'gpu', 'n_cpus': 144, 'cpu_min': 0, 'cpu_max': 143, 'mems_allowed': '0-2,10,18,26'}
+  [four-unpinned:1] [split four-unpinned part 1/4] 30 steps x 2 tiles in 4.961s = 12.09 tiles/s (82.7 ms/tile); median step 0.165s; coarse on device
+  [four-unpinned:0] [split four-unpinned part 0/4] 30 steps x 2 tiles in 4.996s = 12.01 tiles/s (83.3 ms/tile); median step 0.167s; coarse on device
+  [four-unpinned:2] [split four-unpinned part 2/4] 30 steps x 2 tiles in 5.025s = 11.94 tiles/s (83.7 ms/tile); median step 0.168s; coarse on device
+  [four-unpinned:3] [split four-unpinned part 3/4] 30 steps x 2 tiles in 5.073s = 11.83 tiles/s (84.5 ms/tile); median step 0.169s; coarse on device
+--- group four-unpinned: rcs [0, 0, 0, 0]
+--- unpinned: four devices 47.87 tiles/s against one 12.89 = 3.71x (method none)
+
+--- arm split-threads after: --arm split-threads --reps 3 --workdir /scratch/10303/jrc4/src/inexor/runs/v2/_d2e_xback --xback-preset cdev --tile-preset cgh64 --tile 512 --buf 32 --steps 30 --gpus 4 --coarse-device 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+/scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/interpreters/mlir.py:1246: UserWarning: A large amount of constants were captured during lowering (4.60GB total). If this is intentional, disable this warning by setting JAX_CAPTURED_CONSTANTS_WARN_BYTES=-1. To obtain a report of where these constants were encountered, set JAX_CAPTURED_CONSTANTS_REPORT_FRAMES=-1.
+  warnings.warn(message)
+/scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/compiler.py:833: UserWarning: Error writing persistent compilation cache entry for 'jit_body_write': JaxRuntimeError: RESOURCE_EXHAUSTED: Failed to serialize message of type xla.gpu.GpuExecutableProto because its size must be smaller than 2GiB: 4603240036; at byte 0; at uncompressed byte 0; at byte 1546
+	failed to serialize the rest of the fields in GpuExecutableProto split proto (all fields except asm_text, binary, dnn_compiled_graphs, and constants)
+  warnings.warn(
+[split-threads] one card: 30 steps x 8 tiles in 18.501s = 12.97 tiles/s (warm 23.0s)
+[split-threads] 4 cards, one thread each (4 devices used): 48.80 tiles/s summed = 3.76x; by the slowest card 48.27 tiles/s = 3.72x; per card [12.07, 12.32, 12.25, 12.16]; coarse on device
+--- arm split-threads after: rc=0
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/d2e_device_tile_d2f_threads_gb.json
+worst rc 0
+--- LEG tile-split rc=0 ---
+
+=== LEG paint-and-forward ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm cards-paint: --arm cards-paint --n-part 1024 --paint-chunks 16384+1024 --reps 3 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[cards-paint] n_part=1024 state built in 243.6s on gpu
+[cards-paint] chunk 16384 bricks (67,109,413 rows, pad 84,551,871, 16 chunks): one card 2.00s, four 0.90s = 2.23x (medians of 3 after warm 4.9 / 3.5s); density equal across widths = True
+[cards-paint] chunk 1024 bricks (4,194,760 rows, pad 5,284,492, 256 chunks): one card 2.27s, four 1.00s = 2.28x (medians of 3 after warm 4.0 / 1.1s); density equal across widths = True
+--- arm cards-paint: rc=0
+
+--- arm cards-scale: --arm cards-scale --scale-n-part 4096 --scale-cards 4 --reps 3 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[cards-scale] n_coarse=2048 bricks/side=256 chunk 16384 bricks -> block (11, 515, 2048); 4 cards [(0, 512), (512, 1024), (1024, 1536), (1536, 2048)]; chunks per card [256, 256, 256, 256]; on gpu
+[cards-scale] accumulators allocated on the cards in 0.87s ([17.28, 17.28, 17.28, 17.28] GB)
+[cards-scale] adds, synced each: 0.41s wall over 4 card threads; per card [(256, 0.12, 1.07), (256, 0.11, 1.06), (256, 0.11, 1.07), (256, 0.1, 1.07)] (chunks, first add s, median ms)
+[cards-scale] fold 0.89s (ghost planes with mass 12); owned mass 11,880,366,080 vs blocks x cells 11,880,366,080: EXACT = True
+[cards-scale] decode 1.42s; sampled planes BITWISE numpy's decode = True (an overlap cell seen: True); device peaks [25.9, 25.9, 25.9, 25.9] GB
+[cards-scale] forward, warm then ABBA, medians: from the cards 5.25s (pass 1 2.15, pass 2 3.10) vs from host slabs 5.75s (pass 1 2.65, pass 2 3.10); warm 5.81 / 5.74s; density to host 4.64s; spectra BITWISE = True
+--- arm cards-scale: rc=0
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/d2d_device_paint_d2f_bundle_gb.json
+worst rc 0
+--- LEG paint-and-forward rc=0 ---
+
+=== rc_total=0 ===

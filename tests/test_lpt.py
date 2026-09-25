@@ -122,8 +122,8 @@ def test_v_d_identity_against_finite_difference(delta0):
     v = np.asarray(v, np.float64)
     scale = np.max(np.abs(v))
     assert np.max(np.abs(v - v_fd)) < 2e-3 * scale
-    # and the reduced coefficient is +(6/7) D1
-    coef = -(growth_factor_2(a0, PLANCK) * growth_rate_2(a0, PLANCK)) / (
+    # and in the EdS approximation the coefficient reduces to +(6/7) D1
+    coef = -(growth_factor_2(a0, PLANCK, "eds") * growth_rate_2(a0, PLANCK, "eds")) / (
         D1 * growth_rate_a(a0, PLANCK)
     )
     assert coef == pytest.approx((6.0 / 7.0) * D1, rel=1e-12)

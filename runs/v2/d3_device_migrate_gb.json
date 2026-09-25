@@ -1,0 +1,223 @@
+{
+ "argv": [
+  "scripts/v2_d3_device_migrate.py",
+  "--arms",
+  "xback,slab-real,slab-shape",
+  "--reps",
+  "3",
+  "--out-suffix",
+  "_gb"
+ ],
+ "started": "2026-09-13T19:16:47",
+ "job": "995264",
+ "node": "c672-018.vista.tacc.utexas.edu",
+ "commit": "d461cbe",
+ "arms": [
+  {
+   "arm": "xback",
+   "rc": 0,
+   "record": {
+    "arm": "xback",
+    "platform": "gpu",
+    "n_part": 256,
+    "nb": 16,
+    "c_drift": 5.301646762279934,
+    "drift_frac": 1.9,
+    "build_s": 3.8095025001093745,
+    "steps": [
+     {
+      "numpy_s": 4.456583546008915,
+      "jax_s": 5.716735215042718,
+      "stats_equal": true,
+      "field_diffs": {},
+      "stats": {
+       "n_arena_overflow": 89782,
+       "arena_used": 89782,
+       "vel_scale": 8.749759552740715e-05,
+       "vel_scale_min": 5.126865552267096e-05,
+       "n_migrated_checked": 16777216,
+       "brick_reach": 2,
+       "brick_reach_raw": 2,
+       "brick_reach_realized": 2,
+       "peak_staged_slabs": 4
+      }
+     },
+     {
+      "numpy_s": 4.596939966082573,
+      "jax_s": 2.799899501958862,
+      "stats_equal": true,
+      "field_diffs": {},
+      "stats": {
+       "n_arena_overflow": 98397,
+       "arena_used": 98397,
+       "vel_scale": 8.749759552740715e-05,
+       "vel_scale_min": 5.1430809184914184e-05,
+       "n_migrated_checked": 16777216,
+       "brick_reach": 2,
+       "brick_reach_raw": 2,
+       "brick_reach_realized": 2,
+       "peak_staged_slabs": 4
+      }
+     }
+    ],
+    "eject_calls": 32,
+    "insert_calls": 32,
+    "overflow": 188179,
+    "residents_rehomed": 89782,
+    "realized_reach": 2,
+    "vacuous": []
+   }
+  },
+  {
+   "arm": "slab-real",
+   "rc": 0,
+   "record": {
+    "arm": "slab-real",
+    "platform": "gpu",
+    "n_part": 512,
+    "nb": 32,
+    "rows_per_slab": 4194304,
+    "c_drift": 1.2993772982005518,
+    "drift_frac": 0.5,
+    "build_s": 30.83429474197328,
+    "steps": [
+     {
+      "numpy_s": 26.872095813043416,
+      "compiled_s": 17.506301879999228,
+      "eject_calls_s": 3.4745203519705683,
+      "insert_calls_s": 4.1161287111463025,
+      "eject_calls": 32,
+      "insert_calls": 32,
+      "host_s": 9.915652816882357,
+      "new_eject_shapes": 2,
+      "new_insert_shapes": 2,
+      "field_diffs": {},
+      "stats_equal": true,
+      "stats": {
+       "n_arena_overflow": 0,
+       "arena_used": 0,
+       "vel_scale": 9.394810735345579e-05,
+       "vel_scale_min": 5.093777194760437e-05,
+       "n_migrated_checked": 134217728,
+       "brick_reach": 1,
+       "brick_reach_raw": 1,
+       "brick_reach_realized": 1,
+       "peak_staged_slabs": 2
+      }
+     },
+     {
+      "numpy_s": 27.144247725023888,
+      "compiled_s": 15.168883011909202,
+      "eject_calls_s": 1.9393514508847147,
+      "insert_calls_s": 3.3853312500286847,
+      "eject_calls": 32,
+      "insert_calls": 32,
+      "host_s": 9.844200310995802,
+      "new_eject_shapes": 0,
+      "new_insert_shapes": 1,
+      "field_diffs": {},
+      "stats_equal": true,
+      "stats": {
+       "n_arena_overflow": 0,
+       "arena_used": 0,
+       "vel_scale": 9.394810735345579e-05,
+       "vel_scale_min": 5.053445927946704e-05,
+       "n_migrated_checked": 134217728,
+       "brick_reach": 1,
+       "brick_reach_raw": 1,
+       "brick_reach_realized": 1,
+       "peak_staged_slabs": 2
+      }
+     }
+    ],
+    "device_peak": 839091968,
+    "host_maxrss_gb": 24.67730712890625
+   }
+  },
+  {
+   "arm": "slab-shape",
+   "rc": 0,
+   "record": {
+    "arm": "slab-shape",
+    "platform": "gpu",
+    "nb": 256,
+    "rows": 268435456,
+    "bricks": 65536,
+    "drift_frac": 0.5,
+    "c_drift": 8.13850996373347e-05,
+    "gen_s": 12.277759099029936,
+    "reps": 3,
+    "eject": {
+     "warm_s": 11.172988189035095,
+     "public_s": [
+      0.9141862540272996,
+      0.9409048090456054,
+      0.971678419969976
+     ],
+     "public_median_s": 0.9409048090456054,
+     "split": [
+      {
+       "prep_s": 0.011272998992353678,
+       "upload_s": 0.5440267689991742,
+       "compute_s": 0.014872499974444509,
+       "readback_s": 0.3769079860066995
+      },
+      {
+       "prep_s": 0.013213741942308843,
+       "upload_s": 0.516118866042234,
+       "compute_s": 0.014683763030916452,
+       "readback_s": 0.40282468404620886
+      },
+      {
+       "prep_s": 0.013183788978494704,
+       "upload_s": 0.5175095909507945,
+       "compute_s": 0.014709649956785142,
+       "readback_s": 0.3955863870214671
+      }
+     ],
+     "public_repeat_equal": true,
+     "split_equal_public": true,
+     "n_keep": 219755792,
+     "leaver_frac": 0.1813458800315857,
+     "device_peak": 33017562880
+    },
+    "insert": {
+     "warm_s": 10.970737860072404,
+     "public_s": [
+      1.23425270000007,
+      1.2689622599864379,
+      1.2862477919552475
+     ],
+     "public_median_s": 1.2689622599864379,
+     "split": [
+      {
+       "prep_s": 0.012895405059680343,
+       "upload_s": 0.22115967399440706,
+       "compute_s": 0.6282320519676432,
+       "readback_s": 0.43743747496046126
+      },
+      {
+       "prep_s": 0.013424238073639572,
+       "upload_s": 0.19230242201592773,
+       "compute_s": 0.6276082419790328,
+       "readback_s": 0.43356559006497264
+      },
+      {
+       "prep_s": 0.01335690903943032,
+       "upload_s": 0.20178933499846607,
+       "compute_s": 0.6276959230890498,
+       "readback_s": 0.44349221605807543
+      }
+     ],
+     "public_repeat_equal": true,
+     "split_equal_public": true,
+     "n_write": 251015983,
+     "n_spill": 0,
+     "device_peak_after": 33017562880
+    },
+    "host_maxrss_gb": 66.9222412109375
+   }
+  }
+ ],
+ "finished": "2026-09-13T19:20:10"
+}

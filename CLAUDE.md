@@ -163,12 +163,17 @@ explicit `--mem` (see the umbrella albireo memory).
 
 ## Reference code (read-only from here)
 
-- `~/spherex/mbody/mbody/{integrate,forces,painting,lpt}.py` — the port
-  sources (BullFrog weights, geometric force split, CIC patterns, reversible
-  adjoint skeleton).
 - DISCO-DJ installed in `~/spherex/disco-mocks/.pixi/.../site-packages/discodj`
-  (steppers + Diffrax backsolve adjoint) — comparison target; measure its
-  repro floor before setting parity gates.
+  (steppers + Diffrax backsolve adjoint) — the comparison target for the PM
+  step and integrator; measure its repro floor before setting parity gates.
+  `scripts/v2_disco_crosscheck.py` runs it on our ICs and scores it with our card.
+- The BullFrog integrator is defined by Rampf, List & Hahn 2024
+  (arXiv:2409.19049); its weights need the true LCDM growth pair (Sec. 4.4).
+- `~/spherex/mbody/mbody/{integrate,forces,painting,lpt}.py` — where much of
+  the early code was ported from. mbody was a toy: it is provenance, not a
+  physics reference. Its EdS BullFrog weights were the cause of the engine's
+  ~13% high-k deficit (D-v2-25); judge inherited conventions against the
+  physics or DISCO-DJ/emulators, never by parity with mbody.
 
 ## Umbrella
 

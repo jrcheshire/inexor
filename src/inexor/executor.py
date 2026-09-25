@@ -564,13 +564,19 @@ def _rss_mb():
 
 
 def _worker_init(shm_handles, shapes, dtypes, fields, small, fn_args, x64,
-                 core_sets, rank_counter):
+                 core_sets, rank_counter, paint_only=False):
     """Pin affinity, then attach shm views and build the jitted tile program.
 
     `x64` replicates the PARENT's jax_enable_x64 into the worker -- the
     library's never-touch-jax.config rule is about not overriding the caller's
     choice, and a spawned worker starts without the caller's runtime, so
     replicating it is how the choice propagates rather than being made here.
+
+    `paint_only` skips BOTH halves of the force arm: the three coarse-force
+    views and `make_tile_force_fn`. A coarse-paint-only consumer reads neither
+    (`_worker_coarse_task` touches the state and the painting kernel and
+    nothing else), and at c-hero the kernels are the larger per-worker term of
+    the two by a wide margin.
     """
     if core_sets is not None and hasattr(os, "sched_setaffinity"):
         with rank_counter.get_lock():
@@ -581,7 +587,7 @@ def _worker_init(shm_handles, shapes, dtypes, fields, small, fn_args, x64,
     import jax
 
     jax.config.update("jax_enable_x64", bool(x64))
-    from inexor.forces import make_tile_force_fn
+    from inexor.forces import make_tile_force_fn  # noqa: F401  (force arm only)
 
     views, segs = {}, []
     for name in fields:
@@ -589,11 +595,13 @@ def _worker_init(shm_handles, shapes, dtypes, fields, small, fn_args, x64,
         segs.append(seg)
         views[name] = np.ndarray(shapes[name], dtype=dtypes[name], buffer=seg.buf)
     g_coarse = []
-    for i in range(3):
-        seg = open_segment(shm_handles[f"g{i}"])
-        segs.append(seg)
-        g_coarse.append(np.ndarray(shapes[f"g{i}"], dtype=dtypes[f"g{i}"], buffer=seg.buf))
-    one_tile, _ = make_tile_force_fn(**fn_args)
+    if not paint_only:
+        for i in range(3):
+            seg = open_segment(shm_handles[f"g{i}"])
+            segs.append(seg)
+            g_coarse.append(
+                np.ndarray(shapes[f"g{i}"], dtype=dtypes[f"g{i}"], buffer=seg.buf))
+    one_tile = None if paint_only else make_tile_force_fn(**fn_args)[0]
     _G.update(views=views, small=small, g_coarse=g_coarse, one_tile=one_tile,
               segs=segs, st=None, step=None, init_s=time.perf_counter() - t0)
 
@@ -742,6 +750,14 @@ def _worker_alive(_):
 def _worker_task(arg):
     """One tile of the kick; the writes ride back for the parent to apply."""
     t, bricks, C = arg
+    if _G["one_tile"] is None:
+        # the parent refuses this too (`TilePool._refuse_force`); the worker
+        # says it in its own voice so a dispatch that got past the parent does
+        # not surface as `NoneType is not callable` from inside tile_task
+        raise RuntimeError(
+            "tile task on a paint_only worker: this pool was built without the "
+            "force arm, so there is no tile kernel and no coarse mesh here"
+        )
     st = _ensure_facade(C)
     from inexor.engine import tile_task
 
@@ -795,9 +811,18 @@ class TilePool:
     `finally` does) -- creation rebinds the caller's `SlotState` fields to shm
     views, and `close()` gives them regular memory back before unlinking, so
     the state object outlives the pool either way.
+
+    `paint_only=True` builds the COARSE-PAINT half and nothing else: no coarse
+    force meshes in the parent, no force kernels in the workers. It exists for
+    consumers that stream the paint without ever computing a force -- the P(k)
+    card is the one -- and it is not an optimisation but an admissibility
+    condition at hero scale: the three f32 meshes are `3 * n_coarse**3`, which
+    is 103.1 GB at c-hero, against the ~186 GB the card leg has free over its
+    839.5 GB peak (measured, gb 1010938). The force entry points refuse in
+    this mode rather than reading a mesh nobody published.
     """
 
-    def __init__(self, st, cfg, allocator=None):
+    def __init__(self, st, cfg, allocator=None, paint_only=False):
         import jax
 
         if jax.default_backend() != "cpu":
@@ -846,9 +871,11 @@ class TilePool:
             f: int(np.asarray(getattr(st, f)).nbytes)
             for f in self._fields if f not in self._preshared
         }
-        self._shm_demand["coarse force g0,g1,g2"] = int(
-            3 * n**3 * np.dtype(cfg.np_coarse_dtype).itemsize
-        )
+        self.paint_only = bool(paint_only)
+        if not self.paint_only:
+            self._shm_demand["coarse force g0,g1,g2"] = int(
+                3 * n**3 * np.dtype(cfg.np_coarse_dtype).itemsize
+            )
         # The migrate scratch is staged per step and its (K, R) is not known
         # until the first `stage_migrate`, so it cannot be measured here. It
         # is real all the same, so the construction demand is held to a
@@ -876,8 +903,9 @@ class TilePool:
         # the parent's cached brick->arena index maps into the OLD array;
         # values are equal but the invariant is identity, so rebuild lazily
         st._invalidate_arena_index()
-        for i in range(3):
-            self._share(f"g{i}", shape=(n, n, n), dtype=cfg.np_coarse_dtype)
+        if not self.paint_only:
+            for i in range(3):
+                self._share(f"g{i}", shape=(n, n, n), dtype=cfg.np_coarse_dtype)
         fn_args = dict(
             n_fine=cfg.n_fine, box_size=cfg.box_size, n_particles_total=cfg.n_total,
             n_tile=cfg.n_tile, b_fine=cfg.b_fine, r_s=cfg.r_s, paint=cfg.paint_short,
@@ -905,7 +933,7 @@ class TilePool:
                 self.workers, initializer=_worker_init,
                 initargs=(self._names, self._shapes, self._dtypes, self._fields,
                           small, fn_args, bool(jax.config.jax_enable_x64),
-                          core_sets, rank_counter),
+                          core_sets, rank_counter, self.paint_only),
             )
         finally:
             for k, v in saved.items():
@@ -966,10 +994,22 @@ class TilePool:
         nothing. At C-gh that is 12.9 GB of the 25.8 the old jax-list-then-numpy
         -copy shape carried. Returned as a list in component order.
         """
+        self._refuse_force("g_views")
         return [self._views[f"g{i}"] for i in range(3)]
+
+    def _refuse_force(self, what):
+        """A paint-only pool has no force arm, and must say so rather than
+        KeyError on a mesh that was never allocated."""
+        if self.paint_only:
+            raise RuntimeError(
+                f"{what} on a paint_only TilePool: this pool has no coarse "
+                "force meshes and its workers have no tile kernel. Build it "
+                "with paint_only=False for the force arm."
+            )
 
     def stage_step(self, g_coarse, C):
         """Publish this step's coarse force meshes and per-step header."""
+        self._refuse_force("stage_step")
         for i, g in enumerate(g_coarse):
             a = np.asarray(g)
             buf = self._views[f"g{i}"]
@@ -991,6 +1031,7 @@ class TilePool:
 
     def imap(self, tasks):
         """Arrival-order iterator of tile results for the staged step."""
+        self._refuse_force("imap")
         if self._C is None:
             raise RuntimeError("imap before stage_step: the workers have no header")
         C = self._C
@@ -1095,9 +1136,19 @@ class TilePool:
             self._pool.close()
             self._pool.join()
             self._pool = None
-        # give the caller's state regular memory back BEFORE unlinking, or the
-        # arrays would be views into freed segments
+        # Give the caller's state regular memory back BEFORE unlinking, or the
+        # arrays would be views into freed segments.
+        #
+        # ONLY the fields THIS POOL SHARED. An ADOPTED field is the allocator's
+        # segment, which `close()` deliberately does not unlink (see `_adopt`),
+        # so copying it back buys nothing and costs a second whole state: at
+        # c-hero that is 754.6 GB on top of the 754.6 already resident, on a
+        # 1026 GB node. The same "state exists twice" fault that OOM-killed
+        # 922723 at construction, in the teardown instead -- and invisible
+        # below hero scale, where the state is 1.4 GB and the copy is free.
         for f in self._fields:
+            if f in self._preshared:
+                continue
             cur = getattr(self.st, f, None)
             if cur is not None:
                 setattr(self.st, f, np.array(cur, copy=True))

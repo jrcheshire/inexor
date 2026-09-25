@@ -59,7 +59,7 @@ def _geom(cfg, tile=None, buf=32):
     return g
 
 
-def make_ics(g, seed=SEED):
+def make_ics(g, seed=SEED, a_init=A_INIT):
     import jax
 
     from inexor.config import Cosmology
@@ -69,7 +69,7 @@ def make_ics(g, seed=SEED):
     cosmo = Cosmology()
     key = jax.random.PRNGKey(seed)
     d0 = linear_density(key, g["n_part"], g["L"], cosmo, f_NL=0.0, fdtype=np.float64)
-    x, v = lpt_ics(d0, g["L"], A_INIT, cosmo, order=2, fdtype=np.float64)
+    x, v = lpt_ics(d0, g["L"], a_init, cosmo, order=2, fdtype=np.float64)
     return np.asarray(x, np.float64), np.asarray(v, np.float64), cosmo
 
 
@@ -229,26 +229,33 @@ def _pk(x, n_mesh, L, n_total):
     return c[good], s[good] / cnt[good]
 
 
-def leg_accumulated(cfg, g, k_steps, slack=0.10, arena_frac=0.02):
-    """Leg B: the engine against a never-quantized driver of the same shape."""
+def leg_accumulated(cfg, g, k_steps, slack=0.10, arena_frac=0.02, a_init=A_INIT,
+                    bucket_cells=2, coarse_match_order=2, tile_workers=1, ref_only=False):
+    """Leg B: the engine against a never-quantized driver of the same shape.
+
+    `a_init`, `bucket_cells` and `coarse_match_order` default to the ratified
+    gate; `tile_workers` pools the engine arm only (bitwise the serial engine).
+    `ref_only` skips the engine arm and returns the reference spectrum alone, for
+    comparing references across start epochs.
+    """
     import jax.numpy as jnp
 
     from inexor import engine, state
     from inexor.codec import T9Layout
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
 
-    x, v, cosmo = make_ics(g)
-    a_steps = a_grid(A_INIT, A_FINAL, k_steps, SPACING)
+    x, v, cosmo = make_ics(g, a_init=a_init)
+    a_steps = a_grid(a_init, A_FINAL, k_steps, SPACING)
     co = bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo))
     ec = engine.EngineConfig(
         box_size=g["L"], n_part=g["n_part"], n_fine=g["n_fine"], n_coarse=g["n_coarse"],
         n_tile=g["tile"], b_fine=g["buf"], alpha=ALPHA,
-        brick_slack=slack,
+        brick_slack=slack, coarse_match_order=coarse_match_order, tile_workers=tile_workers,
     )
     ec.validate()
 
     # --- the engine
-    t9 = T9Layout(box_size=g["L"], n_part=g["n_part"], bucket_cells=2)
+    t9 = T9Layout(box_size=g["L"], n_part=g["n_part"], bucket_cells=bucket_cells)
     st = state.SlotState.build(
         x, v, t9, g["n_fine"] // ec.n_brick, brick_slack=slack, arena_frac=arena_frac
     )
@@ -264,10 +271,11 @@ def leg_accumulated(cfg, g, k_steps, slack=0.10, arena_frac=0.02):
         t_last[0] = now
 
     t0 = time.perf_counter()
-    engine.run(st, ec, co, collect=_report)
-    st.check()
+    if not ref_only:
+        engine.run(st, ec, co, collect=_report)
+        st.check()
+        xe = np.concatenate([st.decode_brick(b)[1] for b in range(st.n_bricks)])
     wall_engine = time.perf_counter() - t0
-    xe = np.concatenate([st.decode_brick(b)[1] for b in range(st.n_bricks)])
 
     # --- the never-quantized reference.
     #
@@ -287,7 +295,7 @@ def leg_accumulated(cfg, g, k_steps, slack=0.10, arena_frac=0.02):
         xn = np.asarray(xx, dtype=np.float64)
         g_long, _ = _f.force_global(
             xn, g["n_coarse"], g["L"], g["n_part"] ** 3, "long", r_s=ec.r_s,
-            match=(ec.coarse_cell, ec.fine_cell), assign="tsc", paint="int",
+            match=ec.coarse_match, assign="tsc", paint="int",
         )
         b_real = ec._b_realized
         n_brick = _f.k_components and ec.n_brick
@@ -310,13 +318,22 @@ def leg_accumulated(cfg, g, k_steps, slack=0.10, arena_frac=0.02):
     wall_ref = time.perf_counter() - t0
     xr = np.asarray(xr)
 
-    k, p_e = _pk(xe, g["n_fine"], g["L"], g["n_part"] ** 3)
-    _, p_r = _pk(xr, g["n_fine"], g["L"], g["n_part"] ** 3)
+    k, p_r = _pk(xr, g["n_fine"], g["L"], g["n_part"] ** 3)
     k_nyq = np.pi * g["n_fine"] / g["L"]
+    if ref_only:
+        return dict(config=cfg, k=k_steps, a_init=a_init,
+                    coarse_match_order=coarse_match_order, ref_only=True,
+                    k_centres=k.tolist(), p_ref=p_r.tolist(), wall_ref_s=wall_ref)
+    _, p_e = _pk(xe, g["n_fine"], g["L"], g["n_part"] ** 3)
     band = k <= 0.2 * k_nyq
-    dpp = np.abs(p_e[band] / p_r[band] - 1.0)
+    ratio = p_e[band] / p_r[band]
+    dpp = np.abs(ratio - 1.0)
     return dict(
-        config=cfg, k=k_steps, k_gate=float(0.2 * k_nyq),
+        config=cfg, k=k_steps, k_gate=float(0.2 * k_nyq), a_init=a_init,
+        bucket_cells=bucket_cells, quantum=float(t9.quantum),
+        coarse_match_order=coarse_match_order, tile_workers=tile_workers,
+        ratio_vs_k=[[float(a), float(b)] for a, b in zip(k[band], ratio)],
+        k_centres=k.tolist(), p_ref=p_r.tolist(), p_eng=p_e.tolist(),
         max_dpp_in_band=float(dpp.max()),
         median_dpp_in_band=float(np.median(dpp)),
         dpp_vs_k=[[float(a), float(b)] for a, b in zip(k[band], dpp)],
@@ -338,6 +355,17 @@ def main():
                     help="arena size as a fraction of N; D-v2-19 measured 1-2% at cdev8, "
                          "where a brick is 1/512 of the box. `smoke` has far fewer bricks, "
                          "so each is a much larger fraction and needs more")
+    ap.add_argument("--a-init", type=float, default=A_INIT,
+                    help="accum: starting scale factor for the ICs and the step grid")
+    ap.add_argument("--bucket-cells", type=int, default=2,
+                    help="accum: the engine's position bucket in particle cells "
+                         "(quantum = bucket/256; D-v2-14 ratifies 2)")
+    ap.add_argument("--coarse-match-order", type=int, default=2, choices=(2, 3),
+                    help="accum: coarse match order, applied to BOTH arms")
+    ap.add_argument("--tile-workers", type=int, default=1,
+                    help="accum: pool the engine arm; the float reference stays serial")
+    ap.add_argument("--ref-only", action="store_true",
+                    help="accum: run only the never-quantized reference and save its spectrum")
     ap.add_argument("--out-suffix", default="")
     args = ap.parse_args()
 
@@ -363,10 +391,17 @@ def main():
               f"max |delta| {res['max_abs_delta']:.3e}, peak {res['oracle_peak']:.3f} -> "
               f"{'PASS' if res['ok'] else ('VACUOUS' if res['vacuous'] else 'FAIL')}", flush=True)
     else:
-        res = leg_accumulated(args.config, g, args.k, args.slack, args.arena_frac)
-        print(f"  accumulated: max |dP/P| in band {res['max_dpp_in_band']:.3e} against the "
-              f"3e-2 bar ({res['margin']:.1f}x margin); engine {res['wall_engine_s']:.1f}s "
-              f"ref {res['wall_ref_s']:.1f}s", flush=True)
+        res = leg_accumulated(args.config, g, args.k, args.slack, args.arena_frac,
+                              a_init=args.a_init, bucket_cells=args.bucket_cells,
+                              coarse_match_order=args.coarse_match_order,
+                              tile_workers=args.tile_workers, ref_only=args.ref_only)
+        if args.ref_only:
+            print(f"  reference only: {res['k']} steps from a={res['a_init']:.5f}, "
+                  f"ref {res['wall_ref_s']:.1f}s", flush=True)
+        else:
+            print(f"  accumulated: max |dP/P| in band {res['max_dpp_in_band']:.3e} against the "
+                  f"3e-2 bar ({res['margin']:.1f}x margin); engine {res['wall_engine_s']:.1f}s "
+                  f"ref {res['wall_ref_s']:.1f}s", flush=True)
     res["determinism"] = det
     res["slack"] = args.slack
     res["arena_frac"] = args.arena_frac

@@ -306,6 +306,20 @@ def cic_match_factor(shape, cell_solve, cell_target, clip=None, order_solve=2, o
     return ratio, max_applied
 
 
+def _match_orders(match):
+    """`match` is (cell_solve, cell_target) or (cell_solve, cell_target,
+    order_solve, order_target). The 2-tuple is the ratified form and means CIC
+    on both sides; the orders exist because the coarse arm paints and gathers
+    with TSC, and a factor built at CIC order leaves sinc^2 per axis of the
+    coarse window uncorrected (`scripts/v2_force_profile.py`)."""
+    if len(match) == 2:
+        return {}
+    if len(match) != 4:
+        raise ValueError(f"match must be (cell_solve, cell_target[, order_solve, order_target]), "
+                         f"got {match!r}")
+    return dict(order_solve=int(match[2]), order_target=int(match[3]))
+
+
 def split_kernels(shape, cell, which, r_s=None, fdtype=np.float64):
     """The (Kx, Ky, Kz) half-grid kernels of the ratified gaussian split.
 
@@ -450,7 +464,8 @@ def _global_delta_and_kernels(
     kers = split_kernels((n_mesh,) * 3, cell, which, r_s=r_s, fdtype=fdtype)
     max_applied = 1.0
     if match is not None:
-        mf, max_applied = cic_match_factor((n_mesh,) * 3, match[0], match[1], clip=clip)
+        mf, max_applied = cic_match_factor((n_mesh,) * 3, match[0], match[1], clip=clip,
+                                           **_match_orders(match))
         # `mf` is a host f64 half-grid and `k` may be complex64, so an uncast
         # multiply promotes the kernel back to complex128 and silently undoes
         # the narrowing -- at the MATCHED coarse arm specifically, which is the
@@ -528,15 +543,175 @@ def coarse_kernel_parts(n_mesh, box_size, which, r_s=None, match=None, clip=None
     if match is not None:
         # cast for the same reason as in `_global_delta_and_kernels`: an f64
         # match factor would promote a complex64 kernel back to complex128
-        m, _ = cic_match_factor(shape, match[0], match[1], clip=clip)
+        m, _ = cic_match_factor(shape, match[0], match[1], clip=clip, **_match_orders(match))
         mf = m.astype(fdtype, copy=False)
         del m
     return dict(iks=(ikx, iky, ikz), pref=pref, mf=mf,
                 fdtype=fdtype, n_mesh=int(n_mesh), which=which)
 
 
+def refuse_oversize_coarse_solve(n_mesh):
+    """Refuse a MONOLITHIC coarse solve big enough to be silently wrong.
+
+    `ooc_fft` refuses a device transform at or above 2**31 elements because one
+    was MEASURED to return a wrong result with no symptom (1536^3 f32 roundtrip
+    3.8e+3 against 1024^3's 2.9e-6, Vista 972737, jax 0.10.2 + GB200). This
+    module never had that guard, and it is the one the engine's coarse solve
+    actually calls: at c-hero the coarse mesh is 2048^3 = 8.59e9 elements, FOUR
+    TIMES the bound, so the port to a device backend would walk straight into
+    the silent-wrong class. Every preset that has ever run is below it -- c-gh's
+    1024^3 is exactly the size that read 2.9e-6 correctly -- so this refuses
+    nothing that works today.
+
+    CPU IS EXEMPT, deliberately. The bound is empirical and the suspect is
+    cuFFT's 32-bit plan class; refusing on a backend where nothing was ever
+    measured would be inventing a limit rather than enforcing one. The check is
+    therefore on the backend that is about to run the transform.
+
+    The fix when this fires is not a bigger bound, it is the factorized form:
+    `ooc_fft.forward_from_slabs_device` reads 6.676e-06 at 2048^3 where the
+    monolithic call does not fit and does not survive its own roundtrip.
+    """
+    import jax
+
+    from inexor import ooc_fft
+
+    n_elements = int(n_mesh) ** 3
+    if n_elements < ooc_fft.MAX_DEVICE_TRANSFORM_ELEMENTS:
+        return
+    if jax.default_backend() == "cpu":
+        return
+    raise ValueError(
+        f"the monolithic coarse solve at n_mesh={n_mesh} is {n_elements:,} "
+        f"elements, at or above the {ooc_fft.MAX_DEVICE_TRANSFORM_ELEMENTS:,} "
+        f"bound where a device FFT has been MEASURED to return a wrong result "
+        f"silently, on backend {jax.default_backend()!r}. Use the factorized "
+        "path (`ooc_fft.forward_from_slabs_device`), which reads 6.676e-06 at "
+        "2048^3; the plane is the unit."
+    )
+
+
+def coarse_kernel_slab(parts, axis, lo, hi, cdtype):
+    """The complex kernel for one component, on the x-slab [lo, hi).
+
+    BITWISE the corresponding slice of the whole-grid kernel, and that is an
+    identity rather than a hope: `iks` are low-rank broadcasts whose x-component
+    is the only one that slices, `pref` and `mf` are real half-grids sliced along
+    the same axis, and the expression is `(pref * ik) * mf` element for element
+    -- the same association `coarse_kernel_parts` refuses to fold, for the same
+    reason. Nothing here reduces across x, so a slab cannot see its neighbours.
+
+    This is what lets the factorized solve never hold a whole complex kernel:
+    24 B/half becomes 24 B/slab, which is the same argument that kept `pref`
+    real and the `ik_j` low-rank in the first place.
+    """
+    ikx, iky, ikz = parts["iks"]
+    ik = (ikx[lo:hi], iky, ikz)[axis]
+    k = parts["pref"][lo:hi] * np.asarray(ik).astype(cdtype, copy=False)
+    if parts["mf"] is not None:
+        k = k * parts["mf"][lo:hi]
+    return k
+
+
+def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=None,
+                             fold_kernel=True):
+    """The coarse solve through `ooc_fft`'s canonical factorization.
+
+    WHY THIS EXISTS. The monolithic form does not fit at c-hero and is four
+    times over the size where a device FFT was MEASURED to be silently wrong
+    (`refuse_oversize_coarse_solve`). It is also the last place in the engine
+    still calling `jnp.fft.rfftn` directly: the IC stage already goes through
+    this factorization, which `ooc_fft`'s docstring calls the layer's
+    definition of the transform.
+
+    IT DOES NOT AGREE WITH THE MONOLITHIC FORM TO THE BIT, and cannot -- a
+    different transform order rounds differently, which `ooc_fft` says outright
+    about `np.fft.rfftn`. The gate is tolerance against monolithic at sizes
+    monolithic can still do, plus the invariances that ARE bitwise: the spectrum
+    must not depend on slab thickness, and the per-slab kernel must equal the
+    whole-grid one exactly.
+
+    THE COPY IS THE MULTIPLY, not an extra pass. `inverse_to_slabs_device`
+    mutates its spectrum, so each of the three components needs its own -- but
+    writing `work[lo:hi] = spec[lo:hi] * k` produces that copy AS the kernel
+    multiply, one read and one write over the half-grid, which is what a
+    standalone copy would have cost on its own. D5 measured that traversal at
+    ~3.0 s per component at 2048^3 (~9.1 s/step), flat in device count because
+    it is host work; this is where that term comes from.
+
+    `timings`, if a dict, accumulates seconds per part summed over the three
+    components (`forward: pass1/pass2`, the kernel/`multiply` part, `inverse:
+    pass1/pass2`). Every part ends on a host read or a synced card write, so each
+    is its own wall.
+
+    `fold_kernel=False` keeps the host multiply as a separate traversal: the arm the
+    folded form is gated against, and the only difference between them.
+    """
+    import time
+
+    from inexor import ooc_fft
+    from inexor.device.coarse import CardShards
+
+    def _add(key, t0, inner=None):
+        if timings is not None:
+            if inner is not None:
+                for k, v in inner.items():
+                    name = f"{key}: {k[:-2]}"
+                    timings[name] = timings.get(name, 0.0) + v
+            else:
+                timings[key] = timings.get(key, 0.0) + time.perf_counter() - t0
+
+    n = int(n_mesh)
+    ft = {}
+    if isinstance(delta, (list, tuple)):
+        spec = ooc_fft.forward_from_card_planes(delta, n, timings=ft)
+    else:
+        spec = ooc_fft.forward_from_slabs_device(
+            lambda lo, hi: delta[lo:hi], n, slab=slab, timings=ft)
+    _add("forward", None, ft)
+    # `out` as `CardShards`: each component's planes land on the cards that hold
+    # them and no host mesh exists (`ooc_fft.inverse_to_card_shards`)
+    per_card = [[] for _ in out.ranges] if isinstance(out, CardShards) else None
+    # ONE work buffer for all three components, not one each: at 4096^3 it is
+    # 34.4 GB, and a fresh one per component pays its first-touch faults again
+    # (~5.3M minor faults per solve, gb 1003657).
+    work = np.empty_like(spec)
+    for axis in range(3):
+        it = {}
+        if fold_kernel:
+            # The kernel multiply rides the axis-0 pass the inverse runs anyway:
+            # the block is already on the card, so the host stops traversing the
+            # whole half-grid a second time per component (85 s of a 123 s solve
+            # at 4096^3). `pass2=False` below: this call IS that pass.
+            t0 = time.perf_counter()
+            ooc_fft.kspace_pass_device(
+                [(1.0, spec)], n, kernel=ooc_fft.ArrayKernel.coarse(
+                    parts["pref"], parts["iks"][axis], axis, parts["mf"], cdtype),
+                out=work, inverse=True, timings=it)
+            _add("kernel + axis-0 pass", t0)
+        else:
+            t0 = time.perf_counter()
+            for lo in range(0, spec.shape[0], slab):
+                hi = min(lo + slab, spec.shape[0])
+                work[lo:hi] = spec[lo:hi] * coarse_kernel_slab(parts, axis, lo, hi, cdtype)
+            _add("multiply", t0)
+        if per_card is not None:
+            for k, m in enumerate(ooc_fft.inverse_to_card_shards(
+                    work, n, out.ranges, timings=it, pass2=not fold_kernel)):
+                per_card[k].append(m)
+        else:
+            for lo, block in ooc_fft.inverse_to_slabs_device(
+                    work, n, slab=slab, timings=it, pass2=not fold_kernel):
+                out[axis][lo:lo + block.shape[0]] = block
+        # `it` also carries the folded pass's own seconds, recorded above as its own part
+        _add("inverse", None, {k: v for k, v in it.items() if k in ("pass1_s", "pass2_s")})
+    del work
+    return out.assemble(per_card) if per_card is not None else out
+
+
 def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None,
-                        fdtype=None, parts=None, out=None):
+                        fdtype=None, parts=None, out=None, transform="factorized",
+                        slab=None, timings=None, fold_kernel=True):
     """The three long-range force meshes from an ALREADY-PAINTED delta.
 
     `force_global` paints from every position AND gathers at every position,
@@ -571,11 +746,21 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
     built a numpy copy of each, and because a comprehension rebinds only after
     it completes, that is six full meshes live at once -- 25.8 GB at C-gh. One
     component at a time is 8.6.
+
+    `delta` may instead be the per-card shards of `device.paint.coarse_delta_cards`;
+    the factorized solve then transforms each card's planes where they sit
+    (`ooc_fft.forward_from_card_planes`), bitwise the solve of the same density
+    on the host.
+
+    `timings` (factorized only) collects the solve's per-part walls; see
+    `_coarse_solve_factorized`, which `fold_kernel` also belongs to.
     """
-    fdtype = field_dtype(delta.dtype if fdtype is None else fdtype)
-    if np.dtype(delta.dtype) != fdtype:
+    on_cards = isinstance(delta, (list, tuple))
+    ddt = np.dtype(delta[0]["delta"].dtype if on_cards else delta.dtype)
+    fdtype = field_dtype(ddt if fdtype is None else fdtype)
+    if ddt != fdtype:
         raise ValueError(
-            f"coarse_force_meshes: delta is {np.dtype(delta.dtype).name} but fdtype is "
+            f"coarse_force_meshes: delta is {ddt.name} but fdtype is "
             f"{fdtype.name}. These must agree -- the kernels are built at fdtype and a "
             "mismatched multiply promotes the whole solve back to the wider type, which "
             "reads as a working f32 arm that is silently costing f64 memory. Narrow the "
@@ -597,6 +782,27 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
     cdtype = np.complex128 if fdtype == np.dtype(np.float64) else np.complex64
     if out is None:
         out = [np.empty((int(n_mesh),) * 3, dtype=fdtype) for _ in range(3)]
+    if transform == "factorized":
+        from inexor import ooc_fft
+
+        return _coarse_solve_factorized(
+            delta, n_mesh, parts, cdtype, out,
+            ooc_fft._DEF_SLAB if slab is None else int(slab), timings=timings,
+            fold_kernel=fold_kernel)
+    if on_cards:
+        raise ValueError(
+            "coarse_force_meshes: a density on the cards has only the factorized "
+            "solve; a monolithic transform would need the whole mesh on one device")
+    from inexor.device.coarse import CardShards
+
+    if isinstance(out, CardShards):
+        raise ValueError(
+            "coarse_force_meshes: force meshes written onto the cards have only the "
+            "factorized solve; the monolithic transform returns whole host meshes")
+    if transform != "monolithic":
+        raise ValueError(
+            f"transform must be 'monolithic' or 'factorized', got {transform!r}")
+    refuse_oversize_coarse_solve(int(n_mesh))
     dk = jnp.fft.rfftn(delta)
     # SEQUENTIAL PER-COMPONENT SOLVES, and now the comment is true of the
     # outputs as well as of the transforms. `k` is formed, used and dropped
@@ -1115,20 +1321,71 @@ def coarse_subblock_origin_extent(tijk, n_tile, n_coarse, n_fine, halo=COARSE_HA
 def stage_coarse_subblock(g_coarse, origin_cells, extent):
     """Extract the (extent,)*3 periodic sub-block at `origin_cells`.
 
-    Host-side numpy with `mode="wrap"` per axis, so a block straddling the
+    Host-side numpy, wrapped per axis by construction, so a block straddling the
     periodic boundary needs no special case and no copy of the whole mesh.
+
+    ONE 3-D GATHER, NOT THREE 1-D ONES. Taking axis by axis is the obvious
+    spelling and it materializes the whole intermediate slab before the second
+    axis narrows it: at c-hero the first take alone builds (132, 2048, 2048) =
+    2.21 GB to deliver a 9.20 MB block, and it runs once per force component per
+    tile -- 3 x 4096 = 12,288 times a step, i.e. **27.2 TB of host writes per
+    step to produce 113 GB of output**. `np.ix_` gathers the extent^3 elements
+    directly. It is the same elements in the same order, so the change is an
+    identity and `test_the_subblock_is_the_wrapped_slice` pins it against the
+    global mesh element by element, independent of either spelling.
+
+    The defect was invisible until c-hero because the intermediate scales as
+    extent x n_coarse^2: at cgh64 it is small enough to disappear into noise,
+    and the engine has never run at c-hero. It is also ~2.21 GB of transient
+    host allocation per call that no budget carries -- at W=8 workers, ~17.7 GB.
     """
     g = np.asarray(g_coarse)
-    out = g
-    for axis, o in enumerate(np.asarray(origin_cells, dtype=np.int64)):
-        idx = (np.arange(int(extent), dtype=np.int64) + int(o)) % g.shape[axis]
-        out = np.take(out, idx, axis=axis)
-    return out
+    o = np.asarray(origin_cells, dtype=np.int64)
+    if o.shape != (3,) or g.ndim != 3:
+        raise ValueError(f"want a 3-D mesh and a (3,) origin, got {g.shape} and {o.shape}")
+    span = np.arange(int(extent), dtype=np.int64)
+    return g[np.ix_(*((span + int(o[axis])) % g.shape[axis] for axis in range(3)))]
+
+
+def stencil_violation_message(assign, lo_needed, hi_needed, extent):
+    return (
+        f"a row's {assign} stencil reaches outside the staged sub-block: needs "
+        f"[{lo_needed}, {hi_needed}] of [0, {extent - 1}]. Pass only the tile's OWNED "
+        "rows, or raise the halo -- reading past the block wraps to the far side of "
+        "the mesh and is silent."
+    )
+
+
+def check_stencil_guard(guard_out):
+    """Resolve deferred stencil bounds and refuse. Call before USING the result.
+
+    Reads the device scalars, so it is a sync -- it belongs immediately beside
+    the readback of the forces themselves, never inside the tile loop's
+    arithmetic.
+    """
+    for lo_needed, hi_needed, extent, assign in guard_out:
+        lo_i, hi_i = int(lo_needed), int(hi_needed)
+        if lo_i < 0 or hi_i >= extent:
+            raise ValueError(stencil_violation_message(assign, lo_i, hi_i, extent))
+
+
+def _stencil_bounds(i, m, first, n_w, n_coarse, extent):
+    """Lowest and highest cell any LIVE row's stencil reaches, on device.
+
+    Dead rows are pushed to sentinels that cannot win their own reduction, which
+    reproduces the host form's `if keep.any()` exactly: with every row dead the
+    min comes back above zero and the max below `extent`, so an all-padded tile
+    raises nothing, as it did before.
+    """
+    big = jnp.int32(int(n_coarse) + int(extent) + 1)
+    i_lo = i if m is None else jnp.where(m, i, big)
+    i_hi = i if m is None else jnp.where(m, i, -big)
+    return jnp.min(i_lo) + first, jnp.max(i_hi) + first + n_w - 1
 
 
 def gather_coarse_subblock(
     sub_x, sub_y, sub_z, positions, origin_cells, cell_coarse, n_coarse, assign="tsc",
-    live=None,
+    live=None, guard_out=None,
 ):
     """Read the long force for one tile's rows out of a staged sub-block.
 
@@ -1162,9 +1419,22 @@ def gather_coarse_subblock(
     The caller must pass only rows whose stencil fits the halo. Rows outside the
     tile's core would read wrapped values from the far side of the block,
     silently and plausibly, so they are refused rather than trusted.
+
+    **`guard_out` moves that refusal off the critical path without weakening
+    it.** Computing the bounds on the host meant `np.asarray(i)` in the MIDDLE
+    of the gather: it stalls the device before the corner loop, which is the
+    actual work, and then runs a host min/max over every padded row -- a
+    per-particle host pass, once per tile, in a function whose arithmetic is
+    otherwise entirely on device. Pass a list and the bounds come back as
+    device scalars instead, for the caller to check on the sync it already
+    performs on the forces. The refusal then happens after the tile is computed
+    but BEFORE its result is used, which is why a deferred guard is still a
+    guard: nothing wrong is ever written to the state.
     """
-    extent = int(np.asarray(sub_x).shape[0])
-    origin = np.asarray(origin_cells, dtype=np.int64)
+    # `.shape`, not `np.asarray(...).shape`, and the origin straight to int32:
+    # both must accept tracers so `device.tile` can jit the gather with the
+    # origin as a runtime value. The integers are the same either way.
+    extent = int(sub_x.shape[0])
     xp = jnp.asarray(positions) / float(cell_coarse)
     if assign == "tsc":
         base_f = jnp.round(xp)
@@ -1181,24 +1451,26 @@ def gather_coarse_subblock(
     base = jax.lax.stop_gradient(base_f).astype(jnp.int32)
     # exact integer re-basing; `% n_coarse` puts a block straddling the periodic
     # boundary back in range without touching any float
-    i = jnp.mod(base - jnp.asarray(origin, dtype=jnp.int32), int(n_coarse))
+    i = jnp.mod(base - jnp.asarray(origin_cells, dtype=jnp.int32), int(n_coarse))
 
-    i_np = np.asarray(i)
-    keep = np.ones(i_np.shape[0], dtype=bool) if live is None else np.asarray(live)
-    if keep.any():
-        lo_needed = int(i_np[keep].min()) + first
-        hi_needed = int(i_np[keep].max()) + first + len(w_axis) - 1
-        if lo_needed < 0 or hi_needed >= extent:
-            raise ValueError(
-                f"a row's {assign} stencil reaches outside the staged sub-block: needs "
-                f"[{lo_needed}, {hi_needed}] of [0, {extent - 1}]. Pass only the tile's OWNED "
-                "rows, or raise the halo -- reading past the block wraps to the far side of "
-                "the mesh and is silent."
-            )
-    if live is not None:
+    m = None if live is None else jnp.asarray(live)[:, None]
+    lo_needed, hi_needed = _stencil_bounds(i, m, first, len(w_axis), n_coarse, extent)
+    if guard_out is None:
+        # EAGER: pull the two scalars back and refuse here. This is the original
+        # behaviour and it costs a device->host sync in the MIDDLE of the
+        # gather, before the corner loop that is the actual work.
+        lo_i, hi_i = int(lo_needed), int(hi_needed)
+        if lo_i < 0 or hi_i >= extent:
+            raise ValueError(stencil_violation_message(assign, lo_i, hi_i, extent))
+    else:
+        # DEFERRED: hand the caller the two device scalars unevaluated, so they
+        # ride back on the sync it already performs on the forces. The refusal
+        # still happens before this tile's result is used -- see the guard_out
+        # note in the docstring.
+        guard_out.append((lo_needed, hi_needed, extent, assign))
+    if m is not None:
         # padded rows read a valid address with zero weight, exactly as
         # `_tile_corner` does; the index must stay in range for every row
-        m = jnp.asarray(keep)[:, None]
         i = jnp.where(m, i, -first)
         w_axis = tuple(jnp.where(m, w, 0.0) for w in w_axis)
 

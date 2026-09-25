@@ -1,0 +1,183 @@
+=== c672-006.vista.tacc.utexas.edu: commit 28e23ae, job 995813 ===
+0, NVIDIA GB200, 189471 MiB
+1, NVIDIA GB200, 189471 MiB
+2, NVIDIA GB200, 189471 MiB
+3, NVIDIA GB200, 189471 MiB
+               total        used        free      shared  buff/cache   available
+Mem:            1691          74        1649           3           4        1617
+
+=== LEG jax-devices ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+jax devices: [CudaDevice(id=0), CudaDevice(id=1), CudaDevice(id=2), CudaDevice(id=3)]
+--- LEG jax-devices rc=0 ---
+
+=== LEG pytest-gpu-gates ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+...............s....................                                     [100%]
+35 passed, 1 skipped in 324.54s (0:05:24)
+--- LEG pytest-gpu-gates rc=0 ---
+
+=== LEG smoke ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm engine-device: --arm engine-device --n-part 32 --steps 2 --real-frac 0.5 --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[engine-device] smoke: n_part=32 nb=8 built in 0.0s on gpu; K=2, migrate_backend=device
+[engine-device] run 42.4s; phases: tile_long 22.4, migrate 6.9, lead_drift 5.2, coarse_paint 3.6, repack 2.6, coarse_solve 0.7, tile_decode 0.4, tile_short 0.2, kernel_build 0.2, tile_reduce 0.0, membership 0.0, tile_loop_end 0.0, reconcile 0.0
+[engine-device] device peak 0.00 GiB, host maxrss 2.3 GB
+--- arm engine-device: rc=0
+
+--- arm engine-host: --arm engine-host --n-part 32 --steps 2 --real-frac 0.5 --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[engine-host] smoke: n_part=32 nb=8 built in 0.0s on gpu; K=2, migrate_backend=host
+[engine-host] run 29.5s; phases: tile_long 23.5, coarse_paint 3.6, lead_drift 0.8, coarse_solve 0.6, tile_decode 0.5, tile_short 0.2, kernel_build 0.2, migrate 0.1, tile_reduce 0.0, membership 0.0, repack 0.0, tile_loop_end 0.0, reconcile 0.0
+[engine-host] device peak 0.00 GiB, host maxrss 1.8 GB
+--- arm engine-host: rc=0
+
+--- arm migrate-budget: --arm migrate-budget --n-part 32 --steps 2 --real-frac 0.5 --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[migrate-budget] step 0: device 6.90s; estimate 0.001 GiB vs measured peak 0.001 GiB (estimate/measured 0.791); BITWISE numpy = True
+[migrate-budget] step 1: device 4.12s; estimate 0.001 GiB vs measured peak 0.001 GiB (estimate/measured 0.806); BITWISE numpy = True
+--- arm migrate-budget: rc=0
+
+--- arm repack-slab: --arm repack-slab --shape-nb 4 --steps 2 --real-frac 0.5 --allow-cpu
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[repack-slab] nb=4, 65,552 rows in slab 0 (4,097 per brick), 16 residents planted, built in 0.0s on gpu
+[repack-slab] host repack 0.00s (fast 10, merged 16)
+[repack-slab] device repack 0.92s incl. 2 compiles; BITWISE host = True; receipt {'slabs': 4, 'programs': 2, 'windows_peak': 4, 'readahead_uploads': 3, 'empty_slabs': 2, 'held_peak_bytes': 1486584}; device peak 0.01 GiB
+[repack-slab] timed second repack 0.22s (synced; phases sum 0.22s)
+       0.210 s  block program
+       0.002 s  upload: index
+       0.002 s  upload: own slab
+       0.001 s  write-back
+       0.000 s  pass: setup + arena lift
+       0.000 s  upload: read-ahead
+       0.000 s  empty slab
+       0.000 s  pass: tail
+--- arm repack-slab: rc=0
+
+=== R2 GATE: state hashes equal = True; stripped stats equal = True; run 42.4s device vs 29.5s host; migrate 6.9 vs 0.1s; repack 2.6 vs 0.0s ===
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/r2_device_engine_gbsmoke.json
+rc=0
+--- LEG smoke rc=0 ---
+
+=== LEG engine-and-budget ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm engine-device: --arm engine-device --n-part 512 --steps 2 --real-frac 0.5
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[engine-device] cgh64: n_part=512 nb=32 built in 31.3s on gpu; K=2, migrate_backend=device
+[engine-device] run 287.4s; phases: coarse_paint 174.3, tile_decode 41.2, tile_long 31.8, tile_reduce 18.1, lead_drift 6.2, tile_short 4.8, migrate 4.4, coarse_solve 4.0, repack 1.7, kernel_build 0.6, membership 0.3, tile_loop_end 0.0, reconcile 0.0
+[engine-device] device peak 2.83 GiB, host maxrss 24.7 GB
+--- arm engine-device: rc=0
+
+--- arm engine-host: --arm engine-host --n-part 512 --steps 2 --real-frac 0.5
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[engine-host] cgh64: n_part=512 nb=32 built in 31.4s on gpu; K=2, migrate_backend=host
+[engine-host] run 336.2s; phases: coarse_paint 179.7, tile_decode 41.4, migrate 34.8, tile_long 32.6, tile_reduce 18.6, lead_drift 17.3, tile_short 5.7, coarse_solve 4.3, repack 0.8, kernel_build 0.6, membership 0.3, tile_loop_end 0.0, reconcile 0.0
+[engine-host] device peak 2.83 GiB, host maxrss 24.7 GB
+--- arm engine-host: rc=0
+
+--- arm migrate-budget: --arm migrate-budget --n-part 512 --steps 2 --real-frac 0.5
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[migrate-budget] step 0: device 6.16s; estimate 0.935 GiB vs measured peak 1.227 GiB (estimate/measured 0.762); BITWISE numpy = True
+[migrate-budget] step 1: device 1.55s; estimate 0.935 GiB vs measured peak 1.230 GiB (estimate/measured 0.76); BITWISE numpy = True
+--- arm migrate-budget: rc=0
+
+=== R2 GATE: state hashes equal = True; stripped stats equal = True; run 287.4s device vs 336.2s host; migrate 4.4 vs 34.8s; repack 1.7 vs 0.8s ===
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/r2_device_engine_gb.json
+rc=0
+--- LEG engine-and-budget rc=0 ---
+
+=== LEG repack-slab ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm repack-slab: --arm repack-slab --shape-nb 256 --steps 2 --real-frac 0.5
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[repack-slab] nb=256, 268,439,552 rows in slab 0 (4,096 per brick), 4096 residents planted, built in 130.9s on gpu
+[repack-slab] host repack 15.79s (fast 102892, merged 4096)
+[repack-slab] device repack 10.59s incl. 2 compiles; BITWISE host = True; receipt {'slabs': 256, 'programs': 2, 'windows_peak': 256, 'readahead_uploads': 255, 'empty_slabs': 254, 'held_peak_bytes': 6088916610}; device peak 17.21 GiB
+[repack-slab] timed second repack 8.99s (synced; phases sum 8.97s)
+       6.498 s  pass: setup + arena lift
+       1.100 s  pass: tail
+       0.481 s  write-back
+       0.468 s  upload: own slab
+       0.302 s  block program
+       0.087 s  empty slab
+       0.040 s  upload: index
+       0.000 s  upload: read-ahead
+--- arm repack-slab: rc=0
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/r2_device_engine_slab_gb.json
+rc=0
+--- LEG repack-slab rc=0 ---
+
+=== rc_total=0 ===

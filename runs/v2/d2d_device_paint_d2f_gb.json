@@ -1,0 +1,214 @@
+{
+ "argv": [
+  "scripts/v2_d2d_device_paint.py",
+  "--xback-n",
+  "256",
+  "--reps",
+  "3",
+  "--skip-xback-dev",
+  "--card-widths",
+  "1+4",
+  "--chunks",
+  "none",
+  "--scale",
+  "--out-suffix",
+  "_d2f_gb"
+ ],
+ "started": "2026-09-13T15:02:13",
+ "job": "994608",
+ "node": "c672-017.vista.tacc.utexas.edu",
+ "commit": "fd7a70f",
+ "arms": [
+  {
+   "arm": "xback-host",
+   "rc": 0,
+   "record": {
+    "arm": "xback-host",
+    "n_part": 256,
+    "platform": "cpu",
+    "plain": {
+     "sha": "float32[128, 128, 128]:3733a29f65f01d71fdf222e7dd9617a084a0163560ac284226f833c26a938fe3",
+     "arena_used": 0,
+     "abs_max": 0.21173095703125,
+     "build_s": 3.5559201799333096,
+     "paint_s": 9.644546194002032,
+     "jit_sha": "float32[128, 128, 128]:3733a29f65f01d71fdf222e7dd9617a084a0163560ac284226f833c26a938fe3",
+     "jit_equal_to_host_here": true
+    },
+    "arena": {
+     "sha": "float32[128, 128, 128]:7bc8728a5d785fbf42fdfdbdf562d210313cc215377f03a185c70bc52c051f04",
+     "arena_used": 61879,
+     "abs_max": 0.735931396484375,
+     "build_s": 7.404993299394846,
+     "paint_s": 8.219489615410566,
+     "jit_sha": "float32[128, 128, 128]:7bc8728a5d785fbf42fdfdbdf562d210313cc215377f03a185c70bc52c051f04",
+     "jit_equal_to_host_here": true
+    }
+   }
+  },
+  {
+   "arm": "xback-cards",
+   "rc": 0,
+   "record": {
+    "arm": "xback-cards",
+    "n_part": 256,
+    "platform": "gpu",
+    "n_visible": 4,
+    "plain": {
+     "arena_used": 0,
+     "w1": {
+      "sha": "float32[128, 128, 128]:3733a29f65f01d71fdf222e7dd9617a084a0163560ac284226f833c26a938fe3",
+      "equal_to_cpu_host": true,
+      "devices_used": 1,
+      "card_chunks": [
+       64
+      ],
+      "ghost_planes_nonzero": 3,
+      "jit_traces": 1,
+      "paint_s": 2.302761346101761,
+      "solve_s": 1.8470460027456284
+     },
+     "w4": {
+      "sha": "float32[128, 128, 128]:3733a29f65f01d71fdf222e7dd9617a084a0163560ac284226f833c26a938fe3",
+      "equal_to_cpu_host": true,
+      "devices_used": 4,
+      "card_chunks": [
+       16,
+       16,
+       16,
+       16
+      ],
+      "ghost_planes_nonzero": 12,
+      "jit_traces": 0,
+      "paint_s": 2.6739475931972265,
+      "solve_s": 1.1367696579545736
+     },
+     "solve_equal_to_host_density_solve": true
+    },
+    "arena": {
+     "arena_used": 61879,
+     "w1": {
+      "sha": "float32[128, 128, 128]:7bc8728a5d785fbf42fdfdbdf562d210313cc215377f03a185c70bc52c051f04",
+      "equal_to_cpu_host": true,
+      "devices_used": 1,
+      "card_chunks": [
+       64
+      ],
+      "ghost_planes_nonzero": 3,
+      "jit_traces": 1,
+      "paint_s": 1.0666350200772285,
+      "solve_s": 1.0858083963394165
+     },
+     "w4": {
+      "sha": "float32[128, 128, 128]:7bc8728a5d785fbf42fdfdbdf562d210313cc215377f03a185c70bc52c051f04",
+      "equal_to_cpu_host": true,
+      "devices_used": 4,
+      "card_chunks": [
+       16,
+       16,
+       16,
+       16
+      ],
+      "ghost_planes_nonzero": 12,
+      "jit_traces": 0,
+      "paint_s": 0.8810157533735037,
+      "solve_s": 0.8690762463957071
+     },
+     "solve_equal_to_host_density_solve": true
+    }
+   }
+  },
+  {
+   "arm": "cards-scale",
+   "rc": 0,
+   "record": {
+    "arm": "cards-scale",
+    "platform": "gpu",
+    "n_coarse": 2048,
+    "bricks_per_side": 256,
+    "cards": 4,
+    "ranges": [
+     [
+      0,
+      512
+     ],
+     [
+      512,
+      1024
+     ],
+     [
+      1024,
+      1536
+     ],
+     [
+      1536,
+      2048
+     ]
+    ],
+    "chunk_bricks": 16384,
+    "block_extent": [
+     11,
+     515,
+     2048
+    ],
+    "accumulator_bytes": [
+     17280532480,
+     17280532480,
+     17280532480,
+     17280532480
+    ],
+    "alloc_s": 0.8768148180097342,
+    "add_wall_s": 0.4312433321028948,
+    "per_card": [
+     {
+      "chunks": 256,
+      "first_add_s": 0.14571206830441952,
+      "card_s": 0.41969272308051586,
+      "add_median_ms": 1.0552965104579926
+     },
+     {
+      "chunks": 256,
+      "first_add_s": 0.11289854720234871,
+      "card_s": 0.38924461230635643,
+      "add_median_ms": 1.0484829545021057
+     },
+     {
+      "chunks": 256,
+      "first_add_s": 0.13167009316384792,
+      "card_s": 0.40836048126220703,
+      "add_median_ms": 1.062147319316864
+     },
+     {
+      "chunks": 256,
+      "first_add_s": 0.10292377695441246,
+      "card_s": 0.37204279378056526,
+      "add_median_ms": 1.0517481714487076
+     }
+    ],
+    "fold_s": 0.9713688883930445,
+    "ghost_planes_nonzero": 12,
+    "mass": 11880366080,
+    "want_mass": 11880366080,
+    "mass_exact": true,
+    "decode_s": 1.5094647072255611,
+    "peak_int": 4,
+    "decode_bitwise_numpy": true,
+    "device_peaks": [
+     25904022016,
+     25904022016,
+     25904022016,
+     25904022528
+    ],
+    "cards_forward_s": 9.14661225862801,
+    "cards_pass1_s": 3.4987794179469347,
+    "cards_pass2_s": 5.647733256220818,
+    "host_forward_s": 9.99930914863944,
+    "host_pass1_s": 4.745954666286707,
+    "host_pass2_s": 5.252525212243199,
+    "gather_to_host_s": 6.018029456958175,
+    "spectra_bitwise": true
+   }
+  }
+ ],
+ "finished": "2026-09-13T15:03:57"
+}

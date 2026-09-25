@@ -10,6 +10,7 @@ displacement bound, each proven able to fire.
 import json
 import os
 import zlib
+from unittest import mock
 
 import jax
 import numpy as np
@@ -75,6 +76,19 @@ def test_streamed_build_is_bitwise_the_monolithic_one(tmp_path, f_NL):
         "every brick got the same scale, so this fixture cannot tell a per-brick\n"
         "scale from a global one and the comparison above is vacuous"
     )
+
+
+def test_slab_rows_sort_relative_to_their_slab_past_2_to_the_32():
+    """Vista 997280: slab 128 of 256 at 4096^3 carried keys from 2^32; the radix refuses them."""
+    from inexor.layout import _stable_sort_index
+
+    rng = np.random.default_rng(0)
+    lo = 2**32 + 12345
+    rel = rng.integers(0, 50_000, size=20_000)
+    order = icgen._sort_slab_rows(lo + rel, lo)
+    assert np.array_equal(order, np.argsort(rel, kind="stable"))
+    with pytest.raises(ValueError, match="2\\^32"):
+        _stable_sort_index(lo + rel)
 
 
 def test_streamed_build_identity_can_fail(tmp_path):
@@ -274,6 +288,93 @@ def test_write_t9_slabs_manifest_is_written_last(tmp_path):
         icgen.load_slot_state(str(tmp_path))
 
 
+def test_write_t9_slabs_probe_writes_the_same_leading_slabs_and_no_manifest(tmp_path):
+    """`max_slabs` is a timing probe: its slabs are byte-identical to a full write's,
+    it never leaves a loadable directory, and a timed write is the untimed one."""
+    st = _evolved_state()
+    full, probe = str(tmp_path / "full"), str(tmp_path / "probe")
+    t_full, t_probe = {}, {}
+    icgen.write_t9_slabs(st, full, timings=t_full)
+    assert icgen.write_t9_slabs(st, probe, timings=t_probe, max_slabs=2) is None
+    _man, crcs = _crcs(full)
+    assert sorted(os.listdir(probe)) == ["t9_slab_0000.npz", "t9_slab_0001.npz"]
+    for f in os.listdir(probe):
+        with open(os.path.join(probe, f), "rb") as a, open(os.path.join(full, f), "rb") as b:
+            assert a.read() == b.read(), f
+    assert t_probe["slabs"] == 2 and t_full["slabs"] == st.bricks_per_side
+    assert all(t_probe[k] > 0 for k in ("index", "gather", "crc32", "write")), t_probe
+    with pytest.raises(FileNotFoundError, match="refusing to load"):
+        icgen.load_slot_state(probe)
+
+
+class _CountingBuckets(np.ndarray):
+    """An `arena_bucket` that counts whole-array comparisons made against it."""
+
+    calls = 0
+
+    def __ge__(self, other):
+        type(self).calls += 1
+        return np.ndarray.__ge__(self, other)
+
+    def __lt__(self, other):
+        type(self).calls += 1
+        return np.ndarray.__lt__(self, other)
+
+
+def test_write_t9_slabs_groups_the_arena_once_not_once_per_slab(tmp_path):
+    """The arena is PROVISIONED at a fraction of the particles whatever it holds
+    (687M rows = 5.5 GB at C-hero, against 327 actually occupied at step 8), so
+    selecting a slab's residents with `lo <= arena_bucket < hi` inside the slab
+    loop walks that array twice per slab -- 256 times over a checkpoint, for an
+    answer that is one row. This is the defect `arena_slots_of_brick` was
+    written to avoid, and the writer had reintroduced it."""
+    st = _evolved_state()
+    assert st.n_arena and int(np.sum(st.arena_bucket >= 0)) > 0, "vacuous: empty arena"
+    st.arena_bucket = st.arena_bucket.view(_CountingBuckets)
+    _CountingBuckets.calls = 0
+    icgen.write_t9_slabs(st, str(tmp_path / "w"))
+    assert st.bricks_per_side >= 4, "vacuous: too few slabs to tell once from per-slab"
+    assert _CountingBuckets.calls <= 2, (
+        f"{_CountingBuckets.calls} whole-arena comparisons over "
+        f"{st.bricks_per_side} slabs: the grouping is back inside the loop"
+    )
+
+
+def test_write_t9_slabs_hashes_the_buffers_without_copying_them(tmp_path):
+    """`crc32(a.tobytes())` copied the whole payload to hash it -- 2.7 GB a slab
+    at C-hero. `zlib.crc32` takes the buffer itself; this pins that the recorded
+    checksums are unchanged by that, since a wrong one only shows up as a
+    refusal to load much later."""
+    st = _evolved_state()
+    d = str(tmp_path / "w")
+    icgen.write_t9_slabs(st, d)
+    for f in sorted(os.listdir(d)):
+        if not f.startswith("t9_slab_"):
+            continue
+        z = np.load(os.path.join(d, f))
+        meta = json.loads(str(z["meta"]))
+        for key, arr in (("occupancy", z["occupancy"]), ("off", z["off"]),
+                         ("w", z["w"]), ("scale", z["scale"])):
+            assert meta["crc32"][key] == zlib.crc32(arr.tobytes()), (f, key)
+
+
+def test_write_t9_slabs_surfaces_a_failure_from_the_writer_thread(tmp_path):
+    """The write runs on a background thread so it overlaps the next slab's
+    gather. A thread that dies silently would leave a short checkpoint with a
+    manifest standing over it, which loads clean."""
+    st = _evolved_state()
+    calls = []
+
+    def boom(path, *a, **k):
+        calls.append(path)
+        raise OSError("no space left on device")
+
+    with mock.patch.object(icgen, "_save_slab", boom):
+        with pytest.raises(OSError, match="no space left"):
+            icgen.write_t9_slabs(st, str(tmp_path / "w"))
+    assert calls, "the writer thread never ran"
+    assert not os.path.exists(str(tmp_path / "w" / icgen.MANIFEST))
+
 # ------------------------------------------------- staging cleanup (M-v2-6 S4)
 
 
@@ -360,3 +461,27 @@ def test_a_failed_generation_keeps_its_working_set(tmp_path):
     stage = os.path.join(str(tmp_path), icgen.STAGE_DIR)
     assert os.path.isdir(stage) and os.listdir(stage)
     assert not os.path.exists(os.path.join(str(tmp_path), icgen.MANIFEST))
+
+
+def test_load_slot_state_drops_the_page_cache_of_every_slab_it_reads(tmp_path, monkeypatch):
+    """The cache competes with the state rather than serving it (gb 1003657), so the
+    loader drops each slab as it goes -- in BOTH passes, which is why the count is twice
+    the file count. Off by default."""
+    st = _evolved_state()
+    d = str(tmp_path)
+    icgen.write_t9_slabs(st, d)
+    n_files = len(icgen.read_manifest(d)["files"])
+    seen = []
+    monkeypatch.setattr(icgen, "drop_file_cache", lambda p: (seen.append(p), True)[1])
+    icgen.load_slot_state(d)
+    assert seen == []
+    st2 = icgen.load_slot_state(d, drop_cache=True)
+    assert len(seen) == 2 * n_files and len(set(seen)) == n_files
+    np.testing.assert_array_equal(_all_rows(st), _all_rows(st2))
+
+
+def test_drop_file_cache_is_best_effort_and_never_raises(tmp_path):
+    assert icgen.drop_file_cache(str(tmp_path / "nope")) is False
+    p = tmp_path / "f"
+    p.write_bytes(b"x" * 4096)
+    assert icgen.drop_file_cache(str(p)) in (True, False)

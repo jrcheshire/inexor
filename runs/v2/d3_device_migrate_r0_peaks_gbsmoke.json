@@ -1,0 +1,107 @@
+{
+ "argv": [
+  "scripts/v2_d3_device_migrate.py",
+  "--arms",
+  "",
+  "--shape-nb",
+  "8",
+  "--reps",
+  "1",
+  "--peaks",
+  "eject+insert:0.05:1+insert:0.4:2",
+  "--out-suffix",
+  "_r0_peaks_gbsmoke"
+ ],
+ "started": "2026-09-13T21:28:07",
+ "job": "995435",
+ "node": "c672-008.vista.tacc.utexas.edu",
+ "commit": "bef34e0",
+ "arms": [
+  {
+   "arm": "peak eject",
+   "rc": 0,
+   "record": {
+    "arm": "peak-eject",
+    "platform": "gpu",
+    "nb": 8,
+    "rows": 262144,
+    "calls": [
+     {
+      "rows": 262144,
+      "padded": 277732,
+      "wall_s": 2.6722239600494504,
+      "new_program": true
+     },
+     {
+      "rows": 261357,
+      "padded": 262144,
+      "wall_s": 0.4439966445788741,
+      "new_program": true
+     },
+     {
+      "rows": 259522,
+      "padded": 262144,
+      "wall_s": 0.005618654191493988,
+      "new_program": false
+     }
+    ],
+    "programs": 2,
+    "device_peak": 38041344,
+    "b_per_row": 145.1162109375,
+    "b_per_padded_row": 136.97141128858036,
+    "host_maxrss_gb": 1.669921875
+   }
+  },
+  {
+   "arm": "peak insert:0.05:1",
+   "rc": 0,
+   "record": {
+    "arm": "peak-insert",
+    "platform": "gpu",
+    "nb": 8,
+    "emig_share": 0.05,
+    "reach": 1,
+    "slab_rows": 262144,
+    "rows": 288357,
+    "padded": 294247,
+    "gen_s": 0.010110586881637573,
+    "walls_s": [
+     1.3119359910488129,
+     0.007401052862405777
+    ],
+    "n_write": 262197,
+    "n_spill": 0,
+    "device_peak": 43342080,
+    "b_per_row": 150.30701526233108,
+    "b_per_slab_row": 165.3369140625,
+    "host_maxrss_gb": 1.705078125
+   }
+  },
+  {
+   "arm": "peak insert:0.4:2",
+   "rc": 0,
+   "record": {
+    "arm": "peak-insert",
+    "platform": "gpu",
+    "nb": 8,
+    "emig_share": 0.4,
+    "reach": 2,
+    "slab_rows": 262144,
+    "rows": 681571,
+    "padded": 699841,
+    "gen_s": 0.026335892267525196,
+    "walls_s": [
+     1.1438648290932178,
+     0.012131066992878914
+    ],
+    "n_write": 262029,
+    "n_spill": 0,
+    "device_peak": 65974528,
+    "b_per_row": 96.79773347164125,
+    "b_per_slab_row": 251.6728515625,
+    "host_maxrss_gb": 1.740234375
+   }
+  }
+ ],
+ "finished": "2026-09-13T21:28:31"
+}

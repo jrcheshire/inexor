@@ -1,0 +1,254 @@
+{
+ "argv": [
+  "scripts/v2_d2d_device_paint.py",
+  "--skip-xback",
+  "--reps",
+  "3",
+  "--out-suffix",
+  "_dead_gb",
+  "--chunks",
+  "512:4096:jit,512:4096:jit:21139272,512:4096:jit:21139272:spread,512:4096:jit:33554432,512:4096:jit:33554432:spread"
+ ],
+ "started": "2026-09-12T22:59:51",
+ "job": "993600",
+ "node": "c672-012.vista.tacc.utexas.edu",
+ "commit": "dbb852b",
+ "arms": [
+  {
+   "arm": "chunk 512:4096:jit",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": false,
+    "pad_is_pow2": true,
+    "dead_rows": "cell0",
+    "block_extent": [
+     35,
+     256,
+     256
+    ],
+    "jit_shapes": {
+     "pad": 16777216,
+     "live_w": 21137968,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 512,
+    "chunk_bricks": 4096,
+    "bricks_per_side": 32,
+    "rows": 16777200,
+    "pad": 16777216,
+    "frac_of_4096_xslab": 0.062499940395355225,
+    "build_s": 28.67308723500173,
+    "warm_s": 1.200729415009846,
+    "rep_s": [
+     0.030341702993609942,
+     0.02857635699911043,
+     0.028293764000409283
+    ],
+    "window_s": 0.009617645002435893,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 1208914688,
+    "peak_minus_baseline": 1208914688,
+    "b_per_padded_row": 72.05693054199219,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 1.208914688,
+    "planner_4096_gb": 1.207959552
+   }
+  },
+  {
+   "arm": "chunk 512:4096:jit:21139272",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": true,
+    "pad_is_pow2": false,
+    "dead_rows": "cell0",
+    "block_extent": [
+     35,
+     256,
+     256
+    ],
+    "jit_shapes": {
+     "pad": 21139272,
+     "live_w": 21137968,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 512,
+    "chunk_bricks": 4096,
+    "bricks_per_side": 32,
+    "rows": 16777200,
+    "pad": 21139272,
+    "frac_of_4096_xslab": 0.062499940395355225,
+    "build_s": 28.771820629001013,
+    "warm_s": 1.2259887010004604,
+    "rep_s": [
+     0.11617390099854674,
+     0.10815037800057326,
+     0.10821156200836413
+    ],
+    "window_s": 0.009579267993103713,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 1568285184,
+    "peak_minus_baseline": 1568285184,
+    "b_per_padded_row": 74.18823051238472,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 1.2446719679640692,
+    "planner_4096_gb": 1.207959552
+   }
+  },
+  {
+   "arm": "chunk 512:4096:jit:21139272:spread",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": true,
+    "pad_is_pow2": false,
+    "dead_rows": "spread",
+    "block_extent": [
+     35,
+     256,
+     256
+    ],
+    "jit_shapes": {
+     "pad": 21139272,
+     "live_w": 21137968,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 512,
+    "chunk_bricks": 4096,
+    "bricks_per_side": 32,
+    "rows": 16777200,
+    "pad": 21139272,
+    "frac_of_4096_xslab": 0.062499940395355225,
+    "build_s": 28.75475907800137,
+    "warm_s": 1.1292367599962745,
+    "rep_s": [
+     0.03244295700278599,
+     0.03155630000401288,
+     0.030337162999785505
+    ],
+    "window_s": 0.00966442099888809,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 1501175552,
+    "peak_minus_baseline": 1501175552,
+    "b_per_padded_row": 71.01358797975635,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 1.191410304471376,
+    "planner_4096_gb": 1.207959552
+   }
+  },
+  {
+   "arm": "chunk 512:4096:jit:33554432",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": true,
+    "pad_is_pow2": true,
+    "dead_rows": "cell0",
+    "block_extent": [
+     35,
+     256,
+     256
+    ],
+    "jit_shapes": {
+     "pad": 33554432,
+     "live_w": 21137968,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 512,
+    "chunk_bricks": 4096,
+    "bricks_per_side": 32,
+    "rows": 16777200,
+    "pad": 33554432,
+    "frac_of_4096_xslab": 0.062499940395355225,
+    "build_s": 28.874496021002415,
+    "warm_s": 0.903085664001992,
+    "rep_s": [
+     0.3648013579950202,
+     0.36292362899985164,
+     0.36278119700727984
+    ],
+    "window_s": 0.009670851999544539,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 3809383424,
+    "peak_minus_baseline": 3809383424,
+    "b_per_padded_row": 113.52847290039062,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 1.904691712,
+    "planner_4096_gb": 1.207959552
+   }
+  },
+  {
+   "arm": "chunk 512:4096:jit:33554432:spread",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": true,
+    "pad_is_pow2": true,
+    "dead_rows": "spread",
+    "block_extent": [
+     35,
+     256,
+     256
+    ],
+    "jit_shapes": {
+     "pad": 33554432,
+     "live_w": 21137968,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 512,
+    "chunk_bricks": 4096,
+    "bricks_per_side": 32,
+    "rows": 16777200,
+    "pad": 33554432,
+    "frac_of_4096_xslab": 0.062499940395355225,
+    "build_s": 28.468150069995318,
+    "warm_s": 1.242240452003898,
+    "rep_s": [
+     0.03677777500706725,
+     0.035179149999748915,
+     0.0342567159968894
+    ],
+    "window_s": 0.009718083994812332,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 2332987904,
+    "peak_minus_baseline": 2332987904,
+    "b_per_padded_row": 69.52845764160156,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 1.166493952,
+    "planner_4096_gb": 1.207959552
+   }
+  }
+ ],
+ "finished": "2026-09-12T23:02:56"
+}

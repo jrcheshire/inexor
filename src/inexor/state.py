@@ -402,7 +402,22 @@ def brick_reach(st, c_drift, vel_scale=None):
     return int(np.ceil(abs(float(c_drift)) * s * INT16_MAX / extent))
 
 
-def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy"):
+def occupancy_total(occ):
+    """Rows counted by a per-bucket occupancy index, as a Python int.
+
+    Accumulates in int64 WITHOUT widening the index: `occ.astype(np.int64).sum()`
+    materializes an int64 copy, 68.7 GB of transient at 4096^3 (a 34.4 GB uint32
+    index), which is what took gb 1004113's host to its ceiling at the migrate's
+    start and end. Every whole-index count in a step goes through here;
+    `tests/test_occupancy_total.py` gates the fused pass's host peak on it.
+    """
+    return int(np.sum(occ, dtype=np.int64))
+
+
+def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert_kernel="numpy"):
+    # `insert_kernel="jax"` routes every `_insert_slab` through `insert_jax`,
+    # independently of the eject's `kernel`; both default to numpy here for the
+    # reason the NB below gives.
     # NB this default stays "numpy" while `EngineConfig.eject_kernel` defaults to
     # "jax", and the asymmetry is deliberate. The engine always passes the config
     # value, so nothing routes through this default in production; what DOES use
@@ -451,7 +466,7 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy"):
     # gone, with every census agreeing, no aliasing and ownership a perfect
     # partition. It surfaced ~200 lines away as the engine's ownership assertion,
     # which cost four wrong diagnoses. A loss must be loud AT THE POINT OF LOSS.
-    n_before = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    n_before = occupancy_total(st.occupancy) + st.arena_used
 
     # THE REACH, and it is a bound rather than an assumption. The schedule below
     # releases a staged row once its destination has been written, so it must know
@@ -490,7 +505,8 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy"):
             if d in inserted:
                 continue
             if all(((d + o) % nb) in emig for o in reach):
-                n_over += st._insert_slab(d, staged, emig, reach, consumed, scales=scales)
+                n_over += st._insert_slab(d, staged, emig, reach, consumed, scales=scales,
+                                          kernel=insert_kernel)
                 inserted.add(d)
         # release what no pending write can still need
         for s2 in list(staged):
@@ -534,7 +550,7 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy"):
             )
     if len(inserted) != nb:
         raise AssertionError(f"{nb - len(inserted)} slabs were never written back")
-    n_after = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    n_after = occupancy_total(st.occupancy) + st.arena_used
     if n_after != n_before:
         left = sum(len(v.get("dest", ())) for v in staged.values()) if staged else 0
         raise ValueError(
@@ -559,6 +575,85 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy"):
                 vel_scale_min=float(np.min(st.vel_scale)),
                 n_migrated_checked=n_after, brick_reach=r, brick_reach_raw=r_raw,
                 brick_reach_realized=realized_reach, peak_staged_slabs=peak_staged)
+
+
+def _replay_arena_pass(st, reach, r, r_raw, c_drift, scales, n_emig, rr_by_slab, insert_res,
+                       max_staged_slabs=None, census_note=""):
+    """Replay a migrate pass's arena mutations and bookkeeping in serial order.
+
+    For a pass whose ejects and inserts ran out of order, or elsewhere, with every
+    ORDER-DEPENDENT arena mutation deferred: releases (`_release_brick_arena`) at
+    each slab's eject point, claims (`_to_arena`, spilled bricks ascending) at each
+    destination's insert point, and the census and staging accounting at the same
+    schedule points `drift_and_migrate` runs them. Shared by the pooled and device
+    migrates; each is gated bitwise against the serial pass.
+
+    `n_emig[s]` is slab s's emigrant row count; `rr_by_slab[s]` its realized
+    reach; `insert_res[d]` a dict with `consumed` (source slab -> rows taken),
+    `spills` ((brick, dest, off, w, ids) in ascending brick order) and `n_over`.
+    `census_note` is appended to the census failure message.
+
+    Returns `n_over`, `peak_staged`, `realized_reach`, `spill_rows`, `spill_bytes`.
+    """
+    nb = st.bricks_per_side
+    staged_sym, emig_sym, inserted = set(), set(), set()
+    consumed = {}
+    n_over, peak_staged, realized_reach = 0, 0, 0
+    spill_rows = spill_bytes = 0
+    for s in range(nb):
+        lo_b, hi_b = st.slab_bricks(s)
+        for b in range(lo_b, hi_b):
+            st._release_brick_arena(b)
+        staged_sym.add(s)
+        emig_sym.add(s)
+        consumed[s] = 0
+        realized_reach = max(realized_reach, rr_by_slab[s])
+        for d in range(nb):
+            if d in inserted:
+                continue
+            if all(((d + o) % nb) in emig_sym for o in reach):
+                res = insert_res[d]
+                for src, c in res["consumed"].items():
+                    consumed[src] += int(c)
+                for _b, dest_r, off_r, w_r, ids_r in res["spills"]:
+                    spill_rows += len(dest_r)
+                    spill_bytes += dest_r.nbytes + off_r.nbytes + w_r.nbytes
+                    spill_bytes += 0 if ids_r is None else ids_r.nbytes
+                    st._to_arena(dest_r, off_r, w_r, ids_r)
+                n_over += int(res["n_over"])
+                inserted.add(d)
+        for s2 in list(staged_sym):
+            if s2 in inserted:
+                staged_sym.discard(s2)
+        for s2 in list(emig_sym):
+            if all(((s2 + o) % nb) in inserted for o in reach):
+                n_rows = n_emig[s2]
+                if consumed[s2] != n_rows:
+                    raise AssertionError(
+                        f"releasing emig slab {s2} with {n_rows - consumed[s2]} of "
+                        f"{n_rows} rows unconsumed (reach {r}, consumption offsets "
+                        f"{sorted({int(o) for o in reach})}). D-007 forbids "
+                        "dropping; an unconsumed emigrant is a particle about to "
+                        "be destroyed." + census_note
+                    )
+                emig_sym.discard(s2)
+        peak_staged = max(peak_staged, len(staged_sym))
+        if max_staged_slabs is not None and peak_staged > int(max_staged_slabs):
+            raise ValueError(
+                f"the migration is holding {peak_staged} slabs against a budget of "
+                f"{max_staged_slabs}. The drift reaches {r_raw} bricks on a "
+                f"{nb}-brick grid, so {2 * r + 1} slabs must be in flight.\n"
+                f"  c_drift={c_drift:.6g}, max vel_scale={float(np.max(scales)):.6g}, "
+                f"max |dx| = {abs(float(c_drift)) * float(np.max(scales)) * INT16_MAX:.6g} against a "
+                f"brick of {float(st.t9.box_size) / nb:.6g}.\n"
+                "  Reduce the step size, use a coarser brick, or raise the budget "
+                "deliberately -- staging is bounded by (2 * reach + 1) slabs, so "
+                "this is a real memory cost and not a formality."
+            )
+    if len(inserted) != nb:
+        raise AssertionError(f"{nb - len(inserted)} slabs were never written back")
+    return dict(n_over=n_over, peak_staged=peak_staged, realized_reach=realized_reach,
+                spill_rows=spill_rows, spill_bytes=spill_bytes, n_inserted=len(inserted))
 
 
 def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
@@ -627,7 +722,7 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
         )
     nb = st.bricks_per_side
     p3 = st.buckets_per_brick
-    n_before = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    n_before = occupancy_total(st.occupancy) + st.arena_used
     scales = np.array(st.vel_scale, dtype=np.float64, copy=True)
     r_raw = brick_reach(st, c_drift, scales)
     r = min(r_raw, nb // 2)
@@ -651,7 +746,7 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
 
     # worst-case eject rows per slab = live rows + arena residents, both from
     # the pre-pass state the workers will read
-    occ_slab = st.occupancy.astype(np.int64).reshape(nb, -1).sum(axis=1)
+    occ_slab = st.occupancy.reshape(nb, -1).sum(axis=1, dtype=np.int64)
     arena_slab = np.zeros(nb, dtype=np.int64)
     if st.n_arena:
         keys = st.arena_bucket[st.arena_bucket >= 0]
@@ -704,76 +799,25 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
                     free_slots.append(slot_of.pop(s2))
     assert len(ejected) == nb, f"{nb - len(ejected)} slabs were never ejected"
 
-    # THE REPLAY: the serial pass's arena interleave and bookkeeping, re-run
-    # exactly. `_release_brick_arena` at each slab's eject point, `_to_arena`
-    # at each destination's insert point (spilled bricks arrive ascending from
-    # `_insert_slab`'s own loop), and the census/peak accounting at the same
-    # schedule points the serial loop runs them.
-    staged_sym, emig_sym, inserted = set(), set(), set()
-    consumed = {}
-    n_over, peak_staged, realized_reach = 0, 0, 0
-    spill_rows = spill_bytes = 0
-    for s in range(nb):
-        lo_b, hi_b = st.slab_bricks(s)
-        for b in range(lo_b, hi_b):
-            st._release_brick_arena(b)
-        staged_sym.add(s)
-        emig_sym.add(s)
-        consumed[s] = 0
-        realized_reach = max(realized_reach, rr_by_slab[s])
-        for d in range(nb):
-            if d in inserted:
-                continue
-            if all(((d + o) % nb) in emig_sym for o in reach):
-                res = insert_res[d]
-                for src, c in res["consumed"].items():
-                    consumed[src] += int(c)
-                for _b, dest_r, off_r, w_r, ids_r in res["spills"]:
-                    spill_rows += len(dest_r)
-                    spill_bytes += dest_r.nbytes + off_r.nbytes + w_r.nbytes
-                    spill_bytes += 0 if ids_r is None else ids_r.nbytes
-                    st._to_arena(dest_r, off_r, w_r, ids_r)
-                n_over += int(res["n_over"])
-                inserted.add(d)
-        for s2 in list(staged_sym):
-            if s2 in inserted:
-                staged_sym.discard(s2)
-        for s2 in list(emig_sym):
-            if all(((s2 + o) % nb) in inserted for o in reach):
-                n_rows = ejected[s2][2]
-                if consumed[s2] != n_rows:
-                    raise AssertionError(
-                        f"releasing emig slab {s2} with {n_rows - consumed[s2]} of "
-                        f"{n_rows} rows unconsumed (reach {r}, consumption offsets "
-                        f"{sorted({int(o) for o in reach})}). D-007 forbids "
-                        "dropping; an unconsumed emigrant is a particle about to "
-                        "be destroyed. (Pooled pass: the displacement histogram "
-                        "the serial census prints needs rows whose scratch slot "
-                        "may be reused -- re-run serial for the full census.)"
-                    )
-                emig_sym.discard(s2)
-        peak_staged = max(peak_staged, len(staged_sym))
-        if max_staged_slabs is not None and peak_staged > int(max_staged_slabs):
-            raise ValueError(
-                f"the migration is holding {peak_staged} slabs against a budget of "
-                f"{max_staged_slabs}. The drift reaches {r_raw} bricks on a "
-                f"{nb}-brick grid, so {2 * r + 1} slabs must be in flight.\n"
-                f"  c_drift={c_drift:.6g}, max vel_scale={float(np.max(scales)):.6g}, "
-                f"max |dx| = {abs(float(c_drift)) * float(np.max(scales)) * INT16_MAX:.6g} against a "
-                f"brick of {float(st.t9.box_size) / nb:.6g}.\n"
-                "  Reduce the step size, use a coarser brick, or raise the budget "
-                "deliberately -- staging is bounded by (2 * reach + 1) slabs, so "
-                "this is a real memory cost and not a formality."
-            )
-    if len(inserted) != nb:
-        raise AssertionError(f"{nb - len(inserted)} slabs were never written back")
-    n_after = int(st.occupancy.astype(np.int64).sum()) + st.arena_used
+    # THE REPLAY, shared with the device migrate (`_replay_arena_pass`).
+    rep = _replay_arena_pass(
+        st, reach, r, r_raw, c_drift, scales,
+        n_emig={s: ejected[s][2] for s in ejected}, rr_by_slab=rr_by_slab,
+        insert_res=insert_res, max_staged_slabs=max_staged_slabs,
+        census_note=(" (Pooled pass: the displacement histogram the serial census "
+                     "prints needs rows whose scratch slot may be reused -- re-run "
+                     "serial for the full census.)"),
+    )
+    n_over, peak_staged = rep["n_over"], rep["peak_staged"]
+    realized_reach = rep["realized_reach"]
+    spill_rows, spill_bytes = rep["spill_rows"], rep["spill_bytes"]
+    n_after = occupancy_total(st.occupancy) + st.arena_used
     if n_after != n_before:
         raise ValueError(
             f"the migration lost {n_before - n_after} particles ({n_before} -> "
             f"{n_after} against {st.n_particles} stored). D-007 forbids dropping, "
             "so this is corruption, not imprecision.\n"
-            f"  {len(inserted)} of {nb} slabs inserted, arena {st.arena_used}/"
+            f"  {rep['n_inserted']} of {nb} slabs inserted, arena {st.arena_used}/"
             f"{st.n_arena} (pooled pass)\n"
             "  LEADING CAUSE: the slab schedule releases a staged row once its "
             "destination is written, which assumes a particle moves at most ONE "
@@ -946,7 +990,7 @@ class SlotState:
     @property
     def n_live(self):
         """Every particle the container holds: brick runs plus arena residents."""
-        return int(np.sum(self.occupancy.astype(np.int64))) + self.arena_used
+        return occupancy_total(self.occupancy) + self.arena_used
 
     def brick_slot_range(self, brick_flat):
         """The brick's ALLOCATION span (live rows plus its spare)."""
@@ -1437,7 +1481,8 @@ class SlotState:
         )
 
     def _insert_slab(
-        self, bx, staged, emig, reach=(-1, 0, 1), consumed=None, scales=None, spill_sink=None
+        self, bx, staged, emig, reach=(-1, 0, 1), consumed=None, scales=None, spill_sink=None,
+        kernel="numpy",
     ):
         """Write one slab's bricks back: keepers + immigrants + arena residents.
 
@@ -1458,7 +1503,15 @@ class SlotState:
 
         `scales` is the pre-migration snapshot, needed because a row arrives
         holding a code written at its SOURCE brick's scale.
+
+        `kernel="jax"` routes to `_insert_slab_jax`, gated elementwise against
+        this function, which stays the reference and is never conditionally
+        modified (the same rule `_eject_slab` states).
         """
+        if kernel == "jax":
+            return self._insert_slab_jax(bx, staged, emig, reach, consumed, scales, spill_sink)
+        if kernel != "numpy":
+            raise ValueError(f"unknown insert kernel {kernel!r}; expected 'numpy' or 'jax'")
         nb = self.bricks_per_side
         p3 = self.buckets_per_brick
         lo_b, hi_b = self.slab_bricks(bx)
@@ -1535,6 +1588,72 @@ class SlotState:
                 )
             n_over += self._write_brick(b, dest, off, w, ids, spill_sink=spill_sink)
         return n_over
+
+    def _insert_slab_jax(self, bx, staged, emig, reach=(-1, 0, 1), consumed=None,
+                         scales=None, spill_sink=None):
+        """`_insert_slab` with the grouping, scale, rescale and within-brick order
+        compiled (`insert_jax`). Same contract, return value and mutations.
+
+        Kept here: the consumption census (line for line), each row's old-scale
+        gather, the writes into the state, and every arena claim, replayed per
+        brick in ascending order -- `_to_arena` takes the lowest free slots, so the
+        order of claims is the arena layout. An int16 escape refuses before any
+        write, where the numpy path refuses at the offending brick.
+        """
+        from .insert_jax import insert_rows
+
+        nb = self.bricks_per_side
+        p3 = self.buckets_per_brick
+        lo_b, hi_b = self.slab_bricks(bx)
+        keep = staged[bx]
+        sources = sorted({(int(bx) + o) % nb for o in reach})
+        if consumed is not None:
+            for s in sources:
+                if s in emig and len(emig[s]["dest"]):
+                    d_slab = emig[s]["dest"] // (p3 * nb * nb)
+                    consumed[s] += int(np.count_nonzero(d_slab == bx))
+        imm = _cat_dicts([emig[s] for s in sources if s in emig])
+        has_ids = self.ids is not None
+
+        def ids_of(d):
+            return d["ids"] if d["ids"] is not None else np.empty(0, np.int32)
+
+        dest = np.concatenate([keep["dest"], imm["dest"]])
+        src_brick = np.concatenate([keep["dest"] // p3, np.asarray(imm["src"], dtype=np.int64)])
+        res = insert_rows(
+            dest, np.concatenate([keep["off"], imm["off"]]),
+            np.concatenate([keep["w"], imm["w"]]),
+            np.concatenate([ids_of(keep), ids_of(imm)]) if has_ids else None,
+            np.asarray(scales, dtype=np.float64)[src_brick], lo_b,
+            self.brick_start[lo_b:hi_b + 1], p3)
+        if res["abs_max"] > INT16_MAX:
+            raise ValueError(
+                f"velocity code {res['abs_max']:.0f} escapes int16 under a rescale to a "
+                "scale that does not cover it. Per-brick scales make this reachable where a "
+                "global scale made it impossible; the caller must fix the destination scale "
+                "over the rows it is about to write. D-007 forbids the clamp."
+            )
+        nw, ns = res["n_write"], res["n_spill"]
+        pos = res["pos"][:nw]
+        self.off[pos] = res["off"][:nw]
+        self.w[pos] = res["w"][:nw]
+        if has_ids:
+            self.ids[pos] = res["ids"][:nw]
+        self.occupancy[lo_b * p3 : hi_b * p3] = _to_index(res["occupancy"], self.index_dtype,
+                                                          "migrated")
+        self.vel_scale[lo_b:hi_b] = res["scales"]
+        if ns:
+            sl = slice(nw, nw + ns)
+            sd, so, sw = res["dest"][sl], res["off"][sl], res["w"][sl]
+            si = res["ids"][sl] if has_ids else None
+            sb = sd // p3
+            for grp in np.split(np.arange(ns), np.flatnonzero(np.diff(sb)) + 1):
+                args = (sd[grp], so[grp], sw[grp], None if si is None else si[grp])
+                if spill_sink is None:
+                    self._to_arena(*args)
+                else:
+                    spill_sink(int(sb[grp[0]]), *args)
+        return int(ns)
 
     def _write_brick(self, b, dest, off, w, ids=None, spill_sink=None):
         """Counting-sort one brick's members by bucket and write the run.

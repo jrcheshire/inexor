@@ -239,7 +239,8 @@ def test_c_gh_now_fits_a_cpu_only_node_with_margin(capsys):
     out = capsys.readouterr().out
     assert "FITS" in out and "DOES NOT FIT" not in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    assert est == pytest.approx(180.5, abs=1.0)
+    # 180.5 -> 167.889: the factorized coarse solve (2026-09-12): the monolithic form's `coarse_kernels` (2 complex half-grids) and `coarse_fft_workspace` (3) became a host-resident spectrum, one per-component work buffer and a slab-sized kernel.
+    assert est == pytest.approx(167.889, abs=1.0)
     assert est < 237.0, "the bound no longer fits the node it was sized for"
 
 
@@ -290,7 +291,8 @@ def test_the_estimate_is_a_lower_bound_and_says_so(capsys):
     # 3.445 (derived 9 B/row) -> 3.488 (measured 11.1, out of place) -> 3.305
     # (measured 2.1, in place) -> 3.396 (phases summed within a step) -> 3.363
     # (measured 0.49, per-brick census). scripts/v2_m6_repack_bytes.py.
-    assert est == pytest.approx(3.363, abs=0.01)
+    # ... -> 3.343: the factorized coarse solve (2026-09-12): the monolithic form's `coarse_kernels` (2 complex half-grids) and `coarse_fft_workspace` (3) became a host-resident spectrum, one per-component work buffer and a slab-sized kernel.
+    assert est == pytest.approx(3.343, abs=0.01)
     assert est < 7.461, "the bound must sit under the measured peak it bounds"
 
 
@@ -454,10 +456,17 @@ def test_the_phase_model_would_have_refused_the_run_that_died():
     # the old shape: three complex kernels built per step and matched, so a
     # SECOND triple, the f64 island rebuilt every step, and three force meshes
     # copied out at once because the comprehension rebinds only at the end
-    old_solve = (3 * m["coarse_kernels"]                 # six half-grids, not two
+    # Expressed in COMPLEX HALF-GRIDS, which is exactly what `coarse_spectrum`
+    # is, because the two terms this used to name (`coarse_kernels` at two of
+    # them, `coarse_fft_workspace` at three) stopped existing when the coarse
+    # solve was factorized. Same nine half-grids, same bytes, reconstructed from
+    # a term that still exists -- a historical model has to be expressible in
+    # current units or it quietly stops being checkable.
+    half_grid = m["coarse_spectrum"]
+    old_solve = (6 * half_grid          # three kernels, each matched: a second triple
                  + m["coarse_kernel_build_f64"]
                  + m["coarse_kernel_pref"] + m["coarse_match_factor"]
-                 + m["coarse_fft_workspace"]
+                 + 3 * half_grid        # monolithic dk, its device copy, their product
                  + 3 * m["coarse_force_copy_transient"])
     assert old_solve / GB_ == pytest.approx(68.8, abs=1.0), (
         f"the pre-M-v2-6 solve reconstructs to {old_solve / GB_:.1f} GB; if this "
@@ -541,7 +550,7 @@ def test_the_tile_kernel_build_moves_into_the_loop_when_a_pool_runs_it():
     assert pooled["tile_kernel_build_f64"] == "tile_loop"
     assert pooled["tile_kernel_pref"] == "tile_loop"
     # and the coarse arm's phases are untouched by the worker count
-    assert pooled["coarse_kernels"] == serial["coarse_kernels"] == "coarse_solve"
+    assert pooled["coarse_spectrum"] == serial["coarse_spectrum"] == "coarse_solve"
 
 
 def test_the_worker_count_reaches_the_config_the_planner_prices(capsys):
@@ -634,7 +643,8 @@ def test_c_gh_does_not_fit_a_gg_node_at_the_knobs_that_have_been_failing(capsys)
     out = capsys.readouterr().out
     assert "DOES NOT FIT" in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    assert est == pytest.approx(283.2, abs=2.0)
+    # 283.2 -> 270.578: the factorized coarse solve (2026-09-12): the monolithic form's `coarse_kernels` (2 complex half-grids) and `coarse_fft_workspace` (3) became a host-resident spectrum, one per-component work buffer and a slab-sized kernel.
+    assert est == pytest.approx(270.578, abs=2.0)
 
 
 def test_bounding_ejects_charges_the_inserts_that_replace_them():
@@ -672,3 +682,221 @@ def test_bounding_ejects_charges_the_inserts_that_replace_them():
     assert mig(eject_kernel="jax", migrate_eject_inflight=99) == jax_free
     # and the cheapest arrangement of the four is the plain numpy eject
     assert np_free == min(jax_free, jax_cap2, np_free, np_cap2)
+
+
+# --------------------------------------------- the device column (--backend device)
+#
+# The CPU column stays the default and must not move when this one is added, so
+# the first gate here is an invariance and not a new number.
+
+
+def test_the_cpu_column_does_not_move_when_the_device_column_exists(capsys):
+    """The refactor that put the load path behind a helper must be a no-op.
+
+    Both backends build the state on the same host and transform the ICs out of
+    core the same way, so `_print_load_and_ic` is shared -- and a shared helper
+    is exactly where an accidental behaviour change hides. Pin the two lines the
+    C-gh verdict is read off.
+    """
+    main(["--preset", "c-gh", "--host-gb", "237", "--arena-frac", "0.20",
+          "--workers", "8"])
+    out = capsys.readouterr().out
+    assert "LOADING THE STATE, peak resident at each stage" in out
+    assert "the total line above is a MAX: these stages do not coexist" in out
+    assert "IC STAGE (out-of-core, 'derivative' policy)" in out
+    # the CPU column still prices a host that holds the mesh
+    assert "MESH, resident through the tile loop" in out
+    assert "PER GPU" not in out
+
+
+@pytest.mark.parametrize("name", sorted(PRESETS))
+def test_every_mesh_term_is_placed_deliberately(name):
+    """A term with no side is the omitted-term fault, in the module about it.
+
+    `DEVICE_PLACEMENT` is a design assertion and it will go stale the moment a
+    new mesh term lands. It must go stale LOUDLY: defaulting an unplaced term to
+    the host understates the GPU and defaulting it to the GPU understates the
+    host, and either way the budget cannot be traded against.
+    """
+    from inexor.plan import DEVICE_PLACEMENT
+
+    for k in _ec(name).mesh_bytes():
+        assert k in DEVICE_PLACEMENT, f"{k} has no device placement"
+
+
+def test_an_unplaced_mesh_term_is_refused_not_guessed(monkeypatch):
+    """The anti-vacuity arm of the test above: prove the refusal actually fires."""
+    from inexor import plan
+
+    ec = _ec("cdev")
+    real = ec.mesh_bytes
+
+    def with_a_new_term():
+        d = dict(real())
+        d["a_term_nobody_placed"] = 1234
+        return d
+
+    monkeypatch.setattr(ec, "mesh_bytes", with_a_new_term)
+    with pytest.raises(KeyError, match="a_term_nobody_placed"):
+        plan.device_budget(ec, n=ec.n_total, n_gpus=4)
+
+
+def test_one_gpu_charges_every_surviving_term_in_full():
+    """The identity under the shard: at n_gpus=1 nothing is divided.
+
+    This is what makes the /4 a SPLIT rather than a discount -- if the shard
+    arithmetic were wrong in a way that scaled, this arm would catch it, because
+    at one GPU the device column must reproduce `mesh_bytes` exactly for every
+    term the design keeps -- plus the ghost planes a shard carries even on one
+    card (`plan.shard_halo_planes`).
+    """
+    from inexor.plan import DEVICE_PLACEMENT, device_budget, shard_halo_planes
+
+    ec = _ec("cgh64")
+    mesh = ec.mesh_bytes()
+    halo = shard_halo_planes()
+    resident, transient, _phases, _worst, _slabs, host_mesh, _after = device_budget(
+        ec, n=ec.n_total, n_gpus=1)
+    got = {**resident, **transient}
+    kept = {k: v for k, v in mesh.items()
+            if DEVICE_PLACEMENT[k] not in ("gone", "host")}
+    assert kept, "vacuous: no mesh term survives the placement"
+    for k, v in kept.items():
+        assert got[k] == v + (v // ec.n_coarse) * halo.get(k, 0), k
+    # and the deleted host pass is really gone
+    assert "coarse_decode_slab" not in got
+    # EVERY surviving term lands in EXACTLY ONE column, at full value. A term
+    # placed "host" leaves the device table, and if it did not arrive in
+    # `host_mesh` it would be charged nowhere -- the same omission the
+    # DEVICE_PLACEMENT KeyError guards, reached by a different door.
+    on_host = {k: v for k, v in mesh.items() if DEVICE_PLACEMENT[k] == "host"}
+    assert on_host, "vacuous: no term is host-placed, so this arm proves nothing"
+    for k, v in on_host.items():
+        assert host_mesh[k] == v, f"{k} is host-placed but not charged to the host"
+        assert k not in got, f"{k} is charged to BOTH columns"
+
+
+def test_the_shard_is_a_quarter_plus_its_ghost_planes_across_four_cards():
+    from inexor.plan import DEVICE_PLACEMENT, device_budget, shard_halo_planes
+
+    ec = _ec("cgh64")
+    mesh = ec.mesh_bytes()
+    halo = shard_halo_planes()
+    r1, t1, _p, _w, _s, _h, _a = device_budget(ec, n=ec.n_total, n_gpus=1)
+    r4, t4, _p, _w, _s, _h, _a = device_budget(ec, n=ec.n_total, n_gpus=4)
+    one, four = {**r1, **t1}, {**r4, **t4}
+    sharded = [k for k, v in DEVICE_PLACEMENT.items()
+               if v == "shard" and k in mesh]
+    replicated = [k for k, v in DEVICE_PLACEMENT.items()
+                  if v == "replica" and k in mesh]
+    assert sharded and replicated, "vacuous: one of the two classes is empty"
+    assert any(halo.get(k) for k in sharded), "vacuous: no sharded term has ghost planes"
+    for k in sharded:
+        plane = mesh[k] // ec.n_coarse
+        assert four[k] == int(mesh[k] / 4) + plane * halo.get(k, 0), k
+    for k in replicated:
+        assert four[k] == one[k], f"{k} is replicated and must not shrink"
+
+
+def test_the_card_force_shard_is_charged_the_bytes_a_gb200_held():
+    """Vista 993866 (record sec. 23): one card's 4096^3 coarse force shard, three
+    f32 meshes of 516 x 2048 x 2048, held 25,971,130,368 bytes on the device."""
+    from inexor.plan import device_budget
+
+    ec = _ec("c-hero")
+    resident, *_ = device_budget(ec, n=ec.n_total, n_gpus=4)
+    assert resident["coarse_force_resident"] == 25_971_130_368
+
+
+@pytest.mark.parametrize("name", sorted(PRESETS))
+def test_the_slab_window_is_the_brick_span_and_never_wraps_the_box(name):
+    """DERIVED, not picked. A window smaller than the span would drop members.
+
+    `brick_span` is the same function `SlotState.tile_bricks` walks, so this is
+    the membership contract read as a residency requirement rather than a
+    second, independent guess at it.
+    """
+    from inexor.layout import brick_span
+    from inexor.plan import device_window_slabs
+
+    ec = _ec(name)
+    nb = max(1, ec.n_fine // ec.n_brick)
+    _pad, span = brick_span(ec.n_tile, ec._b_realized, ec.n_brick, nb)
+    got = device_window_slabs(ec)
+    assert got == min(span, nb)
+    assert 1 <= got <= nb, "a window wider than the brick grid double-counts"
+
+
+def test_c_hero_fits_a_gb_node_on_the_device_backend_and_the_cpu_one_does_not(capsys):
+    """The verdict the whole design turns on, both directions, one machine.
+
+    The CPU column at 4096^3 does not fit a 1026 GB host at any worker count;
+    the device column does, because the mesh moves to the cards. If this ever
+    flips, the build has lost its premise and the record must say so.
+    """
+    main(["--preset", "c-hero", "--host-gb", "1026", "--arena-frac", "0.01",
+          "--workers", "1"])
+    cpu = capsys.readouterr().out
+    assert "DOES NOT FIT" in cpu.split("against --host-gb")[1]
+
+    main(["--preset", "c-hero", "--backend", "device", "--host-gb", "1026",
+          "--device-gb", "199", "--arena-frac", "0.01"])
+    dev = capsys.readouterr().out
+    assert "against --host-gb 1026.0: FITS" in dev
+    assert "against --device-gb 199.0 per card: FITS" in dev
+    assert "the slab window is 18 x-slabs" in dev
+
+
+def test_the_fused_pass_charges_its_census_in_the_tile_loop_and_one_pass_after():
+    """M4: the fused migrate + repack's census runs one padded slab through the eject
+    kernel inside the tile loop, and one pass replaces the two after it."""
+    from inexor.device.migrate import EJECT_B_PER_PADDED_ROW
+    from inexor.eject_jax import _padded
+    from inexor.plan import (
+        FUSED_DEVICE_B_PER_SLAB_ROW,
+        MIGRATE_DEVICE_B_PER_SLAB_ROW,
+        device_budget,
+    )
+
+    ec = _ec("c-hero")
+    nb = ec.n_fine // ec.n_brick
+    slab_rows = ec.n_total / nb
+    _r, t_f, p_f, _w, _s, _h, a_f = device_budget(ec, n=ec.n_total, n_gpus=4)
+    _r, t_s, p_s, _w, _s, _h, a_s = device_budget(ec, n=ec.n_total, n_gpus=4, fused=False)
+    census = int(EJECT_B_PER_PADDED_ROW * _padded(int(slab_rows)))
+    assert t_f["census_eject (fused pass, one padded slab)"] == census
+    assert p_f["tile_loop"] - p_s["tile_loop"] == census
+    assert not any("census" in k for k in t_s)
+    assert list(a_f.values()) == [int(FUSED_DEVICE_B_PER_SLAB_ROW * slab_rows)]
+    assert max(a_s.values()) == int(MIGRATE_DEVICE_B_PER_SLAB_ROW * slab_rows)
+
+
+def test_the_host_column_charges_the_repacks_second_bucket_index(capsys):
+    from inexor.codec import T9Layout
+    from inexor.plan import PRESETS, BUCKET_CELLS
+
+    main(["--preset", "c-hero", "--backend", "device", "--host-gb", "1026",
+          "--device-gb", "199", "--arena-frac", "0.01"])
+    out = capsys.readouterr().out
+    g = PRESETS["c-hero"]
+    want = T9Layout(g["box"], g["n_part"], BUCKET_CELLS).index_bytes() / 1e9
+    line = next(ln for ln in out.splitlines() if "repack new_occ" in ln)
+    assert abs(float(line.split()[-2]) - want) < 1e-3
+    main(["--preset", "c-hero", "--backend", "device", "--host-gb", "1026",
+          "--device-gb", "199", "--arena-frac", "0.01", "--separate-passes"])
+    sep = capsys.readouterr().out
+    assert "census_eject" not in sep and "migrate_device_pass" in sep
+
+
+def test_the_host_column_charges_one_slab_of_w_per_card_for_the_window_write_back(capsys):
+    from inexor.forces import capacity_shape
+    from inexor.plan import PRESETS
+
+    main(["--preset", "c-hero", "--backend", "device", "--host-gb", "1026",
+          "--device-gb", "199", "--arena-frac", "0.01", "--n-gpus", "4"])
+    out = capsys.readouterr().out
+    g = PRESETS["c-hero"]
+    nb = 256
+    want = 4 * int(capacity_shape(g["n_part"] ** 3 // nb)) * 6 / 1e9
+    line = next(ln for ln in out.splitlines() if "tile_window write-back" in ln)
+    assert abs(float(line.split()[-2]) - want) < 1e-3

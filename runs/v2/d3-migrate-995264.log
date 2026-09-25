@@ -1,0 +1,163 @@
+=== c672-018.vista.tacc.utexas.edu: commit d461cbe, job 995264 ===
+XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=900
+0, NVIDIA GB200, 189471 MiB
+1, NVIDIA GB200, 189471 MiB
+2, NVIDIA GB200, 189471 MiB
+3, NVIDIA GB200, 189471 MiB
+               total        used        free      shared  buff/cache   available
+Mem:            1691          72        1650           2           3        1618
+
+=== LEG escape-forms ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[analyze gpu] prod_jit: abs_max 32767 (numpy 32767); scales differing 0 of 64
+[analyze gpu] prod_eager: abs_max 32767 (numpy 32767); scales differing 0 of 64
+[analyze gpu] intermediates: {'order_equal': 0, 'order_is_permutation': True, 'bl_differ': 0, 'm_row_differ': 5293, 'vmax_differ': 27, 'scales_differ': 27, 'abs_max': 49424.0, 'vmax_vs_numpy_scatter_of_own_inputs_differ': 0}
+[analyze gpu] magnitude {'form': 'int16 abs', 'gathered': False, 'differ': 0}
+[analyze gpu] magnitude {'form': 'int16 abs', 'gathered': True, 'differ': 0}
+[analyze gpu] magnitude {'form': 'int16 abs.max(1)', 'gathered': False, 'differ': 0}
+[analyze gpu] magnitude {'form': 'int16 abs.max(1)', 'gathered': True, 'differ': 5293}
+[analyze gpu] magnitude {'form': 'int16 abs.max(1).astype(f64)', 'gathered': False, 'differ': 0}
+[analyze gpu] magnitude {'form': 'int16 abs.max(1).astype(f64)', 'gathered': True, 'differ': 5293}
+[analyze gpu] magnitude {'form': 'int16 form x s (old kernel)', 'gathered': False, 'differ': 5293}
+[analyze gpu] magnitude {'form': 'int16 form x s (old kernel)', 'gathered': True, 'differ': 5293}
+[analyze gpu] magnitude {'form': 'int32 widened x s', 'gathered': False, 'differ': 0}
+[analyze gpu] magnitude {'form': 'int32 widened x s', 'gathered': True, 'differ': 0}
+[analyze gpu] magnitude {'form': 'f64 widened x s (fix)', 'gathered': False, 'differ': 0}
+[analyze gpu] magnitude {'form': 'f64 widened x s (fix)', 'gathered': True, 'differ': 0}
+[analyze gpu] scatter-max {'rows': 4096, 'segments': 64, 'sorted': False, 'at_int64_eager': 0, 'at_int64_jit': 0, 'segment_max_int32_jit': 0}
+[analyze gpu] scatter-max {'rows': 4096, 'segments': 64, 'sorted': True, 'at_int64_eager': 0, 'at_int64_jit': 0, 'segment_max_int32_jit': 0}
+[analyze gpu] scatter-max {'rows': 8192, 'segments': 64, 'sorted': False, 'at_int64_eager': 0, 'at_int64_jit': 0, 'segment_max_int32_jit': 0}
+[analyze gpu] scatter-max {'rows': 8192, 'segments': 64, 'sorted': True, 'at_int64_eager': 0, 'at_int64_jit': 0, 'segment_max_int32_jit': 0}
+[analyze gpu] scatter-max {'rows': 1048576, 'segments': 65536, 'sorted': False, 'at_int64_eager': 0, 'at_int64_jit': 0, 'segment_max_int32_jit': 0}
+[analyze gpu] scatter-max {'rows': 1048576, 'segments': 65536, 'sorted': True, 'at_int64_eager': 0, 'at_int64_jit': 0, 'segment_max_int32_jit': 0}
+card: /scratch/10303/jrc4/src/inexor/runs/v2/d3_insert_escape_diag_gb_forms.json
+--- LEG escape-forms rc=0 ---
+
+=== LEG smoke ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm xback: --arm xback --n-part 32 --xback-frac 1.9 --steps 2 --reps 1 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[xback] step 0: numpy 0.1s, compiled 1.4s; state BITWISE = True ; stats equal = True; reach 2 (realized 2), overflow 1249, arena_used 1249
+[xback] step 1: numpy 0.1s, compiled 0.1s; state BITWISE = True ; stats equal = True; reach 2 (realized 2), overflow 1398, arena_used 1398
+[xback] receipts: eject calls 16, insert calls 16, overflow 2647, residents re-homed 1249, realized reach 2; VACUOUS: none
+--- arm xback: rc=0
+
+--- arm slab-real: --arm slab-real --n-part 64 --real-frac 0.5 --steps 2 --reps 1 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[slab-real] n_part=64 nb=4 (65,536 rows per slab) built in 0.0s on gpu
+[slab-real] step 0: numpy 0.05s | compiled 2.09s = eject calls 1.30s (4) + insert calls 0.77s (4) + host 0.02s; new shapes eject 2 insert 1; BITWISE numpy = True; reach 1, overflow 0
+[slab-real] step 1: numpy 0.05s | compiled 0.05s = eject calls 0.01s (4) + insert calls 0.02s (4) + host 0.02s; new shapes eject 0 insert 0; BITWISE numpy = True; reach 1, overflow 0
+--- arm slab-real: rc=0
+
+--- arm slab-shape: --arm slab-shape --shape-nb 8 --shape-frac 0.5 --steps 2 --reps 1 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[slab-shape] nb=8: one slab of 64 bricks, 262,144 rows, generated in 0.0s on gpu
+[slab-shape] eject: warm 0.70s, public median 0.005s; split medians prep 0.000 upload 0.003 compute 0.000 readback 0.002s; leavers 0.1789; split == public True, repeat equal True; device peak 0.03 GB
+[slab-shape] insert: warm 0.55s, public median 0.006s; split medians prep 0.000 upload 0.030 compute 0.001 readback 0.002s; written 245,327 spilled 0; split == public True, repeat equal True; device peak so far 0.03 GB
+--- arm slab-shape: rc=0
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/d3_device_migrate_gbsmoke.json
+worst rc 0
+--- LEG smoke rc=0 ---
+
+=== LEG migrate ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm xback: --arm xback --n-part 256 --xback-frac 1.9 --steps 2 --reps 3 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[xback] step 0: numpy 4.5s, compiled 5.7s; state BITWISE = True ; stats equal = True; reach 2 (realized 2), overflow 89782, arena_used 89782
+[xback] step 1: numpy 4.6s, compiled 2.8s; state BITWISE = True ; stats equal = True; reach 2 (realized 2), overflow 98397, arena_used 98397
+[xback] receipts: eject calls 32, insert calls 32, overflow 188179, residents re-homed 89782, realized reach 2; VACUOUS: none
+--- arm xback: rc=0
+
+--- arm slab-real: --arm slab-real --n-part 512 --real-frac 0.5 --steps 2 --reps 3 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[slab-real] n_part=512 nb=32 (4,194,304 rows per slab) built in 30.8s on gpu
+[slab-real] step 0: numpy 26.87s | compiled 17.51s = eject calls 3.47s (32) + insert calls 4.12s (32) + host 9.92s; new shapes eject 2 insert 2; BITWISE numpy = True; reach 1, overflow 0
+[slab-real] step 1: numpy 27.14s | compiled 15.17s = eject calls 1.94s (32) + insert calls 3.39s (32) + host 9.84s; new shapes eject 0 insert 1; BITWISE numpy = True; reach 1, overflow 0
+--- arm slab-real: rc=0
+
+--- arm slab-shape: --arm slab-shape --shape-nb 256 --shape-frac 0.5 --steps 2 --reps 3 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[slab-shape] nb=256: one slab of 65,536 bricks, 268,435,456 rows, generated in 12.3s on gpu
+/scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/interpreters/mlir.py:1246: UserWarning: A large amount of constants were captured during lowering (2.15GB total). If this is intentional, disable this warning by setting JAX_CAPTURED_CONSTANTS_WARN_BYTES=-1. To obtain a report of where these constants were encountered, set JAX_CAPTURED_CONSTANTS_REPORT_FRAMES=-1.
+  warnings.warn(message)
+[slab-shape] eject: warm 11.17s, public median 0.941s; split medians prep 0.013 upload 0.518 compute 0.015 readback 0.396s; leavers 0.1813; split == public True, repeat equal True; device peak 30.75 GB
+[slab-shape] insert: warm 10.97s, public median 1.269s; split medians prep 0.013 upload 0.202 compute 0.628 readback 0.437s; written 251,015,983 spilled 0; split == public True, repeat equal True; device peak so far 30.75 GB
+--- arm slab-shape: rc=0
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/d3_device_migrate_gb.json
+worst rc 0
+--- LEG migrate rc=0 ---
+
+=== LEG slab-lowdrift ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm slab-shape: --arm slab-shape --shape-nb 256 --shape-frac 0.13 --steps 2 --reps 3 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+[slab-shape] nb=256: one slab of 65,536 bricks, 268,435,456 rows, generated in 12.3s on gpu
+/scratch/10303/jrc4/src/inexor/.pixi/envs/gpu/lib/python3.14/site-packages/jax/_src/interpreters/mlir.py:1246: UserWarning: A large amount of constants were captured during lowering (2.15GB total). If this is intentional, disable this warning by setting JAX_CAPTURED_CONSTANTS_WARN_BYTES=-1. To obtain a report of where these constants were encountered, set JAX_CAPTURED_CONSTANTS_REPORT_FRAMES=-1.
+  warnings.warn(message)
+[slab-shape] eject: warm 3.58s, public median 0.947s; split medians prep 0.013 upload 0.552 compute 0.014 readback 0.393s; leavers 0.0497; split == public True, repeat equal True; device peak 30.75 GB
+[slab-shape] insert: warm 3.20s, public median 1.254s; split medians prep 0.013 upload 0.208 compute 0.606 readback 0.439s; written 263,902,910 spilled 0; split == public True, repeat equal True; device peak so far 30.75 GB
+--- arm slab-shape: rc=0
+
+card: /scratch/10303/jrc4/src/inexor/runs/v2/d3_device_migrate_gb_lowdrift.json
+worst rc 0
+--- LEG slab-lowdrift rc=0 ---
+
+=== rc_total=0 ===

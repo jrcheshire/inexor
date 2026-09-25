@@ -822,6 +822,32 @@ def test_checkpointing_is_off_without_a_directory_and_disablable_with_zero(tmp_p
     assert not os.path.exists(d)
 
 
+def test_a_timed_checkpoint_reports_its_own_parts(tmp_path):
+    """A real checkpoint at full size is the only honest measurement of what the
+    write costs: the driver's probe writes a few slabs and multiplies, which read
+    3076 s against the 3757 s a full write actually took (job 1002247). The parts
+    ride on the timed step's receipt so a production run measures them for free,
+    and so the decision about optimizing the writer further is made on four
+    full-size writes rather than on an extrapolation."""
+    co = _coeffs(4)
+    cfg_c = _cfg(checkpoint_dir=str(tmp_path / "ck"), checkpoint_every=2)
+    st = _ck_state(cfg_c)
+    out = engine.run(st, cfg_c, co, timed_steps=(1, 3))
+
+    wrote = [o for o in out if o["checkpoint"] is not None]
+    assert len(wrote) == 2, "vacuous: no checkpoint landed on a timed step"
+    for o in wrote:
+        parts = o["timings"]["checkpoint"]
+        assert set(parts) >= {"index", "gather", "crc32", "write", "slabs"}, parts
+        assert parts["slabs"] == st.bricks_per_side
+        assert all(parts[k] >= 0.0 for k in ("index", "gather", "crc32", "write"))
+
+    # and an untimed checkpoint still writes, carrying no parts
+    out2 = engine.run(_ck_state(cfg_c), cfg_c, co)
+    assert [o["checkpoint"] is not None for o in out2] == [False, True, False, True]
+    assert all(o["timings"] is None for o in out2)
+
+
 def test_checkpointing_refuses_a_state_carrying_ids(tmp_path):
     """The schema has no ids, and a checkpoint that dropped them would make the
     restart non-reproducible for anything id-dependent. It has to refuse before

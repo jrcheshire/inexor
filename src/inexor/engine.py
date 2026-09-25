@@ -64,6 +64,7 @@ from .forces import (
     coarse_subblock_origin_extent,
     gather_coarse_subblock,
     make_tile_force_fn,
+    check_stencil_guard,
     stage_coarse_subblock,
     tile_capacity,
     tile_geom,
@@ -113,8 +114,10 @@ MESH_PHASE = {
     "coarse_match_factor": "resident",
     "coarse_accumulator": "coarse_paint",
     "coarse_decode_slab": "coarse_paint",
-    "coarse_kernels": "coarse_solve",
-    "coarse_fft_workspace": "coarse_solve",
+    "coarse_spectrum": "coarse_solve",
+    "coarse_solve_work": "coarse_solve",
+    "coarse_kernel_slab": "coarse_solve",
+    "coarse_device_planes": "coarse_solve",
     "coarse_force_copy_transient": "coarse_solve",
     # BOTH, and it is not resident: the decode allocates it inside the paint and
     # `step` drops the host name as soon as the jax copy exists, so it spans the
@@ -177,6 +180,17 @@ class EngineConfig:
         migrate_window=None,
         checkpoint_dir=None,
         checkpoint_every=1,
+        migrate_backend="host",
+        migrate_device_budget_bytes=None,
+        coarse_backend="host",
+        tile_backend="host",
+        device_tile_jit=True,
+        device_paint_chunk_bricks=None,
+        device_tile_window=None,
+        device_cards=1,
+        migrate_repack_fused=None,
+        coarse_fold_kernel=True,
+        coarse_match_order=3,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -275,6 +289,76 @@ class EngineConfig:
         # the per-step stats is what proves it applied.
         self.checkpoint_dir = None if checkpoint_dir is None else str(checkpoint_dir)
         self.checkpoint_every = int(checkpoint_every)
+        # D3b R2: where the migrate and the repack run. "host" is everything
+        # above (serial or pooled by `migrate_pooled`); "device" routes both
+        # through `device.migrate.drift_and_migrate_device` and
+        # `device.repack.repack_device`, each gated bitwise against the serial
+        # host pass, on the parent's jax backend (one device, R1/R1b scope).
+        # A pool may still run the tile loop; the device pass ignores it, and
+        # an EXPLICIT `migrate_pooled=True` beside it refuses at validate().
+        # `migrate_device_budget_bytes` is the per-slab device envelope the
+        # device migrate refuses above (record sec. 29: ~112 GB per card at
+        # c-hero); None = no limit, the estimate is on the receipt either way.
+        self.migrate_backend = str(migrate_backend)
+        self.migrate_device_budget_bytes = (
+            None if migrate_device_budget_bytes is None else int(migrate_device_budget_bytes))
+        # The device step executor: where the coarse paint + solve and the tile
+        # loop run. TWO knobs beside `migrate_backend`, one per phase, so a phase
+        # table or an identity gate can move one phase at a time (the
+        # `fine_dtype` / `coarse_dtype` rule). "device" coarse is
+        # `device.paint.coarse_delta_cards` + the solve from the cards; "device"
+        # tile is `device.tile.tile_loop_device`, one compiled program writing
+        # into device state, accepted at a measured floor against the eager tile
+        # (record sec. 17). `device_tile_jit=False` is the eager per-tile arm,
+        # bitwise `tile_task` on the CPU backend -- the oracle arm, not an
+        # operating point (the `pad_ladder=False` precedent).
+        # `device_paint_chunk_bricks` is the device paint's own chunk length;
+        # None = `device.paint.default_chunk_bricks` (a quarter x-slab), because
+        # `chunk_bricks`' 64 is 262,144 device launches per step at 4096^3.
+        self.coarse_backend = str(coarse_backend)
+        self.tile_backend = str(tile_backend)
+        # The coarse kernel multiply rides the inverse's axis-0 pass instead of a
+        # separate host traversal of the half-grid (85 s of a 123 s solve at 4096^3,
+        # gb 1003657). False is the arm it is gated against -- bitwise, because the
+        # association is carried over unchanged -- not an operating point.
+        self.coarse_fold_kernel = bool(coarse_fold_kernel)
+        # The assignment order the coarse match factor divides out. The coarse arm
+        # paints and gathers TSC (order 3), but the ratified factor (D-v2-10, the
+        # probe) is built at CIC order, leaving sinc^2 per axis of the coarse
+        # window on the long force: 3-4.5% low at r = 1.6-3.4 Mpc/h at production
+        # cells (`scripts/v2_force_profile.py`). 3 is the correct match and the
+        # default; 2 is the legacy arm that the probe parity gates are pinned to.
+        if int(coarse_match_order) not in (2, 3):
+            raise ValueError(f"coarse_match_order must be 2 or 3, got {coarse_match_order}")
+        self.coarse_match_order = int(coarse_match_order)
+        self.device_tile_jit = bool(device_tile_jit)
+        self.device_paint_chunk_bricks = (
+            None if device_paint_chunk_bricks is None else int(device_paint_chunk_bricks))
+        # E2: the compiled tile loop against a window of x-slabs on the card
+        # (`device.window.tile_loop_windowed`) instead of the whole state -- the
+        # only form that fits a card at 4096^3. Bitwise the whole-state loop on a
+        # GB200 (Vista 996857, record sec. 35). TRI-STATE, the `migrate_pooled`
+        # pattern:
+        #   None  = AUTO, the default -- windowed wherever the compiled device tile
+        #           runs, inert on every other lane;
+        #   True  = REQUIRE it; refuses at validate() where it cannot apply;
+        #   False = E1's whole-state path, the A/B arm.
+        # `tile_window` is the resolved value every reader uses.
+        self.device_tile_window = None if device_tile_window is None else bool(device_tile_window)
+        # E3 + R3: how many cards the device step splits across -- the coarse paint
+        # and solve by x-planes, the tile loop by tile planes, one thread per card
+        # walking its own planes through its own window, and, under
+        # `migrate_backend="device"`, the migrate and repack by x-slabs.
+        self.device_cards = int(device_cards)
+        # M4: on a step whose repack is due, the device migrate and repack as ONE
+        # visit per slab (`device.fused.migrate_repack_device`), sized by the
+        # destination census the windowed tile loop takes. Bitwise the two passes.
+        # TRI-STATE, the `device_tile_window` pattern: None = AUTO, fused wherever
+        # the device migrate and the tile window both run; True = REQUIRE it,
+        # refused at validate() where it cannot apply; False = the separate passes,
+        # the A/B arm. `fused_pass` is the resolved value.
+        self.migrate_repack_fused = (
+            None if migrate_repack_fused is None else bool(migrate_repack_fused))
 
     @property
     def np_coarse_dtype(self):
@@ -283,6 +367,21 @@ class EngineConfig:
     @property
     def np_fine_dtype(self):
         return np.dtype(self.fine_dtype)
+
+    @property
+    def fused_pass(self):
+        """Whether a step with a repack due runs the fused migrate + repack:
+        `migrate_repack_fused` resolved (None = wherever the device migrate and the
+        tile window both run)."""
+        applies = self.migrate_backend == "device" and self.tile_window
+        return applies and self.migrate_repack_fused is not False
+
+    @property
+    def tile_window(self):
+        """Whether the compiled device tile loop runs against the x-slab window:
+        `device_tile_window` resolved (None = wherever the compiled device tile runs)."""
+        compiled_device = self.tile_backend == "device" and self.device_tile_jit
+        return compiled_device and self.device_tile_window is not False
 
     @property
     def n_total(self):
@@ -295,6 +394,15 @@ class EngineConfig:
     @property
     def fine_cell(self):
         return self.box_size / self.n_fine
+
+    @property
+    def coarse_match(self):
+        """The `match` argument of the coarse solve. Order 2 (the legacy CIC-order
+        match the probe parities were ratified on) keeps the original 2-tuple, so
+        that path is the expression it always was."""
+        if self.coarse_match_order == 2:
+            return (self.coarse_cell, self.fine_cell)
+        return (self.coarse_cell, self.fine_cell, self.coarse_match_order, 2)
 
     @property
     def r_s(self):
@@ -361,7 +469,25 @@ class EngineConfig:
             # then measured 60.01 B per half-grid element per step against the
             # 16.01 it costs now (flat to 0.2% over 7.9x in `half`, n_coarse
             # 128/192/256), and that 44 B/half is 23.7 GB per step at C-gh.
-            coarse_kernels=2 * half * 2 * cw,
+            # THE FACTORIZED SOLVE'S TERMS (the monolithic ones they replace are
+            # in git history; `coarse_kernels` at 2 complex half-grids and
+            # `coarse_fft_workspace` at 3). The record's rule was that a budget
+            # must not be edited to match a measurement of code that has not yet
+            # replaced the code it prices -- the factorized transform IS now the
+            # default, so these price what actually runs.
+            #
+            # HOST-RESIDENT, all three: `_coarse_solve_factorized` keeps the
+            # spectrum in numpy and only planes cross to a device. That is not an
+            # implementation detail, it is the property the whole design rests
+            # on, and it is why these carry the "host" placement rather than
+            # being sharded across the cards.
+            coarse_spectrum=half * 2 * cw,        # the forward's output, held
+            coarse_solve_work=half * 2 * cw,      # per component: copy AS multiply
+            # the per-slab kernel and its product. `2 *` because the kernel slab
+            # and the `spec * k` temporary are live together; slab thickness is
+            # an outer loop bound, so this is the whole cost of the kernel that
+            # used to be a full complex half-grid.
+            coarse_kernel_slab=2 * slab * nc * (nc // 2 + 1) * 2 * cw,
             # THREE complex half-grids, not one, and this is a DERIVATION rather
             # than a measurement: `dk`, the device copy `jnp.asarray(k)` makes of
             # the host kernel, and their product, all live while `irfftn` runs.
@@ -371,7 +497,13 @@ class EngineConfig:
             # `memory_stats()` is None on CPU). Modelled high on purpose: this
             # is a budget, and the failure that costs a node is the one where a
             # term was left out.
-            coarse_fft_workspace=3 * half * 2 * cw,
+            # What the transform actually holds ON a device, which is the term
+            # the monolithic form could not make small. MEASURED at 117.5 MB at
+            # 2048^3 against a 34.4 GB spectrum -- 0.0034x, the witness D1
+            # existed to get. Modelled at 16 planes rather than the ~8 that
+            # measurement implies, on the same "a budget is not a best case"
+            # posture as the terms above.
+            coarse_device_planes=16 * nc * (nc // 2 + 1) * 2 * cw,
             # --- coarse, RESIDENT for the whole run: what the once-per-run
             # build leaves behind (`forces.coarse_kernel_parts`). Both are real
             # half-grids at the coarse dtype; the complex kernels are not kept.
@@ -570,6 +702,20 @@ class EngineConfig:
         # 77.3 / 92.7 B on the same basis; it is not added here because it
         # completes before the step's peak and so is never co-resident with it.
         nb = max(1, self.n_fine // self.n_brick)
+        if self.migrate_backend == "device":
+            # The device passes hold HOST scratch of their own: each builds one
+            # slab's numpy window (slot range + residents) to upload and copies one
+            # block back -- two slab-sized numpy buffers, 9 B/row (+4 with ids),
+            # by construction of `device.migrate._eject_slab` and
+            # `device.repack.repack_device`. Unmeasured on a node; charged from the
+            # code. The device-side terms live in `plan.device_budget`.
+            host_window = int(round(2 * 9.0 * n / nb))
+            out = dict(kick_pending=0, repack_scratch=host_window,
+                       migrate_staging=host_window)
+            if cap is not None:
+                out["tile_buffers"] = (max(int(self.tile_workers), 1) * int(cap)
+                                       * (8 + 1 + 24 + 24 + 1 + 8 + 24 + 24))
+            return out
         out = dict(
             kick_pending=0,
             # 0.49 MEASURED (2.135/2.066 -> 0.490/0.490 at 2.1M and 16.8M
@@ -620,6 +766,78 @@ class EngineConfig:
             raise ValueError(
                 f"migrate_pooled needs a pool: tile_workers is {self.tile_workers}"
             )
+        if self.migrate_backend not in ("host", "device"):
+            raise ValueError(
+                f"migrate_backend must be 'host' or 'device', got {self.migrate_backend!r}")
+        if self.migrate_backend == "device":
+            if self.migrate_pooled is True:
+                raise ValueError(
+                    "migrate_pooled=True and migrate_backend='device' name two different "
+                    "migrates; the device pass does not use the pool. Drop one.")
+        for name in ("coarse_backend", "tile_backend"):
+            if getattr(self, name) not in ("host", "device"):
+                raise ValueError(
+                    f"{name} must be 'host' or 'device', got {getattr(self, name)!r}")
+        if self.coarse_backend == "device":
+            if not self.paint_subblock:
+                # the A/B arm restores a full-mesh paint per chunk; the device paint
+                # has no full-mesh form, so the knob could not apply
+                raise ValueError(
+                    "paint_subblock=False asks for the full-mesh paint, which "
+                    "coarse_backend='device' does not have. Drop one.")
+            if self.device_paint_chunk_bricks is not None and self.device_paint_chunk_bricks < 1:
+                raise ValueError(
+                    f"device_paint_chunk_bricks must be >= 1, got {self.device_paint_chunk_bricks}")
+        if self.tile_backend == "device" and self.tile_workers > 1:
+            raise ValueError(
+                f"tile_backend='device' with tile_workers={self.tile_workers}: the pool is "
+                "the CPU lane and refuses a GPU parent. The device tile loop is one program "
+                "per card; set tile_workers=1.")
+        if not self.device_tile_jit and self.tile_backend != "device":
+            raise ValueError(
+                "device_tile_jit=False selects the eager DEVICE tile, but tile_backend is "
+                f"{self.tile_backend!r}; the knob could not apply.")
+        if self.device_tile_window is True and not (self.tile_backend == "device"
+                                                    and self.device_tile_jit):
+            raise ValueError(
+                "device_tile_window=True windows the COMPILED device tile loop, but "
+                f"tile_backend={self.tile_backend!r}, device_tile_jit={self.device_tile_jit}; "
+                "the knob could not apply.")
+        if self.device_cards < 1:
+            raise ValueError(f"device_cards must be >= 1, got {self.device_cards}")
+        if self.device_cards > 1:
+            if not (self.coarse_backend == "device" and self.tile_backend == "device"
+                    and self.device_tile_jit and self.tile_window):
+                raise ValueError(
+                    f"device_cards={self.device_cards} splits the device step across cards: "
+                    "it needs coarse_backend='device', tile_backend='device', the compiled "
+                    "tile (device_tile_jit) and the window (device_tile_window).")
+            if self.device_cards > self.tiles_side:
+                raise ValueError(
+                    f"device_cards={self.device_cards} > {self.tiles_side} tile planes: a card "
+                    "would run no tiles.")
+        if self.migrate_repack_fused is True and not (
+                self.migrate_backend == "device" and self.tile_window):
+            raise ValueError(
+                "migrate_repack_fused=True fuses the DEVICE migrate with the repack and "
+                "sizes it from the tile window's census, but migrate_backend="
+                f"{self.migrate_backend!r}, tile_window={self.tile_window}; the knob could "
+                "not apply.")
+        on_device = [n for n in ("migrate_backend", "coarse_backend", "tile_backend")
+                     if getattr(self, n) == "device"]
+        if on_device:
+            import jax
+
+            if not jax.config.jax_enable_x64:
+                raise ValueError(
+                    f"{' and '.join(on_device)}='device' needs jax_enable_x64 (the compiled "
+                    "kernels' int64 lattice index is silently int32 without it). Enable it "
+                    "in the driver; the library never does.")
+            if self.device_cards > len(jax.devices()):
+                raise ValueError(
+                    f"device_cards={self.device_cards} but this process sees "
+                    f"{len(jax.devices())} jax devices; more threads than cards would run "
+                    "on one card while reading as a split.")
         self._refuse_f64_without_x64()
         return True
 
@@ -708,7 +926,8 @@ def _assert_stencil_contained(x, coarse_cell, origin, extent, n_coarse):
             )
 
 
-def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=None):
+def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=None,
+                          progress=None):
     """delta on the coarse mesh, accumulated brick by brick.
 
     Integer addition is associative, so a chunked accumulation is **bitwise**
@@ -729,6 +948,10 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
     associativity makes arrival order bitwise the serial order. `census=True`
     and the full-mesh A/B arm (`paint_subblock=False`) route serial regardless,
     so the gate instruments never read a pooled mesh.
+
+    `progress(stage, done, total)`, if given, is called once per chunk; see
+    `inexor.progress.Heartbeat`. At 4096^3 this loop is 16,384 chunks and
+    hours long, and it used to report nothing at all.
 
     `census=True` additionally counts cells whose integer sum is NOT exactly
     representable in f32 (`coarse_cells_inexact_f32`). It is OPT-IN because it
@@ -794,7 +1017,11 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
                                chunk_bricks=cfg.chunk_bricks, nb_side=nb_side))
         tasks = [(gi, np.asarray(gg, dtype=np.int64))
                  for gi, (gg, m) in enumerate(zip(groups, rows)) if m]
+        n_done = 0
         for res in pool.imap_coarse(tasks):
+            n_done += 1
+            if progress is not None:
+                progress("coarse paint", n_done, len(tasks))
             if res["empty"]:
                 continue
             ax = [(np.arange(int(res["extent"][a]), dtype=np.int64)
@@ -804,6 +1031,12 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
         pooled_workers = pool.workers
         groups = []  # the serial loop below must not run the chunks again
     for gi, (gg, m) in enumerate(zip(groups, rows)):
+        # `gi` chunks are COMPLETE at the top of iteration gi, and the count
+        # sits before the `continue` so an empty chunk still advances it. The
+        # closing call is after the loop, where the last chunk has actually run
+        # -- reporting done == total on entry to it would print DONE early.
+        if progress is not None:
+            progress("coarse paint", gi, len(groups))
         if m == 0:
             continue
         _, x, _ = st.decode_bricks(gg)
@@ -838,6 +1071,35 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
               for a in range(3)]
         mesh[np.ix_(*ax)] += sub
         n_sub += 1
+    if progress is not None and groups:
+        progress("coarse paint", len(groups), len(groups))
+    out, peak, inexact = _delta_from_accumulated(mesh, cfg, census=census)
+    if stats is not None:
+        # both, for the same reason `cap`/`cap_true` are both reported: one hides
+        # the padding cost, the other hides the shape churn, and the churn leaked
+        stats["coarse_pad"] = pad
+        stats["coarse_pad_true"] = pad_true
+        stats["coarse_peak_int"] = peak
+        # how many chunks took the sub-block path: an A/B whose knob did not
+        # apply must be readable as such (a knob must prove it applied) --
+        # same rule for the pool (0 = the serial path painted this mesh)
+        stats["coarse_subblock_chunks"] = n_sub
+        stats["coarse_pooled_workers"] = pooled_workers
+        if census:
+            stats["coarse_cells_inexact_f32"] = inexact
+            stats["coarse_exact_decode_ok"] = inexact == 0
+    return out
+
+
+def _delta_from_accumulated(mesh, cfg, census=False):
+    """(delta, peak, inexact) from the accumulated int64 coarse paint.
+
+    Shared by the host streamed paint and the device one (`device.paint`), so
+    the two cannot decode differently: whatever accumulated the integers, this
+    is the one place they become a density. `inexact` is the f32 round-trip
+    census count when `census`, else 0.
+    """
+    n = cfg.n_coarse
     peak = int(np.abs(mesh).max())
     if peak >= 2**31:
         raise ValueError(
@@ -866,21 +1128,7 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
         out[i0 : i0 + slab] = s.astype(np.float64) * scale / mean - 1.0
         if census:
             inexact += int(np.count_nonzero(s.astype(np.float32).astype(np.int64) != s))
-    if stats is not None:
-        # both, for the same reason `cap`/`cap_true` are both reported: one hides
-        # the padding cost, the other hides the shape churn, and the churn leaked
-        stats["coarse_pad"] = pad
-        stats["coarse_pad_true"] = pad_true
-        stats["coarse_peak_int"] = peak
-        # how many chunks took the sub-block path: an A/B whose knob did not
-        # apply must be readable as such (a knob must prove it applied) --
-        # same rule for the pool (0 = the serial path painted this mesh)
-        stats["coarse_subblock_chunks"] = n_sub
-        stats["coarse_pooled_workers"] = pooled_workers
-        if census:
-            stats["coarse_cells_inexact_f32"] = inexact
-            stats["coarse_exact_decode_ok"] = inexact == 0
-    return out
+    return out, peak, inexact
 
 
 # ===========================================================================
@@ -1067,12 +1315,20 @@ def tile_task(st, one_tile, C, g_coarse, t, bricks, ph=_no_phase):
     xo[:n_own] = x[owned]
     lv = np.zeros(C["cap"], dtype=bool)
     lv[:n_own] = True
-    g_long = np.asarray(
-        gather_coarse_subblock(
-            *sub, jnp.asarray(xo), o_cells, C["coarse_cell"], C["n_coarse"],
-            assign="tsc", live=lv,
-        )
-    )[:n_own]
+    # `guard_out` keeps the stencil-containment check off the critical path:
+    # computing its bounds on the host meant a device->host sync in the MIDDLE
+    # of the gather, before the corner loop that is the actual work, plus a host
+    # min/max over every padded row. Deferred, the bounds are device scalars and
+    # are resolved BELOW, after the forces have been read back and the device is
+    # idle, so the refusal costs a round-trip's latency instead of a stall. It
+    # still fires before `g_long` is used, which is the property that matters.
+    stencil_guard = []
+    g_long_dev = gather_coarse_subblock(
+        *sub, jnp.asarray(xo), o_cells, C["coarse_cell"], C["n_coarse"],
+        assign="tsc", live=lv, guard_out=stencil_guard,
+    )
+    g_long = np.asarray(g_long_dev)[:n_own]
+    check_stencil_guard(stencil_guard)
     ph("tile_long")
     t_quant = time.perf_counter()
     g_tot = g_short[owned] + g_long
@@ -1131,8 +1387,48 @@ def apply_result(st, res):
     st.vel_scale[res["run_bricks"]] = res["run_scales"]
 
 
+def _migrate_pass(st, cfg, c_drift, pool, timings=None):
+    """ONE router for the step's migrate and the lead drift: host (serial or
+    pooled, exactly as before) or the device pass. Returns the stats dict; the
+    device pass's `migrate_device` receipt rides in it."""
+    if cfg.migrate_backend == "device":
+        from .device.migrate import drift_and_migrate_device
+
+        return drift_and_migrate_device(
+            st, c_drift, device_budget_bytes=cfg.migrate_device_budget_bytes,
+            devices=_cards(cfg), timings=timings)
+    if pool is not None and cfg.migrate_pooled is not False:
+        return drift_and_migrate_pooled(
+            st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window,
+            eject_inflight=cfg.migrate_eject_inflight,
+        )
+    return drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel)
+
+
+def _repack_pass(st, cfg, timings=None):
+    """The repack, routed like the migrate. Returns the host repack's dict; the
+    device pass adds its `repack_device` receipt."""
+    if cfg.migrate_backend == "device":
+        from .device.repack import repack_device
+
+        return repack_device(st, brick_slack=cfg.brick_slack, devices=_cards(cfg),
+                             timings=timings)
+    return st.repack(brick_slack=cfg.brick_slack)
+
+
+def _cards(cfg):
+    """The cards the device passes split across (`cfg.device_cards`), or None for
+    one card on jax's default device."""
+    if cfg.device_cards <= 1:
+        return None
+    import jax
+
+    return list(jax.devices()[: cfg.device_cards])
+
+
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
-         phase=None, tile_force=None, pool=None, coarse_parts=None):
+         phase=None, tile_force=None, pool=None, coarse_parts=None, device_shapes=None,
+         repack_due=False, timings=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1 and
@@ -1166,6 +1462,29 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     `(None, geom)`: the parent never runs a tile itself, so it needs the
     geometry but not the kernels.
 
+    THE DEVICE LANE (`cfg.coarse_backend` / `cfg.tile_backend`, the executor
+    of `runs/v2/device_design_record.md`). "device" coarse paints, accumulates
+    and decodes the density on the card and solves from it; "device" tile runs
+    the whole loop as one compiled program writing into device state
+    (`device.tile.tile_loop_device`), or the eager per-tile oracle arm under
+    `device_tile_jit=False`. The migrate and repack follow `migrate_backend`.
+    `device_shapes` is the previous step's compiled shapes (`stats
+    ["device_shapes"]`), carried by `run` so they stay monotone and restored
+    from a checkpoint so a resumed run compiles the programs the uninterrupted
+    one did. The compiled tile loop has one boundary, `tile_loop`, in place of
+    the per-tile ones: a synced per-tile timing is not neutral (record sec. 20).
+
+    `timings`, if a dict, collects the device passes' SYNCED per-phase walls: the
+    windowed tile loop's per card (`tile`), the migrate's, or the fused
+    migrate + repack's (`migrate`), and the coarse solve's parts (`solve`). Syncing moves the wall, so a timed step is a
+    breakdown and not the step's cost; `stats["timings"]` carries it (None on an
+    untimed step).
+
+    `repack_due` says this step's repack follows it (`run` passes it). Where
+    `cfg.fused_pass`, the tile loop then takes the destination census and the
+    migrate and repack run fused (`device.fused`), and `stats["repack"]` is filled
+    here; otherwise it is None and the caller repacks.
+
     `phase`, if given, is called with a boundary NAME after each phase of the
     step completes. It exists because a peak is a max and a max carries no
     timestamp: M-v2-6 Stage 0 attributed the peak by differencing whole-run
@@ -1186,37 +1505,84 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
 
     # --- long arm: solve once, globally, on the coarse mesh
     mesh_stats = {}
-    delta = coarse_delta_streamed(st, cfg, stats=mesh_stats, census=census,
-                                  pad_shape=pad_shape, pool=pool)
+    shapes_in = device_shapes or {}
+    shapes_out = {}
+    # E3: the cards the device step splits across; None is one card, jax's default
+    # device, exactly as before
+    devs = None
+    if cfg.device_cards > 1:
+        import jax
+
+        devs = list(jax.devices()[: cfg.device_cards])
+    if cfg.coarse_backend == "device":
+        from .device.paint import coarse_delta_cards
+
+        # The density painted, accumulated and decoded ON THE CARDS, never on the
+        # host: `coarse_force_meshes` takes the shards and transforms each card's
+        # planes where they sit.
+        delta = coarse_delta_cards(
+            st, cfg, devices=devs, stats=mesh_stats, pad_shape=pad_shape,
+            chunk_bricks=cfg.device_paint_chunk_bricks, census=census,
+            shape_floor=shapes_in.get("paint"))
+        shapes_out["paint"] = {k: int(v) for k, v in mesh_stats["coarse_jit_shapes"].items()}
+        # the host path's keys, on every card: each device chunk IS a sub-block
+        # paint, and no pool painted it
+        mesh_stats["coarse_subblock_chunks"] = int(mesh_stats["coarse_device_chunks"])
+        mesh_stats["coarse_pooled_workers"] = 0
+    else:
+        delta = coarse_delta_streamed(st, cfg, stats=mesh_stats, census=census,
+                                      pad_shape=pad_shape, pool=pool)
     ph("coarse_paint")
     # HAND THE FIELD OVER AND LET GO OF IT. `delta` is a full coarse mesh (4.3 GB
     # at C-gh) and the solve reads only the jax copy, so holding the numpy name
     # bound through the solve keeps a dead mesh alive across the phase where the
-    # peak is. Costs nothing when the jax copy aliases the host buffer.
-    dj = jnp.asarray(delta)
+    # peak is. Costs nothing when the jax copy aliases the host buffer. Card
+    # shards are handed over as they are.
+    dj = delta if cfg.coarse_backend == "device" else jnp.asarray(delta)
     # read the REALIZED dtype off the decoded field before letting go of it: the
     # receipt at the end of the step is the check that the coarse knob applied,
     # and it has to come from the array the paint produced. The force meshes
     # cannot serve -- with `out=` they are the pool's preallocated views, whose
     # dtype comes from the config, so a receipt read there would echo what it
     # was told, which is exactly the failure this milestone exists to catch.
-    coarse_dtype_seen = np.dtype(delta.dtype).name
+    coarse_dtype_seen = np.dtype(
+        delta[0]["delta"].dtype if cfg.coarse_backend == "device" else delta.dtype).name
     del delta
     # `coarse_force_meshes` infers from delta.dtype and REFUSES a mismatch, so
     # the dtype cannot silently disagree with what the config asked for.
     # `out=` is the pool's own shm views: the workers read them anyway, so
     # solving into them removes the parent-side triple AND the copy stage_step
     # would otherwise make.
+    # Under the compiled device tile the force meshes are written straight onto
+    # the card they are read on (`device.coarse.CardShards`): no host mesh, and no
+    # re-upload. `g_coarse` is then the card shard dicts, not three host arrays.
+    if cfg.tile_backend == "device" and cfg.device_tile_jit:
+        from .device.coarse import CardShards
+        from .ooc_fft import partition_units
+
+        # one shard per card: the coarse x-planes under the tile planes that card
+        # runs, COARSE_HALO each side. One card is the whole mesh, wrapped, which
+        # is `CardShards.whole_mesh` exactly.
+        per_tile = cfg.n_tile // (cfg.n_fine // cfg.n_coarse)
+        plane_parts = partition_units(cfg.tiles_side, cfg.device_cards, 1)
+        solve_out = CardShards(
+            [(a * per_tile - COARSE_HALO, (b - a) * per_tile + 2 * COARSE_HALO,
+              None if devs is None else devs[k]) for k, (a, b) in enumerate(plane_parts)],
+            cfg.n_coarse)
+    else:
+        solve_out = None if pool is None else pool.g_views()
     g_coarse = coarse_force_meshes(
         dj,
         cfg.n_coarse,
         cfg.box_size,
         "long",
         r_s=cfg.r_s,
-        match=(cfg.coarse_cell, cfg.fine_cell),
+        match=cfg.coarse_match,
         fdtype=cfg.np_coarse_dtype,
         parts=coarse_parts,
-        out=None if pool is None else pool.g_views(),
+        out=solve_out,
+        timings=None if timings is None else timings.setdefault("solve", {}),
+        fold_kernel=cfg.coarse_fold_kernel,
     )
     del dj
     ph("coarse_solve")
@@ -1274,8 +1640,75 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # TWO executors of ONE function. Serial: task and apply inline, in tile
     # order. Pool: the same `tile_task` from workers, applied in arrival order.
     # The bitwise executor-identity gate compares the two.
+    #
+    # THE DEVICE LANE is a third executor. Compiled (`device_tile_jit`), the whole
+    # loop is `device.tile.tile_loop_device`: every tile writes its codes and
+    # scales into device state, guards and the partition are resolved after the
+    # loop, the host state is written once, and only counts come back -- so
+    # nothing reaches the per-result loop below. Eager, `tile_task_device` returns
+    # the `tile_task` dict and `apply_result` lands it, the bitwise oracle arm.
     tasks = [(t, members[t]) for t in cfg.tiles]
-    if pool is not None:
+    if cfg.tile_backend == "device" and cfg.device_tile_jit:
+        from .device.tile import tile_loop_device, tile_step_shapes
+
+        shapes = tile_step_shapes(st, floor=shapes_in.get("tile"))
+        shapes_out["tile"] = {k: int(v) for k, v in shapes.items()}
+        # the force meshes are already on the card (the solve wrote them there);
+        # each tile's program gathers its own sub-blocks from the shard (record
+        # sec. 23), and no host mesh exists to pass
+        if cfg.tile_window:
+            from .device.window import tile_loop_windowed, window_shapes
+
+            # E2: one tile plane's x-slabs on the card at a time, not the state.
+            # E3: one thread per card, each walking the tile planes its shard
+            # covers; their host write-backs are disjoint core slabs
+            wsh = window_shapes(st, cfg.n_tile, b_real, cfg.n_brick,
+                                floor=shapes_in.get("window"))
+            # M4: the census the fused migrate + repack sizes its new ranges from
+            fused_now = bool(repack_due) and cfg.fused_pass
+            tile_timings = [dict() for _ in plane_parts]
+            shapes_out["window"] = wsh
+            wshapes = dict(shapes, window=wsh)
+
+            def run_card(k):
+                a, b = plane_parts[k]
+                return tile_loop_windowed(
+                    st, one_tile, C, None, members, wshapes, planes=range(a, b),
+                    coarse_shard=g_coarse[k], device=None if devs is None else devs[k],
+                    census=float(c_drift) if fused_now else None,
+                    timings=None if timings is None else tile_timings[k])
+
+            if devs is None:
+                loops = [run_card(0)]
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=len(devs)) as ex:
+                    loops = list(ex.map(run_card, range(len(devs))))
+        else:
+            loops = [tile_loop_device(st, one_tile, C, None, members, shapes,
+                                      coarse_shard=g_coarse[0])]
+        n_owned = sum(int(lp["n_owned"]) for lp in loops)
+        n_overhang = sum(int(lp["n_out"]) for lp in loops)
+        tile_scales.extend(float(lp["vel_scale_kick_max"]) for lp in loops
+                           if lp["vel_scale_kick_max"] is not None)
+        # the window's receipts ride with each card's (absent on the whole-state loop)
+        tile_cards = [dict(planes=int(lp.get("planes_run", cfg.tiles_side)),
+                           tiles_run=int(lp["tiles_run"]),
+                           **{k: lp[k] for k in ("window_live_rows_max", "residents_staged",
+                                                 "window_slabs", "wrapped")
+                              if k in lp})
+                      for lp in loops]
+        if timings is not None and cfg.tile_window:
+            timings["tile"] = {f"card {k}": t for k, t in enumerate(tile_timings)}
+        ph("tile_loop")
+        results = ()
+    elif cfg.tile_backend == "device":
+        from .device.tile import tile_task_device
+
+        results = (tile_task_device(st, one_tile, C, g_coarse, t, bricks)
+                   for t, bricks in tasks)
+    elif pool is not None:
         pool.stage_step(g_coarse, C)
         results = pool.imap(tasks)
     else:
@@ -1327,16 +1760,33 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # a peak comparison against every card on record is still like-for-like.
     ph("reconcile")
 
-    if pool is not None and cfg.migrate_pooled is not False:
-        stats = drift_and_migrate_pooled(
-            st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window,
-            eject_inflight=cfg.migrate_eject_inflight,
-        )
+    fused_now = bool(repack_due) and cfg.fused_pass
+    repack_stats = None
+    if fused_now:
+        from .device.fused import migrate_repack_device
+
+        census_counts = sum(lp["census_counts"] for lp in loops)
+        mt = None if timings is None else timings.setdefault("migrate", {})
+        stats, repack_stats = migrate_repack_device(
+            st, c_drift, census_counts, brick_slack=cfg.brick_slack,
+            device_budget_bytes=cfg.migrate_device_budget_bytes, devices=_cards(cfg),
+            timings=mt)
     else:
-        stats = drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel)
+        stats = _migrate_pass(st, cfg, c_drift, pool,
+                              None if timings is None else timings.setdefault("migrate", {}))
+    # the knob's receipts, on every card in both directions: the census the fused
+    # pass was sized from covered this many slabs (0 when it did not run)
+    stats["migrate_repack_fused"] = fused_now
+    stats["census_slabs"] = (int(sum(lp.get("census_slabs", 0) for lp in loops))
+                             if fused_now else 0)
     # the knob's receipt, in BOTH directions: 0 on every serial card, W on
     # every pooled one (the reach fallback reports 0 through migrate_pool)
     stats["migrate_pooled_workers"] = int(stats.get("migrate_pool", {}).get("workers", 0))
+    # the backend's receipt: the name, and on the device the pass's own dict
+    # (slabs, programs, peak estimate); None on the host so every card carries
+    # the key
+    stats["migrate_backend"] = cfg.migrate_backend
+    stats.setdefault("migrate_device", None)
     # PEAK ARENA RESIDENCY, so `arena_frac` stops being chosen by argument.
     # The 6% on record is CLAIMS across a migrate pass, not residency: the
     # arena is a revolving door (`_release_arena_of_brick` frees slots as
@@ -1376,8 +1826,21 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # against
     stats["coarse_dtype"] = coarse_dtype_seen
     stats["fine_dtype"] = str(geom["fdtype"])
+    # the executor's receipts, on every card in both directions. The calls
+    # themselves are counted in `device.paint.CALLS` / `device.tile.CALLS`;
+    # `device_shapes` is what the device programs were compiled at, carried by
+    # `run` across steps and into checkpoints ({} on the host lane)
+    stats["coarse_backend"] = cfg.coarse_backend
+    stats["tile_backend"] = (cfg.tile_backend if cfg.tile_backend == "host"
+                             else ("device" if cfg.device_tile_jit else "device-eager"))
+    stats["device_shapes"] = shapes_out
+    if cfg.tile_backend == "device" and cfg.device_tile_jit:
+        # the split's receipt: cards asked for, and what each card's tile loop ran
+        stats["device_cards"] = cfg.device_cards
+        stats["tile_cards"] = tile_cards
     stats.update(mesh_stats)
-    stats["repack"] = None
+    stats["repack"] = repack_stats
+    stats["timings"] = timings
     if collect is not None:
         collect(stats)
     return stats
@@ -1407,6 +1870,10 @@ def fused_drifts(coeffs):
 #     policy; the pooled migrate is bitwise the serial one (C14) and W is
 #     exactly the thing you want to change when resuming onto another node.
 #   eject_kernel -- both kernels are bitwise on arm64/x86/CUDA (record 5s).
+#   migrate_backend, migrate_device_budget_bytes, migrate_repack_fused -- execution
+#     policy; the device migrate and repack, separate or fused, are bitwise the
+#     serial host passes (D3b R1/R1b, M4 gates), and a resume onto a node with a
+#     different backend is the point.
 #   repack_every, chunk_bricks, brick_slack -- move the LAYOUT, and the layout
 #     carries no physics: both paints are integer and so order-independent
 #     (D-v2-21), which is also why this checkpoint does not preserve
@@ -1424,18 +1891,26 @@ def checkpoint_fingerprint(cfg, coeffs):
     bytes, so the cosmology, the a-grid and K are all in here without the
     checkpoint having to name them or the caller having to pass a cosmology."""
     h = hashlib.sha256()
-    h.update(json.dumps({k: getattr(cfg, k) for k in _FINGERPRINTED}, sort_keys=True).encode())
+    fp = {k: getattr(cfg, k) for k in _FINGERPRINTED}
+    # added ONLY at orders other than 2, so every checkpoint written before the
+    # knob existed (all order 2) keeps its fingerprint and still resumes, and no
+    # order-3 run can collide with one of them
+    if getattr(cfg, "coarse_match_order", 2) != 2:
+        fp["coarse_match_order"] = cfg.coarse_match_order
+    h.update(json.dumps(fp, sort_keys=True).encode())
     h.update(np.ascontiguousarray(coeffs, dtype=np.float64).tobytes())
     return h.hexdigest()
 
 
-def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=None):
+def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=None,
+                      device_shapes=None, timings=None):
     """One generation of a rolling pair. Returns the directory, which is the
     receipt: a run that believed it was checkpointing and was not has `None`
     on every step.
 
     `epoch` is the optional `(a_steps, cosmo)` from `run`; see `epoch_record`
-    for what it writes and why it is not in the fingerprint."""
+    for what it writes and why it is not in the fingerprint. `device_shapes` is
+    the device lane's compiled shapes, restored on resume (see `run`)."""
     from . import icgen
 
     prov = dict(
@@ -1444,12 +1919,14 @@ def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=No
         n_steps=int(len(coeffs)),
         cap_shape=int(cap_shape),
         pad_shape=int(pad_shape),
+        device_shapes={name: {k: int(v) for k, v in s.items()}
+                       for name, s in (device_shapes or {}).items()},
         n_arena=int(st.n_arena),
         fingerprint=checkpoint_fingerprint(cfg, coeffs),
     )
     prov.update(epoch_record(epoch, step))
     d = os.path.join(cfg.checkpoint_dir, f"gen{gen}")
-    icgen.write_t9_slabs(st, d, provenance=prov)
+    icgen.write_t9_slabs(st, d, provenance=prov, timings=timings)
     return d
 
 
@@ -1549,7 +2026,7 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
     return st, dict(prov)
 
 def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
-        stop_at=None, allocator=None, epoch=None):
+        stop_at=None, allocator=None, epoch=None, timed_steps=()):
     """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`.
 
     `phase` is forwarded to `step`; see its docstring. The boundaries `run`
@@ -1581,8 +2058,15 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     `python -m inexor.export` writing peculiar km/s off a bare directory
     instead of the reader having to supply the epoch by hand and get it right.
     Omitted, everything behaves exactly as before; see `epoch_record`.
+
+    `timed_steps` names ABSOLUTE step indices whose device passes are timed with
+    syncs (see `step`'s `timings`); on those steps the repack, if it runs
+    separately, is timed too, into `stats["timings"]["repack"]`, and a
+    checkpoint landing on one reports its own parts into
+    `stats["timings"]["checkpoint"]`.
     """
     cfg.validate()
+    timed_steps = {int(k) for k in timed_steps}
     ph = phase if phase is not None else _no_phase
     ckpt_on = bool(cfg.checkpoint_dir) and cfg.checkpoint_every > 0
     if ckpt_on and st.ids is not None:
@@ -1634,7 +2118,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     # build's own 28 B/half peak lands here, before any force mesh exists.
     coarse_parts = coarse_kernel_parts(
         cfg.n_coarse, cfg.box_size, "long", r_s=cfg.r_s,
-        match=(cfg.coarse_cell, cfg.fine_cell), fdtype=cfg.np_coarse_dtype,
+        match=cfg.coarse_match, fdtype=cfg.np_coarse_dtype,
     )
     ph("kernel_build")
     try:
@@ -1646,11 +2130,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         # The phase boundary still fires so a resumed run's phase table keeps
         # the same shape as an uninterrupted one (the `reconcile` precedent).
         if resume is None:
-            if pool is not None and cfg.migrate_pooled is not False:
-                drift_and_migrate_pooled(st, lead, pool, kernel=cfg.eject_kernel,
-                                         window=cfg.migrate_window)
-            else:
-                drift_and_migrate(st, lead, kernel=cfg.eject_kernel)
+            _migrate_pass(st, cfg, lead, pool)
         ph("lead_drift")
         out = []
         # both buffer shapes are carried ACROSS steps and only ever grow, so the
@@ -1658,6 +2138,9 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         # Stage 0, `coarse_pad` from Stage 0b, which measured it still churning
         cap_shape = 0
         pad_shape = 0
+        # the device lane's compiled shapes (`step`'s `device_shapes`), carried the
+        # same way; {} on the host lane
+        device_shapes = {}
         k0 = 0
         if resume is not None:
             # Both shapes are RESTORED rather than re-laddered from zero, so a
@@ -1669,9 +2152,16 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             # split-run gate therefore cannot see this and does not claim to;
             # what it does catch is the lead drift being reapplied. Not
             # generalized to GPU, where XLA reassociates by shape.
+            #
+            # The device shapes are restored for the stronger reason that
+            # sentence names: on a GPU a program compiled at another shape may
+            # round differently, so a resumed run is only the uninterrupted one if
+            # it compiles the same programs. A checkpoint written before the
+            # executor has none, and a host-lane run needs none.
             k0 = int(resume["step"])
             cap_shape = int(resume["cap_shape"])
             pad_shape = int(resume["pad_shape"])
+            device_shapes = dict(resume.get("device_shapes") or {})
         k_end = len(fused)
         if stop_at is not None:
             k_end = min(k_end, int(stop_at))
@@ -1690,14 +2180,21 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                 )
         n_ckpt = 0
         for k in range(k0, k_end):
+            repack_due = bool(cfg.repack_every and (k + 1) % cfg.repack_every == 0)
+            timings = {} if k in timed_steps else None
             stats = step(st, cfg, (coeffs[k][1], coeffs[k][2]), float(fused[k]), collect,
                          census=census, cap_shape=cap_shape, pad_shape=pad_shape,
                          phase=phase, tile_force=tile_force, pool=pool,
-                         coarse_parts=coarse_parts)
+                         coarse_parts=coarse_parts, device_shapes=device_shapes,
+                         repack_due=repack_due, timings=timings)
             cap_shape = int(stats["cap"])
             pad_shape = int(stats["coarse_pad"])
-            if cfg.repack_every and (k + 1) % cfg.repack_every == 0:
-                stats["repack"] = st.repack(brick_slack=cfg.brick_slack)
+            device_shapes = stats["device_shapes"]
+            if repack_due:
+                # the fused pass has already repacked, inside the migrate phase
+                if stats["repack"] is None:
+                    stats["repack"] = _repack_pass(
+                        st, cfg, None if timings is None else timings.setdefault("repack", {}))
                 ph("repack")
             # AFTER the repack, so the checkpoint is the step's settled state.
             # The receipt goes on every step in both directions, `None` when
@@ -1705,7 +2202,13 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             stats["checkpoint"] = None
             if ckpt_on and (k + 1) % cfg.checkpoint_every == 0:
                 stats["checkpoint"] = _write_checkpoint(
-                    st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2, epoch=epoch
+                    st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2, epoch=epoch,
+                    device_shapes=device_shapes,
+                    # the parts, on a timed step: a real checkpoint at full size
+                    # is a better measurement of them than the driver's few-slab
+                    # probe extrapolated by 32x, which read 3076 s against a
+                    # measured 3757 (job 1002247)
+                    timings=None if timings is None else timings.setdefault("checkpoint", {}),
                 )
                 n_ckpt += 1
                 ph("checkpoint")

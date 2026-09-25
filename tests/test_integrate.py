@@ -8,7 +8,8 @@ reversibility tests and the wrap-adversarial arm, and every test of
 properties of the reversible integer trajectory, which v2 does not have.
 
 What remains is the coefficient layer, which is pure cosmology arithmetic and
-carries forward unchanged: the EdS closed-form oracle (the roadmap M1 gate),
+carries forward: the EdS closed-form oracle (the roadmap M1 gate; the LCDM
+weights are pinned in `test_growth2.py`),
 the FastPM small-step limit, the v/p conversion, and the linear-mode growth
 pins that fix each integrator's defining property.
 
@@ -91,8 +92,8 @@ def _grow_linear_mode_kdk(integrator, K, a_i=0.1, a_f=1.0):
     return x
 
 
-def _grow_linear_mode_bullfrog(K, a_i=0.1, a_f=1.0):
-    t = bullfrog_table(a_grid(a_i, a_f, K, "log"), PLANCK)
+def _grow_linear_mode_bullfrog(K, a_i=0.1, a_f=1.0, growth2="lcdm"):
+    t = bullfrog_table(a_grid(a_i, a_f, K, "log"), PLANCK, growth2=growth2)
     x, v = t.D_steps[0], 1.0  # x = D Psi with Psi = 1; v_D = Psi = 1
     for dD_half, alpha, bcoef in bullfrog_float_coeffs(t):
         x = x + dD_half * v
@@ -109,11 +110,13 @@ def test_fastpm_linear_mode_exact_growth():
         assert abs(_grow_linear_mode_kdk("fastpm", K) / D_f - 1.0) < 1e-4
 
 
-def test_bullfrog_linear_mode_exact_growth():
-    """BullFrog's Zel'dovich consistency: exact linear growth per step."""
+@pytest.mark.parametrize("growth2", ["lcdm", "eds"])
+def test_bullfrog_linear_mode_exact_growth(growth2):
+    """BullFrog's Zel'dovich consistency: exact linear growth per step, whatever
+    the second-order growth (it only enters off the potential flow)."""
     D_f = growth_factor_a(1.0, PLANCK)
     for K in (2, 4, 8):
-        assert abs(_grow_linear_mode_bullfrog(K) / D_f - 1.0) < 1e-6
+        assert abs(_grow_linear_mode_bullfrog(K, growth2=growth2) / D_f - 1.0) < 1e-6
 
 
 def test_exact_kdk_deficit_and_convergence():

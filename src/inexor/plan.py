@@ -142,6 +142,483 @@ def load_stages(*, n, n_rows, n_buckets, index_itemsize, n_arena, n_bricks,
     return stages
 
 
+# ---------------------------------------------------------------------------
+# The device design: the host is a byte store, the four GPUs do the step.
+# ---------------------------------------------------------------------------
+#
+# WHERE EACH MESH TERM LIVES. This table is a DESIGN ASSERTION, not a reading of
+# code -- the device executor does not exist yet. `MESH_PHASE` lives in `engine`
+# precisely because a term's phase is a property of the code that allocates it;
+# when the device lane exists this table moves into it for the same reason, and
+# until then every verdict below is arithmetic over a design, not over a run.
+#
+#   shard   -- decomposed along x across the GPUs, so each card holds 1/n_gpus.
+#              The coarse mesh is planar-decomposed for the factorized FFT, so
+#              every coarse term follows the same split.
+#   replica -- every card runs whole tiles, so each holds its own copy.
+#   host    -- exists, but in HOST memory: no card holds it. Distinct from
+#              "gone", which means the term stops existing at all. The
+#              factorized coarse solve's spectrum is the reason this category
+#              exists -- it is 34.4 GB at c-hero that the design deliberately
+#              never puts on a card.
+#   gone    -- the host pass the port deletes.
+DEVICE_PLACEMENT = {
+    "coarse_delta": "shard",
+    "coarse_force_resident": "shard",
+    "coarse_force_copy_transient": "shard",
+    "coarse_kernel_pref": "shard",
+    "coarse_match_factor": "shard",
+    "coarse_kernel_build_f64": "shard",
+    # HOST-RESIDENT: the factorized solve keeps the spectrum in numpy and sends
+    # only planes across, so a card never holds one. `coarse_device_planes` is
+    # what it DOES hold, and it is a replica because each card transforms its
+    # own planes.
+    "coarse_spectrum": "host",
+    "coarse_solve_work": "host",
+    "coarse_kernel_slab": "host",
+    "coarse_device_planes": "replica",
+    # Priced at the HOST path's int64 width, which over-charges the device form:
+    # the sub-block paint accumulates int32 (`painting.paint_tsc_int_subblock`)
+    # and the engine's int64 mesh is the parent-side accumulator the port
+    # deletes. Left at 8 B/cell deliberately -- a budget that guesses its way
+    # DOWN is the shape of a gate that cannot fail.
+    "coarse_accumulator": "shard",
+    "tile_kernels": "replica",
+    "tile_kernel_build_f64": "replica",
+    "tile_kernel_pref": "replica",
+    "tile_workspace": "replica",
+    # `SlotState.decode_bricks` on the host is the pass the design exists to
+    # remove; it has no device counterpart because the rows are decoded inside
+    # the tile kernel from the streamed slab.
+    "coarse_decode_slab": "gone",
+}
+
+
+def shard_halo_planes():
+    """x-planes a card's shard holds beyond its 1/n_gpus of the mesh, per term.
+
+    Only for terms whose device code builds them with ghosts: the accumulator's
+    1 + 2 (`device.paint.ACC_GHOST_LO/HI`) and the force meshes' `COARSE_HALO`
+    on each side (`device.coarse`; 993866 held 516 planes per card at 4096^3,
+    record sec. 23).
+    """
+    from .device.paint import ACC_GHOST_HI, ACC_GHOST_LO
+    from .forces import COARSE_HALO
+
+    return {"coarse_accumulator": ACC_GHOST_LO + ACC_GHOST_HI,
+            "coarse_force_resident": 2 * COARSE_HALO}
+
+# MEASURED, not chosen: `scripts/v2_g4_gh_memory.py` streams pinned host memory
+# in CHUNK_GIB = 2.0 chunks and the device high-water sat at exactly 2 chunks
+# (4.0 GiB) at every rung of the 64 -> 640 GiB ladder, on one GPU and on four
+# (Vista 974476, record 5z). The per-chunk `block_until_ready` is what makes it
+# 2 and not the whole set -- without it XLA keeps every staged copy alive.
+STREAM_CHUNK_BYTES = 2.0 * 2**30
+STREAM_CHUNKS_IN_FLIGHT = 2
+
+# ONE COARSE-PAINT CHUNK ON A CARD (`device.paint`), MEASURED on a GB200: device
+# `peak_bytes_in_use` per padded row, the `off` window upload included.
+#
+# JITTED, the default (Vista 993294, c672-016): 72.1 / 62.2 / 62.2 B at 16.8M /
+# 84.6M / 338M padded rows. Charged at the largest reading.
+PAINT_CHUNK_B_PER_ROW = 72
+# EAGER (`jit=False`), same job and node: 293.0 / 269.7 / 266.0 B, reproducing
+# Vista 993139 (272.0 / 264.8 / 266.2 on c672-004). For pricing the eager path.
+PAINT_CHUNK_EAGER_B_PER_ROW = 266
+# folded into the measured rate above; kept at 0 so the job card's reader,
+# which adds the two, still resolves
+PAINT_WINDOW_B_PER_ROW = 0
+# THE TRACED READING: bytes alive at once under last-use freeing in the traced
+# program, with no operator fusion, differenced over two padded row counts
+# (125 B/row; positions + TSC weights alone are 96). It is NOT a floor for the
+# compiled program: XLA fuses and reuses buffers, and measured 62 on the card.
+# `tests/test_device_paint.py` re-traces the program and fails if it ever
+# exceeds this, which catches program growth without a card. 121 before the
+# dead rows were spread by default; the +4 is that int32 per-row index, and
+# the card read 69.5-71.0 B/row with it (Vista 993600).
+PAINT_CHUNK_TRACED_B_PER_ROW = 125
+# a chunk's rows are padded on `forces.capacity_shape`'s ladder, whose padding
+# is derived at <= 26.0%
+PAINT_PAD_BOUND = 1.26
+
+# THE DEVICE MIGRATE'S PEAK PER SLAB ROW, MEASURED on a GB200 after the R1
+# retention cuts (Vista 995638, record sec. 31): 1.25 GiB at cgh64 = 320 B per
+# slab row, `device.migrate.drift_and_migrate_device` on one card. Charged at
+# the slab's rows x this. It scales with slab rows by ARITHMETIC (~86 GB at
+# c-hero); the 4096^3 reading is owed to the R2 job.
+MIGRATE_DEVICE_B_PER_SLAB_ROW = 320
+# THE DEVICE REPACK'S PEAK PER SLAB ROW, MEASURED at a production-shape slab
+# (nb=256, 268,439,552 rows, 4,096 residents) on a GB200: 18.75 GB device peak
+# = 69.9 B per slab row, windows and program included (Vista 995813, record
+# sec. 33). Charged at the slab's rows x this.
+REPACK_DEVICE_B_PER_SLAB_ROW = 70
+# THE FUSED DEVICE MIGRATE + REPACK'S PEAK PER SLAB ROW, MEASURED on one GB200 at
+# 1024^3 (16,777,216 rows per slab): 4.02 GiB = 257 B per slab row
+# (`device.fused.migrate_repack_device`, Vista 1001688, record sec. 41). INTERIM:
+# not a production-shape reading; the 4096^3 smoke replaces it.
+FUSED_DEVICE_B_PER_SLAB_ROW = 257
+
+
+def device_window_slabs(ec):
+    """x-slabs of bricks that must be resident to serve one plane of tiles.
+
+    DERIVED, not picked. A tile draws from `brick_span` bricks per side
+    (`layout.brick_span`, the same function the engine's membership uses), so
+    walking tiles in x-order needs that many consecutive x-slabs live at once.
+    At c-hero it is 18: 512/32 bricks across the tile plus one brick of pad on
+    each side, and `choose_brick`'s `c | b_fine` contract is what makes the
+    union exactly the padded box rather than a 1.7x superset.
+    """
+    from .layout import brick_span
+
+    nb = max(1, ec.n_fine // ec.n_brick)
+    _pad, span = brick_span(ec.n_tile, ec._b_realized, ec.n_brick, nb)
+    return min(span, nb)
+
+
+def _print_load_and_ic(args, ec, t9, n, rows, arena, shared):
+    """The load path and the IC stage. Shared by both backends, and it is the
+
+    same host either way: whoever does the step, the state is still built on the
+    host and the IC transform is still out of core.
+    """
+    idx_itemsize = t9.index_bytes() // max(t9.n_buckets_side**3, 1)
+    ld = load_stages(
+        n=n, n_rows=rows + arena, n_buckets=t9.n_buckets_side**3,
+        index_itemsize=max(idx_itemsize, 1), n_arena=arena,
+        n_bricks=ec.n_brick and (args.n_fine // ec.n_brick) ** 3,
+        n_slabs=args.slabs, shared=shared,
+    )
+    _table("LOADING THE STATE, peak resident at each stage", ld,
+           total_label="PEAK (max, not sum)", reduce=max)
+    print("  the total line above is a MAX: these stages do not coexist")
+
+    try:
+        from .ooc_fft import plan_bytes
+
+        ic = plan_bytes(args.n_part, np.dtype(args.coarse_dtype), "derivative")
+        print(f"\nIC STAGE (out-of-core, 'derivative' policy): peak "
+              f"{_fmt(ic['peak'])}")
+    except Exception as exc:  # pragma: no cover - informational only
+        print(f"\nIC STAGE: not evaluable here ({exc})")
+    return max(ld.values())
+
+
+#: Card bytes per row of the emission programs (`device.emit`), from their array
+#: inventories, NOT measured: source program per plane-chunk row (float32/float64
+#: positions, int64 lattice/bucket/brick/key arrays), destination program per padded
+#: row (concatenated window, gather/sort indices, float64 velocities and codes).
+EMIT_SOURCE_B_PER_ROW = 150
+EMIT_DEST_B_PER_ROW = 200
+EMIT_KEPT_B_PER_ROW = 23  # key int64 + off uint8 x 3 + v float32 x 3, per live source row
+
+
+def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1, png=False,
+                     emission="cards", planes_per_call=4):
+    """Host, per-card and disk bytes at each stage of `icgen.generate_t9_slabs_device`.
+
+    Returns `(host, card, disk)`: dicts of stage -> bytes. Within a stage the
+    co-resident terms are summed; stages do not coexist, so a generation's peak is
+    the max over stages. Mirrors the generator's allocation order (its docstring
+    and stage comments). A LOWER BOUND: numpy and XLA temporaries at or below
+    pencil/plane size are charged roughly and the page cache not at all.
+    `png` charges the f_NL != 0 phi round trip in stage 1. `emission` prices stage 6
+    for `device.emit` ("cards") or `icgen._emit_t9_slabs` ("host").
+    """
+    n, W = int(n), max(1, int(n_gpus))
+    w = np.dtype(fdtype).itemsize
+    m = n // 2 + 1
+    field = n**3 * w
+    spec = n * n * m * 2 * w
+    pencil_host = 2 * W * n * m * 2 * w  # a block and its result, per card thread
+    slab_real = int(slab) * n * n * w
+    nb = int(nb) if nb else max(1, n // 16)
+    rows_slab = n**3 // nb
+    chunk_rows = min(int(slab), n // nb) * n * n
+    emission_b = ((2 * window + 1) * rows_slab * 35  # staged keys, offsets, float64 velocities
+                  + rows_slab * 80                   # a destination slab's finalize copies
+                  + chunk_rows * 80)                 # one chunk's float64 positions/velocities
+    host = {
+        "1 noise -> delta spectrum": (spec + field if png else spec) + pencil_host,
+        "2 2LPT source (accumulated on the cards)": 2 * spec + pencil_host,
+        "3 source forward": 3 * spec + pencil_host,
+        "4 velocities (to disk)": 3 * spec + pencil_host + slab_real,
+        "5 displacements (x on the cards, y/z host)": (max(3 * spec, 2 * spec + field,
+                                                           spec + 2 * field)
+                                                       + pencil_host + slab_real),
+        "6 emission": 2 * field + emission_b,
+    }
+    quarter = -(-n // W) * n * n * w
+    work = 6 * n * m * 2 * w + 4 * n * n * 2 * w  # a pencil block's program + a plane's, rough
+    card = {
+        "1 noise -> delta spectrum": work,
+        "2 2LPT source (accumulated on the cards)": quarter + work,
+        "3 source forward": quarter + work,
+        "4 velocities (to disk)": work,
+        "5 displacements (x on the cards, y/z host)": quarter + work,
+        "6 emission": quarter,
+    }
+    if emission == "cards":
+        p = n // nb
+        c = max(1, min(int(planes_per_call), p))
+        halo = (-(-nb // W) + 2 * window) * p * n * n * w
+        rows_src = p * n * n
+        cap = int(rows_src * 1.06)  # the capacity ladder's padding, ~one rung
+        per3 = (n // 2 // nb) ** 3  # bucket_cells 2: n / 2 buckets per side
+        host["6 emission"] = (2 * field
+                              + W * c * n * n * 5 * w                  # u_y, u_z, v uploads
+                              + W * (cap * 9 + nb * nb * per3 * 8))  # D2H off/w + occupancy
+        halo5 = 2 * window * p * n * n * w
+        card["5 displacements (x on the cards, y/z host)"] = quarter + halo5 + work
+        card["6 emission"] = (halo
+                              + (2 * window + 1) * rows_src * EMIT_KEPT_B_PER_ROW
+                              + max(c * n * n * EMIT_SOURCE_B_PER_ROW
+                                    + rows_src * EMIT_KEPT_B_PER_ROW,  # chunk concat
+                                    cap * EMIT_DEST_B_PER_ROW))
+    elif emission != "host":
+        raise ValueError(f"emission must be 'cards' or 'host', got {emission!r}")
+    disk = {"velocity staging (3 fields)": 3 * field, "T9 slabs written": 9 * n**3}
+    return host, card, disk
+
+
+def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=True):
+    """Per-GPU bytes for the host-state / device-step design.
+
+    Returns `(resident, transient, phases)` in the shape the CPU column uses, so
+    the same sum-within-a-phase / max-across discipline applies: glibc's arena
+    behaviour is not the reason on a device, but XLA does not return a buffer to
+    the pool between phases either, and understating a phase is how a run that
+    does not fit gets a FITS.
+
+    `paint_chunk_bricks` is the device coarse paint's chunk length in bricks;
+    None is `device.paint.default_chunk_bricks`. `fused` prices the fused migrate +
+    repack (the engine's default on this lane): its destination census runs one
+    slab's eject kernel inside the tile loop, and after the loop one pass replaces
+    the two.
+    """
+    from .engine import ONCE_PER_RUN_PHASES
+
+    mesh = ec.mesh_bytes()
+    phase_of = ec.mesh_phase()
+    nc = int(ec.n_coarse)
+    halo = shard_halo_planes()
+    resident, transient, phases, host_mesh = {}, {}, {}, {}
+    for k, v in mesh.items():
+        where = DEVICE_PLACEMENT.get(k)
+        if where is None:
+            raise KeyError(
+                f"mesh term {k!r} has no entry in DEVICE_PLACEMENT. A new term "
+                "must be placed deliberately: defaulting it to either side is "
+                "how an omitted term becomes a budget that cannot be traded "
+                "against, which is what this module exists to prevent.")
+        if where == "gone":
+            continue
+        if where == "host":
+            # NOT skipped -- handed back so the HOST table charges it. Dropping
+            # it here would put the term in neither column, which is precisely
+            # the omission the KeyError above exists to prevent, arriving by a
+            # different door: the device table would look smaller and nothing
+            # would look bigger.
+            host_mesh[k] = int(v)
+            continue
+        # a shard is its 1/n_gpus of the x axis plus its ghost planes; every
+        # sharded term is whole x-planes, so v // nc is one plane's bytes exactly
+        b = (int(v / n_gpus) + (int(v) // nc) * halo.get(k, 0) if where == "shard"
+             else int(v))
+        p = phase_of[k]
+        if p == "resident":
+            resident[k] = b
+        else:
+            transient[k] = b
+        for one in (p,) if isinstance(p, str) else p:
+            if one != "resident":
+                phases[one] = phases.get(one, 0) + b
+
+    # The two terms the CPU model has no name for, because on the CPU path the
+    # state IS the working set and nothing streams.
+    slabs = device_window_slabs(ec)
+    nb = max(1, ec.n_fine // ec.n_brick)
+    resident["slab_window (state rows a tile plane needs)"] = int(
+        slabs * (n / nb) * row_bytes)
+    resident["stream_chunks_in_flight"] = int(
+        STREAM_CHUNKS_IN_FLIGHT * STREAM_CHUNK_BYTES)
+
+    # The device coarse paint's own working set. The host decode it replaces is
+    # "gone" in DEVICE_PLACEMENT, and until this line nothing charged the card
+    # for doing that work instead.
+    from .device.paint import default_chunk_bricks
+
+    chunk_len = (default_chunk_bricks(nb) if paint_chunk_bricks is None
+                 else int(paint_chunk_bricks))
+    chunk_rows = n / nb**3 * chunk_len * PAINT_PAD_BOUND
+    paint_b = int(chunk_rows * (PAINT_CHUNK_B_PER_ROW + PAINT_WINDOW_B_PER_ROW))
+    key = f"coarse_paint_chunk ({chunk_len} bricks, decoded + painted)"
+    transient[key] = paint_b
+    phases["coarse_paint"] = phases.get("coarse_paint", 0) + paint_b
+
+    slab_rows = n / nb
+    if fused:
+        # the census: one padded slab through the eject kernel, per card, while
+        # the tile loop's window and workspace are live
+        from .device.migrate import EJECT_B_PER_PADDED_ROW
+        from .eject_jax import _padded
+
+        census_b = int(EJECT_B_PER_PADDED_ROW * _padded(int(slab_rows)))
+        transient["census_eject (fused pass, one padded slab)"] = census_b
+        phases["tile_loop"] = phases.get("tile_loop", 0) + census_b
+
+    in_step = sum(v for k, v in phases.items() if k not in ONCE_PER_RUN_PHASES)
+    once = max((v for k, v in phases.items() if k in ONCE_PER_RUN_PHASES),
+               default=0)
+    # AFTER THE TILE LOOP, and deliberately NOT summed into the in-step phases:
+    # the migrate and the repack run after the paint, the solve and the tile
+    # loop have released their transients (JC, record sec. 29: the envelope is
+    # the card less the RESIDENT terms, ~112 GB at c-hero). They are held apart
+    # so the summed convention above is unchanged and the second verdict is
+    # read against `resident` alone. The two do not coexist either: max.
+    if fused:
+        after_loop = {
+            "migrate_repack_fused_pass (257 B/slab row, sec. 41, 1024^3)": int(
+                FUSED_DEVICE_B_PER_SLAB_ROW * slab_rows),
+        }
+    else:
+        after_loop = {
+            "migrate_device_pass (320 B/slab row, sec. 31)": int(
+                MIGRATE_DEVICE_B_PER_SLAB_ROW * slab_rows),
+            "repack_device_pass (70 B/slab row, sec. 33)": int(
+                REPACK_DEVICE_B_PER_SLAB_ROW * slab_rows),
+        }
+    return resident, transient, phases, max(in_step, once), slabs, host_mesh, after_loop
+
+
+def _device_main(args, ec, t9, n, rows, arena, state):
+    """The host / per-GPU split for the host-state / device-step design.
+
+    Two columns, two budgets, two verdicts. The host column is the state and
+    nothing else that scales with N; the per-GPU column is the sharded coarse
+    mesh, one card's tile workspace, and the window of state a tile plane needs.
+    """
+    dev_args = argparse.Namespace(**vars(args))
+    # ONE process per GPU. Every fine-arm term in `mesh_bytes` is multiplied by
+    # `tile_workers`, so pricing this column at the CPU lane's worker count
+    # would charge each card W tile workspaces it does not allocate.
+    dev_args.workers = 1
+    ec_dev, _ = build(dev_args)
+    n_gpus = max(1, int(args.n_gpus))
+
+    resident, transient, phases, worst_phase, slabs, host_mesh, after_loop = device_budget(
+        ec_dev, n=n, n_gpus=n_gpus, paint_chunk_bricks=args.paint_chunk_bricks,
+        fused=not getattr(args, "separate_passes", False))
+
+    step = ec_dev.step_bytes(n, n_rows=rows, cap=args.cap)
+    host = dict(state)
+    for k, v in step.items():
+        if v:
+            host[f"{k} (host window of the device pass)"] = v
+    # The mesh terms the design puts in HOST memory ON PURPOSE -- the factorized
+    # coarse solve's spectrum and its per-component work buffer. They are the
+    # design working as intended, not a port debt like the two above, so they
+    # are labelled as such rather than lumped in with them.
+    for k, v in host_mesh.items():
+        if v:
+            host[f"{k} (host by design)"] = v
+    # both repack paths build the new per-bucket occupancy on the host and copy it
+    # in at the end: a second bucket index, live beside the first
+    host["repack new_occ (a second bucket index)"] = int(state["bucket_index"])
+    # the windowed tile loop writes each core slab back from its card as one ladder
+    # of `w` rows, every card at once. It downloaded the WHOLE window's `w` and staged
+    # the window as numpy before gb 1002020 (~316 GB over four cards at 4096^3, the
+    # overrun that killed it); the residents it still gathers are O(arena).
+    from .forces import capacity_shape
+
+    nb_dev = max(1, ec.n_fine // ec.n_brick)
+    host["tile_window write-back (one slab of w per card)"] = int(
+        n_gpus * int(capacity_shape(max(1, int(n / nb_dev)))) * 3 * np.dtype(np.int16).itemsize)
+    _table("HOST: the state, plus the per-step terms nothing has moved yet", host)
+    print(f"  state alone: {sum(state.values()) / n:6.2f} B/p")
+    print("  `migrate_staging` and `repack_scratch` are the HOST windows the device "
+          "migrate\n  and repack build per slab (two slab-sized numpy buffers each, "
+          "from the code);\n  their device-side terms are in the AFTER-THE-LOOP "
+          "table below.")
+
+    _table(f"PER GPU (of {n_gpus}), resident through the tile loop", resident)
+    if transient:
+        _table(f"PER GPU (of {n_gpus}), transient (peak while that phase runs)",
+               transient)
+    _table(f"PER GPU (of {n_gpus}), BY PHASE", phases,
+           total_label="sum of ALL phases listed")
+    _table(f"PER GPU (of {n_gpus}), AFTER THE TILE LOOP (migrate, then repack; "
+           "not co-resident with the phases above, JC sec. 29)", after_loop,
+           total_label="max (the two do not coexist)", reduce=max)
+    print(f"  the verdict below charges {_fmt(worst_phase).strip()}, which is "
+          "max(the in-step\n  phases summed, the largest once-per-run phase) -- "
+          "`kernel_build` runs before\n  the loop and is never co-resident with "
+          "it, so adding it would overcharge.")
+    print(f"  the slab window is {slabs} x-slabs, DERIVED from "
+          f"`layout.brick_span`:\n  a tile draws from that many bricks per side, "
+          "so walking tiles in x-order\n  needs that many consecutive slabs live. "
+          "It is not a tuning knob.")
+
+    load_peak = _print_load_and_ic(args, ec, t9, n, rows, arena, shared=True)
+
+    # the generator runs float32 fields (the driver's GEN_FDTYPE), whatever the mesh dtypes
+    # `n` here is the particle COUNT; the stage table wants particles per side
+    ic_host, ic_card, ic_disk = ic_device_stages(
+        args.n_part, n_gpus=n_gpus, fdtype=np.float32, nb=max(1, ec.n_fine // ec.n_brick))
+    _table("IC GENERATION ON THE CARDS (its own job), HOST by stage", ic_host,
+           total_label="PEAK (max, not sum)", reduce=max)
+    _table(f"IC GENERATION ON THE CARDS, PER GPU (of {n_gpus}) by stage", ic_card,
+           total_label="PEAK (max, not sum)", reduce=max)
+    _table("IC GENERATION, DISK", ic_disk)
+    for label, peak, budget in (("host", max(ic_host.values()), args.host_gb),
+                                ("per GPU", max(ic_card.values()), args.device_gb)):
+        if budget is not None:
+            r = peak / (budget * GB)
+            print(f"  IC generation {label} against {budget} GB: "
+                  f"{'FITS' if r < 1.0 else 'DOES NOT FIT'} ({r:.2f}x)")
+
+    print("\nBINDING TERMS")
+    host_peak = sum(host.values())
+    dev_peak = sum(resident.values()) + worst_phase
+    print(f"  host, a lower bound on the run's peak: {_fmt(host_peak)}")
+    print(f"  the LOAD stage peaks at:               {_fmt(load_peak)}"
+          f"   {'<- BINDING' if load_peak > host_peak else ''}")
+    print(f"  per GPU, resident + worst phase:       {_fmt(dev_peak)}")
+    if args.host_gb is not None:
+        r = host_peak / (args.host_gb * GB)
+        print(f"  against --host-gb {args.host_gb}: "
+              f"{'FITS' if r < 1.0 else 'DOES NOT FIT'} ({r:.2f}x)")
+        rl = load_peak / (args.host_gb * GB)
+        print(f"    and the LOAD stage:               "
+              f"{'FITS' if rl < 1.0 else 'DOES NOT FIT'} ({rl:.2f}x)")
+    else:
+        print("  no --host-gb given, so no host verdict (a Vista gb node is 1026)")
+    after_peak = sum(resident.values()) + max(after_loop.values())
+    print(f"  per GPU, resident + after-the-loop:    {_fmt(after_peak)}")
+    if args.device_gb is not None:
+        r = dev_peak / (args.device_gb * GB)
+        print(f"  against --device-gb {args.device_gb} per card: "
+              f"{'FITS' if r < 1.0 else 'DOES NOT FIT'} ({r:.2f}x)")
+        ra = after_peak / (args.device_gb * GB)
+        print(f"    and after the tile loop:          "
+              f"{'FITS' if ra < 1.0 else 'DOES NOT FIT'} ({ra:.2f}x)")
+    else:
+        print("  no --device-gb given, so no per-card verdict (a GB200 detected "
+              "185 GiB = 199 GB)")
+    print("\n  NB the same LOWER BOUND caveat as the CPU column, and two more "
+          "that are\n  specific to this one. (1) DEVICE_PLACEMENT is still a "
+          "design assertion\n  rather than a reading of the code, but the "
+          "executor it asserts now EXISTS\n  and is bitwise the host engine at "
+          "cgh64 on four GB200s (996685, 996857),\n  so the placements are "
+          "checked against something. What is NOT checked is\n  this table at "
+          "4096^3 shapes: that is the D7 smoke.\n  (2) The four-way split is "
+          "charged as an exact quarter, which is right for\n  MEMORY -- each "
+          "card holds its quarter however the wall splits -- and wrong\n  for "
+          "WALL, where D5 measured 2.8-3.0x rather than 4x. Do not read a "
+          "per-card\n  byte here as licence for a quarter of a second anywhere.")
+    return 0
+
+
 def build(args):
     from .codec import T9Layout
     from .engine import EngineConfig
@@ -156,6 +633,7 @@ def build(args):
         tile_workers=max(int(args.workers), 1) if args.workers else 1,
         eject_kernel=args.eject_kernel,
         migrate_eject_inflight=args.eject_inflight,
+        migrate_backend="device" if getattr(args, "backend", "cpu") == "device" else "host",
     )
     t9 = T9Layout(box_size=args.box, n_part=args.n_part, bucket_cells=args.bucket_cells)
     return ec, t9
@@ -166,6 +644,23 @@ def main(argv=None):
         description="Memory anatomy of an inexor configuration, and whether it fits.",
     )
     ap.add_argument("--preset", choices=sorted(PRESETS), default=None)
+    # The CPU column is unchanged and stays the default: the pooled host engine
+    # remains a supported backend and its numbers must not move when this flag
+    # is added. `device` prices the host-state / device-step design instead --
+    # the host holds only the state, the GPUs hold the mesh and a slab window.
+    ap.add_argument("--backend", choices=("cpu", "device"), default="cpu",
+                    help="which engine to price. `device` = the host is a byte "
+                         "store and the GPUs do the step (Vista gb).")
+    ap.add_argument("--n-gpus", type=int, default=4,
+                    help="accelerators the coarse mesh is sharded across, for "
+                         "--backend device. A Vista gb node has 4.")
+    ap.add_argument("--separate-passes", action="store_true",
+                    help="for --backend device: price the migrate and repack as two "
+                         "passes (no census) instead of the fused pass")
+    ap.add_argument("--paint-chunk-bricks", type=int, default=None,
+                    help="for --backend device: bricks per coarse-paint chunk on a "
+                         "card. Default a quarter of an x-slab of bricks; smaller "
+                         "trades card memory for more device launches.")
     ap.add_argument("--n-part", type=int, default=None, help="particles per side")
     ap.add_argument("--box", type=float, default=None, help="box size, Mpc/h")
     ap.add_argument("--n-fine", type=int, default=None)
@@ -277,6 +772,12 @@ def main(argv=None):
     _table("STATE (resident for the whole run)", state)
     print(f"  {'':<20}  {sum(state.values()) / n:6.2f} B/p")
 
+    # The tables below price a host that holds the coarse mesh and runs the tile
+    # loop. The device design's host does neither, so it gets its own two
+    # columns rather than a footnote on these.
+    if args.backend == "device":
+        return _device_main(args, ec, t9, n, rows, arena, state)
+
     mesh = ec.mesh_bytes()
     # The split is `engine.MESH_PHASE`'s, not this module's: a term's phase is a
     # property of the code that allocates it, so the accounting and the engine
@@ -342,26 +843,9 @@ def main(argv=None):
                   "a fit. `df -B1 /dev/shm` on the node you will run on.")
 
     # ---- the load path, which is where two jobs actually died
-    idx_itemsize = t9.index_bytes() // max(t9.n_buckets_side**3, 1)
-    ld = load_stages(
-        n=n, n_rows=rows + arena, n_buckets=t9.n_buckets_side**3,
-        index_itemsize=max(idx_itemsize, 1), n_arena=arena,
-        n_bricks=ec.n_brick and (args.n_fine // ec.n_brick) ** 3,
-        n_slabs=args.slabs, shared=(args.workers is None or args.workers > 1),
-    )
-    _table("LOADING THE STATE, peak resident at each stage", ld,
-           total_label="PEAK (max, not sum)", reduce=max)
-    print("  the total line above is a MAX: these stages do not coexist")
-
-    # ---- IC stage
-    try:
-        from .ooc_fft import plan_bytes
-
-        ic = plan_bytes(args.n_part, np.dtype(args.coarse_dtype), "derivative")
-        print(f"\nIC STAGE (out-of-core, 'derivative' policy): peak "
-              f"{_fmt(ic['peak'])}")
-    except Exception as exc:  # pragma: no cover - informational only
-        print(f"\nIC STAGE: not evaluable here ({exc})")
+    load_peak = _print_load_and_ic(
+        args, ec, t9, n, rows, arena,
+        shared=(args.workers is None or args.workers > 1))
 
     # ---- the verdict, with the binding term NAMED
     print("\nBINDING TERMS")
@@ -389,7 +873,6 @@ def main(argv=None):
     workers_b = int(n_workers * WORKER_STARTUP_BYTES) if n_workers > 1 else 0
     peak_est = (sum(state.values()) + sum(resident.values()) + worst_phase
                 + workers_b)
-    load_peak = max(ld.values())
     # TRANSIENTS ARE CANDIDATES. They were excluded here, so the line could not
     # name a transient however large -- at cdev it reported `tile_kernels` (0.791
     # GB) while `tile_workspace` (1.443) was bigger and the phase MEASURED to set

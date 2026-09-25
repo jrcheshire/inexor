@@ -1,0 +1,104 @@
+{
+ "argv": [
+  "scripts/v2_d3_device_migrate.py",
+  "--smoke",
+  "--arms",
+  "",
+  "--peaks",
+  "eject+insert:0.05:1+insert:0.4:2",
+  "--out-suffix",
+  "_peaks_laptopsmoke"
+ ],
+ "started": "2026-09-13T18:56:08",
+ "job": null,
+ "node": "andromeda",
+ "commit": "9b1c3d6",
+ "arms": [
+  {
+   "arm": "peak eject",
+   "rc": 0,
+   "record": {
+    "arm": "peak-eject",
+    "platform": "cpu",
+    "nb": 8,
+    "rows": 262144,
+    "calls": [
+     {
+      "rows": 262144,
+      "padded": 277732,
+      "wall_s": 0.1216671670008509,
+      "new_program": true
+     },
+     {
+      "rows": 261357,
+      "padded": 262144,
+      "wall_s": 0.10095554199870094,
+      "new_program": true
+     },
+     {
+      "rows": 259522,
+      "padded": 262144,
+      "wall_s": 0.003026667000085581,
+      "new_program": false
+     }
+    ],
+    "programs": 2,
+    "device_peak": null,
+    "b_per_row": null,
+    "b_per_padded_row": null,
+    "host_maxrss_gb": 0.380615234375
+   }
+  },
+  {
+   "arm": "peak insert:0.05:1",
+   "rc": 0,
+   "record": {
+    "arm": "peak-insert",
+    "platform": "cpu",
+    "nb": 8,
+    "emig_share": 0.05,
+    "reach": 1,
+    "slab_rows": 262144,
+    "rows": 288357,
+    "padded": 294247,
+    "gen_s": 0.0076725830003852025,
+    "walls_s": [
+     0.19708608300061314,
+     0.05184254199775751
+    ],
+    "n_write": 262197,
+    "n_spill": 0,
+    "device_peak": null,
+    "b_per_row": null,
+    "b_per_slab_row": null,
+    "host_maxrss_gb": 0.3607635498046875
+   }
+  },
+  {
+   "arm": "peak insert:0.4:2",
+   "rc": 0,
+   "record": {
+    "arm": "peak-insert",
+    "platform": "cpu",
+    "nb": 8,
+    "emig_share": 0.4,
+    "reach": 2,
+    "slab_rows": 262144,
+    "rows": 681571,
+    "padded": 699841,
+    "gen_s": 0.020509957998001482,
+    "walls_s": [
+     0.24617537499943865,
+     0.0842695419996744
+    ],
+    "n_write": 262029,
+    "n_spill": 0,
+    "device_peak": null,
+    "b_per_row": null,
+    "b_per_slab_row": null,
+    "host_maxrss_gb": 0.51214599609375
+   }
+  }
+ ],
+ "finished": "2026-09-13T18:56:10"
+}

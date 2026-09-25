@@ -1,0 +1,109 @@
+{
+ "argv": [
+  "scripts/v2_d2d_device_paint.py",
+  "--skip-xback",
+  "--reps",
+  "1",
+  "--chunks",
+  "32:64:jit:8192,32:64:jit:8192:spread",
+  "--out-suffix",
+  "_deadsmoke"
+ ],
+ "started": "2026-09-12T22:59:24",
+ "job": "993600",
+ "node": "c672-012.vista.tacc.utexas.edu",
+ "commit": "dbb852b",
+ "arms": [
+  {
+   "arm": "chunk 32:64:jit:8192",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": true,
+    "pad_is_pow2": true,
+    "dead_rows": "cell0",
+    "block_extent": [
+     5,
+     16,
+     16
+    ],
+    "jit_shapes": {
+     "pad": 8192,
+     "live_w": 5161,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 32,
+    "chunk_bricks": 64,
+    "bricks_per_side": 8,
+    "rows": 4099,
+    "pad": 8192,
+    "frac_of_4096_xslab": 1.5269964933395386e-05,
+    "build_s": 0.04551858699414879,
+    "warm_s": 3.8254135589959333,
+    "rep_s": [
+     0.003652965009678155
+    ],
+    "window_s": 0.00014611199731007218,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 364800,
+    "peak_minus_baseline": 364800,
+    "b_per_padded_row": 44.53125,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 0.00022982578125,
+    "planner_4096_gb": 0.000371592
+   }
+  },
+  {
+   "arm": "chunk 32:64:jit:8192:spread",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "pad_override": true,
+    "pad_is_pow2": true,
+    "dead_rows": "spread",
+    "block_extent": [
+     5,
+     16,
+     16
+    ],
+    "jit_shapes": {
+     "pad": 8192,
+     "live_w": 5161,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 32,
+    "chunk_bricks": 64,
+    "bricks_per_side": 8,
+    "rows": 4099,
+    "pad": 8192,
+    "frac_of_4096_xslab": 1.5269964933395386e-05,
+    "build_s": 0.006050791998859495,
+    "warm_s": 0.9643526950094383,
+    "rep_s": [
+     0.0038319729937938973
+    ],
+    "window_s": 0.00014876799832563847,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 364800,
+    "peak_minus_baseline": 364800,
+    "b_per_padded_row": 44.53125,
+    "planner_b_per_row": 72,
+    "projected_4096_gb": 0.00022982578125,
+    "planner_4096_gb": 0.000371592
+   }
+  }
+ ],
+ "finished": "2026-09-12T22:59:51"
+}

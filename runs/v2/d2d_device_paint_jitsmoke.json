@@ -1,0 +1,158 @@
+{
+ "argv": [
+  "scripts/v2_d2d_device_paint.py",
+  "--smoke",
+  "--out-suffix",
+  "_jitsmoke"
+ ],
+ "started": "2026-09-12T19:42:57",
+ "job": "993294",
+ "node": "c672-016.vista.tacc.utexas.edu",
+ "commit": "9556ffc",
+ "arms": [
+  {
+   "arm": "xback-host",
+   "rc": 0,
+   "record": {
+    "arm": "xback-host",
+    "n_part": 32,
+    "platform": "cpu",
+    "plain": {
+     "sha": "float32[16, 16, 16]:eb5d0138a1f73bced02fabdf05c55cb3b5499b56938a1c6abec366aba51413c1",
+     "arena_used": 0,
+     "abs_max": 0.154754638671875,
+     "build_s": 0.04290577210485935,
+     "paint_s": 3.5224109683185816,
+     "jit_sha": "float32[16, 16, 16]:eb5d0138a1f73bced02fabdf05c55cb3b5499b56938a1c6abec366aba51413c1",
+     "jit_equal_to_host_here": true
+    },
+    "arena": {
+     "sha": "float32[16, 16, 16]:5b59f68349b213b0eee31a5e2b918403b8a6179ef896ceaf35ff11c3cec61cb2",
+     "arena_used": 1098,
+     "abs_max": 0.429901123046875,
+     "build_s": 0.06274361722171307,
+     "paint_s": 0.5234382692724466,
+     "jit_sha": "float32[16, 16, 16]:5b59f68349b213b0eee31a5e2b918403b8a6179ef896ceaf35ff11c3cec61cb2",
+     "jit_equal_to_host_here": true
+    }
+   }
+  },
+  {
+   "arm": "xback-dev",
+   "rc": 0,
+   "record": {
+    "arm": "xback-dev",
+    "n_part": 32,
+    "platform": "gpu",
+    "plain": {
+     "arena_used": 0,
+     "eager": {
+      "sha": "float32[16, 16, 16]:eb5d0138a1f73bced02fabdf05c55cb3b5499b56938a1c6abec366aba51413c1",
+      "equal_to_cpu_host": true,
+      "device_chunks": 32,
+      "chunk_bricks": 16,
+      "jit_traces": null,
+      "paint_s": 15.960812961682677
+     },
+     "jit": {
+      "sha": "float32[16, 16, 16]:eb5d0138a1f73bced02fabdf05c55cb3b5499b56938a1c6abec366aba51413c1",
+      "equal_to_cpu_host": true,
+      "device_chunks": 32,
+      "chunk_bricks": 16,
+      "jit_traces": 1,
+      "paint_s": 0.8774386718869209
+     }
+    },
+    "arena": {
+     "arena_used": 1098,
+     "eager": {
+      "sha": "float32[16, 16, 16]:5b59f68349b213b0eee31a5e2b918403b8a6179ef896ceaf35ff11c3cec61cb2",
+      "equal_to_cpu_host": true,
+      "device_chunks": 32,
+      "chunk_bricks": 16,
+      "jit_traces": null,
+      "paint_s": 11.354914655908942
+     },
+     "jit": {
+      "sha": "float32[16, 16, 16]:5b59f68349b213b0eee31a5e2b918403b8a6179ef896ceaf35ff11c3cec61cb2",
+      "equal_to_cpu_host": true,
+      "device_chunks": 32,
+      "chunk_bricks": 16,
+      "jit_traces": 1,
+      "paint_s": 0.8404150418937206
+     }
+    }
+   }
+  },
+  {
+   "arm": "chunk 32:64:eager",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": false,
+    "jit_traces": 0,
+    "jit_shapes": null,
+    "n_part": 32,
+    "chunk_bricks": 64,
+    "bricks_per_side": 8,
+    "rows": 4099,
+    "pad": 5161,
+    "frac_of_4096_xslab": 1.5269964933395386e-05,
+    "build_s": 0.0065155476331710815,
+    "warm_s": 4.013071462512016,
+    "rep_s": [
+     0.19298652932047844
+    ],
+    "window_s": 0.00016742385923862457,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 1473024,
+    "peak_minus_baseline": 1473024,
+    "b_per_padded_row": 285.41445456306917,
+    "planner_b_per_row": 266,
+    "projected_4096_gb": 0.001473024,
+    "planner_4096_gb": 0.001372826
+   }
+  },
+  {
+   "arm": "chunk 32:64:jit",
+   "rc": 0,
+   "record": {
+    "arm": "chunk",
+    "platform": "gpu",
+    "jit": true,
+    "jit_traces": 1,
+    "jit_shapes": {
+     "pad": 5161,
+     "live_w": 5161,
+     "arena_n": 1,
+     "arena_rect": 1
+    },
+    "n_part": 32,
+    "chunk_bricks": 64,
+    "bricks_per_side": 8,
+    "rows": 4099,
+    "pad": 5161,
+    "frac_of_4096_xslab": 1.5269964933395386e-05,
+    "build_s": 0.006439421325922012,
+    "warm_s": 1.0588198620826006,
+    "rep_s": [
+     0.004239294677972794
+    ],
+    "window_s": 0.00015315227210521698,
+    "bitwise_vs_host_decode": true,
+    "bytes_in_use_before": 0,
+    "peak_before": 0,
+    "peak_bytes_in_use": 241152,
+    "peak_minus_baseline": 241152,
+    "b_per_padded_row": 46.72582832784344,
+    "planner_b_per_row": 266,
+    "projected_4096_gb": 0.00024115199999999998,
+    "planner_4096_gb": 0.001372826
+   }
+  }
+ ],
+ "finished": "2026-09-12T19:44:03"
+}

@@ -222,13 +222,14 @@ def za_ics(delta0, box_size, a_init, cosmo, fdtype=np.float32, D_of_a=None):
 
 
 def lpt_ics(delta0, box_size, a_init, cosmo, order=2, fdtype=np.float32,
-            resident="mid", workdir=None):
+            resident="mid", workdir=None, growth2="lcdm"):
     """LPT state at a_init in inexor conventions: positions + D-time velocity.
 
     order=1: x = wrap(q + D1 Psi1),          v_D = Psi1
     order=2: x = wrap(q + D1 Psi1 - D2 Psi2), v_D = Psi1 - (D2 f2)/(D1 f1) Psi2
     (module-docstring sign convention; the v_D coefficient reduces to
-    +(6/7) D1 with f2 = 2 f1 and D2 = -(3/7) D1^2). Returns (x_phys, v_D),
+    +(6/7) D1 in the EdS limit f2 = 2 f1, D2 = -(3/7) D1^2). `growth2` selects D2
+    and f2: "lcdm" (default, the ODE solution) or "eds". Returns (x_phys, v_D),
     each (N^3, 3) fdtype -- the MONOLITHIC dev-scale convenience; the
     streamed generator composes the same primitives per slab and never
     builds these arrays. mbody's a-time momentum is p = G_f(a_i) * v_D with
@@ -241,8 +242,8 @@ def lpt_ics(delta0, box_size, a_init, cosmo, order=2, fdtype=np.float32,
     N, L = delta0.shape[0], box_size
     D1 = growth_factor_a(a_init, cosmo)
     f1 = growth_rate_a(a_init, cosmo)
-    D2 = growth_factor_2(a_init, cosmo)
-    f2 = growth_rate_2(a_init, cosmo)
+    D2 = growth_factor_2(a_init, cosmo, growth2)
+    f2 = growth_rate_2(a_init, cosmo, growth2)
     psi1 = zeldovich_displacement(delta0, L, fdtype)
     psi2 = second_order_displacement(delta0, L, fdtype, resident=resident, workdir=workdir)
     q = lagrangian_grid(N, L, fdtype)

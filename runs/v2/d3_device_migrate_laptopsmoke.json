@@ -1,0 +1,192 @@
+{
+ "argv": [
+  "scripts/v2_d3_device_migrate.py",
+  "--smoke",
+  "--out-suffix",
+  "_laptopsmoke"
+ ],
+ "started": "2026-09-13T17:13:26",
+ "job": null,
+ "node": "andromeda",
+ "commit": "040f4f5",
+ "arms": [
+  {
+   "arm": "xback",
+   "rc": 0,
+   "record": {
+    "arm": "xback",
+    "platform": "cpu",
+    "n_part": 32,
+    "nb": 8,
+    "c_drift": 1.770387489869264,
+    "drift_frac": 1.9,
+    "build_s": 0.004448374998901272,
+    "steps": [
+     {
+      "numpy_s": 0.03657283400025335,
+      "jax_s": 0.41347120799764525,
+      "stats_equal": true,
+      "field_diffs": {},
+      "stats": {
+       "n_arena_overflow": 1249,
+       "arena_used": 1249,
+       "vel_scale": 6.550562330134476e-05,
+       "vel_scale_min": 3.114161432611791e-05,
+       "n_migrated_checked": 32768,
+       "brick_reach": 2,
+       "brick_reach_raw": 2,
+       "brick_reach_realized": 2,
+       "peak_staged_slabs": 4
+      }
+     },
+     {
+      "numpy_s": 0.0399916669994127,
+      "jax_s": 0.03449483299846179,
+      "stats_equal": true,
+      "field_diffs": {},
+      "stats": {
+       "n_arena_overflow": 1398,
+       "arena_used": 1398,
+       "vel_scale": 6.550562330134476e-05,
+       "vel_scale_min": 3.3349782664749764e-05,
+       "n_migrated_checked": 32768,
+       "brick_reach": 2,
+       "brick_reach_raw": 2,
+       "brick_reach_realized": 2,
+       "peak_staged_slabs": 4
+      }
+     }
+    ],
+    "eject_calls": 16,
+    "insert_calls": 16,
+    "overflow": 2647,
+    "residents_rehomed": 1249,
+    "realized_reach": 2,
+    "vacuous": []
+   }
+  },
+  {
+   "arm": "slab-real",
+   "rc": 0,
+   "record": {
+    "arm": "slab-real",
+    "platform": "cpu",
+    "n_part": 64,
+    "nb": 4,
+    "rows_per_slab": 65536,
+    "c_drift": 1.6252523727362762,
+    "drift_frac": 0.5,
+    "build_s": 0.03666029200030607,
+    "steps": [
+     {
+      "numpy_s": 0.03833991599822184,
+      "compiled_s": 0.45037395899998955,
+      "eject_calls_s": 0.2458262080035638,
+      "insert_calls_s": 0.19002733399611316,
+      "eject_calls": 4,
+      "insert_calls": 4,
+      "host_s": 0.014520417000312591,
+      "new_eject_shapes": 2,
+      "new_insert_shapes": 1,
+      "field_diffs": {},
+      "stats_equal": true,
+      "stats": {
+       "n_arena_overflow": 0,
+       "arena_used": 0,
+       "vel_scale": 7.51108196805551e-05,
+       "vel_scale_min": 5.396730380492035e-05,
+       "n_migrated_checked": 262144,
+       "brick_reach": 1,
+       "brick_reach_raw": 1,
+       "brick_reach_realized": 1,
+       "peak_staged_slabs": 2
+      }
+     },
+     {
+      "numpy_s": 0.04034158400099841,
+      "compiled_s": 0.07121695800015004,
+      "eject_calls_s": 0.005094040996482363,
+      "insert_calls_s": 0.05176175000087824,
+      "eject_calls": 4,
+      "insert_calls": 4,
+      "host_s": 0.014361167002789443,
+      "new_eject_shapes": 0,
+      "new_insert_shapes": 0,
+      "field_diffs": {},
+      "stats_equal": true,
+      "stats": {
+       "n_arena_overflow": 0,
+       "arena_used": 0,
+       "vel_scale": 7.51108196805551e-05,
+       "vel_scale_min": 5.421806062950307e-05,
+       "n_migrated_checked": 262144,
+       "brick_reach": 1,
+       "brick_reach_raw": 1,
+       "brick_reach_realized": 1,
+       "peak_staged_slabs": 2
+      }
+     }
+    ],
+    "device_peak": null,
+    "host_maxrss_gb": 0.487152099609375
+   }
+  },
+  {
+   "arm": "slab-shape",
+   "rc": 0,
+   "record": {
+    "arm": "slab-shape",
+    "platform": "cpu",
+    "nb": 8,
+    "rows": 262144,
+    "bricks": 64,
+    "drift_frac": 0.5,
+    "c_drift": 8.225727207963125e-05,
+    "gen_s": 0.008064416000706842,
+    "reps": 1,
+    "eject": {
+     "warm_s": 0.12912108300224645,
+     "public_s": [
+      0.004025415997602977
+     ],
+     "public_median_s": 0.004025415997602977,
+     "split": [
+      {
+       "prep_s": 1.2958000297658145e-05,
+       "upload_s": 0.0006328339986794163,
+       "compute_s": 0.0024898329975258093,
+       "readback_s": 8.304199945996515e-05
+      }
+     ],
+     "public_repeat_equal": true,
+     "split_equal_public": true,
+     "n_keep": 215253,
+     "leaver_frac": 0.17887496948242188,
+     "device_peak": null
+    },
+    "insert": {
+     "warm_s": 0.1472066669994092,
+     "public_s": [
+      0.039946500000951346
+     ],
+     "public_median_s": 0.039946500000951346,
+     "split": [
+      {
+       "prep_s": 2.3874999897088856e-05,
+       "upload_s": 0.005560500001593027,
+       "compute_s": 0.03890916599993943,
+       "readback_s": 0.00013041700003668666
+      }
+     ],
+     "public_repeat_equal": true,
+     "split_equal_public": true,
+     "n_write": 245327,
+     "n_spill": 0,
+     "device_peak_after": null
+    },
+    "host_maxrss_gb": 0.481353759765625
+   }
+  }
+ ],
+ "finished": "2026-09-13T17:13:29"
+}

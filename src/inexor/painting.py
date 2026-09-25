@@ -315,7 +315,7 @@ def paint_tsc_int(positions, n_mesh, box_size, frac_bits=12, live=None):
 
 
 def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
-                           frac_bits=12, live=None):
+                           frac_bits=12, live=None, dead_rows="spread"):
     """Integer TSC paint into a coarse SUB-BLOCK. Returns the raw int32 block.
 
     The paint-side twin of `forces.gather_coarse_subblock`, carrying the same
@@ -334,21 +334,41 @@ def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
     `origin/extent` from the chunk's brick cuboid (stencil bound: base can
     round up to the cell AT the cuboid's upper edge, corners reach one
     further, so extent = span + 3) and asserts containment per chunk in
-    numpy before calling. Masked pad rows are routed to cell 0 with a
-    quantized weight of exactly zero -- in bounds and bitwise inert.
+    numpy before calling. Masked pad rows scatter a quantized weight of
+    exactly zero to an in-bounds cell -- bitwise inert (see `dead_rows`).
 
     An axis whose extent equals `n_mesh` is the degenerate full-axis case
     (origin 0), which the engine uses whenever span + 3 would exceed the
     mesh -- keeping the caller's scatter-add indices unique per axis.
+
+    `extent` sets the block's shape and must be Python ints. `origin_cells`
+    may be ints or an int array, including a traced one, so one compiled
+    program can paint every chunk of a step (`device.paint`). It enters as
+    int32, the dtype the stencil base already has, so the index arithmetic is
+    the same int32 arithmetic whichever form the caller passes.
+
+    `dead_rows` says where masked rows scatter their zero weight: "spread" (the
+    default; row i into cell i mod the block size) or "cell0" (every one into
+    block cell 0). Adding zero anywhere is a no-op, so the block is bitwise the
+    same either way. On a GB200 the one heavily duplicated index of "cell0"
+    makes a padded row cost ~4-10x a real one and holds more card memory at
+    large padding; "spread" removes both (Vista 993600).
     """
     scale = np.float32(2.0**frac_bits)
     N = int(n_mesh)
     cell = float(box_size) / N
     ex, ey, ez = (int(e) for e in extent)
-    ox, oy, oz = (int(o) for o in origin_cells)
+    o = jnp.asarray(origin_cells, dtype=jnp.int32)
+    ox, oy, oz = o[0], o[1], o[2]
     base, w = _tsc_pieces(positions, cell)
     mesh = jnp.zeros((ex * ey * ez,), dtype=jnp.int32)
     m = None if live is None else jnp.asarray(live)
+    if dead_rows == "cell0":
+        dead = 0
+    elif dead_rows == "spread":
+        dead = jnp.arange(positions.shape[0], dtype=jnp.int32) % (ex * ey * ez)
+    else:
+        raise ValueError(f"dead_rows must be 'cell0' or 'spread', got {dead_rows!r}")
     for corner in _TSC_CORNERS:
         dx, dy, dz = corner
         lx = (base[:, 0] + dx - ox) % N
@@ -358,7 +378,7 @@ def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
         flat = (lx * ey + ly) * ez + lz
         if m is not None:
             ww = jnp.where(m, ww, 0.0)
-            flat = jnp.where(m, flat, 0)
+            flat = jnp.where(m, flat, dead)
         mesh = mesh.at[flat].add(
             rint_i(ww.astype(jnp.float32) * scale), mode="promise_in_bounds"
         )

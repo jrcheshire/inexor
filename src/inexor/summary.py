@@ -32,6 +32,11 @@ from .cosmology import growth_factor_a, ic_k_table
 
 CARD = "inexor-pk-summary-1"
 
+# The k range `nonlinear_scale` scans, on the card beside its answer: a None
+# there means "no crossing in here", which a reader cannot act on without
+# knowing what "here" was.
+NL_SCAN_K = (1e-3, 10.0)
+
 
 def _mode_grid(n_mesh, box_size):
     """(kx_1d, kz_1d, hermitian weights along kz) for the rfft half-grid.
@@ -63,6 +68,7 @@ def binned_power(
     window=None,
     shot_noise=0.0,
     min_weight=100.0,
+    progress=None,
 ):
     """Slab-streamed, hermitian-weighted binned P(k) of an rfft spectrum.
 
@@ -82,6 +88,9 @@ def binned_power(
     `min_weight` drops bins too sparse for the Gaussian sigma to mean anything;
     100 modes puts the fractional error on sigma itself at ~7%.
 
+    `progress(stage, done, total)`, if given, is called once per slab; see
+    `inexor.progress.Heartbeat`.
+
     Returns a dict of parallel arrays: `k_mean` (weighted), `p`, `n_modes`,
     `p_oracle` when `p_of_k` was given, plus the per-bin `window_correction`
     and `shot_fraction` so neither correction is hidden inside `p`.
@@ -97,6 +106,8 @@ def binned_power(
     acc = {k: np.zeros(nb) for k in ("p", "raw", "oracle", "k", "w", "wcorr")}
     for lo in range(0, n, int(slab)):
         hi = min(lo + int(slab), n)
+        if progress is not None:
+            progress("bin power", lo, n)
         kk = np.sqrt(
             kx[lo:hi].reshape(-1, 1, 1) ** 2
             + kx.reshape(1, n, 1) ** 2
@@ -126,6 +137,8 @@ def binned_power(
         np.add.at(acc["wcorr"], i, (1.0 if w2 is None else w2.ravel()[sel]) * wk)
         if p_of_k is not None:
             np.add.at(acc["oracle"], i, p_of_k(flat[sel]) * wk)
+    if progress is not None:
+        progress("bin power", n, n)
 
     good = acc["w"] > float(min_weight)
     w = acc["w"][good]
@@ -162,7 +175,7 @@ def tsc_window_slab(kx_slab, kx, kz, k_nyq):
     return wx.reshape(-1, 1, 1) * wy.reshape(1, -1, 1) * wz.reshape(1, 1, -1)
 
 
-def nonlinear_scale(p_of_k, k_lo=1e-3, k_hi=10.0, n=4096):
+def nonlinear_scale(p_of_k, k_lo=NL_SCAN_K[0], k_hi=NL_SCAN_K[1], n=4096):
     """The k where the linear dimensionless variance `k^3 P / (2 pi^2)` reaches 1.
 
     Reported, never gated on: it is where the evolved field is EXPECTED to leave
@@ -194,6 +207,8 @@ def pk_summary_card(
     subtract_shot_noise=True,
     min_weight=100.0,
     provenance=None,
+    progress=None,
+    pool=None,
 ):
     """The card: measured P(k), the bin-averaged linear oracle, the z profile.
 
@@ -215,6 +230,19 @@ def pk_summary_card(
     falls under the floor. A card of zero bins passes every structural check a
     caller is likely to make while carrying no measurement at all.
 
+    `pool`, if given, runs the streamed paint's chunks on a `TilePool`
+    (build it `paint_only=True`; the card computes no force). The accumulation
+    stays serial in `coarse_delta_streamed`, where integer associativity makes
+    arrival order BITWISE the serial order, so this is a wall knob that cannot
+    move a number. The transform and the binning are unaffected and stay
+    serial.
+
+    `progress(stage, done, total)`, if given, goes to all three of the long
+    stages -- the streamed paint, the transform and the binning -- each under
+    its own name. At 4096^3 this call is hours long and used to print nothing
+    at all, so an overrun could not be told from a hang; see
+    `inexor.progress.Heartbeat`.
+
     Returns the card dict. Nothing here writes a file or decides a verdict.
     """
     from .engine import coarse_delta_streamed
@@ -222,13 +250,14 @@ def pk_summary_card(
     n = int(cfg.n_coarse)
     box = float(cfg.box_size)
     if delta is None:
-        delta = coarse_delta_streamed(st, cfg)
+        delta = coarse_delta_streamed(st, cfg, pool=pool, progress=progress)
     if delta.shape != (n, n, n):
         raise ValueError(f"delta has shape {delta.shape}, want {(n, n, n)} from cfg.n_coarse")
 
     from . import ooc_fft
 
-    spec = ooc_fft.forward_from_slabs(lambda lo, hi: delta[lo:hi], n, slab=int(slab))
+    spec = ooc_fft.forward_from_slabs(lambda lo, hi: delta[lo:hi], n, slab=int(slab),
+                                      progress=progress)
 
     tab = ic_k_table(cosmo, n, box)
     d2 = growth_factor_a(a_out, cosmo) ** 2
@@ -252,6 +281,7 @@ def pk_summary_card(
         window=_window if deconvolve_window else None,
         shot_noise=shot,
         min_weight=min_weight,
+        progress=progress,
     )
     del spec
     if not len(res["k_mean"]):
@@ -272,10 +302,17 @@ def pk_summary_card(
         growth_factor=float(growth_factor_a(a_out, cosmo)),
         k_nyquist=float(k_nyq),
         k_nonlinear=k_nl,
+        k_nonlinear_scan=[float(NL_SCAN_K[0]), float(NL_SCAN_K[1])],
         shot_noise=float(shot),
         deconvolved="tsc" if deconvolve_window else None,
         oracle="bin-averaged linear, D(a)^2 P_lin; NEVER a bin centre",
         n_bins=int(len(res["k_mean"])),
+        # the EDGES, not just the weighted centres. Two cards can share
+        # `k_mean` to a few digits and still have been binned differently, and
+        # `k_mean` is weighted so it does not reconstruct them. Without this a
+        # card cannot say what band it measured, which is what makes arms at
+        # different meshes comparable or not.
+        k_edges=[float(v) for v in res["k_edges"]],
         k_mean=[float(v) for v in res["k_mean"]],
         p=[float(v) for v in res["p"]],
         p_oracle=[float(v) for v in res["p_oracle"]],

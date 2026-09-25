@@ -220,6 +220,20 @@ def test_nonlinear_scale_finds_the_analytic_crossing():
     assert summary.nonlinear_scale(lambda k: 1e-12 * k**-2.0) is None
 
 
+def test_the_scanned_range_is_on_the_card_beside_the_none():
+    """A None means "no crossing in here" and is unreadable without "here".
+    The card's range must be the one the function actually scanned, so bracket
+    it: a crossing just inside NL_SCAN_K's ceiling is found, one just outside
+    is not."""
+    lo, hi = summary.NL_SCAN_K
+    inside = 2.0 * np.pi**2 / (0.9 * hi)  # A giving k_nl = 0.9 * hi
+    outside = 2.0 * np.pi**2 / (1.1 * hi)
+    assert summary.nonlinear_scale(lambda k: inside * k**-2.0) == pytest.approx(
+        0.9 * hi, rel=1e-3)
+    assert summary.nonlinear_scale(lambda k: outside * k**-2.0) is None
+    assert lo < hi
+
+
 # --------------------------------------------------------- the card, end to end
 
 L_BOX, N_PART, N_FINE, N_COARSE, N_TILE, B_FINE = 32.0, 32, 64, 16, 16, 8
@@ -279,6 +293,8 @@ def test_card_composes_over_a_real_state():
     assert card["card"] == summary.CARD
     assert card["n_bins"] == len(card["z_profile"]) == len(card["k_mean"]) == len(card["p"])
     assert card["deconvolved"] == "tsc"
+    assert card["k_nonlinear_scan"] == [float(summary.NL_SCAN_K[0]),
+                                        float(summary.NL_SCAN_K[1])]
     assert card["shot_noise"] == pytest.approx(L_BOX**3 / st.n_particles)
     assert card["growth_factor"] == pytest.approx(1.0)
     assert np.isfinite(card["z_profile"]).all() and np.isfinite(card["p"]).all()

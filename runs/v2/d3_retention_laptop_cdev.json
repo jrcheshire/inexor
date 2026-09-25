@@ -1,0 +1,353 @@
+{
+ "argv": [
+  "scripts/v2_d3_retention.py",
+  "--n-part",
+  "256",
+  "--kind",
+  "real",
+  "--steps",
+  "2",
+  "--out-suffix",
+  "_laptop_cdev"
+ ],
+ "n_part": 256,
+ "nb": 16,
+ "kind": "real",
+ "slab_rows": 1048576,
+ "walls_s": [
+  6.280239166000683,
+  5.181872583001677
+ ],
+ "sites": {
+  "eject": {
+   "bytes": 259614583,
+   "b_per_slab_row": 247.58775997161865,
+   "top": [
+    {
+     "shape": [
+      1110928
+     ],
+     "dtype": "int64",
+     "bytes": 88874240,
+     "b_per_slab_row": 84.757080078125
+    },
+    {
+     "shape": [
+      1321123,
+      3
+     ],
+     "dtype": "int16",
+     "bytes": 39633690,
+     "b_per_slab_row": 37.79763221740723
+    },
+    {
+     "shape": [
+      1110928,
+      3
+     ],
+     "dtype": "int16",
+     "bytes": 26662272,
+     "b_per_slab_row": 25.4271240234375
+    },
+    {
+     "shape": [
+      1110928,
+      3
+     ],
+     "dtype": "int64",
+     "bytes": 26662272,
+     "b_per_slab_row": 25.4271240234375
+    },
+    {
+     "shape": [
+      1048576
+     ],
+     "dtype": "int64",
+     "bytes": 25165824,
+     "b_per_slab_row": 24.0
+    },
+    {
+     "shape": [
+      1321123,
+      3
+     ],
+     "dtype": "uint8",
+     "bytes": 19816845,
+     "b_per_slab_row": 18.898816108703613
+    },
+    {
+     "shape": [
+      1110928,
+      3
+     ],
+     "dtype": "uint8",
+     "bytes": 13331136,
+     "b_per_slab_row": 12.71356201171875
+    },
+    {
+     "shape": [
+      1110928,
+      1
+     ],
+     "dtype": "float64",
+     "bytes": 8887424,
+     "b_per_slab_row": 8.4757080078125
+    },
+    {
+     "shape": [
+      1048576,
+      3
+     ],
+     "dtype": "int16",
+     "bytes": 6291456,
+     "b_per_slab_row": 6.0
+    },
+    {
+     "shape": [
+      1048576,
+      3
+     ],
+     "dtype": "uint8",
+     "bytes": 3145728,
+     "b_per_slab_row": 3.0
+    },
+    {
+     "shape": [
+      1110928
+     ],
+     "dtype": "bool",
+     "bytes": 1110928,
+     "b_per_slab_row": 1.0594635009765625
+    },
+    {
+     "shape": [
+      4096
+     ],
+     "dtype": "float64",
+     "bytes": 32768,
+     "b_per_slab_row": 0.03125
+    }
+   ]
+  },
+  "insert": {
+   "bytes": 301150245,
+   "b_per_slab_row": 287.1992540359497,
+   "top": [
+    {
+     "shape": [
+      1110928
+     ],
+     "dtype": "int64",
+     "bytes": 115536512,
+     "b_per_slab_row": 110.1842041015625
+    },
+    {
+     "shape": [
+      1321123,
+      3
+     ],
+     "dtype": "int16",
+     "bytes": 39633690,
+     "b_per_slab_row": 37.79763221740723
+    },
+    {
+     "shape": [
+      1110928,
+      3
+     ],
+     "dtype": "int16",
+     "bytes": 26662272,
+     "b_per_slab_row": 25.4271240234375
+    },
+    {
+     "shape": [
+      1048576
+     ],
+     "dtype": "int64",
+     "bytes": 25165824,
+     "b_per_slab_row": 24.0
+    },
+    {
+     "shape": [
+      1482911
+     ],
+     "dtype": "int64",
+     "bytes": 23726576,
+     "b_per_slab_row": 22.627426147460938
+    },
+    {
+     "shape": [
+      1321123,
+      3
+     ],
+     "dtype": "uint8",
+     "bytes": 19816845,
+     "b_per_slab_row": 18.898816108703613
+    },
+    {
+     "shape": [
+      1110928,
+      3
+     ],
+     "dtype": "uint8",
+     "bytes": 13331136,
+     "b_per_slab_row": 12.71356201171875
+    },
+    {
+     "shape": [
+      1482911
+     ],
+     "dtype": "float64",
+     "bytes": 11863288,
+     "b_per_slab_row": 11.313713073730469
+    },
+    {
+     "shape": [
+      1482911,
+      3
+     ],
+     "dtype": "int16",
+     "bytes": 8897466,
+     "b_per_slab_row": 8.485284805297852
+    },
+    {
+     "shape": [
+      1048576,
+      3
+     ],
+     "dtype": "int16",
+     "bytes": 6291456,
+     "b_per_slab_row": 6.0
+    },
+    {
+     "shape": [
+      1482911,
+      3
+     ],
+     "dtype": "uint8",
+     "bytes": 4448733,
+     "b_per_slab_row": 4.242642402648926
+    },
+    {
+     "shape": [
+      1048576,
+      3
+     ],
+     "dtype": "uint8",
+     "bytes": 3145728,
+     "b_per_slab_row": 3.0
+    }
+   ]
+  },
+  "write": {
+   "bytes": 339269596,
+   "b_per_slab_row": 323.5527000427246,
+   "top": [
+    {
+     "shape": [
+      1110928
+     ],
+     "dtype": "int64",
+     "bytes": 115536512,
+     "b_per_slab_row": 110.1842041015625
+    },
+    {
+     "shape": [
+      1482911
+     ],
+     "dtype": "int64",
+     "bytes": 47453152,
+     "b_per_slab_row": 45.254852294921875
+    },
+    {
+     "shape": [
+      1321123,
+      3
+     ],
+     "dtype": "int16",
+     "bytes": 39633690,
+     "b_per_slab_row": 37.79763221740723
+    },
+    {
+     "shape": [
+      1110928,
+      3
+     ],
+     "dtype": "int16",
+     "bytes": 26662272,
+     "b_per_slab_row": 25.4271240234375
+    },
+    {
+     "shape": [
+      1048576
+     ],
+     "dtype": "int64",
+     "bytes": 25165824,
+     "b_per_slab_row": 24.0
+    },
+    {
+     "shape": [
+      1321123,
+      3
+     ],
+     "dtype": "uint8",
+     "bytes": 19816845,
+     "b_per_slab_row": 18.898816108703613
+    },
+    {
+     "shape": [
+      1482911,
+      3
+     ],
+     "dtype": "int16",
+     "bytes": 17794932,
+     "b_per_slab_row": 16.970569610595703
+    },
+    {
+     "shape": [
+      1110928,
+      3
+     ],
+     "dtype": "uint8",
+     "bytes": 13331136,
+     "b_per_slab_row": 12.71356201171875
+    },
+    {
+     "shape": [
+      1482911
+     ],
+     "dtype": "float64",
+     "bytes": 11863288,
+     "b_per_slab_row": 11.313713073730469
+    },
+    {
+     "shape": [
+      1482911,
+      3
+     ],
+     "dtype": "uint8",
+     "bytes": 8897466,
+     "b_per_slab_row": 8.485284805297852
+    },
+    {
+     "shape": [
+      1048576,
+      3
+     ],
+     "dtype": "int16",
+     "bytes": 6291456,
+     "b_per_slab_row": 6.0
+    },
+    {
+     "shape": [
+      1048576,
+      3
+     ],
+     "dtype": "uint8",
+     "bytes": 3145728,
+     "b_per_slab_row": 3.0
+    }
+   ]
+  }
+ }
+}

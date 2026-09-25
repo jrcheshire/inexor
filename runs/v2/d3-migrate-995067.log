@@ -1,0 +1,54 @@
+=== c672-002.vista.tacc.utexas.edu: commit e74c23e, job 995067 ===
+XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=900
+0, NVIDIA GB200, 189471 MiB
+1, NVIDIA GB200, 189471 MiB
+2, NVIDIA GB200, 189471 MiB
+3, NVIDIA GB200, 189471 MiB
+               total        used        free      shared  buff/cache   available
+Mem:            1691          73        1649           2           2        1617
+
+=== LEG smoke ===
+ WARN Encountered 1 warning while parsing the manifest:
+  ⚠ the `[system-requirements]` table is deprecated in favor of virtual
+  │ packages on `platforms`
+    ╭─[/scratch/10303/jrc4/src/inexor/pyproject.toml:68:1]
+ 67 │     platforms = ["linux-64", "linux-aarch64"]
+ 68 │ ╭─▶ [tool.pixi.feature.gpu.system-requirements]
+ 69 │ ├─▶ cuda = "12"
+    · ╰──── declare these on the `platforms` entries instead
+ 70 │     [tool.pixi.feature.gpu.dependencies]
+    ╰────
+  help: e.g. platforms = [{ name = "my-linux-64", platform = "linux-64", cuda
+        = "12" }]
+
+ WARN cache for Repodata at /home1/10303/jrc4/.cache/rattler/cache/repodata is on a network/parallel filesystem (NFS/SMB/FUSE/BeeGFS/Lustre/GPFS/CephFS), redirected to /tmp/pixi-cache-jrc4/repodata for this run. Set [cache.repodata] in config.toml or PIXI_CACHE_DIR to override, or [cache.netfs-redirect] = "never" to keep the original path.
+
+--- arm xback: --arm xback --n-part 32 --xback-frac 1.9 --steps 2 --reps 1 
+cuBLAS < 13.2 (120902 found) has a known issue where many kernels free TMEM buffers multiple times. Executing a cuBLAS kernel concurrently with another kernel (e.g. on another stream) can lead to silent data corruption.
+Traceback (most recent call last):
+  File "/scratch/10303/jrc4/src/inexor/scripts/v2_d3_device_migrate.py", line 576, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/scratch/10303/jrc4/src/inexor/scripts/v2_d3_device_migrate.py", line 520, in main
+    rec, rc = ARMS[args.arm](args)
+              ~~~~~~~~~~~~~~^^^^^^
+  File "/scratch/10303/jrc4/src/inexor/scripts/v2_d3_device_migrate.py", line 173, in arm_xback
+    r_b = state.drift_and_migrate(st_b, c, kernel="jax", insert_kernel="jax")
+  File "/scratch/10303/jrc4/src/inexor/src/inexor/state.py", line 496, in drift_and_migrate
+    n_over += st._insert_slab(d, staged, emig, reach, consumed, scales=scales,
+              ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                              kernel=insert_kernel)
+                              ^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/10303/jrc4/src/inexor/src/inexor/state.py", line 1472, in _insert_slab
+    return self._insert_slab_jax(bx, staged, emig, reach, consumed, scales, spill_sink)
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/10303/jrc4/src/inexor/src/inexor/state.py", line 1590, in _insert_slab_jax
+    raise ValueError(
+    ...<4 lines>...
+    )
+ValueError: velocity code 49424 escapes int16 under a rescale to a scale that does not cover it. Per-brick scales make this reachable where a global scale made it impossible; the caller must fix the destination scale over the rows it is about to write. D-007 forbids the clamp.
+--- arm xback: rc=1, NO RECORD CAME BACK (not a reading)
+
+FATAL: the cross-backend identity did not hold, was vacuous, or did not run; no timing is read as the compiled migrate's
+--- LEG smoke rc=1 ---
+FATAL: smoke failed, not spending the node on the long legs

@@ -1,0 +1,1723 @@
+{
+ "argv": [
+  "scripts/v2_e2e4_device_cards.py",
+  "--smoke",
+  "--arms",
+  "window-sep,window-on,cards-sep,cards",
+  "--steps",
+  "2",
+  "--out-suffix",
+  "_m4_gbsmoke"
+ ],
+ "started": "2026-09-16T18:03:54",
+ "job": "1001688",
+ "node": "c672-010.vista.tacc.utexas.edu",
+ "commit": "b5f9a3c",
+ "arms": [
+  {
+   "arm": "window-sep",
+   "rc": 0,
+   "record": {
+    "arm": "window-sep",
+    "kind": "engine",
+    "platform": "gpu",
+    "preset": "smoke",
+    "n_part": 32,
+    "nb": 8,
+    "steps": 2,
+    "config": {
+     "coarse_backend": "device",
+     "tile_backend": "device",
+     "migrate_backend": "device",
+     "device_tile_window": true,
+     "migrate_repack_fused": false
+    },
+    "build_s": 0.0071777962148189545,
+    "run_s": 16.357704512774944,
+    "phases_total": {
+     "kernel_build": 0.16918806405737996,
+     "lead_drift": 3.0470061730593443,
+     "coarse_paint": 1.565754072740674,
+     "coarse_solve": 0.8731437893584371,
+     "membership": 0.014352552592754364,
+     "tile_loop": 1.085384997073561,
+     "tile_loop_end": 1.7535872757434845e-05,
+     "reconcile": 6.0158781707286835e-06,
+     "migrate": 6.948573993053287,
+     "repack": 2.654307655058801
+    },
+    "phase_trace": [
+     [
+      "kernel_build",
+      0.16918806405737996
+     ],
+     [
+      "lead_drift",
+      3.0470061730593443
+     ],
+     [
+      "coarse_paint",
+      1.461638204753399
+     ],
+     [
+      "coarse_solve",
+      0.7607964943163097
+     ],
+     [
+      "membership",
+      0.007256899960339069
+     ],
+     [
+      "tile_loop",
+      0.8807135219685733
+     ],
+     [
+      "tile_loop_end",
+      1.1296011507511139e-05
+     ],
+     [
+      "reconcile",
+      4.0316954255104065e-06
+     ],
+     [
+      "migrate",
+      2.882276481948793
+     ],
+     [
+      "repack",
+      1.5962254153564572
+     ],
+     [
+      "coarse_paint",
+      0.10411586798727512
+     ],
+     [
+      "coarse_solve",
+      0.11234729504212737
+     ],
+     [
+      "membership",
+      0.007095652632415295
+     ],
+     [
+      "tile_loop",
+      0.20467147510498762
+     ],
+     [
+      "tile_loop_end",
+      6.239861249923706e-06
+     ],
+     [
+      "reconcile",
+      1.984182745218277e-06
+     ],
+     [
+      "migrate",
+      4.066297511104494
+     ],
+     [
+      "repack",
+      1.058082239702344
+     ]
+    ],
+    "hashes": {
+     "off": "c586ec48282a32c75fb6d18b2f0c898cc5504e6f08162a6b4d755d31f0ec1457",
+     "w": "3af893c044d4d57c3c08354b8bb6ac33ce773fcd0a94c6288e34c08f7fa18bde",
+     "occupancy": "fe06857e76a2211d27b25f30eecab8919743a3973beb877c1df2f0337084756a",
+     "brick_start": "3ac61922ff7667bc4791364a02c5091964316c0ee845a1f2aa1092bc65b22b91",
+     "vel_scale": "348bf72d8a2b81b4d148806d662c0cd2935b69477b49bc8209a02631cd0cb524",
+     "arena_bucket": "f02eb90eec53aabc891363e78f808c6d67f5cec2ca77dca33349295ce04d31ab",
+     "ids": null,
+     "arena_base": 36270,
+     "n_live": 32768
+    },
+    "stats": [
+     {
+      "n_arena_overflow": 75,
+      "arena_used": 75,
+      "vel_scale": 7.364371068268876e-05,
+      "vel_scale_min": 2.571135815572681e-05,
+      "n_migrated_checked": 32768,
+      "brick_reach": 1,
+      "brick_reach_raw": 1,
+      "brick_reach_realized": 1,
+      "peak_staged_slabs": 2,
+      "migrate_device": {
+       "slabs": 8,
+       "programs": 27,
+       "spill_rows": 75,
+       "peak_estimate_bytes": 1198297,
+       "budget_bytes": null,
+       "window_direct_slabs": 8,
+       "window_copied_slabs": 0
+      },
+      "migrate_repack_fused": false,
+      "migrate_pooled_workers": 0,
+      "migrate_backend": "device",
+      "cap": 5161,
+      "cap_true": 4118,
+      "n_tiles": 64,
+      "vel_scale_kick_max": 7.364371068268876e-05,
+      "tile_workers": 1,
+      "coarse_dtype": "float32",
+      "fine_dtype": "float64",
+      "coarse_backend": "device",
+      "tile_backend": "device",
+      "device_shapes": {
+       "paint": {
+        "pad": 1291,
+        "live_w": 1291,
+        "arena_n": 1,
+        "arena_rect": 1
+       },
+       "tile": {
+        "arena_rect": 1
+       },
+       "window": {
+        "rows": 20643,
+        "arena": 1
+       }
+      },
+      "device_cards": 1,
+      "tile_cards": [
+       {
+        "planes": 4,
+        "tiles_run": 64
+       }
+      ],
+      "coarse_pad": 1291,
+      "coarse_pad_true": 1035,
+      "coarse_peak_int": 37636,
+      "coarse_card_chunks": [
+       32
+      ],
+      "coarse_device_chunks": 32,
+      "coarse_cards": 1,
+      "coarse_card_ranges": [
+       [
+        0,
+        16
+       ]
+      ],
+      "coarse_chunk_bricks": 16,
+      "coarse_device_jit": true,
+      "coarse_dead_rows": "spread",
+      "coarse_jit_shapes": {
+       "pad": 1291,
+       "live_w": 1291,
+       "arena_n": 1,
+       "arena_rect": 1
+      },
+      "coarse_jit_traces": 1,
+      "coarse_ghost_planes_nonzero": 3,
+      "coarse_subblock_chunks": 32,
+      "coarse_pooled_workers": 0,
+      "repack": {
+       "slots_used": 36287,
+       "slots_per_particle": 1.107391357421875,
+       "scratch_bytes": 47124,
+       "bricks_fast": 480,
+       "bricks_merged": 32,
+       "repack_device": {
+        "slabs": 8,
+        "programs": 7,
+        "windows_peak": 2,
+        "readahead_uploads": 2,
+        "empty_slabs": 0,
+        "held_peak_bytes": 139347
+       }
+      },
+      "checkpoint": null
+     },
+     {
+      "n_arena_overflow": 37,
+      "arena_used": 37,
+      "vel_scale": 6.40737651462089e-05,
+      "vel_scale_min": 1.5402449226827703e-05,
+      "n_migrated_checked": 32768,
+      "brick_reach": 1,
+      "brick_reach_raw": 1,
+      "brick_reach_realized": 1,
+      "peak_staged_slabs": 2,
+      "migrate_device": {
+       "slabs": 8,
+       "programs": 50,
+       "spill_rows": 37,
+       "peak_estimate_bytes": 1136367,
+       "budget_bytes": null,
+       "window_direct_slabs": 8,
+       "window_copied_slabs": 0
+      },
+      "migrate_repack_fused": false,
+      "migrate_pooled_workers": 0,
+      "migrate_backend": "device",
+      "cap": 5161,
+      "cap_true": 4149,
+      "n_tiles": 64,
+      "vel_scale_kick_max": 6.40737651462089e-05,
+      "tile_workers": 1,
+      "coarse_dtype": "float32",
+      "fine_dtype": "float64",
+      "coarse_backend": "device",
+      "tile_backend": "device",
+      "device_shapes": {
+       "paint": {
+        "pad": 1291,
+        "live_w": 1291,
+        "arena_n": 1,
+        "arena_rect": 1
+       },
+       "tile": {
+        "arena_rect": 1
+       },
+       "window": {
+        "rows": 20643,
+        "arena": 1
+       }
+      },
+      "device_cards": 1,
+      "tile_cards": [
+       {
+        "planes": 4,
+        "tiles_run": 64
+       }
+      ],
+      "coarse_pad": 1291,
+      "coarse_pad_true": 1055,
+      "coarse_peak_int": 45004,
+      "coarse_card_chunks": [
+       32
+      ],
+      "coarse_device_chunks": 32,
+      "coarse_cards": 1,
+      "coarse_card_ranges": [
+       [
+        0,
+        16
+       ]
+      ],
+      "coarse_chunk_bricks": 16,
+      "coarse_device_jit": true,
+      "coarse_dead_rows": "spread",
+      "coarse_jit_shapes": {
+       "pad": 1291,
+       "live_w": 1291,
+       "arena_n": 1,
+       "arena_rect": 1
+      },
+      "coarse_jit_traces": 0,
+      "coarse_ghost_planes_nonzero": 3,
+      "coarse_subblock_chunks": 32,
+      "coarse_pooled_workers": 0,
+      "repack": {
+       "slots_used": 36270,
+       "slots_per_particle": 1.10687255859375,
+       "scratch_bytes": 46782,
+       "bricks_fast": 500,
+       "bricks_merged": 12,
+       "repack_device": {
+        "slabs": 8,
+        "programs": 5,
+        "windows_peak": 2,
+        "readahead_uploads": 4,
+        "empty_slabs": 0,
+        "held_peak_bytes": 139347
+       }
+      },
+      "checkpoint": null
+     }
+    ],
+    "split": [
+     {
+      "fused": false,
+      "tile_cards": [
+       {
+        "planes": 4,
+        "tiles_run": 64
+       }
+      ],
+      "coarse_card_chunks": [
+       32
+      ],
+      "migrate_cards": null,
+      "migrate_fallback": null,
+      "cross_card_bytes": null,
+      "repack_cards": null,
+      "cross_card_early_uploads": null
+     },
+     {
+      "fused": false,
+      "tile_cards": [
+       {
+        "planes": 4,
+        "tiles_run": 64
+       }
+      ],
+      "coarse_card_chunks": [
+       32
+      ],
+      "migrate_cards": null,
+      "migrate_fallback": null,
+      "cross_card_bytes": null,
+      "repack_cards": null,
+      "cross_card_early_uploads": null
+     }
+    ],
+    "spills": 112,
+    "device_calls": [
+     2,
+     0,
+     2,
+     3,
+     2
+    ],
+    "snapshot": null,
+    "snapshot_write_s": null,
+    "device_peak": 6077952,
+    "host_maxrss_gb": 2.26751708984375,
+    "rc": 0
+   }
+  },
+  {
+   "arm": "window-on",
+   "rc": 0,
+   "record": {
+    "arm": "window-on",
+    "kind": "engine",
+    "platform": "gpu",
+    "preset": "smoke",
+    "n_part": 32,
+    "nb": 8,
+    "steps": 2,
+    "config": {
+     "coarse_backend": "device",
+     "tile_backend": "device",
+     "migrate_backend": "device",
+     "device_tile_window": true
+    },
+    "build_s": 0.007203172892332077,
+    "run_s": 18.98343844199553,
+    "phases_total": {
+     "kernel_build": 0.17591970600187778,
+     "lead_drift": 3.259781389962882,
+     "coarse_paint": 1.64345310209319,
+     "coarse_solve": 0.7954680249094963,
+     "membership": 0.015008455608040094,
+     "tile_loop": 1.9606208493933082,
+     "tile_loop_end": 1.7696060240268707e-05,
+     "reconcile": 7.200054824352264e-06,
+     "migrate": 11.132884385529906,
+     "repack": 0.0003186245448887348
+    },
+    "phase_trace": [
+     [
+      "kernel_build",
+      0.17591970600187778
+     ],
+     [
+      "lead_drift",
+      3.259781389962882
+     ],
+     [
+      "coarse_paint",
+      1.5443224590271711
+     ],
+     [
+      "coarse_solve",
+      0.689007137902081
+     ],
+     [
+      "membership",
+      0.007871619891375303
+     ],
+     [
+      "tile_loop",
+      1.7392005431465805
+     ],
+     [
+      "tile_loop_end",
+      1.1776108294725418e-05
+     ],
+     [
+      "reconcile",
+      4.0959566831588745e-06
+     ],
+     [
+      "migrate",
+      5.286006496753544
+     ],
+     [
+      "repack",
+      0.00019728019833564758
+     ],
+     [
+      "coarse_paint",
+      0.09913064306601882
+     ],
+     [
+      "coarse_solve",
+      0.1064608870074153
+     ],
+     [
+      "membership",
+      0.007136835716664791
+     ],
+     [
+      "tile_loop",
+      0.2214203062467277
+     ],
+     [
+      "tile_loop_end",
+      5.919951945543289e-06
+     ],
+     [
+      "reconcile",
+      3.10409814119339e-06
+     ],
+     [
+      "migrate",
+      5.846877888776362
+     ],
+     [
+      "repack",
+      0.00012134434655308723
+     ]
+    ],
+    "hashes": {
+     "off": "c586ec48282a32c75fb6d18b2f0c898cc5504e6f08162a6b4d755d31f0ec1457",
+     "w": "3af893c044d4d57c3c08354b8bb6ac33ce773fcd0a94c6288e34c08f7fa18bde",
+     "occupancy": "fe06857e76a2211d27b25f30eecab8919743a3973beb877c1df2f0337084756a",
+     "brick_start": "3ac61922ff7667bc4791364a02c5091964316c0ee845a1f2aa1092bc65b22b91",
+     "vel_scale": "348bf72d8a2b81b4d148806d662c0cd2935b69477b49bc8209a02631cd0cb524",
+     "arena_bucket": "f02eb90eec53aabc891363e78f808c6d67f5cec2ca77dca33349295ce04d31ab",
+     "ids": null,
+     "arena_base": 36270,
+     "n_live": 32768
+    },
+    "stats": [
+     {
+      "n_arena_overflow": 75,
+      "arena_used": 75,
+      "vel_scale": 7.364371068268876e-05,
+      "vel_scale_min": 2.571135815572681e-05,
+      "n_migrated_checked": 32768,
+      "brick_reach": 1,
+      "brick_reach_raw": 1,
+      "brick_reach_realized": 1,
+      "peak_staged_slabs": 2,
+      "migrate_device": {
+       "slabs": 8,
+       "programs": 44,
+       "spill_rows": 75,
+       "peak_estimate_bytes": 1022948,
+       "budget_bytes": null,
+       "window_direct_slabs": 8,
+       "window_copied_slabs": 0,
+       "fused": true
+      },
+      "migrate_repack_fused": true,
+      "migrate_pooled_workers": 0,
+      "migrate_backend": "device",
+      "cap": 5161,
+      "cap_true": 4118,
+      "n_tiles": 64,
+      "vel_scale_kick_max": 7.364371068268876e-05,
+      "tile_workers": 1,
+      "coarse_dtype": "float32",
+      "fine_dtype": "float64",
+      "coarse_backend": "device",
+      "tile_backend": "device",
+      "device_shapes": {
+       "paint": {
+        "pad": 1291,
+        "live_w": 1291,
+        "arena_n": 1,
+        "arena_rect": 1
+       },
+       "tile": {
+        "arena_rect": 1
+       },
+       "window": {
+        "rows": 20643,
+        "arena": 1
+       }
+      },
+      "device_cards": 1,
+      "tile_cards": [
+       {
+        "planes": 4,
+        "tiles_run": 64
+       }
+      ],
+      "coarse_pad": 1291,
+      "coarse_pad_true": 1035,
+      "coarse_peak_int": 37636,
+      "coarse_card_chunks": [
+       32
+      ],
+      "coarse_device_chunks": 32,
+      "coarse_cards": 1,
+      "coarse_card_ranges": [
+       [
+        0,
+        16
+       ]
+      ],
+      "coarse_chunk_bricks": 16,
+      "coarse_device_jit": true,
+      "coarse_dead_rows": "spread",
+      "coarse_jit_shapes": {
+       "pad": 1291,
+       "live_w": 1291,
+       "arena_n": 1,
+       "arena_rect": 1
+      },
+      "coarse_jit_traces": 1,
+      "coarse_ghost_planes_nonzero": 3,
+      "coarse_subblock_chunks": 32,
+      "coarse_pooled_workers": 0,
+      "repack": {
+       "slots_used": 36287,
+       "slots_per_particle": 1.107391357421875,
+       "scratch_bytes": 57766,
+       "bricks_fast": 480,
+       "bricks_merged": 32,
+       "repack_device": {
+        "fused": true,
+        "slabs": 8,
+        "blocks": 8,
+        "readahead_uploads": 0,
+        "empty_slabs": 0
+       }
+      },
+      "checkpoint": null
+     },
+     {
+      "n_arena_overflow": 37,
+      "arena_used": 37,
+      "vel_scale": 6.40737651462089e-05,
+      "vel_scale_min": 1.5402449226827703e-05,
+      "n_migrated_checked": 32768,
+      "brick_reach": 1,
+      "brick_reach_raw": 1,
+      "brick_reach_realized": 1,
+      "peak_staged_slabs": 2,
+      "migrate_device": {
+       "slabs": 8,
+       "programs": 69,
+       "spill_rows": 37,
+       "peak_estimate_bytes": 1014132,
+       "budget_bytes": null,
+       "window_direct_slabs": 8,
+       "window_copied_slabs": 0,
+       "fused": true
+      },
+      "migrate_repack_fused": true,
+      "migrate_pooled_workers": 0,
+      "migrate_backend": "device",
+      "cap": 5161,
+      "cap_true": 4149,
+      "n_tiles": 64,
+      "vel_scale_kick_max": 6.40737651462089e-05,
+      "tile_workers": 1,
+      "coarse_dtype": "float32",
+      "fine_dtype": "float64",
+      "coarse_backend": "device",
+      "tile_backend": "device",
+      "device_shapes": {
+       "paint": {
+        "pad": 1291,
+        "live_w": 1291,
+        "arena_n": 1,
+        "arena_rect": 1
+       },
+       "tile": {
+        "arena_rect": 1
+       },
+       "window": {
+        "rows": 20643,
+        "arena": 1
+       }
+      },
+      "device_cards": 1,
+      "tile_cards": [
+       {
+        "planes": 4,
+        "tiles_run": 64
+       }
+      ],
+      "coarse_pad": 1291,
+      "coarse_pad_true": 1055,
+      "coarse_peak_int": 45004,
+      "coarse_card_chunks": [
+       32
+      ],
+      "coarse_device_chunks": 32,
+      "coarse_cards": 1,
+      "coarse_card_ranges": [
+       [
+        0,
+        16
+       ]
+      ],
+      "coarse_chunk_bricks": 16,
+      "coarse_device_jit": true,
+      "coarse_dead_rows": "spread",
+      "coarse_jit_shapes": {
+       "pad": 1291,
+       "live_w": 1291,
+       "arena_n": 1,
+       "arena_rect": 1
+      },
+      "coarse_jit_traces": 0,
+      "coarse_ghost_planes_nonzero": 3,
+      "coarse_subblock_chunks": 32,
+      "coarse_pooled_workers": 0,
+      "repack": {
+       "slots_used": 36270,
+       "slots_per_particle": 1.10687255859375,
+       "scratch_bytes": 57712,
+       "bricks_fast": 500,
+       "bricks_merged": 12,
+       "repack_device": {
+        "fused": true,
+        "slabs": 8,
+        "blocks": 8,
+        "readahead_uploads": 0,
+        "empty_slabs": 0
+       }
+      },
+      "checkpoint": null
+     }
+    ],
+    "split": [
+     {
+      "fused": true,
+      "tile_cards": [
+       {
+        "planes": 4,
+        "tiles_run": 64
+       }
+      ],
+      "coarse_card_chunks": [
+       32
+      ],
+      "migrate_cards": null,
+      "migrate_fallback": null,
+      "cross_card_bytes": null,
+      "repack_cards": null,
+      "cross_card_early_uploads": null
+     },
+     {
+      "fused": true,
+      "tile_cards": [
+       {
+        "planes": 4,
+        "tiles_run": 64
+       }
+      ],
+      "coarse_card_chunks": [
+       32
+      ],
+      "migrate_cards": null,
+      "migrate_fallback": null,
+      "cross_card_bytes": null,
+      "repack_cards": null,
+      "cross_card_early_uploads": null
+     }
+    ],
+    "spills": 112,
+    "device_calls": [
+     2,
+     0,
+     2,
+     3,
+     0
+    ],
+    "snapshot": null,
+    "snapshot_write_s": null,
+    "device_peak": 6081536,
+    "host_maxrss_gb": 2.337890625,
+    "rc": 0
+   }
+  },
+  {
+   "arm": "cards-sep",
+   "rc": 0,
+   "record": {
+    "arm": "cards-sep",
+    "kind": "engine",
+    "platform": "gpu",
+    "preset": "smoke",
+    "n_part": 32,
+    "nb": 8,
+    "steps": 2,
+    "config": {
+     "coarse_backend": "device",
+     "tile_backend": "device",
+     "migrate_backend": "device",
+     "device_tile_window": true,
+     "device_cards": 4,
+     "migrate_repack_fused": false
+    },
+    "build_s": 0.007215172052383423,
+    "run_s": 17.238143912982196,
+    "phases_total": {
+     "kernel_build": 0.1978975418023765,
+     "lead_drift": 4.217602618969977,
+     "coarse_paint": 2.6219982439652085,
+     "coarse_solve": 0.7612662804313004,
+     "membership": 0.015243400819599628,
+     "tile_loop": 0.8397156647406518,
+     "tile_loop_end": 1.6991980373859406e-05,
+     "reconcile": 8.83219763636589e-06,
+     "migrate": 7.485884139779955,
+     "repack": 1.0985373663716018
+    },
+    "phase_trace": [
+     [
+      "kernel_build",
+      0.1978975418023765
+     ],
+     [
+      "lead_drift",
+      4.217602618969977
+     ],
+     [
+      "coarse_paint",
+      2.5498593281954527
+     ],
+     [
+      "coarse_solve",
+      0.6633709650486708
+     ],
+     [
+      "membership",
+      0.008061572909355164
+     ],
+     [
+      "tile_loop",
+      0.7312226169742644
+     ],
+     [
+      "tile_loop_end",
+      8.5439532995224e-06
+     ],
+     [
+      "reconcile",
+      5.600042641162872e-06
+     ],
+     [
+      "migrate",
+      3.205594448838383
+     ],
+     [
+      "repack",
+      0.6334281032904983
+     ],
+     [
+      "coarse_paint",
+      0.07213891576975584
+     ],
+     [
+      "coarse_solve",
+      0.09789531538262963
+     ],
+     [
+      "membership",
+      0.007181827910244465
+     ],
+     [
+      "tile_loop",
+      0.10849304776638746
+     ],
+     [
+      "tile_loop_end",
+      8.448027074337006e-06
+     ],
+     [
+      "reconcile",
+      3.232154995203018e-06
+     ],
+     [
+      "migrate",
+      4.280289690941572
+     ],
+     [
+      "repack",
+      0.46510926308110356
+     ]
+    ],
+    "hashes": {
+     "off": "c586ec48282a32c75fb6d18b2f0c898cc5504e6f08162a6b4d755d31f0ec1457",
+     "w": "3af893c044d4d57c3c08354b8bb6ac33ce773fcd0a94c6288e34c08f7fa18bde",
+     "occupancy": "fe06857e76a2211d27b25f30eecab8919743a3973beb877c1df2f0337084756a",
+     "brick_start": "3ac61922ff7667bc4791364a02c5091964316c0ee845a1f2aa1092bc65b22b91",
+     "vel_scale": "348bf72d8a2b81b4d148806d662c0cd2935b69477b49bc8209a02631cd0cb524",
+     "arena_bucket": "f02eb90eec53aabc891363e78f808c6d67f5cec2ca77dca33349295ce04d31ab",
+     "ids": null,
+     "arena_base": 36270,
+     "n_live": 32768
+    },
+    "stats": [
+     {
+      "n_arena_overflow": 75,
+      "arena_used": 75,
+      "vel_scale": 7.364371068268876e-05,
+      "vel_scale_min": 2.571135815572681e-05,
+      "n_migrated_checked": 32768,
+      "brick_reach": 1,
+      "brick_reach_raw": 1,
+      "brick_reach_realized": 1,
+      "peak_staged_slabs": 2,
+      "migrate_device": {
+       "slabs": 8,
+       "programs": 29,
+       "spill_rows": 75,
+       "peak_estimate_bytes": 1198297,
+       "budget_bytes": null,
+       "window_direct_slabs": 8,
+       "window_copied_slabs": 0,
+       "cards": 1,
+       "slabs_per_card": [
+        8
+       ],
+       "cross_card_segments": 0,
+       "cross_card_bytes": 0,
+       "fallback": "a card would hold 2 slabs, fewer than 2r + 1 = 3: one card"
+      },
+      "migrate_repack_fused": false,
+      "migrate_pooled_workers": 0,
+      "migrate_backend": "device",
+      "cap": 5161,
+      "cap_true": 4118,
+      "n_tiles": 64,
+      "vel_scale_kick_max": 7.364371068268876e-05,
+      "tile_workers": 1,
+      "coarse_dtype": "float32",
+      "fine_dtype": "float64",
+      "coarse_backend": "device",
+      "tile_backend": "device",
+      "device_shapes": {
+       "paint": {
+        "pad": 1291,
+        "live_w": 1291,
+        "arena_n": 1,
+        "arena_rect": 1
+       },
+       "tile": {
+        "arena_rect": 1
+       },
+       "window": {
+        "rows": 20643,
+        "arena": 1
+       }
+      },
+      "device_cards": 4,
+      "tile_cards": [
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       }
+      ],
+      "coarse_pad": 1291,
+      "coarse_pad_true": 1035,
+      "coarse_peak_int": 37636,
+      "coarse_card_chunks": [
+       8,
+       8,
+       8,
+       8
+      ],
+      "coarse_device_chunks": 32,
+      "coarse_cards": 4,
+      "coarse_card_ranges": [
+       [
+        0,
+        4
+       ],
+       [
+        4,
+        8
+       ],
+       [
+        8,
+        12
+       ],
+       [
+        12,
+        16
+       ]
+      ],
+      "coarse_chunk_bricks": 16,
+      "coarse_device_jit": true,
+      "coarse_dead_rows": "spread",
+      "coarse_jit_shapes": {
+       "pad": 1291,
+       "live_w": 1291,
+       "arena_n": 1,
+       "arena_rect": 1
+      },
+      "coarse_jit_traces": 1,
+      "coarse_ghost_planes_nonzero": 12,
+      "coarse_subblock_chunks": 32,
+      "coarse_pooled_workers": 0,
+      "repack": {
+       "slots_used": 36287,
+       "slots_per_particle": 1.107391357421875,
+       "scratch_bytes": 47124,
+       "bricks_fast": 480,
+       "bricks_merged": 32,
+       "repack_device": {
+        "slabs": 8,
+        "programs": 7,
+        "windows_peak": 2,
+        "readahead_uploads": 0,
+        "empty_slabs": 0,
+        "held_peak_bytes": 139347,
+        "cards": 4,
+        "cross_card_early_uploads": 3
+       }
+      },
+      "checkpoint": null
+     },
+     {
+      "n_arena_overflow": 37,
+      "arena_used": 37,
+      "vel_scale": 6.40737651462089e-05,
+      "vel_scale_min": 1.5402449226827703e-05,
+      "n_migrated_checked": 32768,
+      "brick_reach": 1,
+      "brick_reach_raw": 1,
+      "brick_reach_realized": 1,
+      "peak_staged_slabs": 2,
+      "migrate_device": {
+       "slabs": 8,
+       "programs": 54,
+       "spill_rows": 37,
+       "peak_estimate_bytes": 1136367,
+       "budget_bytes": null,
+       "window_direct_slabs": 8,
+       "window_copied_slabs": 0,
+       "cards": 1,
+       "slabs_per_card": [
+        8
+       ],
+       "cross_card_segments": 0,
+       "cross_card_bytes": 0,
+       "fallback": "a card would hold 2 slabs, fewer than 2r + 1 = 3: one card"
+      },
+      "migrate_repack_fused": false,
+      "migrate_pooled_workers": 0,
+      "migrate_backend": "device",
+      "cap": 5161,
+      "cap_true": 4149,
+      "n_tiles": 64,
+      "vel_scale_kick_max": 6.40737651462089e-05,
+      "tile_workers": 1,
+      "coarse_dtype": "float32",
+      "fine_dtype": "float64",
+      "coarse_backend": "device",
+      "tile_backend": "device",
+      "device_shapes": {
+       "paint": {
+        "pad": 1291,
+        "live_w": 1291,
+        "arena_n": 1,
+        "arena_rect": 1
+       },
+       "tile": {
+        "arena_rect": 1
+       },
+       "window": {
+        "rows": 20643,
+        "arena": 1
+       }
+      },
+      "device_cards": 4,
+      "tile_cards": [
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       }
+      ],
+      "coarse_pad": 1291,
+      "coarse_pad_true": 1055,
+      "coarse_peak_int": 45004,
+      "coarse_card_chunks": [
+       8,
+       8,
+       8,
+       8
+      ],
+      "coarse_device_chunks": 32,
+      "coarse_cards": 4,
+      "coarse_card_ranges": [
+       [
+        0,
+        4
+       ],
+       [
+        4,
+        8
+       ],
+       [
+        8,
+        12
+       ],
+       [
+        12,
+        16
+       ]
+      ],
+      "coarse_chunk_bricks": 16,
+      "coarse_device_jit": true,
+      "coarse_dead_rows": "spread",
+      "coarse_jit_shapes": {
+       "pad": 1291,
+       "live_w": 1291,
+       "arena_n": 1,
+       "arena_rect": 1
+      },
+      "coarse_jit_traces": 0,
+      "coarse_ghost_planes_nonzero": 12,
+      "coarse_subblock_chunks": 32,
+      "coarse_pooled_workers": 0,
+      "repack": {
+       "slots_used": 36270,
+       "slots_per_particle": 1.10687255859375,
+       "scratch_bytes": 46782,
+       "bricks_fast": 500,
+       "bricks_merged": 12,
+       "repack_device": {
+        "slabs": 8,
+        "programs": 5,
+        "windows_peak": 2,
+        "readahead_uploads": 2,
+        "empty_slabs": 0,
+        "held_peak_bytes": 139347,
+        "cards": 4,
+        "cross_card_early_uploads": 2
+       }
+      },
+      "checkpoint": null
+     }
+    ],
+    "split": [
+     {
+      "fused": false,
+      "tile_cards": [
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       }
+      ],
+      "coarse_card_chunks": [
+       8,
+       8,
+       8,
+       8
+      ],
+      "migrate_cards": 1,
+      "migrate_fallback": "a card would hold 2 slabs, fewer than 2r + 1 = 3: one card",
+      "cross_card_bytes": 0,
+      "repack_cards": 4,
+      "cross_card_early_uploads": 3
+     },
+     {
+      "fused": false,
+      "tile_cards": [
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       }
+      ],
+      "coarse_card_chunks": [
+       8,
+       8,
+       8,
+       8
+      ],
+      "migrate_cards": 1,
+      "migrate_fallback": "a card would hold 2 slabs, fewer than 2r + 1 = 3: one card",
+      "cross_card_bytes": 0,
+      "repack_cards": 4,
+      "cross_card_early_uploads": 2
+     }
+    ],
+    "spills": 112,
+    "device_calls": [
+     2,
+     0,
+     8,
+     3,
+     2
+    ],
+    "snapshot": null,
+    "snapshot_write_s": null,
+    "device_peak": 5620992,
+    "host_maxrss_gb": 2.33599853515625,
+    "rc": 0
+   }
+  },
+  {
+   "arm": "cards",
+   "rc": 0,
+   "record": {
+    "arm": "cards",
+    "kind": "engine",
+    "platform": "gpu",
+    "preset": "smoke",
+    "n_part": 32,
+    "nb": 8,
+    "steps": 2,
+    "config": {
+     "coarse_backend": "device",
+     "tile_backend": "device",
+     "migrate_backend": "device",
+     "device_tile_window": true,
+     "device_cards": 4
+    },
+    "build_s": 0.007238628342747688,
+    "run_s": 20.14998470712453,
+    "phases_total": {
+     "kernel_build": 0.17248757602646947,
+     "lead_drift": 2.859256639610976,
+     "coarse_paint": 2.6239816062152386,
+     "coarse_solve": 0.7350733708590269,
+     "membership": 0.014847560320049524,
+     "tile_loop": 2.0940685318782926,
+     "tile_loop_end": 1.7663929611444473e-05,
+     "reconcile": 7.456168532371521e-06,
+     "migrate": 11.649553069844842,
+     "repack": 0.000724191777408123
+    },
+    "phase_trace": [
+     [
+      "kernel_build",
+      0.17248757602646947
+     ],
+     [
+      "lead_drift",
+      2.859256639610976
+     ],
+     [
+      "coarse_paint",
+      2.550796769093722
+     ],
+     [
+      "coarse_solve",
+      0.6369482320733368
+     ],
+     [
+      "membership",
+      0.007660868111997843
+     ],
+     [
+      "tile_loop",
+      1.9730133027769625
+     ],
+     [
+      "tile_loop_end",
+      1.1839903891086578e-05
+     ],
+     [
+      "reconcile",
+      4.9602240324020386e-06
+     ],
+     [
+      "migrate",
+      5.624476975761354
+     ],
+     [
+      "repack",
+      0.0002650241367518902
+     ],
+     [
+      "coarse_paint",
+      0.07318483712151647
+     ],
+     [
+      "coarse_solve",
+      0.09812513878569007
+     ],
+     [
+      "membership",
+      0.0071866922080516815
+     ],
+     [
+      "tile_loop",
+      0.12105522910133004
+     ],
+     [
+      "tile_loop_end",
+      5.824025720357895e-06
+     ],
+     [
+      "reconcile",
+      2.4959444999694824e-06
+     ],
+     [
+      "migrate",
+      6.025076094083488
+     ],
+     [
+      "repack",
+      0.00045916764065623283
+     ]
+    ],
+    "hashes": {
+     "off": "c586ec48282a32c75fb6d18b2f0c898cc5504e6f08162a6b4d755d31f0ec1457",
+     "w": "3af893c044d4d57c3c08354b8bb6ac33ce773fcd0a94c6288e34c08f7fa18bde",
+     "occupancy": "fe06857e76a2211d27b25f30eecab8919743a3973beb877c1df2f0337084756a",
+     "brick_start": "3ac61922ff7667bc4791364a02c5091964316c0ee845a1f2aa1092bc65b22b91",
+     "vel_scale": "348bf72d8a2b81b4d148806d662c0cd2935b69477b49bc8209a02631cd0cb524",
+     "arena_bucket": "f02eb90eec53aabc891363e78f808c6d67f5cec2ca77dca33349295ce04d31ab",
+     "ids": null,
+     "arena_base": 36270,
+     "n_live": 32768
+    },
+    "stats": [
+     {
+      "n_arena_overflow": 75,
+      "arena_used": 75,
+      "vel_scale": 7.364371068268876e-05,
+      "vel_scale_min": 2.571135815572681e-05,
+      "n_migrated_checked": 32768,
+      "brick_reach": 1,
+      "brick_reach_raw": 1,
+      "brick_reach_realized": 1,
+      "peak_staged_slabs": 2,
+      "migrate_device": {
+       "slabs": 8,
+       "programs": 46,
+       "spill_rows": 75,
+       "peak_estimate_bytes": 1022948,
+       "budget_bytes": null,
+       "window_direct_slabs": 8,
+       "window_copied_slabs": 0,
+       "cards": 1,
+       "slabs_per_card": [
+        8
+       ],
+       "cross_card_segments": 0,
+       "cross_card_bytes": 0,
+       "fallback": "a card would hold 2 slabs, fewer than 2r + 1 = 3: one card",
+       "fused": true
+      },
+      "migrate_repack_fused": true,
+      "migrate_pooled_workers": 0,
+      "migrate_backend": "device",
+      "cap": 5161,
+      "cap_true": 4118,
+      "n_tiles": 64,
+      "vel_scale_kick_max": 7.364371068268876e-05,
+      "tile_workers": 1,
+      "coarse_dtype": "float32",
+      "fine_dtype": "float64",
+      "coarse_backend": "device",
+      "tile_backend": "device",
+      "device_shapes": {
+       "paint": {
+        "pad": 1291,
+        "live_w": 1291,
+        "arena_n": 1,
+        "arena_rect": 1
+       },
+       "tile": {
+        "arena_rect": 1
+       },
+       "window": {
+        "rows": 20643,
+        "arena": 1
+       }
+      },
+      "device_cards": 4,
+      "tile_cards": [
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       }
+      ],
+      "coarse_pad": 1291,
+      "coarse_pad_true": 1035,
+      "coarse_peak_int": 37636,
+      "coarse_card_chunks": [
+       8,
+       8,
+       8,
+       8
+      ],
+      "coarse_device_chunks": 32,
+      "coarse_cards": 4,
+      "coarse_card_ranges": [
+       [
+        0,
+        4
+       ],
+       [
+        4,
+        8
+       ],
+       [
+        8,
+        12
+       ],
+       [
+        12,
+        16
+       ]
+      ],
+      "coarse_chunk_bricks": 16,
+      "coarse_device_jit": true,
+      "coarse_dead_rows": "spread",
+      "coarse_jit_shapes": {
+       "pad": 1291,
+       "live_w": 1291,
+       "arena_n": 1,
+       "arena_rect": 1
+      },
+      "coarse_jit_traces": 1,
+      "coarse_ghost_planes_nonzero": 12,
+      "coarse_subblock_chunks": 32,
+      "coarse_pooled_workers": 0,
+      "repack": {
+       "slots_used": 36287,
+       "slots_per_particle": 1.107391357421875,
+       "scratch_bytes": 57766,
+       "bricks_fast": 480,
+       "bricks_merged": 32,
+       "repack_device": {
+        "fused": true,
+        "slabs": 8,
+        "blocks": 8,
+        "readahead_uploads": 0,
+        "empty_slabs": 0,
+        "cards": 1,
+        "cross_card_early_uploads": 0
+       }
+      },
+      "checkpoint": null
+     },
+     {
+      "n_arena_overflow": 37,
+      "arena_used": 37,
+      "vel_scale": 6.40737651462089e-05,
+      "vel_scale_min": 1.5402449226827703e-05,
+      "n_migrated_checked": 32768,
+      "brick_reach": 1,
+      "brick_reach_raw": 1,
+      "brick_reach_realized": 1,
+      "peak_staged_slabs": 2,
+      "migrate_device": {
+       "slabs": 8,
+       "programs": 73,
+       "spill_rows": 37,
+       "peak_estimate_bytes": 1014132,
+       "budget_bytes": null,
+       "window_direct_slabs": 8,
+       "window_copied_slabs": 0,
+       "cards": 1,
+       "slabs_per_card": [
+        8
+       ],
+       "cross_card_segments": 0,
+       "cross_card_bytes": 0,
+       "fallback": "a card would hold 2 slabs, fewer than 2r + 1 = 3: one card",
+       "fused": true
+      },
+      "migrate_repack_fused": true,
+      "migrate_pooled_workers": 0,
+      "migrate_backend": "device",
+      "cap": 5161,
+      "cap_true": 4149,
+      "n_tiles": 64,
+      "vel_scale_kick_max": 6.40737651462089e-05,
+      "tile_workers": 1,
+      "coarse_dtype": "float32",
+      "fine_dtype": "float64",
+      "coarse_backend": "device",
+      "tile_backend": "device",
+      "device_shapes": {
+       "paint": {
+        "pad": 1291,
+        "live_w": 1291,
+        "arena_n": 1,
+        "arena_rect": 1
+       },
+       "tile": {
+        "arena_rect": 1
+       },
+       "window": {
+        "rows": 20643,
+        "arena": 1
+       }
+      },
+      "device_cards": 4,
+      "tile_cards": [
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       }
+      ],
+      "coarse_pad": 1291,
+      "coarse_pad_true": 1055,
+      "coarse_peak_int": 45004,
+      "coarse_card_chunks": [
+       8,
+       8,
+       8,
+       8
+      ],
+      "coarse_device_chunks": 32,
+      "coarse_cards": 4,
+      "coarse_card_ranges": [
+       [
+        0,
+        4
+       ],
+       [
+        4,
+        8
+       ],
+       [
+        8,
+        12
+       ],
+       [
+        12,
+        16
+       ]
+      ],
+      "coarse_chunk_bricks": 16,
+      "coarse_device_jit": true,
+      "coarse_dead_rows": "spread",
+      "coarse_jit_shapes": {
+       "pad": 1291,
+       "live_w": 1291,
+       "arena_n": 1,
+       "arena_rect": 1
+      },
+      "coarse_jit_traces": 0,
+      "coarse_ghost_planes_nonzero": 12,
+      "coarse_subblock_chunks": 32,
+      "coarse_pooled_workers": 0,
+      "repack": {
+       "slots_used": 36270,
+       "slots_per_particle": 1.10687255859375,
+       "scratch_bytes": 57712,
+       "bricks_fast": 500,
+       "bricks_merged": 12,
+       "repack_device": {
+        "fused": true,
+        "slabs": 8,
+        "blocks": 8,
+        "readahead_uploads": 0,
+        "empty_slabs": 0,
+        "cards": 1,
+        "cross_card_early_uploads": 0
+       }
+      },
+      "checkpoint": null
+     }
+    ],
+    "split": [
+     {
+      "fused": true,
+      "tile_cards": [
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       }
+      ],
+      "coarse_card_chunks": [
+       8,
+       8,
+       8,
+       8
+      ],
+      "migrate_cards": 1,
+      "migrate_fallback": "a card would hold 2 slabs, fewer than 2r + 1 = 3: one card",
+      "cross_card_bytes": 0,
+      "repack_cards": 1,
+      "cross_card_early_uploads": 0
+     },
+     {
+      "fused": true,
+      "tile_cards": [
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       },
+       {
+        "planes": 1,
+        "tiles_run": 16
+       }
+      ],
+      "coarse_card_chunks": [
+       8,
+       8,
+       8,
+       8
+      ],
+      "migrate_cards": 1,
+      "migrate_fallback": "a card would hold 2 slabs, fewer than 2r + 1 = 3: one card",
+      "cross_card_bytes": 0,
+      "repack_cards": 1,
+      "cross_card_early_uploads": 0
+     }
+    ],
+    "spills": 112,
+    "device_calls": [
+     2,
+     0,
+     8,
+     3,
+     0
+    ],
+    "snapshot": null,
+    "snapshot_write_s": null,
+    "device_peak": 5620992,
+    "host_maxrss_gb": 2.42578125,
+    "rc": 0
+   }
+  }
+ ],
+ "gates": {
+  "cards": {
+   "against": "window-on",
+   "hashes_equal": true,
+   "stats_diffs": [],
+   "run_s": [
+    20.14998470712453,
+    18.98343844199553
+   ],
+   "spills": [
+    112,
+    112
+   ],
+   "reading_only": false
+  },
+  "window-on": {
+   "against": "window-sep",
+   "hashes_equal": true,
+   "stats_diffs": [],
+   "run_s": [
+    18.98343844199553,
+    16.357704512774944
+   ],
+   "spills": [
+    112,
+    112
+   ],
+   "reading_only": false
+  },
+  "cards vs cards-sep": {
+   "against": "cards-sep",
+   "hashes_equal": true,
+   "stats_diffs": [],
+   "run_s": [
+    20.14998470712453,
+    17.238143912982196
+   ],
+   "spills": [
+    112,
+    112
+   ],
+   "reading_only": false
+  }
+ },
+ "rc": 0
+}
