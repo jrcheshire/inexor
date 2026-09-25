@@ -158,6 +158,7 @@ def generate_t9_slabs(
     window=1,
     provenance=None,
     keep_stage=False,
+    growth2="lcdm",
 ):
     """Generate T9-encoded initial-condition slabs on disk.
 
@@ -231,8 +232,8 @@ def generate_t9_slabs(
     # --- U/V staging + the exact velocity scale and displacement bound -----
     D1 = growth_factor_a(a_init, cosmo)
     f1 = growth_rate_a(a_init, cosmo)
-    D2 = growth_factor_2(a_init, cosmo)
-    f2 = growth_rate_2(a_init, cosmo)
+    D2 = growth_factor_2(a_init, cosmo, growth2)
+    f2 = growth_rate_2(a_init, cosmo, growth2)
     v_coef2 = -(D2 * f2) / (D1 * f1)
     vmax = 0.0
     umax = 0.0
@@ -288,6 +289,7 @@ def generate_t9_slabs(
         bricks_per_side=nb,
         a_init=float(a_init),
         order=order,
+        growth2=growth2,
         f_NL=float(f_NL),
         fdtype=dt.name,
         slab=int(slab),
@@ -497,6 +499,7 @@ def generate_t9_slabs_device(
     window=1,
     provenance=None,
     keep_stage=False,
+    growth2="lcdm",
     devices=None,
     pencil_batch=1,
     noise="device",
@@ -619,8 +622,8 @@ def generate_t9_slabs_device(
 
     D1 = growth_factor_a(a_init, cosmo)
     f1 = growth_rate_a(a_init, cosmo)
-    D2 = growth_factor_2(a_init, cosmo)
-    f2 = growth_rate_2(a_init, cosmo)
+    D2 = growth_factor_2(a_init, cosmo, growth2)
+    f2 = growth_rate_2(a_init, cosmo, growth2)
     v_coef2 = -(D2 * f2) / (D1 * f1)
 
     # --- 3. V = grad(delta + c S_2), staged to disk -------------------------
@@ -724,6 +727,7 @@ def generate_t9_slabs_device(
         bricks_per_side=nb,
         a_init=float(a_init),
         order=order,
+        growth2=growth2,
         f_NL=float(f_NL),
         fdtype=dt.name,
         slab=int(slab),

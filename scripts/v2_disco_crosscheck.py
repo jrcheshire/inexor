@@ -4,6 +4,7 @@ Three phases, each in the env it needs; they exchange one npz each.
 
     export  (inexor env)       IC slabs -> (x, v_d) + the shared a-grid + EH98 table
     evolve  (disco-mocks env)  DISCO-DJ PM on the injected (x, v_d) -> final (x, v_d)
+    evolve-mono (inexor env)   our single-mesh PM on the same (x, v_d), same output
     card    (inexor env)       final particles -> the realization script's P(k) card
 
     pixi run python scripts/v2_disco_crosscheck.py export --config cgh64 \
@@ -58,8 +59,9 @@ def cmd_export(args):
 
     g = R._geom(args.config)
     cosmo = R._cosmo()
-    _, a_steps = R._coeffs(cosmo, args.k_steps, args.a_init)
+    _, a_steps = R._coeffs(cosmo, args.k_steps, args.a_init, args.growth2)
     R._require_ic_epoch(args.ic_dir, args.a_init)
+    R._require_ic_growth2(args.ic_dir, args.growth2)
     st = icgen.load_slot_state(args.ic_dir)
     xs, vs = [], []
     for b in range(st.n_bricks):
@@ -76,13 +78,15 @@ def cmd_export(args):
     # the same z = 0 EH98 table M1's parity arm fed DISCO-DJ (m1_export_ics.dump_pk_eh98)
     k = np.geomspace(1e-4, 1e2, 800)
     P = linear_power(k, config.Cosmology(**M.COSMO), z=0.0, backend="eh98")
-    pk_path = os.path.join(os.path.dirname(os.path.abspath(args.out)), "pk_eh98.txt")
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    os.makedirs(out_dir, exist_ok=True)
+    pk_path = os.path.join(out_dir, "pk_eh98.txt")
     np.savetxt(pk_path, np.column_stack([k, P]), fmt="%.18e",
                header="k [h/Mpc]   P(k) [(Mpc/h)^3]  z=0  inexor EH98 sigma8-normalized")
     _save(args.out, x=x, v_d=v, a_steps=np.asarray(a_steps, np.float64),
           meta=dict(config=args.config, n_part=g["n_part"], box_size=g["L"],
                     ic_dir=args.ic_dir, k_steps=args.k_steps, a_init=float(a_steps[0]),
-                    pk_file=pk_path))
+                    growth2=args.growth2, pk_file=pk_path))
     return 0
 
 
@@ -135,6 +139,65 @@ def cmd_evolve(args):
     return 0
 
 
+def cmd_evolve_mono(args):
+    """Our own single-mesh PM on the same injected (x, v_d): the arm between the two.
+
+    `force_global(which="mono", assign="cic")` -- the kernel the two-level split
+    was gated against (floor F0) and `make_force_fn`'s -- on one n_mesh^3 mesh, f64,
+    driven by the engine's own BullFrog coefficients through the float reference
+    driver. Against DISCO-DJ it differs only in operator and stepper conventions
+    (D-013's ledger); against the engine only in the two-level machinery.
+    """
+    os.environ.setdefault("JAX_ENABLE_X64", "1")
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    import jax.numpy as jnp
+
+    import v2_m6_realization as R
+    from inexor import engine, forces
+
+    R._require_cpu()
+    d = _load(args.inp)
+    meta = d["meta"]
+    n_part, L = int(meta["n_part"]), float(meta["box_size"])
+    # exports from before the flag were made with the EdS weights and ICs
+    growth2 = meta.get("growth2", "eds")
+    co, a_steps = R._coeffs(R._cosmo(), int(meta["k_steps"]), float(meta["a_init"]), growth2)
+    # an export from another platform carries the same grid to roundoff, not bitwise
+    da = float(np.max(np.abs(np.asarray(a_steps, np.float64) - d["a_steps"])))
+    if da > 1e-12:
+        raise SystemExit(f"the export's a-grid is not the one these coefficients were built "
+                         f"on (max |da| {da:.3e})")
+    n_tot = n_part**3
+    print(f"== evolve inexor mono: {n_part}^3 particles, L={L}, PM mesh {args.n_mesh}^3 "
+          f"(cic, f64), {len(co)} BullFrog steps a={a_steps[0]:.4f}->{a_steps[-1]:.4f}, "
+          f"growth2 {growth2}",
+          flush=True)
+
+    t_last = [time.perf_counter()]
+
+    def force_fn(x):
+        g, _ = forces.force_global(np.asarray(x, np.float64), args.n_mesh, L, n_tot, "mono",
+                                   assign="cic", paint="f64")
+        now = time.perf_counter()
+        print(f"    force {now - t_last[0]:6.2f}s", flush=True)
+        t_last[0] = now
+        return jnp.asarray(g)
+
+    t0 = time.perf_counter()
+    X, V = engine.float_run_bullfrog_sync(jnp.asarray(d["x"]), jnp.asarray(d["v_d"]), co,
+                                          force_fn, L)
+    wall = time.perf_counter() - t0
+    print(f"  evolve wall {wall:.1f} s", flush=True)
+    meta.update(n_mesh=args.n_mesh, precision="double", evolve_wall_s=wall,
+                code="inexor-mono",
+                settings="force_global mono, cic, f64 paint, float_run_bullfrog_sync")
+    _save(args.out, x=np.mod(np.asarray(X, np.float64), L), v_d=np.asarray(V, np.float64),
+          a_steps=d["a_steps"], meta=meta)
+    return 0
+
+
 def cmd_card(args, rest):
     import v2_m6_realization as R
     from inexor import summary
@@ -183,6 +246,7 @@ def main():
     e.add_argument("--ic-dir", required=True)
     e.add_argument("--k-steps", type=int, required=True)
     e.add_argument("--a-init", type=float, default=0.1)
+    e.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"))
     e.add_argument("--out", required=True)
     v = sub.add_parser("evolve")
     v.add_argument("--in", dest="inp", required=True)
@@ -190,6 +254,10 @@ def main():
     v.add_argument("--precision", default="double", choices=("double", "single"),
                    help="double is the M1 parity setting")
     v.add_argument("--out", required=True)
+    m = sub.add_parser("evolve-mono")
+    m.add_argument("--in", dest="inp", required=True)
+    m.add_argument("--n-mesh", type=int, required=True)
+    m.add_argument("--out", required=True)
     c = sub.add_parser("card")
     c.add_argument("--in", dest="inp", required=True)
     args = ap.parse_args(argv)
@@ -197,6 +265,8 @@ def main():
         return cmd_export(args)
     if args.phase == "evolve":
         return cmd_evolve(args)
+    if args.phase == "evolve-mono":
+        return cmd_evolve_mono(args)
     return cmd_card(args, rest)
 
 

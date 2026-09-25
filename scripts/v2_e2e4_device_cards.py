@@ -195,8 +195,8 @@ def arm_solve(args):
     st = None
     n = cfg.n_coarse
     parts = coarse_kernel_parts(n, cfg.box_size, "long", r_s=cfg.r_s,
-                                match=(cfg.coarse_cell, cfg.fine_cell), fdtype=cfg.np_coarse_dtype)
-    kw = dict(r_s=cfg.r_s, match=(cfg.coarse_cell, cfg.fine_cell), fdtype=cfg.np_coarse_dtype,
+                                match=cfg.coarse_match, fdtype=cfg.np_coarse_dtype)
+    kw = dict(r_s=cfg.r_s, match=cfg.coarse_match, fdtype=cfg.np_coarse_dtype,
               parts=parts)
     devs = _devices(CARDS)
     per_tile = cfg.n_tile // (cfg.n_fine // n)

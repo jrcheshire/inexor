@@ -89,7 +89,8 @@ def run_inexor(tag, kernel_dtype="f64", paint="f32"):
     # reference used is therefore a question to measure, not to assume.
     kd = jnp.float64 if kernel_dtype == "f64" else jnp.float32
     force_fn = make_force_fn(box, fdtype=kd, paint=paint)
-    for c in bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo)):
+    # the stored v1 references were evolved with the EdS weights (D-013 mbody arm)
+    for c in bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo, growth2="eds")):
         x, v = float_step_bullfrog(x, v, tuple(np.asarray(c, np.float64)), force_fn, box.box_size)
 
     # A SEPARATE name, deliberately. `inexor_float_{tag}.npz` is a stored v1

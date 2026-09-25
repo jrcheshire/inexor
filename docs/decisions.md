@@ -1372,3 +1372,66 @@ ratifying it did not measure it.
   `python -m inexor.plan`, which computes those numbers on demand and cannot go
   stale. Its transcription did, twice. Clauses 1-4 are the only content that
   was neither duplicated nor computable. Nothing in the repo referenced it.
+
+## D-v2-25 -- LCDM BullFrog weights and 2LPT growth; the TSC-order coarse match as default
+
+- **Status:** PROPOSED (drafted 2026-09-25; JC ratifies). Supersedes D-013's
+  convention ledger item (2) as a statement about which convention is correct
+  (D-013 itself stands as the record of the v1 parity arms), and D-v2-10's
+  CIC-order coarse match as the production default.
+- **Context:** the engine's P(k) ran low against EuclidEmulator2 by a smooth
+  deficit growing with k (0.83 of EE2's boost at k = 1.56, 512^3/256 Mpc/h, 120
+  steps), and every accuracy axis tested (steps, fine mesh, coarse mesh,
+  spacing, start epoch) converged without closing it. DISCO-DJ on our ICs, scored
+  with our card, sat within 1-4% of EE2 (Vista gh 1021604). The cdev8 lab
+  localized the gap: the two-level engine equals our single-mesh PM to 1e-3; our
+  single-mesh force equals DISCO-DJ's on a clustered z = 0 state to 3e-4 rms,
+  no scale; both codes step-converge (120 -> 240 moves either < 1e-3) to
+  answers 13% apart at k = 1.56; and our single-mesh PM with DISCO-DJ's alpha
+  swapped in matches DISCO-DJ to 9e-5 in every bin.
+- **Cause:** `integrate._bullfrog_weights` used the EdS second-order growth
+  E = -(3/7) D^2 (inherited from mbody). In D-time the equation of motion is
+  dv/dD = (3/2) [Omega_m(a)/f(a)^2] (1/D) (-grad phi - v); the EdS weights set
+  the bracket to 1, while it reaches 1.13 at z = 0. The kick-weight ratio
+  DISCO-DJ/ours equals Omega_m(a)/f(a)^2 at each step midpoint to 4e-4. Linear
+  growth is exact either way (on the potential flow the bracket multiplies
+  zero), which is why low k and every linear check agreed. Rampf, List & Hahn
+  2024 (arXiv:2409.19049) Sec. 4.4: with approximate growth BullFrog "is not a
+  consistent scheme, but instead only converges to an approximate solution".
+- **Decision:**
+  1. The BullFrog weights take E and dE/dD from the LCDM second-order growth
+     ODE (`cosmology._growth2_solution`), the default of `bullfrog_table`
+     (`growth2="lcdm"`). `growth2="eds"` is kept only to reproduce runs made
+     with it.
+  2. The 2LPT ICs take the same D2 and f2 (`growth_factor_2`/`growth_rate_2`
+     default "lcdm"; ~2e-5 at z = 9). The IC manifest records `growth2`; run and
+     card refuse ICs made with the other; a manifest without the field is EdS.
+  3. `coarse_match_order` defaults to 3 (TSC-order match; +1.8% at k >= 1,
+     gg 1018341, measured 2026-09-23). The fingerprint adds the field only off
+     order 2, so pre-knob checkpoints resume at 2 and never under the default.
+  4. Legacy settings stay reachable and pinned where a gate compares against
+     stored legacy references: the D-013 mbody arm (`scripts/m1_parity.py`,
+     `m1_kernel_probe.py`, `m1_export_ics.py`) pins `growth2="eds"`. No
+     probe-parity test needed pinning: the one that broke
+     (`test_engine_device_step`) built its hand reference with a hardcoded
+     order-2 match and now takes `cfg.coarse_match`, as do three scripts that
+     had the same hardcoding (`v2_m4_f32_mesh_gate`, `v2_m6_c2_pool`,
+     `v2_e2e4_device_cards`).
+- **Consequences:** every engine result before this ADR -- the 4096^3
+  realization and every accuracy ladder -- ran with EdS weights and the order-2
+  match. Their convergence statements hold for the equations they integrated;
+  their accuracy statements against emulators do not carry over. Banked ICs are
+  EdS-era and are refused under the new default; regenerate on demand.
+- **Validation (2026-09-25, laptop, cdev8, fresh LCDM ICs, one export shared
+  by every arm):**
+  - engine (LCDM weights, order 3, 120 steps, 8 tile workers) / DISCO-DJ:
+    max |r - 1| = 1.0e-3 over all 57 bins (was 13% at k = 1.56);
+  - single-mesh PM / DISCO-DJ: 9.9e-5 (reproduces the alpha-swap result);
+  - single-mesh 240 / 120 steps: 8.4e-4, still converged;
+  - LCDM vs EdS 2LPT ICs: velocities 1.3e-5 rms, positions below the T9
+    quantum;
+  - our alpha vs DISCO-DJ's on the 120-step grid: 1.3e-5 (kick weight 7.7e-4,
+    DISCO-DJ's tabulated growth); kick weight -> (3/2) Omega_m/f^2 at first
+    order in the step (`tests/test_growth2.py`);
+  - full suite 990 passed / 23 skipped after the fixes above.
+  Not yet run: the 512^3 re-score against EE2.

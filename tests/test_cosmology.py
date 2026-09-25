@@ -42,11 +42,13 @@ def test_growth_rate_limits():
     assert growth_rate_a(1.0, PLANCK) == pytest.approx(PLANCK.Omega_m**0.55, rel=1e-2)
 
 
-def test_second_order_growth_identities():
+def test_second_order_growth_eds_identities():
+    """The legacy EdS option; the LCDM default is pinned in test_growth2.py."""
     a = 0.5
     D1 = growth_factor_a(a, PLANCK)
-    assert growth_factor_2(a, PLANCK) == pytest.approx(-(3.0 / 7.0) * D1**2, rel=1e-12)
-    assert growth_rate_2(a, PLANCK) == pytest.approx(2.0 * growth_rate_a(a, PLANCK), rel=1e-12)
+    assert growth_factor_2(a, PLANCK, "eds") == pytest.approx(-(3.0 / 7.0) * D1**2, rel=1e-12)
+    assert growth_rate_2(a, PLANCK, "eds") == pytest.approx(2.0 * growth_rate_a(a, PLANCK),
+                                                             rel=1e-12)
 
 
 def test_E_of_a_endpoints():

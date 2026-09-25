@@ -190,7 +190,7 @@ class EngineConfig:
         device_cards=1,
         migrate_repack_fused=None,
         coarse_fold_kernel=True,
-        coarse_match_order=2,
+        coarse_match_order=3,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -326,9 +326,8 @@ class EngineConfig:
         # paints and gathers TSC (order 3), but the ratified factor (D-v2-10, the
         # probe) is built at CIC order, leaving sinc^2 per axis of the coarse
         # window on the long force: 3-4.5% low at r = 1.6-3.4 Mpc/h at production
-        # cells (`scripts/v2_force_profile.py`). 2 is the ratified arm and stays
-        # the default so every oracle and gate remains bitwise; 3 is the corrected
-        # arm under test.
+        # cells (`scripts/v2_force_profile.py`). 3 is the correct match and the
+        # default; 2 is the legacy arm that the probe parity gates are pinned to.
         if int(coarse_match_order) not in (2, 3):
             raise ValueError(f"coarse_match_order must be 2 or 3, got {coarse_match_order}")
         self.coarse_match_order = int(coarse_match_order)
@@ -398,8 +397,9 @@ class EngineConfig:
 
     @property
     def coarse_match(self):
-        """The `match` argument of the coarse solve. The ratified 2-tuple at the
-        default order, so the default path is the expression it always was."""
+        """The `match` argument of the coarse solve. Order 2 (the legacy CIC-order
+        match the probe parities were ratified on) keeps the original 2-tuple, so
+        that path is the expression it always was."""
         if self.coarse_match_order == 2:
             return (self.coarse_cell, self.fine_cell)
         return (self.coarse_cell, self.fine_cell, self.coarse_match_order, 2)
@@ -1892,8 +1892,9 @@ def checkpoint_fingerprint(cfg, coeffs):
     checkpoint having to name them or the caller having to pass a cosmology."""
     h = hashlib.sha256()
     fp = {k: getattr(cfg, k) for k in _FINGERPRINTED}
-    # added ONLY off the ratified default, so every checkpoint written before the
-    # knob existed keeps its fingerprint and still resumes
+    # added ONLY at orders other than 2, so every checkpoint written before the
+    # knob existed (all order 2) keeps its fingerprint and still resumes, and no
+    # order-3 run can collide with one of them
     if getattr(cfg, "coarse_match_order", 2) != 2:
         fp["coarse_match_order"] = cfg.coarse_match_order
     h.update(json.dumps(fp, sort_keys=True).encode())

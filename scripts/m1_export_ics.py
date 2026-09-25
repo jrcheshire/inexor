@@ -74,8 +74,9 @@ def export_ics(args):
     g_i = integrate._G_f(args.a_init, cosmo)
     g_f = integrate._G_f(args.a_final, cosmo)
     for order in args.lpt:
-        x, v_d = lpt.lpt_ics(
-            delta0, M.BOX_SIZE, args.a_init, cosmo, order=order, fdtype=jnp.float64
+        x, v_d = lpt.lpt_ics(  # v1 references: EdS D2 (D-013)
+            delta0, M.BOX_SIZE, args.a_init, cosmo, order=order, fdtype=jnp.float64,
+            growth2="eds",
         )
         tag = M.run_tag(args.n, args.steps, args.spacing, args.integrator, order, args.seed)
         cfg = dict(

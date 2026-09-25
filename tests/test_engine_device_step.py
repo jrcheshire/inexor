@@ -201,7 +201,7 @@ def test_the_compiled_step_writes_what_the_tile_loop_writes_directly():
     delta = engine.coarse_delta_streamed(ref, cfg)
     g = forces.coarse_force_meshes(
         jnp.asarray(delta), cfg.n_coarse, cfg.box_size, "long", r_s=cfg.r_s,
-        match=(cfg.coarse_cell, cfg.fine_cell), fdtype=cfg.np_coarse_dtype)
+        match=cfg.coarse_match, fdtype=cfg.np_coarse_dtype)
     b_real = cfg._b_realized
     members = {t: ref.tile_bricks(t, cfg.n_tile, b_real, cfg.n_brick, cfg.n_fine)
                for t in cfg.tiles}

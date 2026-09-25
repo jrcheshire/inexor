@@ -175,7 +175,7 @@ def leg_dtype_ledger(g, slack=0.10, arena_frac=0.02):
         delta = engine.coarse_delta_streamed(st, ec)
         meshes = forces.coarse_force_meshes(
             jnp.asarray(delta), ec.n_coarse, ec.box_size, "long", r_s=ec.r_s,
-            match=(ec.coarse_cell, ec.fine_cell), fdtype=ec.np_coarse_dtype,
+            match=ec.coarse_match, fdtype=ec.np_coarse_dtype,
         )
         origin, extent = forces.coarse_subblock_origin_extent(
             (0, 0, 0), ec.n_tile, ec.n_coarse, ec.n_fine

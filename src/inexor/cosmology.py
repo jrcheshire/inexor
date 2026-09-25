@@ -5,8 +5,10 @@ caller can import it before or without configuring JAX. Everything here is a
 constant of the run, computed in float64 and consumed by the integrator
 coefficient tables (integrate.py) and the IC generators (ic.py / lpt.py).
 
-Migrated verbatim from scripts/_m0_common.py (M0-verdicted bits) with mbody
-ports for the 2LPT growth pair and sigma_R (mbody/cosmology.py:377-493).
+Migrated from scripts/_m0_common.py (M0-verdicted bits) and mbody (sigma_R).
+The second-order growth D2 is the LCDM ODE solution, which the BullFrog weights
+need to be consistent (Rampf, List & Hahn 2024, Sec. 4.4); the EdS -(3/7) D^2
+survives only as an explicit option.
 linear_power gains a backend dispatch: "eh98" (analytic, self-contained) or
 "table" (tabulated (k, P) at z=0, e.g. a CAMB dump from the parity env --
 the M1 CAMB-parity hook, plan 2026-07-13).
@@ -77,22 +79,95 @@ def growth_factor_md(a, cosmo):
     return _growth_unnorm(float(a), cosmo)
 
 
-def growth_factor_2(a, cosmo):
-    """Second-order growth factor D2(a) for 2LPT, the EdS approximation.
+GROWTH2_MODELS = ("lcdm", "eds")
 
-    D2 = -(3/7) D1^2 (Bouchet et al. 1995; the standard 2LPT-IC choice).
-    Normalized consistently with growth_factor_a (D1(a=1) = 1), so the
-    Lagrangian displacement is Psi = D1 Psi1 + D2 Psi2. The dropped LCDM
-    correction Omega_m(a)^(-1/143) is < 0.9% at z=0 and ~2e-5 at IC redshifts
-    (mbody docstring, carried verbatim).
+_A_ODE_START = 1e-5
+_A_ODE_END = 2.0
+
+
+@lru_cache(maxsize=None)
+def _growth2_solution(cosmo):
+    """Dense solution of the linear and second-order growth ODEs in x = ln a.
+
+    With Om(a) = Omega_m / (a^3 E^2), both orders obey
+        y_xx + (2 - 3/2 Om(a)) y_x - 3/2 Om(a) y = src,
+    src = 0 for D and -3/2 Om(a) D^2 for the second-order growth E (Rampf, List &
+    Hahn 2024, eqs. 3.5). Started on the growing mode D = a - (2L/11) a^4,
+    E = -(3/7) D^2 - (3L/1001) D^5, L = Omega_Lambda / Omega_m, so both are
+    UNNORMALISED (D -> a as a -> 0, the `_growth_unnorm` convention). State is
+    (D, D_x, E, E_x).
     """
-    D1 = growth_factor_a(a, cosmo)
-    return -(3.0 / 7.0) * D1**2
+    from scipy.integrate import solve_ivp
+
+    Om0, lam = cosmo.Omega_m, cosmo.Omega_Lambda / cosmo.Omega_m
+
+    def rhs(x, y):
+        a = np.exp(x)
+        om = Om0 / (a**3 * E_of_a(a, cosmo) ** 2)
+        D, Dx, E, Ex = y
+        fr = 2.0 - 1.5 * om
+        return [Dx, 1.5 * om * D - fr * Dx, Ex, 1.5 * om * (E - D * D) - fr * Ex]
+
+    a0 = _A_ODE_START
+    D = a0 - (2.0 * lam / 11.0) * a0**4
+    Dx = a0 - (8.0 * lam / 11.0) * a0**4
+    E = -(3.0 / 7.0) * D**2 - (3.0 * lam / 1001.0) * D**5
+    Ex = (-(6.0 / 7.0) * D - (15.0 * lam / 1001.0) * D**4) * Dx
+    sol = solve_ivp(rhs, (np.log(a0), np.log(_A_ODE_END)), [D, Dx, E, Ex], method="DOP853",
+                    rtol=1e-13, atol=1e-30, dense_output=True, max_step=0.02)
+    if not sol.success:
+        raise RuntimeError(f"second-order growth ODE failed: {sol.message}")
+    return sol.sol
 
 
-def growth_rate_2(a, cosmo):
-    """Second-order growth rate f2 = dlnD2/dlna = 2 f1 (EdS approximation)."""
-    return 2.0 * growth_rate_a(a, cosmo)
+def _growth2_state(a, cosmo):
+    a = float(a)
+    if not (_A_ODE_START <= a <= _A_ODE_END):
+        raise ValueError(f"a = {a} is outside the growth ODE's range "
+                         f"[{_A_ODE_START}, {_A_ODE_END}]")
+    return _growth2_solution(cosmo)(np.log(a))
+
+
+def _check_model(model):
+    if model not in GROWTH2_MODELS:
+        raise ValueError(f"model must be one of {GROWTH2_MODELS}, got {model!r}")
+
+
+def growth_factor_2(a, cosmo, model="lcdm"):
+    """Second-order growth factor D2(a) for 2LPT, normalized with growth_factor_a.
+
+    Normalized consistently with growth_factor_a (D1(a=1) = 1), so the Lagrangian
+    displacement is Psi = D1 Psi1 + D2 Psi2 and D2 carries 1/D0^2.
+
+    model="lcdm" (default) is the solution of the LCDM second-order growth ODE
+    (`_growth2_solution`). model="eds" is the approximation D2 = -(3/7) D1^2
+    (Bouchet et al. 1995), off by ~2e-5 at z = 9 and ~0.8% at z = 0; kept only to
+    reproduce runs made with it.
+    """
+    _check_model(model)
+    if model == "eds":
+        return -(3.0 / 7.0) * growth_factor_a(a, cosmo) ** 2
+    return float(_growth2_state(a, cosmo)[2]) / _D0(cosmo) ** 2
+
+
+def growth_rate_2(a, cosmo, model="lcdm"):
+    """Second-order growth rate f2 = dlnD2/dlna. model="eds" gives 2 f1."""
+    _check_model(model)
+    if model == "eds":
+        return 2.0 * growth_rate_a(a, cosmo)
+    s = _growth2_state(a, cosmo)
+    return float(s[3] / s[2])
+
+
+def growth2_and_slope(a, cosmo):
+    """(D2, dD2/dD1) at `a` from the LCDM ODE, normalized with growth_factor_a.
+
+    The pair the BullFrog weights need (`integrate._bullfrog_weights`); the slope
+    is taken against the NORMALIZED D1, so it carries 1/D0.
+    """
+    D, Dx, E, Ex = _growth2_state(a, cosmo)
+    D0 = _D0(cosmo)
+    return float(E) / D0**2, float(Ex / Dx) / D0
 
 
 # ============================================================================

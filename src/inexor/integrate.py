@@ -17,6 +17,9 @@ between the codec/force milestones and that one.
 
 Three integrator families, all still live as coefficient sources:
 - "bullfrog": DKD with an affine kick (Rampf, List & Hahn 2024). The flagship.
+  Its weights take the LCDM second-order growth by default; the EdS
+  -(3/7) D^2 form converges to a different, EdS-coupled solution (paper Sec. 4.4)
+  and is kept only as `growth2="eds"`.
 - "fastpm":   growth-corrected KDK (Feng et al. 2016).
 - "exact":    KDK with literal background integrals (mbody "exact"); the
   fallback. ~2% growth deficit at low step count -- expected, tested at the
@@ -37,7 +40,13 @@ import jax.numpy as jnp
 import numpy as np
 from scipy.integrate import quad
 
-from .cosmology import E_of_a, growth_factor_a, growth_rate_a
+from .cosmology import (
+    GROWTH2_MODELS,
+    E_of_a,
+    growth2_and_slope,
+    growth_factor_a,
+    growth_rate_a,
+)
 
 # ============================================================================
 # Coefficient tables (host numpy/scipy float64 island; constants of the run)
@@ -53,17 +62,22 @@ def a_grid(a_init, a_final, n_steps, spacing="log"):
     raise ValueError(f"spacing must be 'log' or 'linear', got {spacing!r}")
 
 
-def _bullfrog_weights(D0, D1):
-    """BullFrog (alpha, beta, dD, D_mid) for a step D0 -> D1. Verbatim mbody port.
+def _bullfrog_weights(D0, D1, e=None):
+    """BullFrog (alpha, beta, dD, D_mid) for a step D0 -> D1 (Rampf, List & Hahn
+    2024, Eqs. 2.3-2.4).
 
-    EdS second-order growth E = -(3/7)D^2, E' = -(6/7)D; paper Eqs 2.3-2.4
-    (Rampf, List & Hahn 2024). Pure function of the two growth values.
+    `e = (E0, E0', E1')` is the second-order growth at D0 and its slope dE/dD at
+    D0 and D1, from `cosmology.growth2_and_slope`. The weights are invariant under
+    D -> cD, E -> c^2 E, so any consistent normalization works. `e=None` is the
+    EdS special case E = -(3/7) D^2, E' = -(6/7) D, the closed form Eq. 2.3 reduces
+    to at Omega_m = 1; in LCDM it is not consistent (paper Sec. 4.4).
     """
     dD = D1 - D0
     D_mid = D0 + 0.5 * dD
-    E0 = -(3.0 / 7.0) * D0 * D0
-    E0p = -(6.0 / 7.0) * D0
-    E1p = -(6.0 / 7.0) * D1
+    if e is None:
+        E0, E0p, E1p = -(3.0 / 7.0) * D0 * D0, -(6.0 / 7.0) * D0, -(6.0 / 7.0) * D1
+    else:
+        E0, E0p, E1p = e
     F_mid = (E0 + E0p * 0.5 * dD) / D_mid - D_mid
     alpha = (E1p - F_mid) / (E0p - F_mid)
     return alpha, 1.0 - alpha, dD, D_mid
@@ -80,17 +94,30 @@ class BullFrogTable(NamedTuple):
     D_mid: np.ndarray  # (K,)
 
 
-def bullfrog_table(a_steps, cosmo, D_of_a=None):
-    """BullFrog weights for a schedule; D_of_a overrides growth (EdS pin test)."""
+def bullfrog_table(a_steps, cosmo, D_of_a=None, growth2="lcdm"):
+    """BullFrog weights for a schedule.
+
+    growth2="lcdm" (default) takes the second-order growth from the LCDM ODE;
+    "eds" uses -(3/7) D^2, only to reproduce runs made with it. D_of_a overrides
+    the linear growth (the EdS pin test) and so requires growth2="eds": an
+    overridden D has no matching LCDM second-order growth.
+    """
+    if growth2 not in GROWTH2_MODELS:
+        raise ValueError(f"growth2 must be one of {GROWTH2_MODELS}, got {growth2!r}")
+    if D_of_a is not None and growth2 != "eds":
+        raise ValueError("D_of_a overrides the linear growth; pass growth2='eds' with it")
     a_steps = np.asarray(a_steps, dtype=np.float64)
     if D_of_a is None:
         D_steps = np.array([growth_factor_a(a, cosmo) for a in a_steps])
     else:
         D_steps = np.array([D_of_a(a) for a in a_steps])
     K = len(a_steps) - 1
+    if growth2 == "lcdm":
+        E, Ep = np.array([growth2_and_slope(a, cosmo) for a in a_steps]).T
     alphas, betas, dD, D_mid = (np.empty(K) for _ in range(4))
     for k in range(K):
-        alphas[k], betas[k], dD[k], D_mid[k] = _bullfrog_weights(D_steps[k], D_steps[k + 1])
+        e = None if growth2 == "eds" else (E[k], Ep[k], Ep[k + 1])
+        alphas[k], betas[k], dD[k], D_mid[k] = _bullfrog_weights(D_steps[k], D_steps[k + 1], e)
     return BullFrogTable(a_steps, D_steps, alphas, betas, dD, D_mid)
 
 

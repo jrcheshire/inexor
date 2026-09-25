@@ -72,6 +72,8 @@ class _Args:
         self.alloc_margin = 0.10
         self.arena_frac = 0.01
         self.a_init = rlz.m3.A_INIT
+        # `_manifest` records no growth2, which means the legacy EdS generation
+        self.growth2 = "eds"
 
 
 def _manifest(d, kind):
@@ -330,6 +332,43 @@ def test_ics_at_another_epoch_are_refused(tmp_path):
     with pytest.raises(SystemExit) as e:
         rlz._require_ic_epoch(d, 1.0 / 51.0)
     assert "a_init" in str(e.value)
+
+
+def _growth2_manifest(d, growth2):
+    import json
+
+    from inexor import icgen
+
+    d.mkdir(parents=True, exist_ok=True)
+    body = {"schema": "t9-slabs-2", "provenance": {}}
+    if growth2 is not None:
+        body["growth2"] = growth2
+    (d / icgen.MANIFEST).write_text(json.dumps(body))
+    return str(d)
+
+
+def test_ics_with_the_other_growth2_are_refused(tmp_path):
+    import pytest
+
+    rlz._require_ic_growth2(_growth2_manifest(tmp_path / "a", "lcdm"), "lcdm")
+    with pytest.raises(SystemExit, match="growth2"):
+        rlz._require_ic_growth2(_growth2_manifest(tmp_path / "b", "lcdm"), "eds")
+
+
+def test_a_manifest_without_growth2_is_eds(tmp_path):
+    import pytest
+
+    d = _growth2_manifest(tmp_path / "old", None)
+    rlz._require_ic_growth2(d, "eds")
+    with pytest.raises(SystemExit, match="growth2"):
+        rlz._require_ic_growth2(d, "lcdm")
+
+
+def test_growth2_changes_the_coefficients():
+    """So the checkpoint fingerprint, which hashes them, keeps the two apart."""
+    lcdm = rlz._coeffs(rlz._cosmo(), 40)[0]
+    eds = rlz._coeffs(rlz._cosmo(), 40, None, "eds")[0]
+    assert np.array_equal(lcdm[:, 0], eds[:, 0]) and not np.allclose(lcdm[:, 1:], eds[:, 1:])
 
 
 def test_a_manifest_without_an_epoch_is_only_the_ratified_start(tmp_path):

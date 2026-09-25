@@ -67,7 +67,8 @@ def _evolve(ics, cfg, zero_nyquist):
     cosmo = config.Cosmology(**M.COSMO)
     a_steps = np.asarray(ics["a_steps"], dtype=np.float64)
     force = _force_fn(cfg["n_mesh"], cfg["box_size"], cfg["n_mesh"] ** 3, zero_nyquist)
-    coeffs = integrate.bullfrog_float_coeffs(integrate.bullfrog_table(a_steps, cosmo))
+    # v1 stored-reference conventions: EdS weights (D-013)
+    coeffs = integrate.bullfrog_float_coeffs(integrate.bullfrog_table(a_steps, cosmo, growth2="eds"))
     x = jnp.asarray(ics["x"], dtype=jnp.float64)
     v = jnp.asarray(ics["v_d"], dtype=jnp.float64)
     for c in coeffs:

@@ -258,7 +258,7 @@ def _preamble(engine, ec, st, coeff, jnp_mod):
     delta = engine.coarse_delta_streamed(st, ec)
     g_coarse = coarse_force_meshes(
         jnp_mod.asarray(delta), ec.n_coarse, ec.box_size, "long", r_s=ec.r_s,
-        match=(ec.coarse_cell, ec.fine_cell), fdtype=ec.np_coarse_dtype,
+        match=ec.coarse_match, fdtype=ec.np_coarse_dtype,
     )
     g_coarse = [np.asarray(g) for g in g_coarse]
     b_real = ec._b_realized

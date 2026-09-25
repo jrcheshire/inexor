@@ -369,15 +369,15 @@ def _engine_config(g, args, checkpoint_dir):
         # a derived alpha is the whole point of --n-coarse; without this the
         # split scale would silently revert to the ratified default
         **({} if "alpha" not in g else {"alpha": g["alpha"]}),
-        # getattr: tests build a bare Namespace, and the ratified order is the
-        # default an absent flag must mean
-        coarse_match_order=getattr(args, "coarse_match_order", 2),
+        # getattr: tests build a bare Namespace, and an absent flag must mean
+        # the library default
+        coarse_match_order=getattr(args, "coarse_match_order", 3),
     )
     ec.validate()
     return ec
 
 
-def _coeffs(cosmo, k_steps=K_STEPS, a_init=None):
+def _coeffs(cosmo, k_steps=K_STEPS, a_init=None, growth2="lcdm"):
     """The BullFrog coefficients and the scale-factor grid for `k_steps` steps.
 
     `a_init` defaults to the ratified start, a = 0.1 (z = 9). It enters the
@@ -388,7 +388,9 @@ def _coeffs(cosmo, k_steps=K_STEPS, a_init=None):
     step counts share their epoch and their k bins and difference directly.
     The checkpoint fingerprint hashes these coefficients, so a run at one step
     count cannot resume another's checkpoint -- it is refused rather than
-    silently continued onto a different trajectory.
+    silently continued onto a different trajectory. `growth2` selects the
+    BullFrog weights' second-order growth ("lcdm", or the legacy "eds"), and
+    also enters the coefficients and so the fingerprint.
     """
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
 
@@ -396,7 +398,7 @@ def _coeffs(cosmo, k_steps=K_STEPS, a_init=None):
     if not 0.0 < a0 < m3.A_FINAL:
         raise SystemExit(f"a_init {a0} must lie in (0, {m3.A_FINAL})")
     a_steps = a_grid(a0, m3.A_FINAL, int(k_steps), m3.SPACING)
-    return bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo)), a_steps
+    return bullfrog_float_coeffs(bullfrog_table(a_steps, cosmo, growth2=growth2)), a_steps
 
 
 def _require_ic_epoch(ic_dir, a_init):
@@ -425,11 +427,29 @@ def _require_ic_epoch(ic_dir, a_init):
             f"this run asks for {want!r}. Regenerate them, or pass the matching --a-init.")
 
 
+def _require_ic_growth2(ic_dir, growth2):
+    """Refuse ICs whose 2LPT second-order growth differs from the run's.
+
+    The generator bakes D2 and f2 into the ICs; the run's BullFrog weights take
+    the same choice. A manifest that records none predates the flag and was made
+    with the EdS approximation.
+    """
+    from inexor import icgen
+
+    with open(os.path.join(ic_dir, icgen.MANIFEST)) as fh:
+        have = json.load(fh).get("growth2", "eds")
+    if have != growth2:
+        raise SystemExit(
+            f"the ICs in {ic_dir} were generated with growth2 = {have!r} and this run "
+            f"asks for {growth2!r}. Regenerate them, or pass the matching --growth2.")
+
+
 def _card(kind, args, body, tag=""):
     card = dict(card=f"inexor-realization-{kind}-1", config=args.config,
                 workdir=args.workdir, commit=_git_commit(), host=platform.node(),
                 machine=platform.machine(), numpy=np.__version__,
-                k_steps=int(args.k_steps), when=time.strftime("%Y-%m-%dT%H:%M:%S"), **body)
+                k_steps=int(args.k_steps), growth2=getattr(args, "growth2", "lcdm"),
+                when=time.strftime("%Y-%m-%dT%H:%M:%S"), **body)
     # the tag keeps a segmented run's cards: without it each segment's card
     # overwrote the last and a multi-day run would end holding only its final leg
     path = os.path.join(args.workdir, f"realization_{kind}{tag}.json")
@@ -494,12 +514,13 @@ def cmd_ics(args):
             fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
             pencil_batch=args.pencil_batch, noise=args.noise, provenance=prov,
             bucket_cells=args.bucket_cells, log=lambda line: print(line, flush=True),
+            growth2=args.growth2,
         )
     else:
         man = icgen.generate_t9_slabs(
             args.workdir, key, g["n_part"], g["L"], _cosmo(), args.a_init, nb,
             fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
-            provenance=prov, bucket_cells=args.bucket_cells,
+            provenance=prov, bucket_cells=args.bucket_cells, growth2=args.growth2,
         )
     wall = time.perf_counter() - t0
     peak = _maxrss_bytes()
@@ -526,7 +547,7 @@ def cmd_run(args):
     from inexor import engine, icgen
 
     cosmo = _cosmo()
-    co, a_steps = _coeffs(cosmo, args.k_steps, args.a_init)
+    co, a_steps = _coeffs(cosmo, args.k_steps, args.a_init, args.growth2)
     d = _ckpt_dir(args)
     os.makedirs(d, exist_ok=True)
     ec = _engine_config(g, args, d)
@@ -553,6 +574,7 @@ def cmd_run(args):
             return 0
     else:
         _require_ic_epoch(args.workdir, args.a_init)
+        _require_ic_growth2(args.workdir, args.growth2)
         st = icgen.load_slot_state(
             args.workdir, brick_slack=args.slack, alloc_margin=args.alloc_margin,
             arena_frac=args.arena_frac, alloc=allocator,
@@ -718,6 +740,7 @@ def _ic_state(args, alloc=None):
             % float(args.a_init)
         )
     _require_ic_epoch(args.ic_dir, args.a_init)
+    _require_ic_growth2(args.ic_dir, args.growth2)
     return icgen.load_slot_state(
         args.ic_dir, brick_slack=args.slack, alloc_margin=args.alloc_margin,
         arena_frac=args.arena_frac, alloc=alloc,
@@ -730,7 +753,7 @@ def cmd_export(args):
     from inexor import export
 
     cosmo = _cosmo()
-    co, a_steps = _coeffs(cosmo, args.k_steps, args.a_init)
+    co, a_steps = _coeffs(cosmo, args.k_steps, args.a_init, args.growth2)
     ec = _engine_config(g, args, _ckpt_dir(args))
     st, step = _state_at_head(args, ec, co)
     if step < args.k_steps and not args.allow_partial:
@@ -816,7 +839,7 @@ def cmd_card(args):
     from inexor.executor import SharedAllocator, TilePool, malloc_trim
 
     cosmo = _cosmo()
-    co, a_steps = _coeffs(cosmo, args.k_steps, args.a_init)
+    co, a_steps = _coeffs(cosmo, args.k_steps, args.a_init, args.growth2)
     ec = _engine_config(g, args, _ckpt_dir(args))
 
     # THE PAINT IS THE CARD'S LARGEST STAGE AND IT IS THE ONE THAT POOLS.
@@ -963,11 +986,18 @@ def build_parser():
                     help="starting scale factor, for ICs and the step grid alike "
                          "(default the ratified 0.1, z = 9). Loading ICs made at "
                          "another epoch is refused")
-    ap.add_argument("--coarse-match-order", type=int, default=2, choices=(2, 3),
+    ap.add_argument("--coarse-match-order", type=int, default=3, choices=(2, 3),
                     help="assignment order the coarse match factor divides out. "
-                         "2 (CIC) is the ratified arm; the coarse arm paints TSC, "
-                         "so 3 is the corrected one. In the checkpoint fingerprint "
-                         "when not 2, so arms cannot cross-resume")
+                         "The coarse arm paints TSC, so 3 (default) is correct; 2 "
+                         "(CIC) is the legacy arm the probe parities were ratified "
+                         "on. In the checkpoint fingerprint when not 2, so arms "
+                         "cannot cross-resume")
+    ap.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"),
+                    help="second-order growth for the 2LPT ICs and the BullFrog "
+                         "weights: the LCDM ODE solution (default) or the legacy EdS "
+                         "-(3/7) D^2, which converges to an EdS-coupled solution. "
+                         "Recorded in the IC manifest; run and card refuse ICs made "
+                         "with the other")
     ap.add_argument("--buf", type=int, default=None,
                     help="override the buffer in FINE CELLS. Changes beta and the "
                          "split's truncation error, both of which get printed")

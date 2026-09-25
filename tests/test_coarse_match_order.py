@@ -2,10 +2,10 @@
 
 The coarse arm paints and gathers TSC while the ratified factor divides out a
 CIC window, so the long force keeps sinc^2 per axis of the coarse window.
-`coarse_match_order=3` corrects it; 2 stays the default so every oracle and gate
-remains bitwise. These tests pin both halves: the default is the ratified
-expression unchanged, and the corrected arm meets its Ewald target where the
-ratified one measurably does not.
+`coarse_match_order=3` corrects it and is the default; 2 is the legacy arm the
+probe parity gates are pinned to. These tests pin both halves: order 2 is the
+ratified expression unchanged, and the corrected arm meets its Ewald target
+where the ratified one measurably does not.
 """
 
 import argparse
@@ -37,8 +37,9 @@ def _cfg(**kw):
                         b_fine=32, **kw)
 
 
-def test_the_default_is_the_ratified_two_tuple():
-    assert _cfg().coarse_match == (1.0, 0.25)
+def test_order_two_is_the_ratified_two_tuple_and_three_the_default():
+    assert _cfg(coarse_match_order=2).coarse_match == (1.0, 0.25)
+    assert _cfg().coarse_match == (1.0, 0.25, 3, 2)
 
 
 def test_order_two_spelled_out_is_bitwise_the_ratified_factor():
@@ -69,19 +70,20 @@ def test_only_orders_two_and_three_are_accepted():
         _cfg(coarse_match_order=4)
 
 
-def test_the_default_fingerprint_is_the_pre_knob_one():
-    """Every checkpoint on disk, the 4096^3 generations included, was written
-    before the knob existed and must still resume."""
+def test_the_order_two_fingerprint_is_the_pre_knob_one():
+    """Every checkpoint on disk, the 4096^3 generations included, was written at
+    order 2 before the knob existed and must still resume at order 2 -- and never
+    under the order-3 default."""
     import hashlib
     import json
 
-    cfg = _cfg()
+    cfg = _cfg(coarse_match_order=2)
     co = np.linspace(0.0, 1.0, 7)
     h = hashlib.sha256()
     h.update(json.dumps({k: getattr(cfg, k) for k in _FINGERPRINTED}, sort_keys=True).encode())
     h.update(np.ascontiguousarray(co, dtype=np.float64).tobytes())
     assert checkpoint_fingerprint(cfg, co) == h.hexdigest()
-    assert checkpoint_fingerprint(_cfg(coarse_match_order=3), co) != h.hexdigest()
+    assert checkpoint_fingerprint(_cfg(), co) != h.hexdigest()
 
 
 def test_the_driver_passes_the_order_to_the_engine():
@@ -90,8 +92,10 @@ def test_the_driver_passes_the_order_to_the_engine():
     a = argparse.Namespace(slack=0.10, tile_workers=1, checkpoint_every=5,
                            migrate_pooled=None, eject_kernel="jax", coarse_match_order=3)
     assert rlz._engine_config(rlz._geom("cdev8"), a, "/tmp/nowhere").coarse_match_order == 3
-    del a.coarse_match_order
+    a.coarse_match_order = 2
     assert rlz._engine_config(rlz._geom("cdev8"), a, "/tmp/nowhere").coarse_match_order == 2
+    del a.coarse_match_order
+    assert rlz._engine_config(rlz._geom("cdev8"), a, "/tmp/nowhere").coarse_match_order == 3
 
 
 def _long_arm_error(order):
