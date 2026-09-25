@@ -546,10 +546,11 @@ def under(path, root):
     return a == b or a.startswith(b + os.sep)
 
 
-def _planner(preset, cards, slack, arena):
+def _planner(preset, cards, slack, arena, alloc_margin=0.10):
     cmd = [sys.executable, "-m", "inexor.plan", "--preset", preset, "--backend", "device",
            "--n-gpus", str(cards), "--host-gb", "1026", "--device-gb", "199",
-           "--arena-frac", str(arena), "--slack", str(slack)]
+           "--arena-frac", str(arena), "--slack", str(slack),
+           "--alloc-margin", str(alloc_margin)]
     out = subprocess.run(cmd, capture_output=True, text=True,
                          env=dict(os.environ, PYTHONPATH=os.path.join(REPO, "src"))).stdout
 
@@ -616,8 +617,13 @@ def cmd_preflight(args):
         refusals.append(f"manifest holds {man['n_particles']} particles")
     if len(man["files"]) != int(man["bricks_per_side"]):
         refusals.append(f"{len(man['files'])} slab files for {man['bricks_per_side']} slabs")
+    # a manifest without the field predates it and was generated with EdS D2
+    card["manifest"]["growth2"] = man.get("growth2", "eds")
+    if card["manifest"]["growth2"] != args.growth2:
+        refusals.append(f"the ICs were generated with growth2 = {card['manifest']['growth2']!r} "
+                        f"and the run asks for {args.growth2!r}")
 
-    plan = _planner(args.preset, args.cards, args.slack, args.arena_frac)
+    plan = _planner(args.preset, args.cards, args.slack, args.arena_frac, args.alloc_margin)
     card["planner"] = plan
     _rss, _hwm, avail = host_memory()
     nm = numa_memory()
@@ -658,7 +664,7 @@ def cmd_run(args):
 
     from inexor import engine, icgen
     from inexor.plan import engine_config
-    from v2_m6_realization import _coeffs, _cosmo
+    from v2_m6_realization import _coeffs, _cosmo, _require_ic_growth2
 
     jax.config.update("jax_enable_x64", True)
     ics = os.path.realpath(args.workdir)
@@ -668,6 +674,13 @@ def cmd_run(args):
             raise SystemExit(f"FATAL: {what} would be written under the IC directory")
     if args.checkpoint_every and not args.checkpoint_dir:
         raise SystemExit("FATAL: --checkpoint-every needs --checkpoint-dir")
+    if args.expect_step and not args.checkpoint_dir:
+        raise SystemExit("FATAL: --expect-step needs --checkpoint-dir to resume from")
+    if not args.expect_step and args.checkpoint_dir and any(
+            os.path.exists(os.path.join(args.checkpoint_dir, f"gen{g}", "manifest.json"))
+            for g in (0, 1)):
+        raise SystemExit(f"FATAL: {args.checkpoint_dir} already holds a checkpoint; a run "
+                         "from the ICs would overwrite it. Pass --expect-step to resume.")
     if args.membind_nodes:
         bad = membind_refusals(_node_list(args.membind_nodes))
         if bad:
@@ -684,7 +697,8 @@ def cmd_run(args):
         raise SystemExit(f"FATAL: checkpoint probe dir {args.ckpt_probe_dir} is not empty")
     mon = Monitor(args.card, card, beat_s=args.beat, fail_at=os.environ.get("D7_FAIL_AT"),
                   with_numa_maps=args.numa_maps)
-    card["plan"] = dict(stop_at=args.stop_at, timed_last=args.timed_last,
+    card["plan"] = dict(stop_at=args.stop_at, k_steps=args.k_steps,
+                        expect_step=args.expect_step, timed_last=args.timed_last,
                         timed_all=args.timed_all, numa_maps=args.numa_maps,
                         drop_ic_cache=args.drop_ic_cache,
                         ckpt_probe_slabs=args.ckpt_probe_slabs, trim_probe=args.trim_probe,
@@ -705,13 +719,35 @@ def cmd_run(args):
         card["config"] = dict(tile_window=ec.tile_window, fused_pass=ec.fused_pass,
                               device_cards=ec.device_cards, checkpoint_dir=ec.checkpoint_dir,
                               coarse_dtype=ec.coarse_dtype, fine_dtype=ec.fine_dtype)
-        print(f"== D7 run {args.preset}: {args.cards} cards, K={args.stop_at}, "
-              f"window={ec.tile_window} fused={ec.fused_pass}, from {args.workdir}", flush=True)
+        src = (f"the step-{args.expect_step} checkpoint in {args.checkpoint_dir}"
+               if args.expect_step else args.workdir)
+        print(f"== D7 run {args.preset}: {args.cards} cards, steps {args.expect_step} -> "
+              f"{args.stop_at} of {args.k_steps}, window={ec.tile_window} "
+              f"fused={ec.fused_pass}, from {src}", flush=True)
         mon.start()
 
-        st = icgen.load_slot_state(args.workdir, brick_slack=args.slack,
-                                   alloc_margin=args.alloc_margin, arena_frac=args.arena_frac,
-                                   drop_cache=args.drop_ic_cache)
+        cosmo = _cosmo()
+        co, a_steps = _coeffs(cosmo, args.k_steps, growth2=args.growth2)
+        resume = None
+        if args.expect_step:
+            # a resume job that silently restarted from the ICs would burn its whole
+            # wall redoing finished steps, so the step it resumes from is stated
+            st, resume = engine.load_checkpoint(
+                args.checkpoint_dir, ec, co, brick_slack=args.slack,
+                alloc_margin=args.alloc_margin, arena_frac=args.arena_frac)
+            if int(resume["step"]) != args.expect_step:
+                raise RuntimeError(
+                    f"the newest checkpoint under {args.checkpoint_dir} is at step "
+                    f"{resume['step']}, and this job was submitted to resume from step "
+                    f"{args.expect_step}")
+        else:
+            _require_ic_growth2(args.workdir, args.growth2)
+            st = icgen.load_slot_state(args.workdir, brick_slack=args.slack,
+                                       alloc_margin=args.alloc_margin,
+                                       arena_frac=args.arena_frac,
+                                       drop_cache=args.drop_ic_cache)
+        k0 = 0 if resume is None else int(resume["step"])
+        card["start_step"] = k0
         card["state"] = dict(n_particles=st.n_particles, n_bricks=st.n_bricks,
                              rows=int(st.off.shape[0]), n_arena=int(st.n_arena))
         mon("load")
@@ -729,8 +765,7 @@ def cmd_run(args):
                     f"{off / GB:.1f} GB of the loaded state sits on CPU-less (HBM) nodes "
                     f"{sorted(where)}: those bytes are on the cards, which will OOM in the "
                     "step. The membind did not hold.")
-        co, a_steps = _coeffs(_cosmo())
-        timed = (tuple(range(args.stop_at)) if args.timed_all
+        timed = (tuple(range(k0, args.stop_at)) if args.timed_all
                  else (args.stop_at - 1,) if args.timed_last else ())
 
         def collect(stats):
@@ -739,8 +774,8 @@ def cmd_run(args):
             with mon.lock:
                 card["steps"].append(s)
 
-        out = engine.run(st, ec, co, phase=mon, stop_at=args.stop_at, collect=collect,
-                         timed_steps=timed)
+        out = engine.run(st, ec, co, phase=mon, resume=resume, stop_at=args.stop_at,
+                         collect=collect, timed_steps=timed, epoch=(a_steps, cosmo))
         card["finished"] = time.time()
         # a checkpoint is written after the last boundary and has none of its own
         card["after_last_boundary_s"] = card["finished"] - mon.t_last
@@ -923,6 +958,8 @@ def main(argv=None):
         p.add_argument("--slack", type=float, default=0.10)
         p.add_argument("--alloc-margin", type=float, default=0.10)
         p.add_argument("--arena-frac", type=float, default=0.01)
+        p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"),
+                       help="the second-order growth the ICs must have been generated with")
     pf = sub.choices["preflight"]
     pf.add_argument("--scratch", default=os.environ.get("SCRATCH", "/tmp"))
     pf.add_argument("--host-margin", type=float, default=0.95,
@@ -930,7 +967,13 @@ def main(argv=None):
                          "nodes' MemTotal")
     pf.add_argument("--allow-cpu", action="store_true")
     pr = sub.choices["run"]
-    pr.add_argument("--stop-at", type=int, required=True, help="steps to run from the ICs")
+    pr.add_argument("--stop-at", type=int, required=True,
+                    help="absolute step to stop before (a checkpoint boundary when checkpointing)")
+    pr.add_argument("--k-steps", type=int, default=40,
+                    help="steps in the whole schedule; a segment runs part of it")
+    pr.add_argument("--expect-step", type=int, default=0,
+                    help="0 = start from the ICs; else resume from the newest checkpoint "
+                         "under --checkpoint-dir, refusing unless it is at this step")
     pr.add_argument("--timed-last", action="store_true",
                     help="synced per-phase breakdown of the device passes on the last step")
     pr.add_argument("--timed-all", action="store_true",

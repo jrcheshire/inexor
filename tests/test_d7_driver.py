@@ -121,3 +121,62 @@ def test_pages_off_the_cpu_nodes_names_the_hbm_nodes():
 
 def test_node_list_parses_ranges_and_lists():
     assert d7._node_list("0,1") == {0, 1} and d7._node_list("0-3") == {0, 1, 2, 3}
+
+
+def _slabs(d):
+    return {f: open(os.path.join(d, f), "rb").read()
+            for f in sorted(os.listdir(d)) if f != "manifest.json"}
+
+
+def test_a_segmented_run_resumes_to_the_uninterrupted_state_and_refuses_misuse(tmp_path):
+    """The driver's segment path, which a 120-step 4096^3 realization needs because
+    the schedule is longer than a queue's wall: two segments with a resume between
+    them land bitwise on the uninterrupted run, and the two ways a batch script can
+    get a resume wrong -- restarting from the ICs onto a live checkpoint directory,
+    or resuming from a step it was not submitted for -- refuse instead of burning
+    the wall."""
+    import json
+
+    import v2_m6_realization as m6
+
+    ics = str(tmp_path / "ics")
+    m6.cmd_ics(m6.build_parser().parse_args(["ics", "--config", "smoke", "--workdir", ics]))
+
+    def run(ckpt, stop, expect=0):
+        return d7.main(["run", "--preset", "smoke", "--workdir", ics, "--cards", "1",
+                        "--card", str(tmp_path / f"card_{stop}_{expect}.json"),
+                        "--k-steps", "40", "--stop-at", str(stop), "--expect-step", str(expect),
+                        "--checkpoint-dir", ckpt, "--checkpoint-every", "2", "--beat", "30"])
+
+    full, seg = str(tmp_path / "full"), str(tmp_path / "seg")
+    assert run(full, 4) == 0
+    assert run(seg, 2) == 0
+    with pytest.raises(SystemExit, match="already holds a checkpoint"):
+        run(seg, 2)
+    with pytest.raises(RuntimeError, match="submitted to resume from step 3"):
+        run(seg, 4, expect=3)
+    assert run(seg, 4, expect=2) == 0
+
+    assert _slabs(os.path.join(full, "gen1")) == _slabs(os.path.join(seg, "gen1"))
+    with open(os.path.join(seg, "gen1", "manifest.json")) as fh:
+        prov = json.load(fh)["provenance"]
+    assert (prov["step"], prov["n_steps"]) == (4, 40)
+    assert prov.get("a") is not None, "the checkpoint does not record its epoch"
+
+
+def test_the_driver_refuses_ics_generated_with_another_growth2(tmp_path):
+    import json
+
+    import v2_m6_realization as m6
+
+    ics = str(tmp_path / "ics")
+    m6.cmd_ics(m6.build_parser().parse_args(["ics", "--config", "smoke", "--workdir", ics]))
+    p = os.path.join(ics, "manifest.json")
+    with open(p) as fh:
+        man = json.load(fh)
+    man.pop("growth2")  # what every manifest written before the flag looks like
+    with open(p, "w") as fh:
+        json.dump(man, fh)
+    with pytest.raises(SystemExit, match="growth2 = 'eds'"):
+        d7.main(["run", "--preset", "smoke", "--workdir", ics, "--cards", "1",
+                 "--card", str(tmp_path / "card.json"), "--stop-at", "2"])
