@@ -30,6 +30,13 @@
 #   card     serial card of DISCO-DJ's final particles
 #
 # BUDGET: gh = 1 SU/node-hr; expected ~0.5 h, 1.5 h wall.
+#
+# DISCO_BACKEND=cpu runs DISCO-DJ on JAX's CPU backend instead (e.g. on gg, whose
+# queue is short): disco-mocks' `default` env + its `setup` task (CPU jax 0.10.1,
+# discodj a687972), a CPU device asserted. The parity settings are identical;
+# cdev8 GPU and CPU cards agreed to 1e-6. Submit with -p gg and a longer -t: the
+# 512^3 CPU rate is unmeasured, so the smoke leg's wall is scaled by 64 and
+# printed before the evolve commits.
 
 set -u
 export PATH="$HOME/.pixi/bin:$PATH"
@@ -51,7 +58,7 @@ echo "=== $(hostname) job $SLURM_JOB_ID $(date) ==="
 echo "ICs: $IC"
 git -C "$INEXOR" log --oneline -1
 git -C "$DISCO" log --oneline -1
-nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
+command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || echo "no GPU on this node"
 
 leg () {
   local name="$1"; shift
@@ -63,8 +70,17 @@ leg () {
 
 # inexor legs run on the CPU backend; the disco legs on the card
 inexor () { (cd "$INEXOR" && JAX_PLATFORMS=cpu pixi run -e gpu python "$@"); }
-disco () { (cd "$INEXOR" && XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
-  pixi run --manifest-path "$DISCO/pixi.toml" -e gpu python "$@"); }
+BACKEND=${DISCO_BACKEND:-gpu}
+case "$BACKEND" in
+  gpu) DENV=gpu; DSETUP=setup-gpu; DPLAT=gpu
+       disco () { (cd "$INEXOR" && XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
+         pixi run --manifest-path "$DISCO/pixi.toml" -e gpu python "$@"); } ;;
+  cpu) DENV=default; DSETUP=setup; DPLAT=cpu
+       disco () { (cd "$INEXOR" && JAX_PLATFORMS=cpu \
+         pixi run --manifest-path "$DISCO/pixi.toml" -e default python "$@"); } ;;
+  *) echo "FATAL: DISCO_BACKEND must be gpu or cpu, got $BACKEND"; exit 1 ;;
+esac
+echo "DISCO-DJ backend: $BACKEND (env $DENV)"
 
 # ---- guards: nothing about either checkout or env is assumed
 clean_checkout () {  # tracked files must be unmodified; untracked logs are fine
@@ -74,7 +90,7 @@ clean_checkout () {  # tracked files must be unmodified; untracked logs are fine
 leg checkout-inexor clean_checkout "$INEXOR"
 leg checkout-disco clean_checkout "$DISCO"
 leg env-inexor bash -c "cd '$INEXOR' && pixi install -e gpu"
-leg env-disco bash -c "cd '$DISCO' && pixi install -e gpu && pixi run -e gpu setup-gpu"
+leg env-disco bash -c "cd '$DISCO' && pixi install -e $DENV && pixi run -e $DENV $DSETUP"
 leg gate-disco disco -c "
 import json, importlib.metadata as md, jax, discodj
 url = json.loads(md.distribution('discodj').read_text('direct_url.json') or '{}')
@@ -83,7 +99,7 @@ print('discodj', md.version('discodj'), commit, discodj.__file__)
 print('jax', jax.__version__, jax.devices())
 assert jax.__version__ == '0.10.1', jax.__version__
 assert commit.startswith('a687972'), commit
-assert jax.devices()[0].platform == 'gpu', jax.devices()
+assert jax.devices()[0].platform == '$DPLAT', jax.devices()
 "
 leg gate-inexor inexor -c "import sys; sys.path.insert(0, 'scripts'); import jax, inexor, v2_m6_realization, v2_disco_crosscheck; print('inexor', inexor.__file__, 'jax', jax.__version__, jax.devices())"
 
@@ -91,7 +107,9 @@ leg gate-inexor inexor -c "import sys; sys.path.insert(0, 'scripts'); import jax
 S=$WORK/smoke
 leg smoke-ics inexor scripts/v2_m6_realization.py ics --config cdev8 --workdir "$S/ics"
 leg smoke-export inexor $DRV export --config cdev8 --ic-dir "$S/ics" --k-steps 120 --out "$S/in.npz"
+T0=$(date +%s)
 leg smoke-evolve disco $DRV evolve --in "$S/in.npz" --n-mesh 256 --out "$S/out.npz"
+echo "smoke evolve leg $(( $(date +%s) - T0 )) s; x64 (512^3 particles and mesh) ~ $(( ($(date +%s) - T0) * 64 / 60 )) min, a naive linear scaling"
 leg smoke-card inexor $DRV card --in "$S/out.npz" -- --config cdev8 --k-steps 120 \
   --workdir "$S" --coarse-match-order 3 --slack 0.10 --arena-frac 0.01 --min-weight 1
 
