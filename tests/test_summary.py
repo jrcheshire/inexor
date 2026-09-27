@@ -1,11 +1,10 @@
-"""summary.py: the per-run P(k) accuracy statement (M-v2-6 Stage 4).
+"""summary.py: the per-run P(k) accuracy card.
 
-The load-bearing gate is a NULL: on a field whose spectrum is known exactly,
-the z profile must be standard normal. That is what validates the whole
-normalization chain at once -- hermitian mode weights, the bin-averaged oracle,
-and the Gaussian sigma -- and a wrong weight shows up as a uniform sqrt(2)
-inflation that no comparison against another estimator of ours would catch.
+The central gate is a null: on white noise, whose spectrum is exact, the z profile is
+standard normal. That checks power normalization, hermitian mode weights and the Gaussian
+sigma together; a wrong weight shows as a uniform sqrt(2) inflation.
 """
+
 
 import numpy as np
 import pytest
@@ -19,12 +18,7 @@ N, BOX = 64, 64.0
 
 
 def _white(seed=0, n=N, box=BOX):
-    """Unit-variance white noise and its exact spectrum.
-
-    P = sigma^2 * (L/N)^3 for a per-cell variance sigma^2: with
-    P = |delta_k|^2 L^3 / N^6 and <|delta_k|^2> = N^3 sigma^2. FLAT, so the
-    bin-averaged and bin-centre oracles coincide and the null tests the
-    normalization alone rather than the averaging."""
+    """Unit-variance white noise and its exact, flat spectrum P = sigma^2 (L/N)^3."""
     f = np.random.default_rng(seed).normal(size=(n, n, n))
     return f, (box / n) ** 3
 
@@ -34,13 +28,8 @@ NULL_SEEDS = 4
 
 
 def _pooled_null_z(oracle_scale=1.0, seeds=NULL_SEEDS):
-    """z over `seeds` independent white-noise realizations, pooled.
-
-    One realization gives ~59 usable bins, and the sampling error on std(z) is
-    1/sqrt(2m) -- too loose at that size to see a 25% error in the mode
-    weighting (measured: the bar is +-0.37 and the defect moves std to 0.71).
-    Pooling four realizations is what gives the null its power, and it is
-    cheaper than a bigger grid.
+    """z pooled over `seeds` white-noise realizations. One gives ~59 bins, a 4-SE std bar of
+    +-0.37, too loose to see a dropped hermitian weight (std 0.71).
     """
     zs = []
     for seed in range(seeds):
@@ -57,20 +46,10 @@ def _pooled_null_z(oracle_scale=1.0, seeds=NULL_SEEDS):
 
 
 def test_white_noise_null_is_standard_normal():
-    """THE gate on the whole normalization chain: power normalization, mode
-    weights and the Gaussian sigma, on a field whose spectrum is exact.
+    """Pooled null z has mean 0 and std 1 within 4 SE (1/sqrt(m), 1/sqrt(2m)).
 
-    Bars are the sampling errors of the statistics themselves, not picked: over
-    `m` pooled bins, mean(z) has SE = 1/sqrt(m) and std(z) has SE = 1/sqrt(2m),
-    both checked at 4 SE.
-
-    What it catches, measured by planting each: dropping the hermitian weight
-    entirely (std 0.71 against a 1 +- 0.18 bar) and a power normalization off by
-    a factor of the grid size. What it does NOT catch is the kz = 0 / Nyquist
-    planes being weighted like the rest -- those are ~6% of the half grid, so it
-    moves std to 1.04 and sits under the noise. That case is covered exactly by
-    `test_hermitian_weights_are_the_full_grid_multiplicities` instead, which is
-    the right instrument for a discrete fact.
+    Catches a dropped hermitian weight (std 0.71) and a grid-size power error. Mis-weighting only
+    the kz = 0 / Nyquist planes (std 1.04) is pinned exactly by the multiplicity test below.
     """
     z = _pooled_null_z()
     m = len(z)
@@ -80,34 +59,27 @@ def test_white_noise_null_is_standard_normal():
 
 
 def test_the_null_can_fail():
-    """A gate that cannot fail reads as a pass, and this one is loose enough
-    that the question is real. An oracle wrong by 10% must trip it; one wrong by
-    1% must not, or the bar would be catching noise rather than the defect."""
+    """The null trips on an oracle 10% off and passes one 1% off."""
     assert abs(_pooled_null_z(oracle_scale=1.10).mean()) > 4.0 / np.sqrt(200)
     z1 = _pooled_null_z(oracle_scale=1.01)
     assert abs(z1.mean()) < 4.0 / np.sqrt(len(z1))
 
 
 def test_hermitian_weights_are_the_full_grid_multiplicities():
-    """Exact, because the null cannot see it. A half-grid element stands for
-    two full-grid modes except on the self-conjugate kz planes -- kz = 0 always,
-    and kz = Nyquist on an even grid, which hold each mode beside its own
-    conjugate. Weighting those like the rest is a ~6% error in the mode count,
-    which is 3% on every z and invisible to a spread test."""
+    """A half-grid kz plane counts twice except the self-conjugate ones (kz = 0, and
+    Nyquist on an even grid); the weights sum to n. Exact, since the null cannot see a
+    ~6% mode-count error."""
     for n in (8, 9, 16, 17):
         _, kz, w = summary._mode_grid(n, 32.0)
         assert len(w) == n // 2 + 1 == len(kz)
         assert w[0] == 1.0, "kz = 0 is self-conjugate"
         assert w[-1] == (1.0 if n % 2 == 0 else 2.0), "Nyquist exists only on an even grid"
         assert np.all(w[1 : n // 2] == 2.0)
-        # the weights must sum to the full grid's plane count, which is the
-        # whole point of them
         assert w.sum() == n
 
 
 def test_the_measurement_itself_is_unbiased():
-    """Independently of the z scaling: the binned power of white noise is its
-    known flat spectrum."""
+    """Binned white-noise power matches its flat spectrum to 1%, independent of z."""
     f, p_true = _white()
     spec = ooc_fft.rfftn_ooc(f)
     res = summary.binned_power(spec, N, BOX, p_of_k=lambda k: np.full_like(k, p_true))
@@ -115,15 +87,9 @@ def test_the_measurement_itself_is_unbiased():
 
 
 def test_bin_centre_oracle_carries_a_deterministic_bias():
-    """The M-v2-5 leg VI finding, reproduced as arithmetic rather than as a
-    field. P's curvature across a bin means its average over the realized modes
-    is not its value at the bin's mean k, and the gap is DETERMINISTIC: it does
-    not average down with more modes, it grows in sigma units as sqrt(N_modes).
-    That is how a correct code reads as an 8.7 sigma failure.
-
-    FOUR bins, not the production 64: the gap is P's curvature across a bin
-    scaled by sqrt(N_modes), so a small box needs wide bins to show what a
-    production box shows with narrow ones."""
+    """A bin-centre oracle is biased by P's curvature across the bin by >3 sigma here (four
+    wide bins so a small box shows it).
+    """
     edges = np.linspace(0.0, 0.5 * np.pi * N / BOX, 5)
     zeros = np.zeros((N, N, N // 2 + 1), dtype=np.complex128)
 
@@ -138,15 +104,9 @@ def test_bin_centre_oracle_carries_a_deterministic_bias():
 
 
 def test_the_bin_centre_bias_grows_as_sqrt_of_the_mode_count():
-    """The half that makes it dangerous: it is not noise, so a bigger run makes
-    it WORSE. Isolating that needs the bins held fixed in k while the mode count
-    moves, and the mode count in a fixed k shell goes as the BOX volume, not as
-    the grid -- at fixed box, refining the mesh adds modes above the band and
-    none inside it. Comparing bins at different k instead would confound the
-    count with P's curvature, which changes across the band too.
-
-    Doubling the box is 8x the modes, so the predicted ratio is sqrt(8) = 2.83.
-    Read on the second bin from the top; the last bin is edge-affected."""
+    """The bin-centre bias in sigma grows as sqrt(N_modes): bins fixed in k, box doubled
+    (predicted ratio sqrt(8)), read on the second-highest bin (the last is edge-affected).
+    """
     edges = np.linspace(0.0, 0.7, 5)
     got = {}
     for n, box in ((64, 64.0), (128, 128.0)):
@@ -176,24 +136,22 @@ def test_slab_is_a_memory_knob_only(slab):
 
 
 def test_tsc_window_is_the_cic_window_at_exponent_three_halves():
-    """`paint_tsc_int` is a quadratic spline, so its window is `sinc^3` per axis
-    where CIC's is `sinc^2`. Both are exactly 1 at k = 0 and the ratio is the
-    3/2 power everywhere, which pins the exponent rather than the shape."""
+    """TSC's window is sinc^3 per axis and CIC's sinc^2: both 1 at k = 0 and
+    W_tsc = W_cic^1.5 everywhere, which pins the exponent."""
     w_t, w_c = tsc_window(16, 32.0), cic_window(16, 32.0)
     assert w_t[0, 0, 0] == 1.0 and w_c[0, 0, 0] == 1.0
     ok = w_c > 1e-12
     np.testing.assert_allclose(w_t[ok], w_c[ok] ** 1.5, rtol=1e-12)
 
-    # and the two differ enough at half Nyquist that using the wrong one shows
+    # and they differ by >2% at half Nyquist, so using the wrong one shows
     knyq = np.pi * 16 / 32.0
     s = np.sinc(0.5 * knyq / (2 * knyq))
     assert abs(s**3 / s**2 - 1.0) > 0.02
 
 
 def test_corrections_are_applied_in_the_painted_order_and_reported():
-    """A painted discrete field has <|delta|^2> = W^2 (P + 1/nbar), so the
-    estimator is raw/W^2 - shot and NOT (raw - shot)/W^2. Checked against a
-    hand-computed bin on a spectrum of ones, where every step is arithmetic."""
+    """<|delta|^2> = W^2 (P + 1/nbar), so the estimator is raw/W^2 - shot, not
+    (raw - shot)/W^2; checked on a spectrum of ones. Both corrections are reported."""
     n, box = 16, 32.0
     spec = np.ones((n, n, n // 2 + 1), dtype=np.complex128)
     shot = 1e-4
@@ -210,9 +168,7 @@ def test_corrections_are_applied_in_the_painted_order_and_reported():
 
 
 def test_nonlinear_scale_finds_the_analytic_crossing():
-    """Delta^2 = k^3 P / (2 pi^2) = 1. For P = A k^-3 that is A = 2 pi^2 / 1
-    independent of k, so use a slope that actually crosses: P = A k^-2 gives
-    k_nl = 2 pi^2 / A."""
+    """Delta^2 = k^3 P / (2 pi^2) = 1; for P = A k^-2 the crossing is k_nl = 2 pi^2 / A."""
     A = 50.0
     k_nl = summary.nonlinear_scale(lambda k: A * k**-2.0)
     assert abs(k_nl / (2.0 * np.pi**2 / A) - 1.0) < 1e-3
@@ -221,10 +177,8 @@ def test_nonlinear_scale_finds_the_analytic_crossing():
 
 
 def test_the_scanned_range_is_on_the_card_beside_the_none():
-    """A None means "no crossing in here" and is unreadable without "here".
-    The card's range must be the one the function actually scanned, so bracket
-    it: a crossing just inside NL_SCAN_K's ceiling is found, one just outside
-    is not."""
+    """A None is read against the scanned range, so NL_SCAN_K must be the range actually
+    scanned: a crossing just inside its ceiling is found, one just outside is not."""
     lo, hi = summary.NL_SCAN_K
     inside = 2.0 * np.pi**2 / (0.9 * hi)  # A giving k_nl = 0.9 * hi
     outside = 2.0 * np.pi**2 / (1.1 * hi)
@@ -267,8 +221,8 @@ def _smoke_state():
 
 
 def _smoke_card(st, cfg, **kw):
-    """The smoke mesh is 16^3, so its bins have tens of modes rather than
-    millions; the production default would drop every one of them."""
+    """Card with 4 bins and min_weight=20: the 16^3 smoke mesh has tens of modes per
+    bin, and the production default would drop every bin."""
     edges = np.linspace(0.0, 0.5 * np.pi * cfg.n_coarse / cfg.box_size, 5)
     return summary.pk_summary_card(
         st, cfg, Cosmology(), a_out=1.0, edges=edges, min_weight=20.0, **kw
@@ -276,10 +230,8 @@ def _smoke_card(st, cfg, **kw):
 
 
 def test_the_card_refuses_to_be_empty():
-    """The production default at a smoke mesh keeps no bin. That must refuse:
-    a zero-bin card satisfies every length and finiteness check a caller makes
-    and carries no measurement. Found by a sibling test failing, not by this
-    one -- the vacuous version of the test below passed."""
+    """A zero-bin card (production defaults at a smoke mesh) refuses: it would pass
+    every length and finiteness check while carrying no measurement."""
     st, cfg = _smoke_state()
     with pytest.raises(ValueError, match="not a card"):
         summary.pk_summary_card(st, cfg, Cosmology(), a_out=1.0)
@@ -306,8 +258,8 @@ def test_card_composes_over_a_real_state():
 
 
 def test_card_accepts_a_delta_the_caller_already_has():
-    """The engine can hand over the last step's coarse field; paying for the
-    paint twice at C-gh is 4.3 GB and a full streamed pass."""
+    """A caller-supplied coarse delta gives the same card as repainting (which costs
+    4.3 GB and a streamed pass at C-gh); a wrong-shape delta refuses."""
     from inexor import engine
 
     st, cfg = _smoke_state()
@@ -340,9 +292,8 @@ def test_band_verdict_names_its_band_and_flags_the_nonlinear_reach():
 
 
 def test_the_slab_built_window_is_the_full_grid_one():
-    """The card builds the TSC window per slab to avoid a second full-grid f64
-    array beside the spectrum (17 GB at C-gh). Two expressions of one function
-    is exactly how they drift, so pin them."""
+    """The per-slab TSC window (built to avoid a second full-grid f64 array, 17 GB at
+    C-gh) equals the full-grid one exactly."""
     n, box = 12, 24.0
     k_nyq = np.pi * n / box
     kx = 2.0 * np.pi * np.fft.fftfreq(n, d=box / n)

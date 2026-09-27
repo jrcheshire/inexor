@@ -1,29 +1,12 @@
-"""The per-run accuracy statement: large-scale P(k) with a z profile.
+"""The per-run accuracy card: large-scale P(k) against linear theory, as a z profile.
 
-M-v2-6 Stage 4, the summary a finished realization ships with. Until this
-existed a run produced a state on disk and no evidence that the state was
-right, which is the whole of what an accuracy statement is for.
+Pipeline: `coarse_delta_streamed` -> `ooc_fft` -> slab-streamed binned P(k) -> a linear oracle
+averaged over each bin's realized modes (never evaluated at a bin centre: at large mode counts
+the curvature of P across a bin alone gives |z| >> 1). No particle or O(N) position array is
+materialized; only the coarse mesh and its spectrum are held.
 
-The measurement is `coarse_delta_streamed` -> `ooc_fft` -> a slab-streamed
-binned P(k) -> a **bin-averaged** linear oracle, and it never holds a full-size
-float array: the coarse mesh is 4.3 GB at C-gh and its spectrum 8.6 GB, against
-a state of 164.6 GB, and neither the particles nor an O(N) position array is
-materialized at any point.
-
-**The oracle is averaged over the realized modes of each bin, never evaluated
-at a bin centre.** That is not a refinement. At 2048^3 mode counts the
-deterministic Jensen term from P's curvature across a bin reaches z = +15 near
-k ~ 0.2, and it failed a leg of M-v2-5 at max|z| 8.71 before the bin-averaged
-form replaced it (Vista 902091 vs 902182). A bin-centre oracle reads as a code
-defect and is an instrument defect.
-
-**What this card does NOT do is emit a verdict.** It stores the z profile, the
-mode counts and the corrections, and stops. A scalar over a band that reaches
-past the nonlinear scale measures gravity rather than the code: the evolved
-field is SUPPOSED to depart from linear theory there, and a `max|z|` that mixes
-the two cannot be read. `k_nonlinear` is on the card so a caller can state its
-own band, and `band_verdict` computes one over a band the caller names and
-records the name alongside the number.
+The card emits no verdict: past the nonlinear scale the evolved field is expected to leave
+linear theory. `band_verdict` computes `max|z|` over a band the caller names.
 """
 
 import numpy as np
@@ -32,22 +15,16 @@ from .cosmology import growth_factor_a, ic_k_table
 
 CARD = "inexor-pk-summary-1"
 
-# The k range `nonlinear_scale` scans, on the card beside its answer: a None
-# there means "no crossing in here", which a reader cannot act on without
-# knowing what "here" was.
+# The k range `nonlinear_scale` scans; recorded on the card so a None is interpretable.
 NL_SCAN_K = (1e-3, 10.0)
 
 
 def _mode_grid(n_mesh, box_size):
     """(kx_1d, kz_1d, hermitian weights along kz) for the rfft half-grid.
 
-    The weight is the multiplicity a half-grid element stands for on the full
-    grid: 2 for every kz plane except kz=0 and, on an even grid, kz=Nyquist,
-    which are self-conjugate and hold each mode beside its own conjugate. It
-    weights the power average and the mode COUNT alike, and the count is what
-    sets sigma, so getting it wrong inflates every z by a uniform sqrt(2) --
-    visible only against a field whose answer is known, which is what the null
-    test in `tests/test_summary.py` is.
+    The weight is the full-grid multiplicity of a half-grid element: 2, except 1 on the
+    self-conjugate planes kz=0 and (even N) kz=Nyquist. It weights both the power average
+    and the mode count that sets sigma.
     """
     kx = 2.0 * np.pi * np.fft.fftfreq(n_mesh, d=box_size / n_mesh)
     kz = 2.0 * np.pi * np.fft.rfftfreq(n_mesh, d=box_size / n_mesh)
@@ -72,28 +49,15 @@ def binned_power(
 ):
     """Slab-streamed, hermitian-weighted binned P(k) of an rfft spectrum.
 
-    `spec` is the (N, N, N//2+1) array `ooc_fft` returns; it is read slab by
-    slab and never copied. `p_of_k`, if given, is averaged over the SAME modes
-    and the SAME weights to produce the bin-averaged oracle -- one accumulation
-    pass, so the oracle cannot drift onto a different mode set than the
-    measurement it is compared against.
+    `spec` is the (N, N, N//2+1) array `ooc_fft` returns, read slab by slab, never copied.
+    `p_of_k`, if given, is averaged in the same pass over the same modes and weights (the
+    bin-averaged oracle). `window(kx_slab, kx, kz) -> W` divides power by W**2 per mode
+    before binning; `shot_noise` is subtracted after, i.e. `P_raw / W**2 - 1/nbar`.
+    `min_weight` drops bins with fewer modes (100 -> ~7% error on sigma itself).
+    `progress(stage, done, total)` is called once per slab.
 
-    `window` is a callable `(kx_slab, kx, kz) -> W` giving the mass-assignment
-    window over the slab's modes; measured power is divided by `W**2` per MODE,
-    before binning, because the correction varies across a bin. `shot_noise` is
-    subtracted after that, which is the order the painted field builds them in:
-    a discrete sample painted with W has <|delta|^2> = W^2 (P + 1/nbar), so the
-    estimator is `P_raw / W**2 - 1/nbar`.
-
-    `min_weight` drops bins too sparse for the Gaussian sigma to mean anything;
-    100 modes puts the fractional error on sigma itself at ~7%.
-
-    `progress(stage, done, total)`, if given, is called once per slab; see
-    `inexor.progress.Heartbeat`.
-
-    Returns a dict of parallel arrays: `k_mean` (weighted), `p`, `n_modes`,
-    `p_oracle` when `p_of_k` was given, plus the per-bin `window_correction`
-    and `shot_fraction` so neither correction is hidden inside `p`.
+    Returns a dict of parallel per-bin arrays: `k_mean` (weighted), `p`, `n_modes`,
+    `window_correction`, `shot_fraction`, `k_edges`, and `p_oracle`, `z` when `p_of_k` given.
     """
     n = int(n_mesh)
     kx, kz, wgt_z = _mode_grid(n, box_size)
@@ -146,28 +110,23 @@ def binned_power(
         k_mean=acc["k"][good] / w,
         p=acc["p"][good] / w,
         n_modes=w,
-        # what the corrections did, per bin, so `p` is never a black box
         window_correction=acc["wcorr"][good] / w,
         shot_fraction=(shot_noise / (acc["raw"][good] / w)) if shot_noise else np.zeros(int(good.sum())),
         k_edges=edges,
     )
     if p_of_k is not None:
         out["p_oracle"] = acc["oracle"][good] / w
-        # Gaussian: Var(P_hat)/P^2 = 2/N_modes. The oracle is the denominator
-        # rather than the measurement, so a bin that came out low is not handed
-        # a smaller sigma for having done so.
+        # Gaussian Var(P_hat)/P^2 = 2/N_modes, normalized by the oracle so a low bin does not
+        # get a smaller sigma.
         out["z"] = (out["p"] / out["p_oracle"] - 1.0) / np.sqrt(2.0 / w)
     return out
 
 
 def tsc_window_slab(kx_slab, kx, kz, k_nyq):
-    """The TSC window over one axis-0 slab of modes, built rather than sliced.
+    """The TSC window over one axis-0 slab of modes.
 
-    `diagnostics.tsc_window` returns the whole half-grid, which is another
-    (N, N, N//2+1) f64 array beside the spectrum -- 17 GB at C-gh to hold a
-    separable product of three 1D factors. This is the same function on a slab;
-    `tests/test_summary.py` pins the two against each other, which is what stops
-    them drifting.
+    Same function as `diagnostics.tsc_window` (pinned by tests), built per slab from the
+    separable 1D factors to avoid a second full (N, N, N//2+1) f64 array.
     """
     wx = np.sinc(np.asarray(kx_slab) / (2.0 * k_nyq)) ** 3
     wy = np.sinc(np.asarray(kx) / (2.0 * k_nyq)) ** 3
@@ -178,10 +137,8 @@ def tsc_window_slab(kx_slab, kx, kz, k_nyq):
 def nonlinear_scale(p_of_k, k_lo=NL_SCAN_K[0], k_hi=NL_SCAN_K[1], n=4096):
     """The k where the linear dimensionless variance `k^3 P / (2 pi^2)` reaches 1.
 
-    Reported, never gated on: it is where the evolved field is EXPECTED to leave
-    linear theory, so it is the scale past which a z against a linear oracle
-    stops being about the code. Returns None if the crossing is outside the
-    scanned range rather than extrapolating to a number that looks measured.
+    Reported, never gated on. Returns None if the crossing is outside the scanned range
+    (no extrapolation).
     """
     k = np.geomspace(k_lo, k_hi, int(n))
     d2 = k**3 * np.asarray(p_of_k(k)) / (2.0 * np.pi**2)
@@ -189,7 +146,6 @@ def nonlinear_scale(p_of_k, k_lo=NL_SCAN_K[0], k_hi=NL_SCAN_K[1], n=4096):
     if not len(above) or above[0] == 0:
         return None
     i = int(above[0])
-    # log-linear interpolation across the crossing; the grid is log-spaced
     lo, hi = np.log(d2[i - 1]), np.log(d2[i])
     f = (0.0 - lo) / (hi - lo)
     return float(np.exp(np.log(k[i - 1]) + f * (np.log(k[i]) - np.log(k[i - 1]))))
@@ -212,38 +168,17 @@ def pk_summary_card(
 ):
     """The card: measured P(k), the bin-averaged linear oracle, the z profile.
 
-    `a_out` is the output scale factor; the oracle is `D(a_out)**2` times the
-    z=0 linear spectrum, `growth_factor_a` being normalized to D(1) = 1.
+    Oracle is `D(a_out)**2 P_lin(k, z=0)` with D(1) = 1. `delta` reuses a coarse field the
+    caller already has; otherwise `coarse_delta_streamed` paints one (needs the integer coarse
+    accumulator, since an f64 paint is order-dependent). The window correction is analytic TSC
+    (default band stops at half Nyquist); shot noise is V/N.
 
-    `delta` lets a caller pass a coarse field it already has (the engine can
-    hand over the last step's) rather than paying for the paint twice. Without
-    one this calls `coarse_delta_streamed`, which needs the integer coarse
-    accumulator -- an f64 paint is order-dependent and cannot be streamed.
+    Raises if no bin reaches `min_weight` (the default 64 bins are sized for a 1024^3 coarse
+    mesh): a zero-bin card would carry no measurement. `pool` (a `paint_only` `TilePool`)
+    parallelizes the paint chunks only and is bitwise-neutral by integer associativity.
+    `progress` goes to the paint, transform and binning stages.
 
-    The window correction is TSC because the coarse paint is TSC, and it is the
-    analytic window rather than interlacing, so it is trustworthy well below
-    Nyquist and the default band stops at half Nyquist. Shot noise is `V/N`.
-
-    `min_weight` drops bins too sparse for a Gaussian sigma to mean anything,
-    and an empty result is REFUSED rather than returned: the default 64 bins
-    are sized for a 1024^3 coarse mesh, and at a small `n_coarse` every bin
-    falls under the floor. A card of zero bins passes every structural check a
-    caller is likely to make while carrying no measurement at all.
-
-    `pool`, if given, runs the streamed paint's chunks on a `TilePool`
-    (build it `paint_only=True`; the card computes no force). The accumulation
-    stays serial in `coarse_delta_streamed`, where integer associativity makes
-    arrival order BITWISE the serial order, so this is a wall knob that cannot
-    move a number. The transform and the binning are unaffected and stay
-    serial.
-
-    `progress(stage, done, total)`, if given, goes to all three of the long
-    stages -- the streamed paint, the transform and the binning -- each under
-    its own name. At 4096^3 this call is hours long and used to print nothing
-    at all, so an overrun could not be told from a hang; see
-    `inexor.progress.Heartbeat`.
-
-    Returns the card dict. Nothing here writes a file or decides a verdict.
+    Returns the card dict; writes nothing and decides no verdict.
     """
     from .engine import coarse_delta_streamed
 
@@ -307,17 +242,12 @@ def pk_summary_card(
         deconvolved="tsc" if deconvolve_window else None,
         oracle="bin-averaged linear, D(a)^2 P_lin; NEVER a bin centre",
         n_bins=int(len(res["k_mean"])),
-        # the EDGES, not just the weighted centres. Two cards can share
-        # `k_mean` to a few digits and still have been binned differently, and
-        # `k_mean` is weighted so it does not reconstruct them. Without this a
-        # card cannot say what band it measured, which is what makes arms at
-        # different meshes comparable or not.
+        # edges, since the weighted `k_mean` does not reconstruct the binning
         k_edges=[float(v) for v in res["k_edges"]],
         k_mean=[float(v) for v in res["k_mean"]],
         p=[float(v) for v in res["p"]],
         p_oracle=[float(v) for v in res["p_oracle"]],
         n_modes=[float(v) for v in res["n_modes"]],
-        # the max-over-band lesson: the SHAPE is the product, not a scalar
         z_profile=[float(v) for v in res["z"]],
         window_correction=[float(v) for v in res["window_correction"]],
         shot_fraction=[float(v) for v in res["shot_fraction"]],
@@ -329,10 +259,8 @@ def pk_summary_card(
 def band_verdict(card, k_max, k_min=0.0, bar=5.0):
     """`max|z|` over a band the CALLER names, with the name recorded beside it.
 
-    There is no default band on purpose. Any band reaching past
-    `card["k_nonlinear"]` measures gravity rather than the code, so the number
-    is only meaningful next to the limits that produced it -- which is why they
-    come back in the result instead of being left at the call site.
+    No default band: past `card["k_nonlinear"]` the z measures gravity, not the code, so
+    the limits are returned with the number.
     """
     k = np.asarray(card["k_mean"])
     z = np.asarray(card["z_profile"])
@@ -348,8 +276,6 @@ def band_verdict(card, k_max, k_min=0.0, bar=5.0):
         max_abs_z=m,
         bar=float(bar),
         ok=bool(m < float(bar)),
-        # loud rather than silent: a band past the nonlinear scale is expected
-        # to fail and the failure is not about the code
         band_reaches_nonlinear=bool(knl is not None and float(k_max) > knl),
         k_nonlinear=knl,
     )

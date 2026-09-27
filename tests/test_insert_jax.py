@@ -1,13 +1,8 @@
-"""The compiled insert must be BITWISE the numpy one, or it is not adoptable.
+"""The compiled insert (`insert_jax`) is BITWISE the numpy `_insert_slab`.
 
-`_insert_slab` fixes every brick's velocity scale, re-rounds every row's codes,
-orders every run and claims the arena, so a compiled twin that is merely close
-moves the state's physical layout. Every assertion here is exact equality.
-
-Anti-vacuity is asserted before any comparison: particles crossing more than one
-brick (reach > 1), bricks overflowing into the arena, and arena residents being
-re-homed on a later step. A fixture without them would pass a broken grouping,
-a broken spill order or a broken arena replay.
+The insert fixes brick scales, re-rounds codes, orders runs and claims the arena, so a
+merely-close twin moves the state's layout; every assertion is exact equality.
+Anti-vacuity: reach > 1, arena overflow and arena residents re-homed on a later step.
 """
 
 import copy
@@ -119,14 +114,9 @@ def test_the_padding_path_is_exercised_and_bitwise(x64):
 
 
 def test_the_sort_key_sees_rows_on_both_sides_of_the_slab(x64):
-    """ANTI-VACUITY for the narrowed key: the sentinel path must be exercised.
-
-    The key is slab-relative and every row bound elsewhere collapses onto ONE
-    sentinel above the in-slab range. If a fixture's immigrant buffer only ever
-    held rows for the slab being written, that collapse would never run and the
-    narrowing would be untested -- so assert the buffer carries destinations
-    BELOW `lo_b` and ABOVE `hi_b`, including the periodic wrap at slab 0.
-    """
+    """Anti-vacuity for the slab-relative key: rows bound elsewhere collapse onto one
+    sentinel, so the immigrant buffers must carry destinations BELOW `lo_b` and ABOVE
+    `hi_b` (including the periodic wrap at slab 0)."""
     st = _state()
     c = _c_drift(st, 1.9)
     nb = int(st.bricks_per_side)
@@ -151,17 +141,14 @@ def test_the_sort_key_sees_rows_on_both_sides_of_the_slab(x64):
 def test_the_written_positions_stay_int64(x64):
     """The index family is int32; `pos` must NOT be, and it is the silent one.
 
-    `pos` is `brick_start[bl] + rank`: `rank` counts rows within a slab and is
-    int32, but `brick_start` holds GLOBAL slot indices -- ~7.5e10 at 4096^3, past
-    int32 by an order of magnitude. It stays wide by int64 + int32 -> int64, which
-    is a promotion rule rather than anything this module asserts, so pin it. A
-    truncation here would relocate written rows and nothing at a testable size
-    would notice: the fixtures' slot indices are tiny.
+    `pos` is `brick_start[bl] + rank` with int32 `rank` and GLOBAL int64 slot indices
+    (~7.5e10 at 4096^3). It stays wide only by promotion, and a truncation would be
+    invisible at fixture sizes, so pin it with a base past int32.
     """
     from inexor import insert_jax
 
     insert_jax._CACHE.clear()
-    p3, nb2, base = 8, 4, 2**35          # base is FAR past int32, as C-hero's are
+    p3, nb2, base = 8, 4, 2**35          # base is FAR past int32, as c-hero's are
     starts = np.arange(nb2 + 1, dtype=np.int64) * 16 + base
     n = 6
     dest = np.array([0, 1, 1, 2, 3, 3], dtype=np.int64) * p3 + np.arange(n) % p3
@@ -182,10 +169,9 @@ def test_the_written_positions_stay_int64(x64):
 def test_the_narrow_key_guard_refuses_shapes_that_would_wrap():
     """The guarded branch is unrunnable, so pin the DECISION instead.
 
-    Tripping the wide path needs `nb2 * p3 >= 2**32`, whose occupancy array alone
-    is 34 GB, so no test can exercise it -- which is exactly why the predicate is
-    separate and tested here. At `nb2 * p3 == 2**32` the sentinel wraps to 0 and
-    out-of-slab rows sort FIRST, measured on a scratch reproduction.
+    The wide path needs `nb2 * p3 >= 2**32` (a 34 GB occupancy array), so the predicate
+    is tested instead. At `nb2 * p3 == 2**32` the sentinel wraps to 0 and out-of-slab
+    rows would sort FIRST.
     """
     from inexor.insert_jax import narrow_key_ok
 

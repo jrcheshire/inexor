@@ -6,31 +6,24 @@
 #SBATCH -t 04:00:00
 #SBATCH -o d8-gh-1card-%j.log
 #SBATCH --signal=B:USR1@900
-# D8 on ONE GH200: a whole realization at PRESET (default c-1024 = 1024^3 in 512 Mpc/h,
-# the same resolution as every other preset) -- device-generated LCDM ICs, the
-# 120-step schedule on the device lane with one card, and its P(k) card. The first
-# single-card device-lane run on gh; the question is how easy and how fast a gh node
-# is at this size, and how the planner's host figure reads against a gh node, which
-# is what sizes a 2048^3 attempt.
-#   sbatch scripts/run/gh_single_card_vista.sbatch
-#   sbatch -t <wall> --export=ALL,PRESET=c-gh,SLACK=0.05,ALLOC_MARGIN=0.05 ...  (2048^3)
+# A whole realization on ONE GH200: device-generated LCDM ICs, the 120-step schedule on
+# the single-card device lane, and its P(k) card. PRESET defaults to c-1024 (1024^3 in
+# 512 Mpc/h, the same resolution as every other preset); c-gh is 2048^3.
 #
-# A GH200 host is ~116 GB of LPDDR with a hard cliff (runs/v2/cost_of_memory.md);
-# MemAvailable also counts the card's HBM, so the preflight compares against the
-# CPU node alone and the process is bound to it (--membind 0).
+# Requires INEXOR_RUNS (run root; outputs under $INEXOR_RUNS/d8-gh-<preset>-<job>) and
+# INEXOR_SRC or submission from the inexor checkout. Optional: PRESET, SLACK,
+# ALLOC_MARGIN, ARENA_FRAC. The account is passed with `sbatch -A`:
+#   INEXOR_RUNS=$SCRATCH/inexor_runs sbatch -A <account> scripts/run/gh_single_card_vista.sbatch
+#   sbatch -A <account> -t <wall> --export=ALL,PRESET=c-gh,SLACK=0.05,ALLOC_MARGIN=0.05 ...
 #
-# TIME (c-1024), ALL ARITHMETIC -- nothing has run on one gh card at any size:
-# 1009133's ~650 s/step at 4096^3 on four GB200s / 64 (volume) x ~3 (one card for
-# four, D5's 2.8-3.0x split) x 1.2 (GH200 vs GB200 tile force, gb probe) = ~35-45 s
-# per step; 120 steps ~70-90 min. ICs ~5 min, pytest ~2, three checkpoints ~1 min,
-# card ~5. CENTRAL ~1.5-2 h; small-N fixed costs could dominate either way.
-# REQUESTED 4:00 (~1.7 SU central, max 4).
+# A GH200 host is ~116 GB of LPDDR with a hard cliff; MemAvailable also counts the card's
+# HBM, so the preflight compares against the CPU NUMA node alone and the process is bound
+# to it (--membind 0).
 #
-# PRE-REGISTERED (measured, not gated):
-#   1. seconds per step over the 120 steps, and its split by phase;
-#   2. host peak against the planner's lower bound (1009133 read 1.04x at 4096^3)
-#      and per-card peak against its figure;
-#   3. the P(k) card, for the record against the 512^3 LCDM result.
+# Wall (c-1024), estimated: ~35-45 s/step (4096^3 on four GB200s scaled by volume, one
+# card for four, and GH200 vs GB200 tile force), 120 steps ~70-90 min; ICs ~5 min, pytest
+# ~2, checkpoints ~1, card ~5. ~1.5-2 h central; 4 h requested since small-N fixed costs
+# are unmeasured. USR1 900 s before the wall triggers driver stack dumps.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
@@ -42,8 +35,7 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
 export XLA_CLIENT_MEM_FRACTION=0.95
 export JAX_COMPILATION_CACHE_DIR=$SCRATCH/inexor-xla-cache
-# the default 64 GB cap is JAX's, not the node's (894010 was voided for it); every
-# earlier gh sbatch set 160
+# JAX's default host-memory cap is 64 GB, below what host streaming needs here
 export XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=160
 export INEXOR_LOAD_TRACE=1
 export JAX_LOG_COMPILES=1

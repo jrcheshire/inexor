@@ -1,37 +1,20 @@
-"""Host-side diagnostics: P(k) / r(k) estimators, the Scoccimarro bispectrum,
-reversibility check, overflow monitor (architecture.md Module layout; mbody
-fields/diagnostics binning conventions).
+"""Host-side diagnostics: P(k), r(k), the Scoccimarro bispectrum, sub-volume response.
 
-BINNING CONVENTION (deliberate change vs the frozen _m0_common estimator):
-fundamental-width spherical shells anchored at kmin = 0.5 k_f (the first bin
-straddles the fundamental, k = 0 excluded), UNWEIGHTED histogram of the raw
-rfftn half-grid modes, bin centers at edge midpoints -- exactly mbody
-fields.power_spectrum, so in-package numbers are directly comparable to the
-mbody parity reference. The parity harness additionally measures every code
-with one neutral estimator (scripts/_m1_common.py); this module is for
-in-package use. Interlacing is deliberately deferred (deconvolve_cic suffices
-at the low-k scales M1 gates on; recorded future option).
+Binning: fundamental-width spherical shells from kmin = 0.5 k_f (k = 0 excluded), half-open
+[lo, hi) in every bin, unweighted over the raw rfftn half-grid modes, centers at edge
+midpoints. The k-space tables (_k_grid, _bin_edges, cic_window, _shell_mask) are numpy
+float64 so every estimator shares one binning. The bispectrum's field-side work (FFTs, band
+fields, triple products) is JAX; pk_estimator and cross_r are pure numpy.
 
-BACKEND SPLIT (bispectrum path only). The k-space coefficient tables -- _k_grid,
-_bin_edges, cic_window, _shell_mask -- stay numpy float64: they ARE the binning
-convention, and keeping them in one place is what stops the bispectrum forking
-it (CLAUDE.md, "host-side coefficient tables are numpy float64"). Only the
-field-side work (FFTs, band fields, triple-product reductions) is JAX, so the
-estimator is shared with ichnaea rather than ported twice. pk_estimator,
-cross_r and everything below them remain pure numpy.
-
-x64 IS THE CALLER'S JOB. Library code never toggles jax_enable_x64 (jht/sfbfs
-convention), and an f64 bispectrum silently computed in f32 does not fail -- it
-just relocates every tolerance in tests/test_bispectrum.py to a floor about five
-orders of magnitude higher. bispectrum() therefore hard-fails on a non-f64 band
-field rather than proceeding.
+x64 is the caller's job (the library never toggles jax_enable_x64); `bispectrum` raises on
+non-f64 band fields, since an f32 result does not fail, it only loses ~5 orders of precision.
 """
 
 import numpy as np
 
 
 def _k_grid(n_mesh, box_size):
-    """(k_1d, kz_1d, k_mag) on the rfftn half-grid, float64 h/Mpc (mbody port)."""
+    """(k_1d, kz_1d, k_mag) on the rfftn half-grid, float64 h/Mpc."""
     N, L = n_mesh, box_size
     d = L / N
     k_1d = 2.0 * np.pi * np.fft.fftfreq(N, d=d)
@@ -41,11 +24,9 @@ def _k_grid(n_mesh, box_size):
 
 
 def cic_window(n_mesh, box_size):
-    """CIC mass-assignment window W(k) on the rfftn half-grid (float64).
+    """CIC mass-assignment window W(k) = prod_i sinc^2(k_i / (2 k_nyq)), float64 half-grid.
 
-    W(k) = prod_i sinc^2(k_i / (2 k_nyq)); a particle-painted P(k) is
-    suppressed by W^2 (negligible at low k, ~50% near Nyquist). Divide a
-    measured particle power by W^2 to deconvolve; grid fields carry no window.
+    Divide particle-painted power by W^2 to deconvolve; grid fields carry no window.
     """
     k_1d, kz_1d, _ = _k_grid(n_mesh, box_size)
     knyq = np.pi * n_mesh / box_size
@@ -55,18 +36,11 @@ def cic_window(n_mesh, box_size):
 
 
 def tsc_window(n_mesh, box_size):
-    """TSC mass-assignment window W(k) on the rfftn half-grid (float64).
+    """TSC mass-assignment window W(k) = prod_i sinc^3(k_i / (2 k_nyq)), float64 half-grid.
 
-    `W(k) = prod_i sinc^3(k_i / (2 k_nyq))`, the CIC form at exponent 3 -- one
-    power per convolution of the top-hat, and TSC is the quadratic spline. The
-    engine's coarse paint is TSC (`paint_tsc_int`), so this is the window a
-    coarse `delta` carries and `cic_window` is the wrong one for it: at half
-    Nyquist along an axis the two differ by 21%, which is 12 sigma at C-gh mode
-    counts and would read as a code defect.
-
-    Divide a measured particle power by W^2 to deconvolve. Analytic only: this
-    is the plain window correction and NOT interlacing, so it does not remove
-    aliasing, and it is trustworthy well below Nyquist rather than up to it.
+    The window of the engine's coarse (TSC) paint; use it, not `cic_window`, for a coarse
+    `delta`. Divide particle power by W^2 to deconvolve. No interlacing, so aliasing remains:
+    reliable well below Nyquist only.
     """
     k_1d, kz_1d, _ = _k_grid(n_mesh, box_size)
     knyq = np.pi * n_mesh / box_size
@@ -87,29 +61,15 @@ def _bin_edges(n_mesh, box_size, dk=None, kmin=None, kmax=None):
 
 
 def _shell_mask(k_mag, k_lo, k_hi):
-    """Boolean mask for the |k| shell [k_lo, k_hi) on the rfftn half-grid.
-
-    HALF-OPEN, so adjacent shells of width dk tile without double-counting a
-    mode sitting exactly on a bin edge (mbody fields._shell_mask:138). This is
-    the convention _shell_index and the bispectrum band fields both realize;
-    see _shell_index for why pk_estimator no longer uses np.histogram.
-    """
+    """Boolean mask for the |k| shell [k_lo, k_hi); half-open, so adjacent shells tile."""
     return (k_mag >= k_lo) & (k_mag < k_hi)
 
 
 def _shell_index(k_mag, edges):
-    """Per-mode bin index for `edges`, -1 outside. Uniformly half-open.
+    """Per-mode bin index for `edges`, -1 outside; half-open in every bin.
 
-    np.histogram closes its LAST bin ([lo, hi] rather than [lo, hi)), so a mode
-    landing exactly on the top edge was counted by pk_estimator but excluded by
-    a _shell_mask-built band field. That is a one-bin disagreement at Nyquist
-    between two estimators in this same module, which is exactly the kind of
-    convention fork the module docstring exists to prevent -- so the binning is
-    now digitize-based for every bin (the scripts/_m1_common.py convention).
-
-    Kept as index arithmetic rather than a stack of boolean masks because a
-    mask per bin costs n_bins * N^2 * (N/2+1) bytes, which is the wrong price
-    for a convention fix.
+    digitize rather than np.histogram, which closes its last bin and would disagree with
+    `_shell_mask` at the top edge.
     """
     idx = np.digitize(k_mag.ravel(), edges) - 1
     idx[idx >= len(edges) - 1] = -1
@@ -126,9 +86,7 @@ def _binned_sums(idx, n_bins, weights=None):
 def pk_estimator(delta, box_size, dk=None, kmin=None, kmax=None, deconvolve_cic=False):
     """Binned auto P(k) of a real mesh field, P = (L^3/N^6) |delta_k|^2.
 
-    mbody fields.power_spectrum binning (see module docstring). Returns
-    (k_centers, P, n_modes) float64 numpy arrays. Binning is half-open in every
-    bin including the last (see _shell_index).
+    Returns (k_centers, P, n_modes) float64 numpy arrays; empty bins are dropped.
     """
     delta = np.asarray(delta, dtype=np.float64)
     N, L = delta.shape[0], box_size
@@ -147,10 +105,10 @@ def pk_estimator(delta, box_size, dk=None, kmin=None, kmax=None, deconvolve_cic=
 
 
 def cross_r(delta_a, delta_b, box_size, dk=None, kmin=None, kmax=None):
-    """Cross-correlation coefficient r(k) = P_ab / sqrt(P_aa P_bb), same bins
-    as pk_estimator. r == 1 for fields differing only by a k-independent
-    amplitude -- the primary parity metric ("do the evolved phases track?").
-    Returns (k_centers, r, n_modes) float64 (mbody diagnostics port).
+    """Cross-correlation coefficient r(k) = P_ab / sqrt(P_aa P_bb), pk_estimator's bins.
+
+    r == 1 for fields differing only by a k-independent amplitude. Returns
+    (k_centers, r, n_modes) float64.
     """
     a = np.asarray(delta_a, dtype=np.float64)
     b = np.asarray(delta_b, dtype=np.float64)
@@ -175,24 +133,16 @@ def cross_r(delta_a, delta_b, box_size, dk=None, kmin=None, kmax=None):
 
 
 # ===========================================================================
-# Scoccimarro bispectrum (mbody fields.py:147,174 port; JAX field path)
+# Scoccimarro bispectrum (JAX field path)
 # ===========================================================================
 
 
 def _shell_spec(triangles, box_size, dk=None):
     """Host-side prep: unique (center, width) shells + per-triangle shell indices.
 
-    Returns (centers, widths, tri_idx) with tri_idx an (n_tri, 3) int array.
-
-    Shells are keyed by the (center, width) PAIR, not by the center alone, so a
-    per-shell dk is expressible: the gate wants dk_long = k_f to keep resolution
-    at the squeezed threshold and dk_short = 4 k_f for n_tri, and the same
-    center may legitimately carry different widths in different legs. Indexing
-    by position also removes mbody's float-keyed band-field dicts, which forced
-    callers to pass bit-identical float objects (its finding N3).
-
-    dk is None (-> k_fundamental on every leg), a scalar, or a 3-sequence read
-    as (dk_1, dk_2, dk_3) per triangle leg.
+    Returns (centers, widths, tri_idx), tri_idx an (n_tri, 3) int array. Shells are keyed by
+    the (center, width) pair, so one center may carry different widths on different legs.
+    dk is None (k_fundamental on every leg), a scalar, or a per-leg 3-sequence.
     """
     tris = np.atleast_2d(np.asarray(triangles, dtype=np.float64))
     if tris.shape[1] != 3:
@@ -221,11 +171,7 @@ def _shell_spec(triangles, box_size, dk=None):
 
 
 def _theta_stack(n_mesh, box_size, centers, widths):
-    """(n_shell, N, N, N//2+1) float64 shell indicators. Numpy coefficient island.
-
-    Costs n_shell * N^2 * (N/2+1) * 8 bytes and is freed once the band fields
-    exist; the band fields themselves are the resident cost (see bispectrum).
-    """
+    """(n_shell, N, N, N//2+1) float64 shell indicators (numpy)."""
     _, _, k_mag = _k_grid(n_mesh, box_size)
     return np.stack(
         [_shell_mask(k_mag, c - 0.5 * w, c + 0.5 * w).astype(np.float64)
@@ -234,15 +180,10 @@ def _theta_stack(n_mesh, box_size, centers, widths):
 
 
 def _band_fields(delta, theta, want_i=True):
-    """Real-space band-filtered fields, the JAX half of the estimator.
+    """Real-space band fields I_n = irfftn(delta_k Theta_n), or J_n = irfftn(Theta_n).
 
-        I_n(x) = irfftn(delta_k * Theta_n),   J_n(x) = irfftn(Theta_n)
-
-    I carries the data; J is the same filter with the field replaced by ones,
-    and its triple product counts closeable mode-triplets. J is INDEPENDENT of
-    delta, so a caller comparing two arms (tiled vs monolithic) should compute
-    it once and pass it to both -- that halves the resident cost, which is
-    2 * n_shell * N^3 * 8 bytes (N=256, n_shell=7 -> 1.9 GB; N=512 -> 15 GB).
+    J (want_i=False) is independent of delta and its triple product counts mode-triplets;
+    compute it once and share it across compared arms. Each stack is n_shell * N^3 * 8 bytes.
     """
     import jax.numpy as jnp
 
@@ -255,16 +196,9 @@ def _band_fields(delta, theta, want_i=True):
 
 
 def _triple_sums(f_a, f_b, f_c, tri_idx):
-    """sum_x A_a B_b C_c for each triangle, via lax.scan.
+    """sum_x A_a B_b C_c per triangle; leg j is drawn from stack j (cross-bispectra).
 
-    Three separate stacks so the estimator does CROSS-bispectra: leg j of every
-    triangle is drawn from stack j. Pass the same stack three times for the auto
-    case. This is what the W discriminator needs -- W puts a residual field on
-    the long leg and the reference field on the two short legs.
-
-    A scan rather than a vmap on purpose: vmap would materialize one real
-    (N, N, N) temporary PER TRIANGLE, so the peak would scale with the triangle
-    count. The scan holds exactly one.
+    lax.scan rather than vmap so only one (N, N, N) temporary is live.
     """
     import jax
     import jax.numpy as jnp
@@ -277,20 +211,17 @@ def _triple_sums(f_a, f_b, f_c, tri_idx):
 
 
 def bispectrum_core(delta, theta, tri_idx, alpha, n_mesh, j_fields=None):
-    """The jit-able core. Returns (B, n_tri) as JAX f64 arrays.
+    """Traceable core of `bispectrum`; returns (B, n_tri) as JAX f64 arrays.
 
-    Split out from bispectrum() so the whole thing is jit-able from the start:
-    everything here is traceable, while the shell bookkeeping in _shell_spec /
-    _theta_stack is host-side numpy that must NOT be traced. Callers wanting
-    jit should wrap this, holding theta/tri_idx/alpha/n_mesh fixed.
+    The host-side shell prep (_shell_spec, _theta_stack) stays outside; to jit, wrap this
+    with theta/tri_idx/alpha/n_mesh held fixed.
     """
     import jax.numpy as jnp
 
     legs = delta if isinstance(delta, (tuple, list)) else (delta, delta, delta)
     if len(legs) != 3:
         raise ValueError(f"delta must be one field or exactly 3 (one per leg); got {len(legs)}")
-    # Distinct arrays only: the auto case must not pay 3x the band-field memory,
-    # which is the resident cost of the whole estimator.
+    # one band-field stack per distinct array, so the auto case builds one
     uniq, stacks = [], []
     for f in legs:
         for k, seen in enumerate(uniq):
@@ -311,15 +242,8 @@ def bispectrum_core(delta, theta, tri_idx, alpha, n_mesh, j_fields=None):
     s = _triple_sums(stacks[0], stacks[1], stacks[2], tri_idx)
     norm = _triple_sums(j_fields, j_fields, j_fields, tri_idx)
     n_tri = float(n_mesh) ** 6 * norm
-    # Non-closing bin triples have no mode-triplets at all. mbody documents
-    # n_tri = 0 for these but still divides, which in f32 round-off returns a
-    # large finite garbage B rather than anything a caller would notice.
-    #
-    # The threshold is on n_tri, NOT on the raw J-product: a non-closing triple
-    # does not give an exact zero, it gives f64 FFT round-off (measured 5.7e-14
-    # in n_tri units at N=16), so `norm > 0` admits garbage. n_tri is a COUNT of
-    # mode-triplets, so it is >= 1 whenever the configuration closes at all and
-    # anything below 0.5 is round-off with no scale ambiguity to argue about.
+    # Non-closing triples give FFT round-off, not an exact zero; n_tri is a count, so < 0.5
+    # means none (B = NaN).
     closes = n_tri >= 0.5
     b = jnp.where(closes, alpha * s / jnp.where(closes, norm, 1.0), jnp.nan)
     return b, jnp.where(closes, n_tri, 0.0)
@@ -328,33 +252,17 @@ def bispectrum_core(delta, theta, tri_idx, alpha, n_mesh, j_fields=None):
 def bispectrum(delta, box_size, triangles, dk=None, j_fields=None):
     """Binned bispectrum B(k1, k2, k3) via the Scoccimarro FFT estimator.
 
-    For each triangle,
+    B = (V^2 / N^9) sum_x I1 I2 I3 / sum_x J1 J2 J3 per triangle (V = L^3, I, J from
+    _band_fields); no free constant in pk_estimator's DFT convention.
 
-        B = (V^2 / N^9) * sum_x I1 I2 I3 / sum_x J1 J2 J3,   V = L^3,
+    delta : real (N, N, N) field, or a 3-tuple for a cross-bispectrum (leg j from field j).
+    triangles : (k1, k2, k3) shell centers in h/Mpc; non-closing bins give n_tri = 0, B = NaN.
+    dk : None (k_fundamental), a scalar, or a per-leg 3-sequence.
+    j_fields : optional precomputed J stack to share across compared arms.
 
-    with I, J the band-filtered fields of _band_fields. The V^2/N^9 prefactor is
-    exact in the same DFT convention that fixes pk_estimator's V/N^6 (the
-    triangle count cancels between the data and the J normalization), so a
-    correct field returns B with no free constant. mbody fields.py:174 port.
-
-    delta : real (N, N, N) field, or a 3-tuple of them for a CROSS-bispectrum
-        (leg j is drawn from field j, in the triangle's own leg order). The
-        auto case shares one band-field stack rather than building three.
-    triangles : sequence of (k1, k2, k3) shell centers in h/Mpc. Fully general;
-        a triple whose bins cannot close returns n_tri = 0 and B = NaN.
-    dk : None (k_fundamental), a scalar, or a 3-sequence for a PER-LEG width.
-    j_fields : optional precomputed J stack (see _band_fields) to share across
-        two arms of a comparison.
-
-    Returns (B, n_tri) as float64 numpy arrays, one entry per triangle. n_tri is
-    the mode-triplet count -- a sampling diagnostic, small counts are noisy.
-
-    NO CIC deconvolution and NO shot-noise subtraction, matching mbody. For a
-    tiled-vs-monolithic RATIO both arms paint identically and the window divides
-    out, so this is the right default there; a B quoted in absolute terms off a
-    particle-painted field is NOT window-corrected and must not be compared to a
-    continuum template. The oracle test uses a grid field, where no window
-    enters at all.
+    Returns (B, n_tri) float64 numpy arrays, one per triangle; n_tri is the mode-triplet count.
+    No window deconvolution and no shot-noise subtraction: fine for ratios of identically
+    painted fields, not for absolute comparison of a particle-painted B to a template.
     """
     centers, widths, tri_idx = _shell_spec(triangles, box_size, dk)
     if isinstance(delta, (tuple, list)):
@@ -370,27 +278,11 @@ def bispectrum(delta, box_size, triangles, dk=None, j_fields=None):
 
 
 def band_power(delta, box_size, centers, dk=None):
-    """P(k) on the SAME shells the bispectrum uses -- the R_Q denominator.
+    """P(k) on exactly the bispectrum's shells, for the reduced bispectrum's denominator.
 
-    The gate statistic is the reduced bispectrum ratio
-    Q = B / (P1 P2 + P2 P3 + P3 P1), so its P must come from shells that are
-    bit-identically the estimator's. pk_estimator bins on a uniform edge grid
-    from kmin, which in general contains neither the requested centers nor a
-    per-shell dk, so reading Q's denominator off it would silently mix two
-    binnings.
-
-    Shell-averaged, unweighted over the raw rfftn half-grid, exactly as
-    pk_estimator averages -- so band_power at a bin pk_estimator also resolves
-    returns the same number and the same mode count (asserted in the tests away
-    from Nyquist). NOTE this is the shell average of P, not the triplet-weighted
-    average implicit in B's normalization; that is the standard convention for Q
-    and is stated here because the two differ at the few-percent level in bins
-    with steep P(k).
-
-    centers : sequence of shell centers (h/Mpc). dk as in bispectrum, except a
-    3-sequence is not meaningful here -- pass a scalar or None.
-
-    Returns (P, n_modes) float64 numpy arrays, one entry per center.
+    Unweighted shell average as in pk_estimator (not the triplet-weighted average in B's
+    normalization; they differ by a few percent where P(k) is steep). centers in h/Mpc; dk
+    None or a scalar. Returns (P, n_modes) float64, one per center.
     """
     delta = np.asarray(delta, dtype=np.float64)
     n, ell = delta.shape[0], box_size
@@ -409,28 +301,15 @@ def band_power(delta, box_size, centers, dk=None):
 
 
 def local_bispectrum_binned(delta_shape_n, box_size, cosmo, triangles, f_NL, z=0.0, dk=None):
-    """Bin-AVERAGED tree-level local-f_NL bispectrum -- the exact oracle for
-    bispectrum() above. mbody ic.py:151 port.
+    """Bin-averaged tree-level local-f_NL bispectrum: the exact expectation of `bispectrum`.
 
-    bispectrum() returns the mean of B_tree over every mode-triplet in each
-    (b1, b2, b3) bin, so comparing it to the continuum B_tree at the bin CENTRE
-    (ic.local_bispectrum_template) carries a binning systematic: the shell mode
-    density ~ k^2 pushes the effective k above centre, biasing the steep
-    squeezed long side low. This evaluates the same bin average exactly, so a
-    correct estimator matches it with unit calibration.
-
-    With B_tree = 2 f_NL sum_perm g(k_a) f(k_b) f(k_c), g = M, f = P_lin / M,
-    the bin average is
+    Unlike the continuum template at bin centers, this averages B_tree over the same
+    mode-triplets the estimator sums, via the same shell-product identity:
 
         2 f_NL sum_x (F1 F2 G3 + G1 F2 F3 + F1 G2 F3) / sum_x (J1 J2 J3),
-        G_n = irfftn(M Theta_n), F_n = irfftn((P/M) Theta_n), J_n = irfftn(Theta_n),
+        G_n = irfftn(M Theta_n), F_n = irfftn((P/M) Theta_n), J_n = irfftn(Theta_n).
 
-    the same shell-product identity the estimator uses, so the N^6 factors
-    cancel against the triangle count on both sides.
-
-    delta_shape_n : the mesh size N the estimator will be run at. The bin
-    average depends on the mesh (it is an average over that mesh's modes), so
-    this is not an optional convenience argument.
+    delta_shape_n is the mesh size N the estimator runs at (the average depends on it).
     """
     import jax.numpy as jnp
 
@@ -442,9 +321,7 @@ def local_bispectrum_binned(delta_shape_n, box_size, cosmo, triangles, f_NL, z=0
     _, _, k_mag = _k_grid(n, box_size)
     m_k = poisson_factor(n, box_size, cosmo, z=z)
     p_lin = linear_power(k_mag.ravel(), cosmo, z=z).reshape(k_mag.shape)
-    # k = 0 is excluded from every shell (kmin > 0), but poisson_factor parks a
-    # placeholder 1 there, so zero the weight explicitly rather than relying on
-    # the mask to hide a value that is not physical.
+    # poisson_factor holds a placeholder at k = 0; zero the weight there explicitly
     f_wt = np.where(k_mag > 0, p_lin / np.where(k_mag > 0, m_k, 1.0), 0.0)
 
     theta = _theta_stack(n, box_size, centers, widths)
@@ -467,9 +344,8 @@ def local_bispectrum_binned(delta_shape_n, box_size, cosmo, triangles, f_NL, z=0
 def _subvolume_blocks(delta, n_sub, offset_cells):
     """Split a periodic mesh into n_sub^3 equal cubes, origin shifted by offset_cells.
 
-    Returns (n_sub^3, s, s, s) with s = N // n_sub, block index raveled C-order.
-    The shift is a np.roll, so the split stays a partition of the periodic box:
-    every cell belongs to exactly one block and no cell is dropped.
+    Returns (n_sub^3, s, s, s), s = N // n_sub, blocks raveled C-order; a partition of the
+    periodic box.
     """
     n = delta.shape[0]
     s = n // n_sub
@@ -482,16 +358,8 @@ def _subvolume_blocks(delta, n_sub, offset_cells):
 def _straddle_fraction(n_mesh, n_sub, offset_cells, tiles_per_side):
     """Fraction of sub-volumes that cross at least one tile wall.
 
-    A sub-volume lying wholly inside one tile can only see the long-wavelength
-    modulation that tile already carries in its own frame; it is blind to the
-    seam BY CONSTRUCTION. A lattice of such sub-volumes measures both arms in a
-    correlated way and cannot detect the defect, which is the reason this
-    function exists rather than a comment.
-
-    NOTE the obvious guard -- "make n_sub coprime to tiles_per_side" -- is not
-    available here: an equal-cube split needs n_sub | N, N is a power of two, and
-    so is tiles_per_side, so every admissible pair shares a factor. The offset is
-    what breaks the alignment, and this is the measurement of whether it did.
+    A sub-volume inside one tile is blind to tile seams. With N and tiles_per_side powers of
+    two, n_sub cannot be coprime to the tiling, so only the lattice offset breaks alignment.
     """
     s = n_mesh // n_sub
     tile_cells = n_mesh // tiles_per_side
@@ -507,37 +375,20 @@ def _straddle_fraction(n_mesh, n_sub, offset_cells, tiles_per_side):
 
 def subvolume_response(delta, box_size, n_sub, k_centers, dk=None, offset_frac=0.5,
                        tiles_per_side=None):
-    """Position-dependent P(k): the response of small-scale power to the local
-    long-wavelength density (the integrated bispectrum, Chiang et al. 2014).
+    """Position-dependent P(k) (integrated bispectrum, Chiang et al. 2014).
 
-    Splits the box into n_sub^3 equal sub-cubes, measures each one's mean
-    overdensity `delta_bar` and its own band power `P_sub(k)`, then regresses
-    the fractional power fluctuation on `delta_bar`:
+    Over n_sub^3 equal sub-cubes, regresses P_sub(k) / <P_sub(k)> - 1 = slope(k) * delta_bar.
 
-        P_sub(k) / <P_sub(k)> - 1 = slope(k) * delta_bar + noise
+    `slope` is dlnP/ddelta_bar. Built on sub-volume band power, it is insensitive to
+    small-scale phases, unlike the reduced-bispectrum ratio.
 
-    `slope` is dlnP/ddelta_bar, the squeezed-limit coupling in amplitude form.
+    n_sub must divide the mesh; a center below the sub-volume fundamental 2 pi n_sub / L
+    raises. offset_frac shifts the lattice by that fraction of a sub-volume; with
+    tiles_per_side given, `straddle_frac` (sub-volumes crossing a tile wall) is computed and
+    0.0 raises.
 
-    WHY THIS EXISTS ALONGSIDE bispectrum(). The reduced-bispectrum ratio cannot
-    separate amplitude-wrong from phase-wrong: two fields that have decorrelated
-    give a ratio that saturates at a bounded value and is not monotone in how
-    broken they are. This statistic is built on band POWER inside a sub-volume,
-    so it is insensitive to the small-scale phases and keeps its meaning where
-    the ratio loses it. It is a different estimator, not a reformulation.
-
-    n_sub must divide the mesh (equal cubes, no trimming). The sub-volume's own
-    fundamental is 2 pi n_sub / L, and requesting a center below it raises --
-    an empty band would otherwise return NaN and read as a failed arm.
-
-    offset_frac shifts the sub-volume lattice by that fraction of a sub-volume
-    (default half), which is what stops it from aligning with a tile lattice.
-    Pass tiles_per_side to have that checked rather than assumed: the returned
-    `straddle_frac` is the fraction of sub-volumes crossing a tile wall, and a
-    fully nested lattice (0.0) raises.
-
-    Returns a dict: delta_bar (n_blocks,), p_sub (n_blocks, n_k), p_mean (n_k,),
-    slope (n_k,), slope_err (n_k,), n_modes (n_k,), plus n_sub, n_blocks,
-    sub_box, k_f_sub, offset_cells and straddle_frac.
+    Returns a dict: delta_bar, p_sub, p_mean, slope, slope_err, n_modes, k_centers, n_sub,
+    n_blocks, sub_box, k_f_sub, offset_cells, straddle_frac.
     """
     delta = np.asarray(delta, dtype=np.float64)
     n = delta.shape[0]
@@ -583,9 +434,7 @@ def subvolume_response(delta, box_size, n_sub, k_centers, dk=None, offset_frac=0
     del pm
 
     p_mean = p_sub.mean(axis=0)
-    # Ordinary least squares through the sub-volume scatter. delta_bar averages
-    # to ~0 over the full box by construction, but it is centered explicitly so
-    # the slope does not depend on that holding exactly.
+    # OLS with delta_bar centered explicitly
     x = delta_bar - delta_bar.mean()
     sxx = float((x**2).sum())
     y = p_sub / p_mean[None, :] - 1.0
@@ -608,11 +457,3 @@ def min_image_rms(x_a, x_b, box_size):
     d = np.asarray(x_a, dtype=np.float64) - np.asarray(x_b, dtype=np.float64)
     d = d - box_size * np.round(d / box_size)
     return float(np.sqrt(np.mean(d**2)))
-
-
-# `reversibility_check` and `overflow_report` lived here and were removed with
-# the v1 retirement (2026-08-08). Both spoke the v1 state vocabulary: exact
-# integer equality of an (x, w) pair after a forward+reverse replay, and the
-# D-007 headroom monitor on the w-frame ladder's int16 velocity. v2 has no
-# reverse replay and no ladder. The wrap-never-clamp invariant itself is NOT
-# retired -- it moves into the T9 codec's own refusals at M-v2-1.

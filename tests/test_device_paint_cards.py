@@ -1,14 +1,9 @@
-"""The coarse mesh on the cards, gated BITWISE against the host paint.
+"""The coarse mesh painted across cards, gated bitwise against `engine.coarse_delta_streamed`.
 
-The oracle is the real host code, `engine.coarse_delta_streamed`. Every card
-count must reproduce it to the bit: integer addition does not care which card a
-chunk was added on, and the ghost fold is more integer addition.
-
-Card counts above the backend's device count replicate device handles
-(`test_ooc_fft._devices`): the partition, the threads, the ghost fold and the
-per-card decode all run either way. With
-`--xla_force_host_platform_device_count=4`, or on a four-GPU node, the same
-tests become a true multi-device gate.
+Integer addition is independent of which card adds a chunk, and the ghost fold is more integer
+addition, so every card count must match to the bit. Card counts above the backend's device
+count replicate handles (partition, threads, fold and per-card decode still run); with
+`--xla_force_host_platform_device_count=4` or four GPUs it is a true multi-device gate.
 """
 
 import numpy as np
@@ -20,7 +15,7 @@ from inexor import engine, state  # noqa: E402
 from inexor.codec import T9Layout  # noqa: E402
 from inexor.device import paint as dpaint  # noqa: E402
 
-# `tests/test_engine.py`'s validated smoke geometry, verbatim.
+# tests/test_engine.py's validated smoke geometry.
 L_BOX, N_PART, N_FINE, N_COARSE, N_TILE, B_FINE = 32.0, 32, 64, 16, 16, 8
 
 
@@ -132,7 +127,7 @@ def test_census_matches_the_host():
 
 
 def test_skipping_the_fold_moves_the_density():
-    """The gate can fail: the ghost planes carry real mass."""
+    """Control: the ghost planes carry real mass, so skipping the fold must fail the gate."""
     cfg = _cfg()
     st = _state(cfg, 2)
     want = engine.coarse_delta_streamed(st, cfg)

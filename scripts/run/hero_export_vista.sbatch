@@ -5,60 +5,29 @@
 #SBATCH -n 1
 #SBATCH -t 05:00:00
 #SBATCH -o d7g-hero-export-%j.log
-# D7g: the portable (x, v) export off gb 1009133's step-40 checkpoint, and
-# NOTHING ELSE. Sibling of v2_d7f_hero_card, split out of the combined D7e job
-# that gb 1010938 was cancelled from: the export does not depend on the card,
-# reads the same checkpoint, and queueing it behind a card that overran cost it
-# its whole wall without producing a byte.
+# The portable (x, v) export of an evolved 4096^3 realization's final checkpoint, and
+# nothing else. The checkpoint is the engine's own T9 encoding; this writes it as two
+# plain float32 .npy arrays (~1.65 TB) that any halo finder or analysis code can mmap.
+# Independent of the card job (hero_card_vista.sbatch): same checkpoint, neither reads the
+# other's output, so they may run concurrently or in either order.
 #
-# The two are INDEPENDENT and may run at the same time (gb allows two running
-# jobs per user) or in either order. Neither reads the other's output.
+# Requires INEXOR_RUNS (run root), SRC_RUN (the realization directory holding
+# hero-ckpt/), K_STEPS (schedule length; the newest checkpoint must be at this step),
+# PROD_DIR (product directory; the export goes to $PROD_DIR/export), and INEXOR_SRC or
+# submission from the inexor checkout. The account is passed with `sbatch -A`:
+#   INEXOR_RUNS=$SCRATCH/inexor_runs SRC_RUN=$SCRATCH/inexor_runs/hero-k120 K_STEPS=120 \
+#     PROD_DIR=$SCRATCH/inexor_runs/hero-k120-prod \
+#     sbatch -A <account> scripts/run/hero_export_vista.sbatch
 #
-# 1009133's checkpoint is the engine's own T9 encoding, readable by nothing
-# outside this package; this is what turns it into two plain float32 .npy
-# arrays that any halo finder or analysis code can mmap. ~1.65 TB.
+# Wall: legs ~2 min; loading the 687 GB state ~28 min; then max(decode, write), which the
+# writer thread overlaps: decode 16,777,216 bricks at ~366 us/brick on Grace = ~1.7 h
+# (2.5x slower than on the laptop, and read at +-25%), write 1.65 TB at 706-807 MB/s
+# = ~35 min. ~2.2 h central, decode-bound; 5 h requested for the uncertain decode rate.
 #
-# TIME: measured terms x loop counts, with the decode rate taken ON GRACE.
-#   legs (fingerprint, pytest, cgh64 ICs, cgh64 run to 3) .......   95 s  measured, 1010730
-#   cgh64 export ................................................   12 s  measured, 1010938
-#   hero: load the 687 GB state ................................. 1663 s  measured, 1010938
-#   hero: max(decode, write), the two being overlapped by the
-#     writer thread (7762c89):
-#       decode 16,777,216 bricks @ 366 us ........................ 6140 s  see below
-#       write 1.65 TB @ 706-807 MB/s ............................. 2100 s  measured, 1009133
-#   CENTRAL 2.2 h.  REQUESTED 5:00.  ~2.5 SU at the central.
-#   THE DECODE RATE IS THE ONE TO WATCH AND IT IS NOT THE LAPTOP'S. D7e priced
-#   it at 133-149 us/brick measured on the M4; 1010938's cgh64 export did 32,768
-#   bricks in 12 s = 366 us/brick on Grace at the SAME 4,096 particles/brick,
-#   2.5x slower, and that factor is the same class of miss that made D7e's card
-#   estimate 6-9x optimistic. The 12 s reading is +-3 s (the leg prints 0.1 min
-#   resolution), so treat 366 us as an order, not a rate -- which is why the
-#   request is 5:00 against a 2.2 h central rather than 3:00.
-#   The write is comfortably the smaller term either way, so the overlap the
-#   writer thread buys is worth its whole cost and the leg is DECODE-bound.
-#
-# THE LAYOUT PARAMETERS ARE NOT THE SCRIPT'S DEFAULTS AND MUST NOT BE. See
-# v2_d7f_hero_card for the full note; 1009133 ran slack 0.10 / arena-frac 0.01.
-# D7e predicted the export leg peaks ~688 GB (0.67x); the card leg measured 11%
-# over its own prediction on 1010938, so expect nearer 760 GB and still clear.
-#
-# DISK: 1.65 TB into $SCRATCH, which had 2.5 PB free of 13 PB. The $SCRATCH copy
-# of gen1 must OUTLIVE this job -- sirius is a 64 GB storage server and is an
-# archive target only, so it cannot hold either the state or the export.
-#
-# HOST MEMORY IS BOUND TO THE CPU SOCKETS, as in every D7 job since 1003511.
-#
-# PRE-REGISTERED QUESTIONS:
-#   1. What does the export cost in parts -- `decode` against `write thread` --
-#      and does the depth-one overlap hold on Grace? That writer is new code
-#      (7762c89) and has never run above cgh64.
-#   2. What is NFS's rate for two sequential 825 GB streams, against the
-#      706-807 MB/s the checkpoint's 256 x 2.7 GB files measured?
-#   3. Is the decode really 366 us/brick at hero scale, or did the cgh64 reading
-#      carry fixed overhead? The heartbeat answers this in the first minute.
-#
-# Submit from the Vista checkout:
-#   sbatch scripts/run/hero_export_vista.sbatch
+# Layout parameters must match the run, not the script defaults (see
+# hero_card_vista.sbatch): slack 0.10 / arena-frac 0.01. Expected host peak ~690-760 GB.
+# Host memory is bound to the CPU sockets (`numactl --membind=0,1`). The export must be
+# written to $SCRATCH and kept there: the state and export do not fit anywhere else.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
@@ -74,7 +43,6 @@ unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
 
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
-# SRC_RUN / PROD_DIR / K_STEPS override the run this reads; the defaults are 1009133's
 SRC=${SRC_RUN:?set SRC_RUN to the realization directory}
 K_STEPS=${K_STEPS:?set K_STEPS to the schedule length}
 export K_STEPS
@@ -92,8 +60,8 @@ mkdir -p "$WORK" "$PROD"
 export PROD
 
 ln -sfn "$SRC/hero-ckpt" "$PROD/ckpt"
-# the NEWEST complete generation must be the schedule's last step; which generation
-# holds it depends on how the run was segmented, so it is read, not assumed
+# the newest generation must be at the schedule's last step; which generation holds it
+# depends on the segmentation, so it is read, not assumed
 HEAD_MAN=$(python3 -c "
 import json, os
 best = None
@@ -107,9 +75,8 @@ print(best[1] if best and best[0] == $K_STEPS else '')
 ")
 [ -n "$HEAD_MAN" ] || { echo "FATAL: no step-$K_STEPS manifest under $PROD/ckpt"; exit 1; }
 export HEAD_MAN
-# An export directory left by a killed run holds full-looking, short arrays. The
-# header is written LAST and removed FIRST, so its absence beside data files is
-# exactly that case; refuse rather than write into it.
+# An export directory left by a killed run holds full-looking, short arrays. The header is
+# written last and removed first, so a directory without it is that case; refuse.
 if [ -e "$PROD/export" ] && [ ! -e "$PROD/export/export.json" ]; then
   echo "FATAL: $PROD/export exists without a header -- an interrupted export."
   echo "       Move or remove it deliberately; this job will not write into it."
@@ -156,9 +123,8 @@ run_leg () {
   return $rc
 }
 
-# THE FINGERPRINT GUARD, before anything expensive. Same contract and same
-# reason as v2_d7f_hero_card: the fingerprint hashes coefficients out of
-# QUADPACK, so it rides on the node's libm and can only be settled here.
+# Fingerprint guard, before anything expensive: the fingerprint hashes QUADPACK-derived
+# coefficients, so it depends on the node's libm (see hero_card_vista.sbatch).
 run_leg fingerprint-guard \
   $CPU pixi run -e gpu python -c '
 import sys, json, argparse
@@ -182,11 +148,9 @@ run_leg pytest-gpu \
   pixi run -e gpu python -m pytest -q -rs tests/test_export.py tests/test_progress.py \
   || { echo "FATAL: the export gates failed"; exit 1; }
 
-# --- cgh64: the export end to end, on the same NFS, before the hero leg.
-# STEP 3, not 24: the export is epoch-BLIND -- it decodes and writes whatever
-# the checkpoint holds, and no branch in it depends on the scale factor. (The
-# card is the opposite, which is why its job steps to 24; see v2_d7f.) Three
-# steps is the cheapest thing that produces a checkpoint to read.
+# --- cgh64: the export end to end, on the same filesystem, before the hero leg. Step 3
+# suffices: the export has no epoch-dependent branch (unlike the card), and three steps is
+# the cheapest run that produces a checkpoint.
 run_leg cgh64-ics \
   $BIND pixi run -e gpu python scripts/run/realization.py ics --config cgh64 \
     --workdir "$WORK/cgh64" --generator device \
@@ -206,7 +170,7 @@ run_leg cgh64-export \
   || { echo "FATAL: the export path is broken at cgh64"; exit 1; }
 du -sh "$WORK/cgh64-prod/export"
 
-# --- THE 4096^3 EXPORT. 1.65 TB, decode-bound, one call.
+# --- The 4096^3 export. 1.65 TB, decode-bound, one call.
 run_leg hero-export \
   $CPU $BIND pixi run -e gpu python scripts/run/realization.py export --config c-hero \
     --workdir "$PROD" --k-steps "$K_STEPS" $LAYOUT $HB --export-dir "$PROD/export"

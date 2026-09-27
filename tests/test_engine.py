@@ -1,4 +1,5 @@
-"""The v2 engine core: BullFrog PM on T9 state in slot order (M-v2-3, S5)."""
+"""The engine core: BullFrog PM on T9 state in slot order -- streamed coarse paint, fused
+schedule, ownership partition, shape ladders, phase hook, and checkpoint/resume."""
 
 import json
 import os
@@ -11,8 +12,7 @@ from inexor.codec import T9Layout
 from inexor.config import Cosmology
 from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table, float_step_bullfrog
 
-# The `smoke` rung of the v2 config table, which is the smallest geometry whose
-# tile+buffer decomposition is not degenerate.
+# The smallest geometry whose tile+buffer decomposition is not degenerate.
 L_BOX, N_PART, N_FINE, N_COARSE, N_TILE, B_FINE = 32.0, 32, 64, 16, 16, 8
 BRICKS = None  # derived from choose_brick
 
@@ -59,17 +59,15 @@ def test_the_geometry_validates():
 
 
 def test_the_streamed_coarse_paint_is_bitwise_the_monolithic_one():
-    """The property that makes streaming the long arm possible at all, and it is
-    a consequence of the paint being INTEGER: integer addition is associative, so
-    chunking the accumulation cannot move a bit. With the f64 paint it would."""
+    """Chunked coarse paint is bitwise the monolithic one: the paint is integer and integer
+    addition is associative, so chunking cannot move a bit."""
     import jax.numpy as jnp
 
     cfg = _cfg()
     x, _, st = _state(cfg, 2)
     got = engine.coarse_delta_streamed(st, cfg)
 
-    # the same paint over every particle at once, in slot order so the SET is
-    # identical (order cannot matter, which is the point)
+    # the same paint over every particle at once
     slots_all = []
     for b in range(st.n_bricks):
         s, xb, _ = st.decode_brick(b)
@@ -98,9 +96,8 @@ def test_the_streamed_paint_refuses_the_order_dependent_accumulator():
 
 
 def test_the_fused_schedule_covers_the_same_total_drift():
-    """The fused form must be the SAME trajectory, not a similar one: the two
-    half-drifts share a velocity, so h_k + h_{k+1} after each kick plus a leading
-    h_0 reproduces the boundary form's total advance exactly."""
+    """The fused drifts (leading h_0, then h_k + h_{k+1} after each kick) cover exactly the
+    boundary form's total advance."""
     a = a_grid(0.1, 1.0, 8, "log")
     co = bullfrog_float_coeffs(bullfrog_table(a, Cosmology()))
     lead, fused = engine.fused_drifts(co)
@@ -111,10 +108,8 @@ def test_the_fused_schedule_covers_the_same_total_drift():
 
 
 def test_the_synchronised_float_driver_matches_the_reference_stepper():
-    """The matched oracle the parity gate uses. Algebraically identical to
-    looping float_step_bullfrog and deliberately not bitwise it -- so this
-    asserts agreement to roundoff, and that the difference is not zero, which
-    would mean the fused form was never actually exercised."""
+    """The fused float driver matches looping float_step_bullfrog to float64 round-off, and
+    is not bitwise it (a zero difference would mean the fused form was not exercised)."""
     import jax.numpy as jnp
 
     from inexor.config import BoxConfig
@@ -154,9 +149,8 @@ def test_one_step_conserves_particles_and_leaves_the_container_consistent():
 
 
 def test_the_step_asserts_ownership_is_a_partition():
-    """`n_owned` is checked against the particle count every step, because the
-    velocity-scale reconciliation is only exact if ownership partitions -- and
-    because a broken partition would otherwise silently drop a tile's kick."""
+    """`engine.step` asserts owned rows == particle count; a broken partition would
+    otherwise silently drop or double a kick."""
     cfg = _cfg()
     _, _, st = _state(cfg, 7)
     a = a_grid(0.1, 1.0, 4, "log")
@@ -184,12 +178,9 @@ def test_a_short_run_advances_and_stays_consistent():
 
 
 def test_the_velocity_scale_is_per_brick_and_never_clamps():
-    """Per-brick scales removed the 32 B/p `pending` array, and with it the
-    theorem that made overflow impossible. Under one global scale the encode
-    could not escape int16 because the scale was a max over a PARTITION; per
-    brick it can, whenever a fast particle drifts into a quiet brick. So the
-    range assertion below is doing real work now where it was a formality
-    before, and the spread assertion is what says the fixture could expose it."""
+    """Velocity codes stay in int16 under per-brick scales, where a fast particle drifting
+    into a quiet brick could overflow. The spread check shows the fixture has distinct
+    per-brick scales, so it could expose that."""
     from inexor.codec import assert_int16_range
 
     cfg = _cfg()
@@ -207,28 +198,22 @@ def test_the_velocity_scale_is_per_brick_and_never_clamps():
 
 
 def test_the_engine_defaults_to_the_order_independent_paints():
-    """The choice `density_tsc`'s docstring defers to M-v2-3. The low-level
-    defaults stay f64 so the probe-parity comparisons keep comparing like with
-    like; the ENGINE is where the D-006-compliant path is selected."""
+    """The engine selects the integer (order-independent) paints for both arms, although the
+    low-level `density_tsc` default stays f64."""
     cfg = _cfg()
     assert cfg.paint_short == "int"
     assert cfg.paint_long == "int"
 
 
 # ------------------------------------------------- the capacity shape ladder
-# M-v2-6 Stage 0. `cap` moves every step as occupancy shifts, and every buffer
-# keyed on it keys a new XLA shape, so an unquantized cap leaks one executable
-# family per step: measured at cdev8, ten distinct caps over ten steps
-# (285,554 -> 397,319) and a peak host RSS LINEAR in K at 0.331 GB/step.
+# `cap` moves every step with occupancy and each value keys a new XLA shape, so an
+# unquantized cap retains one executable family per step (host RSS measured linear in steps,
+# 0.331 GB/step). The ladder quantizes it.
 
 
 def test_the_capacity_ladder_is_monotone_and_never_shrinks_a_shape():
-    """Both arguments monotone, and exactness on a rung.
-
-    Monotonicity is the load-bearing property: an octave-relative ladder would
-    map cap 1001 -> 1250 while cap 1024 -> 1024, and a shape schedule that can go
-    DOWN as cap goes up reintroduces exactly the churn this removes.
-    """
+    """The ladder is >= cap, monotone in cap and in the floor, and exact on a rung. A shape
+    that could go down as cap goes up (e.g. an octave-relative ladder) reintroduces churn."""
     caps = np.arange(1, 5000)
     shapes = np.array([forces.capacity_shape(int(c)) for c in caps])
     assert np.all(shapes >= caps), "a shape must never be smaller than the rows it holds"
@@ -242,8 +227,7 @@ def test_the_capacity_ladder_is_monotone_and_never_shrinks_a_shape():
 
 
 def test_the_capacity_ladder_bounds_both_padding_and_shape_count():
-    """The two quantities the knob trades, asserted as bounds rather than checked
-    by eye: worst-case padding is one rung, and a doubling of cap costs exactly
+    """Worst-case padding is one rung, and each half-open octave (2^k, 2^(k+1)] costs exactly
     `rungs` shapes."""
     for rungs in (1, 2, 3, 4, 8):
         ratio = 2.0 ** (1.0 / rungs)
@@ -251,24 +235,16 @@ def test_the_capacity_ladder_bounds_both_padding_and_shape_count():
         shapes = np.array([forces.capacity_shape(int(c), rungs=rungs) for c in caps])
         # +1 absorbs the integer ceil on small rungs; the claim is the RATIO
         assert np.all(shapes <= np.ceil(caps * ratio) + 1)
-        # the HALF-OPEN octave (2^k, 2^(k+1)] is what costs `rungs` shapes; the
-        # closed interval also contains the lower rung itself, which is where the
-        # first version of this assertion was simply wrong
+        # half-open: the closed interval would also contain the lower rung
         lo, hi = 4096, 8192
         n = len({forces.capacity_shape(c, rungs=rungs) for c in range(lo + 1, hi + 1)})
         assert n == rungs, f"a half-open octave should cost {rungs} shapes, got {n}"
 
 
 def test_quantizing_the_capacity_shape_is_bitwise_neutral():
-    """THE GATE for the fix, and it is an identity rather than a threshold.
-
-    Padded rows are MASKED, not filled: the short arm passes `live`, the long arm
-    `live=lv`, masked rows contribute an integer paint weight of exactly zero, the
-    gathers do not mix rows, and both results are sliced back to the real count.
-    So a bigger buffer must give bit-identical state. Run with `cap_rungs=1`
-    (coarsest ladder, largest padding, and it lands on a different shape than the
-    fine ladder) against a run that pads as little as the ladder allows.
-    """
+    """Padding `cap` is bitwise neutral on evolved state: padded rows are masked (integer
+    paint weight exactly zero, no row mixing, results sliced back). Compares cap_rungs=1
+    (largest padding) against 16, and checks the two arms really took different shapes."""
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
 
     cosmo = Cosmology()
@@ -295,8 +271,7 @@ def test_quantizing_the_capacity_shape_is_bitwise_neutral():
 
 
 def test_the_run_visits_few_shapes_and_they_never_decrease():
-    """The behavioural claim: a run's shape family is small and monotone. Without
-    the ladder, cdev8 took a distinct cap on all ten of ten steps."""
+    """A run's cap shapes are few (at most half the steps) and non-decreasing."""
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
 
     cosmo = Cosmology()
@@ -315,22 +290,13 @@ def test_the_run_visits_few_shapes_and_they_never_decrease():
 
 
 # ------------------------------------------------- the coarse chunk pad ladder
-# M-v2-6 Stage 0b. Stage 0 put `cap` on the ladder and left the SECOND shape
-# keyed on occupancy alone: `coarse_delta_streamed` sizes its chunk buffer from
-# `max(rows)`, which moves every step for the same reason `cap` does. Measured at
-# the smoke config, ten distinct pad values over ten steps against one for `cap`,
-# and antares 446 measured the run peak still climbing +110 MB/step at cdev,
-# linear over 15 steps and surviving malloc_trim (so it is live memory, and a
-# retained executable family is live memory).
+# `coarse_delta_streamed` sizes its chunk buffer from `max(rows)`, a second XLA shape that
+# moves every step for the same reason `cap` does; it gets its own ladder.
 
 
 def _pad_shapes_of_a_run(cfg, co, seed=0):
-    """The shapes as XLA SEES them, taken at the call rather than off the stats.
-
-    Reading `coarse_pad` back out of the stats would pass if the field were
-    quantized while the buffer stayed raw, which is the one defect this fix could
-    plausibly have. `paint_tsc_int`'s first argument IS the buffer.
-    """
+    """Buffer row counts as XLA sees them, spied at both paint entry points. Reading the
+    stats alone would pass if the field were quantized while the buffer stayed raw."""
     seen = []
     real_full = engine.paint_tsc_int
     real_sub = engine.paint_tsc_int_subblock
@@ -343,9 +309,7 @@ def _pad_shapes_of_a_run(cfg, co, seed=0):
         seen.append(int(xp.shape[0]))
         return real_sub(xp, *a, **kw)
 
-    # both entry points: since Stage 2c the chunk buffer reaches XLA through
-    # `paint_tsc_int_subblock` on cuboid chunks and `paint_tsc_int` only on the
-    # fallback path -- the buffer is the first argument of either
+    # cuboid chunks go through the sub-block paint, the fallback through the full one
     engine.paint_tsc_int = spy_full
     engine.paint_tsc_int_subblock = spy_sub
     try:
@@ -358,15 +322,9 @@ def _pad_shapes_of_a_run(cfg, co, seed=0):
 
 
 def test_the_coarse_chunk_pad_collapses_to_a_small_shape_family():
-    """The behavioural claim, and it is exact arithmetic: a shape COUNT is
-    integer, so this is one of the few M-v2-6 numbers the laptop can settle.
-
-    The bound is DERIVED from the ladder rather than picked -- over a pad range
-    [lo, hi] the ladder offers `ceil(rungs * log2(hi/lo)) + 1` rungs, and the run
-    may visit no more than that. The vacuity guard is the load-bearing half: if
-    `coarse_pad_true` never moved at this config the assertion below would hold
-    for a ladder that did nothing at all.
-    """
+    """The pad ladder collapses the run's pad shapes: no more than the
+    `ceil(rungs * log2(hi/lo)) + 1` rungs the ladder offers over the pad range, and fewer
+    than the raw values. The raw pad must vary here or the bound holds for a no-op ladder."""
     import math
 
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
@@ -396,15 +354,9 @@ def test_the_coarse_chunk_pad_collapses_to_a_small_shape_family():
 
 
 def test_the_pad_ladder_knob_restores_the_churn_and_moves_no_bit():
-    """`pad_ladder=False` is the A arm of the owed A/B, so two things have to
-    hold or the job measures nothing: the knob must genuinely restore the churn
-    (otherwise the arms differ in name only), and the two arms must evolve to
-    bit-identical state (otherwise their peaks are not measurements of the same
-    engine and the slope difference is unattributable).
-
-    `cap` stays on its ladder in BOTH arms on purpose. Moving `cap_rungs` would
-    move both shape families at once.
-    """
+    """`pad_ladder=False` restores the per-step pad churn while evolving bit-identical state,
+    so a memory A/B between the arms compares the same engine. `cap` stays laddered in both
+    arms so only one shape family moves."""
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
 
     cosmo = Cosmology()
@@ -433,15 +385,8 @@ def test_the_pad_ladder_knob_restores_the_churn_and_moves_no_bit():
 
 
 def test_quantizing_the_coarse_pad_is_bitwise_neutral():
-    """THE GATE, an identity like the `cap` one and for the same reason: the pad
-    rows are masked (`live=lv`), a masked row contributes an integer weight of
-    exactly zero, and integer addition is associative -- so a bigger chunk buffer
-    must give a bit-identical mesh, not a nearly-identical one.
-
-    Compared on the MESH rather than on evolved state so a failure localizes
-    here; `test_quantizing_the_capacity_shape_is_bitwise_neutral` carries the
-    end-to-end version for `cap`.
-    """
+    """A larger chunk pad gives a bit-identical coarse mesh (masked rows weigh exactly zero,
+    integer addition is associative). Compared on the mesh so a failure localizes here."""
     cfg = _cfg()
     _, _, st = _state(cfg, 3)
     stats = {}
@@ -458,18 +403,14 @@ def test_quantizing_the_coarse_pad_is_bitwise_neutral():
 
 
 # ------------------------------------------------- ownership is a partition
-# M-v2-6. The old rule tested the TILE-LOCAL coordinate,
-# `all(u >= core_lo & u < core_hi)` with u = mod(x - origin, L) reached through a
-# DIFFERENT subtraction per tile, so neighbouring tiles' decisions were not
-# complementary in floating point. antares job 431 lost exactly one particle of
-# 16,777,216 at cdev to a ~1 ulp gap at a core plane. It is realization-dependent,
-# which is why it survived this long -- cdev passes on an Apple-arm64 realization
-# and fails on an x86-64 one, the streams being per-machine-class (D-v2-23).
+# A tile-local float rule, `all(u >= core_lo & u < core_hi)` with u = mod(x - origin, L),
+# uses a different subtraction per tile, so neighbouring tiles' decisions are not
+# complementary and a row ~1 ulp from a core plane can be owned by no tile.
 
 
 def _boundary_positions():
-    """Positions engineered to sit ON and either side of every core plane, plus
-    the wrap point -- the cases the old float rule could drop."""
+    """Positions on and 1 ulp either side of every core plane and the wrap point, plus
+    uniform filler."""
     cell = L_BOX / N_FINE
     planes = np.arange(0, N_FINE + 1, N_TILE) * cell  # 0 .. L_BOX inclusive
     eps = np.spacing(L_BOX)  # ~1 ulp at the box scale
@@ -486,8 +427,7 @@ def _boundary_positions():
 
 
 def test_ownership_is_an_exact_partition_including_on_the_core_planes():
-    """Every row owned by EXACTLY one tile. Not 'almost always' -- the engine
-    asserts this as a partition and the velocity-scale theorem depends on it."""
+    """Every row, including those on core planes, is owned by exactly one tile."""
     cfg = _cfg()
     x = _boundary_positions()
     cell = L_BOX / N_FINE
@@ -501,12 +441,8 @@ def test_ownership_is_an_exact_partition_including_on_the_core_planes():
 
 
 def test_the_old_tile_local_rule_is_the_one_that_leaks():
-    """The regression's provenance, kept executable so the fix cannot be undone
-    quietly: reproduce the retired rule and show it drops rows the new one keeps.
-
-    If this ever stops finding a gap the test is vacuous, so it asserts that the
-    old rule DOES leak -- which is what makes it evidence rather than decoration.
-    """
+    """Control: the tile-local float rule must drop a row on this fixture, or the fixture
+    cannot discriminate the exact partition above from the leaky rule."""
     cfg = _cfg()
     x = _boundary_positions()
     cell = L_BOX / N_FINE
@@ -524,9 +460,8 @@ def test_the_old_tile_local_rule_is_the_one_that_leaks():
 
 
 def test_a_run_keeps_every_particle_owned_once_over_many_steps():
-    """The engine's own partition assertion, exercised over a run rather than a
-    step: `engine.step` raises if the tiles do not own exactly n_particles rows,
-    so completing is the assertion passing at every step."""
+    """The engine's per-step partition assertion holds over an 8-step run (completing is
+    the assertion passing every step)."""
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
 
     cosmo = Cosmology()
@@ -539,14 +474,9 @@ def test_a_run_keeps_every_particle_owned_once_over_many_steps():
 
 
 def test_ownership_from_bricks_counts_every_stored_row_exactly_once():
-    """The partition the engine's assertion actually counts: rows in STORAGE.
-
-    `owned_mask` partitions space exactly and that is a different partition --
-    membership comes from brick ordinals, so a row whose stored brick disagrees
-    with its position by one cell is handed to one tile and assigned to another,
-    and nobody claims it (antares 436: one row of 16,777,216). This asserts the
-    storage-derived form over the real container, summed over every tile.
-    """
+    """Ownership derived from stored brick ordinals counts every stored row exactly once over
+    all tiles. This is the partition the engine counts; a spatial rule can disagree with it
+    for a row whose stored brick is one cell off its position."""
     cfg = _cfg()
     _, _, st = _state(cfg, 11)
     b_real = cfg._b_realized
@@ -566,8 +496,7 @@ def test_ownership_from_bricks_counts_every_stored_row_exactly_once():
 
 
 def test_every_brick_belongs_to_exactly_one_tile_core():
-    """The arithmetic the storage-derived partition rests on, asserted rather than
-    argued: the brick grid divides into tile cores with nothing left over."""
+    """The brick grid divides into tile cores with nothing left over or claimed twice."""
     cfg = _cfg()
     nb = cfg.n_fine // cfg.n_brick
     per = cfg.n_tile // cfg.n_brick
@@ -584,14 +513,9 @@ def test_every_brick_belongs_to_exactly_one_tile_core():
     )
 
 
-# ------------------------------------------------- the phase hook (M-v2-6 Stage 0b)
-# A peak is a max and a max carries no timestamp. Stage 0 attributed the engine's
-# peak by differencing whole-run maxima between arms, and at cdev the terms it was
-# separating (67-179 MB) sat inside the run-to-run scatter of the maximum itself
-# (sigma 45-115 MB over five repeats of one leg, antares 445). The hook names the
-# boundaries so a caller can take a high-water mark per phase instead. These tests
-# pin the two properties the instrument rests on: the boundaries are where the
-# docstring says, and the hook cannot move a number.
+# ------------------------------------------------- the phase hook
+# The hook names phase boundaries so a caller can take a per-phase memory high-water mark.
+# Pinned: the boundaries fall where documented, and the hook cannot move a number.
 
 
 def _phase_names(cfg, seed, n_steps=2):
@@ -604,12 +528,8 @@ def _phase_names(cfg, seed, n_steps=2):
 
 
 def test_the_phase_hook_names_every_boundary_in_order():
-    """The per-step sequence, asserted exactly rather than by membership.
-
-    Membership would pass if the hook fired the right names in the wrong places,
-    which is the one failure that would silently misattribute a peak: a boundary
-    after the wrong statement reports another phase's allocation as this one's.
-    """
+    """The exact per-step boundary sequence; membership alone would pass names fired in the
+    wrong places, which would misattribute a phase's peak."""
     cfg = _cfg()
     seen, out, _ = _phase_names(cfg, 21, n_steps=2)
     assert seen[0] == "kernel_build", "the once-per-run force build is unnamed"
@@ -628,9 +548,8 @@ def test_the_phase_hook_names_every_boundary_in_order():
 
 
 def test_the_tile_loop_end_boundary_falls_after_every_tile():
-    """`pending` is largest at the end of the tile loop and nowhere else, so that
-    boundary is the only place a high-water mark can price it. If it fired inside
-    the loop it would price a fraction of the term and read as a smaller one."""
+    """`tile_loop_end` fires once, after the last tile, so it separates the tile loop from the
+    step tail."""
     cfg = _cfg()
     seen, _, _ = _phase_names(cfg, 22, n_steps=1)
     i = seen.index("tile_loop_end")
@@ -649,12 +568,7 @@ def test_the_repack_boundary_fires_only_when_the_repack_does():
 
 
 def test_the_phase_hook_cannot_move_a_number():
-    """Neutrality, asserted on the STATE and on the per-step diagnostics.
-
-    An instrument that perturbs what it measures is worse than no instrument,
-    and this one runs inside the hot loop. Both runs start from the same seed,
-    so every field must agree exactly -- not to a tolerance.
-    """
+    """Passing a hook leaves state and per-step diagnostics bit-identical."""
     cfg = _cfg()
     _, _, st_a = _state(cfg, 24)
     _, _, st_b = _state(cfg, 24)
@@ -673,7 +587,7 @@ def test_the_phase_hook_cannot_move_a_number():
 
 
 def test_the_default_hook_is_a_no_op_that_returns_nothing():
-    """`_no_phase` is what the hot loop calls when no caller asked for a trace."""
+    """The default hook, called when no trace was requested, is a no-op."""
     assert engine._no_phase("anything") is None
 
 
@@ -681,9 +595,8 @@ def test_the_default_hook_is_a_no_op_that_returns_nothing():
 
 
 def test_the_subblock_paint_knob_is_bitwise_and_genuinely_applies():
-    """Stage 2c's gate: the sub-block path must change NO bit of the coarse
-    delta, and the A/B knob must prove it applied -- an arm whose knob did not
-    move measures nothing (both stats fields assert it here)."""
+    """The sub-block coarse paint is bitwise the full one, and the stats show each arm really
+    took its path."""
     cfg_on = _cfg()
     cfg_off = _cfg(paint_subblock=False)
     _, _, st1 = _state(cfg_on, 5)
@@ -698,9 +611,8 @@ def test_the_subblock_paint_knob_is_bitwise_and_genuinely_applies():
 
 
 def test_the_subblock_containment_guard_fires_on_a_wrong_cuboid():
-    """The host-side half of the containment contract must REFUSE, not wrap:
-    a stencil corner leaving the block wraps silently inside the jit (the
-    D-v2-21 failure class), so the guard in front of it is the safety."""
+    """The host-side containment guard raises on a stencil leaving its cuboid (inside the jit
+    it would wrap silently) and passes a contained one."""
     rng = np.random.default_rng(0)
     x = rng.uniform(0.0, L_BOX, size=(64, 3))
     cell = L_BOX / N_COARSE
@@ -708,7 +620,7 @@ def test_the_subblock_containment_guard_fires_on_a_wrong_cuboid():
         engine._assert_stencil_contained(
             x, cell, np.array([0, 0, 0]), np.array([4, 4, 4]), N_COARSE
         )
-    # and the passing direction, so the test cannot rot into always-raising
+    # the passing direction, so the guard is not always-raising
     lo, hi = 5.5 * cell, 8.4 * cell  # bases 6..8 -> [origin+1, origin+extent-2]
     x_ok = rng.uniform(lo, hi, size=(64, 3))
     engine._assert_stencil_contained(
@@ -717,7 +629,7 @@ def test_the_subblock_containment_guard_fires_on_a_wrong_cuboid():
 
 
 # --------------------------------------------------------------------------
-# M-v2-6 Stage 4(b): checkpoint and resume
+# checkpoint and resume
 
 
 def _ck_state(cfg, seed=0):
@@ -726,10 +638,8 @@ def _ck_state(cfg, seed=0):
 
 
 def _rows(st):
-    """Container content with allocation layout and intra-bucket order divided
-    out -- the normal form the writer's round-trip gate uses. Raw array
-    equality is the wrong invariant: a reloaded state's `brick_start` comes
-    from `_alloc_geometry`, not from the run that produced it."""
+    """Container content with allocation layout and intra-bucket order divided out. Raw array
+    equality is wrong here: a reloaded `brick_start` comes from `_alloc_geometry`."""
     out = []
     for b in range(st.n_bricks):
         slots = st.brick_member_slots(b)
@@ -748,25 +658,10 @@ def _coeffs(k=6):
 
 
 def test_resumed_run_is_bitwise_the_uninterrupted_one(tmp_path):
-    """THE Stage 4(b) gate: six steps straight through, against six steps
-    interrupted after the third and resumed from disk, particle for particle.
-
-    NB the interrupted arm runs the FULL schedule and stops, rather than
-    running a truncated one. `fused_drifts` fuses the trailing half-drift of
-    each step with the leading half of the next, so a run over `coeffs[:3]` is
-    a different trajectory, not the first half of this one.
-
-    What this gate CATCHES: the lead drift being reapplied on resume, which
-    would move the whole box an extra half step (mutation-checked, fails).
-
-    What it does NOT catch, stated because the docstring claimed otherwise
-    first: `cap_shape` / `pad_shape` not being restored. Both are flat at this
-    geometry (5161 at every step), so re-laddering from zero reaches the same
-    value and the mutation is vacuous. Measured separately rather than assumed
-    -- quadrupling both shapes on resume moves 0 of ~229k rows, since the
-    padded rows are masked -- so on arm64 CPU at this scale the restore is a
-    compile-count choice, not a correctness one. A GPU arm, where XLA
-    reassociates by shape, is not covered by that measurement."""
+    """Six steps straight through equal six steps resumed from the step-3 checkpoint, row for
+    row. Both arms get the full schedule (`fused_drifts` makes `coeffs[:3]` a different
+    trajectory). Catches a lead drift reapplied on resume; does not catch unrestored
+    `cap_shape`/`pad_shape`, which are flat at this geometry."""
     co = _coeffs(6)
     ref = _ck_state(_cfg())
     engine.run(ref, _cfg(), co)
@@ -778,8 +673,7 @@ def test_resumed_run_is_bitwise_the_uninterrupted_one(tmp_path):
     out = engine.run(st, cfg_c, co)
     assert [o["checkpoint"] is not None for o in out] == [False, False, True] * 2
 
-    # drop the newer generation's manifest: what an interrupted write leaves,
-    # and what makes step 3 the newest COMPLETE checkpoint
+    # drop the newer manifest, as an interrupted write would; step 3 is then newest complete
     os.remove(os.path.join(d, "gen1", "manifest.json"))
     st_r, resume = engine.load_checkpoint(d, _cfg(), co, arena_frac=0.05)
     assert int(resume["step"]) == 3, "fell back to the wrong generation"
@@ -789,10 +683,8 @@ def test_resumed_run_is_bitwise_the_uninterrupted_one(tmp_path):
 
 
 def test_load_checkpoint_refuses_a_foreign_run(tmp_path):
-    """A resume under a different geometry or a different schedule does not
-    fail loudly on its own -- it produces a run that is half one thing and half
-    another. The fingerprint covers `coeffs` as bytes, so the cosmology, the
-    a-grid and K are all in it."""
+    """Resume refuses a different geometry or schedule (the fingerprint hashes `coeffs`, so
+    cosmology, a-grid and K are covered) but accepts different execution policy."""
     d = str(tmp_path / "ck")
     cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=1)
     engine.run(_ck_state(cfg_c), cfg_c, _coeffs(4))
@@ -801,17 +693,14 @@ def test_load_checkpoint_refuses_a_foreign_run(tmp_path):
         engine.load_checkpoint(d, _cfg(), _coeffs(5))          # different schedule
     with pytest.raises(ValueError, match="different configuration or schedule"):
         engine.load_checkpoint(d, _cfg(frac_bits=11), _coeffs(4))   # different geometry
-    # execution policy is deliberately NOT fingerprinted: resuming onto another
-    # node with a different worker count is the point of having checkpoints
+    # execution policy is not fingerprinted: resuming on another machine must work
     engine.load_checkpoint(d, _cfg(tile_workers=2, eject_kernel="numpy"), _coeffs(4),
                            arena_frac=0.05)
 
 
 def test_checkpointing_is_off_without_a_directory_and_disablable_with_zero(tmp_path):
-    """`checkpoint_every=0` is the off switch, the `repack_every` idiom. With no
-    directory the machinery is inert rather than a refusal, because the default
-    config has none and every single-process caller would otherwise raise -- so
-    the RECEIPT is what proves it applied."""
+    """No directory, or `checkpoint_every=0`, writes nothing and reports no checkpoint (the
+    default config has no directory, so this is inert rather than a refusal)."""
     co = _coeffs(3)
     out = engine.run(_ck_state(_cfg()), _cfg(), co)
     assert all(o["checkpoint"] is None for o in out)
@@ -824,12 +713,8 @@ def test_checkpointing_is_off_without_a_directory_and_disablable_with_zero(tmp_p
 
 
 def test_a_timed_checkpoint_reports_its_own_parts(tmp_path):
-    """A real checkpoint at full size is the only honest measurement of what the
-    write costs: the driver's probe writes a few slabs and multiplies, which read
-    3076 s against the 3757 s a full write actually took (job 1002247). The parts
-    ride on the timed step's receipt so a production run measures them for free,
-    and so the decision about optimizing the writer further is made on four
-    full-size writes rather than on an extrapolation."""
+    """A checkpoint on a timed step reports its write-cost parts in the step's timings, so a
+    production run measures full-size writes directly; untimed checkpoints carry none."""
     co = _coeffs(4)
     cfg_c = _cfg(checkpoint_dir=str(tmp_path / "ck"), checkpoint_every=2)
     st = _ck_state(cfg_c)
@@ -843,16 +728,14 @@ def test_a_timed_checkpoint_reports_its_own_parts(tmp_path):
         assert parts["slabs"] == st.bricks_per_side
         assert all(parts[k] >= 0.0 for k in ("index", "gather", "crc32", "write"))
 
-    # and an untimed checkpoint still writes, carrying no parts
     out2 = engine.run(_ck_state(cfg_c), cfg_c, co)
     assert [o["checkpoint"] is not None for o in out2] == [False, True, False, True]
     assert all(o["timings"] is None for o in out2)
 
 
 def test_checkpointing_refuses_a_state_carrying_ids(tmp_path):
-    """The schema has no ids, and a checkpoint that dropped them would make the
-    restart non-reproducible for anything id-dependent. It has to refuse before
-    the first step, not 37 minutes into it."""
+    """The checkpoint schema has no ids, so a run carrying ids refuses before the first step
+    rather than dropping them."""
     cfg_c = _cfg(checkpoint_dir=str(tmp_path / "ck"), checkpoint_every=1)
     st = _ck_state(cfg_c, seed=1)
     st.ids = np.arange(len(st.off), dtype=np.int64)
@@ -868,20 +751,9 @@ def test_load_checkpoint_refuses_when_nothing_is_complete(tmp_path):
 
 
 def test_a_run_split_into_segments_is_bitwise_the_uninterrupted_one(tmp_path):
-    """`stop_at` + `resume` as a real segmented run, which is how a realization
-    whose wall exceeds a queue limit has to be executed.
-
-    Stronger than the gate above, which simulates the interruption by deleting a
-    manifest after running the whole schedule. This one actually stops: three
-    segments of two steps, each a separate `engine.run` reading the previous
-    segment's checkpoint off disk, against six steps straight through.
-
-    The trajectory is the load-bearing part. Each segment is handed the FULL
-    coefficient list and told where to stop, never a truncated one, because
-    `fused_drifts` makes `coeffs[:n]` a different trajectory rather than a
-    prefix -- so a segmented run that composed only approximately would show up
-    here as a payload difference, not a rounding one.
-    """
+    """Three `stop_at` + `resume` segments of two steps, each reloading from disk, equal six
+    steps straight through row for row (how a run longer than a queue limit executes).
+    Each segment gets the full coefficient list, since `coeffs[:n]` is not a prefix."""
     co = _coeffs(6)
     ref = _ck_state(_cfg())
     engine.run(ref, _cfg(), co)
@@ -907,10 +779,8 @@ def test_a_run_split_into_segments_is_bitwise_the_uninterrupted_one(tmp_path):
 
 
 def test_a_resumed_segment_writes_first_to_the_generation_it_did_not_load(tmp_path):
-    """A resumed segment must not overwrite its own resume point before a newer
-    state exists. One checkpoint per segment is the case that exposed it: with
-    the counter restarting at gen 0 every segment, each one rewrote the state it
-    had just loaded and gen 1 was never written at all."""
+    """A resumed segment writes first to the generation it did not load, so its resume point
+    survives until a newer state exists (one checkpoint per segment is the hard case)."""
     co = _coeffs(6)
     d = str(tmp_path / "seg")
     cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=2)
@@ -932,12 +802,8 @@ def test_a_resumed_segment_writes_first_to_the_generation_it_did_not_load(tmp_pa
 
 
 def test_stop_at_refuses_to_discard_a_segments_work(tmp_path):
-    """Stopping off a checkpoint boundary loses everything since the last one.
-
-    The refusal matters more than it looks: the caller is a batch script that
-    reads exit 0 as "this segment is done, submit the next one", so a silent
-    partial segment would be resumed from the wrong step and the run would
-    quietly repeat work or, worse, look finished."""
+    """`stop_at` off a checkpoint boundary (or at 0) refuses: a batch caller reads exit 0 as
+    segment done, so a silent partial segment would resume from the wrong step."""
     co = _coeffs(6)
     d = str(tmp_path / "seg")
     cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=2)
@@ -949,8 +815,7 @@ def test_stop_at_refuses_to_discard_a_segments_work(tmp_path):
 
 
 def test_eject_inflight_refuses_zero():
-    """At zero no eject can launch and the dispatch loop blocks forever, so
-    this has to refuse rather than hang a cluster job for its whole wall."""
+    """eject_inflight=0 refuses; at zero the dispatch loop would block forever."""
     import pytest as _pytest
 
     from inexor.state import drift_and_migrate_pooled
@@ -965,14 +830,9 @@ def _epoch(k=6):
 
 
 def test_a_checkpoint_records_the_epoch_it_actually_sits_at(tmp_path):
-    """THE index gate for `epoch_record`, and the reason it is a test rather
-    than a reading: `a_grid` emits n_steps+1 points, `_write_checkpoint` is
-    called with the number of COMPLETED steps, and the two conventions have to
-    agree or every exported velocity is scaled at the wrong epoch -- silently,
-    since a neighbouring epoch's factor is a perfectly plausible number.
-
-    Checked at EVERY checkpoint, not just the last: an off-by-one that happens
-    to be right at the final step is the version of this bug that ships."""
+    """Each checkpoint records a = a_steps[completed steps] (a_grid has n_steps+1 points). An
+    off-by-one would silently scale exported velocities at a neighbouring epoch; checked at
+    every retained checkpoint, not just the final one."""
     import json
 
     a_steps, cosmo = _epoch(6)
@@ -990,15 +850,12 @@ def test_a_checkpoint_records_the_epoch_it_actually_sits_at(tmp_path):
     for step, prov in seen.items():
         assert prov["a"] == float(a_steps[step]), f"step {step} recorded the wrong epoch"
         assert prov["cosmology"]["Omega_m"] == cosmo.Omega_m
-    # and the last one is the final epoch, which is the case a wrong convention
-    # can still get right by accident
     assert seen[6]["a"] == 1.0
 
 
 def test_epoch_is_optional_and_absent_by_default(tmp_path):
-    """A run that passes no epoch writes the manifest it always wrote. This is
-    what keeps the banked 2048^3 slabs and every existing checkpoint loading:
-    the epoch is provenance, not schema."""
+    """Without an epoch the manifest carries no `a`/`cosmology` and the schema is unchanged:
+    the epoch is provenance, not schema, so existing checkpoints keep loading."""
     import json
 
     d = str(tmp_path / "ck")
@@ -1012,9 +869,8 @@ def test_epoch_is_optional_and_absent_by_default(tmp_path):
 
 
 def test_epoch_does_not_move_the_fingerprint_or_the_trajectory(tmp_path):
-    """Recording the epoch must be inert. The fingerprint already hashes
-    `coeffs`, so adding the epoch to it would invalidate every checkpoint on
-    disk to record nothing new -- and a resume across the two arms must work."""
+    """Recording the epoch moves neither the trajectory nor the fingerprint (which already
+    hashes `coeffs`), and a checkpoint with an epoch resumes under a config without one."""
     co = _epoch(4)
     d0, d1 = str(tmp_path / "a"), str(tmp_path / "b")
     c0 = _cfg(checkpoint_dir=d0, checkpoint_every=4)
@@ -1026,14 +882,12 @@ def test_epoch_does_not_move_the_fingerprint_or_the_trajectory(tmp_path):
     np.testing.assert_array_equal(_rows(st0), _rows(st1))
     assert (engine.checkpoint_fingerprint(c0, _coeffs(4))
             == engine.checkpoint_fingerprint(c1, _coeffs(4)))
-    # a checkpoint written WITH an epoch resumes under a config that has none
     engine.load_checkpoint(d1, _cfg(), _coeffs(4), arena_frac=0.05)
 
 
 def test_a_mismatched_epoch_grid_refuses_before_the_first_step(tmp_path):
-    """`coeffs` is always the full schedule, so `len(a_steps) == len(coeffs)+1`
-    holds on every leg including a `stop_at` segment. Checked at call time: the
-    alternative is discovering it one step into a run that costs hours."""
+    """An epoch grid without len(coeffs)+1 points refuses at call time (coeffs is always the
+    full schedule, so this holds on every segment)."""
     d = str(tmp_path / "ck")
     cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=1)
     with pytest.raises(ValueError, match="epoch grid has"):

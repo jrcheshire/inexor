@@ -1,14 +1,6 @@
-"""Position-dependent P(k) (diagnostics.subvolume_response) -- the amplitude-side
-squeezed statistic G3 Stage 5 reads where the bispectrum ratio has lost its
-meaning.
-
-TOLERANCES ARE MEASURED, NOT ASSUMED. The partition and guard checks are exact
-(integer bookkeeping). The recovery check is statistical -- it regresses a
-sub-volume scatter -- so its bound is set from the measured deviation on these
-fixtures and the measured value is quoted next to it.
-
-Pure numpy: this estimator has no JAX path, so unlike test_bispectrum.py there
-is no x64 fixture to manage.
+"""Position-dependent P(k) (diagnostics.subvolume_response), the amplitude-side squeezed
+statistic. Partition and guard checks are exact; the recovery bound comes from a measured
+deviation, quoted in its test. Pure numpy.
 """
 
 import numpy as np
@@ -43,31 +35,15 @@ def _split_fields(n, ell, seed):
 
 
 def _modulated(n, ell, seed, amp):
-    """delta = long + short * (1 + amp * long).
-
-    Inside a sub-volume the small-scale power is scaled by (1 + amp*long_bar)^2
-    while the sub-volume mean overdensity IS long_bar (the small-scale part
-    averages away), so the exact expected response is dlnP/ddelta_bar = 2*amp.
-    No fitted constant, which is what makes this a real oracle.
-    """
+    """delta = long + short * (1 + amp * long), so the expected dlnP/ddelta_bar is 2*amp."""
     long_f, short_f = _split_fields(n, ell, seed)
     return long_f + short_f * (1.0 + amp * long_f)
 
 
 def _block_oracle(n, n_sub, seed, amp):
-    """A field whose response is EXACT, not statistical.
-
-    Every sub-volume gets the same small-scale realization (the pattern is
-    periodic with the sub-volume), and is then multiplied by (1 + amp*c_i) with
-    c_i a per-sub-volume constant that IS that sub-volume's mean overdensity. So
-    P_sub = P_block * (1 + amp*c_i)^2 with no cosmic variance between blocks, and
-
-        slope = 2*amp / (1 + amp^2 var(c))
-
-    exactly, in the limit where the regression is linear. The realistic fixture
-    above cannot do this job: with 64 sub-volumes of band-limited noise the
-    fitted slope carries a 15-60% error bar, so it can confirm a null but cannot
-    certify a scale.
+    """A field whose response is exact: every sub-volume holds the same small-scale
+    realization scaled by (1 + amp*c_i), c_i its mean, so slope = 2*amp / (1 + amp^2 var(c)).
+    `_modulated` has a 15-60% slope error at 64 sub-volumes: fine for a null, not a scale.
     """
     rng = np.random.default_rng(seed)
     s = n // n_sub
@@ -95,17 +71,8 @@ def test_blocks_are_an_exact_partition():
 
 
 def test_straddle_fraction_matches_a_cell_level_count():
-    """The guard's arithmetic against an independent brute-force count.
-
-    The reference assigns every CELL a tile id and calls a sub-volume nested iff
-    all of its cells share one id -- a different computation from the wall-
-    interval arithmetic in _straddle_fraction, so agreement is evidence.
-
-    VERIFIED TO DISCRIMINATE: closing the wall interval (`lo <= w`) gives 6
-    disagreements and dropping its second period (`range(0, n_mesh, ...)`) gives
-    8. A third mutation, shrinking the interval by one cell, is caught ONLY by
-    the offsets 1 and s-1 below -- they are what put a tile wall on a block's
-    first and last cell, and without them that mutation passes silently.
+    """`_straddle_fraction` against a cell-level tile-id count. Mutations caught: closing the
+    wall interval, dropping its second period, and (only via offsets 1 and s-1) shrinking it.
     """
     for n_sub in (2, 4, 8):
         for tps in (2, 4, 8):
@@ -138,12 +105,7 @@ def test_center_below_subvolume_fundamental_raises():
 
 
 def test_unmodulated_field_gives_zero_response():
-    """The null: small-scale power that does not track the long mode.
-
-    delta = long + short with no coupling, so the true slope is 0 and what the
-    estimator returns is its own noise. Bounded against the fitted error bar,
-    not against an absolute number, because the noise depends on the fixture.
-    """
+    """Null: uncoupled fields give a slope within 3 sigma of 0 (the fitted error bar)."""
     d = _modulated(N_MESH, L_BOX, 5, 0.0)
     res = _run(d, 4, tiles_per_side=4)
     z = np.abs(res["slope"]) / res["slope_err"]
@@ -152,21 +114,11 @@ def test_unmodulated_field_gives_zero_response():
 
 @pytest.mark.parametrize("amp", [0.1, 0.25, 0.5])
 def test_injected_modulation_is_recovered(amp):
-    """The oracle: an injected coupling of known size comes back as 2*amp.
+    """An injected coupling comes back as 2*amp/(1 + amp^2 var(c)) within 5e-2 relative.
 
-    Uses the block-periodic construction, where the expected slope is exact
-    (see _block_oracle) rather than a statistical expectation. The lattice is
-    unoffset here ON PURPOSE -- the construction defines its blocks on that
-    lattice, and this test is about the estimator's arithmetic, not the seam
-    guard, which test_nested_lattice_raises covers.
-
-    MEASURED deviation from 2*amp/(1 + amp^2 var(c)) over seeds 11-14 and three
-    amplitudes: worst 1.71e-2 relative, and it scales LINEARLY in amp
-    (3.4e-3 / 8.6e-3 / 1.71e-2 at amp = 0.1 / 0.25 / 0.5 on seed 12). That is
-    the O(amp^2) skewness term the expected-value formula truncates, not
-    estimator error -- the two shell centers return bit-identical slopes, as
-    they must when every block carries the same small-scale content. Bound set
-    at 5e-2, ~3x the measured worst.
+    Measured worst 1.71e-2 over seeds 11-14, linear in amp (3.4e-3 / 8.6e-3 / 1.71e-2 at 0.1 /
+    0.25 / 0.5): the O(amp^2) term the formula truncates. Unoffset lattice, since the oracle's
+    blocks are defined on it.
     """
     for seed in (11, 12, 13, 14):
         d, var_c = _block_oracle(N_MESH, 4, seed, amp)
@@ -177,10 +129,7 @@ def test_injected_modulation_is_recovered(amp):
 
 
 def test_response_is_stable_across_subvolume_count():
-    """n_sub = 4 vs 8 must agree: the response is a property of the field, not
-    of the binning. They share no sub-volume boundary and have different noise,
-    so this is a genuine consistency check.
-    """
+    """n_sub = 4 and 8 agree within 3 sigma."""
     d = _modulated(N_MESH, L_BOX, 21, 0.5)
     r4 = _run(d, 4, tiles_per_side=4)
     r8 = _run(d, 8, tiles_per_side=4)
@@ -197,6 +146,6 @@ def test_bookkeeping_fields_are_reported():
     assert res["offset_cells"] == (N_MESH // 4) // 2
     assert (res["n_modes"] > 0).all()
     assert res["p_sub"].shape == (64, len(CENTERS))
-    # equal-volume blocks partitioning the box: the sub-volume means average to
-    # the field mean exactly (which is NOT zero -- the fixture keeps its k=0 mode)
+    # equal-volume blocks: sub-volume means average to the field mean (nonzero: the
+    # fixture keeps its k=0 mode)
     assert float(res["delta_bar"].mean()) == pytest.approx(float(d.mean()), rel=0, abs=1e-14)

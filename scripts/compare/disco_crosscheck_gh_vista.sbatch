@@ -5,37 +5,35 @@
 #SBATCH -n 1
 #SBATCH -t 01:30:00
 #SBATCH -o disco-xcheck-%j.log
-# Does a single-mesh PM share the ~14% high-k deficit against EE2?
+# Cross-check the engine's P(k) against a single-mesh PM: DISCO-DJ evolves our ICs at our
+# fine resolution (512^3 particles, 1024^3 mesh = 0.25 Mpc/h, 120 BullFrog steps on the
+# same a-grid; CIC, ik gradient/Laplacian, no deconvolution), and the result is carded
+# with the realization script's own estimator, so it differences bin-for-bin against the
+# engine's card on the same ICs with the seed scatter cancelled.
 #
-# DISCO-DJ evolves OUR ICs (the z = 9, corrected-match realization that
-# mo3_1018341_k120 carded) on its own PM at our fine resolution: 512^3 particles,
-# 1024^3 mesh (0.25 Mpc/h), 120 BullFrog steps on the same a-grid, M1 parity
-# settings (CIC, ik gradient/Laplacian, no deconvolution). The result is carded
-# with the realization script's own estimator, so it differences bin-for-bin
-# against mo3_1018341_k120 with the seed scatter cancelled.
+# Requires INEXOR_RUNS (run root), DISCO_SRC (disco-mocks checkout), IC_DIR (cgh64 ICs to
+# cross-check), and INEXOR_SRC or submission from the inexor checkout. The account is
+# passed with `sbatch -A`:
+#   INEXOR_RUNS=$SCRATCH/inexor_runs DISCO_SRC=$HOME/src/disco-mocks IC_DIR=<ic dir> \
+#     sbatch -A <account> scripts/compare/disco_crosscheck_gh_vista.sbatch
 #
-# LEGS
-#   guards   both checkouts clean; both `gpu` envs installed from their locks
-#            and disco-mocks' pinned pip layer rebuilt in-job (absent on Vista:
-#            only `default` was installed); jax 0.10.1, discodj a687972 and a
-#            GPU device asserted, inexor + the driver importable
-#   smoke    the whole chain at cdev8 (128^3, 256^3 mesh, 120 steps): fresh
-#            ICs, export, evolve, card. Low k must match the local cdev8 run.
+# Legs:
+#   guards   both checkouts clean; both envs installed from their locks and disco-mocks'
+#            pinned pip layer rebuilt in-job; jax 0.10.1, discodj a687972 and the
+#            expected device platform asserted; inexor + the driver importable
+#   smoke    the whole chain at cdev8 (128^3, 256^3 mesh, 120 steps): fresh ICs,
+#            export, evolve, card
 #   export   cgh64 ICs -> (x, v_d), 6.4 GB
-#   evolve   DISCO-DJ f64. Expected device peak ~75 GB (289 B/p measured in f32
-#            at pm_ratio 2, doubled); the memory fraction is raised to 0.95
-#            (~91 GB). If f64 does not fit, the job STOPS -- f32 is not the
-#            parity setting and is a separate decision.
+#   evolve   DISCO-DJ in f64; expected device peak ~75 GB (289 B/p in f32 at pm_ratio 2,
+#            doubled), so the memory fraction is raised to 0.95 (~91 GB). If f64 does not
+#            fit the job stops: f32 is a different setting.
 #   card     serial card of DISCO-DJ's final particles
+# Wall: ~0.5 h expected, 1.5 h requested. SMOKE_ONLY=1 stops after the smoke.
 #
-# BUDGET: gh = 1 SU/node-hr; expected ~0.5 h, 1.5 h wall.
-#
-# DISCO_BACKEND=cpu runs DISCO-DJ on JAX's CPU backend instead (e.g. on gg, whose
-# queue is short): disco-mocks' `default` env + its `setup` task (CPU jax 0.10.1,
-# discodj a687972), a CPU device asserted. The parity settings are identical;
-# cdev8 GPU and CPU cards agreed to 1e-6. Submit with -p gg and a longer -t: the
-# 512^3 CPU rate is unmeasured, so the smoke leg's wall is scaled by 64 and
-# printed before the evolve commits.
+# DISCO_BACKEND=cpu runs DISCO-DJ on JAX's CPU backend (disco-mocks' `default` env and
+# its `setup` task) with identical settings; cdev8 GPU and CPU cards agree to 1e-6.
+# Submit with -p gg and a longer -t: the smoke leg prints its wall scaled by 64 as a
+# naive 512^3 estimate before the evolve commits.
 
 set -u
 export PATH="$HOME/.pixi/bin:$PATH"
@@ -47,8 +45,6 @@ INEXOR=${INEXOR_SRC:-$SLURM_SUBMIT_DIR}
 DISCO=${DISCO_SRC:?set DISCO_SRC to the disco-mocks checkout}
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 WORK=$RUNS/disco-xcheck-$SLURM_JOB_ID
-# IC_DIR overrides the realization (e.g. a chained engine job's fresh ICs); the
-# default is the EdS-era corrected-match realization mo3_1018341_k120 carded
 IC=${IC_DIR:?set IC_DIR to the IC directory to cross-check}
 DRV=scripts/compare/disco_crosscheck.py
 mkdir -p "$WORK"

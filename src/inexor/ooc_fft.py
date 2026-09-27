@@ -1,40 +1,21 @@
 """Out-of-core 3D real FFTs: host-resident k-space, slab-streamed real space.
 
-"Out of core" means out of DEVICE core (D-v2-15 clause 4: a 2048^3
-`jnp.fft.rfftn` does not fit a GH200 -- workspace 7x the field). Here the
-spectral array lives in host numpy and every real-space field is only ever
-touched one axis-0 slab at a time, so the IC stage's peak is one spectral
-array plus O(plane) buffers. Disk holds staged REAL fields and T9 slabs only
-(clause 3); k-space is never spilled.
+"Out of core" means out of DEVICE memory: the spectrum lives in host numpy and real-space
+fields are touched one axis-0 slab at a time, so the peak is one spectral array plus
+O(plane) buffers. k-space is never spilled to disk.
 
-THE CANONICAL FACTORIZATION -- this, not `np.fft.rfftn`, is the layer's
-definition:
+The layer is DEFINED by this factorization (not by `np.fft.rfftn`, which it does not
+match bitwise):
 
   pass 1  scipy.fft.rfft2 of ONE axis-0 plane at a time;
   pass 2  scipy.fft.fft(axis=0) of ONE y-pencil-plane (N, N//2+1) at a time.
 
-THE UNIT IS ONE PLANE BY MEASUREMENT, NOT TASTE. pocketfft's results are
-batch-size dependent at the bit level: on a 32^3 f64 field, per-plane rfft2
-differs from the whole-batch call in 341 elements and a 5-column axis-0
-chunk differs from the whole call in 68 (2026-08-10, scipy in the locked
-env; worker count moves nothing). So a slab- or chunk-sized compute unit
-would make the spectrum depend on the streaming decomposition -- exactly
-what D-v2-15 clause 5 defines reproducibility against. With a fixed
-one-plane unit, slab thickness is an OUTER loop bound that cannot touch a
-bit, and "streamed == monolithic" is a theorem the tests then merely
-confirm.
+The unit is one plane because pocketfft results depend on batch size at the bit level;
+with a fixed unit, slab thickness is an outer loop bound and streamed == monolithic
+bitwise. scipy.fft, not np.fft, because np.fft upcasts f32 to complex128.
 
-Equality with `np.fft.rfftn` is NOT claimed (a different transform order
-rounds differently); the tests keep a tolerance-level cross-check only.
-
-scipy.fft, not np.fft, throughout: pocketfft preserves single precision
-(np.fft silently upcasts f32 to complex128, which would both lie about the
-f32 path and double the spectral residency).
-
-Spectral multipliers reuse `forces.k_components`' conventions exactly
-(fftfreq-signed ik, k = 0 mapped to 1/k^2 = 1) but are built PER SLAB in f64
--- a full (N, N, N//2+1) float64 |k| or 1/k^2 grid at 2048^3 is 34.4 GB, the
-very term D-v2-15 clause 2 retires.
+Spectral multipliers follow `forces.k_components` (fftfreq-signed ik, 1/k^2 = 1 at
+k = 0) and are built per slab in float64, never as a full O(N^3) grid.
 """
 
 import threading
@@ -69,14 +50,10 @@ def _kz(n_mesh, box_size):
 
 
 def fft_axis0_inplace(spec, inverse=False, workers=_DEF_WORKERS, progress=None):
-    """Pass 2: (i)fft along axis 0, one y-pencil-plane at a time, in place.
+    """Pass 2: (i)fft along axis 0, one y-pencil-plane (N, N//2+1) at a time, in place.
 
-    The unit is the contiguous copy of spec[:, y, :] -- a fixed (N, N//2+1)
-    shape whatever the caller's streaming looked like, so pass 2 has no knob
-    that could move a bit. O(N * M) working memory (~17 MB at 2048^3 c64).
-
-    `progress(stage, done, total)`, if given, is called once per plane; see
-    `inexor.progress.Heartbeat`.
+    `progress(stage, done, total)`, if given, is called once per plane
+    (`inexor.progress.Heartbeat`).
     """
     fn = scipy.fft.ifft if inverse else scipy.fft.fft
     ny = spec.shape[1]
@@ -96,15 +73,11 @@ def forward_from_slabs(slab_fn, n_mesh, slab=_DEF_SLAB, workers=_DEF_WORKERS,
                        progress=None):
     """Forward 3D rfft of a field the caller produces slab-wise.
 
-    slab_fn(lo, hi) -> (hi-lo, N, N) real array of axis-0 planes [lo, hi).
-    The real field is never materialized here -- fused generation (white
-    noise -> spectrum) is the design point. Returns the (N, N, N//2+1)
-    spectral array, complex64/complex128 following the slabs' dtype. slab is
-    a pure memory knob: the compute unit is one plane regardless.
-
-    `progress(stage, done, total)`, if given, reports the two passes
-    separately ("fft plane" then "fft axis0"): they cost differently per unit
-    and one rate over both describes neither.
+    slab_fn(lo, hi) -> (hi-lo, N, N) real array of axis-0 planes [lo, hi); the real
+    field is never materialized. Returns the (N, N, N//2+1) spectrum, complex64 or
+    complex128 following the slabs' dtype. `slab` is a memory knob only and cannot move
+    a bit. `progress(stage, done, total)` reports the passes separately ("fft plane",
+    then "fft axis0").
     """
     n = int(n_mesh)
     slab = n if slab is None else int(slab)
@@ -119,11 +92,8 @@ def forward_from_slabs(slab_fn, n_mesh, slab=_DEF_SLAB, workers=_DEF_WORKERS,
                              f"want {(hi - lo, n, n)}")
         if spec is None:
             spec = np.empty(_spec_shape(n), dtype=_cdtype_for(s.dtype))
-        # per plane DIRECTLY into the target rows -- a whole-slab intermediate
-        # here is a full spectrum copy at slab = n, which is how the memory
-        # ladder read A = 11.74 B/p against a 2-spectrum design (Vista 902241:
-        # source + intermediate + target = 3 spec-equivalents through
-        # rfftn_ooc). Same per-plane transforms, so no bit moves.
+        # directly into the target rows: a whole-slab intermediate is a full spectrum
+        # copy at slab = n
         for i in range(hi - lo):
             spec[lo + i] = scipy.fft.rfft2(s[i], workers=workers)
         if progress is not None:
@@ -135,11 +105,7 @@ def forward_from_slabs(slab_fn, n_mesh, slab=_DEF_SLAB, workers=_DEF_WORKERS,
 def inverse_to_slabs(spec, n_mesh, slab=_DEF_SLAB, workers=_DEF_WORKERS):
     """Inverse of `forward_from_slabs`, yielding (lo, real_slab) in axis-0 order.
 
-    MUTATES spec (the axis-0 inverse pass runs in place) -- the caller hands
-    over ownership; a spectrum needed again must be copied first, which is a
-    memory decision the caller should be making explicitly anyway. The real
-    slabs come back one plane-transform at a time for the same bitwise reason
-    as the forward pass.
+    MUTATES spec (the axis-0 inverse runs in place); copy it first if it is needed again.
     """
     n = int(n_mesh)
     slab = n if slab is None else int(slab)
@@ -160,11 +126,9 @@ def rfftn_ooc(field, workers=_DEF_WORKERS):
 
 
 def irfftn_ooc(spec, n_mesh, workers=_DEF_WORKERS):
-    """Monolithic convenience; consumes spec like the generator does.
+    """Monolithic convenience; consumes (mutates) spec like `inverse_to_slabs`.
 
-    Iterates the inverse at the default slab rather than slab = n: the
-    whole-box slab buffer would be a second full field beside the assembled
-    output (the 902241 double-buffer class), and slab size cannot move a bit.
+    Iterates at the default slab, not slab = n, to avoid a second full-field buffer.
     """
     n = int(n_mesh)
     out = np.empty((n, n, n), dtype=np.float64 if spec.dtype == np.complex128 else np.float32)
@@ -174,34 +138,15 @@ def irfftn_ooc(spec, n_mesh, workers=_DEF_WORKERS):
 
 
 # ---------------------------------------------------------------------------
-# the device path: the SAME factorization, planes transformed on an accelerator
+# the device path: the SAME factorization, planes transformed on an accelerator;
+# the spectrum stays host-resident and only planes cross to the device
 # ---------------------------------------------------------------------------
-#
-# WHY THIS EXISTS AT ALL. The coarse solve at 4096^3 is a 2048^3 transform. The
-# monolithic device form does not fit (peak/field 8.0x measured, 275 GB against
-# a GB200's 185 GiB) and the HOST out-of-core form above costs 417 s/step, 39%
-# of a gb node's 1080 s per-step budget on its own. Factorized per plane it is
-# projected at 0.4 s. Same factorization as the host path, different executor.
-#
-# The spectral array stays HOST-RESIDENT here exactly as it does above: only
-# planes cross to the device. That is the property that makes the design's
-# memory work, not an implementation detail.
 
-#: A device transform at or above this many elements is REFUSED, never attempted.
-#:
-#: MEASURED (Vista 972737, jax 0.10.2 + GB200, record 5y finding 2):
-#: `jnp.fft.rfftn` of a 1536^3 f32 field -- 3.6e9 elements -- returns a WRONG
-#: transform SILENTLY. Its roundtrip reads max|d|/rms 3.8e+3 where 1024^3
-#: (1.07e9 elements) reads 2.9e-6, with the same peak/field ratio and a
-#: plausible wall, so nothing about the call looks wrong from outside. 2^31 is
-#: where those two readings bracket; the cuFFT 32-bit-plan class is the obvious
-#: suspect and is NOT measured, so treat the bound as empirical.
-#:
-#: The factorization below never approaches it -- one 2048^2 plane is 4.2e6
-#: elements, three orders under. This guard is for the batch knobs and for any
-#: caller who reaches past them for a monolithic transform. It refuses rather
-#: than checking a receipt afterwards because a wrong spectrum that is merely
-#: reported is still a wrong spectrum, and D-007's discipline is to refuse.
+#: A device transform at or above this many elements is refused, never attempted: a
+#: 1536^3 f32 `jnp.fft.rfftn` on a GB200 returns a wrong transform silently (roundtrip
+#: max|d|/rms ~4e3 vs ~3e-6 at 1024^3). The bound is empirical (likely 32-bit FFT plan
+#: indexing). Per-plane transforms sit far below it; the guard covers batch knobs and
+#: monolithic callers.
 MAX_DEVICE_TRANSFORM_ELEMENTS = 2**31
 
 
@@ -219,12 +164,9 @@ def refuse_oversize_device_transform(n_elements, what="transform"):
 
 
 def _require_x64_for(dtype):
-    """f64 on device needs the caller to have enabled x64, or it silently narrows.
+    """Refuse a float64 device transform unless the caller enabled x64.
 
-    Same contract and same reason as `eject_jax.require_x64`: this library never
-    toggles `jax_enable_x64`, and with it off a float64 field is transformed at
-    single precision and handed back in a float64 container, which is a wrong
-    answer wearing the right dtype.
+    The library never toggles `jax_enable_x64`; with it off, f64 would silently narrow.
     """
     if np.dtype(dtype) != np.float64:
         return
@@ -240,13 +182,7 @@ def _require_x64_for(dtype):
 
 
 def _check_spectral_dtype(got, want, what):
-    """The dtype ledger, on the seam where a silent upcast would hide.
-
-    `np.fft` upcasts f32 to complex128 and that is why the host path uses scipy;
-    the device path has the mirror-image risk (a narrowing under x64-off). An
-    f32 arm that came back complex128 would pass every value comparison in this
-    module and double the spectral residency the whole design is sized on.
-    """
+    """Refuse a device FFT output whose dtype differs from the expected one."""
     if np.dtype(got) != np.dtype(want):
         raise TypeError(
             f"{what} returned {np.dtype(got).name}, want {np.dtype(want).name}: "
@@ -254,22 +190,10 @@ def _check_spectral_dtype(got, want, what):
         )
 
 
-#: How a host buffer gets to the device and back.
-#:
-#: "pageable" hands the driver ordinary numpy. The OS may move that memory, so
-#: the GPU cannot DMA from it: the driver copies it into a staging buffer of its
-#: own first, and every crossing pays that copy.
-#:
-#: "staged" routes through `pinned_host` -- page-locked memory the OS has
-#: promised not to move, which the DMA engine reads directly. The copy is still
-#: paid (host -> pinned), but EXPLICITLY, and the crossing itself is then a
-#: straight DMA. D5 measured 7.8x between the two memory kinds on a synthetic
-#: microbenchmark at width; whether that survives the explicit copy is the whole
-#: question this policy exists to answer, and it is measured on the real
-#: transform rather than on a proxy.
-#:
-#: The policy MUST NOT move a bit -- it changes the route, not the arithmetic --
-#: and a test pins that.
+#: How a host buffer crosses to the device and back. "pageable": ordinary numpy, which
+#: the driver copies into its own staging buffer. "staged": an explicit copy into
+#: `pinned_host` (page-locked) memory, then a direct DMA. The policy changes the route,
+#: never the arithmetic: results are bitwise identical.
 TRANSFER_POLICIES = ("pageable", "staged")
 
 
@@ -280,14 +204,10 @@ def _pinned_sharding(device):
 
 
 def _device_sharding(device):
-    """The device target for a buffer that is currently in another memory kind.
+    """Device-memory target for a buffer in another memory kind.
 
-    MUST be a sharding, not the bare `Device`. `jax.device_put(pinned, dev)`
-    raises "Memory kind mismatch with xla::PjRtBuffers" -- a bare device carries
-    no memory kind to switch TO, so the move out of `pinned_host` has nothing to
-    target. Vista 992589 failed on exactly this: `staging_supported` probed with
-    a bare device, reported False on four GB200s that stage perfectly well, and
-    every staged leg refused. The refusal was right; the probe was wrong.
+    Must be a sharding, not a bare `Device`: `jax.device_put(pinned, dev)` raises a
+    memory-kind mismatch because a bare device names no memory kind to move to.
     """
     import jax
 
@@ -297,10 +217,7 @@ def _device_sharding(device):
 def staging_supported(device=None):
     """Can this backend do the host -> pinned_host -> device round trip?
 
-    Callers ASK, and refuse, rather than catching a failure and quietly
-    transferring pageable: a staged arm that silently ran pageable would report
-    that staging buys nothing, which is the one wrong answer this measurement
-    can produce.
+    Callers check this and refuse rather than silently falling back to pageable.
     """
     import jax
 
@@ -315,12 +232,10 @@ def staging_supported(device=None):
 
 
 def _to_device(a, device, transfer="pageable"):
-    """Host -> device, under a transfer policy.
+    """Host -> device under a transfer policy; `device=None` means jax's default device.
 
-    `jnp.asarray` places on the default device; `jax.device_put` COMMITS to the
-    one named. The distinction is the whole of the multi-device path -- an
-    uncommitted array on a four-GPU node runs every batch on device 0 while
-    looking exactly like work.
+    A named device is committed with `jax.device_put` (`jnp.asarray` would place every
+    part on device 0).
     """
     import jax
     import jax.numpy as jnp
@@ -348,16 +263,9 @@ def rfft2_planes_device(planes, plane_batch=1, out=None, device=None,
                         transfer="pageable"):
     """Pass 1 on device: 2-D real FFTs of axis-0 planes, (t, N, N) -> (t, N, M).
 
-    numpy in, numpy out -- the spectrum is host-resident by design.
-
-    `plane_batch` IS PART OF THE TRANSFORM'S DEFINITION, not a free knob. The
-    host path fixed its unit at one plane because pocketfft's results are
-    batch-size dependent at the bit level (module docstring: 341 elements on a
-    32^3 f64 field), and there is no reason to expect a device FFT library to be
-    kinder. So the default is 1, matching the host unit, and any card or record
-    that quotes a spectrum must carry the batch beside it. What IS guaranteed is
-    that `slab` cannot move a bit at fixed `plane_batch` -- streaming stays an
-    outer loop bound, which is the property D-v2-15 clause 5 is defined against.
+    numpy in, numpy out. `plane_batch` is part of the transform's definition (FFT bits
+    may depend on batch size), so the default is 1, matching the host unit; at fixed
+    `plane_batch`, `slab` cannot move a bit.
     """
     import jax.numpy as jnp
 
@@ -384,8 +292,8 @@ def fft_axis0_device_inplace(spec, inverse=False, pencil_batch=1, device=None,
                              transfer="pageable"):
     """Pass 2 on device: (i)fft along axis 0, y-pencil-planes at a time, in place.
 
-    The host twin's unit is one (N, M) pencil-plane; `pencil_batch` widens it and
-    carries the same definitional status as `plane_batch` above.
+    `pencil_batch` widens the one-pencil-plane unit and, like `plane_batch`, is part
+    of the transform's definition.
     """
     import jax.numpy as jnp
 
@@ -403,32 +311,17 @@ def fft_axis0_device_inplace(spec, inverse=False, pencil_batch=1, device=None,
 
 
 # ---------------------------------------------------------------------------
-# splitting a pass across devices
+# splitting a pass across devices: a partition of the plane / pencil loop, with no
+# inter-device communication (the spectrum stays host-resident)
 # ---------------------------------------------------------------------------
-#
-# The factorization is embarrassingly parallel and has NO inter-device
-# communication: pass 1 is independent per plane, pass 2 is independent per
-# y-pencil-plane, and the spectrum stays host-resident throughout. So "use four
-# GPUs" is a partition of a loop, not a distributed transform -- and the only
-# thing that can stop it scaling is the shared host bus, which D1 measured this
-# path to be bound by (91% of the wall, record sec. 9).
 
 
 def partition_units(total, n_parts, unit):
     """Split [0, total) into `n_parts` contiguous ranges, boundaries on `unit`.
 
-    The alignment is the transform's DEFINITION, not tidiness. This layer's
-    results are batch-size dependent at the bit level (module docstring: 341
-    elements on a 32^3 f64 field) and a batch restarts at the start of every
-    part, so a boundary off a `unit` multiple gives a different sequence of
-    batch sizes from the unpartitioned loop -- a different spectrum, silently,
-    at exactly the widths nobody runs by default. With aligned boundaries the
-    partition is an identity and "W devices == 1 device, bitwise" is a theorem
-    the tests confirm rather than a hope.
-
-    Refuses a width it cannot realize (fewer whole units than parts) instead of
-    returning empty ranges: a part with no work is a device that quietly did
-    not participate, which reads downstream as "it did not scale".
+    Batches restart at every part, so aligned boundaries keep the unpartitioned batch
+    sequence and make W devices bitwise equal to one. Refuses when there are fewer whole
+    units than parts rather than returning empty ranges.
     """
     total, n_parts = int(total), int(n_parts)
     unit = max(1, int(unit))
@@ -456,10 +349,8 @@ def partition_units(total, n_parts, unit):
 def _run_parts(fn, parts, devices):
     """Run `fn(lo, hi, device)` over `parts` concurrently, one thread per part.
 
-    Threads, not processes: the engine is ONE process holding one host-resident
-    state, and jax releases the GIL across dispatch and transfer. A single part
-    runs INLINE, so the one-device path carries no pool overhead and stays the
-    reference every wider width is measured against.
+    Threads share the host-resident state; jax releases the GIL across dispatch and
+    transfer. A single part runs inline.
     """
     if len(parts) == 1:
         fn(parts[0][0], parts[0][1], devices[0])
@@ -488,23 +379,12 @@ def forward_from_slabs_device(slab_fn, n_mesh, slab=_DEF_SLAB, plane_batch=1,
                               transfer="pageable", kernel=None, box_size=1.0):
     """Device twin of `forward_from_slabs`; identical structure, identical contract.
 
-    `kernel` (a `KSpaceKernel`) is applied on the card inside pass 2
-    (`kspace_pass_device`); None leaves pass 2 exactly as it was.
-
-    `devices` is a sequence of jax devices to split each pass across, or None
-    for jax's own placement on one device. The split is contiguous and
-    batch-aligned, so the spectrum is BITWISE identical to the devices=None one
-    at the same `plane_batch` / `pencil_batch` (`partition_units`).
-
-    Pass 1 splits the planes WITHIN a slab and the slab loop stays sequential:
-    `slab_fn` is the caller's generator and is not assumed re-entrant. That puts
-    a barrier at every slab boundary, which is a real property of streaming and
-    is why a measured split is owed rather than assumed.
-
-    `timings`, if a dict is passed, receives `pass1_s` and `pass2_s`. The two
-    passes have different shapes -- pass 1 is per-plane device work behind a
-    per-slab barrier, pass 2 is a strided HOST gather plus device work -- so a
-    split that stalls is attributable rather than inferred from an Amdahl fit.
+    `kernel` (a `KSpaceKernel` or `ArrayKernel`), if given, is applied on the card inside
+    pass 2 (`kspace_pass_device`). `devices` is a sequence of jax devices to split each
+    pass across, or None for one default device; the split is batch-aligned, so the
+    spectrum is bitwise identical at every device count (`partition_units`). Pass 1
+    splits planes within a slab; the slab loop is sequential because `slab_fn` is not
+    assumed re-entrant. `timings`, if a dict, receives `pass1_s` and `pass2_s`.
     """
     devs = _devices_or_default(devices)
     n = int(n_mesh)
@@ -551,17 +431,12 @@ def forward_from_card_planes(shards, n_mesh, plane_batch=1, pencil_batch=1,
                              timings=None, transfer="pageable"):
     """`forward_from_slabs_device` for a real-space field already on the cards.
 
-    `shards` are dicts with `lo`, `hi`, `device` and `delta`: x-planes [lo, hi)
-    of the field, shape (hi - lo, N, N), resident on that device, together
-    tiling [0, N) (`device.paint.coarse_delta_cards`). Pass 1 transforms each
-    card's planes where they sit, one thread per card, so no real-space plane
-    crosses the bus; pass 2 is `forward_from_slabs_device`'s, split across the
-    same devices. The spectrum stays host-resident.
-
-    BITWISE the host-slab path at the same `plane_batch` / `pencil_batch`: every
-    card boundary must be a `plane_batch` multiple, so the batch sequence is the
-    unpartitioned one (`partition_units`). `timings` receives `pass1_s` and
-    `pass2_s`.
+    `shards` are dicts with `lo`, `hi`, `device`, `delta`: x-planes [lo, hi) of the
+    field, shape (hi - lo, N, N), on that device, together tiling [0, N)
+    (`device.paint.coarse_delta_cards`). Pass 1 transforms each card's planes in place
+    (one thread per card; no real-space plane crosses the bus); pass 2 is split across
+    the same devices. Bitwise equal to the host-slab path at the same batches; card
+    boundaries must be `plane_batch` multiples. `timings` receives `pass1_s`, `pass2_s`.
     """
     import jax.numpy as jnp
 
@@ -624,12 +499,8 @@ def inverse_to_slabs_device(spec, n_mesh, slab=_DEF_SLAB, plane_batch=1,
                             transfer="pageable", pass2=True):
     """Device twin of `inverse_to_slabs`. MUTATES spec, exactly as that one does.
 
-    `devices` splits both passes as in `forward_from_slabs_device`, bitwise
-    identically to the one-device path. This is the leg the coarse solve pays
-    three times per step, and the only one that generates no field, so it is the
-    clean thing to time: a forward's wall carries host RNG that does NOT split.
-
-    `pass2=False` skips the axis-0 pass, for a buffer `kspace_pass_device`
+    `devices` splits both passes as in `forward_from_slabs_device`, bitwise identically
+    to one device. `pass2=False` skips the axis-0 pass, for a buffer `kspace_pass_device`
     already took through it (inverse=True).
     """
     import jax.numpy as jnp
@@ -692,22 +563,14 @@ def inverse_to_card_shards(spec, n_mesh, shards, plane_batch=1, pencil_batch=1,
     """`inverse_to_slabs_device` with the real-space planes written onto the cards.
 
     `shards` is `(x0, nx, device)` per card: that card receives global x-planes
-    `x0 .. x0 + nx - 1` (mod n) as one `(nx, n, n)` device array, in that order.
-    Ranges may overlap and may wrap -- a halo plane is simply transformed on
-    every card that holds it. Returns the arrays, one per shard. MUTATES spec,
-    exactly as `inverse_to_slabs_device` does.
+    `x0 .. x0 + nx - 1` (mod n) as one `(nx, n, n)` device array. Ranges may overlap and
+    wrap (halo planes are transformed on every card holding them). Returns one array per
+    shard; MUTATES spec. Pass 1 runs `irfft2` per plane on its card, written by a donated
+    plane-set program, so no real-space plane reaches the host.
 
-    Pass 2 is that function's, split across the shards' devices. Pass 1 runs one
-    thread per card: each plane's `irfft2` is computed on the card that holds it
-    and written into its array there by a donated plane-set program, so no
-    real-space plane crosses back to the host and no host mesh is assembled.
-
-    BITWISE `device.coarse.shard_coarse_meshes` of the host-slab path's mesh at
-    the same `pencil_batch`: every plane is its own batch on both paths. That is
-    also why `plane_batch` must be 1 -- a plane held by two cards would otherwise
-    be transformed in two different batches.
-
-    `pass2=False` skips the axis-0 pass, as in `inverse_to_slabs_device`.
+    Bitwise `device.coarse.shard_coarse_meshes` of the host-slab mesh at the same
+    `pencil_batch`. `plane_batch` must be 1 so a shared plane is never transformed in two
+    different batches. `pass2=False` as in `inverse_to_slabs_device`.
     """
     import jax
     import jax.numpy as jnp
@@ -767,23 +630,14 @@ def inverse_to_card_shards(spec, n_mesh, shards, plane_batch=1, pencil_batch=1,
 
 
 # ---------------------------------------------------------------------------
-# k-space kernels folded into the device axis-0 pass (D6)
+# k-space kernels folded into the device axis-0 pass: the multiply rides the pencil
+# block already on the card, so there is no host multiply or host spectrum copy.
+#
+# With x64 on, a single kernel is bitwise its host twin (float64 multiplier, one cast).
+# A product of kernels rounds once, so it matches one host pass with the product
+# function, not the host chain of per-factor passes. With x64 off the multiplier is
+# float32 and differs by a few to tens of eps x rms.
 # ---------------------------------------------------------------------------
-#
-# The host IC generator multiplies each spectrum by its kernel in a
-# single-threaded numpy pass, and copies the spectrum first whenever it is
-# needed again: at 4096^3 that is a 275 GB host pass per kernel plus a 275 GB
-# copy. Here the multiply rides the y-pencil block the axis-0 pass already
-# sends to a card, so neither the host multiply nor the host copy exists, and
-# the host builds nothing O(N^3).
-#
-# With x64 on, each single kernel is BITWISE its host twin (float64 multiplier,
-# one cast to the spectrum dtype, on both sides; measured 2026-09-14). A product
-# of kernels rounds ONCE here where the host chain rounds after every factor, so
-# it is bitwise one host pass with the product function, not the chain (~73
-# eps x rms apart at 64^3 f32). With x64 off the multiplier is built in float32
-# and moves 5-65 eps x rms (colour worst: log/exp interpolation). Performance
-# over bitwise is JC's call for this path (2026-09-14).
 
 
 class KSpaceKernel:
@@ -844,19 +698,12 @@ class KSpaceKernel:
 class ArrayKernel:
     """A multiplier the CALLER already holds as arrays, applied per pencil block.
 
-    `KSpaceKernel` evaluates analytic factors on the card from k alone; the engine's
-    coarse kernel is not analytic here -- `pref` and the CIC match factor are real
-    half-grids built once per run by `forces.coarse_kernel_parts`, and the `ik_j` are
-    low-rank. This carries them into the same pass, so the kernel multiply happens where
-    the axis-0 transform already reads the block instead of in a separate host traversal
-    over the whole half-grid (85 s of a 123 s coarse solve at 4096^3, gb 1003657).
-
-    `halfgrids` are (N, N, M) real arrays sliced on the pencil axis; `lowrank` are arrays
-    broadcastable to a block, each tagged with the axis it varies along (0, 1 or 2), and
-    the axis-1 one is sliced with the block. The product is formed in the order given,
-    left to right, which is how the caller's host expression associates -- `(pref * ik)
-    * mf`, the association `coarse_kernel_parts` refuses to change. `cdtype` is the
-    complex type the product is cast to before it multiplies the spectrum.
+    For non-analytic kernels such as the engine's coarse kernel (`pref` and the CIC match
+    factor are real half-grids from `forces.coarse_kernel_parts`; `ik_j` is low-rank).
+    `terms` are `(kind, array, axis)`: "half" = (N, N, M) real array sliced on the pencil
+    axis; "low" = 1-D array varying along `axis` (0, 1 or 2), sliced when axis is 1. The
+    product is formed left to right, matching the host expression's association
+    `(pref * ik) * mf`. `cdtype` is the complex type of the product.
     """
 
     __slots__ = ("terms", "cdtype")
@@ -876,9 +723,9 @@ class ArrayKernel:
     def coarse(cls, pref, ik, axis, mf, cdtype):
         """`(pref * ik_axis) * mf` -- the engine's coarse kernel, `mf` optional.
 
-        `ik` is cast to `cdtype` HERE, before it meets `pref`, because that is the order
-        `forces.coarse_kernel_slab` casts in and the cast is not associative with the
-        multiply at f32."""
+        `ik` is cast to `cdtype` before it meets `pref`, matching
+        `forces.coarse_kernel_slab`'s order (the cast does not commute with the f32
+        multiply)."""
         terms = [("half", pref, None), ("low", np.asarray(ik).astype(cdtype), axis)]
         if mf is not None:
             terms.append(("half", mf, None))
@@ -964,24 +811,14 @@ def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inv
                        transfer="pageable"):
     """Combine spectra, apply a k-space kernel and run the axis-0 (i)fft, on the cards.
 
-    `sources` is a sequence of `(coef, spec)`, every spec an (N, N, M) host array
-    of one complex dtype. Each y-pencil block `sum(coef * spec[:, y0:y1, :])` is
-    sent to a card, where the kernel is applied AFTER the axis-0 fft (forward:
-    the array is pass 1's output) or BEFORE the axis-0 ifft (inverse), and the
-    result is written into `out[:, y0:y1, :]`. `transform=False` applies the
-    combination and kernel only. `kernel=None` is the identity.
-
-    `kernel` is a `KSpaceKernel` (analytic, evaluated on the card from k) or an
-    `ArrayKernel` (the caller's own half-grids and low-rank factors, uploaded per block).
-
-    `out` defaults to a new array and MAY be one of the sources: each thread
-    reads and writes only its own y range, so the pass is in place. `devices`
-    and `pencil_batch` split exactly as in `forward_from_slabs_device`, and the
-    result is bitwise the same at every card count.
-
-    Replaces, for the device IC generator, `mul_radial_inplace` /
-    `grad_invk2_spec` / `deriv2_spec` followed by `fft_axis0_inplace`, and the
-    host spectrum copies those require.
+    `sources` is a sequence of `(coef, spec)`, each spec an (N, N, M) host array of one
+    complex dtype. Each y-pencil block `sum(coef * spec[:, y0:y1, :])` goes to a card; the
+    kernel is applied AFTER the axis-0 fft (forward; input is pass 1's output) or BEFORE
+    the axis-0 ifft (inverse), and the result is written to `out[:, y0:y1, :]`.
+    `transform=False` skips the fft. `kernel` is a `KSpaceKernel`, an `ArrayKernel`, or
+    None (identity). `out` may be one of the sources (each thread touches only its own y
+    range). Bitwise the same at every card count. Device replacement for
+    `mul_radial_inplace` / `grad_invk2_spec` / `deriv2_spec` + `fft_axis0_inplace`.
     """
     import jax
     import jax.numpy as jnp
@@ -1063,15 +900,14 @@ def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inv
 
 # ---------------------------------------------------------------------------
 # pass 1 on the cards for the IC stage: noise drawn where it is transformed, and
-# squares accumulated where they are inverse-transformed (D6)
+# squares accumulated where they are inverse-transformed
 # ---------------------------------------------------------------------------
 
 
 def zeros_card_shards(n_mesh, devices, dtype=np.float32):
     """Card shards of zeros tiling x-planes [0, N): `[{lo, hi, device, delta}]`.
 
-    The shard format `forward_from_card_planes` consumes, one contiguous run of
-    x-planes per device (`partition_units` at unit 1).
+    The format `forward_from_card_planes` consumes; one contiguous run per device.
     """
     import jax
     import jax.numpy as jnp
@@ -1094,16 +930,12 @@ def noise_forward_cards(key, n_mesh, devices, fdtype=np.float32, kernel=None, bo
                         pencil_batch=1, timings=None, transfer="pageable"):
     """Plane-keyed white noise drawn ON the cards, forward-transformed, kernel applied.
 
-    Plane i is `jax.random.normal(fold_in(key, i), (N, N))`, drawn and `rfft2`d on
-    the card that owns x-plane i; only its 2-D spectrum crosses to the host. Then
-    pass 2 with `kernel` folded in (`kspace_pass_device`, in place). Returns the
-    host (N, N, N//2+1) spectrum.
-
-    The same construction as `ic.white_plane`, but drawn on the card's backend:
-    the normal transform's bits are not specified across backends, so the result
-    is a DIFFERENT stream from `ic.IC_STREAM` on a GPU and carries
-    `ic.IC_STREAM_DEVICE`. Bitwise the same at every card count (each plane is
-    drawn and transformed on its own).
+    Plane i is `jax.random.normal(fold_in(key, i), (N, N))`, drawn and `rfft2`d on the
+    card owning it; only its 2-D spectrum reaches the host. Pass 2 then applies `kernel`
+    in place. Returns the host (N, N, N//2+1) spectrum. Same construction as
+    `ic.white_plane`, but normal-sampling bits differ across backends, so on a GPU this
+    is stream `ic.IC_STREAM_DEVICE`, not `ic.IC_STREAM`. Bitwise the same at every card
+    count.
     """
     import jax
     import jax.numpy as jnp
@@ -1147,14 +979,11 @@ def inverse_accumulate_cards(sources, n_mesh, acc_shards, weight, kernel=None, b
                              work=None, pencil_batch=1, timings=None, transfer="pageable"):
     """acc += weight * (inverse transform of kernel * sum(coef * spec))**2, on the cards.
 
-    Pass 2 (`kspace_pass_device`, kernel folded in) writes into the host buffer
-    `work`, which may not alias a source and is returned for reuse; the sources
-    are left intact. Pass 1 runs one thread per card: each x-plane's `irfft2` is
-    computed on the card that owns it and its weighted square is added into that
-    card's shard of `acc_shards` (`zeros_card_shards` format) by a donated
-    program, so no real-space plane crosses to the host. The square is taken in
-    the accumulator's dtype. Returns `(acc_shards, work)` -- the shards hold new
-    arrays; the old ones are donated.
+    Pass 2 writes into host buffer `work` (must not alias a source; sources survive).
+    Pass 1 computes each x-plane's `irfft2` on its owning card and adds the weighted
+    square, in the accumulator's dtype, into that card's shard of `acc_shards`
+    (`zeros_card_shards` format) by a donated program. Returns `(acc_shards, work)`;
+    the shards hold new arrays, the old ones are donated.
     """
     import jax
     import jax.numpy as jnp
@@ -1209,17 +1038,14 @@ def inverse_accumulate_cards(sources, n_mesh, acc_shards, weight, kernel=None, b
 
 
 # ---------------------------------------------------------------------------
-# the roundtrip receipt
+# roundtrip check
 # ---------------------------------------------------------------------------
 
 
 def plane_noise(n_mesh, plane, fdtype, seed=0):
     """One deterministic plane of white noise, keyed by its OWN index.
 
-    Keyed per plane rather than per slab so the field a receipt transforms is
-    independent of the streaming decomposition -- otherwise the slab-invariance
-    gate would be comparing two different fields and would pass by construction.
-    Same reason the IC stage keys its noise stream per plane.
+    Keyed per plane so the field is independent of the slab decomposition.
     """
     rng = np.random.default_rng([int(seed), int(plane)])
     return rng.standard_normal((int(n_mesh), int(n_mesh))).astype(fdtype)
@@ -1227,15 +1053,10 @@ def plane_noise(n_mesh, plane, fdtype, seed=0):
 
 def roundtrip_residual(n_mesh, fdtype=np.float32, seed=0, slab=_DEF_SLAB,
                        plane_batch=1, pencil_batch=1, device=True):
-    """max|forward-then-inverse - original| / rms(original). THE receipt.
+    """max|forward-then-inverse - original| / rms(original), returned in a dict.
 
-    Streams: the field is regenerated plane by plane for the comparison rather
-    than held, so this is runnable at 2048^3 where a resident field is 34.4 GB.
-
-    This is the measurement that catches the silent-wrong-transform class. It is
-    reported, never asserted here -- what a caller does with 3.8e+3 is a gate's
-    decision, and `MAX_DEVICE_TRANSFORM_ELEMENTS` is what makes the wrong regime
-    unreachable in the first place.
+    The field is regenerated plane by plane rather than held. Reported, not asserted:
+    thresholds belong to the caller.
     """
     n = int(n_mesh)
     fwd = forward_from_slabs_device if device else None
@@ -1266,18 +1087,16 @@ def roundtrip_residual(n_mesh, fdtype=np.float32, seed=0, slab=_DEF_SLAB,
 
 
 # ---------------------------------------------------------------------------
-# spectral multipliers (slab-built, f64 precision island, k_components
-# conventions: fftfreq-signed ik; k = 0 -> 1/k^2 = 1 with ik zero there)
+# spectral multipliers (slab-built in float64; k = 0 -> 1/k^2 = 1, ik zero there)
 # ---------------------------------------------------------------------------
 
 
 def mul_radial_inplace(spec, n_mesh, box_size, f_of_k, dc_value, slab=_DEF_SLAB):
     """spec *= f(|k|), evaluated per axis-0 slab; the DC bin gets dc_value.
 
-    f_of_k receives a float64 |k| array with the k = 0 entry replaced by the
-    grid's smallest nonzero |k| (in any ICKTable's range by construction --
-    the kk_safe trick); its value there is then discarded in favour of
-    dc_value (0.0 zeroes the mean mode; 1.0 leaves DC untouched).
+    f_of_k receives a float64 |k| array whose k = 0 entry is replaced by the grid's
+    smallest nonzero |k| (keeping it inside table range); that value is then overwritten
+    by dc_value (0.0 zeroes the mean mode; 1.0 leaves DC untouched).
     """
     n = int(n_mesh)
     slab = n if slab is None else int(slab)
@@ -1318,9 +1137,7 @@ def _ik_over_k2_slab(axis, lo, hi, n_mesh, box_size):
 def grad_invk2_spec(spec, axis, n_mesh, box_size, slab=_DEF_SLAB):
     """COPY of spec * ik_axis / k^2 -- the displacement kernel, slab-built.
 
-    A copy, deliberately: the multiplier has zeros (DC among them), so an
-    in-place form is not invertible and the source spectrum is needed again
-    for the other two components.
+    A copy because the source spectrum is needed again for the other components.
     """
     n = int(n_mesh)
     slab = n if slab is None else int(slab)
@@ -1355,20 +1172,16 @@ def deriv2_spec(spec, i, j, n_mesh, box_size, slab=_DEF_SLAB):
 
 
 # ---------------------------------------------------------------------------
-# disk staging (D-v2-15 clause 3) -- EXPLICIT IO, deliberately not memmap
+# disk staging: explicit IO, not memmap
 # ---------------------------------------------------------------------------
 
 
 class StagedArray:
     """A disk-staged (n0, n, n) array written and read one axis-0 slab at a time.
 
-    Plain `.npy` on disk (np.load can always inspect it), but accessed through
-    explicit read()/write() calls rather than memmap ON PURPOSE: dirty pages
-    of a written memmap are MAPPED INTO THE PROCESS and count in ru_maxrss,
-    so a memmap-staged generator read ~175 B/p on its first smoke where its
-    heap holds ~8 -- the instrument was measuring reclaimable page cache as if
-    it were footprint (2026-08-10). Buffered file IO keeps those pages the
-    kernel's, so the process's memory story stays the true one.
+    Plain `.npy` on disk (np.load can read it), accessed through explicit IO rather than
+    memmap: dirty memmap pages count in the process's ru_maxrss, so memmap would inflate
+    measured peak memory with reclaimable page cache.
     """
 
     def __init__(self, path, dtype, shape, mode):
@@ -1425,7 +1238,7 @@ class StagedArray:
 
 
 # ---------------------------------------------------------------------------
-# the accounting function (mesh_bytes pattern) and its refusal
+# memory accounting and refusal
 # ---------------------------------------------------------------------------
 
 
@@ -1465,8 +1278,8 @@ def plan_bytes(n_mesh, fdtype, policy, slab=_DEF_SLAB):
 
 
 def require_fits(n_mesh, fdtype, policy, budget_bytes, slab=_DEF_SLAB):
-    """Refuse loudly (D-007 discipline: refuse, never silently page) if the
-    predicted peak exceeds the budget; returns the plan when it fits."""
+    """Raise MemoryError if the predicted peak exceeds `budget_bytes` (refuse rather
+    than page); otherwise return the `plan_bytes` plan."""
     plan = plan_bytes(n_mesh, fdtype, policy, slab=slab)
     if plan["peak"] > budget_bytes:
         detail = ", ".join(

@@ -1,7 +1,5 @@
-"""cosmology.py: growth identities, EH98 sanity, sigma8 normalization, backends.
-
-Tolerances follow mbody's test_cosmology conventions; the module is a
-jax-free float64 island, so everything here is plain numpy.
+"""cosmology.py: growth identities, EH98 sanity, sigma8 normalization, power backends, and
+the IC k-table. The module is jax-free float64, so everything here is plain numpy.
 """
 
 import numpy as np
@@ -23,7 +21,7 @@ from inexor.cosmology import (
 
 
 def test_module_is_jax_free():
-    """The precision island must never grow a jax dependency (house rule)."""
+    """The float64 cosmology module must never import jax."""
     import inexor.cosmology as mod
 
     assert not any(name in ("jax", "jnp") for name in vars(mod)), "cosmology must stay jax-free"
@@ -108,7 +106,7 @@ def test_distinct_cosmologies_do_not_share_caches():
 
 
 # ---------------------------------------------------------------------------
-# ICKTable (M-v2-5, D-v2-15 clause 2)
+# ICKTable
 # ---------------------------------------------------------------------------
 
 
@@ -123,11 +121,8 @@ def _realized_kmag(n, L):
 
 
 def test_ic_k_table_meets_the_bar_on_the_full_cdev_multiset():
-    """Charter bar (JC 2026-08-10): max rel error of table P(k) vs analytic EH98
-    over EVERY realized |k| on the production rfft grid < 1e-4. Asserted here on
-    the exact C-dev multiset (n=256, L=128 -- 8.5e6 values, the one scale where
-    materializing it is the point); the C-gh/C-hero grids are the probe's job.
-    """
+    """Max rel error of table P(k) vs analytic EH98 over every realized |k| of the n=256,
+    L=128 rfft grid (8.5e6 values) is below 1e-4."""
     n, L = 256, 128.0
     tab = ic_k_table(PLANCK, n, L)
     kk = _realized_kmag(n, L)
@@ -139,7 +134,7 @@ def test_ic_k_table_meets_the_bar_on_the_full_cdev_multiset():
 
 
 def test_ic_k_table_bar_can_fail():
-    """Anti-vacuity: a 32-point table must MISS the bar, or the bar tests nothing."""
+    """Control: a 32-point table must miss the 1e-4 bar, or the bar tests nothing."""
     n, L = 64, 128.0
     tab = ic_k_table(PLANCK, n, L, n_points=32)
     kk = _realized_kmag(n, L)
@@ -199,8 +194,7 @@ def test_ic_k_table_shape_and_scalar_handling():
 
 
 def test_ic_k_table_accepts_empty_queries():
-    """A slab-streamed caller's k-cut can empty a slab; an empty query is a
-    no-op, not a crash (found by the leg-VI Jensen diagnostic, 2026-08-10)."""
+    """A slab-streamed caller's k-cut can empty a slab; an empty query is a no-op."""
     tab = ic_k_table(PLANCK, 64, 128.0)
     assert tab.P_of_k(np.array([])).size == 0
     assert tab.T_of_k(np.array([])).size == 0

@@ -1,48 +1,20 @@
-"""The v2 engine: BullFrog PM on T9 state in slot order (M-v2-3).
+"""The engine: BullFrog PM on T9 state in slot order.
 
-`integrate.py` provides per-step coefficients and a stateless float stepper;
-`forces.py` provides two independent arms; `state.py` provides the container and
-the exchange. Nothing composed them, and `integrate.py:14-16` says so: the v1
-drivers were deleted at the retirement and "the v2 engine's own driver lands at
-M-v2-3". This is that driver.
+Composes `integrate` (coefficients), `forces` (coarse + tiled fine arms) and `state` (the
+container and the exchange) into a step loop.
 
-## The step, and why it is not the reference stepper's shape
+BullFrog DKD's trailing half-drift of step n and leading half-drift of step n+1 share
+`v_{n+1}`, so they fuse into one drift of `(dD_n + dD_{n+1})/2`. State is therefore carried
+drift-synchronized (positions at step midpoints, velocities at step boundaries) and a step is
 
-BullFrog DKD carries a velocity that is SHARED across the step boundary: the
-trailing half-drift of step n and the leading half-drift of step n+1 both use
-`v_{n+1}`, so they fuse exactly into one drift of `(dD_n + dD_{n+1})/2`. The
-engine therefore carries state DRIFT-SYNCHRONIZED -- positions at step midpoints,
-velocities at step boundaries -- and one step is
+    force at the stored positions  ->  kick  ->  one fused drift + migrate
 
-    force at the stored positions  ->  kick  ->  ONE fused drift + migrate
+so the layout runs, and the state is quantized, once per step. Consequently the engine is
+not bitwise `float_step_bullfrog` (`mod(mod(x+a)+b) != mod(x+a+b)` in float);
+`float_run_bullfrog_sync` is its matched float reference.
 
-rather than drift, force, kick, drift. Two reasons, and the second is the one
-that matters:
-
-  1. The layout runs once per step instead of twice. It is 85.5% of the force on
-     the production backend, so that is ~40% of the step.
-  2. The state is quantized ONCE per step, which is the cadence D-v2-14's
-     ratified accumulated-error figure was measured at. The two-drift form
-     quantizes twice and that number would stop describing the engine.
-
-Measured before it was built (JC's call): moving the quantization from the step
-boundary to the midpoint costs nothing. At cdev8, K=40, the ratified bucket
-against its own never-quantized reference, max |dP/P| 2.311e-4 at the midpoint
-against 2.821e-4 at the boundary, both ~2 orders under D-v2-9's absolute 3e-2.
-
-The price is that the engine is NOT bitwise `float_step_bullfrog`:
-`mod(mod(x+a)+b)` and `mod(x+a+b)` are equal in R and not in float (24,867 of
-100,000 components, max 2.8e-14). `float_run_bullfrog_sync` below is the matched
-reference the parity gate compares against; `float_step_bullfrog` is untouched,
-being an mbody port under a stability contract.
-
-## Nothing O(N) in floats, anywhere
-
-The long arm is solved on the coarse mesh and read per tile out of a staged
-sub-block (D-v2-16 cl.3); the short arm is per tile already; the kick applies
-tile-locally and writes velocities back through the layout (cl.1). The two
-global `(n,3)` f64 arrays that would otherwise appear are 206 GB each at C-gh,
-and deleting them is what makes that configuration runnable.
+Nothing is O(N) in floats: the long arm is read per tile from a staged coarse sub-block, the
+short arm is per tile, and the kick writes velocities back per tile through the layout.
 """
 
 import dataclasses
@@ -81,11 +53,9 @@ __all__ = [
 
 
 def _dtype_name(x, what):
-    """Normalize a mesh dtype to its name at CONSTRUCTION, numpy only.
+    """Normalize a mesh dtype ("float32", np.float32, jnp.float32...) to its name, numpy only.
 
-    Accepts "float32", np.float32 or jnp.float32 alike and stores the name, so
-    `EngineConfig` keeps its no-jax-at-construction rule. Failing here rather
-    than at first use means a typo cannot survive as far as a cluster job.
+    Raises at construction for anything but float32/float64.
     """
     dt = np.dtype(x)
     if dt not in (np.dtype(np.float32), np.dtype(np.float64)):
@@ -93,21 +63,10 @@ def _dtype_name(x, what):
     return dt.name
 
 
-# WHICH PHASE EACH BUDGET TERM IS CHARGED TO, so a caller can add up what is
-# actually live at once instead of assuming one transient at a time.
-#
-# That assumption is why `inexor.plan` said FITS twice for a run that did not.
-# It took the LARGEST SINGLE mesh transient -- 12.9 GB of a 56 GB total at C-gh
-# -- and the terms it was choosing between are not alternatives: the coarse
-# solve holds its kernels, its transform workspace and its output copy at the
-# same moment, which is the phase Vista 923139 died in.
-#
-# `resident` means live for the whole run and charged unconditionally. Every
-# other value names a phase, or a TUPLE of phases for a term that spans more
-# than one; terms sharing a phase are summed, and the phases are maxed over,
-# because they genuinely do not overlap -- the tile loop cannot run while the
-# coarse solve is running, and the phase boundary hook in `step` is what makes
-# that checkable rather than asserted.
+# The phase each budget term is charged to, so a budget sums what is live at once.
+# `resident` = live for the whole run. Otherwise a phase name, or a tuple for a term spanning
+# several. Terms in a phase are summed; distinct phases do not overlap (the phase hook in
+# `step` marks the boundaries).
 MESH_PHASE = {
     "coarse_kernel_build_f64": "kernel_build",
     "coarse_kernel_pref": "resident",
@@ -119,10 +78,7 @@ MESH_PHASE = {
     "coarse_kernel_slab": "coarse_solve",
     "coarse_device_planes": "coarse_solve",
     "coarse_force_copy_transient": "coarse_solve",
-    # BOTH, and it is not resident: the decode allocates it inside the paint and
-    # `step` drops the host name as soon as the jax copy exists, so it spans the
-    # paint and the solve and then goes. It used to stay bound through the whole
-    # tile loop, which is what made "resident" the right label before M-v2-6.
+    # allocated in the paint, dropped by `step` once the solve's input exists
     "coarse_delta": ("coarse_paint", "coarse_solve"),
     "coarse_force_resident": "resident",
     "tile_kernels": "resident",
@@ -138,14 +94,8 @@ STEP_PHASE = {
     "tile_buffers": "tile_loop",
 }
 
-# Phases that run ONCE per run rather than once per step. Everything else is
-# inside the step loop, and a budget must add those up rather than take the
-# largest, because glibc does not hand freed arenas back between them: this
-# project measured `malloc_trim` recovering 12-41% of a run's peak, which is
-# exactly the retention that makes a step's phases accumulate into its
-# high-water instead of alternating. Taking the max across a step's phases
-# would be the tidier model and it would have made the c-gh bound SMALLER,
-# which is the direction every wrong call here has already gone.
+# Phases run once per run. The in-step phases are summed by budgets, not maxed, because glibc
+# retains freed arenas between them, so a step's phases accumulate into its high-water.
 ONCE_PER_RUN_PHASES = frozenset({"kernel_build"})
 
 
@@ -199,164 +149,88 @@ class EngineConfig:
         self.n_tile = int(n_tile)
         self.b_fine = int(b_fine)
         self.alpha = float(alpha)
-        # D-006 on BOTH arms. The coarse paint's integer twin was a named
-        # deliverable (D-v2-16 cl.2); the tiled short arm had the same defect and
-        # no document named it, which M-v2-3's planning session found. The layout
-        # reorders particles every step, so an order-dependent primal paint is
-        # not reproducible even on one machine.
+        # Integer (order-independent) paint on both arms: the layout reorders particles every
+        # step, so an order-dependent float paint is not reproducible even on one machine.
         self.paint_short = str(paint_short)
         self.paint_long = str(paint_long)
         self.frac_bits = int(frac_bits)
         self.chunk_bricks = int(chunk_bricks)
-        # D-v2-19 clause 3: frozen capacity fails at EVERY granularity, so the
-        # repack is required rather than an optimization. Built without it, the
-        # engine hit the D-007 refusal with a full arena by step 10 at `smoke`.
+        # The repack is required, not an optimization: frozen per-brick capacity eventually
+        # overflows the arena.
         self.brick_slack = float(brick_slack)
         self.repack_every = int(repack_every)
         self.eject_kernel = str(eject_kernel)
         self.migrate_eject_inflight = (
             None if migrate_eject_inflight is None else int(migrate_eject_inflight))
-        # M-v2-4. TWO knobs, defaulting independently, deliberately NOT coupled:
-        # the coarse mesh is the gated arm (it grows with the box and is the
-        # binding resident term at hero scale) and the fine tile mesh is
-        # measured (P^3, box-independent). Moving one must move one error term
-        # or the gate's reading is unattributable -- which is also why
-        # `fine_dtype` does not follow `coarse_dtype` by default: setting one
-        # knob would then silently set two.
+        # Independent on purpose, so each moves one error term: the coarse mesh grows with the
+        # box, the fine tile mesh (P^3) does not.
         self.coarse_dtype = _dtype_name(coarse_dtype, "coarse_dtype")
         self.fine_dtype = _dtype_name(fine_dtype, "fine_dtype")
-        # Rungs per octave for the per-tile buffer SHAPE ladder (M-v2-6 Stage 0).
-        # `cap` moves every step, so an unquantized shape leaks one XLA executable
-        # family per step. A knob rather than a constant because it trades padded
-        # rows against retained executables and the balance is machine-dependent:
-        # more rungs means less padding and more compilations.
+        # Rungs per octave of the per-tile buffer shape ladder: `cap` moves every step, and an
+        # unquantized shape would compile a new executable each time. More rungs = less
+        # padding, more compilations.
         self.cap_rungs = int(cap_rungs)
-        # The A/B knob for the SECOND shape ladder, and it exists only so the
-        # coarse chunk buffer can be turned back to its pre-fix behaviour with
-        # `cap` left on its ladder in both arms. Moving `cap_rungs` would move
-        # both ladders at once and the reading would be unattributable, which is
-        # the same reason `fine_dtype` does not follow `coarse_dtype`.
-        # False is NOT an operating point: it is the arm whose slope the fix is
-        # measured against.
+        # Ladder for the coarse chunk buffer shape, separate from `cap_rungs`. False (unpadded
+        # chunk shape) is a comparison arm, not an operating point.
         self.pad_ladder = bool(pad_ladder)
-        # Stage 2c: paint each chunk into a coarse sub-block instead of a full
-        # mesh. Bitwise-neutral by the associativity of integer addition (the
-        # streamed-vs-monolithic pin is the regression); False = the A/B arm
-        # that restores the full-mesh-per-chunk behaviour, the same pattern as
-        # `pad_ladder`.
+        # Paint each chunk into a coarse sub-block instead of a full mesh; bitwise-neutral by
+        # integer associativity. False (full mesh per chunk) is a comparison arm.
         self.paint_subblock = bool(paint_subblock)
-        # W2: the tile-loop executor. 1 = the serial loop, exactly as before
-        # (no-worse-defaults until the pooled gate passes on the target
-        # machine); > 1 = the process pool in `executor.py`, which drives the
-        # SAME `tile_task` from workers -- canary C2 measured 10.4x at W=8 on
-        # gg with bitwise identity on three architectures (Vista 913729).
-        # `worker_affinity` pins each worker to a disjoint core set BEFORE jax
-        # imports there: XLA-CPU sizes its spin pool by VISIBLE cores and
-        # ignores every thread env var, and the un-pinned pool measured walls
-        # GROWING with W (antares 466); worth 20-49% on gg. A knob so the
-        # effect stays measurable, not because off is ever an operating point.
+        # 1 = serial tile loop; > 1 = `executor.TilePool` running the same `tile_task`
+        # (bitwise identical). `worker_affinity` pins each worker to disjoint cores before jax
+        # loads (XLA-CPU sizes its spin pool by visible cores); off is not an operating point.
         self.tile_workers = int(tile_workers)
         self.worker_affinity = bool(worker_affinity)
-        # Idle-half Stage 2: route `drift_and_migrate` through the SAME pool,
-        # workers writing brick payloads and the parent replaying the arena
-        # interleave (state.drift_and_migrate_pooled). TRI-STATE, because the
-        # verdict (C14, Vista 918684: bitwise on three legs, migrate 26.03 ->
-        # 3.78 s/step at cgh64 W=16) licenses pooling by default but
-        # `tile_workers` defaults to 1, and a bare True would make every
-        # single-process EngineConfig refuse at validate():
-        #   None  = AUTO, the default -- pooled wherever a pool exists, serial
-        #           where one does not. No config has to name the knob to get
-        #           the verdict's win.
-        #   True  = REQUIRE a pool; still refuses at validate() without one, so
-        #           an explicit request that cannot apply is never silently
-        #           downgraded to serial.
-        #   False = force serial even with a pool. This is the A/B baseline arm
-        #           and every serial reference MUST name it rather than lean on
-        #           the default, which no longer means serial.
-        # `migrate_window` bounds the scratch slots in flight; None = sized to
-        # feed the workers (see the driver's docstring for the floor).
+        # Run `drift_and_migrate` on the pool (`state.drift_and_migrate_pooled`; bitwise the
+        # serial pass). None = auto (pooled wherever a pool exists); True = require a pool
+        # (refused at validate() without one); False = serial (serial references must say so).
+        # `migrate_window` bounds scratch slots in flight; None = sized to feed the workers.
         self.migrate_pooled = None if migrate_pooled is None else bool(migrate_pooled)
         self.migrate_window = None if migrate_window is None else int(migrate_window)
-        # M-v2-6 Stage 4(b): checkpoint after every `checkpoint_every` steps into
-        # `checkpoint_dir`, alternating two generations. Cadence is in STEPS and
-        # never in wall-clock, because at full scale one step is 37 min at 2048^3
-        # and 7.75 h at 4096^3, so a step IS the granularity -- there is no
-        # coherent state between two of them to write (positions sit at
-        # midpoints, velocities at boundaries). 0 disables, the `repack_every`
-        # idiom. Checkpointing is inert without a directory rather than a
-        # refusal, because the default config has no directory and every
-        # single-process caller would otherwise start raising; the receipt in
-        # the per-step stats is what proves it applied.
+        # Checkpoint every `checkpoint_every` steps into `checkpoint_dir`, alternating two
+        # generations. Cadence is in steps (only step boundaries have a coherent state); 0
+        # disables; inert without a directory. Per-step stats record whether it applied.
         self.checkpoint_dir = None if checkpoint_dir is None else str(checkpoint_dir)
         self.checkpoint_every = int(checkpoint_every)
-        # D3b R2: where the migrate and the repack run. "host" is everything
-        # above (serial or pooled by `migrate_pooled`); "device" routes both
-        # through `device.migrate.drift_and_migrate_device` and
-        # `device.repack.repack_device`, each gated bitwise against the serial
-        # host pass, on the parent's jax backend (one device, R1/R1b scope).
-        # A pool may still run the tile loop; the device pass ignores it, and
-        # an EXPLICIT `migrate_pooled=True` beside it refuses at validate().
-        # `migrate_device_budget_bytes` is the per-slab device envelope the
-        # device migrate refuses above (record sec. 29: ~112 GB per card at
-        # c-hero); None = no limit, the estimate is on the receipt either way.
+        # Where migrate and repack run: "host" (serial or pooled per `migrate_pooled`) or
+        # "device" (`device.migrate.drift_and_migrate_device` + `device.repack.repack_device`,
+        # bitwise the serial host pass). With "device", an explicit `migrate_pooled=True` is
+        # refused. `migrate_device_budget_bytes` is the per-slab device envelope the device
+        # migrate refuses above; None = no limit.
         self.migrate_backend = str(migrate_backend)
         self.migrate_device_budget_bytes = (
             None if migrate_device_budget_bytes is None else int(migrate_device_budget_bytes))
-        # The device step executor: where the coarse paint + solve and the tile
-        # loop run. TWO knobs beside `migrate_backend`, one per phase, so a phase
-        # table or an identity gate can move one phase at a time (the
-        # `fine_dtype` / `coarse_dtype` rule). "device" coarse is
-        # `device.paint.coarse_delta_cards` + the solve from the cards; "device"
-        # tile is `device.tile.tile_loop_device`, one compiled program writing
-        # into device state, accepted at a measured floor against the eager tile
-        # (record sec. 17). `device_tile_jit=False` is the eager per-tile arm,
-        # bitwise `tile_task` on the CPU backend -- the oracle arm, not an
-        # operating point (the `pad_ladder=False` precedent).
-        # `device_paint_chunk_bricks` is the device paint's own chunk length;
-        # None = `device.paint.default_chunk_bricks` (a quarter x-slab), because
-        # `chunk_bricks`' 64 is 262,144 device launches per step at 4096^3.
+        # One backend knob per phase, so phases move independently. "device" coarse =
+        # `device.paint.coarse_delta_cards` + solve from the cards; "device" tile =
+        # `device.tile.tile_loop_device`, one compiled program into device state.
+        # `device_tile_jit=False` is the eager per-tile reference arm (bitwise `tile_task` on
+        # CPU). `device_paint_chunk_bricks` None = `device.paint.default_chunk_bricks` (a
+        # quarter x-slab; `chunk_bricks` would mean far too many device launches).
         self.coarse_backend = str(coarse_backend)
         self.tile_backend = str(tile_backend)
-        # The coarse kernel multiply rides the inverse's axis-0 pass instead of a
-        # separate host traversal of the half-grid (85 s of a 123 s solve at 4096^3,
-        # gb 1003657). False is the arm it is gated against -- bitwise, because the
-        # association is carried over unchanged -- not an operating point.
+        # Fold the coarse kernel multiply into the inverse's axis-0 pass rather than a separate
+        # host traversal. Bitwise either way (same association); False is a comparison arm.
         self.coarse_fold_kernel = bool(coarse_fold_kernel)
-        # The assignment order the coarse match factor divides out. The coarse arm
-        # paints and gathers TSC (order 3), but the ratified factor (D-v2-10, the
-        # probe) is built at CIC order, leaving sinc^2 per axis of the coarse
-        # window on the long force: 3-4.5% low at r = 1.6-3.4 Mpc/h at production
-        # cells (`scripts/v2_force_profile.py`). 3 is the correct match and the
-        # default; 2 is the legacy arm that the probe parity gates are pinned to.
+        # Assignment order the coarse match factor divides out. The coarse arm paints and
+        # gathers TSC, so 3 is correct (default); 2 (CIC order) leaves a residual sinc^2 per
+        # axis on the long force and is kept for the reference parity comparisons.
         if int(coarse_match_order) not in (2, 3):
             raise ValueError(f"coarse_match_order must be 2 or 3, got {coarse_match_order}")
         self.coarse_match_order = int(coarse_match_order)
         self.device_tile_jit = bool(device_tile_jit)
         self.device_paint_chunk_bricks = (
             None if device_paint_chunk_bricks is None else int(device_paint_chunk_bricks))
-        # E2: the compiled tile loop against a window of x-slabs on the card
-        # (`device.window.tile_loop_windowed`) instead of the whole state -- the
-        # only form that fits a card at 4096^3. Bitwise the whole-state loop on a
-        # GB200 (Vista 996857, record sec. 35). TRI-STATE, the `migrate_pooled`
-        # pattern:
-        #   None  = AUTO, the default -- windowed wherever the compiled device tile
-        #           runs, inert on every other lane;
-        #   True  = REQUIRE it; refuses at validate() where it cannot apply;
-        #   False = E1's whole-state path, the A/B arm.
-        # `tile_window` is the resolved value every reader uses.
+        # Run the compiled device tile loop against a window of x-slabs on the card
+        # (`device.window.tile_loop_windowed`) rather than the whole state; bitwise the
+        # whole-state loop. None = auto (wherever the compiled device tile runs); True =
+        # require (refused where it cannot apply); False = whole-state. Read `tile_window`.
         self.device_tile_window = None if device_tile_window is None else bool(device_tile_window)
-        # E3 + R3: how many cards the device step splits across -- the coarse paint
-        # and solve by x-planes, the tile loop by tile planes, one thread per card
-        # walking its own planes through its own window, and, under
-        # `migrate_backend="device"`, the migrate and repack by x-slabs.
+        # Cards the device step splits across: coarse paint/solve by x-planes, tile loop by
+        # tile planes (one thread per card), and device migrate/repack by x-slabs.
         self.device_cards = int(device_cards)
-        # M4: on a step whose repack is due, the device migrate and repack as ONE
-        # visit per slab (`device.fused.migrate_repack_device`), sized by the
-        # destination census the windowed tile loop takes. Bitwise the two passes.
-        # TRI-STATE, the `device_tile_window` pattern: None = AUTO, fused wherever
-        # the device migrate and the tile window both run; True = REQUIRE it,
-        # refused at validate() where it cannot apply; False = the separate passes,
-        # the A/B arm. `fused_pass` is the resolved value.
+        # On a repack step, run the device migrate and repack as one visit per slab
+        # (`device.fused.migrate_repack_device`, sized by the windowed tile loop's destination
+        # census); bitwise the two passes. Tri-state as `device_tile_window`; read `fused_pass`.
         self.migrate_repack_fused = (
             None if migrate_repack_fused is None else bool(migrate_repack_fused))
 
@@ -397,41 +271,22 @@ class EngineConfig:
 
     @property
     def coarse_match(self):
-        """The `match` argument of the coarse solve. Order 2 (the legacy CIC-order
-        match the probe parities were ratified on) keeps the original 2-tuple, so
-        that path is the expression it always was."""
+        """The `match` argument of the coarse solve (order 2 keeps the plain 2-tuple form)."""
         if self.coarse_match_order == 2:
             return (self.coarse_cell, self.fine_cell)
         return (self.coarse_cell, self.fine_cell, self.coarse_match_order, 2)
 
     @property
     def r_s(self):
-        """The split scale. `alpha = r_s / d_coarse` is the dimensionless knob,
-        so C-dev results transfer to configurations where cells do not."""
+        """The split scale; `alpha = r_s / coarse_cell` is the dimensionless knob."""
         return self.alpha * self.coarse_cell
 
     def mesh_bytes(self):
-        """Per-step MESH anatomy in bytes, as a function of the two dtypes.
+        """Per-step mesh anatomy in bytes, as a function of the two dtypes.
 
-        **Deliberately not folded into `bytes_per_particle`.** That reports a
-        per-particle budget and the mesh is not per-particle; a mesh term
-        divided by N would shrink as the box grows, which is the opposite of
-        what the coarse mesh does. The `scaffold=0.0` precedent there is the
-        same instinct -- a term that vanishes from a table is indistinguishable
-        from one that was never counted.
-
-        This exists because that is exactly what happened. D-v2-16 clause 3
-        quoted 12.9 GB at C-gh and 103 GB at C-hero; those are the f32 numbers
-        (`v4_architecture_record.md` item 6 says so), and the shipped code was
-        f64 throughout, so the engine paid 25.8 and 206 GB from the freeze until
-        M-v2-4. Nothing in the package could have shown that, because nothing
-        counted the mesh at all. `test_the_coarse_meshes_match_the_ratified_
-        budget` is the check that would have.
-
-        Terms are labelled `resident` (live simultaneously during the tile loop)
-        or `transient` (peak while a phase runs). The kernel BUILD stays f64 at
-        either dtype -- it is the precision island -- so it does not shrink, and
-        it is reported separately rather than hidden inside the kernel term.
+        Kept out of `bytes_per_particle`: mesh terms are not per-particle. Phases per term
+        are `mesh_phase()`. Kernel builds stay f64 at either dtype (the precision island) and
+        are reported separately. Fine-arm terms are per tile worker.
         """
         cw = self.np_coarse_dtype.itemsize
         fw = self.np_fine_dtype.itemsize
@@ -444,151 +299,58 @@ class EngineConfig:
         pcells = p**3
         phalf = p * p * (p // 2 + 1)
         slab = max(1, min(nc, 32))
-        # EVERY FINE-ARM TERM IS PER WORKER, and counting them once is what let
-        # 923313 die in a phase this priced at 1.4 GB. In pool mode the parent
-        # builds NO tile kernels at all -- `run` hands it `(None, tile_geom(...))`
-        # and each worker builds its own triple and runs its own tile -- so the
-        # node holds W copies of the kernels, W builds, and W tile working sets,
-        # not one. Serial runs have exactly one of each, which is what `max(W, 1)`
-        # gives, so no existing measurement moves.
-        #
-        # This is the same fault as the pool's startup footprint being in no
-        # table until it was measured, and the same one the umbrella note about
-        # parent RSS missing pool workers is about: ru_maxrss sees ONE process,
-        # so an instrument reading the parent cannot see this term AT ALL and
-        # the budget has to carry it by construction.
+        # In pool mode each worker builds its own tile kernels and working set (the parent
+        # builds none), so fine-arm terms scale with W.
         w = max(int(self.tile_workers), 1)
         return dict(
             # --- coarse, transient
             coarse_accumulator=cells * 8,          # int64 host, dtype-independent
-            coarse_decode_slab=slab * nc * nc * 8,  # one f64 slab (M-v2-4)
+            coarse_decode_slab=slab * nc * nc * 8,  # one f64 slab
             coarse_kernel_build_f64=3 * half * 8,   # k2_true/k2_safe/fac, the island
-            # ONE component at a time, matched: `k = pref * ik` and `k * mf` are
-            # live together and nothing else is. It was three components at once
-            # until M-v2-6 hoisted the build out of the step; the whole group
-            # then measured 60.01 B per half-grid element per step against the
-            # 16.01 it costs now (flat to 0.2% over 7.9x in `half`, n_coarse
-            # 128/192/256), and that 44 B/half is 23.7 GB per step at C-gh.
-            # THE FACTORIZED SOLVE'S TERMS (the monolithic ones they replace are
-            # in git history; `coarse_kernels` at 2 complex half-grids and
-            # `coarse_fft_workspace` at 3). The record's rule was that a budget
-            # must not be edited to match a measurement of code that has not yet
-            # replaced the code it prices -- the factorized transform IS now the
-            # default, so these price what actually runs.
-            #
-            # HOST-RESIDENT, all three: `_coarse_solve_factorized` keeps the
-            # spectrum in numpy and only planes cross to a device. That is not an
-            # implementation detail, it is the property the whole design rests
-            # on, and it is why these carry the "host" placement rather than
-            # being sharded across the cards.
+            # The factorized solve (one component at a time). Host-resident:
+            # `_coarse_solve_factorized` keeps the spectrum in numpy and ships only planes.
             coarse_spectrum=half * 2 * cw,        # the forward's output, held
             coarse_solve_work=half * 2 * cw,      # per component: copy AS multiply
-            # the per-slab kernel and its product. `2 *` because the kernel slab
-            # and the `spec * k` temporary are live together; slab thickness is
-            # an outer loop bound, so this is the whole cost of the kernel that
-            # used to be a full complex half-grid.
+            # per-slab kernel and the `spec * k` temporary, live together
             coarse_kernel_slab=2 * slab * nc * (nc // 2 + 1) * 2 * cw,
-            # THREE complex half-grids, not one, and this is a DERIVATION rather
-            # than a measurement: `dk`, the device copy `jnp.asarray(k)` makes of
-            # the host kernel, and their product, all live while `irfftn` runs.
-            # It is an upper bound on the group -- XLA is free to fuse the
-            # multiply into the transform, and nothing in-process can see
-            # whether it did (`v2_m6_host_bytes.py` is blind to jax buffers and
-            # `memory_stats()` is None on CPU). Modelled high on purpose: this
-            # is a budget, and the failure that costs a node is the one where a
-            # term was left out.
-            # What the transform actually holds ON a device, which is the term
-            # the monolithic form could not make small. MEASURED at 117.5 MB at
-            # 2048^3 against a 34.4 GB spectrum -- 0.0034x, the witness D1
-            # existed to get. Modelled at 16 planes rather than the ~8 that
-            # measurement implies, on the same "a budget is not a best case"
-            # posture as the terms above.
+            # planes the transform holds on a device; charged at 16 planes, about twice the
+            # measured working set
             coarse_device_planes=16 * nc * (nc // 2 + 1) * 2 * cw,
-            # --- coarse, RESIDENT for the whole run: what the once-per-run
-            # build leaves behind (`forces.coarse_kernel_parts`). Both are real
-            # half-grids at the coarse dtype; the complex kernels are not kept.
-            # `pref = (fac / k2_safe).astype(fdtype)` was in neither arm's
-            # accounting until M-v2-6, and the match factor was in NO table at
-            # all -- `cic_match_factor` is called on every coarse solve and the
-            # engine always passes `match`, so it was 4.30 GB of C-gh that no
-            # budget had ever named.
+            # --- coarse, resident for the whole run: the once-per-run build's real half-grids
+            # (`forces.coarse_kernel_parts`); the complex kernels are not kept.
             coarse_kernel_pref=half * cw,
             coarse_match_factor=half * cw,
             # --- coarse, resident through the tile loop
             coarse_delta=cells * cw,
             coarse_force_resident=3 * cells * cw,
-            # ONE component, not three. The old form returned a list
-            # comprehension of jax meshes and the engine then built a numpy copy
-            # of each; a comprehension rebinds only after it completes, so all
-            # six were live together -- 25.8 GB at C-gh. `coarse_force_meshes`
-            # now solves one component at a time straight into the caller's
-            # buffers (the pool's shm views), so the transient is one mesh and
-            # the pool's own copy disappears with it. M-v2-6 measured
-            # `coarse_solve` at 14.19 MB (cdev8) and 110.89 (cdev) against 6.29
-            # and 50.33 for one copy; the coarse_div arm moved it 7.3x for an 8x
-            # change in cells, which is what identifies this as a cells term
-            # rather than a particle one.
+            # one component: `coarse_force_meshes` solves one at a time into the caller's buffers
             coarse_force_copy_transient=cells * cw,
             # --- fine, resident through the tile loop
             tile_kernels=w * 3 * phalf * 2 * fw,
-            # THE BUILD, which the tile arm never counted though the coarse arm
-            # always did. `split_kernels` holds `k2_true`, `k2_safe` and `fac` as
-            # full f64 half-grids plus `pref` at the fine dtype while it
-            # materialises the three complex kernels, so the peak of a build is
-            # 80*phalf at f64 where this dict modelled 48. The `ik_j` are LOW-RANK
-            # broadcasts ((nx,1,1) etc.) and cost nothing, which is why the factor
-            # is 5/3 and not larger.
-            #
-            # Measured, and the reason this is a derivation rather than a fit:
-            # `membership` (the phase that calls `make_tile_force_fn`) reads 85.60
-            # MB at cdev8 against 51.12 modelled and 1319.45 at cdev against
-            # 791.28 -- ratios of 1.675 and 1.667 against a derived 5/3. The
-            # config ladder alone could not have found this: particles, coarse
-            # cells and phalf scale together on every rung, and it took cdev's
-            # 15.48x phalf against 8.00x particles to separate them.
+            # the build: `split_kernels` holds k2_true, k2_safe, fac (f64) and pref (fine dtype)
+            # while materializing the complex kernels; the `ik_j` are low-rank broadcasts
             tile_kernel_build_f64=w * 3 * phalf * 8,
             tile_kernel_pref=w * phalf * fw,
             # --- fine, transient per tile
             tile_workspace=w * (pcells * (fw + 4 + 3 * fw) + phalf * 2 * fw),
         )
 
-    # Eject output, MEASURED per row of the slab a worker is handed, numpy
-    # domain and flat over an 8x change in slab rows (cdev8 / cdev):
-    #
-    #     numpy kernel   36.20 / 34.81 B/row
-    #     jax kernel    142.77 / 129.35 B/row
-    #
-    # The jax arm's figure is its NUMPY allocations; its device buffers are
-    # invisible to tracemalloc and sit on top, so both are floors and the jax
-    # one is the looser of the two. Both kernels are bitwise (record 5s, and
-    # re-confirmed alongside these numbers), so the 3.7x is a pure memory/wall
-    # trade with no correctness content: numpy ejects measured 1.6-1.9x slower
-    # on arm64 CPU.
+    # Measured eject host allocations per slab row (flat in slab size). Floors: the jax
+    # kernel's device buffers are not included. Both kernels are bitwise identical; numpy is
+    # slower, so this is a pure memory/wall trade.
     EJECT_BYTES_PER_ROW = {"numpy": 35.0, "jax": 129.0}
 
-    # An insert's own buffers, MEASURED the same way and flat to 0.1% over the
-    # same 8x: 50.28 / 50.25 B/row. Its INPUTS are free -- it reads slices of
-    # the shm scratch, which are views -- so this is the O(brick) working set
-    # alone, and it is why bounding ejects does not bound the pass on its own.
+    # An insert's own working set per row (its inputs are views of the shm scratch).
     INSERT_BYTES_PER_ROW = 50.25
 
-    # The SERIAL pass's whole-phase coefficient, measured as `migrate`'s own
-    # increment at cdev8 and cdev (181.7 and 198.9 B per slab-particle). It
-    # covers eject AND insert and the 2r+1 slabs the serial schedule stages.
+    # The serial pass's measured whole-phase bytes per slab row (eject + insert, 2r+1 slabs).
     SERIAL_MIGRATE_BYTES_PER_ROW = 190.0
 
     def _migrate_b_per_row(self):
-        """Bytes per slab-row the migrate holds, for THIS execution policy.
+        """Bytes per slab row the migrate holds under this execution policy.
 
-        **The pooled path holds one slab per WORKER and the serial one holds
-        2r+1 in total**, and the model had no worker count in it at all -- it
-        carried the serial coefficient whatever was running. At c-gh that priced
-        a pass at 12.75 GB which measured over 91: eight jax ejects of a 67M-row
-        slab are 69 GB between them, and Vista 923341 died there, in the LEAD
-        DRIFT, before reaching a single step.
-
-        The insert side is NOT separately measured and is not added here. This
-        is therefore a floor, and it is a floor built from the eject alone.
+        Serial holds 2r+1 slabs in total; pooled holds one slab per worker, so it scales with
+        the worker count (and the eject kernel).
         """
         if self.tile_workers <= 1 or self.migrate_pooled is False:
             return self.SERIAL_MIGRATE_BYTES_PER_ROW
@@ -600,30 +362,14 @@ class EngineConfig:
                 "one would be indistinguishable from a budget that measured it."
             )
         w = self.tile_workers
-        # WORST CASE, and the worst case is the point of a ceiling: every worker
-        # not held back from an eject is assumed to be running one. With the
-        # bound in place the rest can only be inserts, which are 2.6x cheaper
-        # but not free -- so a bound of E over W workers is E ejects PLUS W-E
-        # inserts, never E alone. Modelling it as E alone is how a knob comes to
-        # look like it solved a problem it only moved.
+        # worst case: E workers ejecting and the other W - E inserting
         e = w if self.migrate_eject_inflight is None else min(
             self.migrate_eject_inflight, w)
         return per_row * e + self.INSERT_BYTES_PER_ROW * max(w - e, 0)
 
     def mesh_phase(self):
-        """`MESH_PHASE`, adjusted for how THIS config actually runs.
-
-        The module dict describes the serial engine, where `run` hoists
-        `make_tile_force_fn` and the kernel build lands at its own boundary
-        before the loop. **In pool mode the parent builds no tile kernels at
-        all** -- it is handed `(None, tile_geom(...))` and each worker builds
-        its own triple on its first task, which happens INSIDE the tile loop.
-
-        That distinction is not bookkeeping: `kernel_build` is a once-per-run
-        phase and is held apart from the in-step sum, so leaving the tile build
-        there would drop W builds out of the budget for the very step the run
-        keeps dying in. A phase map that cannot express "who runs this, and
-        when" is a phase map that quietly excuses the largest term.
+        """`MESH_PHASE` for this config: in pool mode each worker builds its tile kernels on
+        its first task, so the tile kernel build is charged to `tile_loop`, not `kernel_build`.
         """
         m = dict(MESH_PHASE)
         if self.tile_workers > 1:
@@ -632,83 +378,24 @@ class EngineConfig:
         return m
 
     def step_bytes(self, n_particles, n_rows=None, cap=None):
-        """Per-step HOST terms that scale with PARTICLES, not with the mesh.
+        """Per-step host terms that scale with particles, not with the mesh (see `mesh_bytes`).
 
-        The companion to `mesh_bytes`, and it exists for the same reason: nothing
-        counted these either. M-v2-6 Stage 0 measured the engine's end-to-end peak
-        for the first time and found 8.2 GB at cdev8 where state plus
-        `mesh_bytes` plus the tile buffers modelled ~0.25 GB, so a planner built
-        only on `mesh_bytes` would have sized C-gh and been wrong by a factor of
-        thirty. A term that is not in the table cannot be traded against anything.
-
-        Terms, each pointing at the line that allocates it:
-
-        `brick_scales` -- one f64 per brick, the array that REPLACED
-        `kick_pending`. That term held `(slots int64, v_new f64)` for every owned
-        row until a global velocity scale could be reconciled -- 32 B/p, 274.9 GB
-        at C-gh, the largest single term in the configuration and the one the
-        module docstring wrongly claimed did not exist ("Nothing O(N) in floats,
-        anywhere"). Per-brick scales delete the wait that forced it: a brick's
-        rows are all kicked in one tile, so its scale is known immediately. What
-        is left is `n_bricks * 8` -- 16.8 MB at C-gh, five orders down, and it is
-        RESIDENT rather than per-step, so it is carried in the state table
-        instead. The line stays here reading zero because a term that vanishes
-        from a table is indistinguishable from one that was never counted.
-
-        `repack_scratch` -- `SlotState.repack` allocates `zeros_like` of `off`
-        and `w` while the originals stay live. The DERIVED figure was 9 B per
-        row (3 for `off` plus 6 for `w`); MEASURED it is **11.1 B/row**, flat to
-        2.6% across 64x in particle count (262k / 2.1M / 16.8M -> 11.35 / 11.09
-        / 11.06, `scripts/v2_m6_repack_bytes.py`). The extra ~2 B/row is the two
-        int64 occupancy arrays over `n_buckets` plus the sort, and it carries
-        because `n_buckets` and `n_rows` keep their ratio up the config table.
-        That was ~115 GB at C-gh. **Rewritten in place (M-v2-6) it measures 2.1
-        B/row** -- 2.135 and 2.066 at 2.1M and 16.8M particles -- so ~22 GB, a
-        5.3x reduction, and the term stops being the binding one. What remains
-        is almost entirely the two int64 occupancy arrays, which are per-BUCKET;
-        narrowing them to the index dtype would roughly halve it again and is
-        not done here because it has not been measured.
-
-        **D-v2-19 clause 3's in-place form does NOT fix it, and the clause's own
-        number is what hid that.** `BrickPackedLayout.repack` reports
-        `scratch_bytes` of 0.13-0.52 MB "independent of N", but that counts only
-        its two chunk buffers (`layout.py:662,670`); it also allocates `live`,
-        `parts` and `final` at one row each. Measured **39.4 B/row**, flat over
-        the same 64x, so porting it would multiply this term by 3.55x. The
-        reported figure is not merely low, it has the wrong SHAPE: a fixed
-        buffer divided by a growing row count reads as N-independent while the
-        real cost is linear. The clause's REASONING -- a repack is a monotone
-        rearrangement, not a sort -- is sound and is what licenses a genuinely
-        O(brick) implementation. The reference simply is not one.
-
-        `tile_buffers` -- the per-tile host working set, `cap`-sized. Needs a
-        measured `cap`; omitted when not supplied rather than guessed.
+        `kick_pending` -- always 0: per-brick velocity scales (resident, `n_bricks * 8`, in
+        the state table) let each brick's scale be set in its own tile, so no per-particle
+        pending-kick array exists. Kept as a zero line.
+        `repack_scratch` -- the in-place `SlotState.repack`'s measured working set per row.
+        `migrate_staging` -- slabs in flight during the migrate (O(N^(2/3)), see below).
+        `tile_buffers` -- per-worker per-tile host working set; only with a measured `cap`.
         """
         n = int(n_particles)
         rows = int(n_rows) if n_rows is not None else int(round(n * 1.21))
-        # MIGRATION STAGING IS N^(2/3), NOT N, and that is the whole reason it is
-        # worth a line. `state.drift_and_migrate` walks x-slabs and releases a
-        # staged slab as soon as every write that could reach it has happened, so
-        # the rows in flight are a handful of SLABS rather than the state: a slab
-        # is N / bricks_per_side, and bricks_per_side grows as N^(1/3), so this
-        # term grows as N^(2/3). Carrying it as an O(N) term would overstate it by
-        # 8x at C-gh.
-        #
-        # The coefficient is measured, the SHAPE is derived, and two configs agree
-        # on the coefficient which is what tests the shape: 181.7 B per
-        # slab-particle at cdev8 and 198.9 at cdev, an 8x change in N (`migrate`
-        # own-increment 47.62 and 208.58 MB, M-v2-6 host-byte instrument).
-        # `lead_drift` is the SAME function called once before the loop and runs
-        # 77.3 / 92.7 B on the same basis; it is not added here because it
-        # completes before the step's peak and so is never co-resident with it.
+        # Migration staging is a few x-slabs, not the state: a slab is N / bricks_per_side, so
+        # the term grows as N^(2/3). The coefficient is measured, the shape derived. The lead
+        # drift (same function, before the loop) is never co-resident with a step's peak.
         nb = max(1, self.n_fine // self.n_brick)
         if self.migrate_backend == "device":
-            # The device passes hold HOST scratch of their own: each builds one
-            # slab's numpy window (slot range + residents) to upload and copies one
-            # block back -- two slab-sized numpy buffers, 9 B/row (+4 with ids),
-            # by construction of `device.migrate._eject_slab` and
-            # `device.repack.repack_device`. Unmeasured on a node; charged from the
-            # code. The device-side terms live in `plan.device_budget`.
+            # The device passes' host scratch: two slab-sized numpy buffers at 9 B/row (from the
+            # code, not measured). Device-side terms are in `plan.device_budget`.
             host_window = int(round(2 * 9.0 * n / nb))
             out = dict(kick_pending=0, repack_scratch=host_window,
                        migrate_staging=host_window)
@@ -718,13 +405,8 @@ class EngineConfig:
             return out
         out = dict(
             kick_pending=0,
-            # 0.49 MEASURED (2.135/2.066 -> 0.490/0.490 at 2.1M and 16.8M
-            # particles, `scripts/v2_m6_repack_bytes.py`), after the per-bucket
-            # arrays came out: 11.1 out of place -> 2.1 in place -> 0.49 once
-            # `repack` stopped casting `occupancy` to int64 twice, stopped
-            # building an n_buckets bincount for the arena, and built its output
-            # at the index dtype. This coefficient only holds while n_buckets and
-            # n_rows keep their ratio, which they do up the config table.
+            # measured B/row of the in-place repack; holds while n_buckets / n_rows is fixed,
+            # as it is across the presets
             repack_scratch=int(round(rows * 0.49)),
             migrate_staging=int(round(self._migrate_b_per_row() * n / nb)),
         )
@@ -760,9 +442,7 @@ class EngineConfig:
         if self.tile_workers < 1:
             raise ValueError(f"tile_workers must be >= 1, got {self.tile_workers}")
         if self.migrate_pooled is True and self.tile_workers < 2:
-            # a knob that cannot apply must refuse, not silently run serial.
-            # `is True` and not truthiness: None is AUTO and falls back to
-            # serial by design, an EXPLICIT True cannot.
+            # an explicit True must not silently run serial (None = auto may)
             raise ValueError(
                 f"migrate_pooled needs a pool: tile_workers is {self.tile_workers}"
             )
@@ -780,8 +460,6 @@ class EngineConfig:
                     f"{name} must be 'host' or 'device', got {getattr(self, name)!r}")
         if self.coarse_backend == "device":
             if not self.paint_subblock:
-                # the A/B arm restores a full-mesh paint per chunk; the device paint
-                # has no full-mesh form, so the knob could not apply
                 raise ValueError(
                     "paint_subblock=False asks for the full-mesh paint, which "
                     "coarse_backend='device' does not have. Drop one.")
@@ -842,17 +520,10 @@ class EngineConfig:
         return True
 
     def _refuse_f64_without_x64(self):
-        """An f64 mesh without x64 is not an f64 mesh (M-v2-4).
+        """Refuse a float64 mesh dtype when jax_enable_x64 is off (it would silently be f32).
 
-        The library never enables x64 and every caller opts in, so this refuses
-        nothing that works today. What it prevents is the one configuration that
-        lies about itself: asking for f64, silently getting f32, and reading the
-        result as an f64 reference. That is the reference arm of M-v2-4's own
-        gate, where a silent degradation would not make the comparison fail --
-        it would make it read ZERO, which is a pass.
-
-        In `validate()` rather than in `step()` so an ad-hoc single step stays
-        possible; `run()` calls `validate()`.
+        The library never enables x64; callers opt in. Called from `validate()` (which `run`
+        calls), not `step()`, so an ad-hoc single step stays possible.
         """
         import jax
 
@@ -876,14 +547,10 @@ class EngineConfig:
 def _chunk_cuboid(chunk_index, chunk_len, nb, n_coarse):
     """Map a brick-major run of `chunk_len` bricks to a coarse-cell cuboid.
 
-    Returns `(cell_origin (3,), cell_span (3,))`, or None when the run is not
-    a cuboid -- and None simply routes that chunk to the full-mesh paint, so
-    this is a fast path with a bitwise-identical fallback, never a
-    requirement. A run IS a cuboid exactly when the chunk length divides the
-    brick grid cleanly: whole i-planes (nb^2 | L), whole j-rows within one
-    plane (nb | L and L | nb^2), or a fraction of one row (L | nb). All three
-    also make every chunk the SAME shape (L | nb^3, so no tail chunk), which
-    is what keeps the sub-block paint on one XLA shape.
+    Returns `(cell_origin (3,), cell_span (3,))`, or None when the run is not a cuboid (the
+    chunk then takes the bitwise-identical full-mesh paint). A run is a cuboid when L divides
+    the brick grid cleanly: whole i-planes (nb^2 | L), whole j-rows (nb | L | nb^2) or part of a
+    row (L | nb); each also gives every chunk the same shape (one XLA shape).
     """
     L = int(chunk_len)
     nb = int(nb)
@@ -906,11 +573,8 @@ def _chunk_cuboid(chunk_index, chunk_len, nb, n_coarse):
 def _assert_stencil_contained(x, coarse_cell, origin, extent, n_coarse):
     """The host-side half of `paint_tsc_int_subblock`'s containment contract.
 
-    Cheap (one rint + compare over the chunk's real rows), OUTSIDE the jit --
-    which is exactly what the fine arm's in-jit guard could not be (D-v2-21).
-    A violation means the cuboid derivation is wrong, and the failure mode it
-    prevents is a stencil corner wrapping to the far side of the block
-    SILENTLY, so this refuses rather than falls back.
+    Cheap and outside the jit. A violation means the cuboid derivation is wrong; the stencil
+    would otherwise wrap silently to the far side of the block, so this raises.
     """
     base = np.rint(x / float(coarse_cell)).astype(np.int64)
     for ax in range(3):
@@ -930,36 +594,18 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
                           progress=None):
     """delta on the coarse mesh, accumulated brick by brick.
 
-    Integer addition is associative, so a chunked accumulation is **bitwise**
-    what a single call over every position produces -- that is a property to
-    test, not to hope for, and it is the reason the coarse paint must be the
-    integer one before the paint can be streamed at all. With the f64 paint the
-    chunking would change the answer.
+    Requires the integer paint: integer addition is associative, so the chunked accumulation
+    is bitwise a single call over all positions (an f64 paint would change with chunking).
 
-    `stats`, if a dict, receives `coarse_peak_int` -- the max accumulated cell
-    sum, which the int32 refusal below already computes, so it is free.
+    `stats`, if a dict, receives the pad shapes, `coarse_peak_int` (max cell sum) and which
+    path painted. `pad_shape` is the previous step's chunk shape, keeping it monotone across
+    a run (`forces.capacity_shape`). `pool` runs each chunk's decode + sub-block paint on
+    workers while accumulation stays here (bitwise by associativity); `census=True` and
+    `paint_subblock=False` always run serial. `progress` is called once per chunk.
 
-    `pad_shape` is the previous step's chunk shape, carried forward so the shape
-    is monotone across a run for the same reason `cap` is; see the comment on
-    `pad` below and `forces.capacity_shape`.
-
-    `pool`, if given, runs each chunk's decode + sub-block paint on the tile
-    pool's workers (W2 Stage C); the ACCUMULATION stays here, where integer
-    associativity makes arrival order bitwise the serial order. `census=True`
-    and the full-mesh A/B arm (`paint_subblock=False`) route serial regardless,
-    so the gate instruments never read a pooled mesh.
-
-    `progress(stage, done, total)`, if given, is called once per chunk; see
-    `inexor.progress.Heartbeat`. At 4096^3 this loop is 16,384 chunks and
-    hours long, and it used to report nothing at all.
-
-    `census=True` additionally counts cells whose integer sum is NOT exactly
-    representable in f32 (`coarse_cells_inexact_f32`). It is OPT-IN because it
-    costs two extra passes over the mesh and is a gate instrument, not a
-    production need. **It counts round-trip failures rather than cells above
-    2^24**: `< 2^24` is sufficient for exactness, not necessary, and
-    `5000 * 2^12 = 625 * 2^15` is exact at 2.05e7 -- a magnitude threshold
-    overstates the loss, sometimes by a lot.
+    `census=True` also counts cells whose integer sum does not round-trip through f32
+    (`coarse_cells_inexact_f32`); two extra mesh passes. Round-trip, not `>= 2^24`, which is
+    sufficient for exactness but not necessary.
     """
     if cfg.paint_long != "int":
         raise ValueError(
@@ -973,45 +619,26 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
     bricks = list(range(st.n_bricks))
     groups = [bricks[i : i + cfg.chunk_bricks] for i in range(0, len(bricks), cfg.chunk_bricks)]
     rows = [sum(st.brick_member_count(b) for b in gg) for gg in groups]
-    # ONE shape for every chunk. A varying row count recompiles per chunk, which
-    # profiled at 2.91 s of a 13.21 s step -- the same trap as the long-range
-    # read. Padding is masked, not filled: an unmasked pad row would add mass.
-    #
-    # ONE shape ACROSS STEPS too, which the max alone does not give: occupancy
-    # shifts every step, so `max(rows)` took ten distinct values over ten steps
-    # at the smoke config (against one for `cap` since Stage 0 put that on the
-    # ladder), and every buffer keyed on it keys a new XLA shape whose executable
-    # is cached for the life of the process. That is the leading measured cause
-    # of the run peak's +110 MB/step at cdev (M-v2-6 Stage 0b, antares 446: the
-    # growth is linear over 15 steps, unsaturating, and survives malloc_trim, so
-    # it is live memory rather than allocator slack). Same ladder, same rungs
-    # knob, and the same masking argument makes it bitwise neutral.
+    # One padded shape for every chunk and, via the capacity ladder, across steps: each new
+    # shape compiles and caches another executable for the life of the process. Pad rows
+    # are masked (an unmasked pad row would add mass), so padding is bitwise neutral.
     pad_true = int(max(rows)) if rows else 0
     pad = (
         capacity_shape(pad_true, rungs=cfg.cap_rungs, floor_shape=pad_shape)
         if cfg.pad_ladder
         else pad_true
     )
-    # SUB-BLOCK PAINT (Stage 2c). The full-mesh form allocated and accumulated
-    # an n_coarse^3 mesh PER CHUNK -- chunks ~ n_bricks ~ N and per-chunk mesh
-    # ~ n_coarse^3 ~ N, a superlinear term measured at 20.4% of the cgh64 step
-    # (job 464) and growing. A chunk is a brick-major run, i.e. a spatial
-    # cuboid, so its TSC footprint is a bounded sub-block: paint there, then
-    # add the block into the accumulator through per-axis wrapped indices.
-    # Integer addition is associative and the sub-block contributions are
-    # bit-identical to the full paint's (weights global, index rebased), so
-    # the accumulated mesh is BITWISE unchanged -- the streamed-vs-monolithic
-    # pin is the regression. An axis whose span+3 would reach n_coarse runs
-    # full-axis instead, which keeps the scatter indices unique per axis (a
-    # repeated index under fancy-indexed += would drop adds).
+    # Sub-block paint: a brick-major chunk is a spatial cuboid, so its TSC footprint is a
+    # bounded block, painted locally and added through per-axis wrapped indices (bitwise the
+    # full-mesh paint; avoids an n_coarse^3 mesh per chunk). An axis whose span+3 reaches
+    # n_coarse runs full-axis, keeping scatter indices unique (a repeated index under
+    # fancy-indexed += would drop adds).
     nb_side = cfg.n_fine // cfg.n_brick
     coarse_cell = cfg.box_size / float(n)
     n_sub = 0
     pooled_workers = 0
     if pool is not None and cfg.paint_subblock and not census:
-        # W2 Stage C: chunks on the workers, integer accumulation here. The
-        # serial loop below is unchanged and remains the oracle the
-        # streamed-vs-monolithic pin reads.
+        # chunks on the workers, integer accumulation here
         pool.stage_coarse(dict(pad=int(pad), n_coarse=n, box=cfg.box_size,
                                frac_bits=cfg.frac_bits,
                                chunk_bricks=cfg.chunk_bricks, nb_side=nb_side))
@@ -1031,10 +658,6 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
         pooled_workers = pool.workers
         groups = []  # the serial loop below must not run the chunks again
     for gi, (gg, m) in enumerate(zip(groups, rows)):
-        # `gi` chunks are COMPLETE at the top of iteration gi, and the count
-        # sits before the `continue` so an empty chunk still advances it. The
-        # closing call is after the loop, where the last chunk has actually run
-        # -- reporting done == total on entry to it would print DONE early.
         if progress is not None:
             progress("coarse paint", gi, len(groups))
         if m == 0:
@@ -1075,14 +698,10 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
         progress("coarse paint", len(groups), len(groups))
     out, peak, inexact = _delta_from_accumulated(mesh, cfg, census=census)
     if stats is not None:
-        # both, for the same reason `cap`/`cap_true` are both reported: one hides
-        # the padding cost, the other hides the shape churn, and the churn leaked
         stats["coarse_pad"] = pad
         stats["coarse_pad_true"] = pad_true
         stats["coarse_peak_int"] = peak
-        # how many chunks took the sub-block path: an A/B whose knob did not
-        # apply must be readable as such (a knob must prove it applied) --
-        # same rule for the pool (0 = the serial path painted this mesh)
+        # receipts that the knobs applied (pooled_workers 0 = painted serially)
         stats["coarse_subblock_chunks"] = n_sub
         stats["coarse_pooled_workers"] = pooled_workers
         if census:
@@ -1094,10 +713,8 @@ def coarse_delta_streamed(st, cfg, stats=None, census=False, pad_shape=0, pool=N
 def _delta_from_accumulated(mesh, cfg, census=False):
     """(delta, peak, inexact) from the accumulated int64 coarse paint.
 
-    Shared by the host streamed paint and the device one (`device.paint`), so
-    the two cannot decode differently: whatever accumulated the integers, this
-    is the one place they become a density. `inexact` is the f32 round-trip
-    census count when `census`, else 0.
+    Shared by the host and device (`device.paint`) paints, so both decode identically.
+    `inexact` is the f32 round-trip census count when `census`, else 0.
     """
     n = cfg.n_coarse
     peak = int(np.abs(mesh).max())
@@ -1106,18 +723,9 @@ def _delta_from_accumulated(mesh, cfg, census=False):
             f"the accumulated coarse paint reached {peak}, past int32. "
             "Lower frac_bits -- this is D-007-class corruption, not imprecision."
         )
-    # SLABBED DECODE (M-v2-4). The old form was
-    #     counts_from_int(mesh.astype(np.int32), ...) / mean - 1.0
-    # which materializes an int32 copy of the whole mesh plus two full f64
-    # meshes on top of the int64 accumulator -- about 30 GB at C-gh, all of it
-    # transient, none of it counted anywhere. Slabbing makes the transient one
-    # slab (0.27 GB at C-gh) and lets the result land straight at the requested
-    # dtype. Every operation is elementwise, so the slabbed result is
-    # bit-identical to the whole-array form; `tests/test_engine.py` pins the
-    # streamed paint against the monolithic one and would catch it if not.
-    #
-    # The decode stays f64 and the narrowing happens after `- 1.0`; see
-    # `painting.density_tsc` for how little that buys and why it is kept anyway.
+    # Slabbed decode: the transient is one f64 slab and the result lands at the requested
+    # dtype; elementwise, so bitwise the whole-array form. Decode in f64, narrow after `- 1.0`
+    # (see `painting.density_tsc`).
     mean = float(cfg.n_total) / float(n) ** 3
     scale = 2.0 ** -cfg.frac_bits
     out = np.empty((n, n, n), dtype=cfg.np_coarse_dtype)
@@ -1139,12 +747,8 @@ def _delta_from_accumulated(mesh, cfg, census=False):
 def _diagnose_partition(st, cfg):
     """Where the ownership deficit is, for the assertion's message.
 
-    Failure path only. The bare count ("16777215 against 16777216") is
-    unattributable and cost three wrong explanations before this existed: a
-    tile-local float gap, a position-vs-storage mismatch, and a lost row. Each was
-    consistent with the count and none was the cause. What actually distinguishes
-    them is WHICH rows are unclaimed and what is unusual about them, and the state
-    knows.
+    Failure path only: reports which rows are unclaimed, aliased or double-claimed, and where
+    the occupancy / member-count / decode censuses disagree.
     """
     b_real = cfg._b_realized
     nb = cfg.n_fine // cfg.n_brick
@@ -1159,14 +763,9 @@ def _diagnose_partition(st, cfg):
             continue
         brick_of_row = np.repeat(np.asarray(members, dtype=np.int64), counts)
         own = owned_mask_from_bricks(brick_of_row, t, cfg.n_tile, cfg.n_brick, nb)
-        # np.add.at, NOT `claimed[idx] += 1`. Fancy-index += increments a repeated
-        # index ONCE, so the buffered form cannot see the very duplication this is
-        # looking for -- the first version of this diagnostic reported zero
-        # double-claims on a state whose distinct-slot count was short by one.
+        # np.add.at: fancy-index += counts a repeated index once, hiding double claims
         np.add.at(claimed, np.asarray(slots)[own], 1)
-    # counts vs DISTINCT slots: `SlotState.check` compares counts (state.py:587),
-    # so an aliased slot passes it -- occupancy still sums to n_particles while
-    # one slot is reachable through two bricks and the reachable SET is short.
+    # distinct slots, since `SlotState.check` compares counts and an aliased slot passes it
     seen = np.zeros(st.off.shape[0], dtype=np.int64)
     total_decoded = 0
     for b in range(st.n_bricks):
@@ -1177,11 +776,8 @@ def _diagnose_partition(st, cfg):
     aliased = np.nonzero(seen > 1)[0]
     unclaimed = np.nonzero(live & (claimed == 0))[0]
     twice = np.nonzero(claimed > 1)[0]
-    # THREE censuses that must be identical, printed rather than inferred. Job 440
-    # showed decoded == distinct == n_particles - 1 with no aliasing, so a row is
-    # unreachable while `check` passes -- and `check` sums OCCUPANCY. Whichever
-    # pair disagrees localizes the defect: occupancy vs member_count is a counting
-    # bug, member_count vs decode is a span/decode bug.
+    # Three per-brick censuses that must agree: occupancy vs member_count disagreeing is a
+    # counting bug, member_count vs decode a span/decode bug.
     p3 = st.buckets_per_brick
     occ = st.occupancy.astype(np.int64)
     occ_per_brick = occ.reshape(st.n_bricks, p3).sum(axis=1)
@@ -1242,30 +838,16 @@ def _no_phase(_name):
 def tile_task(st, one_tile, C, g_coarse, t, bricks, ph=_no_phase):
     """One tile of the kick: decode -> short + long force -> quantize per brick.
 
-    Reads `st` and writes NOTHING: every write the tile owes comes back in the
-    returned dict, and `apply_result` is the only place they land. This is the
-    executor seam -- the serial loop in `step` calls task and apply inline, and
-    the pool executor distributes the task over workers -- so a bitwise gate
-    between the two compares two executors of ONE function rather than two
-    codebases. Promoted from `scripts/v2_m6_c2_pool.py` (C2 of the wall plan),
-    which keeps its own copy as the ratified canary.
-
-    `C` is the per-step header: geometry ints, `cap`, and the kick
-    coefficients. Small and picklable by construction, because in pool mode it
-    rides to the workers with every task.
-
-    `ph` is the phase hook (see `step`); the serial executor passes the real
-    one so the per-phase high-water boundaries stay exactly where the
-    monolithic loop had them. The `busy` wall times are returned either way --
-    under overlap they are the only per-phase timing that means anything,
-    since a boundary hook cannot see work that runs concurrently.
+    Reads `st` and writes nothing: the tile's writes are returned and applied only by
+    `apply_result`. This is the executor seam: the serial loop in `step` and the pool workers
+    run the same function. `C` is the small, picklable per-step header (geometry, `cap`, kick
+    coefficients). `ph` is the phase hook (see `step`); `busy` walls are returned either way.
     """
     import jax.numpy as jnp
 
     t_dec = time.perf_counter()
     slots, x, v = st.decode_bricks(bricks)
-    # the brick each decoded row came from, in the order decode_bricks
-    # concatenates: this is what ownership is read off, NOT the position
+    # the brick each decoded row is stored in (decode order); ownership is read from this
     brick_of_row = np.repeat(
         np.asarray(bricks, dtype=np.int64), [st.brick_member_count(b) for b in bricks]
     )
@@ -1279,11 +861,8 @@ def tile_task(st, one_tile, C, g_coarse, t, bricks, ph=_no_phase):
     live[:m] = True
     origin, _ = tile_origin_extent(t, C["n_tile"], C["b_real"], C["cell"])
     u = jnp.mod(jnp.asarray(x[idx]) - jnp.asarray(origin), C["box"])
-    # ownership from the brick each row is STORED IN, which is the same thing
-    # membership is built from, so the two cannot disagree. Two earlier rules
-    # both re-derived it from a coordinate and both lost exactly one row of
-    # 16,777,216 at cdev (antares 431 tile-local, 436 global-position). See
-    # `forces.owned_mask_from_bricks` for why this one cannot.
+    # ownership from the storage brick, the same source as membership, so the two cannot
+    # disagree (re-deriving it from a coordinate can lose boundary rows)
     own_rows = owned_mask_from_bricks(
         brick_of_row, t, C["n_tile"], C["n_brick"], C["n_fine"] // C["n_brick"]
     )
@@ -1305,23 +884,14 @@ def tile_task(st, one_tile, C, g_coarse, t, bricks, ph=_no_phase):
         t, C["n_tile"], C["n_coarse"], C["n_fine"], halo=COARSE_HALO
     )
     sub = [stage_coarse_subblock(g, o_cells, extent) for g in g_coarse]
-    # Padded to `cap` with a live mask, for the SAME reason the short arm is:
-    # a per-tile row count keys a new XLA shape, so every tile recompiles.
-    # Profiled before the fix at 2,107 compilations and 24.1 s of a 32.7 s
-    # step -- 74% of it, 18.5 s inside backend_compile_and_load. One shape
-    # serves every tile.
+    # padded to `cap` with a live mask so one XLA shape serves every tile
     n_own = int(owned.sum())
     xo = np.zeros((C["cap"], 3), dtype=np.float64)
     xo[:n_own] = x[owned]
     lv = np.zeros(C["cap"], dtype=bool)
     lv[:n_own] = True
-    # `guard_out` keeps the stencil-containment check off the critical path:
-    # computing its bounds on the host meant a device->host sync in the MIDDLE
-    # of the gather, before the corner loop that is the actual work, plus a host
-    # min/max over every padded row. Deferred, the bounds are device scalars and
-    # are resolved BELOW, after the forces have been read back and the device is
-    # idle, so the refusal costs a round-trip's latency instead of a stall. It
-    # still fires before `g_long` is used, which is the property that matters.
+    # `guard_out` defers the stencil-containment bounds (device scalars) until after the
+    # readback, avoiding a mid-gather sync; it still fires before `g_long` is used.
     stencil_guard = []
     g_long_dev = gather_coarse_subblock(
         *sub, jnp.asarray(xo), o_cells, C["coarse_cell"], C["n_coarse"],
@@ -1333,14 +903,9 @@ def tile_task(st, one_tile, C, g_coarse, t, bricks, ph=_no_phase):
     t_quant = time.perf_counter()
     g_tot = g_short[owned] + g_long
     v_new = C["alpha_k"] * v[owned] + C["bcoef"] * g_tot
-    # QUANTIZE HERE, per brick, instead of holding `v_new` for a global scale.
-    # `decode_bricks` concatenates brick by brick and ownership is read off
-    # the brick a row is STORED in, so the owned rows are whole brick blocks
-    # and stay contiguous under the mask -- which is what lets a run scan
-    # replace a sort. The assertion below is on that contiguity, because it
-    # is load-bearing and free to check: if a brick ever appeared in two
-    # runs, the second run would silently overwrite the first one's scale
-    # and decode every row of it wrong.
+    # Quantize per brick. Owned rows are whole, contiguous brick blocks (decode order +
+    # storage-brick ownership), so a run scan finds them; asserted, since a brick split over
+    # two runs would silently overwrite its own scale.
     slots_o, bricks_o = slots[owned], brick_of_row[owned]
     cut = np.flatnonzero(np.diff(bricks_o)) + 1
     run_lo = np.concatenate(([0], cut))
@@ -1375,11 +940,8 @@ def tile_task(st, one_tile, C, g_coarse, t, bricks, ph=_no_phase):
 def apply_result(st, res):
     """Apply one tile's writes: velocity codes at owned rows, per-brick scales.
 
-    Disjoint across tiles because ownership is a partition (asserted in
-    `step`), so ANY application order gives the same state -- which is what
-    lets the pool executor apply results in arrival order. Batched writes are
-    bitwise the per-run writes the loop used to do: same rows, same values,
-    disjoint runs.
+    Writes are disjoint across tiles (ownership is a partition, asserted in `step`), so any
+    application order gives the same state.
     """
     if res["empty"]:
         return
@@ -1388,9 +950,9 @@ def apply_result(st, res):
 
 
 def _migrate_pass(st, cfg, c_drift, pool, timings=None):
-    """ONE router for the step's migrate and the lead drift: host (serial or
-    pooled, exactly as before) or the device pass. Returns the stats dict; the
-    device pass's `migrate_device` receipt rides in it."""
+    """Route the step's migrate (and the lead drift) to host serial, host pooled or device.
+
+    Returns the pass's stats dict (the device pass adds a `migrate_device` receipt)."""
     if cfg.migrate_backend == "device":
         from .device.migrate import drift_and_migrate_device
 
@@ -1406,8 +968,7 @@ def _migrate_pass(st, cfg, c_drift, pool, timings=None):
 
 
 def _repack_pass(st, cfg, timings=None):
-    """The repack, routed like the migrate. Returns the host repack's dict; the
-    device pass adds its `repack_device` receipt."""
+    """Route the repack like the migrate; the device pass adds a `repack_device` receipt."""
     if cfg.migrate_backend == "device":
         from .device.repack import repack_device
 
@@ -1431,71 +992,27 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
          repack_due=False, timings=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
-    `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1 and
-    2; `c_drift` is the FUSED drift for this step.
+    `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1-2; `c_drift` is
+    this step's fused drift. `census=True` enables the coarse decode census.
+    `tile_force` (`(one_tile, geom)` from `make_tile_force_fn`) and `coarse_parts`
+    (`forces.coarse_kernel_parts`) are built once by `run`; standalone calls build their own.
+    `cap_shape` / `pad_shape` / `device_shapes` carry the previous step's shapes so they stay
+    monotone (and a resumed run compiles the same programs).
 
-    `census=True` turns on the coarse decode census; see
-    `coarse_delta_streamed`. Off by default: it is a gate instrument and costs
-    two extra passes over the coarse mesh.
+    `pool` (a live `executor.TilePool`, owned by `run`) runs `tile_task` on workers and applies
+    results in arrival order; `tile_force` may then be `(None, geom)`. In pool mode intra-tile
+    phase boundaries do not fire and stats carry worker busy/idle/concurrency figures.
 
-    `tile_force`, if given, is the `(one_tile, geom)` pair from
-    `make_tile_force_fn`; `run` builds it once and passes it down, because the
-    per-step rebuild re-traces and re-compiles the same program every step
-    (~1.5 s/step, constant -- canary C0). Standalone calls omit it and build
-    their own, unchanged.
+    Device lane: "device" coarse paints, decodes and solves on the cards; "device" tile runs
+    the loop as one compiled program (`device.tile.tile_loop_device`) or the eager reference
+    under `device_tile_jit=False`, with a single `tile_loop` phase boundary. Migrate and repack
+    follow `migrate_backend`. `timings`, if a dict, collects synced per-phase walls (`tile`,
+    `migrate`, `solve`); syncing moves the wall, so a timed step is a breakdown, not a cost.
+    `repack_due`: under `cfg.fused_pass` the migrate and repack run fused here and
+    `stats["repack"]` is filled; otherwise it is None and the caller repacks.
 
-    `coarse_parts` is the same arrangement for the LONG arm and it was owed for
-    longer: `forces.coarse_kernel_parts` is a function of geometry alone, `run`
-    builds it once, and before M-v2-6 the whole thing was rebuilt every step
-    inside the solve at 60.01 B per half-grid element -- 32.28 GB per step at
-    C-gh, measured, against the 12.9 the planner charged. Standalone calls omit
-    it and build their own, unchanged.
-
-    `pool`, if given, is a live `executor.TilePool`: the tile loop dispatches
-    `tile_task` over its workers and applies results in arrival order, instead
-    of running task+apply inline in tile order. `run` owns the pool's
-    lifecycle. In pool mode the intra-tile phase boundaries do not fire (a
-    boundary hook cannot see overlapped work) and the stats carry the busy
-    triple -- per-phase worker busy seconds, realized concurrency, idle --
-    which is what distinguishes "not enough parallel work" from "workers
-    starved" from "slower per tile under contention". `tile_force` may then be
-    `(None, geom)`: the parent never runs a tile itself, so it needs the
-    geometry but not the kernels.
-
-    THE DEVICE LANE (`cfg.coarse_backend` / `cfg.tile_backend`, the executor
-    of `runs/v2/device_design_record.md`). "device" coarse paints, accumulates
-    and decodes the density on the card and solves from it; "device" tile runs
-    the whole loop as one compiled program writing into device state
-    (`device.tile.tile_loop_device`), or the eager per-tile oracle arm under
-    `device_tile_jit=False`. The migrate and repack follow `migrate_backend`.
-    `device_shapes` is the previous step's compiled shapes (`stats
-    ["device_shapes"]`), carried by `run` so they stay monotone and restored
-    from a checkpoint so a resumed run compiles the programs the uninterrupted
-    one did. The compiled tile loop has one boundary, `tile_loop`, in place of
-    the per-tile ones: a synced per-tile timing is not neutral (record sec. 20).
-
-    `timings`, if a dict, collects the device passes' SYNCED per-phase walls: the
-    windowed tile loop's per card (`tile`), the migrate's, or the fused
-    migrate + repack's (`migrate`), and the coarse solve's parts (`solve`). Syncing moves the wall, so a timed step is a
-    breakdown and not the step's cost; `stats["timings"]` carries it (None on an
-    untimed step).
-
-    `repack_due` says this step's repack follows it (`run` passes it). Where
-    `cfg.fused_pass`, the tile loop then takes the destination census and the
-    migrate and repack run fused (`device.fused`), and `stats["repack"]` is filled
-    here; otherwise it is None and the caller repacks.
-
-    `phase`, if given, is called with a boundary NAME after each phase of the
-    step completes. It exists because a peak is a max and a max carries no
-    timestamp: M-v2-6 Stage 0 attributed the peak by differencing whole-run
-    maxima between arms, and at cdev the terms it was trying to separate
-    (67-179 MB) sat inside the run-to-run scatter of the maximum itself
-    (sigma 45-115 MB over five repeats of one leg, antares 445), so no
-    difference of maxima could be read. Naming the boundaries lets a caller
-    take a high-water mark PER PHASE instead, which is a measurement of where
-    the peak is rather than an inference from what it is not. The hook takes no
-    payload and returns nothing on purpose -- it must not be able to perturb
-    the step, and the default is a function that does nothing at all.
+    `phase`, if given, is called with a boundary name after each phase, so a caller can take
+    a per-phase high-water mark. It takes no payload and cannot perturb the step.
     """
     import jax.numpy as jnp
 
@@ -1507,8 +1024,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     mesh_stats = {}
     shapes_in = device_shapes or {}
     shapes_out = {}
-    # E3: the cards the device step splits across; None is one card, jax's default
-    # device, exactly as before
+    # cards the device step splits across; None = jax's default device
     devs = None
     if cfg.device_cards > 1:
         import jax
@@ -1517,52 +1033,34 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     if cfg.coarse_backend == "device":
         from .device.paint import coarse_delta_cards
 
-        # The density painted, accumulated and decoded ON THE CARDS, never on the
-        # host: `coarse_force_meshes` takes the shards and transforms each card's
-        # planes where they sit.
+        # density painted and decoded on the cards; the solve transforms the shards in place
         delta = coarse_delta_cards(
             st, cfg, devices=devs, stats=mesh_stats, pad_shape=pad_shape,
             chunk_bricks=cfg.device_paint_chunk_bricks, census=census,
             shape_floor=shapes_in.get("paint"))
         shapes_out["paint"] = {k: int(v) for k, v in mesh_stats["coarse_jit_shapes"].items()}
-        # the host path's keys, on every card: each device chunk IS a sub-block
-        # paint, and no pool painted it
+        # the host path's receipt keys: each device chunk is a sub-block paint, none pooled
         mesh_stats["coarse_subblock_chunks"] = int(mesh_stats["coarse_device_chunks"])
         mesh_stats["coarse_pooled_workers"] = 0
     else:
         delta = coarse_delta_streamed(st, cfg, stats=mesh_stats, census=census,
                                       pad_shape=pad_shape, pool=pool)
     ph("coarse_paint")
-    # HAND THE FIELD OVER AND LET GO OF IT. `delta` is a full coarse mesh (4.3 GB
-    # at C-gh) and the solve reads only the jax copy, so holding the numpy name
-    # bound through the solve keeps a dead mesh alive across the phase where the
-    # peak is. Costs nothing when the jax copy aliases the host buffer. Card
-    # shards are handed over as they are.
+    # drop the host `delta` before the solve (the solve reads only `dj`)
     dj = delta if cfg.coarse_backend == "device" else jnp.asarray(delta)
-    # read the REALIZED dtype off the decoded field before letting go of it: the
-    # receipt at the end of the step is the check that the coarse knob applied,
-    # and it has to come from the array the paint produced. The force meshes
-    # cannot serve -- with `out=` they are the pool's preallocated views, whose
-    # dtype comes from the config, so a receipt read there would echo what it
-    # was told, which is exactly the failure this milestone exists to catch.
+    # The realized dtype, read from the painted field: the force meshes may be preallocated
+    # views whose dtype merely echoes the config.
     coarse_dtype_seen = np.dtype(
         delta[0]["delta"].dtype if cfg.coarse_backend == "device" else delta.dtype).name
     del delta
-    # `coarse_force_meshes` infers from delta.dtype and REFUSES a mismatch, so
-    # the dtype cannot silently disagree with what the config asked for.
-    # `out=` is the pool's own shm views: the workers read them anyway, so
-    # solving into them removes the parent-side triple AND the copy stage_step
-    # would otherwise make.
-    # Under the compiled device tile the force meshes are written straight onto
-    # the card they are read on (`device.coarse.CardShards`): no host mesh, and no
-    # re-upload. `g_coarse` is then the card shard dicts, not three host arrays.
+    # `coarse_force_meshes` refuses a delta/fdtype mismatch. `out=` is the pool's shm views
+    # (no parent-side copy), or under the compiled device tile the card shards the tiles read
+    # (`device.coarse.CardShards`), in which case `g_coarse` is shard dicts.
     if cfg.tile_backend == "device" and cfg.device_tile_jit:
         from .device.coarse import CardShards
         from .ooc_fft import partition_units
 
-        # one shard per card: the coarse x-planes under the tile planes that card
-        # runs, COARSE_HALO each side. One card is the whole mesh, wrapped, which
-        # is `CardShards.whole_mesh` exactly.
+        # one shard per card: coarse x-planes under its tile planes, COARSE_HALO each side
         per_tile = cfg.n_tile // (cfg.n_fine // cfg.n_coarse)
         plane_parts = partition_units(cfg.tiles_side, cfg.device_cards, 1)
         solve_out = CardShards(
@@ -1592,26 +1090,15 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     members = {
         t: st.tile_bricks(t, cfg.n_tile, b_real, cfg.n_brick, cfg.n_fine) for t in cfg.tiles
     }
-    # brick_member_COUNT, not brick_live_count: a brick's arena residents are
-    # part of its membership and `decode_bricks` returns them, so sizing `cap`
-    # off the run length alone under-counts and the force refuses.
+    # member count includes arena residents, which `decode_bricks` returns
     counts = [sum(st.brick_member_count(b) for b in members[t]) for t in cfg.tiles]
     cap_true = tile_capacity(counts)
-    # QUANTIZE THE SHAPE, do not use the true max. `cap_true` moves every step as
-    # occupancy shifts (measured at cdev8: ten distinct values over ten steps,
-    # 285,554 -> 397,319), so every buffer keyed on it keys a new XLA shape and
-    # the executable cache grows without bound -- a peak host RSS linear in K at
-    # 0.331 GB/step. `capacity_shape` puts it on a geometric ladder and
-    # `cap_shape` carries the previous value so it is monotone across the run.
-    # Padding is masked exactly as the within-step padding already is, so this is
-    # bitwise neutral; `tests/test_engine.py` pins that.
+    # Quantize the shape: `cap_true` moves every step, and each new shape grows the XLA
+    # executable cache. Geometric ladder, monotone via `cap_shape`; masked, so bitwise neutral.
     cap = capacity_shape(cap_true, rungs=cfg.cap_rungs, floor_shape=cap_shape)
 
     if tile_force is None:
-        # standalone calls build per step, as before; `run` hoists the build to
-        # once per run -- it re-traces and re-compiles `one_tile` every call
-        # (~1.5 s/step at cdev, constant: canary C0) and rebuilds the kernel
-        # triple, which is the `membership` phase's transient
+        # standalone call: build (and compile) here; `run` builds once per run
         tile_force = make_tile_force_fn(
             cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine,
             r_s=cfg.r_s, paint=cfg.paint_short, frac_bits=cfg.frac_bits,
@@ -1621,8 +1108,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     cell = geom["cell"]
     ph("membership")
 
-    # the per-step header `tile_task` runs from: everything it needs that is
-    # not an array. In pool mode this is what rides to the workers per task.
+    # the per-step header `tile_task` runs from (sent to workers with each task)
     C = dict(
         cap=int(cap), n_tile=cfg.n_tile, n_brick=cfg.n_brick, n_fine=cfg.n_fine,
         n_coarse=cfg.n_coarse, box=cfg.box_size, coarse_cell=cfg.coarse_cell,
@@ -1630,41 +1116,27 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     )
 
     tile_scales, n_owned, n_overhang = [], 0, 0
-    # NO `pending`. It held `(slots int64, v_new f64)` for every owned row until
-    # the last tile had been kicked, because a GLOBAL scale cannot be known
-    # before then -- 32 B/p, 274.9 GB at C-gh, and the largest single term in the
-    # whole configuration. Per-brick scales remove the wait rather than the
-    # array: a brick's rows are all kicked in one tile, so its scale is known the
-    # moment that tile is done and `apply_result` writes its codes immediately.
-    #
-    # TWO executors of ONE function. Serial: task and apply inline, in tile
-    # order. Pool: the same `tile_task` from workers, applied in arrival order.
-    # The bitwise executor-identity gate compares the two.
-    #
-    # THE DEVICE LANE is a third executor. Compiled (`device_tile_jit`), the whole
-    # loop is `device.tile.tile_loop_device`: every tile writes its codes and
-    # scales into device state, guards and the partition are resolved after the
-    # loop, the host state is written once, and only counts come back -- so
-    # nothing reaches the per-result loop below. Eager, `tile_task_device` returns
-    # the `tile_task` dict and `apply_result` lands it, the bitwise oracle arm.
+    # Per-brick velocity scales: a brick's rows are all kicked in one tile, so its codes are
+    # written as soon as that tile is done (no per-particle pending array).
+    # Executors: serial (task + apply inline, tile order); pool (same `tile_task`, arrival
+    # order); compiled device (`tile_loop_device` writes into device state and returns only
+    # counts, so nothing reaches the result loop below); eager device (`tile_task_device`
+    # returns the `tile_task` dict).
     tasks = [(t, members[t]) for t in cfg.tiles]
     if cfg.tile_backend == "device" and cfg.device_tile_jit:
         from .device.tile import tile_loop_device, tile_step_shapes
 
         shapes = tile_step_shapes(st, floor=shapes_in.get("tile"))
         shapes_out["tile"] = {k: int(v) for k, v in shapes.items()}
-        # the force meshes are already on the card (the solve wrote them there);
-        # each tile's program gathers its own sub-blocks from the shard (record
-        # sec. 23), and no host mesh exists to pass
+        # the force meshes are already on the card; each tile gathers from its shard
         if cfg.tile_window:
             from .device.window import tile_loop_windowed, window_shapes
 
-            # E2: one tile plane's x-slabs on the card at a time, not the state.
-            # E3: one thread per card, each walking the tile planes its shard
-            # covers; their host write-backs are disjoint core slabs
+            # one tile plane's x-slabs on the card at a time; one thread per card over its own
+            # tile planes (host write-backs are disjoint core slabs)
             wsh = window_shapes(st, cfg.n_tile, b_real, cfg.n_brick,
                                 floor=shapes_in.get("window"))
-            # M4: the census the fused migrate + repack sizes its new ranges from
+            # the destination census the fused migrate + repack is sized from
             fused_now = bool(repack_due) and cfg.fused_pass
             tile_timings = [dict() for _ in plane_parts]
             shapes_out["window"] = wsh
@@ -1692,7 +1164,6 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         n_overhang = sum(int(lp["n_out"]) for lp in loops)
         tile_scales.extend(float(lp["vel_scale_kick_max"]) for lp in loops
                            if lp["vel_scale_kick_max"] is not None)
-        # the window's receipts ride with each card's (absent on the whole-state loop)
         tile_cards = [dict(planes=int(lp.get("planes_run", cfg.tiles_side)),
                            tiles_run=int(lp["tiles_run"]),
                            **{k: lp[k] for k in ("window_live_rows_max", "residents_staged",
@@ -1732,17 +1203,10 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
             ph("tile_reduce")
     loop_wall = time.perf_counter() - t_loop
 
-    # The boundary stays so the trace keeps its shape and peak comparisons
-    # against every card on record are like-for-like. (The `pending` array it
-    # was placed to price was deleted with the per-brick scales; nothing
-    # accumulates across the loop any more.)
+    # kept so the phase trace has a stable shape (nothing accumulates across the loop)
     ph("tile_loop_end")
 
     if n_owned != st.n_particles:
-        # SELF-DIAGNOSING, because the bare count sent me down three wrong
-        # explanations. Computed only on the failure path, so the happy path pays
-        # nothing. It names where the deficit is rather than leaving it to be
-        # guessed from the geometry.
         raise AssertionError(
             f"the tiles own {n_owned} rows against {st.n_particles} particles: ownership "
             "is supposed to be a partition, so this is a geometry error.\n"
@@ -1755,9 +1219,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
             "nonzero overhang means the decomposition is wrong rather than wasteful."
         )
 
-    # Nothing to reconcile: every brick's codes were written at its own scale
-    # inside the loop. The phase boundary stays so the trace keeps its shape and
-    # a peak comparison against every card on record is still like-for-like.
+    # nothing to reconcile (per-brick scales); boundary kept for a stable phase trace
     ph("reconcile")
 
     fused_now = bool(repack_due) and cfg.fused_pass
@@ -1774,43 +1236,25 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     else:
         stats = _migrate_pass(st, cfg, c_drift, pool,
                               None if timings is None else timings.setdefault("migrate", {}))
-    # the knob's receipts, on every card in both directions: the census the fused
-    # pass was sized from covered this many slabs (0 when it did not run)
+    # Receipts that each knob applied, present on every step (0 / None when inactive).
     stats["migrate_repack_fused"] = fused_now
     stats["census_slabs"] = (int(sum(lp.get("census_slabs", 0) for lp in loops))
                              if fused_now else 0)
-    # the knob's receipt, in BOTH directions: 0 on every serial card, W on
-    # every pooled one (the reach fallback reports 0 through migrate_pool)
     stats["migrate_pooled_workers"] = int(stats.get("migrate_pool", {}).get("workers", 0))
-    # the backend's receipt: the name, and on the device the pass's own dict
-    # (slabs, programs, peak estimate); None on the host so every card carries
-    # the key
     stats["migrate_backend"] = cfg.migrate_backend
     stats.setdefault("migrate_device", None)
-    # PEAK ARENA RESIDENCY, so `arena_frac` stops being chosen by argument.
-    # The 6% on record is CLAIMS across a migrate pass, not residency: the
-    # arena is a revolving door (`_release_arena_of_brick` frees slots as
-    # bricks are rewritten) and C15 found 88.7-96.2% of occupied bricks with
-    # no residents at all. What that makes the true peak has never been
-    # measured, and it is what sets how small the arena can safely be.
+    # arena residency after the pass (slots are freed as bricks are rewritten, so this is
+    # not the claim count); informs the choice of `arena_frac`
     for _k in ("migrate", "migrate_pool"):
         _u = (stats.get(_k) or {}).get("arena_used")
         if _u is not None:
             stats["arena_used"] = int(_u)
             break
     ph("migrate")
-    # both: `cap` is the SHAPE every buffer took, `cap_true` the max over tiles it
-    # was quantized from. Reporting only one of them hides either the padding cost
-    # or the shape churn, and the shape churn is what leaked.
-    # `vel_scale` stays a SCALAR in the stats dict -- the max over bricks, which
-    # `drift_and_migrate` already put there -- so every reader of a card keeps
-    # working. `vel_scale_min` is beside it: the two together are what say how
-    # much the per-brick scales actually spread, and a single number cannot.
+    # `cap` is the buffer shape, `cap_true` the max it was quantized from.
     stats.update(cap=cap, cap_true=cap_true, n_tiles=len(cfg.tiles),
                  vel_scale_kick_max=float(max(tile_scales)) if tile_scales else 1.0)
-    # ALWAYS on the card, 1 included: a pooled run's per-phase memory and
-    # boundary timings are void under overlap, and the comparability check
-    # refuses to read them against serial cards only if the knob is recorded
+    # always recorded: pooled per-phase memory and timings are not comparable to serial
     stats["tile_workers"] = int(getattr(cfg, "tile_workers", 1))
     if pool is not None:
         b_sum = float(sum(busy.values()))
@@ -1820,22 +1264,15 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
             idle_s=pool.workers * loop_wall - b_sum,
             rss_mb=rss,
         )
-    # the REALIZED dtypes, read off the arrays rather than echoed from the
-    # config: a receipt that repeats what it was told cannot catch a knob that
-    # did not apply, which is the whole failure mode this milestone is built
-    # against
+    # realized dtypes, read from the arrays rather than echoed from the config
     stats["coarse_dtype"] = coarse_dtype_seen
     stats["fine_dtype"] = str(geom["fdtype"])
-    # the executor's receipts, on every card in both directions. The calls
-    # themselves are counted in `device.paint.CALLS` / `device.tile.CALLS`;
-    # `device_shapes` is what the device programs were compiled at, carried by
-    # `run` across steps and into checkpoints ({} on the host lane)
+    # `device_shapes`: the shapes the device programs compiled at ({} on the host lane)
     stats["coarse_backend"] = cfg.coarse_backend
     stats["tile_backend"] = (cfg.tile_backend if cfg.tile_backend == "host"
                              else ("device" if cfg.device_tile_jit else "device-eager"))
     stats["device_shapes"] = shapes_out
     if cfg.tile_backend == "device" and cfg.device_tile_jit:
-        # the split's receipt: cards asked for, and what each card's tile loop ran
         stats["device_cards"] = cfg.device_cards
         stats["tile_cards"] = tile_cards
     stats.update(mesh_stats)
@@ -1849,10 +1286,9 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
 def fused_drifts(coeffs):
     """The drift-synchronized schedule from `bullfrog_float_coeffs`.
 
-    Returns `(lead, fused)`: a leading half-drift that puts positions on the
-    first midpoint, then one drift per step -- `h_k + h_{k+1}` after each kick,
-    with `h_{K-1}` alone on the last so the trajectory lands on the same endpoint
-    the boundary form does.
+    Returns `(lead, fused)`: a leading half-drift onto the first midpoint, then one drift per
+    step, `h_k + h_{k+1}`, with `h_{K-1}` alone on the last so the endpoint matches the
+    boundary form.
     """
     h = np.asarray(coeffs)[:, 0]
     return float(h[0]), np.concatenate([h[:-1] + h[1:], h[-1:]])
@@ -1861,24 +1297,14 @@ def fused_drifts(coeffs):
 
 # ------------------------------------------------------------- checkpoints
 
-# The config fields a resumed run must match. Deliberately NOT every attribute:
-# these are the ones that move numbers, either as physics/geometry or as a
-# BUFFER SHAPE, and a shape belongs here because XLA reassociates by shape and
-# a padded reduction can move bits (the pad-and-mask lesson). Excluded on
-# purpose, with the reason each is safe to change across a resume:
-#   tile_workers, worker_affinity, migrate_pooled, migrate_window -- execution
-#     policy; the pooled migrate is bitwise the serial one (C14) and W is
-#     exactly the thing you want to change when resuming onto another node.
-#   eject_kernel -- both kernels are bitwise on arm64/x86/CUDA (record 5s).
-#   migrate_backend, migrate_device_budget_bytes, migrate_repack_fused -- execution
-#     policy; the device migrate and repack, separate or fused, are bitwise the
-#     serial host passes (D3b R1/R1b, M4 gates), and a resume onto a node with a
-#     different backend is the point.
-#   repack_every, chunk_bricks, brick_slack -- move the LAYOUT, and the layout
-#     carries no physics: both paints are integer and so order-independent
-#     (D-v2-21), which is also why this checkpoint does not preserve
-#     allocation geometry at all.
-#   checkpoint_dir, checkpoint_every -- the mechanism itself.
+# The config fields a resume must match: those that move numbers, as physics/geometry or as a
+# buffer shape (XLA reassociates by shape). Safe to change across a resume, so excluded:
+#   execution policy (tile_workers, worker_affinity, migrate_pooled, migrate_window,
+#     eject_kernel, migrate_backend, migrate_device_budget_bytes, migrate_repack_fused) --
+#     every alternative is bitwise the serial host path;
+#   layout (repack_every, chunk_bricks, brick_slack) -- both paints are integer and so
+#     order-independent; checkpoints store membership, not allocation;
+#   checkpoint_dir, checkpoint_every.
 _FINGERPRINTED = (
     "box_size", "n_part", "n_fine", "n_coarse", "n_tile", "b_fine", "alpha",
     "paint_short", "paint_long", "frac_bits", "coarse_dtype", "fine_dtype",
@@ -1887,14 +1313,11 @@ _FINGERPRINTED = (
 
 
 def checkpoint_fingerprint(cfg, coeffs):
-    """What a resume must match. Covers the schedule too: `coeffs` is hashed as
-    bytes, so the cosmology, the a-grid and K are all in here without the
-    checkpoint having to name them or the caller having to pass a cosmology."""
+    """Hash of what a resume must match: `_FINGERPRINTED` config fields plus `coeffs` as bytes
+    (so the cosmology, a-grid and K are covered)."""
     h = hashlib.sha256()
     fp = {k: getattr(cfg, k) for k in _FINGERPRINTED}
-    # added ONLY at orders other than 2, so every checkpoint written before the
-    # knob existed (all order 2) keeps its fingerprint and still resumes, and no
-    # order-3 run can collide with one of them
+    # only when != 2, so order-2 fingerprints are unchanged
     if getattr(cfg, "coarse_match_order", 2) != 2:
         fp["coarse_match_order"] = cfg.coarse_match_order
     h.update(json.dumps(fp, sort_keys=True).encode())
@@ -1904,13 +1327,10 @@ def checkpoint_fingerprint(cfg, coeffs):
 
 def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=None,
                       device_shapes=None, timings=None):
-    """One generation of a rolling pair. Returns the directory, which is the
-    receipt: a run that believed it was checkpointing and was not has `None`
-    on every step.
+    """Write generation `gen` of the rolling pair; returns its directory (the step's receipt).
 
-    `epoch` is the optional `(a_steps, cosmo)` from `run`; see `epoch_record`
-    for what it writes and why it is not in the fingerprint. `device_shapes` is
-    the device lane's compiled shapes, restored on resume (see `run`)."""
+    `epoch` is the optional `(a_steps, cosmo)` from `run` (see `epoch_record`);
+    `device_shapes` are restored on resume."""
     from . import icgen
 
     prov = dict(
@@ -1933,26 +1353,10 @@ def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=No
 def epoch_record(epoch, step):
     """The `{a, cosmology}` a checkpoint carries so its units can be chosen later.
 
-    `epoch` is `(a_steps, cosmo)` -- the FULL `integrate.a_grid` output and the
-    cosmology it was built from -- or `None`, which writes nothing and leaves
-    the manifest exactly as it was before this existed.
-
-    **The index convention is the whole content of this function.** `a_steps`
-    has `n_steps + 1` entries, `a_steps[0]` is the initial epoch, and
-    `_write_checkpoint` is called with `step` = the number of COMPLETED steps.
-    So a checkpoint at `step` sits at `a_steps[step]`, which is the same
-    indexing the M-v2-6 driver's export leg does. It is pinned in
-    `tests/test_engine.py` rather than left to a reading of two call sites.
-
-    **Deliberately NOT in `checkpoint_fingerprint`.** The fingerprint already
-    hashes `coeffs` as bytes, so the cosmology and the a-grid are inside it;
-    this is the same information written down READABLY, for a consumer that has
-    only the directory. Adding it to `_FINGERPRINTED` would change every
-    fingerprint and invalidate every checkpoint on disk to record nothing new.
-
-    Nothing here is required for a resume, and a manifest without it loads and
-    resumes exactly as before -- which is why this is provenance rather than a
-    schema field, and why the banked 2048^3 slabs still load unchanged.
+    `epoch` is `(a_steps, cosmo)` (the full `integrate.a_grid` output, n_steps + 1 entries,
+    and its cosmology) or None (writes nothing). `step` is the number of completed steps, so
+    the checkpoint sits at `a_steps[step]`. Provenance only: not needed to resume, and not
+    in the fingerprint (which already covers it via `coeffs`).
     """
     if epoch is None:
         return {}
@@ -1971,19 +1375,10 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
                     arena_frac=None, alloc=None):
     """Newest complete checkpoint under `checkpoint_dir` -> `(st, resume)`.
 
-    Picks by the recorded step rather than by mtime, and only among generations
-    whose manifest is present -- the manifest is removed before a rewrite and
-    written last, so a torn generation is invisible here and the older one
-    survives. That is the whole reason there are two.
-
-    Refuses a fingerprint mismatch. Resuming a state under a different geometry
-    or a different schedule would not fail, it would produce a run that is half
-    one thing and half another, and nothing downstream could see it.
-
-    Capacity is the caller's to choose and is not restored from the file: this
-    format stores membership, not allocation. `brick_slack` defaults to the
-    config's and `arena_frac` to whatever the checkpoint recorded, which
-    reproduces a comparable container without claiming to reproduce the same one.
+    Picks the highest recorded step among generations with a manifest (removed before a
+    rewrite, written last, so a torn generation is skipped and the other survives). Raises
+    on a fingerprint mismatch, which would otherwise splice two runs silently. Capacity is not
+    stored: `brick_slack` defaults to the config's, `arena_frac` to the checkpoint's.
     """
     from . import icgen
 
@@ -2029,59 +1424,29 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         stop_at=None, allocator=None, epoch=None, timed_steps=()):
     """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`.
 
-    `phase` is forwarded to `step`; see its docstring. The boundaries `run`
-    itself adds are the lead drift and the repack, so that every allocation in
-    the run falls inside exactly one named phase and the phases sum to the run.
+    Returns the list of per-step stats. `phase` is forwarded to `step`; `run` adds the
+    `kernel_build`, `lead_drift`, `repack` and `checkpoint` boundaries.
 
-    **`stop_at` runs a SEGMENT of the schedule**, stopping before absolute step
-    `stop_at`, and it is the other half of `resume`. Together they let one
-    schedule cross job boundaries, which a realization at full scale needs: the
-    projected wall is order a day and a queue's limit is not negotiable.
+    `resume` (from `load_checkpoint`) and `stop_at` (stop before that absolute step) run the
+    schedule in segments that compose bitwise into the uninterrupted run; always pass the
+    full `coeffs` (a run over `coeffs[:n]` is a different trajectory, since drifts are fused
+    across steps). With checkpointing on, `stop_at` must be a checkpoint boundary.
 
-    It is deliberately NOT "run the first n steps of a shorter schedule".
-    `fused_drifts` fuses each step's trailing half-drift with the next step's
-    leading half, so a run over `coeffs[:n]` is a DIFFERENT trajectory rather
-    than a prefix of this one. `stop_at` takes the full `coeffs` and stops, so
-    the segments compose back into the uninterrupted run bitwise -- which is
-    what `test_a_run_split_into_segments_is_bitwise_the_uninterrupted_one`
-    asserts particle for particle.
-
-    Stopping somewhere a checkpoint was not written throws that segment's work
-    away, and doing so silently is the failure this refuses: with checkpointing
-    on, `stop_at` must land on a checkpoint boundary.
-
-    **`epoch` is `(a_steps, cosmo)` and only checkpoints read it.** The engine
-    has no cosmology of its own -- `EngineConfig` is geometry and policy, and
-    `coeffs` are growth-factor numbers with no scale factor left in them -- so
-    a caller that wants its checkpoints to know their own epoch passes the
-    `integrate.a_grid` output and the cosmology it came from. What that buys is
-    `python -m inexor.export` writing peculiar km/s off a bare directory
-    instead of the reader having to supply the epoch by hand and get it right.
-    Omitted, everything behaves exactly as before; see `epoch_record`.
-
-    `timed_steps` names ABSOLUTE step indices whose device passes are timed with
-    syncs (see `step`'s `timings`); on those steps the repack, if it runs
-    separately, is timed too, into `stats["timings"]["repack"]`, and a
-    checkpoint landing on one reports its own parts into
-    `stats["timings"]["checkpoint"]`.
+    `epoch = (a_steps, cosmo)` is read only by checkpoints (`epoch_record`), so an export can
+    convert velocities to km/s from the directory alone. `timed_steps` names absolute steps
+    whose device passes, separate repack and checkpoint are timed into `stats["timings"]`.
     """
     cfg.validate()
     timed_steps = {int(k) for k in timed_steps}
     ph = phase if phase is not None else _no_phase
     ckpt_on = bool(cfg.checkpoint_dir) and cfg.checkpoint_every > 0
     if ckpt_on and st.ids is not None:
-        # fail here, not 37 minutes into the first step: the slab schema has no
-        # ids and a checkpoint that dropped them would make the restart
-        # non-reproducible for anything id-dependent
         raise ValueError(
             "checkpointing a state that carries ids: the t9-slabs-2 schema has no room "
             "for them, so the resumed run would silently lose particle identity"
         )
     if epoch is not None:
-        # Same reason as above: check the grid against the schedule here rather
-        # than at the first checkpoint, which is a step into the run. `coeffs`
-        # is always the FULL schedule even for a `stop_at` segment, so this
-        # invariant holds on every leg.
+        # checked up front; `coeffs` is the full schedule even for a `stop_at` segment
         a_steps, _ = epoch
         if len(a_steps) != len(coeffs) + 1:
             raise ValueError(
@@ -2091,9 +1456,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             )
     pool = None
     if cfg.tile_workers > 1:
-        # the pool's workers each build their own kernels + jitted program, so
-        # the parent needs only the geometry -- bit-identical numbers from
-        # `tile_geom` without the kernel triple's memory or the trace
+        # workers build their own kernels; the parent needs only the geometry
         from .executor import TilePool
 
         pool = TilePool(st, cfg, allocator=allocator)
@@ -2102,20 +1465,13 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             paint=cfg.paint_short, frac_bits=cfg.frac_bits, fdtype=cfg.np_fine_dtype,
         ))
     else:
-        # ONCE per run, not per step: the rebuild re-traces and re-compiles the
-        # same jitted program and rebuilds the kernel triple every step (canary
-        # C0: ~1.5 s/step, constant). The triple is now resident for the whole
-        # run instead of a per-step `membership` transient -- a named boundary
-        # so every allocation still falls inside exactly one phase.
+        # once per run: the tile program and its kernels are resident for the run
         tile_force = make_tile_force_fn(
             cfg.n_fine, cfg.box_size, cfg.n_total, cfg.n_tile, cfg.b_fine,
             r_s=cfg.r_s, paint=cfg.paint_short, frac_bits=cfg.frac_bits,
             fdtype=cfg.np_fine_dtype,
         )
-    # The LONG arm's build, hoisted for the same reason and paid at the same
-    # boundary. Geometry only, so one build serves every step; it is 4.30 GB
-    # resident at C-gh against 23.7 GB of per-step transient it removes, and the
-    # build's own 28 B/half peak lands here, before any force mesh exists.
+    # the long arm's kernel parts, likewise once per run (geometry only)
     coarse_parts = coarse_kernel_parts(
         cfg.n_coarse, cfg.box_size, "long", r_s=cfg.r_s,
         match=cfg.coarse_match, fdtype=cfg.np_coarse_dtype,
@@ -2123,41 +1479,21 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     ph("kernel_build")
     try:
         lead, fused = fused_drifts(coeffs)
-        # onto the first midpoint; pooled under the same knob as the per-step
-        # migrate (5j: this ONE call was mistaken for a per-step phase once).
-        # SKIPPED on a resume -- the checkpointed state is already past it, and
-        # applying it twice would drift the whole box by an extra half step.
-        # The phase boundary still fires so a resumed run's phase table keeps
-        # the same shape as an uninterrupted one (the `reconcile` precedent).
+        # Lead half-drift onto the first midpoint; skipped on resume (the checkpoint is past
+        # it). The boundary fires either way.
         if resume is None:
             _migrate_pass(st, cfg, lead, pool)
         ph("lead_drift")
         out = []
-        # both buffer shapes are carried ACROSS steps and only ever grow, so the
-        # run visits at most a few shapes instead of one per step: `cap` from
-        # Stage 0, `coarse_pad` from Stage 0b, which measured it still churning
+        # buffer shapes carried across steps and only grown, so few shapes are compiled
         cap_shape = 0
         pad_shape = 0
-        # the device lane's compiled shapes (`step`'s `device_shapes`), carried the
-        # same way; {} on the host lane
         device_shapes = {}
         k0 = 0
         if resume is not None:
-            # Both shapes are RESTORED rather than re-laddered from zero, so a
-            # resumed run keeps the "few shapes per run" property instead of
-            # paying a fresh compile. This is a COMPILE-COUNT choice and not a
-            # correctness one: measured 2026-08-18 at cdev scale on arm64 CPU,
-            # quadrupling both shapes on resume moves nothing (0 of ~229k rows
-            # on `off` and `w`), because the padded rows are masked. The
-            # split-run gate therefore cannot see this and does not claim to;
-            # what it does catch is the lead drift being reapplied. Not
-            # generalized to GPU, where XLA reassociates by shape.
-            #
-            # The device shapes are restored for the stronger reason that
-            # sentence names: on a GPU a program compiled at another shape may
-            # round differently, so a resumed run is only the uninterrupted one if
-            # it compiles the same programs. A checkpoint written before the
-            # executor has none, and a host-lane run needs none.
+            # Shapes are restored rather than re-laddered: on CPU this only saves compiles
+            # (padding is masked), but on GPU a program compiled at another shape may round
+            # differently, so a resume must compile the same programs.
             k0 = int(resume["step"])
             cap_shape = int(resume["cap_shape"])
             pad_shape = int(resume["pad_shape"])
@@ -2178,11 +1514,8 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                     f"{k_end % cfg.checkpoint_every} step(s) past its last checkpoint and "
                     "throw that work away. Move the stop onto a checkpoint boundary."
                 )
-        # A resumed run's first write goes to the generation it did NOT load, so
-        # the state it resumed from survives until a newer one is complete; the
-        # write unlinks its target's manifest first, so always starting at gen 0
-        # meant a segment dying mid-write rolled back past its own resume point,
-        # or left nothing loadable when gen 1 was still empty.
+        # A resumed run first writes the generation it did not load, so its resume point
+        # survives until a newer checkpoint is complete.
         n_ckpt = 0 if resume is None else 1 - int(resume.get("gen", 1))
         for k in range(k0, k_end):
             repack_due = bool(cfg.repack_every and (k + 1) % cfg.repack_every == 0)
@@ -2201,18 +1534,12 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                     stats["repack"] = _repack_pass(
                         st, cfg, None if timings is None else timings.setdefault("repack", {}))
                 ph("repack")
-            # AFTER the repack, so the checkpoint is the step's settled state.
-            # The receipt goes on every step in both directions, `None` when
-            # checkpointing is off: a knob must prove it applied.
+            # after the repack (the step's settled state); None when not written
             stats["checkpoint"] = None
             if ckpt_on and (k + 1) % cfg.checkpoint_every == 0:
                 stats["checkpoint"] = _write_checkpoint(
                     st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2, epoch=epoch,
                     device_shapes=device_shapes,
-                    # the parts, on a timed step: a real checkpoint at full size
-                    # is a better measurement of them than the driver's few-slab
-                    # probe extrapolated by 32x, which read 3076 s against a
-                    # measured 3757 (job 1002247)
                     timings=None if timings is None else timings.setdefault("checkpoint", {}),
                 )
                 n_ckpt += 1
@@ -2227,14 +1554,8 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
 def float_run_bullfrog_sync(x, v, coeffs, force_fn, box_size):
     """The drift-synchronized float reference the parity gate compares against.
 
-    Algebraically identical to looping `float_step_bullfrog`, and deliberately
-    NOT bitwise it: `mod(mod(x+a)+b)` and `mod(x+a+b)` differ in float. That is
-    the whole reason this exists rather than the gate reusing the stepper --
-    comparing the engine against a driver of a different SHAPE would report a
-    roundoff difference as an engine defect.
-
-    `float_step_bullfrog` is untouched; it is an mbody port with a stability
-    contract and the probes drive it.
+    Algebraically identical to looping `float_step_bullfrog` but with the engine's fused-drift
+    shape, since `mod(mod(x+a)+b)` and `mod(x+a+b)` differ in float.
     """
     import jax.numpy as jnp
 

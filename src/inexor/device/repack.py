@@ -1,40 +1,20 @@
-"""D3b R1b: the repack on the device, slab by slab, bitwise the host `SlotState.repack`.
+"""The repack on the device, slab by slab, bitwise the host `SlotState.repack`.
 
-WHAT MOVES. `SlotState.repack` redistributes brick capacity in two directional
-host passes over every row (~6-9 ns per row, projected 430-630 s/step at 4096^3,
-record sec. 29). Here each x-slab's old slot range and its arena residents go to
-the device once, one program computes every row's destination and scatters the
-slab's whole NEW block (spare rows zeroed, ids -1) plus its new occupancy, and
-the block comes back as one slice into the new range.
-
-NO SORT. The reference order within a brick is the stable sort of [live run in
-bucket order, then arena residents ascending slot] by bucket, and both parts are
-already sorted, so every destination is a count:
+Each x-slab's old slot range and its arena residents go to the device once; one program computes
+every row's destination and scatters the slab's whole new block (spare rows zeroed, ids -1) plus
+its new occupancy, which comes back as one slice. No sort is needed: within a brick the reference
+order is [live run in bucket order, then residents by (bucket, slot)], so destinations are counts:
   live row of rank i in bucket w:  new_start[b] + i + n_res(b, bucket < w)
-  resident of rank j among the brick's residents sorted by (bucket, slot):
-                                   new_start[b] + occ_cum[b, w] + j
-`n_res` and `j` come from ONE searchsorted over the slab's residents sorted by
-bucket (a stable argsort of the O(arena) resident list, whose pass order is
-already ascending slot within brick).
+  resident of rank j by (bucket, slot):  new_start[b] + occ_cum[b, w] + j
+with `n_res` and `j` from one searchsorted over the residents sorted stably by bucket. Nothing
+rounds, so the result is bitwise.
 
-WHY IT CAN BE BITWISE. Destinations are integer counts, the payload is copied,
-and the new occupancy is a bincount -- nothing rounds.
-
-THE HAZARD, handled by staging instead of by pass direction: a block write
-into slab s's new range can overlap the OLD range of a later slab, so before
-writing slab s every later slab whose old range intersects [new_lo, new_hi) is
-uploaded first (a read-ahead window; its peak is on the receipt). Writes go in
-ascending slab order, so an earlier slab's old range has always been read. The
-arena rows cannot be overrun: the allocation refusal bounds `n_alloc_new` by the
-old `arena_base`. Their payload is still lifted once up front, grouped by brick,
-so each slab's window is two contiguous copies.
-
-SEVERAL CARDS (R3, `devices=`). Card k owns a contiguous run of slabs and sweeps
-them ascending as above, one thread per card; the new ranges are disjoint, so the
-writes are. The hazard then crosses cards: a block write can overlap the old range
-of a slab ANOTHER card has not read yet. So before any card writes, every slab
-whose old range intersects a new range owned by a different card is uploaded by
-its own card (`cross_card_early_uploads` on the receipt).
+Overrun hazard: a write into slab s's new range can overlap a later slab's old range, so every
+such later slab is uploaded first (read-ahead); writes go in ascending slab order. The arena cannot
+be overrun because the allocation refusal bounds the new allocation by the old `arena_base`.
+With several cards (`devices=`), card k sweeps its own contiguous slabs; the new ranges are
+disjoint, and every slab whose old range intersects another card's new range is uploaded by its
+owner before any card writes.
 """
 
 from __future__ import annotations
@@ -43,7 +23,7 @@ import numpy as np
 
 from .migrate import _Clock, _ladder, _program, _put, pass_arena_index
 
-#: RECEIPT: passes run through this module.
+#: Call count of device repack passes.
 CALLS = 0
 
 
@@ -68,15 +48,13 @@ def _repack_program(cap, w_cap, a_cap, out_cap, nb2, p3, has_ids, off_dtype, w_d
             rank = r - row_offsets[bi]
             lc = live[bi]
             is_ar = rank >= lc
-            # live rows: bucket = how many of the brick's prefix sums are <= rank
-            # (the device decode's lifted searchsorted, O(rows))
+            # live rows: bucket = count of the brick's prefix sums <= rank (lifted searchsorted)
             occ_cum = jnp.cumsum(occ.astype(jnp.int64), axis=1)
             keys = (occ_cum + (jnp.arange(nb2, dtype=jnp.int64) * lift)[:, None]).reshape(-1)
             w_live = jnp.searchsorted(keys, bi * lift + rank, side="right").astype(jnp.int64)
             w_live = jnp.clip(w_live - bi * p3, 0, p3 - 1)
-            # residents: appended to the window after the slot range, in pass
-            # order (grouped by brick, ascending slot). Sorted by bucket ONCE;
-            # stable, so ties keep slot order.
+            # residents follow the slot range in the window, grouped by brick in ascending
+            # slot; a stable sort by bucket keeps slot order on ties
             k = jnp.clip(ar_offsets[bi] + rank - lc, 0, a_cap - 1)
             order = jnp.argsort(ar_bucket, stable=True)
             sb = ar_bucket[order]
@@ -87,9 +65,8 @@ def _repack_program(cap, w_cap, a_cap, out_cap, nb2, p3, has_ids, off_dtype, w_d
             bucket = bi * p3 + within
             slot = jnp.where(is_ar, span + k, starts_rel[bi] + rank)
             slot = jnp.where(real, slot, 0)
-            # residents of MY brick in buckets below mine; residents sorted by a
-            # brick-major bucket ordinal are grouped by brick, so the count of
-            # all residents below my bucket, less my brick's offset, is it
+            # own-brick residents in lower buckets: all residents below this bucket (sorted
+            # brick-major) less the brick's offset
             n_res_lt = jnp.searchsorted(sb, bucket, side="left").astype(jnp.int64) - ar_offsets[bi]
             j = rank_of[k] - ar_offsets[bi]
             occ_cum_w = occ_cum.reshape(-1)[bucket]
@@ -115,9 +92,9 @@ def _repack_program(cap, w_cap, a_cap, out_cap, nb2, p3, has_ids, off_dtype, w_d
 
 
 def repack_geometry(st, brick_slack):
-    """The host repack's capacity arithmetic, line for line: (run_counts, counts,
-    new_start, n_alloc). Duplicated rather than shared so `SlotState.repack`
-    stays the untouched oracle; `tests/test_repack_device.py` pins the two equal."""
+    """The host repack's capacity arithmetic: (run_counts, counts, new_start, n_alloc).
+    Duplicated rather than shared so the host repack stays an independent reference;
+    `tests/test_repack_device.py` pins the two equal."""
     p3 = st.buckets_per_brick
     run_counts = st.occupancy.reshape(st.n_bricks, p3).sum(axis=1, dtype=np.int64)
     arena_live = np.nonzero(st.arena_bucket >= 0)[0]
@@ -129,9 +106,8 @@ def repack_geometry(st, brick_slack):
 
 
 def capacity_from_counts(st, counts, brick_slack):
-    """`repack_geometry`'s capacity arithmetic from per-brick member counts:
-    (new_start, n_alloc), with the index-ceiling and allocation refusals. The fused
-    migrate + repack calls it with the destination census before any row moves."""
+    """(new_start, n_alloc) from per-brick member counts, with the index-ceiling and
+    allocation refusals. The fused pass calls it with the census before any row moves."""
     _limit = int(np.iinfo(st.index_dtype).max)
     _hot = int(counts.max()) if counts.size else 0
     if _hot > _limit:
@@ -175,14 +151,10 @@ def _cross_card_slabs(old_start, new_start, parts, nb2):
 def repack_device(st, brick_slack=0.10, timings=None, devices=None):
     """`SlotState.repack` with every slab's row work on the device.
 
-    Same contract, mutations and return dict (`scratch_bytes` is the HOST bytes
-    this driver holds: the lifted arena payload, one slab's window and one
-    block), plus a `repack_device` receipt. Gated bitwise against the host
-    repack (`tests/test_repack_device.py`, and `tests/test_repack_device_cards.py`
-    across cards). Needs `jax_enable_x64`.
+    Same contract, mutations and return dict (`scratch_bytes` counts the host bytes
+    this driver holds), plus a `repack_device` stats dict. Needs `jax_enable_x64`.
 
-    `devices` is a sequence of jax devices, one per card (None: one card, jax's
-    default device); see SEVERAL CARDS above.
+    `devices` is a sequence of jax devices, one per card (None: jax's default device).
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -266,9 +238,7 @@ def repack_device(st, brick_slack=0.10, timings=None, devices=None):
             np.cumsum(live + ar_counts, out=row_offsets[1:])
             n_rows = int(row_offsets[-1])
             if n_rows == 0 and n_hi == n_lo:
-                # an EMPTY slab: no row to place, no block to write, its occupancy
-                # slice already zero -- exactly what the program would produce, at
-                # the cost of nothing (a one-slab probe state has 255 of these)
+                # empty slab: nothing to write, occupancy slice already zero
                 acc["empty"] += 1
                 del windows[s]
                 clock.mark("empty slab")
@@ -287,8 +257,7 @@ def repack_device(st, brick_slack=0.10, timings=None, devices=None):
                 _put(e["span"], dev, np.int64))
             index_dev = None
             clock.mark("block program", out_off, out_w, out_ids, occ_s)
-            # THE hazard: read every later slab of this card this write would overrun
-            # (another card's were read before any card wrote)
+            # upload every later slab of this card this write would overrun
             t = s + 1
             while t < hi and int(old_start[t * nb2]) < n_hi:
                 if t not in windows:
@@ -335,7 +304,7 @@ def repack_device(st, brick_slack=0.10, timings=None, devices=None):
     st.w[n_alloc:] = 0
     if has_ids:
         st.ids[n_alloc:] = -1
-    # CONTENTS, not bindings (the pool shares these arrays), as the host does
+    # assign contents, not bindings: the pool shares these arrays
     st.brick_start[...] = new_start
     st.occupancy[...] = new_occ
     st.arena_base = n_alloc

@@ -1,14 +1,6 @@
-"""`python -m inexor.plan`: the terms it names, and the invariance the C-gh
-verdict rests on.
-
-The module had no tests. It is a front end over `mesh_bytes` / `step_bytes` /
-`index_bytes` / `plan_bytes`, all of which have their own, so the arithmetic was
-covered -- but the REDUCTION was not, and the reduction is what prints a verdict.
-Two defects lived there: the "largest single term" line could not name a
-transient however large, and `tile_buffers` vanished from the table whenever
-`cap` was absent, which for a planning run is always. Both are the failure the
-module's own docstring is about: a term that is not in the table cannot be traded
-against anything.
+"""`python -m inexor.plan`: the reduction that prints a verdict, the measured coefficients
+the byte model is anchored to, and that every term is either in a table or named as omitted.
+Per-term arithmetic (`mesh_bytes`, `step_bytes`, ...) is tested where it lives.
 """
 
 import numpy as np
@@ -30,23 +22,13 @@ def _ec(name):
     )
 
 
-# ------------------------------------------------- the invariance under the verdict
+# ------------------------------------------------------ the measured anchors
 
 
 @pytest.mark.parametrize("name", ["cdev", "cgh64", "c-gh"])
 def test_the_tile_transient_does_not_grow_from_the_anchor_to_c_gh(name):
-    """THE fact that makes the C-gh binding term readable, and it was nowhere.
-
-    `kick_pending` is O(N) and the tile transients scale with `cap`, which reads
-    as "two terms growing at different rates". They are not: the config table
-    holds the fine cell FIXED and grows volume at T=256/b=32, so cdev, cgh64 and
-    C-gh have the SAME particles per tile and the SAME padded tile, hence the
-    same tile transient in bytes. The phase measured to set the peak at cdev
-    (job 446, `tile_short`, 3.432 GB) therefore does not grow up the ladder at
-    all, while `kick_pending` grows 512x from cdev to C-gh.
-
-    If a preset ever moves off that shared geometry this test fails, and the
-    re-pricing has to be redone rather than inherited.
+    """cdev, cgh64 and C-gh share particles per tile and padded tile, so the tile transients
+    are identical up the ladder and the measured cdev tile phase (3.432 GB) prices C-gh.
     """
     ec, anchor = _ec(name), _ec("cdev")
     n_per_tile = PRESETS[name]["n_part"] ** 3 / len(ec.tiles)
@@ -60,15 +42,8 @@ def test_the_tile_transient_does_not_grow_from_the_anchor_to_c_gh(name):
 
 
 def test_kick_pending_is_gone_and_its_replacement_is_five_orders_smaller():
-    """`kick_pending` WAS the binding term: 32 B/p over 2048^3 = 274.9 GB against
-    a ~116 GB host, enough on its own to keep C-gh off a `gh` node even if
-    everything else were free. Per-brick velocity scales removed the reason it
-    existed -- the engine no longer waits for a global reduction before it can
-    encode -- and what replaced it is one f64 per brick.
-
-    The line is asserted to still EXIST and read zero rather than deleted. A term
-    that vanishes from a table is indistinguishable from one that was never
-    counted, which is the failure mode this whole planner was built against.
+    """`kick_pending` stays in the table at zero (a vanished term looks uncounted); per-brick
+    velocity scales cost >1e4x less than its 32 B/particle.
     """
     n = PRESETS["c-gh"]["n_part"] ** 3
     ec = _ec("c-gh")
@@ -80,32 +55,19 @@ def test_kick_pending_is_gone_and_its_replacement_is_five_orders_smaller():
 
 
 def test_the_crossover_that_made_the_anchor_the_last_tile_dominated_rung():
-    """KEPT AS A RECORD, and it no longer describes the engine. It is where
-    `kick_pending` overtook the tile force phase, and it is why the one measured
-    peak (cdev) and the model disagreed at C-gh without contradicting each other:
-    the anchor was the last rung on which the tile force won. The term is gone
-    now, so nothing crosses here any more -- but the reasoning is what a future
-    reader needs to interpret every card measured before the removal."""
-    measured_tile_phase = 3.432e9  # job 446, cdev, `tile_short` own increment
+    """A 32 B/p term overtakes the measured cdev tile phase (3.432 GB) between cdev and
+    cgh64; context for cards measured while `kick_pending` was charged.
+    """
+    measured_tile_phase = 3.432e9  # cdev, `tile_short` own increment
     n_cross = measured_tile_phase / 32
     assert PRESETS["cdev"]["n_part"] ** 3 < n_cross < PRESETS["cgh64"]["n_part"] ** 3
     assert 400 < round(n_cross ** (1 / 3)) < 500
 
 
 def test_the_tile_kernel_build_reproduces_the_measured_phase():
-    """The M-v2-6 correction, pinned against MEASUREMENTS at two configs.
-
-    `mesh_bytes` counted only the three complex kernels `split_kernels` returns
-    and none of what it holds live to build them -- `k2_true`, `k2_safe`, `fac`
-    (f64 half-grids) and `pref` (fine dtype) -- so it read 48*phalf where the
-    peak is 80*phalf at f64. The coarse arm always carried the analogous term;
-    the tile arm never did.
-
-    The numbers are the `membership` phase from `v2_m6_host_bytes.py`, which is
-    where `make_tile_force_fn` is called. Two configs because one cannot separate
-    the kernel axis from the particle axis: they move together on every rung of
-    the config table, and only cdev's 15.48x phalf against 8.00x particles
-    splits them.
+    """The tile kernel build (kernels + `k2_true`, `k2_safe`, `fac`, `pref`) matches the
+    measured `membership` phase within 2% at cdev8 and cdev (only cdev separates the kernel and
+    particle axes), and is 5/3 of `tile_kernels` at f64.
     """
     for name, measured_mb in (("cdev8", 85.60), ("cdev", 1319.45)):
         m = _ec(name).mesh_bytes()
@@ -114,14 +76,12 @@ def test_the_tile_kernel_build_reproduces_the_measured_phase():
             f"{name}: modelled {build / 1e6:.2f} MB against a measured "
             f"{measured_mb} MB for the tile kernel build"
         )
-        # and the correction is 5/3 of the old term at f64, by derivation
+        # 5/3 of the three kernels alone at f64, by derivation
         assert build == pytest.approx(m["tile_kernels"] * 5 / 3, rel=1e-9)
 
 
 def test_the_low_rank_ik_grids_are_why_the_factor_is_five_thirds():
-    """If `kernel_grids` ever returned full ik half-grids instead of low-rank
-    broadcasts, the build would cost 3 more f64 grids and the factor would be
-    2.17, not 5/3. The docstring promises low-rank; this fails if it stops."""
+    """`kernel_grids` returns low-rank ik broadcasts; full grids would make the factor 2.17."""
     from inexor.forces import kernel_grids
 
     ikx, iky, ikz, k2_true, k2_safe = kernel_grids((16, 16, 16), 1.0, np.float64)
@@ -131,32 +91,22 @@ def test_the_low_rank_ik_grids_are_why_the_factor_is_five_thirds():
 
 
 def test_both_arms_count_the_prefactor():
-    """`pref` is a full half-grid in BOTH arms and was in neither."""
+    """`pref` is a full half-grid in both the coarse and tile arms and is charged in both."""
     m = _ec("cdev").mesh_bytes()
     assert m["coarse_kernel_pref"] > 0 and m["tile_kernel_pref"] > 0
 
 
 def test_the_coarse_force_copy_is_one_component_not_three():
-    """It used to be three, and that was the bug rather than the accounting.
-
-    `g_coarse = [np.asarray(g) for g in g_coarse]` rebinds only after the
-    comprehension, so the three jax meshes survived their three numpy copies'
-    creation -- six live at once, 25.8 GB at C-gh. M-v2-6 made
-    `coarse_force_meshes` solve one component at a time straight into the
-    caller's buffers, so the transient is ONE mesh and the pool's own copy
-    stopped existing with it."""
+    """`coarse_force_meshes` solves one component at a time into the caller's buffers, so
+    the copy transient is one mesh (a third of the resident force).
+    """
     m = _ec("cdev").mesh_bytes()
     assert m["coarse_force_copy_transient"] * 3 == m["coarse_force_resident"]
 
 
 def test_migration_staging_is_n_to_the_two_thirds_not_n():
-    """The shape is derived, the coefficient is measured, and two configs
-    agreeing on the coefficient is what tests the shape.
-
-    `drift_and_migrate` walks x-slabs and releases each as soon as every write
-    that could reach it is done, so rows in flight are a few SLABS -- N divided
-    by bricks_per_side, which itself grows as N^(1/3). Modelling it as O(N) would
-    overstate it by 8x at C-gh, which is the whole reason it earns a term.
+    """Migration staging is N^(2/3) (a few x-slabs in flight): measured coefficients at
+    cdev8 and cdev agree within 8%, and 8x the particles gives 4x the term.
     """
     for name, measured_mb in (("cdev8", 47.62), ("cdev", 208.58)):
         p = PRESETS[name]
@@ -164,17 +114,14 @@ def test_migration_staging_is_n_to_the_two_thirds_not_n():
         assert got / 1e6 == pytest.approx(measured_mb, rel=0.08), (
             f"{name}: modelled {got / 1e6:.2f} MB against a measured {measured_mb}"
         )
-    # and the SHAPE: 8x the particles must give 4x the term, not 8x
     a = _ec("cdev8").step_bytes(PRESETS["cdev8"]["n_part"] ** 3)["migrate_staging"]
     b = _ec("cdev").step_bytes(PRESETS["cdev"]["n_part"] ** 3)["migrate_staging"]
     assert b / a == pytest.approx(4.0, rel=0.02), "migration staging stopped being N^(2/3)"
 
 
 def test_per_step_terms_do_not_depend_on_slack():
-    """Measured: raising slack 0.2 -> 0.5 moves n_rows 1.217x and EVERY per-step
-    phase by exactly 1.000x. Slack buys spare slots in the storage arrays, which
-    the state pays for and the step never touches, because the step decodes live
-    members rather than rows. So only `repack_scratch` may carry `n_rows` here.
+    """Only `repack_scratch` depends on `n_rows`: measured, slack 0.2 -> 0.5 moves n_rows
+    1.217x and every per-step phase 1.000x.
     """
     ec = _ec("cdev8")
     n = PRESETS["cdev8"]["n_part"] ** 3
@@ -191,25 +138,18 @@ def test_per_step_terms_do_not_depend_on_slack():
 
 
 def test_the_largest_term_line_can_name_a_transient(capsys):
-    """It could not. At cdev it reported `tile_kernels` (0.791 GB) while
-    `tile_workspace` (1.443) was larger, because transients were left out of the
-    candidate set -- so the line structurally could not name the tile force, the
-    phase job 446 measured to SET the peak."""
+    """The "largest single term" line considers transients: at cdev it names
+    `tile_workspace` (1.443 GB) over `tile_kernels` (0.791).
+    """
     main(["--preset", "cdev", "--host-gb", "124", "--cap", "5284492"])
     out = capsys.readouterr().out
     assert "largest single term: tile_workspace (transient)" in out
 
 
 def test_the_binding_term_at_c_gh_is_now_the_state_itself(capsys):
-    """The end of the removals: with `kick_pending` deleted and the repack
-    rewritten in place, no TRANSIENT is the largest term any more -- the state
-    payload is, at 9 B/p. There is nothing left to remove that is not the
-    simulation itself, so any further reduction is a codec question rather than
-    an accounting one.
-
-    C-gh still does not fit a `gh` host (1.70x, from 4.41x at the start of
-    M-v2-6), and that gap is now structural: state plus resident mesh alone
-    clears 116 GB. The `gg` test below is the one that changed."""
+    """At C-gh the largest term is the 9 B/p state payload, and C-gh does not fit a 116 GB
+    `gh` host (~1.70x).
+    """
     main(["--preset", "c-gh", "--host-gb", "116", "--cap", "5284492"])
     out = capsys.readouterr().out
     assert "largest single term: t9_payload" in out
@@ -219,37 +159,21 @@ def test_the_binding_term_at_c_gh_is_now_the_state_itself(capsys):
 
 
 def test_c_gh_now_fits_a_cpu_only_node_with_margin(capsys):
-    """THE first time the production configuration fits anything.
-
-    At the start of M-v2-6 the lower bound was 511.2 GB, 2.16x even a 237 GB
-    `gg` node. Deleting `kick_pending` (274.9 GB) and rewriting the repack in
-    place (115.4 -> 21.8) brought it to 164.6.
-
-    It reads 180.5 now, and the path there ran in both directions. Charging
-    every phase inside a step rather than the single largest transient PUSHED
-    it up (that is the model which would have refused the run that OOM-killed);
-    hoisting the coarse kernel build and rewriting the repack census pulled it
-    back down by more. Neither move was for the number -- one is an accounting
-    correction and the other removes real allocations.
-
-    Pinned because the margin is what makes a capacity run proposable at all,
-    and it is now thin: still a LOWER BOUND, one measured to read ~1.9x low at
-    cdev, so fitting on paper is not the same as fitting."""
+    """C-gh fits a 237 GB `gg` node on paper at a 167.9 GB lower bound (a bound measured
+    ~1.9x low at cdev).
+    """
     main(["--preset", "c-gh", "--host-gb", "237", "--cap", "5284492"])
     out = capsys.readouterr().out
     assert "FITS" in out and "DOES NOT FIT" not in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    # 180.5 -> 167.889: the factorized coarse solve (2026-09-12): the monolithic form's `coarse_kernels` (2 complex half-grids) and `coarse_fft_workspace` (3) became a host-resident spectrum, one per-component work buffer and a slab-sized kernel.
     assert est == pytest.approx(167.889, abs=1.0)
     assert est < 237.0, "the bound no longer fits the node it was sized for"
 
 
 def test_removing_the_repack_scratch_too_would_still_not_reach_a_gh_host(capsys):
-    """Where the remaining gap is, stated as a test so it cannot be forgotten:
-    state (98.6 GB resident) plus the resident mesh (18.0) is already 116.5 GB
-    against a 116 GB hard cliff, BEFORE any transient. So no per-step removal
-    reaches a `gh` node -- the resident floor alone clears it -- which is what
-    makes the target machine a scoping question rather than an optimization."""
+    """State (98.6 GB) plus resident mesh (18.0) exceed a 116 GB `gh` host before any
+    transient, so no per-step reduction makes C-gh fit one.
+    """
     main(["--preset", "c-gh", "--host-gb", "116", "--cap", "5284492"])
     out = capsys.readouterr().out
     state_total = float(out.split("STATE")[1].split("total")[1].split("GB")[0])
@@ -261,9 +185,7 @@ def test_removing_the_repack_scratch_too_would_still_not_reach_a_gh_host(capsys)
 
 
 def test_an_absent_cap_names_the_omission_instead_of_dropping_it(capsys):
-    """`tile_buffers` needs a measured `cap` and is rightly not guessed -- but
-    silently omitting it prints a total that excludes the per-tile host set
-    sitting inside the peak-setting phase. The omission has to be visible."""
+    """Without `--cap`, `tile_buffers` is absent from the tables and named as excluded."""
     main(["--preset", "cdev", "--host-gb", "124"])
     out = capsys.readouterr().out
     assert "`tile_buffers` is NOT in the total above" in out
@@ -278,26 +200,17 @@ def test_an_absent_cap_names_the_omission_instead_of_dropping_it(capsys):
 
 
 def test_the_estimate_is_a_lower_bound_and_says_so(capsys):
-    """Still a floor, and still known-soft: 3.363 GB against job 446's measured
-    7.461 at cdev, so 2.22x low where it has been checked. The ladder is
-    3.783 -> 3.305 -> 3.396 -> 3.363: the M-v2-6 terms, the phase model and the
-    repack census move it in both directions and none is claimed to close the
-    gap, which is why the wording stays. What the phase model DID fix is the shape of the error
-    at C-gh, where the old form under-charged the coarse solve by 3x."""
+    """The estimate is labelled a lower bound: 3.343 GB at cdev, under the measured 7.461."""
     main(["--preset", "cdev", "--host-gb", "124", "--cap", "5284492"])
     out = capsys.readouterr().out
     assert "LOWER BOUND" in out and "not a measurement" in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    # 3.445 (derived 9 B/row) -> 3.488 (measured 11.1, out of place) -> 3.305
-    # (measured 2.1, in place) -> 3.396 (phases summed within a step) -> 3.363
-    # (measured 0.49, per-brick census). scripts/v2_m6_repack_bytes.py.
-    # ... -> 3.343: the factorized coarse solve (2026-09-12): the monolithic form's `coarse_kernels` (2 complex half-grids) and `coarse_fft_workspace` (3) became a host-resident spectrum, one per-component work buffer and a slab-sized kernel.
     assert est == pytest.approx(3.343, abs=0.01)
     assert est < 7.461, "the bound must sit under the measured peak it bounds"
 
 
 def test_no_host_budget_gives_no_verdict(capsys):
-    """A wrong default host size would silently make a verdict up."""
+    """Without `--host-gb` there is no verdict; a default host size would invent one."""
     main(["--preset", "cdev"])
     out = capsys.readouterr().out
     assert "no --host-gb given, so no verdict" in out
@@ -305,22 +218,14 @@ def test_no_host_budget_gives_no_verdict(capsys):
 
 
 def test_every_preset_is_evaluable():
-    """A preset that raises is a planning tool that cannot plan the config table.
-
-    `smoke` did raise: `--buf` defaulted to 32 rather than None, and the preset
-    fill only writes fields still None, so the flag's default outranked the table
-    and smoke's buf=8 never applied -- T=16 + 2*32 = 80 against a 64 fine mesh,
-    straight into the degeneracy guard. Invisible for every other preset because
-    they all carry buf=32.
-    """
+    """Every preset evaluates; `smoke` needs its own b=8 (b=32 pads its tile past n_fine)."""
     for name in PRESETS:
         assert main(["--preset", name, "--host-gb", "116"]) == 0
         assert np.isfinite(sum(_ec(name).mesh_bytes().values()))
 
 
 def test_a_preset_buffer_is_not_shadowed_by_the_flag_default(capsys):
-    """The other half of the same defect, stated as the contract: the table's own
-    value must reach the config."""
+    """A preset's own `buf` reaches the config, and an explicit `--buf` still overrides it."""
     main(["--preset", "smoke", "--host-gb", "116"])
     assert "b=8" in capsys.readouterr().out
     main(["--preset", "smoke", "--host-gb", "116", "--buf", "4"])
@@ -328,27 +233,13 @@ def test_a_preset_buffer_is_not_shadowed_by_the_flag_default(capsys):
 
 
 def test_the_repack_scratch_coefficient_is_the_measured_one_not_the_payload_width():
-    """9 B/row is what `off` and `w` come to; 11.1 is what the function costs.
-
-    The gap was per-bucket int64 arrays plus the sort, and it was invisible for
-    as long as the term was derived from the payload width alone. Measured flat
-    over 8x in particle count at every stage of the ladder, which is what says
-    it is a coefficient and not a fixed cost being amortized:
-
-        11.1 B/row   out of place
-         2.1         in place (M-v2-6)
-         0.49        once the per-bucket arrays came out -- `occupancy` cast to
-                     int64 twice, an n_buckets bincount for the arena, and an
-                     int64 output narrowed at the end
-
-    Pinned because the derived figure is the intuitive one and would be an easy
-    "simplification" to reintroduce.
+    """`repack_scratch` is the measured 0.49 B/row (flat over 8x in N), not the 9 B/row
+    payload width; >= 9 would mean the repack copies the payload again.
     """
     n = PRESETS["c-gh"]["n_part"] ** 3
     ec = _ec("c-gh")
     rows = int(np.ceil(np.ceil(n * 1.10) * 1.10))
     scratch = ec.step_bytes(n, n_rows=rows)["repack_scratch"]
-    # 9 derived -> 11.1 out of place -> 2.1 in place -> 0.49 per-brick census.
     assert scratch / rows == pytest.approx(0.49, abs=0.02)
     assert scratch < 30e9, "the in-place rewrite should put this well under a gh host"
     assert scratch / rows < 9.0, (
@@ -358,37 +249,21 @@ def test_the_repack_scratch_coefficient_is_the_measured_one_not_the_payload_widt
 
 
 def test_the_in_place_reference_would_make_the_repack_scratch_worse():
-    """D-v2-19 clause 3 points at `BrickPackedLayout.repack` as the in-place
-    form to port, on a reported `scratch_bytes` of 0.13-0.52 MB "independent of
-    N". That figure counts only its two chunk buffers; the function also
-    allocates `live`, `parts` and `final` at one row each, and measures 39.4
-    B/row against the 11.1 it would replace -- a 3.55x REGRESSION.
-
-    This test pins the arithmetic consequence rather than re-running the
-    measurement, so the conclusion survives without the probe: any replacement
-    must beat the current coefficient, and the reference does not.
-
-    The clause's REASONING is not in dispute and is what licenses a real fix: a
-    repack is a monotone rearrangement, not a sort, so an O(brick) walk exists.
-    The reference is simply not that implementation.
+    """`BrickPackedLayout.repack` measures 39.4 B/row (its reported scratch omits `live`,
+    `parts`, `final`), >15x the current coefficient, so porting it would regress.
     """
     n = PRESETS["c-gh"]["n_part"] ** 3
     rows = int(np.ceil(np.ceil(n * 1.10) * 1.10))
     current = _ec("c-gh").step_bytes(n, n_rows=rows)["repack_scratch"]
     reference_would_be = rows * 39.4
     assert reference_would_be > current, "the port is only worth doing if it wins"
-    # 3.55x worse than the out-of-place form it would have replaced; against
-    # the in-place form actually written it is ~19x worse.
+    # ~19x the current coefficient (and 3.55x an out-of-place copy at 11.1 B/row)
     assert reference_would_be / current > 15.0
 
 
 def test_the_load_model_matches_what_the_loader_actually_allocates(tmp_path):
-    """The planner's load stages, against the real loader at a small config.
-
-    A model nothing checks is a model that drifts, and this one now carries
-    the verdict for a 2048^3 run: `load_stages` said 134.7 GB where two jobs
-    had already died with nothing in any table naming that path. Held here
-    against the bytes the loader really asks for.
+    """`load_stages` against the real loader's shared-memory bytes at a small config:
+    payload + index + arena within 2%, and the modelled peak at or above them.
     """
     import numpy as np
 
@@ -415,7 +290,6 @@ def test_the_load_model_matches_what_the_loader_actually_allocates(tmp_path):
     try:
         got = icgen.load_slot_state(str(tmp_path), brick_slack=0.20,
                                     arena_frac=0.20, alloc=alloc)
-        # what the loader REALLY put in shared memory
         measured = alloc.bytes_held()
         n_rows = got.off.shape[0]
         n_buckets = t9.n_buckets_side**3
@@ -424,44 +298,27 @@ def test_the_load_model_matches_what_the_loader_actually_allocates(tmp_path):
             n=n_part**3, n_rows=n_rows, n_buckets=n_buckets, index_itemsize=idx,
             n_arena=got.arena_bucket.shape[0], n_bricks=nb**3, n_slabs=n_slabs,
             shared=True)
-        # the payload + index the model says the segments must hold
+        # payload + index + arena
         want = n_rows * 9 + n_buckets * idx + got.arena_bucket.nbytes
         assert measured == pytest.approx(want, rel=0.02), (
             f"the allocator holds {measured} B where the model wants {want} B")
-        # and the model's peak stage must exceed what is actually resident
         assert max(modelled.values()) >= measured
     finally:
         alloc.close()
 
 
 def test_the_phase_model_would_have_refused_the_run_that_died():
-    """The gate this module did not have, written against the job that needed it.
+    """The phase model refuses the monolithic-coarse-solve configuration that ran out of
+    memory (~79 GB lost in the solve).
 
-    Vista 923139 OOM-killed inside the coarse solve of step 1 while the planner
-    said FITS at 0.75x. Three accounting faults, all fixed: the bound charged
-    the largest SINGLE transient (12.9 GB of a 56 GB mesh total) instead of
-    everything a phase holds at once; `cic_match_factor` -- called on every
-    coarse solve, since the engine always passes `match` -- was in NO table; and
-    the solve's transform workspace counted one complex half-grid where `dk`,
-    the device copy of the kernel and their product are three.
-
-    Reconstructing the pre-M-v2-6 solve from the terms that remain gives 68.8 GB
-    against the ~79 GB the node actually lost, which is the model landing within
-    13% of a measurement it had been missing by 5x. Carried through the phase
-    sum it clears a 237 GB gg node, so the corrected planner refuses the run
-    that died. That is the property worth pinning: not the number, the verdict.
+    Reconstructed from current terms that solve is 68.8 GB, under the measurement as a lower
+    bound must be, and the phase sum exceeds a 237 GB `gg` node. The factorized solve is <half.
     """
     ec = _ec("c-gh")
     m = ec.mesh_bytes()
-    # the old shape: three complex kernels built per step and matched, so a
-    # SECOND triple, the f64 island rebuilt every step, and three force meshes
-    # copied out at once because the comprehension rebinds only at the end
-    # Expressed in COMPLEX HALF-GRIDS, which is exactly what `coarse_spectrum`
-    # is, because the two terms this used to name (`coarse_kernels` at two of
-    # them, `coarse_fft_workspace` at three) stopped existing when the coarse
-    # solve was factorized. Same nine half-grids, same bytes, reconstructed from
-    # a term that still exists -- a historical model has to be expressible in
-    # current units or it quietly stops being checkable.
+    # The monolithic solve: three kernels built and matched every step (a second
+    # triple), the f64 build every step, three force meshes copied at once; in
+    # complex half-grids (`coarse_spectrum` is one).
     half_grid = m["coarse_spectrum"]
     old_solve = (6 * half_grid          # three kernels, each matched: a second triple
                  + m["coarse_kernel_build_f64"]
@@ -489,7 +346,7 @@ def test_the_phase_model_would_have_refused_the_run_that_died():
                 if one in ("resident", "coarse_solve") or one in engine.ONCE_PER_RUN_PHASES:
                     continue
                 in_step[one] = in_step.get(one, 0) + v
-    # the state figure is the c-gh table's own, at the pilot's arena_frac
+    # the state figure is the c-gh table's own, at arena_frac 0.10
     old_peak = 112.476 * GB_ + resident + sum(in_step.values()) + 8 * 1.12 * GB_
     assert old_peak / GB_ > 237.0, (
         f"the run that OOM-killed reconstructs to {old_peak / GB_:.1f} GB, which "
@@ -504,14 +361,8 @@ def test_the_phase_model_would_have_refused_the_run_that_died():
 
 
 def test_every_fine_arm_term_is_per_worker():
-    """923313 died in a phase this module priced at 1.4 GB.
-
-    In pool mode the parent builds NO tile kernels -- `run` hands it
-    `(None, tile_geom(...))` -- so each of W workers builds its own triple and
-    runs its own tile. The node holds W copies of every fine-arm term and the
-    budget was carrying one. An instrument reading the parent cannot see this
-    at all (ru_maxrss is one process's), so the accounting has to carry it by
-    construction or nothing will.
+    """With W tile workers every fine-arm term and `tile_buffers` is charged W times and no
+    coarse term moves (each worker builds its own kernels; the parent's ru_maxrss cannot see it).
     """
     fine = ("tile_kernels", "tile_workspace", "tile_kernel_build_f64",
             "tile_kernel_pref")
@@ -525,20 +376,18 @@ def test_every_fine_arm_term_is_per_worker():
     m8 = eight.mesh_bytes()
     for k in fine:
         assert m8[k] == 8 * one[k], f"{k} did not scale with tile_workers"
-    # and no COARSE term moves: the long arm is solved once, in the parent
     for k, v in one.items():
         if k not in fine:
             assert m8[k] == v, f"{k} moved with the worker count and should not"
-    # the per-tile buffers are per worker too
     assert (eight.step_bytes(eight.n_total, cap=1000)["tile_buffers"]
             == 8 * _ec("c-gh").step_bytes(eight.n_total, cap=1000)["tile_buffers"])
 
 
 def test_the_tile_kernel_build_moves_into_the_loop_when_a_pool_runs_it():
-    """`kernel_build` is held apart from the in-step sum because it runs once
-    before the loop -- true of the PARENT. The workers build on their first
-    task, inside the tile loop, so leaving their build in `kernel_build` would
-    drop W builds out of the budget for the step the run keeps dying in."""
+    """With a tile pool, the workers build their kernels on their first task inside the
+    tile loop, so the tile build terms are charged to `tile_loop` rather than to the once-per-run
+    `kernel_build`; coarse phases do not move.
+    """
     serial = _ec("c-gh").mesh_phase()
     assert serial["tile_kernel_build_f64"] == "kernel_build"
     pooled = EngineConfig(
@@ -549,15 +398,13 @@ def test_the_tile_kernel_build_moves_into_the_loop_when_a_pool_runs_it():
     ).mesh_phase()
     assert pooled["tile_kernel_build_f64"] == "tile_loop"
     assert pooled["tile_kernel_pref"] == "tile_loop"
-    # and the coarse arm's phases are untouched by the worker count
     assert pooled["coarse_spectrum"] == serial["coarse_spectrum"] == "coarse_solve"
 
 
 def test_the_worker_count_reaches_the_config_the_planner_prices(capsys):
-    """`--workers` fed only the shm table. It has to reach `EngineConfig`, or
-    the fine-arm terms are priced for one worker while the shm table is priced
-    for eight -- two halves of one report describing different runs, which is
-    the fault the whole module exists to prevent."""
+    """`--workers` reaches `EngineConfig`, so the fine-arm terms and the shm table price the
+    same worker count (eight workers add >20 GB at C-gh).
+    """
     main(["--preset", "c-gh", "--host-gb", "255.1", "--workers", "8",
           "--cap", "5284492"])
     eight = capsys.readouterr().out
@@ -573,19 +420,9 @@ def test_the_worker_count_reaches_the_config_the_planner_prices(capsys):
 
 
 def test_the_pooled_migrate_holds_one_slab_per_worker():
-    """The term that killed four jobs, and it was in the model as a constant.
-
-    `drift_and_migrate_pooled` hands each worker a whole slab and
-    `_eject_slab` returns keep/emig for all of it, so W slabs are live at once.
-    The model carried 190 B per slab-row whatever was running -- a coefficient
-    measured as the SERIAL pass's own increment, where the schedule stages
-    2r+1 = 3 slabs in total. At c-gh that priced a pass at 12.75 GB which
-    measured over 91, and Vista 923341 died in it, in the LEAD DRIFT, before
-    reaching a single step.
-
-    The per-row figures are measured (numpy domain, flat over an 8x change in
-    slab rows at cdev8/cdev) and the two kernels are bitwise, so the 3.7x
-    between them is a pure memory/wall trade.
+    """Pooled migration stages one slab per worker, linear in W: 12.75 GB serial and 69.3 GB
+    pooled (W=8, jax eject) at C-gh; the numpy eject saves ~50.5 GB. Per-row coefficients are
+    measured; the two eject kernels are bitwise.
     """
     g = PRESETS["c-gh"]
     kw = dict(box_size=g["box"], n_part=g["n_part"], n_fine=g["n_fine"],
@@ -600,22 +437,17 @@ def test_the_pooled_migrate_holds_one_slab_per_worker():
     p = pooled.step_bytes(n)["migrate_staging"]
     m = lean.step_bytes(n)["migrate_staging"]
 
-    # the serial arm keeps the coefficient it was measured with
     assert s / GB_ == pytest.approx(12.75, abs=0.2)
-    # the pooled arm scales with W, and at the production kernel it is the
-    # largest single per-step term at c-gh by a factor of three
+    # pooled, jax eject: over 3x repack_scratch
     assert p / GB_ == pytest.approx(69.3, abs=1.0)
     assert p > 3 * EngineConfig(**kw, tile_workers=8).step_bytes(n)["repack_scratch"]
-    # and the kernel choice is worth ~50 GB
     assert (p - m) / GB_ == pytest.approx(50.5, abs=1.5)
-    # linear in W, because each worker holds one slab
     four = EngineConfig(**kw, tile_workers=4, eject_kernel="jax")
     assert 2 * four.step_bytes(n)["migrate_staging"] == p
 
 
 def test_an_unmeasured_eject_kernel_is_refused_not_guessed():
-    """A budget that invents a coefficient is indistinguishable from one that
-    measured it, which is the fault this whole module exists against."""
+    """An eject kernel with no measured coefficient raises rather than being priced."""
     g = PRESETS["cdev"]
     ec = EngineConfig(
         box_size=g["box"], n_part=g["n_part"], n_fine=g["n_fine"],
@@ -629,33 +461,18 @@ def test_an_unmeasured_eject_kernel_is_refused_not_guessed():
 
 
 def test_c_gh_does_not_fit_a_gg_node_at_the_knobs_that_have_been_failing(capsys):
-    """Four jobs said so; now the arithmetic does too.
-
-    Pinned because the whole value of this module is that it refuses BEFORE a
-    node is spent, and for the last four submissions it did the opposite -- it
-    said FITS at 0.75x for a run that OOM-killed. If this ever flips back to
-    FITS without a term being genuinely removed, something has been quietly
-    dropped from the budget again.
-    """
-    # the pilot's own knobs: W=8, arena_frac 0.10, jax eject
+    """At W=8, arena_frac 0.10, jax eject, C-gh does not fit a 255.1 GB node (~270.6 GB)."""
     main(["--preset", "c-gh", "--host-gb", "255.1", "--workers", "8",
           "--cap", "5284492", "--eject-kernel", "jax", "--arena-frac", "0.10"])
     out = capsys.readouterr().out
     assert "DOES NOT FIT" in out
     est = float(out.split("a lower bound on the run's peak:")[1].split("GB")[0])
-    # 283.2 -> 270.578: the factorized coarse solve (2026-09-12): the monolithic form's `coarse_kernels` (2 complex half-grids) and `coarse_fft_workspace` (3) became a host-resident spectrum, one per-component work buffer and a slab-sized kernel.
     assert est == pytest.approx(270.578, abs=2.0)
 
 
 def test_bounding_ejects_charges_the_inserts_that_replace_them():
-    """A bound that only counted what it held back would flatter itself.
-
-    Measured, per row of the slab a task is handed: an eject is 129 B on the
-    jax kernel and 35 on numpy, an insert 50. So a worker prevented from
-    ejecting does not go idle -- it inserts -- and E ejects over W workers is
-    E ejects PLUS W-E inserts. The consequence is worth pinning because it is
-    counterintuitive: with the NUMPY eject the bound makes the pass BIGGER,
-    since an insert costs more than the eject it displaces.
+    """Capping concurrent ejects at E charges E ejects plus W-E inserts (measured per slab
+    row: eject 129 B jax / 35 B numpy, insert 50 B), so the cap costs more with the numpy eject.
     """
     g = PRESETS["c-gh"]
     kw = dict(box_size=g["box"], n_part=g["n_part"], n_fine=g["n_fine"],
@@ -677,46 +494,31 @@ def test_bounding_ejects_charges_the_inserts_that_replace_them():
         "cost here -- a model showing a saving would be counting only what it "
         "held back"
     )
-    # a bound at or above W is the unbounded case exactly
     assert mig(eject_kernel="jax", migrate_eject_inflight=8) == jax_free
     assert mig(eject_kernel="jax", migrate_eject_inflight=99) == jax_free
-    # and the cheapest arrangement of the four is the plain numpy eject
+    # the uncapped numpy eject is the cheapest of the four
     assert np_free == min(jax_free, jax_cap2, np_free, np_cap2)
 
 
 # --------------------------------------------- the device column (--backend device)
-#
-# The CPU column stays the default and must not move when this one is added, so
-# the first gate here is an invariance and not a new number.
 
 
 def test_the_cpu_column_does_not_move_when_the_device_column_exists(capsys):
-    """The refactor that put the load path behind a helper must be a no-op.
-
-    Both backends build the state on the same host and transform the ICs out of
-    core the same way, so `_print_load_and_ic` is shared -- and a shared helper
-    is exactly where an accidental behaviour change hides. Pin the two lines the
-    C-gh verdict is read off.
-    """
+    """The shared `_print_load_and_ic` helper leaves the CPU column unchanged."""
     main(["--preset", "c-gh", "--host-gb", "237", "--arena-frac", "0.20",
           "--workers", "8"])
     out = capsys.readouterr().out
     assert "LOADING THE STATE, peak resident at each stage" in out
     assert "the total line above is a MAX: these stages do not coexist" in out
     assert "IC STAGE (out-of-core, 'derivative' policy)" in out
-    # the CPU column still prices a host that holds the mesh
     assert "MESH, resident through the tile loop" in out
     assert "PER GPU" not in out
 
 
 @pytest.mark.parametrize("name", sorted(PRESETS))
 def test_every_mesh_term_is_placed_deliberately(name):
-    """A term with no side is the omitted-term fault, in the module about it.
-
-    `DEVICE_PLACEMENT` is a design assertion and it will go stale the moment a
-    new mesh term lands. It must go stale LOUDLY: defaulting an unplaced term to
-    the host understates the GPU and defaulting it to the GPU understates the
-    host, and either way the budget cannot be traded against.
+    """Every mesh term has an entry in `DEVICE_PLACEMENT`; a defaulted side would understate
+    either the GPU or the host.
     """
     from inexor.plan import DEVICE_PLACEMENT
 
@@ -725,7 +527,7 @@ def test_every_mesh_term_is_placed_deliberately(name):
 
 
 def test_an_unplaced_mesh_term_is_refused_not_guessed(monkeypatch):
-    """The anti-vacuity arm of the test above: prove the refusal actually fires."""
+    """Anti-vacuity for the test above: an unplaced term raises KeyError."""
     from inexor import plan
 
     ec = _ec("cdev")
@@ -742,13 +544,8 @@ def test_an_unplaced_mesh_term_is_refused_not_guessed(monkeypatch):
 
 
 def test_one_gpu_charges_every_surviving_term_in_full():
-    """The identity under the shard: at n_gpus=1 nothing is divided.
-
-    This is what makes the /4 a SPLIT rather than a discount -- if the shard
-    arithmetic were wrong in a way that scaled, this arm would catch it, because
-    at one GPU the device column must reproduce `mesh_bytes` exactly for every
-    term the design keeps -- plus the ghost planes a shard carries even on one
-    card (`plan.shard_halo_planes`).
+    """At n_gpus=1 each surviving term is charged in full plus its ghost planes (so /4 is a
+    split), and lands in exactly one of the device and host columns.
     """
     from inexor.plan import DEVICE_PLACEMENT, device_budget, shard_halo_planes
 
@@ -763,12 +560,10 @@ def test_one_gpu_charges_every_surviving_term_in_full():
     assert kept, "vacuous: no mesh term survives the placement"
     for k, v in kept.items():
         assert got[k] == v + (v // ec.n_coarse) * halo.get(k, 0), k
-    # and the deleted host pass is really gone
+    # the host decode pass does not exist on the device backend
     assert "coarse_decode_slab" not in got
-    # EVERY surviving term lands in EXACTLY ONE column, at full value. A term
-    # placed "host" leaves the device table, and if it did not arrive in
-    # `host_mesh` it would be charged nowhere -- the same omission the
-    # DEVICE_PLACEMENT KeyError guards, reached by a different door.
+    # every host-placed term is charged to `host_mesh` at full value and not to the
+    # device, or it would be charged nowhere
     on_host = {k: v for k, v in mesh.items() if DEVICE_PLACEMENT[k] == "host"}
     assert on_host, "vacuous: no term is host-placed, so this arm proves nothing"
     for k, v in on_host.items():
@@ -799,8 +594,9 @@ def test_the_shard_is_a_quarter_plus_its_ghost_planes_across_four_cards():
 
 
 def test_the_card_force_shard_is_charged_the_bytes_a_gb200_held():
-    """Vista 993866 (record sec. 23): one card's 4096^3 coarse force shard, three
-    f32 meshes of 516 x 2048 x 2048, held 25,971,130,368 bytes on the device."""
+    """One card's C-hero coarse force shard (3 f32 meshes of 516 x 2048 x 2048) is charged
+    the 25,971,130,368 bytes measured on a GB200.
+    """
     from inexor.plan import device_budget
 
     ec = _ec("c-hero")
@@ -810,11 +606,8 @@ def test_the_card_force_shard_is_charged_the_bytes_a_gb200_held():
 
 @pytest.mark.parametrize("name", sorted(PRESETS))
 def test_the_slab_window_is_the_brick_span_and_never_wraps_the_box(name):
-    """DERIVED, not picked. A window smaller than the span would drop members.
-
-    `brick_span` is the same function `SlotState.tile_bricks` walks, so this is
-    the membership contract read as a residency requirement rather than a
-    second, independent guess at it.
+    """The device slab window is `brick_span` (what `SlotState.tile_bricks` walks) capped at
+    the brick grid.
     """
     from inexor.layout import brick_span
     from inexor.plan import device_window_slabs
@@ -828,11 +621,8 @@ def test_the_slab_window_is_the_brick_span_and_never_wraps_the_box(name):
 
 
 def test_c_hero_fits_a_gb_node_on_the_device_backend_and_the_cpu_one_does_not(capsys):
-    """The verdict the whole design turns on, both directions, one machine.
-
-    The CPU column at 4096^3 does not fit a 1026 GB host at any worker count;
-    the device column does, because the mesh moves to the cards. If this ever
-    flips, the build has lost its premise and the record must say so.
+    """C-hero does not fit a 1026 GB host on the CPU backend and fits it (and a 199 GB card)
+    on the device backend.
     """
     main(["--preset", "c-hero", "--host-gb", "1026", "--arena-frac", "0.01",
           "--workers", "1"])
@@ -848,8 +638,9 @@ def test_c_hero_fits_a_gb_node_on_the_device_backend_and_the_cpu_one_does_not(ca
 
 
 def test_the_fused_pass_charges_its_census_in_the_tile_loop_and_one_pass_after():
-    """M4: the fused migrate + repack's census runs one padded slab through the eject
-    kernel inside the tile loop, and one pass replaces the two after it."""
+    """The fused migrate + repack charges its census (one padded slab through the eject
+    kernel) in the tile loop and one pass after it; `fused=False` charges neither.
+    """
     from inexor.device.migrate import EJECT_B_PER_PADDED_ROW
     from inexor.eject_jax import _padded
     from inexor.plan import (

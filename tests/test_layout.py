@@ -1,12 +1,7 @@
 """Shared brick-geometry and bucket-ordering machinery.
 
-The layout CLASS is tested in `test_brick_packed.py`. What lives here is the
-module-level machinery both the class and the ratified probe depend on, plus one
-measured finding about which positions to bucket.
-
-The per-bucket `BrickLayout` these tests originally covered was removed when the
-brick-packed design superseded it; its measurements survive in
-`runs/v2/m1_layout_record.md` and its code in git history.
+The layout CLASS is tested in `test_brick_packed.py`; this covers the module-level
+geometry guards and the bucket-order key.
 """
 
 
@@ -29,7 +24,7 @@ N_FINE = 64
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """Enable x64 for this module only, then restore (test_bispectrum.py pattern)."""
+    """Enable x64 for each test in this module, then restore."""
     import jax
 
     prev = jax.config.jax_enable_x64
@@ -51,15 +46,14 @@ def _lattice(seed, n_part=N_PART, jitter=0.35):
 
 def test_brick_span_wrap_guard_still_refuses_the_measured_bug():
     """n_fine=64, n_tile=32, b=20 gave span 6 against a 4-brick grid and a 3.29
-    relative short-force error -- silent double-painting. Pinned so promotion
-    cannot lose it."""
+    relative short-force error -- silent double-painting. Must refuse."""
     with pytest.raises(ValueError, match="double-count"):
         brick_span(32, 20, 8, 4)
 
 
 def test_assert_brick_divides_buffer_catches_the_overhang_case():
-    """T128/b96 -> brick 64, union side 384 against P=320: the one V4a leg with
-    3.04e9 overhang and a ~1.7x inflated cap."""
+    """T128/b96 -> brick 64, union side 384 against P=320: 3.04e9 overhang and a ~1.7x
+    inflated cap. Must refuse."""
     assert_brick_divides_buffer(128, 32, 32, 512)  # the operating geometry is fine
     with pytest.raises(ValueError, match="does not divide"):
         assert_brick_divides_buffer(128, 96, 64, 512)

@@ -1,41 +1,19 @@
-"""Lagrangian perturbation theory: turn a density field into moving particles
-(mbody lpt.py lineage; rebuilt at M-v2-5 on the out-of-core FFT layer -- host
-numpy end to end, no six-simultaneous-fields moment, D-v2-15).
+"""Lagrangian perturbation theory: displacements and particle ICs from a density mesh.
 
-Sign convention (carried verbatim from mbody, validated by the skewness
-test): Psi here is +grad lap^-1 delta, so div Psi1 = -delta0 -- the OPPOSITE
-potential sign to the textbook 2LPT x = q - D1 grad phi1 + D2 grad phi2.
-That flips the sign of the second-order term: positions are
+Host numpy throughout, on the out-of-core FFT layer. Sign convention: Psi = +grad lap^-1 delta,
+so div Psi1 = -delta0 (opposite potential sign to the textbook 2LPT form), giving
 
-    x = q + D1 Psi1 - D2 Psi2        (D2 = -(3/7) D1^2, so -D2 = +(3/7) D1^2)
+    x   = q + D1 Psi1 - D2 Psi2                     (D2 = -(3/7) D1^2 in EdS)
+    v_D = dx/dD1 = Psi1 - (D2 f2)/(D1 f1) Psi2       (= Psi1 + (6/7) D1 Psi2 in EdS)
 
-and the D-time velocity v = dx/dD1 is
+`lpt2_source_from_spec` accumulates delta2 pairwise under a `resident` policy: "mid" keeps the
+accumulator plus at most three derivative fields; "low" stages each derivative to disk and fuses
+per axis-0 slab. The two policies are bitwise identical (same per-element op sequence), so
+"low" is a pure memory knob. The (N^3, 3) outputs exist only in the monolithic conveniences
+(za_ics / lpt_ics); the streamed generator (icgen) composes the per-component primitives.
 
-    v_D = Psi1 - (D2 f2)/(D1 f1) Psi2 = Psi1 + (6/7) D1 Psi2
-
-using f2 = 2 f1 and D2 = -(3/7) D1^2 (cosmology.growth_{factor,rate}_2).
-
-MEMORY SHAPE (the M-v2-5 rebuild). The 2LPT source used to hold six
-derivative fields simultaneously and lpt_ics six (N^3, 3) arrays -- the
-measured n=1024 device OOM. Now:
-
-  - `lpt2_source_from_spec` accumulates delta2 PAIRWISE under a `resident`
-    policy: "mid" (dev default) keeps at most the accumulator plus three
-    derivative fields; "low" (the C-gh policy) streams each derivative to a
-    disk-staged memmap (D-v2-15 clause 3: disk stages the IC stage only) and
-    fuses them back one axis-0 slab at a time, so no derivative field is ever
-    host-resident. THE TWO POLICIES ARE BITWISE IDENTICAL BY CONSTRUCTION --
-    each element sees the same multiply/add sequence (pinned by test) -- so
-    "low" is a pure memory knob, never a physics one.
-  - psi is produced PER COMPONENT from a spectral copy; the (N^3, 3) stacked
-    outputs survive only in the monolithic conveniences (za_ics / lpt_ics),
-    which dev-scale gates and probes consume. The streamed generator (icgen)
-    consumes the per-component/per-slab primitives instead and never builds
-    them.
-
-All functions take the density mesh delta0 (z=0 normalized) as input --
-generation lives in ic.py. Displacement outputs are (N^3, 3) flattened
-C-order, matching lagrangian_grid.
+Inputs are the z=0 normalized density delta0 (generated in ic.py); displacements are (N^3, 3)
+flattened C-order, matching lagrangian_grid.
 """
 
 import os
@@ -45,9 +23,8 @@ import numpy as np
 from . import ooc_fft
 from .cosmology import growth_factor_2, growth_factor_a, growth_rate_2, growth_rate_a
 
-# The six unique second derivatives, in THE canonical order: diagonals first
-# (the accumulator needs all three at once), then the squared off-diagonals
-# one at a time.
+# The six unique second derivatives in canonical order: diagonals first (the accumulator needs
+# all three at once), then the squared off-diagonals one at a time.
 _DIAG = ((0, 0), (1, 1), (2, 2))
 _OFFDIAG = ((0, 1), (0, 2), (1, 2))
 
@@ -57,18 +34,12 @@ def _np_dtype(fdtype):
 
 
 def _psi_from_spec(spec, n_mesh, box_size, fdtype, slab=None):
-    """(ik/k^2) spec -> (N^3, 3) real displacement-like vector field.
-
-    Monolithic convenience: one component at a time from a spectral copy, so
-    the transient is one field + one spec copy, never three meshes at once.
-    """
+    """(ik/k^2) spec -> (N^3, 3) real vector field, one component at a time from a spectral copy."""
     n = int(n_mesh)
     out = np.empty((n**3, 3), dtype=_np_dtype(fdtype))
     for ax in range(3):
-        # slab default 32, never n: at slab = n the multiplier build holds a
-        # full complex128 half-grid plus its f64 k^2 (~12 B/p of transient) --
-        # the 902241 ladder read the monolithic psi arm at 39.7 B/p against a
-        # ~28 design through exactly this. Slab size cannot move a bit.
+        # Keep slab small (default 32): slab = n builds a full complex128 half-grid multiplier
+        # (~12 B/p transient). Slab size does not change any bit.
         comp_spec = ooc_fft.grad_invk2_spec(spec, ax, n, box_size, slab=slab)
         out[:, ax] = ooc_fft.irfftn_ooc(comp_spec, n).reshape(-1)
     return out
@@ -77,11 +48,9 @@ def _psi_from_spec(spec, n_mesh, box_size, fdtype, slab=None):
 def zeldovich_displacement(delta0, box_size, fdtype=np.float32):
     """Zel'dovich displacement Psi1 = (ik/k^2) delta0, shape (N^3, 3), z=0 norm.
 
-    Same kernel conventions as the force solve (forces.k_components; the
-    force == ZA identity is a permanent test). The Nyquist plane
-    (ill-defined spectral gradient of a real field) is handled by the inverse
-    transform's real projection; it is the only residual in the
-    div Psi1 = -delta0 identity.
+    Same kernel conventions as the force solve (forces.k_components). The Nyquist plane
+    (ill-defined spectral gradient of a real field) is handled by the inverse transform's real
+    projection and is the only residual in div Psi1 = -delta0.
     """
     d0 = np.asarray(delta0, dtype=_np_dtype(fdtype))
     return _psi_from_spec(ooc_fft.rfftn_ooc(d0), d0.shape[0], box_size, fdtype)
@@ -90,16 +59,12 @@ def zeldovich_displacement(delta0, box_size, fdtype=np.float32):
 def lpt2_source_from_spec(delta_k, n_mesh, box_size, resident="mid", workdir=None, slab=32):
     """Second-order (2LPT) source delta2 from the linear density's SPECTRUM.
 
-    delta2(x) = sum_{i<j} [ phi,ii phi,jj - (phi,ij)^2 ] with
-    phi,ij(k) = -k_i k_j / k^2 delta_k (Bouchet et al. 1995; Scoccimarro
-    1998). Quadratic in delta0, scaling as amplitude^2.
+    delta2(x) = sum_{i<j} [phi,ii phi,jj - (phi,ij)^2], phi,ij(k) = -k_i k_j / k^2 delta_k
+    (Bouchet et al. 1995; Scoccimarro 1998); quadratic in delta0.
 
-    resident="mid": accumulator + at most three derivative fields resident.
-    resident="low": every derivative staged to a `.npy` memmap under workdir
-    (REQUIRED then) and fused back per axis-0 slab -- no derivative field is
-    ever resident. Both policies execute the identical per-element op
-    sequence, so they are bitwise equal (pinned by test); delta_k is left
-    intact either way.
+    resident="mid": accumulator + at most three derivative fields resident. resident="low":
+    every derivative staged to a `.npy` file under workdir (required) and fused per axis-0 slab.
+    Both are bitwise equal (identical per-element op sequence); delta_k is left intact.
     """
     n = int(n_mesh)
     rdt = np.float64 if delta_k.dtype == np.complex128 else np.float32
@@ -124,9 +89,7 @@ def lpt2_source_from_spec(delta_k, n_mesh, box_size, resident="mid", workdir=Non
     if workdir is None:
         raise ValueError("resident='low' stages derivatives to disk and requires workdir")
 
-    # StagedArray, not memmap: dirty mapped pages count in the process's RSS
-    # and would misreport the residency this policy exists to avoid (see
-    # ooc_fft.StagedArray).
+    # StagedArray, not memmap: dirty mapped pages count in RSS and would defeat this policy.
     staged = {}
     for i, j in _DIAG + _OFFDIAG:
         sa = ooc_fft.StagedArray.create(
@@ -144,7 +107,7 @@ def lpt2_source_from_spec(delta_k, n_mesh, box_size, resident="mid", workdir=Non
         xx = staged[(0, 0)].read_slab(lo, hi)
         yy = staged[(1, 1)].read_slab(lo, hi)
         zz = staged[(2, 2)].read_slab(lo, hi)
-        # the SAME per-element op sequence as the "mid" branch, slab-viewed
+        # same per-element op sequence as the "mid" branch
         a = xx * yy
         a += xx * zz
         a += yy * zz
@@ -165,10 +128,7 @@ def lpt2_source(delta0, box_size, fdtype=np.float32, resident="mid", workdir=Non
 
 
 def second_order_displacement(delta0, box_size, fdtype=np.float32, resident="mid", workdir=None):
-    """2LPT displacement Psi2 = (ik/k^2) delta2, shape (N^3, 3), z=0 normalized.
-
-    div Psi2 = -delta2 by the same kernel identity as Psi1.
-    """
+    """2LPT displacement Psi2 = (ik/k^2) delta2, shape (N^3, 3), z=0 normalized; div Psi2 = -delta2."""
     d0 = np.asarray(delta0, dtype=_np_dtype(fdtype))
     n = d0.shape[0]
     delta_k = ooc_fft.rfftn_ooc(d0)
@@ -178,11 +138,7 @@ def second_order_displacement(delta0, box_size, fdtype=np.float32, resident="mid
 
 
 def divergence(psi, box_size):
-    """FFT divergence of an (N^3, 3) vector field; returns a real (N,N,N) mesh.
-
-    Diagnostic (dev-scale, test oracle): div Psi1 == -delta0 away from the
-    Nyquist plane. Plain numpy k arrays; not a streaming path.
-    """
+    """FFT divergence of an (N^3, 3) vector field -> real (N,N,N) mesh. Small-n diagnostic."""
     n3 = psi.shape[0]
     n = round(n3 ** (1.0 / 3.0))
     kx = 2.0 * np.pi * np.fft.fftfreq(n, d=box_size / n)
@@ -208,9 +164,8 @@ def lagrangian_grid(n_mesh, box_size, fdtype=np.float32):
 def za_ics(delta0, box_size, a_init, cosmo, fdtype=np.float32, D_of_a=None):
     """ZA state at a_init: x = wrap(q + D_i Psi1), v = dx/dD = Psi1 (D-time).
 
-    The D-time velocity of a ZA mode is Psi1, CONSTANT in D. Returns
-    (x_phys, v) each (N^3, 3). D_of_a: optional growth override (e.g.
-    lambda a: a for EdS pin tests).
+    The ZA D-time velocity is Psi1, constant in D. Returns (x_phys, v), each (N^3, 3).
+    D_of_a: optional growth override (e.g. lambda a: a for EdS tests).
     """
     N, L = delta0.shape[0], box_size
     D_i = D_of_a(a_init) if D_of_a is not None else growth_factor_a(a_init, cosmo)
@@ -227,13 +182,9 @@ def lpt_ics(delta0, box_size, a_init, cosmo, order=2, fdtype=np.float32,
 
     order=1: x = wrap(q + D1 Psi1),          v_D = Psi1
     order=2: x = wrap(q + D1 Psi1 - D2 Psi2), v_D = Psi1 - (D2 f2)/(D1 f1) Psi2
-    (module-docstring sign convention; the v_D coefficient reduces to
-    +(6/7) D1 in the EdS limit f2 = 2 f1, D2 = -(3/7) D1^2). `growth2` selects D2
-    and f2: "lcdm" (default, the ODE solution) or "eds". Returns (x_phys, v_D),
-    each (N^3, 3) fdtype -- the MONOLITHIC dev-scale convenience; the
-    streamed generator composes the same primitives per slab and never
-    builds these arrays. mbody's a-time momentum is p = G_f(a_i) * v_D with
-    G_f = a^3 E D' (the conversion the parity harness applies).
+    (module-docstring sign convention). `growth2` selects D2, f2: "lcdm" (ODE solution, default)
+    or "eds". Returns (x_phys, v_D), each (N^3, 3) fdtype; monolithic convenience, bitwise equal
+    to the streamed generator. An a-time momentum is p = G_f(a_i) v_D with G_f = a^3 E D'.
     """
     if order == 1:
         return za_ics(delta0, box_size, a_init, cosmo, fdtype)
@@ -248,13 +199,11 @@ def lpt_ics(delta0, box_size, a_init, cosmo, order=2, fdtype=np.float32,
     psi2 = second_order_displacement(delta0, L, fdtype, resident=resident, workdir=workdir)
     q = lagrangian_grid(N, L, fdtype)
     dt = _np_dtype(fdtype)
-    # THE canonical combine sequence, shared per element with the streamed
-    # generator (icgen stages U and V per slab with these exact ops): the
-    # displacement is formed FIRST, then added to q -- (q + D1 psi1) - D2 psi2
-    # associates differently and would break streamed == monolithic bitwise.
+    # Canonical combine order, shared per element with icgen: form the displacement first, then
+    # add q; (q + D1 psi1) - D2 psi2 associates differently and breaks streamed == monolithic.
     u = dt.type(D1) * psi1
     u -= dt.type(D2) * psi2
     x = np.mod(q + u, dt.type(L))
-    v_coef2 = -(D2 * f2) / (D1 * f1)  # == +(6/7) D1 for EdS-approx D2, f2
+    v_coef2 = -(D2 * f2) / (D1 * f1)  # +(6/7) D1 in EdS
     v = psi1 + dt.type(v_coef2) * psi2
     return x, v

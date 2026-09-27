@@ -1,10 +1,8 @@
-"""E3: the step on several cards -- the coarse paint and solve split across them and
-one thread per card walking its own tile planes through its own window -- gated
-BITWISE against the same run on one card.
+"""The step on several cards (coarse paint and solve split, one thread per card over its own
+tile planes and window), gated bitwise against the same run on one card.
 
-The multi-card tests need that many jax devices and SKIP otherwise: replicating
-one device's handle would bypass `validate()`'s refusal of more cards than
-devices. On the laptop run them under
+Multi-card tests need that many jax devices and skip otherwise (replicated handles would bypass
+`validate()`'s device-count refusal); on CPU use
 `XLA_FLAGS=--xla_force_host_platform_device_count=4`.
 """
 
@@ -18,9 +16,7 @@ from tests.test_engine_device_step import _cfg, _same_stats  # noqa: E402
 
 KW = dict(coarse_backend="device", tile_backend="device", migrate_backend="device",
           device_tile_window=True)
-#: receipts that describe the card split rather than the step, and the paint's
-#: compile count, which depends on what already ran in the process (the one-card
-#: run compiles the program the wider run then reuses)
+#: receipts of the card split, and the paint's compile count (depends on what already ran)
 CARD_KEYS = ("coarse_card_chunks", "coarse_cards", "coarse_card_ranges",
              "coarse_ghost_planes_nonzero", "device_cards", "tile_cards",
              "coarse_jit_traces")
@@ -64,11 +60,9 @@ def test_a_run_on_w_cards_is_bitwise_the_run_on_one(w):
         assert sum(c["tiles_run"] for c in cards) == n_tiles
         assert o["coarse_cards"] == w and all(ch > 0 for ch in o["coarse_card_chunks"]), (
             "a card painted no chunk")
-        # the migrate and repack split too, or say why not
         md = o["migrate_device"]
         assert md["cards"] == w or md["fallback"], "the migrate did not use the cards"
-        # fused, the repack runs inside the migrate's pass and takes its split
-        # (a fallback included); separate, it splits by itself
+        # fused, the repack takes the migrate's split; separate, it splits by itself
         want = md["cards"] if o["migrate_repack_fused"] else w
         assert o["repack"]["repack_device"]["cards"] == want
     assert all(o["device_cards"] == 1 and len(o["tile_cards"]) == 1 for o in o1)

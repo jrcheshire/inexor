@@ -1,10 +1,8 @@
-"""D3b R2: the engine with `migrate_backend="device"` is BITWISE the host engine.
+"""Routing gate: the engine with `migrate_backend="device"` is bitwise the host engine.
 
-The whole run -- lead drift, every step's migrate, the repack after each step,
-a split-run resume -- against the host engine particle for particle, with the
-receipts proving which pass ran. The device passes are gated bitwise against the
-serial host passes in their own suites; this is the ROUTING gate: that the engine
-calls them where it says it does and nowhere else.
+The whole run (lead drift, every migrate and repack, a split-run resume) matches the host
+particle for particle, with receipts showing which pass ran. The device passes' own bitwise
+gates live in their own suites.
 """
 
 
@@ -105,8 +103,7 @@ def test_a_device_backend_run_is_bitwise_the_host_run_with_receipts():
 def test_the_device_backend_beside_a_tile_pool_still_runs_the_device_pass():
     """A pool may drive the tile loop; the migrate is the device's, not the pool's.
 
-    CPU backend only: `TilePool` is the CPU lane and refuses a GPU parent by
-    design (995764 found this test asking it to)."""
+    CPU backend only: `TilePool` refuses a GPU parent by design."""
     if jax.devices()[0].platform != "cpu":
         pytest.skip("TilePool is the CPU lane; no pool beside a GPU parent")
     co = _coeffs(2)
@@ -133,12 +130,10 @@ def test_a_device_backend_run_split_and_resumed_is_bitwise_the_uninterrupted_one
                                           arena_frac=0.05)
     assert int(resume["step"]) == 2
     engine.run(st_r, _cfg(migrate_backend="device"), co, resume=resume)
-    # rows, not raw arrays: a reloaded state's allocation geometry is
-    # `_alloc_geometry`'s, not the producing run's (test_engine's `_rows`)
+    # rows, not raw arrays: a reloaded state has its own allocation geometry
     from tests.test_engine import _rows
 
     np.testing.assert_array_equal(_rows(ref), _rows(st_r))
-    # and the host engine agrees with both
     host = _state(_cfg(), with_ids=False)
     engine.run(host, _cfg(), co)
     _same(host, ref, "host vs device")

@@ -1,11 +1,11 @@
-"""DISCO-DJ on our ICs, scored with our card: does a single-mesh PM share the deficit?
+"""DISCO-DJ on our ICs, scored with our P(k) card: does a single-mesh PM share the deficit?
 
-Three phases, each in the env it needs; they exchange one npz each.
+Four phases, each in the env it needs; they exchange one npz each.
 
-    export  (inexor env)       IC slabs -> (x, v_d) + the shared a-grid + EH98 table
-    evolve  (disco-mocks env)  DISCO-DJ PM on the injected (x, v_d) -> final (x, v_d)
-    evolve-mono (inexor env)   our single-mesh PM on the same (x, v_d), same output
-    card    (inexor env)       final particles -> the realization script's P(k) card
+    export      (inexor env)       IC slabs -> (x, v_d) + the shared a-grid + EH98 P(k) table
+    evolve      (disco-mocks env)  DISCO-DJ PM on the injected (x, v_d) -> final (x, v_d)
+    evolve-mono (inexor env)       our single-mesh PM on the same (x, v_d), same output
+    card        (inexor env)       final particles -> the realization script's P(k) card
 
     pixi run python scripts/compare/disco_crosscheck.py export --config cgh64 \
         --ic-dir IC --k-steps 120 --out W/disco_in.npz
@@ -15,14 +15,14 @@ Three phases, each in the env it needs; they exchange one npz each.
     pixi run python scripts/compare/disco_crosscheck.py card --in W/disco_out.npz \
         -- --config cgh64 --k-steps 120 --workdir W --coarse-match-order 3
 
-`evolve` uses the M1 parity settings (`m1_run_disco._evolve_injected`): CIC
-(worder 2), ik gradient and Laplacian, no deconvolution, no antialiasing,
-BullFrog on the explicit a-grid, momentum = v_d * Fplus(a). Particle order is
-irrelevant to the PM: DISCO-DJ stores X - q periodically wrapped and adds q back
-before every paint (`nbody/acc.py`).
+`evolve` runs DISCO-DJ with CIC (worder 2), ik gradient and Laplacian, no
+deconvolution, no antialiasing, BullFrog on the explicit a-grid, momentum
+= v_d * Fplus(a). Particle order is irrelevant to the PM: DISCO-DJ stores X - q
+periodically wrapped and adds q back before every paint (its `nbody/acc.py`).
 
 `card` takes everything after `--` as realization-script arguments, so the bins,
-the paint, the deconvolution and the layout are the ones the engine's cards use.
+paint, deconvolution and layout are the ones the engine's cards use; it writes
+`<workdir>/disco_pk.json`. `evolve-mono` and `card` require the CPU backend.
 """
 
 import argparse
@@ -81,7 +81,7 @@ def cmd_export(args):
           f"{args.k_steps} steps a={a_steps[0]:.4f}->{a_steps[-1]:.4f}, "
           f"rms|v_d| {np.sqrt(np.mean(np.sum(v**2, 1))):.3f}", flush=True)
 
-    # the same z = 0 EH98 table M1's parity arm fed DISCO-DJ (m1_export_ics.dump_pk_eh98)
+    # z = 0 EH98 table for DISCO-DJ's linear P(k); fix_sigma8=False keeps it as given
     k = np.geomspace(1e-4, 1e2, 800)
     P = linear_power(k, cosmo, z=0.0, backend="eh98")
     out_dir = os.path.dirname(os.path.abspath(args.out))
@@ -149,11 +149,10 @@ def cmd_evolve(args):
 def cmd_evolve_mono(args):
     """Our own single-mesh PM on the same injected (x, v_d): the arm between the two.
 
-    `force_global(which="mono", assign="cic")` -- the kernel the two-level split
-    was gated against (floor F0) and `make_force_fn`'s -- on one n_mesh^3 mesh, f64,
-    driven by the engine's own BullFrog coefficients through the float reference
-    driver. Against DISCO-DJ it differs only in operator and stepper conventions
-    (D-013's ledger); against the engine only in the two-level machinery.
+    `force_global(which="mono", assign="cic")` on one n_mesh^3 mesh in f64, driven by
+    the engine's BullFrog coefficients through the float reference driver. It differs
+    from DISCO-DJ only in operator and stepper conventions, and from the engine only in
+    the two-level force split.
     """
     os.environ.setdefault("JAX_ENABLE_X64", "1")
     import jax
@@ -168,7 +167,7 @@ def cmd_evolve_mono(args):
     d = _load(args.inp)
     meta = d["meta"]
     n_part, L = int(meta["n_part"]), float(meta["box_size"])
-    # exports from before the flag were made with the EdS weights and ICs
+    # an export without a growth2 field was made with the EdS weights and ICs
     growth2 = meta.get("growth2", "eds")
     co, a_steps = R._coeffs(R._cosmo(), int(meta["k_steps"]), float(meta["a_init"]), growth2)
     # an export from another platform carries the same grid to roundoff, not bitwise

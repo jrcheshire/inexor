@@ -1,10 +1,5 @@
-"""diagnostics.py: estimator binning (hand-computed small grid), spectrum
-recovery, r(k) identities, minimum-image displacement.
-
-The reversibility-primitive and overflow-monitor tests went with the v1
-retirement (2026-08-08): both asserted properties of an (x, w) integer state
-under a forward+reverse replay, which v2 does not have.
-"""
+"""diagnostics.py: P(k) binning on a hand-computed grid, Parseval, CIC window limits, r(k)
+identities, minimum-image displacement."""
 
 import numpy as np
 import pytest
@@ -25,7 +20,7 @@ def test_single_mode_power_hand_computed():
     delta = A * np.cos(2.0 * np.pi * x / L)[:, None, None] * np.ones((N, N, N))
     kc, pk, nm = pk_estimator(delta, L)
     kf = 2.0 * np.pi / L
-    # first bin straddles the fundamental (mbody convention)
+    # first bin straddles the fundamental
     assert kc[0] == pytest.approx(kf, rel=0.5)
     expected_mode_power = (A / 2.0) ** 2 * L**3  # (V/N^6) |A N^3/2|^2
     # bin mean = mode power / n_modes_in_bin (only 2 hot modes of nm[0])

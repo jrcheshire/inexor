@@ -1,35 +1,13 @@
-"""M-v2-4 S1: the dtype ledger for the force path.
+"""Dtype ledger for the force path.
 
-WHY THIS FILE EXISTS. Before it, NOTHING in the suite asserted the dtype of a
-force, density, kernel or gather array. `grep '\\.dtype =='` over `tests/` hit
-only the codec, the bispectrum, the integrator and the tile membership. So an
-"f32 force mesh" that silently ran in f64 would have passed every test in the
-repo, including all ~30 bitwise-parity tests in `test_two_level_force.py` --
-because they compare VALUES against the probe, and an f32 arm that upcast back
-to f64 produces exactly the f64 values they expect.
+Kernel, density, decode, gather and engine arrays must carry the dtype asked for, and the f64
+defaults are pinned. Value-parity tests cannot see this: an f32 arm that upcasts back to f64
+reproduces the f64 values exactly. Two promotion traps are asserted on the real functions:
 
-That is the failure mode this project has been bitten by repeatedly: a knob that
-reports success without having applied. The ledger lands BEFORE any source
-change in M-v2-4 so every later stage has a tripwire from its first commit, and
-so the f64 defaults are pinned as a contract rather than surviving by accident.
-
-TWO PROMOTION TRAPS are pinned here as measured facts rather than as prose,
-because both are live in the current code and both would make an f32 arm
-invisible. They are asserted on the ACTUAL library functions, not on synthetic
-arrays, so a future change to those functions is what fails the test:
-
-  1. `f64 * complex64 -> complex128`. Narrowing `kernel_grids`' dtype alone is
-     not enough: `split_kernels` builds its real prefactor from `k2_true`, which
-     is DELIBERATELY f64 so `s_of_k` sees a true DC zero, and f64 times a c64
-     kernel promotes straight back to c128.
-  2. `f32_accumulator + f64_weight * f32_field -> f64`. Three of the four
-     gathers already set their accumulator from the field's dtype, but all four
-     build their weights from f64 positions, so the accumulation promotes and
-     the gather returns f64 no matter what the mesh is.
-
-Both tests carry the reason in their assertion message, so a later
-"simplification" that drops one of M-v2-4's casts fails here with an
-explanation rather than with a bare dtype mismatch.
+  1. `f64 * complex64 -> complex128`: `split_kernels`' prefactor comes from `k2_true`, kept f64
+     so `s_of_k` sees a true DC zero, so the real prefactor itself must be narrowed.
+  2. `f32_acc + f64_weight * f32_field -> f64`: gather weights come from f64 positions, so the
+     weight product must be cast to the field dtype.
 """
 
 
@@ -43,15 +21,8 @@ from inexor.codec import T9Layout  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """The ledger is only meaningful under x64.
-
-    The library never enables x64 and callers opt in, so WITHOUT this fixture
-    every `jnp.float64` in the force path is silently f32 and a "the default is
-    f64" assertion would fail for a reason that has nothing to do with M-v2-4.
-    That silent degradation is itself a defect -- M-v2-4 S6 makes
-    `EngineConfig.validate()` refuse the f64-without-x64 combination -- but the
-    refusal belongs there, and here the fixture just makes the ledger readable.
-    """
+    """The ledger needs x64: without it every `jnp.float64` is silently f32 (a config that
+    does this is refused by `EngineConfig.validate()`, tested below)."""
     import jax
 
     prev = jax.config.jax_enable_x64
@@ -65,8 +36,7 @@ N_MESH = 16
 N_PART = 8
 R_S = 1.5
 
-# The tile-arm geometry, matching test_two_level_force.py so a dtype read here
-# and a value read there describe the same configuration.
+# Tile-arm geometry, matching test_two_level_force.py.
 N_FINE_T, N_TILE_T, B_FINE_T, N_PART_T = 64, 16, 8, 16
 
 
@@ -90,12 +60,8 @@ def _tile_fixture(seed):
 
 
 def _owned_subblock(seed, fdtype=None):
-    """A staged sub-block plus the tile-0 rows it is allowed to serve.
-
-    `gather_coarse_subblock` REFUSES rows outside the tile's core -- reading past
-    the block would wrap to the far side of the mesh silently -- so a dtype read
-    has to stage the same way the engine does rather than handing it every row.
-    """
+    """A staged sub-block plus the tile-0 rows it may serve; `gather_coarse_subblock`
+    refuses rows outside the tile core, which would otherwise wrap silently."""
     import jax.numpy as jnp
 
     n_coarse = N_FINE_T // forces.COARSE_RATIO
@@ -119,11 +85,8 @@ def _name(a):
 
 
 def _assert_dtypes(rows):
-    """Report EVERY mismatch at once.
-
-    A dtype regression usually moves several arrays along one path, and failing
-    on the first hides how far it reached -- which is the diagnostic.
-    """
+    """Report every mismatch at once: a dtype regression usually moves several arrays along
+    one path, and how far it reached is the diagnostic."""
     bad = [(what, got, want) for what, got, want in rows if got != want]
     assert not bad, "dtype ledger:\n" + "\n".join(
         f"  {what}: {got}, expected {want}" for what, got, want in bad
@@ -131,15 +94,11 @@ def _assert_dtypes(rows):
 
 
 # ============================================================ the f64 defaults
-#
-# Every row below passes TODAY. The file is the contract that they keep doing so
-# while M-v2-4 threads an opt-in f32 through the same functions.
 
 
 def test_the_kernel_defaults_are_f64():
-    """`kernel_grids` takes an fdtype and `split_kernels` does not (yet); both
-    build in f64 today, and `k2_true` must stay f64 at every fdtype because
-    `s_of_k` needs a genuine DC zero."""
+    """Both kernel builders default to f64, and `k2_true` is f64 because `s_of_k` needs a
+    genuine DC zero."""
     shape, cell = (8, 12, 16), L_BOX / 16
     ikx, iky, ikz, k2_true, k2_safe = forces.kernel_grids(shape, cell, np.float64)
     kx, ky, kz = forces.split_kernels(shape, cell, "long", r_s=R_S)
@@ -160,14 +119,9 @@ def test_the_kernel_defaults_are_f64():
 
 
 def test_the_low_rank_k_components_default_is_f32_and_is_a_different_builder():
-    """`k_components` defaults to f32 while `kernel_grids` defaults to f64.
-
-    That asymmetry is real and load-bearing: `k_components` serves
-    `make_force_fn`, whose whole point is a dtype-parameterized single-level
-    solve, while `kernel_grids` serves the two-level split where the f64 build is
-    the precision island. Pinned so the two are not "harmonized" into one
-    default by someone reading only one of them.
-    """
+    """`k_components` (for the dtype-parameterized `make_force_fn`) defaults to f32;
+    `kernel_grids` (the two-level split's f64 build) defaults to f64. Pinned so the two are
+    not harmonized by someone reading only one."""
     ikx, iky, ikz, inv_k2 = forces.k_components(N_MESH, L_BOX)
     _assert_dtypes([
         ("k_components/ikx", _name(ikx), "complex64"),
@@ -183,11 +137,9 @@ def test_the_low_rank_k_components_default_is_f32_and_is_a_different_builder():
 
 
 def test_the_paint_and_decode_defaults_are_unchanged():
-    """The accumulators are the part M-v2-4 must NOT touch: int32 for the
-    deterministic primal paints, f64 for the differentiable twins. Only the
-    DECODE dtype is a knob, and its two call sites disagree today by design --
-    `density_contrast` takes f32 (every ratified v1 number ran through it) and
-    `density_tsc` pins f64."""
+    """Accumulators are int32 for the deterministic paints and f64 for the float twins. Only
+    the decode dtype is a knob, and its defaults differ by design: `density_contrast` f32,
+    `density_tsc` f64."""
     import jax.numpy as jnp
 
     pos = _positions(1)
@@ -256,8 +208,7 @@ def test_the_gathers_and_subblock_staging_default_to_f64():
 
 
 def _engine_fixture(seed=40, **kw):
-    """The `smoke` rung, the smallest geometry whose decomposition is not
-    degenerate. Matches `tests/test_engine.py`."""
+    """The `smoke` config of test_engine.py: the smallest non-degenerate decomposition."""
     cfg = engine.EngineConfig(
         box_size=L_BOX, n_part=32, n_fine=64, n_coarse=16, n_tile=16, b_fine=8, **kw
     )
@@ -269,14 +220,13 @@ def _engine_fixture(seed=40, **kw):
 
 
 def test_the_engine_coarse_arm_defaults_to_f64():
-    """The shipping path, end to end: the streamed integer accumulation decodes
-    to f64 and the coarse solve stays there. This row is the one M-v2-4 moves."""
+    """The streamed integer accumulation decodes to f64 by default."""
     cfg, st = _engine_fixture()
     delta = engine.coarse_delta_streamed(st, cfg)
     _assert_dtypes([("engine.coarse_delta_streamed", _name(delta), "float64")])
 
 
-# ============================================== S2: the kernel seam, at f32
+# ================================================== the kernel seam, at f32
 
 
 def test_split_kernels_narrows_the_kernel_and_keeps_the_build_in_f64():
@@ -288,18 +238,13 @@ def test_split_kernels_narrows_the_kernel_and_keeps_the_build_in_f64():
         ("split_kernels(f32)/Ky", _name(ky), "complex64"),
         ("split_kernels(f32)/Kz", _name(kz), "complex64"),
     ])
-    # the build is f64 whatever the output dtype: k2_true must keep a genuine
-    # DC zero or S(0) != 1 and the split breaks at DC, silently
+    # the build stays f64: k2_true needs a genuine DC zero or S(0) != 1
     assert _name(forces.kernel_grids(shape, cell, np.float32)[3]) == "float64"
 
 
 def test_the_f32_kernel_is_the_f64_one_to_two_ulp_and_is_not_equal_to_it():
-    """Both halves matter.
-
-    Equal would mean the narrowing did not happen (the promotion trap). Further
-    than 2 ulp would mean it narrowed something it should not have -- the build
-    rather than the prefactor.
-    """
+    """Equal would mean the narrowing did not happen (the promotion trap); further than 2 ulp
+    would mean the build, not just the prefactor, was narrowed."""
     shape, cell = (32,) * 3, L_BOX / 32
     for which in ("long", "short"):
         k64 = forces.split_kernels(shape, cell, which, r_s=R_S)
@@ -318,13 +263,12 @@ def test_the_f32_kernel_is_the_f64_one_to_two_ulp_and_is_not_equal_to_it():
 
 
 def test_split_kernels_refuses_a_dtype_it_cannot_serve():
-    """Loud, like the other setup-time refusals. A silently-ignored dtype is the
-    failure mode the whole ledger exists to prevent."""
+    """An unsupported dtype raises: a silently ignored dtype is what this ledger guards."""
     with pytest.raises(ValueError, match="fdtype must be float32 or float64"):
         forces.split_kernels((8,) * 3, 1.0, "long", r_s=R_S, fdtype=np.float16)
 
 
-# ================================================ S3: the decode seam, at f32
+# ================================================== the decode seam, at f32
 
 
 def test_the_decode_seam_narrows_the_field():
@@ -352,13 +296,11 @@ def test_the_decode_seam_narrows_the_field():
 
 
 def _hot_mesh(frac_bits=12, mean=8.0):
-    """A coarse mesh at the table's exact mean of 8.0 with one genuinely hot cell.
+    """A coarse mesh at the table's exact mean of 8.0 with one hot cell.
 
-    The hot cell is ODD on purpose. `< 2^24` is sufficient for an exact int->f32
-    decode, not necessary: what matters is significand WIDTH, and the first
-    fixture I wrote here (`5000 * 2^12 = 625 * 2^15`, 2.05e7) decoded exactly
-    despite being well past 2^24. A census that counts cells above 2^24 and
-    calls them lost therefore OVERSTATES the loss.
+    The hot cell is odd: `< 2^24` is sufficient but not necessary for an exact int->f32
+    decode (significand width is what counts; 625 * 2^15 = 2.05e7 is exact), so it must need
+    all 25 bits to lose anything.
     """
     m = np.full((4, 4, 4), int(mean * 2**frac_bits), dtype=np.int32)
     m[0, 0, 0] = 2**24 + 12345           # odd: needs all 25 bits
@@ -368,20 +310,9 @@ def _hot_mesh(frac_bits=12, mean=8.0):
 
 
 def test_without_the_minus_one_the_decode_order_cannot_matter():
-    """`tile_delta_from_int` gains NOTHING from decoding in f64, and that is a
-    theorem rather than a measurement.
-
-    Its field is counts/mean with no `- 1` (ik(0) = 0 kills DC, so the short
-    force cannot see the offset). `mean` is exactly 8.0 at every config in the
-    table and `2**-frac_bits` is a power of two, so every step between the int32
-    mesh and the returned field is an exact rescaling that cannot move the
-    significand. Both orders round the same integer to 24 bits at the same
-    point.
-
-    Asserted so the f64 decode there is understood as free-and-harmless rather
-    than as load-bearing -- someone pricing the transient later needs to know it
-    buys nothing on this arm.
-    """
+    """`tile_delta_from_int` gains nothing from an f64 decode, by construction: with no `- 1`
+    (ik(0) = 0 kills DC), mean 8.0 and scale 2**-frac_bits are powers of two, so every step
+    is an exact rescaling and both orders round the same integer once."""
     import jax.numpy as jnp
 
     m, frac_bits, mean = _hot_mesh()
@@ -396,22 +327,11 @@ def test_without_the_minus_one_the_decode_order_cannot_matter():
 
 
 def test_with_the_minus_one_the_f64_decode_helps_only_the_cells_that_matter_least():
-    """THE DECODE FORK, measured rather than argued.
+    """With `counts/mean - 1.0`, the f64 decode helps only cells needing > 24 significand bits.
 
-    The cancellation in `counts/mean - 1.0` is the one place the decode order
-    can matter. It matters far less than the plausible argument suggests, and
-    the honest version is worth pinning because the wrong version is what gets
-    re-derived:
-
-      - a NEAR-MEAN cell has a raw sum around 2^15, exact in both orders, so
-        there is no cancellation to protect. The Sterbenz argument for the f64
-        decode is true and irrelevant.
-      - only a cell needing more than 24 significand bits differs, i.e. >= 512x
-        the mean, where delta >> 1 and the absolute error is 6e-8 RELATIVE.
-
-    So the f64 decode is kept for costing nothing, not for rescuing the low-k
-    power. If a gate ever reads a decode margin, it must read it in relative
-    terms on the cells concerned.
+    Near-mean cells (raw sum ~2^15) are exact either way, so there is no cancellation to
+    protect; only a cell >= 512x the mean differs, where delta >> 1 and the direct-f32 error
+    is < 1e-6 relative. Decode margins must therefore be read relative, on those cells.
     """
     m, frac_bits, mean = _hot_mesh()
     exact = m.astype(np.float64) * 2.0**-frac_bits / mean - 1.0
@@ -430,8 +350,7 @@ def test_with_the_minus_one_the_f64_decode_helps_only_the_cells_that_matter_leas
         "a cell under the significand bound lost precision; the fork is not where "
         "this test says it is"
     )
-    # only the hot cell moves, the f64 order is exact there, and the direct one
-    # is off by a relatively negligible amount
+    # only the hot cell moves: exact via f64, relatively negligible error direct
     assert err_a[0, 0, 0] == 0.0
     assert err_b[0, 0, 0] > 0.0, "the hot cell did not lose anything; fixture is vacuous"
     rel = float(err_b[0, 0, 0] / abs(exact[0, 0, 0]))
@@ -439,8 +358,8 @@ def test_with_the_minus_one_the_f64_decode_helps_only_the_cells_that_matter_leas
 
 
 def test_counts_from_int_is_exact_where_we_claim_and_not_past_it():
-    """The bound the decode design rests on, asserted on the library rather than
-    quoted from its docstring."""
+    """The 2^24 exact-decode bound, asserted on `counts_from_int`: exact just below it,
+    inexact just above."""
     import jax.numpy as jnp
 
     lo = np.asarray([[[2**24 - 1]]], dtype=np.int32)
@@ -454,7 +373,7 @@ def test_counts_from_int_is_exact_where_we_claim_and_not_past_it():
         )
 
 
-# ============================================== S4: the gather seam, at f32
+# ================================================== the gather seam, at f32
 
 
 def test_every_gather_follows_the_field_dtype():
@@ -481,18 +400,12 @@ def test_every_gather_follows_the_field_dtype():
 
 @pytest.mark.parametrize("assign", ["cic", "tsc"])
 def test_the_subblock_gather_stays_bitwise_the_global_gather_at_f32(assign):
-    """THE CONTRACT S4 was most likely to break (D-v2-16 clause 3).
+    """Staged sub-block gather is bitwise the global gather at f32 (test_two_level_force.py
+    covers f64).
 
-    Staging is a memory decision and must not move a number, at EITHER dtype.
-    The f64 half of this is `test_gathering_from_the_subblock_is_bitwise_the_
-    global_gather` in the parity suite; this is the f32 half, and it is the
-    reason the narrowing rule casts the three-factor PRODUCT rather than the
-    per-axis weights. Narrowing early was measured in situ against this exact
-    fixture: 113 of 186 elements differ at 1.19e-7, on the UNMASKED path, so it
-    diverges everywhere rather than only for padded rows.
-
-    Checked on tile 0, whose block straddles the periodic boundary, which is
-    where an index-shift or a rounding difference would hide.
+    This requires casting the three-factor weight product, not the per-axis weights:
+    narrowing early makes 113 of 186 elements differ by 1.19e-7 on this fixture, unmasked
+    rows included. Tile 0 straddles the periodic boundary, where an index shift would hide.
     """
     import jax.numpy as jnp
 
@@ -519,11 +432,8 @@ def test_the_subblock_gather_stays_bitwise_the_global_gather_at_f32(assign):
 
 
 def test_narrowing_the_weight_early_would_break_the_contract():
-    """Why the rule says AFTER the product, asserted rather than asserted-in-prose.
-
-    If f32(a)*f32(b)*f32(c) equalled f32(a*b*c) the ordering would not matter
-    and the rule would be cargo. It does not.
-    """
+    """Control: per-axis narrowing differs from narrowing the product, so the gathers'
+    cast-after-product rule matters."""
     rng = np.random.default_rng(70)
     a, b, c = (rng.random(4096) for _ in range(3))
     early = (a.astype(np.float32) * b.astype(np.float32) * c.astype(np.float32))
@@ -534,7 +444,7 @@ def test_narrowing_the_weight_early_would_break_the_contract():
     )
 
 
-# ========================================== S5: both arms wired, end to end
+# ============================================== both arms wired, end to end
 
 
 def test_the_global_arm_runs_f32_end_to_end():
@@ -552,13 +462,8 @@ def test_the_global_arm_runs_f32_end_to_end():
 
 
 def test_the_match_factor_does_not_promote_the_kernel_back():
-    """The matched coarse arm is the one D-v2-10 ratified, so this is the arm
-    where a silent promotion would matter most.
-
-    `cic_match_factor` returns a host f64 half-grid. `complex64 * float64` is
-    complex128, so an uncast multiply undoes `split_kernels`' narrowing at
-    exactly the configuration that ships.
-    """
+    """The matched coarse arm (the shipping configuration) stays f32: `cic_match_factor`
+    returns an f64 half-grid, and an uncast `complex64 * float64` would promote to c128."""
     pos = _positions(81)
     cell = L_BOX / N_MESH
     g32, applied = forces.force_global(
@@ -572,21 +477,15 @@ def test_the_match_factor_does_not_promote_the_kernel_back():
 
 
 def test_the_tile_arm_runs_f32_end_to_end_through_both_paints():
-    """Also the proof that `fdtype` now REACHES `tile_delta_from_int`.
-
-    `make_tile_force_fn` called it positionally until M-v2-4, so the tile arm
-    decoded at the f64 default whatever the caller asked for.
-    """
+    """`fdtype` reaches `tile_delta_from_int` through `make_tile_force_fn`, on both paints."""
     u, live, shape, cell = _tile_fixture(82)
     for paint in ("f64", "int"):
         one_tile, geom = forces.make_tile_force_fn(
             N_FINE_T, L_BOX, N_PART_T**3, N_TILE_T, B_FINE_T, r_s=R_S,
             paint=paint, fdtype=np.float32,
         )
-        # ownership is supplied now, not computed in the kernel: it is a layout
-        # property of the global position and the tile-local float test it
-        # replaces was not a partition (see forces.owning_tile). This fixture is
-        # tile-local only, so every live row is treated as owned.
+        # ownership is supplied by the caller (see forces.owning_tile); this fixture is
+        # tile-local, so every live row is owned
         out, owned, _ = one_tile(u, live, live)
         assert geom["fdtype"] == "float32", f"geom does not carry the dtype ({paint})"
         assert _name(out) == "float32", (
@@ -610,12 +509,8 @@ def test_force_short_tiled_carries_the_dtype_into_its_sink_and_diag():
 
 
 def test_coarse_force_meshes_refuses_a_dtype_it_was_not_given():
-    """The seam that makes a non-applying knob impossible rather than unlikely.
-
-    A caller who narrows the delta but leaves the kernels f64 gets a solve that
-    promotes back: correct numbers, double the memory, no symptom. Casting the
-    delta to match would hide that, so a disagreement raises.
-    """
+    """A narrowed delta with f64 kernels would promote back silently (right numbers, double
+    the memory), so a dtype disagreement raises rather than casting."""
     import jax.numpy as jnp
 
     pos = _positions(84)
@@ -627,12 +522,12 @@ def test_coarse_force_meshes_refuses_a_dtype_it_was_not_given():
                                             fdtype=np.float32)[0]) == "float32"
 
 
-# ================================= S6: the engine knobs, independent and live
+# ==================================== the engine knobs, independent and live
 
 
 def test_the_two_engine_knobs_move_independently():
-    """Attributability. If one knob moved both meshes, leg 1's reading could not
-    be assigned to the coarse arm, which is the only arm the gate is about."""
+    """The coarse and fine knobs move independently, so an accuracy reading can be
+    attributed to one arm."""
     cfg, st = _engine_fixture(coarse_dtype="float32", fine_dtype="float64")
     assert (cfg.coarse_dtype, cfg.fine_dtype) == ("float32", "float64")
     delta = engine.coarse_delta_streamed(st, cfg)
@@ -646,11 +541,8 @@ def test_the_two_engine_knobs_move_independently():
 
 
 def test_the_engine_reports_the_dtypes_it_actually_used():
-    """Read off the arrays, not echoed from the config.
-
-    A receipt that repeats what it was told cannot catch a knob that did not
-    apply -- and three knobs in this milestone turned out not to apply.
-    """
+    """The run summary reads dtypes off the arrays rather than echoing the config, which
+    could not catch a knob that did not apply."""
     from inexor.config import Cosmology
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
 
@@ -670,12 +562,8 @@ def test_the_engine_reports_the_dtypes_it_actually_used():
 
 
 def test_the_census_counts_round_trips_not_a_magnitude_threshold():
-    """S3's finding, wired into the instrument.
-
-    `< 2^24` is sufficient for an exact int->f32 decode, not necessary, so a
-    census that thresholds on magnitude reports losses that did not happen.
-    `5000 * 2^12 = 625 * 2^15` is 2.05e7 and exact.
-    """
+    """The decode census counts failed int->f32 round trips, not cells above 2^24:
+    5000 * 2^12 = 625 * 2^15 (2.05e7) is past 2^24 yet exact."""
     m = np.array([[[5000 * 2**12, 2**24 + 12345]]], dtype=np.int64)
     above_threshold = int(np.count_nonzero(m > 2**24))
     round_trip_fails = int(np.count_nonzero(m.astype(np.float32).astype(np.int64) != m))
@@ -687,13 +575,11 @@ def test_the_census_counts_round_trips_not_a_magnitude_threshold():
 
 
 def test_the_slabbed_decode_is_bitwise_the_whole_array_form():
-    """The decode was slabbed to kill ~30 GB of transient at C-gh. Elementwise,
-    so it must not move a bit -- asserted directly rather than inferred from the
-    streamed-vs-monolithic paint test, which would also pass if BOTH forms
-    changed together."""
+    """The slabbed coarse decode (elementwise) is bitwise the whole-array expression. Asserted
+    directly: a streamed-vs-monolithic paint test would pass if both forms changed."""
     cfg, st = _engine_fixture(seed=46)
     got = np.asarray(engine.coarse_delta_streamed(st, cfg))
-    # the pre-M-v2-4 expression, whole-array
+    # whole-array reference
     import jax.numpy as jnp
 
     from inexor.painting import counts_from_int, paint_tsc_int
@@ -713,12 +599,8 @@ def test_the_slabbed_decode_is_bitwise_the_whole_array_form():
 
 
 def test_an_f64_mesh_without_x64_is_refused():
-    """The one configuration that lies about itself.
-
-    Asking for f64 without x64 silently gives f32. In M-v2-4's own gate that is
-    the REFERENCE arm, where a silent degradation does not make the comparison
-    fail -- it makes it read zero, which is a pass.
-    """
+    """f64 without x64 silently gives f32; on a reference arm that makes a comparison read
+    zero, i.e. pass, so `validate()` refuses it."""
     import jax
 
     cfg, _ = _engine_fixture(seed=48)
@@ -735,8 +617,7 @@ def test_an_f64_mesh_without_x64_is_refused():
 
 
 def test_a_bad_engine_dtype_is_refused_at_construction():
-    """At construction, not at first use: a typo must not survive as far as a
-    cluster job."""
+    """A dtype typo is refused at construction, not at first use."""
     with pytest.raises(ValueError, match="coarse_dtype must be float32 or float64"):
         engine.EngineConfig(box_size=L_BOX, n_part=32, n_fine=64, n_coarse=16,
                             n_tile=16, b_fine=8, coarse_dtype="float16")
@@ -745,25 +626,16 @@ def test_a_bad_engine_dtype_is_refused_at_construction():
                             n_tile=16, b_fine=8, fine_dtype=np.int32)
 
 
-# ============================================ S7: the mesh receipt
+# ============================================ the mesh receipt
 
-# C-gh, from the config table in docs/plan-plan-v2.md. Constructing this
-# allocates nothing -- EngineConfig is plain attributes.
+# The C-gh production geometry. EngineConfig is plain attributes, so this allocates nothing.
 C_GH = dict(box_size=1024.0, n_part=2048, n_fine=4096, n_coarse=1024, n_tile=256, b_fine=32)
 GB = 1024.0**3
 
 
 def test_the_coarse_meshes_match_the_ratified_budget():
-    """THE TEST THAT WOULD HAVE CAUGHT IT.
-
-    D-v2-16 clause 3 ratified 12.9 GB of resident coarse force at C-gh. That is
-    the f32 figure; the shipped code was f64 and paid 25.8 GB from the freeze
-    until M-v2-4, and nothing in the package could have shown it because nothing
-    counted the mesh at all.
-
-    Asserted in GB against the ADR's own numbers rather than against a formula,
-    so it fails if either the code or the ratified figure moves.
-    """
+    """Resident coarse force at C-gh is 12.0 GiB (12.9 GB) at f32 and exactly double at f64.
+    Asserted against the budget figure rather than a formula, so moving either fails."""
     f32 = engine.EngineConfig(**C_GH, coarse_dtype="float32").mesh_bytes()
     f64 = engine.EngineConfig(**C_GH, coarse_dtype="float64").mesh_bytes()
     assert f32["coarse_force_resident"] / GB == pytest.approx(12.0, abs=0.05), (
@@ -774,12 +646,8 @@ def test_the_coarse_meshes_match_the_ratified_budget():
 
 
 def test_the_kernel_build_does_not_shrink_with_the_knob():
-    """The precision island, made visible in the accounting.
-
-    `split_kernels` builds at f64 whatever it returns, so someone pricing an f32
-    arm off the kernel term alone would over-predict the saving. Reported as its
-    own line for that reason.
-    """
+    """`split_kernels` builds at f64 whatever it returns, so the build is its own accounting
+    line; pricing an f32 arm off the kernel term alone would over-predict the saving."""
     f32 = engine.EngineConfig(**C_GH, coarse_dtype="float32").mesh_bytes()
     f64 = engine.EngineConfig(**C_GH, coarse_dtype="float64").mesh_bytes()
     assert f32["coarse_kernel_build_f64"] == f64["coarse_kernel_build_f64"]
@@ -790,8 +658,7 @@ def test_the_kernel_build_does_not_shrink_with_the_knob():
 
 
 def test_the_coarse_knob_does_not_move_the_fine_terms_or_the_accumulator():
-    """Each knob moves its own terms and nothing else -- the accounting version
-    of the attributability the two knobs exist for."""
+    """Each dtype knob moves only its own terms in the memory accounting."""
     a = engine.EngineConfig(**C_GH, coarse_dtype="float32", fine_dtype="float64").mesh_bytes()
     b = engine.EngineConfig(**C_GH, coarse_dtype="float64", fine_dtype="float64").mesh_bytes()
     for k in ("tile_kernels", "tile_workspace", "coarse_accumulator", "coarse_decode_slab",
@@ -807,9 +674,8 @@ def test_the_coarse_knob_does_not_move_the_fine_terms_or_the_accumulator():
 
 
 def test_the_slabbed_decode_transient_is_negligible_at_c_gh():
-    """The point of slabbing, stated as a number rather than a claim: the old
-    whole-array decode built an int32 copy plus two full f64 meshes on top of
-    the int64 accumulator."""
+    """The slabbed decode transient is < 0.5 GiB at C-gh, > 50x under a whole-array decode
+    (an int32 copy plus two full f64 meshes on top of the int64 accumulator)."""
     m = engine.EngineConfig(**C_GH, coarse_dtype="float32").mesh_bytes()
     old_transient = m["coarse_accumulator"] + 4 * 1024**3 + 2 * 8 * 1024**3
     assert m["coarse_decode_slab"] / GB < 0.5
@@ -820,18 +686,9 @@ def test_the_slabbed_decode_transient_is_negligible_at_c_gh():
 
 
 def test_narrowing_the_kernel_build_alone_does_not_narrow_the_kernel():
-    """TRAP 1, asserted on the real functions.
-
-    `kernel_grids(fdtype=f32)` genuinely returns c64 and f32. But
-    `split_kernels`' prefactor comes from `split_factor(k2_true, ...)`, and
-    `k2_true` is pinned f64 on purpose, so `fac / k2_safe` is f64 and
-    `f64 * c64 -> c128`. An M-v2-4 that threads the dtype into `kernel_grids`
-    and stops there produces a c128 kernel, which then promotes the f32 delta
-    back to f64 at `dk * jnp.asarray(k)` and the milestone is invisible.
-
-    The fix S2 lands is to narrow the REAL PREFACTOR instead. This test pins the
-    trap so that fix cannot be undone by "simplifying" the cast away.
-    """
+    """Trap 1: `kernel_grids(fdtype=f32)` returns c64/f32, but the prefactor from f64
+    `k2_true` makes `(fac / k2_safe) * ikx` c128, which would re-promote an f32 delta at the
+    kernel multiply. Pins why `split_kernels` narrows the real prefactor."""
     shape, cell = (8,) * 3, L_BOX / 8
     ikx, _, _, k2_true, k2_safe = forces.kernel_grids(shape, cell, np.float32)
     assert _name(ikx) == "complex64", "kernel_grids' own fdtype should reach ik"
@@ -849,22 +706,14 @@ def test_narrowing_the_kernel_build_alone_does_not_narrow_the_kernel():
 
 
 def test_a_gather_accumulator_would_be_defeated_by_an_f64_weight():
-    """TRAP 2, and the proof S4's cast is what defeats it.
-
-    `gather_coarse_subblock` sets its accumulators from the FIELD's dtype, which
-    reads like it always followed the mesh. It did not: the corner weights come
-    from f64 positions, and `f32_acc + f64_w * f32_field -> f64`, so before S4
-    an f32 sub-block gathered in f64 and returned f64.
-
-    Both halves are asserted. The raw promotion is still live and is what the
-    cast exists for; the function is no longer subject to it.
-    """
+    """Trap 2: `f32_acc + f64_w * f32_field -> f64` still holds, so the gathers' weight cast
+    is load-bearing; with it, an f32 sub-block gathers to f32."""
     import jax.numpy as jnp
 
     _, sub, owned, _, origin, n_coarse, cell_c = _owned_subblock(50, fdtype=jnp.float32)
     assert _name(sub[0]) == "float32", "staging is a slice and must not change dtype"
 
-    # the promotion itself, unchanged and still the reason for the cast
+    # the raw promotion the cast exists for
     acc32 = jnp.zeros((4,), dtype=jnp.float32)
     w64 = jnp.ones((4,), dtype=jnp.float64)
     fld32 = jnp.ones((4,), dtype=jnp.float32)

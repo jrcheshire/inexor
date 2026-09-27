@@ -1,4 +1,4 @@
-"""The device repack must be BITWISE the host `SlotState.repack`, or it is not adoptable.
+"""The device repack must be BITWISE the host `SlotState.repack`.
 
 Every state array (spare and freed rows included) and the host's return dict are
 compared exactly. Anti-vacuity first: the arena is populated before the repack

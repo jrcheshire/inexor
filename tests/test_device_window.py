@@ -1,5 +1,4 @@
-"""E2: the tile loop against a window of x-slabs, gated BITWISE against the
-whole-state `tile_loop_device`.
+"""The tile loop over a window of x-slabs, gated bitwise against whole-state `tile_loop_device`.
 
 At this geometry a tile draws from 4 of 8 x-slabs and tile plane 0's window
 wraps x = 0, so the window genuinely slides; the state is built with no brick
@@ -184,8 +183,8 @@ def _traced_peak(fn):
 
 
 def test_staging_a_window_allocates_no_host_window(monkeypatch):
-    """gb 1002020 died with four cards each holding a 45 GiB numpy window on the host.
-    Slabs now go up as views; the copied fallback is the control that must fail."""
+    """Staging uploads slabs as views, holding well under a quarter of the window on the host
+    (a host copy is 45 GiB per card at scale). The copied fallback is the control that must fail."""
     cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
     shapes = _shapes(cfg, st)
     nb, pad, span, per = dwin.plane_geometry(st, cfg.n_tile, cfg._b_realized, cfg.n_brick)
@@ -214,7 +213,7 @@ def test_the_write_back_downloads_a_slab_at_a_time():
     before = migrate.READS.get("window: write-back", 0)
     peak, _ = _traced_peak(lambda: dwin._write_core(st_a, win, w_dev, 0, per, nb))
     reads = migrate.READS.get("window: write-back", 0) - before
-    # the whole-window download this replaced, as the reference both must equal
+    # reference: a whole-window download
     dwin_rows = np.asarray(w_dev)
     edges = win["edges"]
     for s in range(0, per):
@@ -225,11 +224,10 @@ def test_the_write_back_downloads_a_slab_at_a_time():
     st_b.w[win["res_slots"][k]] = dwin_rows[win["W"] + k]
     assert np.array_equal(st_a.w, st_b.w), "the per-slab write-back differs"
     assert len(k) > 0, "VACUOUS: no core resident was written back"
-    # THE BOUND IS WHAT THE CODE DOWNLOADS, not a laptop reading: on the CPU backend a
-    # download aliases the device buffer and allocates ~nothing, which is how a bound of
-    # a quarter of the window passed on the laptop and failed on a GB200 (1002227, 43.8
-    # KB). Per plane the write-back holds one core slab's ladder of `w`, then the core
-    # residents' ladder of `w` and its int64 index; 1.5x covers the reading's own copies.
+    # The bound is derived from what the code downloads, not a CPU reading (a CPU download
+    # aliases the device buffer and allocates ~nothing). Per plane: one core slab's ladder of
+    # `w`, then the core residents' ladder of `w` and its int64 index; 1.5x covers the
+    # reading's own copies.
     slab = max(dwin._ladder(int(edges[s + 1] - edges[s])) for s in range(per))
     res = dwin._ladder(len(k))
     expected = slab * st.w.itemsize * 3 + res * (st.w.itemsize * 3 + 8)

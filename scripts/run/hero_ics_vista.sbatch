@@ -5,24 +5,20 @@
 #SBATCH -n 1
 #SBATCH -t 03:00:00
 #SBATCH -o d8-hero-ics-%j.log
-# D8, job 1 of the 120-step 4096^3 realization: the ICs, with LCDM second-order
-# growth (D-v2-25), by the device generator on four GB200s, into a NEW directory.
-# c-hero-r0 (EdS D2) is kept untouched; the run driver refuses it for an LCDM run.
-#   1. preflight: devices, scratch space, planner verdicts (stops the job);
+# 4096^3 ICs (LCDM second-order growth) by the device generator on four GB200s, into a
+# new directory. Legs:
+#   1. preflight: devices, scratch space, planner verdicts (a refusal stops the job);
 #   2. smoke at 32^3: device generator vs host generator, 4 cards == 1 card (stops the job);
-#   3. the 4096^3 generation -> $HERO (refuses if a manifest is already there);
-#   4. the GPU pytest set for the generator.
-# The leg set is v2_d6_device_ics_vista.sbatch's minus its 2048^3 probe and allocator
-# A/B, which were measurements that are done; env copied from it verbatim.
+#   3. the 4096^3 generation -> $HERO_IC_DIR (refuses if a manifest is already there);
+#   4. manifest check: growth2 = lcdm, 4096^3 particles in 256 slabs;
+#   5. the GPU pytest set for the generator.
 #
-# TIME: 998798 wrote c-hero-r0 in 66.7 min with this generator and allocator; the
-# smoke is ~1 min and the pytest ~3. Nothing in D-v2-25 touches the IC stage's cost
-# (D2/f2 are two scalars). CENTRAL ~1.2 h; REQUESTED 3:00 (~1.2 SU, max 3).
+# Requires: INEXOR_RUNS (run root), HERO_IC_DIR (IC output directory), and INEXOR_SRC or
+# submission from the inexor checkout. The account is passed with `sbatch -A`:
+#   INEXOR_RUNS=$SCRATCH/inexor_runs HERO_IC_DIR=$SCRATCH/inexor_runs/c-hero-lcdm \
+#     sbatch -A <account> scripts/run/hero_ics_vista.sbatch
 #
-# PRE-REGISTERED:
-#   - preflight or smoke failure stops the job before the generation;
-#   - the manifest must record growth2 = lcdm and 4096^3 particles in 256 slabs;
-#   - wall and host peak are reported against 998798 (66.7 min), not gated.
+# Wall: the generation takes ~67 min, the smoke ~1 min, the pytest ~3; 3 h leaves margin.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }

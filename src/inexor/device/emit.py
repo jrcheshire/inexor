@@ -1,9 +1,6 @@
-"""D6b: T9 emission on the cards -- the slab files `icgen._emit_t9_slabs` writes, per slab on a card.
+"""T9 emission on the cards: the slab files `icgen._emit_t9_slabs` writes, computed on devices.
 
-WHAT MOVES. The host emission walks Lagrangian x-slabs through a sliding window and
-finalizes each destination slab with ~10 full-size numpy passes (~250-350 ns per
-particle on Grace; 35 of 40 min at 2048^3, Vista 997280). Here card k owns a
-contiguous run of destination slabs and, one thread per card:
+Card k owns a contiguous run of destination slabs and, one thread per card:
 
   1. per SOURCE slab (in plane chunks), one program turns displacements into position
      codes, the brick-major bucket key, the destination slab and the ring-window
@@ -14,7 +11,7 @@ contiguous run of destination slabs and, one thread per card:
      codes;
   3. the host writes the slab with `icgen._write_t9_slab`.
 
-WHY IT CAN BE BITWISE the host emission (gated on the CPU backend): keys are
+Bitwise equal to the host emission (gated on the CPU backend): keys are
 integers; the position quantum is an exact power of two, so `x / quantum` equals
 `x * (1 / quantum)` (refused otherwise); every velocity division is by a full-shape
 array computed in the program (CPU XLA turns a scalar or broadcast divisor into a
@@ -61,7 +58,7 @@ def card_slab_ranges(n, nb, devices, window):
 
 
 def shards_from_host(field, ranges):
-    """Upload a host (n, n, n) field as `card_slab_ranges` shards (tests and probes)."""
+    """Upload a host (n, n, n) field as `card_slab_ranges` shards (for tests)."""
     import jax
 
     n = field.shape[0]

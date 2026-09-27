@@ -1,22 +1,9 @@
 """integrate.py: coefficient oracles, linear-mode growth pins, float steppers.
 
-Trimmed 2026-08-08 with the v1 retirement. What went with it: the ladder
-composition guard, the integer micro-replays (BullFrog and KDK, 100 synthetic
-steps each), the PM exact-bit replay and its STE twin bit-match, the tier-0
-reversibility tests and the wrap-adversarial arm, and every test of
-`evolve`/`evolve_float`/`replay_roundtrip`/`simulate`. All of them asserted
-properties of the reversible integer trajectory, which v2 does not have.
-
-What remains is the coefficient layer, which is pure cosmology arithmetic and
-carries forward: the EdS closed-form oracle (the roadmap M1 gate; the LCDM
-weights are pinned in `test_growth2.py`),
-the FastPM small-step limit, the v/p conversion, and the linear-mode growth
-pins that fix each integrator's defining property.
-
-Growth-pin methodology (mbody `_grow_linear_mode`): a linear mode's geometric
-force equals its displacement -- both track D -- so the COEFFICIENT TABLES
-alone determine the growth. It is a scalar recurrence with no PM or CIC
-resolution effects; those belong to the deficit matrix, not to unit tests.
+The EdS closed-form BullFrog weights (the LCDM weights are pinned in `test_growth2.py`),
+the FastPM small-step limit, the v/p conversion, and linear-mode growth pins. A linear
+mode's geometric force equals its displacement (both track D), so the coefficient
+tables alone determine its growth: a scalar recurrence with no PM or CIC effects.
 """
 
 import jax.numpy as jnp
@@ -43,8 +30,7 @@ from inexor.integrate import (
 
 
 def test_bullfrog_eds_closed_form():
-    """M0 self-check 1 / the roadmap M1 GATE: < 1e-12 vs the published EdS
-    closed form (mbody test_integrate.py:472 oracle)."""
+    """BullFrog weights at D-steps agree with the published EdS closed form to 1e-12."""
     err = 0.0
     for n in [1.0, 2.0, 3.5, 7.0, 20.0]:
         D0, dD = n * 0.05, 0.05
@@ -57,7 +43,7 @@ def test_bullfrog_eds_closed_form():
 
 
 def test_fastpm_reduces_to_exact_small_step():
-    """mbody pattern: over a tiny interval the growth-corrected FastPM kernels
+    """Over a tiny interval the growth-corrected FastPM kernels
     converge to the exact background integrals."""
     a0, a1 = 0.5, 0.5005
     a_c = 0.5 * (a0 + a1)
@@ -104,7 +90,7 @@ def _grow_linear_mode_bullfrog(K, a_i=0.1, a_f=1.0, growth2="lcdm"):
 
 def test_fastpm_linear_mode_exact_growth():
     """FastPM's defining property: a linear mode grows as D(a) exactly at ANY
-    step count (pins the previously-unexercised fastpm table)."""
+    step count."""
     D_f = growth_factor_a(1.0, PLANCK)
     for K in (2, 4, 8):
         assert abs(_grow_linear_mode_kdk("fastpm", K) / D_f - 1.0) < 1e-4
@@ -121,9 +107,8 @@ def test_bullfrog_linear_mode_exact_growth(growth2):
 
 def test_exact_kdk_deficit_and_convergence():
     """The exact-KDK fallback has a real low-K growth deficit, converging
-    toward D as K rises. Measured (this toy, a 0.1 -> 1.0): log spacing
-    0.61% at K=2 -> 4.8e-6 at K=32; mbody's documented ~2%+ K=2 number is
-    its LINEAR-spacing default (7.7% here) -- spacing matters more than K.
+    toward D as K rises. Measured (a 0.1 -> 1.0, log spacing): 0.61% at K=2 ->
+    4.8e-6 at K=32 (linear spacing gives 7.7% at K=2).
     """
     D_f = growth_factor_a(1.0, PLANCK)
     err = {K: abs(_grow_linear_mode_kdk("exact", K) / D_f - 1.0) for K in (2, 8, 32)}
@@ -137,8 +122,8 @@ def test_exact_kdk_deficit_and_convergence():
 
 @pytest.fixture
 def _x64():
-    """Enable x64 for one test, then restore (test_bispectrum.py pattern; x64 is
-    process-global in jax 0.10.2 and the library never sets it -- callers do)."""
+    """Enable x64 for one test, then restore (x64 is process-global; the library never
+    sets it, callers do)."""
     import jax
 
     prev = jax.config.jax_enable_x64
@@ -148,10 +133,7 @@ def _x64():
 
 
 def test_float_step_bullfrog_matches_the_hand_recurrence(_x64):
-    """The float stepper is what the v2 probes drive with a two-level force, so
-    it needs coverage that does not route through a deleted driver.
-
-    Linear mode: the geometric force equals the displacement, so an identity
+    """Linear mode: the geometric force equals the displacement, so an identity
     force_fn makes float_step_bullfrog's DKD reproduce the scalar recurrence the
     growth pin above uses. box_size is large enough that the periodic mod is
     inert -- what is under test is the coefficient application, not the wrap.

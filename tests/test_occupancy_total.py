@@ -1,10 +1,9 @@
 """`state.occupancy_total`: whole-index counts without an index-sized host copy.
 
-gb 1004113 was killed in step 7's migrate at ~10 GB free per CPU socket: the fused
-pass widened the 34.4 GB uint32 bucket index to int64 to count it, at its start and
-at its end, a 68.7 GB transient each time on top of `new_occ`. The helper is gated
-on value and allocation, and the fused pass on its host peak against the index,
-with the widened count restored as the control that must fail.
+Widening the 34.4 GB uint32 bucket index (4096^3) to int64 to count it is a 68.7 GB
+transient on top of `new_occ`. The helper is gated on value and allocation, and the
+fused pass on its host peak against the index, with a widened count substituted as
+the control that must fail.
 """
 
 import copy

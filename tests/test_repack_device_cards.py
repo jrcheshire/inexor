@@ -1,4 +1,4 @@
-"""R3b: the device repack split across cards, gated BITWISE against the host
+"""The device repack split across cards, gated BITWISE against the host
 `SlotState.repack`.
 
 Every state array and the host's return dict are compared. Anti-vacuity: the arena

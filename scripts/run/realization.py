@@ -1,52 +1,37 @@
-"""M-v2-6's deliverable: a COMPLETE mock, generated, stepped, exported and scored.
+"""Generate, step, export and score one complete mock, one phase per process.
 
-Every other script in this milestone measures a phase. This one produces the
-thing the milestone is for, and it exists because the pieces Stage 4 built have
-never been run together: `export.write_particles` and `summary.pk_summary_card`
-have no caller outside their own tests, and a full 2048^3 IC generation end to
-end is listed under "what this does NOT establish" in the M-v2-5 record.
+Subcommands:
 
-**Subcommands are separate PROCESSES on purpose**, not stages of one run:
+    ics     generate the T9 IC slabs (host, or `--generator device` on the cards)
+    run     step the schedule, or a segment of it, checkpointing as it goes
+    export  write plain .npy (x, v) from the newest checkpoint
+    card    the run's P(k) against linear theory, as a z profile, to a JSON card
 
-    ics     generate the T9 slabs (the streamed M-v2-5 path) and clean up staging
-    run     step the schedule, or a SEGMENT of it, checkpointing as it goes
-    export  write plain .npy (x, v) anything can read
-    card    the run's own P(k) against theory, as a z profile
+Each subcommand is its own PROCESS, since a high-water mark never resets: that is
+the only way each phase's peak host RSS is readable, and a queue limit costs one
+phase, not the run.
 
-A high-water mark never resets, so one process per phase is the only way each
-phase's peak host RSS is readable -- the same reason `v2_m6_engine_peak.py`
-generates its ICs in a subprocess, and it matters more here: the monolithic
-generator's peak is 70-90 B/p and would swamp every engine reading it preceded.
-It also means a queue limit costs one phase, not the run.
+Segments: `run --stop-at N` advances to absolute step N, which must be a checkpoint
+boundary, and stops; the next `run` resumes from the newest checkpoint. Segments
+compose BITWISE into the uninterrupted run
+(`test_a_run_split_into_segments_is_bitwise_the_uninterrupted_one`) because each
+is handed the full coefficient list and a stop step rather than a truncated
+schedule -- `fused_drifts` makes `coeffs[:n]` a different trajectory.
 
-**Segments, and why they are the unit.** The projected wall at 2048^3 is order a
-day and the gg QOS caps a job at two. `run --stop-at` advances the schedule to an
-absolute step and stops on a checkpoint; the next job resumes from disk. Segments
-compose back into the uninterrupted run BITWISE
-(`test_a_run_split_into_segments_is_bitwise_the_uninterrupted_one`), because each
-one is handed the full coefficient list and told where to stop rather than a
-truncated schedule -- `fused_drifts` makes `coeffs[:n]` a different trajectory.
+Conventions and refusals:
 
-**What is gated, and what is merely reported.**
+- `run`, `export` and `card` require the CPU backend; so does `ics` unless
+  `--generator device`.
+- The preset geometry must equal `_instruments.CONFIGS` for any config both define.
+- `run` resumes from a checkpoint whenever one exists and prints which source it
+  used; starting from ICs, it refuses ICs made at another `--a-init`/`--growth2`.
+- `export` refuses a checkpoint short of `--k-steps` unless `--allow-partial`.
+- In the library: `write_particles` refuses a short file, `pk_summary_card` an
+  empty card, and `stop_at` a stop off a checkpoint boundary.
+- Walls, peaks, the phase card and the z profile go to
+  `realization_{ics,run,export,pk}*.json` in `--workdir`. No verdict is emitted.
 
-- GATE: CPU backend. The pool refuses a non-CPU parent and every phase card on
-  record is CPU; a run that silently used a device would be comparable to
-  nothing.
-- GATE: the geometry this drives must equal `v2_m3_engine_gate`'s for any config
-  both define. Two config tables that drift are how a "2048^3 result" stops
-  describing the ladder it is supposed to cap.
-- GATE: `run` refuses to start from ICs when a checkpoint exists, and says which
-  it used. Silently re-running from step 0 in a resume job would burn the wall
-  and look like success.
-- GATE (in the library, named here so it is not re-derived): `write_particles`
-  refuses a short file, `pk_summary_card` refuses an empty card, and `stop_at`
-  refuses to stop off a checkpoint boundary.
-- REPORTED: every wall, every peak, the phase card, the repack fast/merge split,
-  the checkpoint receipts, and the z profile. No verdict is emitted anywhere --
-  `band_verdict` takes a band the caller names, and naming it is not this
-  script's business.
-
-Usage (the 2048^3 realization, one phase per job step):
+Usage (one phase per job step):
 
     python scripts/run/realization.py ics    --config c-gh --workdir $W
     python scripts/run/realization.py run    --config c-gh --workdir $W --stop-at 5
@@ -84,37 +69,23 @@ from _instruments import (  # noqa: E402
 from _instruments import _geom as _base_geom  # noqa: E402
 from inexor.plan import PRESETS, RATIFIED  # noqa: E402
 
-# The generator dtype the M-v2-5 record measured the production path at.
+# The IC generator's float dtype on the production path.
 GEN_FDTYPE = np.float32
-# The DEFAULT step count. `--k-steps` overrides it; the module constant stays
-# because `device_run.py` imports `_coeffs` and because every card and
-# checkpoint on record was written at 40.
+# The default step count; `--k-steps` overrides it. `device_run.py` imports
+# `_coeffs`, whose default this is.
 K_STEPS = 40
 
 
 class _StreamingTracer(PhaseTracer):
-    """`PhaseTracer`, but every boundary is EMITTED when it happens.
+    """`PhaseTracer` that also PRINTS each boundary as it is crossed.
 
-    923313 exists because nothing had taken a per-phase high-water at c-gh. It
-    took one and I never saw it, because the card is accumulated and printed
-    when the run finishes and the run was SIGKILLed in step 1 -- so the job
-    measured exactly the thing it was built to measure and left no record of it.
-    Both prior attempts had died mid-run; a report that only exists at the end
-    was never going to survive one.
+    A run killed mid-step still leaves the phases it reached, in order, with the
+    live reading (the end-of-run card would be lost). Relies on unbuffered stdout
+    (`PYTHONUNBUFFERED`, set by the sbatch) so a SIGKILL cannot strand lines.
 
-    So each boundary prints as it is crossed. A killed run leaves the phases it
-    reached, in order, with the reading that was live when it died -- which is
-    the line the next diagnosis starts from. `PYTHONUNBUFFERED` is set by the
-    sbatch, so a SIGKILL cannot strand these in a buffer either (922790 printed
-    nothing at all for exactly that reason).
-
-    `MemAvailable` rides along because `VmHWM` is the PARENT'S, and at C-gh the
-    parent is not where the pool's memory is. A phase whose parent peak is flat
-    while the node's available memory collapses is the workers, and those two
-    columns side by side are what distinguishes that from the parent growing.
-
-    Subclassed rather than edited in: `v2_m6_peak_trace.py` is a ratified probe
-    and D-v2-16 clause 7 gates promotion on those being unmodified.
+    `MemAvailable` is printed beside the parent's `VmHWM` because the pool's
+    memory is in the workers: a flat parent peak with collapsing available memory
+    is the workers growing, not the parent.
     """
 
     def __init__(self, *a, **kw):
@@ -142,14 +113,10 @@ class _StreamingTracer(PhaseTracer):
 
 
 def _require_linux_for_peaks():
-    """Per-phase high-water needs procfs; there is no macOS equivalent.
+    """Refuse `--phase-instrument peak` without procfs (no macOS equivalent).
 
-    Checked by READING the files rather than by testing `sys.platform`, for the
-    same reason `executor.has_memfd()` probes instead of consulting an
-    attribute: the platform name is a proxy for the capability and this
-    milestone has already shipped one gate that trusted the proxy and was wrong
-    (`hasattr(os, "memfd_create")` is False on the conda-forge interpreter that
-    can memfd perfectly well). Here the capability is the file.
+    Probes the files themselves rather than `sys.platform`: the capability is the
+    file, and a platform name is only a proxy for it.
     """
     for path in ("/proc/self/status", "/proc/self/clear_refs"):
         if not os.path.exists(path):
@@ -162,18 +129,13 @@ def _require_linux_for_peaks():
 
 
 def _print_phase_card(rep, instrument):
-    """The phase card, in the units the instrument that produced it reports.
+    """Print the phase card in the units of `instrument` ("time": s; "peak": GB).
 
-    A FUNCTION rather than inline in `cmd_run` so the node can exercise it in a
-    second before spending forty minutes reaching it. This milestone has lost
-    two cluster jobs on a `print` -- 447 on a key belonging to another arm's
-    worker, 448 on one renamed out from under it -- and a reporting path that
-    only ever runs after the expensive part is untested code by construction.
+    A separate function so the reporting path can be exercised cheaply before a
+    long run reaches it.
 
-    **The peak numbers are the PARENT ONLY.** `VmHWM` is one process's, and the
-    pool's workers are others; their RSS is summed separately in the `memory:`
-    line above. A phase peak here is not a node total and must not be read as
-    one.
+    Peak numbers are the PARENT PROCESS ONLY; the pool workers' RSS is summed
+    separately in `cmd_run`'s `memory:` line. A phase peak is not a node total.
     """
     if instrument != "peak":
         print("  phase card (s over this segment):")
@@ -181,13 +143,10 @@ def _print_phase_card(rep, instrument):
             if v > 0:
                 print(f"     {k:<16s} {v:9.2f}  {100 * rep['per_phase_frac'][k]:5.1f}%")
         return
-    # PEAK and OWN both, because they answer different questions and this
-    # milestone has confused them before: `peak` is the absolute RSS reached
-    # while the phase ran, which is what a host ceiling cares against; `own` is
-    # that minus the RSS the phase started from, i.e. what the phase itself
-    # allocated. A large peak with a near-zero own is a phase running inside
-    # someone else's residency, and differencing two maxima cannot tell those
-    # apart -- which is precisely how M-v2-6 Stage 0's gates became unreadable.
+    # `peak` is the absolute RSS reached while the phase ran (what a host ceiling
+    # cares about); `own` is that minus the RSS the phase started from (what the
+    # phase itself allocated). A large peak with near-zero own is a phase running
+    # inside someone else's residency.
     print("  phase card (GB high-water over this segment, PARENT PROCESS ONLY):")
     rows = sorted(rep["phases"].items(), key=lambda kv: -kv[1]["peak"])
     for k, v in rows:
@@ -205,7 +164,8 @@ def _split_terms(g):
 
     `forces.py` models both terms of the two-level split analytically:
     alpha = r_s/d_coarse gives exp(-pi^2 alpha^2) and beta = b/r_s gives
-    erfc(beta/2). RATIFIED alpha is 1.0, so r_s is one coarse cell.
+    erfc(beta/2). The default alpha is `RATIFIED["alpha"]` = 1.0, so r_s is one
+    coarse cell.
     """
     d_coarse = float(g["L"]) / int(g["n_coarse"])
     d_fine = float(g["L"]) / int(g["n_fine"])
@@ -216,38 +176,24 @@ def _split_terms(g):
 
 
 def _geom(cfg_name, n_fine=None, buf=None, n_coarse=None, n_part=None):
-    """Geometry from the ratified preset table, CHECKED against the engine gate's.
+    """Geometry dict for preset `cfg_name`, with optional resolution overrides.
 
-    `n_part` overrides the particles per side, for a mass-resolution ladder. The
-    box and both meshes are held, so the force (fine cell, coarse cell, r_s,
-    beta) is identical across arms in physical units and only the interparticle
-    spacing varies. Every preset sits at the same 0.5 Mpc/h spacing, so this is
-    the one resolution axis the table cannot reach. Refused unless a power of
-    two (D-007) that the brick grid divides.
+    `plan.PRESETS` is the source; for configs also in `_instruments.CONFIGS` the
+    two tables must agree (ValueError otherwise), so small-config and preset
+    results stay comparable. Overrides apply after that check:
 
-    `n_coarse` overrides the coarse mesh. THE SPLIT SCALE IS THEN HELD: r_s is
-    `alpha * coarse_cell` and alpha is ratified at 1.0, so refining the coarse
-    mesh at fixed alpha would SHRINK r_s and change the force decomposition
-    between arms -- that is a different experiment (is the ratified split
-    right?) from the convergence one (is the coarse solve resolved?). Deriving
-    alpha to hold r_s physically fixed keeps the decomposition identical, and
-    only ever RAISES alpha, which drives the coarse-representation term
-    exp(-pi^2 alpha^2) further down. Coarsening at fixed r_s would lower alpha
-    instead: at alpha 0.5 that term is 0.085, so it is refused.
+    - `n_part`: particles per side (mass-resolution ladder). Box and meshes are
+      held, so only the interparticle spacing varies. Must be a power of two;
+      brick divisibility is checked by the IC generator and loader.
+    - `n_coarse`: coarse mesh, with the split scale r_s = alpha * coarse_cell HELD
+      physically fixed by deriving alpha. Refining raises alpha, which only lowers
+      the coarse-representation error exp(-pi^2 alpha^2); coarsening (alpha below
+      the default 1.0; 0.085 at alpha 0.5) is refused.
+    - `n_fine`: fine mesh, with `buf` (counted in FINE cells) derived to hold beta.
+      A fixed buf would shrink the physical buffer: at cgh64, erfc(beta/2) runs
+      1.5e-8 -> 4.7e-3 -> 1.6e-1 over a 512..4096 ladder. An explicit `buf` wins.
 
-    `n_fine` overrides the preset's fine mesh, for a force-resolution ladder.
-    THE BUFFER IS THEN DERIVED, not left alone: `buf` is counted in FINE CELLS,
-    so holding it fixed while refining the mesh shrinks the PHYSICAL buffer and
-    blows up the split's truncation error -- at cgh64, erfc(beta/2) runs
-    1.5e-8 -> 4.7e-3 -> 1.6e-1 over a 512..4096 ladder. The finest arm would be
-    16% wrong from truncation alone and would read as convergence going the
-    wrong way. Deriving buf holds beta, so `n_fine` varies force resolution and
-    nothing else. An explicit `buf` still wins, and says what it did to beta.
-
-    `plan.PRESETS` is the only table carrying 2048^3; `CONFIGS` is the one
-    every engine card was measured through. They agree today, and this asserts it
-    rather than trusting it, because a silent divergence would make this script's
-    output incomparable to the ladder it caps.
+    Prints the geometry and both split error terms.
     """
     p = PRESETS[cfg_name]
     g = dict(n_part=p["n_part"], L=p["box"], n_fine=p["n_fine"],
@@ -264,8 +210,7 @@ def _geom(cfg_name, n_fine=None, buf=None, n_coarse=None, n_part=None):
         if float(g["L"]) != float(ref["L"]):
             raise ValueError(f"geometry tables disagree on {cfg_name}.L")
 
-    # the cross-check above is the POINT of this function and must see the
-    # ratified preset, so any override lands after it
+    # the cross-check above must see the unmodified preset, so overrides land after it
     if n_fine is not None and int(n_fine) != int(g["n_fine"]):
         _, beta0, _, _ = _split_terms(g)
         ratio = int(n_fine) // int(g["n_coarse"])
@@ -291,8 +236,6 @@ def _geom(cfg_name, n_fine=None, buf=None, n_coarse=None, n_part=None):
             )
 
     if n_part is not None and int(n_part) != int(g["n_part"]):
-        # brick-grid divisibility is refused by the IC generator and the loader
-        # (`bricks_per_side must divide n_part`), which own that layout
         n = int(n_part)
         if n < 2 or n & (n - 1):
             raise SystemExit(f"n_part {n} is not a power of two (D-007)")
@@ -318,14 +261,10 @@ def _git_commit():
 
 
 def _ic_provenance(generator):
-    """What produced these ICs, stored IN THE MANIFEST beside the slabs.
+    """Provenance dict for the IC manifest: generator, commit, host, jax, XLA env.
 
-    The run card carries commit/host/machine already, but the card is a separate
-    file and the slabs outlive it -- 998798's 4096^3 manifest went to disk with
-    `provenance: {}` and nothing in c-hero-r0 says which backend, jax or allocator
-    wrote it. Every 4096^3 run reads these slabs, and D-v2-23's `ic_stream` only
-    separates the noise streams, not the rest. Also the allocator receipt for an
-    A/B: the manifest, not a job label, says which arm an arm was.
+    Stored in the manifest because the slabs outlive the run card; it is also the
+    allocator receipt for an A/B between generator configurations.
     """
     prov = dict(generator=generator, commit=_git_commit(), host=platform.node(),
                 machine=platform.machine(), numpy=np.__version__,
@@ -339,8 +278,7 @@ def _ic_provenance(generator):
         prov["n_devices"] = len(jax.devices())
     except Exception as e:  # a CPU generator on a node with no jax device
         prov["jax"] = f"unread ({e.__class__.__name__})"
-    # the two knobs 997814 -> 998798 turned, verbatim, so a wall comparison across
-    # generations can refuse rather than guess
+    # the allocator knobs, verbatim, so cross-run wall comparisons can check them
     prov["allocator"] = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc") or "bfc"
     for var in ("XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE",
                 "XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB", "XLA_FLAGS"):
@@ -357,9 +295,8 @@ def _cosmo():
 def _engine_config(g, args, checkpoint_dir):
     """The production config, from `inexor.plan.engine_config`.
 
-    ONE definition, shared with the planner. It used to be built here from
-    scratch, which is how the driver ended up running an f64 coarse mesh that
-    M-v2-4 had rejected while the planner priced f32 and said FITS.
+    One definition shared with the planner, so the driver runs exactly the
+    configuration the planner prices.
     """
     from inexor.plan import engine_config
 
@@ -368,14 +305,13 @@ def _engine_config(g, args, checkpoint_dir):
              n_coarse=g["n_coarse"], tile=g["tile"], buf=g["buf"]),
         brick_slack=args.slack, tile_workers=args.tile_workers,
         checkpoint_dir=checkpoint_dir, checkpoint_every=args.checkpoint_every,
-        # AUTO by default, never True: C14 made the library default a tri-state
-        # precisely because a hard True refuses when no pool exists, and this
-        # driver must not turn a serial smoke run into a refusal.
+        # unset = the library's AUTO default, never True: a hard True refuses when
+        # no pool exists, which would turn a serial smoke run into a refusal
         **({} if args.migrate_pooled is None else
            {"migrate_pooled": args.migrate_pooled}),
         **({} if args.eject_kernel is None else {"eject_kernel": args.eject_kernel}),
-        # a derived alpha is the whole point of --n-coarse; without this the
-        # split scale would silently revert to the ratified default
+        # the alpha derived by --n-coarse; without it the split scale would
+        # silently revert to the default
         **({} if "alpha" not in g else {"alpha": g["alpha"]}),
         # getattr: tests build a bare Namespace, and an absent flag must mean
         # the library default
@@ -388,17 +324,11 @@ def _engine_config(g, args, checkpoint_dir):
 def _coeffs(cosmo, k_steps=K_STEPS, a_init=None, growth2="lcdm"):
     """The BullFrog coefficients and the scale-factor grid for `k_steps` steps.
 
-    `a_init` defaults to the ratified start, a = 0.1 (z = 9). It enters the
-    a-grid and so the coefficients, which the checkpoint fingerprint hashes:
-    arms at different starts cannot cross-resume.
-
-    Every arm ends at A_FINAL whatever `k_steps` is, so cards from different
-    step counts share their epoch and their k bins and difference directly.
-    The checkpoint fingerprint hashes these coefficients, so a run at one step
-    count cannot resume another's checkpoint -- it is refused rather than
-    silently continued onto a different trajectory. `growth2` selects the
-    BullFrog weights' second-order growth ("lcdm", or the legacy "eds"), and
-    also enters the coefficients and so the fingerprint.
+    Returns (coeffs, a_steps). `a_init` defaults to A_INIT = 0.1 (z = 9); every
+    grid ends at A_FINAL, so cards at different step counts share their epoch and
+    k bins. `growth2` selects the BullFrog weights' second-order growth ("lcdm",
+    or the legacy "eds"). All three enter the coefficients, which the checkpoint
+    fingerprint hashes, so arms differing in any of them cannot cross-resume.
     """
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
 
@@ -415,8 +345,7 @@ def _require_ic_epoch(ic_dir, a_init):
     The generator bakes a_init into the displacements (D1, D2) and velocities
     (f1, f2); the run takes it from the a-grid. Evolving one under the other
     starts the right field at the wrong time and nothing downstream can see it.
-    A manifest from before `a_init` was recorded is accepted only at the
-    ratified start, which is the only one that existed then.
+    A manifest that records no `a_init` is accepted only at A_INIT = 0.1.
     """
     from inexor import icgen
 
@@ -458,8 +387,7 @@ def _card(kind, args, body, tag=""):
                 machine=platform.machine(), numpy=np.__version__,
                 k_steps=int(args.k_steps), growth2=getattr(args, "growth2", "lcdm"),
                 when=time.strftime("%Y-%m-%dT%H:%M:%S"), **body)
-    # the tag keeps a segmented run's cards: without it each segment's card
-    # overwrote the last and a multi-day run would end holding only its final leg
+    # the tag keeps one card per segment of a segmented run
     path = os.path.join(args.workdir, f"realization_{kind}{tag}.json")
     with open(path, "w") as fh:
         json.dump(card, fh, indent=2, default=str)
@@ -494,8 +422,8 @@ def _newest_checkpoint_step(args):
 
 def cmd_ics(args):
     if args.generator == "device":
-        # the device generator's host peak is still ru_maxrss; its card peak is read
-        # by the job's nvidia-smi sampler, not here
+        # the device generator's host peak is still ru_maxrss; its card (GPU) peak
+        # is read by the job's nvidia-smi sampler, not here
         import jax
 
         jax.config.update("jax_enable_x64", True)
@@ -560,11 +488,9 @@ def cmd_run(args):
     os.makedirs(d, exist_ok=True)
     ec = _engine_config(g, args, d)
 
-    # THE STATE IS BUILT STRAIGHT INTO SHARED MEMORY, so it exists once
-    # rather than twice. Before this the loader made ~135 GB of private
-    # arrays at c-gh and TilePool copied them into another ~135 GB; job
-    # 922723 was OOM-killed doing exactly that. Serial runs get no allocator
-    # and no pool, and behave as they always did.
+    # With a pool, the state is loaded straight into shared memory so it exists
+    # once, not twice (private arrays plus TilePool's copy: ~135 GB each at
+    # c-gh). Serial runs get no allocator and no pool.
     from inexor.executor import SharedAllocator, malloc_trim
 
     allocator = SharedAllocator() if ec.tile_workers > 1 else None
@@ -591,7 +517,7 @@ def cmd_run(args):
     t_load = time.perf_counter() - t_load
     # glibc keeps freed arenas, and the pool's segments are fresh kernel pages
     # that cannot be served from them, so the loader's transients and the
-    # pool's demand STACK unless this is called. Reported, not assumed.
+    # pool's demand STACK unless this is called. The result is printed.
     trimmed = malloc_trim()
 
     k0 = 0 if resume is None else int(resume["step"])
@@ -601,8 +527,6 @@ def cmd_run(args):
           f"{st.off.shape[0]:,} rows; load {t_load:.1f} s")
     print(f"  W={ec.tile_workers} pooled_migrate={ec.migrate_pooled} "
           f"eject={ec.eject_kernel} slack={args.slack} ckpt_every={args.checkpoint_every}")
-    # the dtypes were in no log line, which is most of why the f64 coarse mesh
-    # kept being re-found rather than read
     print(f"  coarse={ec.coarse_dtype} fine={ec.fine_dtype} "
           f"arena_frac={args.arena_frac} alloc_margin={args.alloc_margin} "
           f"coarse_match={ec.coarse_match}")
@@ -610,42 +534,28 @@ def cmd_run(args):
           f"{'yes, %.1f GB' % (allocator.bytes_held() / 1e9) if allocator else 'no (serial)'}"
           f"; malloc_trim={trimmed}")
 
-    # ONE phase callback, so the two instruments are exclusive rather than
-    # composed, and that is deliberate: `PhaseTracer` writes /proc/self/clear_refs
-    # at every boundary and the reset costs wall, which is the whole reason
-    # `v2_m6_phase_time.py` exists as a separate probe. Running both would give a
-    # phase card whose seconds describe the instrument.
-    #
-    # `--phase-instrument peak` is what answers the question this milestone is
-    # stuck on. Nothing has ever taken a per-phase high-water at c-gh: 923139
-    # died inside the coarse solve and all we have is a 10 s system sampler,
-    # against which `inexor.plan` under-charged that phase by 5x. In pool mode
-    # the intra-tile boundaries do not fire, so this is ~7 clear_refs per step
-    # against a step measured in minutes.
+    # ONE phase callback, so the two instruments are exclusive: `PhaseTracer`
+    # writes /proc/self/clear_refs at every boundary and the reset costs wall, so
+    # a combined card's seconds would partly describe the instrument. In pool
+    # mode the intra-tile boundaries do not fire, so `peak` costs ~7 clear_refs
+    # per step.
     if args.phase_instrument == "peak":
-        # REFUSE NOW, not at the first boundary. `PhaseTracer` needs
-        # /proc/self/clear_refs, which macOS does not have, and the first
-        # boundary is on the far side of a load measured in minutes -- so
-        # without this the failure mode is "the job died after the expensive
-        # part, on the instrument".
+        # refuse now, not at the first boundary, which comes after a load
+        # measured in minutes
         _require_linux_for_peaks()
         ph = _StreamingTracer(trim="off")
     else:
         ph = PhaseTimer()
     stats = []
     t0 = time.perf_counter()
-    # `epoch` costs nothing at run time and is what lets `python -m inexor.export`
-    # write km/s off a bare checkpoint directory, without a reader having to
-    # know this driver's a-grid and reproduce it by hand.
+    # `epoch` is stored with the checkpoints so `python -m inexor.export` can
+    # write km/s from a bare checkpoint directory without this driver's a-grid
     out = engine.run(st, ec, co, phase=ph, resume=resume, stop_at=stop,
                      collect=stats.append, allocator=allocator,
                      epoch=(a_steps, cosmo))
     wall = time.perf_counter() - t0
-    # `clear_refs` RESETS ru_maxrss ALONG WITH VmHWM -- both read the kernel's
-    # one `mm->hiwater_rss` -- so after a traced run `_maxrss_bytes()` reports
-    # the peak since the last boundary, not the run's. `PhaseTracer` accumulates
-    # `run_peak` across boundaries for exactly this reason; taking it from there
-    # is not a preference, it is the only correct source under tracing.
+    # `clear_refs` resets ru_maxrss along with VmHWM (both read `mm->hiwater_rss`),
+    # so under tracing the run's peak is only available as `PhaseTracer.run_peak`
     peak = ph.run_peak if args.phase_instrument == "peak" else _maxrss_bytes()
 
     n = len(out)
@@ -661,12 +571,8 @@ def cmd_run(args):
         m0 = rp[-1].get("bricks_merged", 0)
         print(f"  repack last step: {f0:,} fast / {m0:,} merged bricks "
               f"({100 * f0 / max(f0 + m0, 1):.1f}% fast)")
-    # THE POOL'S WORKERS ARE OTHER PROCESSES, and `ru_maxrss` cannot see them.
-    # `v2_m6_engine_peak` is serial-only for exactly this reason. A peak read
-    # from the parent alone at W=16 would report a fraction of what the node is
-    # actually holding, which is the one number deciding whether the full run
-    # fits -- so the workers' own RSS is summed in and the total is what the
-    # memory criterion is read against.
+    # The pool's workers are other processes, invisible to `ru_maxrss`, so their
+    # own RSS (from the last step's stats) is summed in for the node total.
     arena_peak = max((d.get("arena_used", 0) for d in stats), default=0)
     if arena_peak:
         print(f"  arena peak residency: {arena_peak:,} rows "
@@ -694,11 +600,8 @@ def cmd_run(args):
         tile_workers=ec.tile_workers, migrate_pooled=bool(ec.migrate_pooled),
         eject_kernel=str(ec.eject_kernel), brick_slack=args.slack,
         arena_frac=args.arena_frac, checkpoint_every=args.checkpoint_every,
-        # WHICH instrument produced `phase`, on the card rather than inferable
-        # from its shape: the two reports carry different keys and different
-        # units, and a reader that guesses wrong reads seconds as gigabytes.
-        # It also records that `peak_rss_bytes` came from `PhaseTracer.run_peak`
-        # rather than ru_maxrss, which clear_refs would have made meaningless.
+        # which instrument produced `phase` (seconds vs bytes), and so whether
+        # `peak_rss_bytes` came from `PhaseTracer.run_peak` or ru_maxrss
         phase_instrument=args.phase_instrument,
         phase=rep, per_step_stats=stats, a_steps=list(map(float, a_steps)),
         projected_full_run_h=per_step * args.k_steps / 3600.0,
@@ -727,11 +630,10 @@ def _ic_state(args, alloc=None):
     refuses them, by their manifest's `provenance.kind` -- so carding them
     needs `cmd_run`'s own IC branch rather than `_state_at_head`.
 
-    The refusal below is the point of the function. A checkpoint generation
-    loads perfectly well through `load_slot_state`, and `cmd_card` would then
-    take its epoch from the `step = 0` this returns and compare a step-40 state
-    against the a = 0.1 oracle -- a card that is wrong by D(a)^2 and says so
-    nowhere.
+    Refuses a checkpoint directory: it would load through `load_slot_state`, and
+    `cmd_card` would then score an evolved state against the a_init oracle,
+    wrong by D(a)^2 with no warning. Also refuses an `--a-init`/`--growth2`
+    mismatch.
     """
     from inexor import icgen
 
@@ -784,10 +686,7 @@ def cmd_export(args):
     )
     wall = time.perf_counter() - t0
     peak = _maxrss_bytes()
-    # SIZES FROM THE FILESYSTEM, not from the manifest: the manifest's `files`
-    # maps a role to a NAME, and the first version of this line assumed it mapped
-    # to a dict of stats and crashed after a clean export. Reporting code is
-    # untested code until it has run.
+    # sizes from the filesystem: the manifest's `files` maps a role to a file NAME
     tot = 0
     for name in man.get("files", {}).values():
         try:
@@ -796,10 +695,8 @@ def cmd_export(args):
             pass
     print(f"  wall {wall / 60:.1f} min | peak host {peak / 1e9:.1f} GB"
           + (f" | {tot / 1e9:.1f} GB written" if tot else ""))
-    # Report the units this export ACTUALLY carries, off the returned header.
-    # The line here used to say "D-time unless the header says otherwise",
-    # which was true and useless: this leg always passes `a` and `cosmo`, so it
-    # always writes km/s, and a reader had to go open the header to learn it.
+    # the velocity units this export actually carries, from the returned header
+    # (km/s, since this leg always passes `a` and `cosmo`)
     print(f"  velocities: {man['units']['velocity']} at a={a_out:.6g}, "
           f"Omega_m={cosmo.Omega_m!r}, h={cosmo.h!r}"
           + (f" (x{man['peculiar_velocity_factor']:.6g} on the engine's dx/dD)"
@@ -810,10 +707,9 @@ def cmd_export(args):
 
 
 def _heartbeat(args):
-    """The progress callback for the two hour-long product legs, or None.
+    """The progress callback for the export and card loops, or None if `--heartbeat 0`.
 
-    Off by `--heartbeat 0`, which is how an A/B keeps the legs comparable; the
-    call itself is a clock read per chunk against a chunk costing ~0.1 s.
+    Cost is one clock read per chunk against a chunk costing ~0.1 s.
     """
     if not args.heartbeat:
         return None
@@ -826,11 +722,9 @@ def _linear_band(k, k_nl, scan_hi):
     """Which bins linear theory applies to, and how to print the nonlinear scale.
 
     `summary.nonlinear_scale` returns None when the linear Delta^2 never reaches
-    1 anywhere it scanned -- the ordinary state of an early output, and what
-    `float(card["k_nonlinear"])` died on in gb 1010730's cgh64 card leg at
-    a = 0.1189. With no crossing, every bin under the scan ceiling is linear;
-    bins above it were never examined and are left out rather than assumed.
-    Returns (mask, text).
+    1 anywhere it scanned (ordinary at early epochs). Then every bin at or below
+    the scan ceiling `scan_hi` is linear; bins above it were never examined and
+    are left out. Returns (mask, text).
     """
     k = np.asarray(k, dtype=float)
     if k_nl is not None:
@@ -850,23 +744,14 @@ def cmd_card(args):
     co, a_steps = _coeffs(cosmo, args.k_steps, args.a_init, args.growth2)
     ec = _engine_config(g, args, _ckpt_dir(args))
 
-    # THE PAINT IS THE CARD'S LARGEST STAGE AND IT IS THE ONE THAT POOLS.
-    # `pk_summary_card` is one call: a streamed paint over `n_bricks /
-    # chunk_bricks` chunks, then a transform, then the binning. Only the first
-    # is embarrassingly parallel, and it is the only one of the three that the
-    # engine's own runs have ever parallelised -- the card was the consumer
-    # nobody pooled. Same machinery, same guarantee: workers return bounded
-    # sub-blocks and the parent accumulates, so integer associativity makes the
-    # pooled mesh BITWISE the serial one.
-    #
-    # The pool is `paint_only`: a full TilePool allocates three coarse force
-    # meshes (103.1 GB at c-hero) and builds a tile kernel per worker, and the
-    # card reads neither.
-    #
-    # THE STATE IS LOADED STRAIGHT INTO SHARED MEMORY so it exists once rather
-    # than twice -- without the allocator `TilePool` copies every field and the
-    # 754.6 GB state becomes 1509 GB against a 1026 GB node. Same fault that
-    # OOM-killed job 922723.
+    # The card's streamed paint (its largest stage; transform and binning follow)
+    # can run on a pool: workers return bounded sub-blocks and the parent
+    # accumulates integers, so the pooled mesh is BITWISE the serial one. The
+    # pool is `paint_only`: a full TilePool allocates three coarse force meshes
+    # (103.1 GB at c-hero) and a tile kernel per worker, which the card never
+    # reads. The state goes straight into shared memory so it exists once:
+    # otherwise TilePool copies every field (754.6 GB -> 1509 GB at c-hero,
+    # against a 1026 GB node).
     pooled = args.card_pool
     if pooled is None:
         pooled = ec.tile_workers > 1
@@ -878,9 +763,7 @@ def cmd_card(args):
     else:
         st, step = _state_at_head(args, ec, co, alloc=allocator)
     t_load = time.perf_counter() - t_load
-    # glibc keeps freed arenas and the pool's segments are fresh kernel pages
-    # that cannot be served from them, so the loader's transients and the
-    # pool's demand STACK without this.
+    # see `cmd_run`: without the trim the loader's transients and the pool stack
     trimmed = malloc_trim() if pooled else None
 
     a_out = float(a_steps[-1]) if step >= args.k_steps else float(a_steps[step])
@@ -895,21 +778,16 @@ def cmd_card(args):
             t_pool = time.perf_counter()
             pool = TilePool(st, ec, allocator=allocator, paint_only=True)
             t_pool = time.perf_counter() - t_pool
-            # A knob must prove it applied: W and the shm actually held, not
-            # the fact that `--card-pool` was passed. Spawn is reported apart
-            # from `wall` because it is FIXED -- 16 interpreters importing jax
-            # -- so it is a large share of a cgh64 card and a rounding error on
-            # a hero one, and a serial-vs-pooled ratio that leaves it inside is
-            # read at the wrong scale.
+            # print the W and shm actually held, not that `--card-pool` was
+            # passed. Spawn is a fixed cost (W interpreters importing jax),
+            # reported apart from `wall` so serial-vs-pooled ratios exclude it.
             print(f"  paint pool: W={pool.workers}, spawn {t_pool:.1f} s, "
                   f"state in shared memory {allocator.bytes_held() / 1e9:.1f} GB, "
                   f"malloc_trim={trimmed}")
         else:
             print("  paint pool: none (serial)")
-        # EVERY ARM MUST REPORT ON THE SAME BINS. The default band is
-        # [0, half Nyquist] of the CARD'S OWN coarse mesh, so two arms at
-        # different coarse meshes would silently measure different k and the
-        # difference between them would be a resampling, not a result.
+        # the default band is [0, half Nyquist] of the card's own coarse mesh;
+        # `--k-max` pins the bins so arms at different coarse meshes share them
         edges = None
         if args.k_max:
             edges = np.linspace(0.0, float(args.k_max), int(args.n_bins) + 1)
@@ -929,13 +807,9 @@ def cmd_card(args):
     lin, k_nl_txt = _linear_band(k, k_nl, card.get("k_nonlinear_scan", [None, None])[1])
     print(f"  wall {wall / 60:.1f} min | {card['n_bins']} bins over "
           f"k = {k.min():.4f} to {k.max():.4f}, k_nonlinear = {k_nl_txt}")
-    # THE WHOLE-RANGE MEDIAN IS NOT THE NUMBER TO READ, and printing it alone
-    # invites the wrong conclusion. The oracle is LINEAR theory, so a bin above
-    # k_nonlinear is being compared against a prediction that does not apply
-    # there; a large |z| in that band is the simulation being nonlinear, not the
-    # engine being wrong. At a small box every bin can land above k_nl -- cdev8
-    # does -- and then the card cannot speak to accuracy at all, which is worth
-    # saying out loud rather than leaving a frightening median on the page.
+    # The oracle is LINEAR theory, so |z| is only meaningful below k_nonlinear;
+    # above it a large |z| is the simulation being nonlinear. At a small box
+    # (cdev8) every bin can lie above k_nl, and the card says so.
     if lin.any():
         print(f"  BELOW k_nonlinear ({int(lin.sum())} bins): |z| median "
               f"{np.median(np.abs(z[lin])):.2f} max {np.max(np.abs(z[lin])):.2f}")
@@ -960,10 +834,7 @@ def cmd_card(args):
                            n_bins_below_k_nl=int(lin.sum()),
                            ic_dir=args.ic_dir,
                            peak_rss_bytes=_maxrss_bytes(), summary=card),
-          # an IC card and a checkpoint card of the same run are two different
-          # epochs of one realization and belong side by side; sharing
-          # `realization_pk.json` would mean the second silently replaced the
-          # first, which is the comparison both exist for
+          # IC and checkpoint cards of one run are kept side by side, not overwritten
           tag=("_ics" if args.ic_dir else ""))
     return 0
 

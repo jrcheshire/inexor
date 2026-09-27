@@ -4,7 +4,7 @@ BullFrog is consistent only with the true LCDM growth pair (Rampf, List & Hahn
 2024, Sec. 4.4); with E = -(3/7) D^2 it converges to an EdS-coupled solution
 whose late-time kicks are 12% weak. These pin the ODE solution against the
 limits it must reproduce, and the weights against the continuum equation of
-motion they must converge to. Bars sit above measured values (2026-09-25):
+motion they must converge to. Bars sit above the measured values:
 the linear-growth comparisons are limited by `growth_factor_a`'s quadrature
 (~7e-9), everything internal to the ODE by roundoff.
 """

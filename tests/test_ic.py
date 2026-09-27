@@ -1,7 +1,5 @@
-"""ic.py: spectrum recovery, f_NL round trip + linearity, COBE-scale phi,
-tree-level template sanity (the full bispectrum-estimator-vs-template oracle
-is an M4-class [slow] item once an estimator exists; f_NL's structural
-properties are exactly testable without one)."""
+"""ic.py: spectrum recovery, f_NL round trip + linearity, COBE-scale phi, tree-level
+template sanity, and the plane-keyed white noise's decomposition invariance."""
 
 import jax
 import jax.numpy as jnp
@@ -35,7 +33,6 @@ def x64():
 
 
 def test_pk_recovery_within_sample_variance():
-    # M0 self-check 5 promoted (mbody-binned estimator now)
     delta0 = gaussian_delta(jax.random.PRNGKey(2), N, L, PLANCK)
     kc, pk, nm = pk_estimator(np.asarray(delta0), L, kmax=0.6 * np.pi * N / L)
     p_ref = linear_power(kc, PLANCK)
@@ -54,12 +51,7 @@ def test_fnl_zero_round_trips_to_gaussian():
 
 
 def test_fnl_enters_linearly():
-    """f_NL linearity by equal increments. The jax.grad arm this test used to
-    carry was RETIRED with v1 at M-v2-5 (JC, 2026-08-10): the generator is
-    host numpy through ooc_fft, and a jnp twin would ship two same-seed fields
-    differing in last bits -- the trap the one-stream design exists to
-    prevent. `colour_white` is the seam a differentiable twin would be built
-    behind if differentiable ICs are ever needed, gated then."""
+    """f_NL enters linearly: equal increments give equal field increments."""
     key = jax.random.PRNGKey(4)
 
     def field(f_nl):
@@ -88,7 +80,7 @@ def test_poisson_M_shape_and_limits():
 
 
 def test_poisson_M_table_path_matches_analytic():
-    """M-v2-5: the ICKTable transfer path agrees with the analytic one at
+    """The ICKTable transfer path agrees with the analytic one at
     interp-error class, preserves shape, and keeps the k=0 -> M=0 contract."""
     from inexor.cosmology import ic_k_table
 
@@ -104,7 +96,7 @@ def test_poisson_M_table_path_matches_analytic():
 
 
 # ---------------------------------------------------------------------------
-# Plane-keyed white noise (M-v2-5, D-v2-15 clause 5)
+# Plane-keyed white noise
 # ---------------------------------------------------------------------------
 
 
@@ -150,8 +142,7 @@ def test_white_noise_invariance_can_fail(x64):
 
 
 def test_gaussian_delta_is_bitwise_the_streamed_assembly(x64):
-    """THE FIRST M-v2-5 IDENTITY GATE, at unit-test scale: the monolithic
-    convenience is the streamed generator at slab = N, bitwise. The streamed
+    """The monolithic convenience is the streamed generator at slab = N, bitwise. The streamed
     arm here is built from ragged 5-plane noise slabs through
     forward_from_slabs, coloured identically, and assembled from 3-plane
     inverse slabs -- every loop bound different from the monolithic call."""
@@ -179,11 +170,8 @@ def test_gaussian_delta_is_bitwise_the_streamed_assembly(x64):
 
 def test_linear_density_mean_phi2_is_decomposition_invariant(x64):
     """The fixed-order reduction: THREADING the running total through slabs of
-    any thickness replays the monolithic fold exactly. Summing slabs
-    separately and adding subtotals re-associates and moves last bits -- that
-    failure was MEASURED here first (a 16-plane grouping differed at 1e-16
-    relative), which is why the API threads `tot` instead of returning
-    per-slab sums to add."""
+    any thickness replays the monolithic fold exactly. Adding per-slab subtotals would
+    re-associate and move last bits (~1e-16 relative), hence the threaded `tot`."""
     from inexor.ic import mean_sq_by_plane, sq_sum_by_plane
 
     rng = np.random.default_rng(9)
@@ -197,7 +185,7 @@ def test_linear_density_mean_phi2_is_decomposition_invariant(x64):
     # anti-vacuity: perturbing one element must move the reduction. NB a
     # one-ulp bump is BELOW this statistic's resolution (it moves the square
     # by ~4e-16 against a plane-sum ulp of ~2e-13 over 1024 O(1) terms), so
-    # the probe uses the smallest perturbation class the reduction can see.
+    # this uses the smallest perturbation the reduction can see.
     g = f.copy()
     g[13, 5, 7] += 1e-9
     assert mean_sq_by_plane(g) != ref
@@ -232,9 +220,8 @@ def test_bispectrum_template_squeezed_divergence():
 
 
 def test_gaussian_delta_table_backend_dc_safe():
-    # regression (S6 deficit matrix): the table backend refuses k outside its
-    # range, and the |k| grid contains the DC mode -- gaussian_delta must
-    # evaluate the colour DC-safely (the DC colour is zeroed regardless)
+    # the table backend refuses k outside its range and the |k| grid contains the DC
+    # mode: gaussian_delta must evaluate the colour DC-safely (the DC colour is zeroed)
     k_t = np.geomspace(1e-4, 1e2, 800)  # the density of the real pk_*.txt dumps
     table = (k_t, linear_power(k_t, PLANCK))
     d_tab = gaussian_delta(jax.random.PRNGKey(0), N, L, PLANCK, table=table, backend="table")

@@ -1,9 +1,8 @@
-"""export.py: the portable (x, v) writer (M-v2-6 Stage 4).
+"""export.py: the portable (x, v) writer and its CLI.
 
-The gate is an IDENTITY, not a tolerance: the export must reproduce the state's
-own decode, row for row, in the state's own order. Everything else here is the
-refusal surface plus the two claims the module makes in prose -- that chunking
-is invisible, and that the f32 default resolves the position quantum.
+The core gate is an identity: the export reproduces the state's own decode, row for row, in
+the state's order. The rest covers ids, chunk invariance, f32 precision against the position
+quantum, velocity units and epoch handling, refusals, and the streamed writer thread.
 """
 
 import dataclasses
@@ -24,9 +23,8 @@ N_PART, NB, BOX = 16, 4, 16.0
 
 
 def _evolved_state(seed=3, steps=3, arena_frac=0.05, slack=0.02, with_ids=False):
-    """A state that has been through the exchange, so it has live spares and a
-    populated arena. The arena is the part an export can silently drop: those
-    rows are not in any brick's contiguous run."""
+    """A state after a few migrations: live spares and a populated arena (arena rows are not in
+    any brick's contiguous run, so an export can silently drop them)."""
     rng = np.random.default_rng(seed)
     g = (np.arange(N_PART) + 0.5) * (BOX / N_PART)
     q = np.stack(np.meshgrid(g, g, g, indexing="ij"), axis=-1).reshape(-1, 3)
@@ -42,9 +40,9 @@ def _evolved_state(seed=3, steps=3, arena_frac=0.05, slack=0.02, with_ids=False)
 
 
 def test_export_is_the_states_own_decode(tmp_path):
-    """THE Stage 4 export gate. `decode_bricks` over every brick is what the
-    force sees; the export must be that, exactly, in that order. Written at f64
-    so the comparison is bitwise and the only thing under test is the writer."""
+    """The export equals `decode_bricks` over every brick (what the force sees), in order.
+
+    Written at f64 so the comparison is bitwise and only the writer is under test."""
     st = _evolved_state()
     assert st.arena_used > 0, "vacuous: no arena residents, so folding them in is untested"
 
@@ -57,14 +55,12 @@ def test_export_is_the_states_own_decode(tmp_path):
     np.testing.assert_array_equal(x, xr)
     np.testing.assert_array_equal(v, vr)
     assert ids is None and head["has_ids"] is False
-    # positions decode to a lattice index times the quantum, so the box is a
-    # closed-open interval and nothing may sit on the far edge
+    # positions are lattice index * quantum: [0, BOX), nothing on the far edge
     assert x.min() >= 0.0 and x.max() < BOX
 
 
 def test_export_carries_ids_when_the_state_has_them(tmp_path):
-    """Row order is spatial and recovers no Lagrangian index, so a state that
-    paid for ids must not have them dropped on the way out."""
+    """Ids are exported when present (row order is spatial and recovers no Lagrangian index)."""
     st = _evolved_state(with_ids=True)
     d = str(tmp_path / "e")
     head = export.write_particles(st, d, dtype=np.float64)
@@ -73,14 +69,14 @@ def test_export_carries_ids_when_the_state_has_them(tmp_path):
     slots, _, _ = st.decode_bricks(list(range(st.n_bricks)))
     assert head["has_ids"] is True
     np.testing.assert_array_equal(ids, st.ids[slots])
-    # every particle exactly once: the ids ARE the Lagrangian index
+    # every particle exactly once
     np.testing.assert_array_equal(np.sort(ids), np.arange(st.n_particles, dtype=np.int32))
 
 
 @pytest.mark.parametrize("chunk", [1, 3, 7, 4096])
 def test_chunking_is_invisible(tmp_path, chunk):
-    """The streaming granularity is a memory knob and must not reach the bytes.
-    Chunk sizes chosen ragged against the brick count (64) and past it."""
+    """Output bytes are independent of `chunk_bricks`; sizes are ragged against 64 bricks and
+    past it."""
     st = _evolved_state()
     ref = str(tmp_path / "ref")
     export.write_particles(st, ref, dtype=np.float64, chunk_bricks=4096)
@@ -93,15 +89,11 @@ def test_chunking_is_invisible(tmp_path, chunk):
 
 
 def test_f32_default_resolves_the_position_quantum():
-    """The f32 default is a claim about precision, so measure it rather than
-    assert it in prose. The stored position is an integer lattice index times
-    `box / n_levels` and f32's spacing at magnitude `box` is `box * 2**-23`.
+    """The quantum-to-f32-spacing ratio (`quantum / (box * 2**-23)`) clears 2 at production sizes.
 
-    The bar is DERIVED, not picked: the cast must not move a particle off its
-    lattice site, so the ratio has to clear 2 (half a quantum, which is what
-    the companion test measures on real rows). Measured: 128x at cgh64, 32x at
-    C-gh, 16x at C-hero -- it halves each time the box doubles at fixed cell,
-    so it is a property of the config and C-hero is the binding rung."""
+    Clearing 2 keeps an f32 cast within half a quantum of its lattice site. Values are 128x,
+    32x, 16x for n_part 512/2048/4096; the ratio halves each time the box doubles at fixed
+    cell, so the largest box is the binding case."""
     want = {512: 128.0, 2048: 32.0, 4096: 16.0}
     for n_part, box in ((512, 256.0), (2048, 1024.0), (4096, 2048.0)):
         t9 = T9Layout(box, n_part, 2)
@@ -111,7 +103,7 @@ def test_f32_default_resolves_the_position_quantum():
 
 
 def test_f32_export_stays_inside_half_a_quantum(tmp_path):
-    """The consequence of the above, on real rows."""
+    """An f32 export stays within half a quantum of the f64 decode on real rows."""
     st = _evolved_state()
     d = str(tmp_path / "e")
     export.write_particles(st, d, dtype=np.float32)
@@ -121,10 +113,8 @@ def test_f32_export_stays_inside_half_a_quantum(tmp_path):
 
 
 def test_peculiar_velocity_factor_against_a_finite_difference():
-    """`peculiar_velocity_factor` uses f = dlnD/dlna to get dD/da. Check it by
-    the other road: v_pec = a * H * (dD/da) * a * v_D = 100 a^2 E(a) dD/da v_D,
-    with dD/da differenced rather than derived, so the two paths share no
-    algebra beyond D itself."""
+    """`peculiar_velocity_factor` (via f = dlnD/dlna) matches 100 a^2 E(a) dD/da with dD/da
+    central-differenced, so the two paths share no algebra beyond D; 1e-6 is FD error scale."""
     for a in (0.25, 0.5, 1.0):
         h = 1e-5
         dDda = (growth_factor_a(a + h, PLANCK) - growth_factor_a(a - h, PLANCK)) / (2 * h)
@@ -159,9 +149,8 @@ def test_refuses_half_a_cosmology(tmp_path):
 
 
 def test_header_is_written_last(tmp_path):
-    """The completeness marker: an export interrupted mid-write leaves arrays
-    that are the right size in their headers and short on disk, and those load
-    without complaint. The absent header is what refuses."""
+    """The header is the completeness marker: without it a load refuses, since truncated arrays
+    would otherwise load without complaint."""
     st = _evolved_state()
     d = str(tmp_path / "e")
     os.makedirs(d)
@@ -173,8 +162,7 @@ def test_header_is_written_last(tmp_path):
     export.write_particles(st, d)
     export.load_particles(d)
 
-    # and a pre-existing header is removed BEFORE the arrays move, so a torn
-    # rewrite cannot be read as complete
+    # a header alongside a missing array still refuses to load
     os.remove(os.path.join(d, "x.npy"))
     with pytest.raises(Exception):
         export.load_particles(d, mmap=False)
@@ -192,8 +180,7 @@ def test_refuses_crc_corruption(tmp_path):
 
 
 def test_corruption_gate_can_fire_and_the_clean_file_passes(tmp_path):
-    """The other half of the check above: the same call on an untouched export
-    must pass, or `crc mismatch` would be proving nothing."""
+    """Control for the crc test: an untouched export loads cleanly."""
     st = _evolved_state()
     d = str(tmp_path / "e")
     export.write_particles(st, d)
@@ -201,8 +188,7 @@ def test_corruption_gate_can_fire_and_the_clean_file_passes(tmp_path):
 
 
 def test_truncated_stream_refuses_at_close(tmp_path):
-    """`_StreamedNpy` declares its shape before it has the rows. A writer that
-    delivered fewer must not close a file whose header overstates it."""
+    """`_StreamedNpy` refuses to close with fewer rows than its declared shape."""
     s = export._StreamedNpy(str(tmp_path / "t.npy"), (10, 3), np.float32)
     s.append(np.zeros((4, 3)))
     with pytest.raises(RuntimeError, match="Rows were lost"):
@@ -222,8 +208,7 @@ def test_header_records_the_box_and_the_row_order(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The CLI's units decision. km/s is the DEFAULT (a halo finder is the consumer),
-# which is only possible when the checkpoint records its own epoch.
+# CLI units: km/s is the default when the checkpoint records its epoch.
 
 
 def _checkpoint(tmp_path, name, epoch=None, **prov):
@@ -239,9 +224,8 @@ def _checkpoint(tmp_path, name, epoch=None, **prov):
 
 
 def test_cli_defaults_to_km_per_second_off_a_recorded_epoch(tmp_path, capsys):
-    """The point of the whole change: no flags, and the file is km/s at the
-    epoch the checkpoint carries. Compared against the D-time file times the
-    factor, so the DEFAULT is pinned to a value and not merely to a label."""
+    """With no flags, the CLI writes km/s at the checkpoint's epoch, pinned to the values of a
+    direct km/s export and not merely to the header label."""
     ck = _checkpoint(tmp_path, "ck", epoch=(0.5, PLANCK))
     out = str(tmp_path / "out")
     assert export._main([ck, out]) == 0
@@ -261,9 +245,8 @@ def test_cli_defaults_to_km_per_second_off_a_recorded_epoch(tmp_path, capsys):
 
 
 def test_cli_falls_back_to_dtime_and_says_so_when_no_epoch_is_recorded(tmp_path, capsys):
-    """The pre-epoch artifacts -- the banked 2048^3 slabs among them -- carry no
-    epoch, and must still export. What is NOT allowed is doing it quietly: the
-    fallback names itself on stdout and in the header's provenance."""
+    """A checkpoint with no epoch exports D-time velocities, and says so on stdout and in the
+    header's provenance."""
     ck = _checkpoint(tmp_path, "ck", kind="inexor-checkpoint", step=3)
     out = str(tmp_path / "out")
     assert export._main([ck, out]) == 0
@@ -276,9 +259,8 @@ def test_cli_falls_back_to_dtime_and_says_so_when_no_epoch_is_recorded(tmp_path,
 
 
 def test_cli_flags_override_the_recorded_epoch(tmp_path):
-    """`--a` wins over a recorded epoch, and the header records that it did --
-    otherwise two files from one checkpoint differ with nothing to say why.
-    `--d-time` is the other explicit exit."""
+    """`--a` overrides a recorded epoch and the header records the override; `--d-time` forces
+    D-time."""
     ck = _checkpoint(tmp_path, "ck", epoch=(0.5, PLANCK))
 
     a_dir = str(tmp_path / "over")
@@ -295,8 +277,7 @@ def test_cli_flags_override_the_recorded_epoch(tmp_path):
 
 
 def test_cli_refuses_epoch_flags_that_cannot_act(tmp_path):
-    """A flag that is silently ignored writes a header claiming a cosmology that
-    never entered the file. Both directions refuse instead."""
+    """Epoch/cosmology flags that cannot act refuse rather than being silently ignored."""
     with_epoch = _checkpoint(tmp_path, "with", epoch=(0.5, PLANCK))
     without = _checkpoint(tmp_path, "without")
 
@@ -307,9 +288,8 @@ def test_cli_refuses_epoch_flags_that_cannot_act(tmp_path):
 
 
 def test_cli_cosmology_override_rides_on_the_recorded_epoch(tmp_path):
-    """`--omega-m` alone means "this epoch, that cosmology", which is the shape
-    a reader wants when the recorded cosmology is not the one they want to
-    convert with. The un-overridden fields come from the checkpoint."""
+    """`--omega-m` alone keeps the recorded epoch and overrides one cosmology field; the other
+    fields come from the checkpoint."""
     ck = _checkpoint(tmp_path, "ck", epoch=(0.5, PLANCK))
     out = str(tmp_path / "out")
     export._main([ck, out, "--omega-m", "0.25"])
@@ -322,9 +302,7 @@ def test_cli_cosmology_override_rides_on_the_recorded_epoch(tmp_path):
     assert head["peculiar_velocity_factor"] == want
     assert want != export.peculiar_velocity_factor(0.5, PLANCK), "override did not apply"
 
-    # The epoch and the cosmology now come from DIFFERENT places, so both the
-    # header and the terminal have to say so; reporting only the epoch would
-    # leave a reader thinking the checkpoint's own cosmology was used.
+    # epoch and cosmology come from different places; provenance must name both
     src = head["provenance"]["epoch_source"]
     assert "checkpoint epoch" in src and "Omega_m=0.25" in src, src
     assert head["cosmology"]["Omega_m"] == 0.25
@@ -332,12 +310,10 @@ def test_cli_cosmology_override_rides_on_the_recorded_epoch(tmp_path):
 
 
 def test_cli_announces_the_epoch_it_converted_at(tmp_path, capsys):
-    """`--omega-m`/`--h` work alone, which means the epoch and the cosmology can
-    come from different places. The terminal line has to name the epoch, the
-    cosmology and where each came from -- a velocity converted at a neighbouring
-    scale factor is off by tens of percent and looks entirely reasonable.
+    """The stdout line names the epoch, the cosmology, and where each came from.
 
-    The header carries the same three things, since stdout does not survive."""
+    A velocity converted at the wrong scale factor is off by tens of percent yet looks
+    plausible."""
     ck = _checkpoint(tmp_path, "ck", epoch=(0.5, PLANCK))
     export._main([ck, str(tmp_path / "out"), "--omega-m", "0.25"])
 
@@ -351,9 +327,7 @@ def test_cli_announces_the_epoch_it_converted_at(tmp_path, capsys):
 
 
 def test_dtime_export_records_no_cosmology(tmp_path):
-    """The header's `a` / factor / cosmology travel together: all three present
-    on a km/s file, all three None on a D-time one. A half-filled set is how a
-    reader ends up converting with numbers that were never applied."""
+    """`a`, factor and cosmology in the header are all None on a D-time export and set on km/s."""
     st = _evolved_state()
     d = str(tmp_path / "dtime")
     head = export.write_particles(st, d)
@@ -366,15 +340,12 @@ def test_dtime_export_records_no_cosmology(tmp_path):
     assert head["cosmology"] == dataclasses.asdict(PLANCK)
 
 
-# --- the streamed writer: the view-not-copy fix, and the writer thread ---
+# --- the streamed writer: byte views and the writer thread ---
 
 
 def test_append_writes_the_bytes_the_tobytes_form_wrote(tmp_path):
-    """`append` takes a flat byte VIEW of the cast block instead of copying it.
-
-    The control is the copy it replaced: same file bytes, same running crc32.
-    Chunked in three so the crc is exercised across calls rather than once.
-    """
+    """`append` writes the same bytes and running crc32 as the `tobytes()` form, over three
+    calls so the crc carries across appends."""
     rng = np.random.default_rng(0)
     block = rng.normal(size=(30, 3))
     path = tmp_path / "x.npy"
@@ -394,8 +365,8 @@ def test_append_writes_the_bytes_the_tobytes_form_wrote(tmp_path):
 
 
 def test_the_write_runs_off_the_main_thread(tmp_path):
-    """Anti-vacuity: without this the overlap could be absent and every value
-    test above would still pass, because a serial writer is also correct."""
+    """Appends run on the writer thread; value tests cannot see this, since a serial writer is
+    also correct."""
     import threading
 
     st = _evolved_state()
@@ -416,8 +387,7 @@ def test_the_write_runs_off_the_main_thread(tmp_path):
 
 
 def test_a_failure_on_the_writer_thread_surfaces(tmp_path):
-    """A write that raised on the worker must not leave a complete-looking
-    export: the header is the receipt and it is written last."""
+    """An exception on the writer thread propagates and no header is written."""
     st = _evolved_state()
     real = export._StreamedNpy.append
     calls = []
@@ -438,9 +408,8 @@ def test_a_failure_on_the_writer_thread_surfaces(tmp_path):
 
 
 def test_timings_report_the_parts_and_the_chunk_count(tmp_path):
-    """The parts are what price the leg on a metered node, so they are pinned
-    here rather than trusted. `write` is BLOCKED time and `write thread` is busy
-    time; reading the first as the write's duration understates the disk."""
+    """`timings` reports decode, write (main-thread blocked time), write thread (busy time) and
+    the chunk count."""
     st = _evolved_state()
     t = {}
     export.write_particles(st, str(tmp_path), chunk_bricks=8, timings=t)
@@ -451,11 +420,9 @@ def test_timings_report_the_parts_and_the_chunk_count(tmp_path):
 
 
 def test_append_does_not_copy_the_block_to_write_it(tmp_path):
-    """The view-not-copy fix has no effect on the BYTES, so the value tests
-    above cannot see it; what it changes is allocation, so that is what this
-    watches. The control is the `tobytes()` form it replaced, run on the same
-    block: the cast to f32 is the one copy the writer must take, and the old
-    form took a second one on top of it.
+    """`append` peaks under 1.5x the f32 payload (the cast is its only copy).
+
+    The `tobytes()` control must exceed 1.9x (a second copy), or the bound cannot discriminate.
     """
     import tracemalloc
 
@@ -478,12 +445,12 @@ def test_append_does_not_copy_the_block_to_write_it(tmp_path):
     def control():
         s = export._StreamedNpy(str(tmp_path / "b.npy"), blk.shape, np.float32)
         b = np.ascontiguousarray(blk, dtype=np.float32)
-        raw = b.tobytes()                      # the copy this fix removed
+        raw = b.tobytes()                      # the extra copy
         s._fh.write(raw)
         s.crc = zlib.crc32(raw, s.crc)
         s.rows += b.shape[0]
         s.close()
 
     assert _peak(fixed) < 1.5 * payload
-    assert _peak(control) > 1.9 * payload      # the control IS the defect
+    assert _peak(control) > 1.9 * payload
     assert (tmp_path / "a.npy").read_bytes() == (tmp_path / "b.npy").read_bytes()

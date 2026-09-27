@@ -1,4 +1,4 @@
-"""D6: the IC generator on the cards (`icgen.generate_t9_slabs_device`).
+"""The IC generator on the cards (`icgen.generate_t9_slabs_device`).
 
 The host generator is the oracle and stays untouched. What is exact here is gated
 bitwise (card counts, the card noise stream on the CPU backend); what differs by
@@ -95,8 +95,7 @@ def test_a_different_seed_is_a_different_realization(tmp_path):
     assert not np.array_equal(a.off, b.off)
 
 
-# PROPOSED bars (JC to confirm, 2026-09-14), from the floors measured at this fixture on
-# four forced host devices: float32 moved at most 1 position code and ~200 of 120,033
+# Bars from the floors measured at this fixture on four forced host devices: float32 moved at most 1 position code and ~200 of 120,033
 # velocity codes, each by exactly 1, with per-brick scales at <= 5.1e-7 relative;
 # float64 moved no code and scales at <= 5.6e-16. A code bar of 1 is a quantization
 # statement (roundoff can move a rounding by one code, never two); the scale bars are
@@ -150,10 +149,9 @@ def test_refusals(tmp_path):
 def test_host_allocation_is_what_the_planner_charges():
     """numpy's peak over a WARMED generation vs `plan.ic_device_stages`' host column.
 
-    Measured 2026-09-14 on four forced host devices: 1.06x at 128^3 and 1.02x at 256^3
-    (tracemalloc sees numpy, not jax arrays, which is the planner's host column). PROPOSED
-    bar: within [0.9, 1.2]. RSS is not the quantity: on CPU devices it also holds the
-    "cards".
+    Measured on four forced host devices: 1.06x at 128^3, 1.02x at 256^3 (tracemalloc
+    sees numpy, not jax arrays, which is the planner's host column); bar [0.9, 1.2]. RSS
+    is not the quantity: on CPU devices it also holds the "cards".
     """
     import tempfile
     import tracemalloc

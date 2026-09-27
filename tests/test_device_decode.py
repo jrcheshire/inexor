@@ -1,23 +1,10 @@
-"""D2a: the tile decode on the device, gated BITWISE against the host one.
+"""The device tile decode, gated bitwise against the host decode.
 
-Most device work in this project cannot carry a bitwise cross-backend gate --
-`tests/conftest.py`'s `detflag` marker exists because CUDA's f32 scatter-add is
-not reproducible. The decode can. It is elementwise integer arithmetic and one
-multiply, with no reduction, no scatter and nothing transcendental, so there is
-nothing for a GPU's ordering freedom to change. A tolerance here would be
-hiding something rather than accommodating it.
-
-Two things this file works hard at, because both have burned this project:
-
-- **The arena branch must actually run.** `SlotState.build` allocates arena rows
-  but nothing lands in them until a migrate overflows a brick, so the obvious
-  fixture exercises the arena path zero times while looking like it covers it.
-  Every arena test here asserts a nonzero resident count FIRST. (Measured while
-  writing this: the natural fixture gave 0 residents and the gate passed.)
-- **The host must not be doing per-particle work.** The whole point of the phase
-  is deleting a per-particle host pass, so a test asserts the plan's arrays are
-  O(bricks + arena) and never O(rows). A device decode fed by a host loop over
-  rows would pass every value comparison here and defeat the purpose.
+The decode is elementwise integer arithmetic and one multiply (no reduction, scatter or
+transcendental), so bit equality holds across backends and no tolerance is needed. Arena tests
+first assert a nonzero arena resident count: nothing lands in the arena until a migrate
+overflows a brick, so a plain fixture would skip that branch. The host plan is also gated to
+O(bricks + arena) size and work, since a host loop over rows would pass every value check.
 """
 
 import numpy as np
@@ -35,9 +22,7 @@ BRICKS = 2
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """The decode is f64 on both sides; with x64 off jax narrows it to f32 and
-    hands it back in an f64 container -- a wrong answer wearing the right
-    dtype, and the comparison would be against the host's real f64."""
+    """The decode is f64 on both sides; with x64 off jax would silently narrow to f32."""
     import jax
 
     prev = jax.config.jax_enable_x64
@@ -64,11 +49,9 @@ def _built(**kw):
 
 
 def _with_arena_residents():
-    """A state whose bricks have really overflowed into the arena.
+    """A state with arena residents: `brick_slack=0.0` forces migrants into the arena.
 
-    `brick_slack=0.0` leaves no spare in any brick, so the first migrate that
-    moves a particle across a brick boundary has to put it in the arena. The
-    caller asserts the count; this only sets it up.
+    The caller asserts the resident count.
     """
     st = _built(brick_slack=0.0, arena_frac=0.30)
     state.drift_and_migrate(st, 0.35)
@@ -114,7 +97,7 @@ def test_decode_is_bitwise_the_host_decode_with_no_arena_residents():
 
 
 def test_decode_is_bitwise_the_host_decode_WITH_arena_residents():
-    """The branch the obvious fixture never reaches."""
+    """The arena branch of the decode, with residents asserted present."""
     st = _with_arena_residents()
     bricks = _all_bricks()
     n_res = sum(len(st.arena_slots_of_brick(b)) for b in bricks)
@@ -131,10 +114,8 @@ def test_decode_is_bitwise_the_host_decode_WITH_arena_residents():
 
 
 def test_the_bitwise_comparison_can_fail():
-    """Anti-vacuity: one byte of `off` must move the decoded positions.
-
-    Without this, every equality above could be comparing two constants.
-    """
+    """Control: one byte of `off` must move the decoded positions, or the gates above
+    could be comparing two constants."""
     st = _built(arena_frac=0.25)
     bricks = _all_bricks()
     slots, x, _v, _bor = _host(st, bricks)
@@ -149,11 +130,10 @@ def test_the_bitwise_comparison_can_fail():
 
 
 def test_rows_stay_grouped_by_brick():
-    """`tile_task` replaces a sort with a run scan and asserts this itself: if a
+    """Each brick's rows are one contiguous run (order, not just the multiset).
 
-    brick appeared in two runs the second would overwrite the first's velocity
-    scale and decode every row of it wrong. The device decode has to preserve
-    the order, not merely the multiset.
+    `tile_task` scans runs instead of sorting; a brick in two runs would get the wrong velocity
+    scale.
     """
     st = _with_arena_residents()
     bricks = _all_bricks()
@@ -175,13 +155,11 @@ def test_padding_is_marked_not_live_and_does_not_move_the_real_rows():
     assert np.array_equal(np.asarray(tight["live"]), np.ones(m, bool))
     live = np.asarray(padded["live"])
     assert live[:m].all() and not live[m:].any()
-    # the padding must not perturb the real rows: one XLA shape, same answer
     assert np.array_equal(np.asarray(padded["x"])[:m], np.asarray(tight["x"])[:m])
 
 
 def test_every_output_has_the_padded_shape():
-    """One shape per `cap`, which is why `cap` is padded at all: a per-tile row
-    count keys a new XLA program, profiled at 74% of a step before the fix."""
+    """Every output has shape set by `cap`, so all tiles share one compiled XLA program."""
     st = _built(arena_frac=0.25)
     bricks = _all_bricks()
     cap = len(st.decode_bricks(bricks)[0]) + 11
@@ -194,11 +172,9 @@ def test_every_output_has_the_padded_shape():
 
 
 def test_the_host_plan_is_not_per_particle():
-    """The phase exists to DELETE a per-particle host pass. A device decode fed
+    """The host plan's arrays are O(bricks + arena), never O(rows).
 
-    by a host loop over rows would pass every value comparison in this file and
-    defeat the point, so the plan's own size is gated: O(bricks + arena), never
-    O(rows).
+    A device decode fed by a host loop over rows would pass every value comparison here.
     """
     from inexor.device import decode as dev
 
@@ -218,14 +194,10 @@ def test_the_host_plan_is_not_per_particle():
 
 
 def test_the_host_plan_does_not_copy_the_whole_index():
-    """The plan's OUTPUT is O(bricks + arena), and so must its WORK be.
+    """The host plan's peak allocation is well under an int64 copy of the whole index.
 
-    `test_the_host_plan_is_not_per_particle` gates array sizes, and a plan that
-    widens the entire occupancy index to int64 before slicing out its bricks
-    passes it: that copy is 8 B per bucket of the WHOLE state -- 68.7 GB per
-    chunk at 4096^3 -- and it was measured on a GB200 as host prep growing with
-    the state rather than the chunk (Vista 993350). Host allocation is gated
-    against the whole index instead.
+    Widening the whole occupancy index before slicing passes the size gate above but costs
+    8 B per bucket of the whole state (68.7 GB per chunk at 4096^3).
     """
     import tracemalloc
 
@@ -251,15 +223,11 @@ def test_the_host_plan_does_not_copy_the_whole_index():
 
 
 def test_x64_off_is_refused_rather_than_silently_narrowing_the_slots():
-    """The failure that is INVISIBLE at this file's own scale.
+    """With x64 off the decode raises instead of narrowing slot indices to int32.
 
-    With x64 off, `jnp.arange(cap, dtype=int64)` truncates to int32 and every
-    slot index narrows with it. At n_part=16 that changes nothing and the
-    bitwise gates above still pass; at c-hero the slot space is 8.3e10, 38x
-    past int32, so slots wrap, the gather reads the wrong rows and nothing
-    raises. Same contract and same reason as `eject_jax.require_x64`, and the
-    reason it is a refusal rather than a note is that no test at a runnable
-    size can catch it.
+    Narrowing is invisible at test scale but wraps slots at production scale (8.3e10 slots, 38x
+    past int32), so no runnable-size value test can catch it. Same contract as
+    `eject_jax.require_x64`.
     """
     import jax
 
@@ -279,11 +247,7 @@ def test_x64_off_is_refused_rather_than_silently_narrowing_the_slots():
 
 
 def _largest_intermediate(jaxpr):
-    """Element count of the largest array any equation produces, sub-jaxprs included.
-
-    Inputs and lifted constants are not equation outputs, so the state arrays
-    and the host plan do not count -- only what the decode itself allocates.
-    """
+    """Element count of the largest equation output, sub-jaxprs included (inputs excluded)."""
     best = 0
     for eqn in jaxpr.eqns:
         for v in eqn.outvars:
@@ -298,13 +262,9 @@ def _largest_intermediate(jaxpr):
 
 
 def test_no_intermediate_scales_as_rows_times_buckets_per_brick():
-    """The decode must be O(rows) on the device, not O(rows x buckets per brick).
+    """The traced decode's largest intermediate is O(rows), not O(rows x buckets per brick).
 
-    A bucket search that compares every row against its brick's whole prefix sum
-    builds a (rows, 512) table at every production config. That is invisible
-    here and fatal at scale: ~100 GB for one 4096^3 tile and ~1.1 TB for an
-    x-slab of bricks, against a 199 GB card. A value test cannot see it, so the
-    traced program's largest intermediate is gated instead.
+    A (rows, 512) search table is invisible to value tests but ~100 GB per 4096^3 tile.
     """
     import jax
 

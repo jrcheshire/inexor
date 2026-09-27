@@ -1,6 +1,5 @@
-"""D2e: a tile's coarse sub-block gathered from a device-resident shard, gated
-BITWISE against the host staging (`forces.stage_coarse_subblock`), which reads
-the global mesh directly and is independent of the shard's bookkeeping."""
+"""A tile's coarse sub-block gathered from a device-resident shard, gated bitwise against
+`forces.stage_coarse_subblock`, which reads the global mesh without the shard's bookkeeping."""
 
 import numpy as np
 import pytest
@@ -63,8 +62,7 @@ def test_a_partial_shard_is_bitwise_and_refuses_outside_planes():
 
 
 def test_a_mislabelled_shard_fails_the_comparison():
-    """Anti-vacuity: the same planes told they start one plane later read the
-    wrong block."""
+    """Control: the same planes labelled as starting one plane later read the wrong block."""
     g = _meshes()
     sh = dcoarse.shard_coarse_meshes(g, x0=6, nx=9)
     o = (8, 3, 3)

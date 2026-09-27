@@ -1,22 +1,8 @@
-"""The T9 state codec (D-v2-14): bucket-relative uint8 positions, int16 velocities.
+"""The T9 state codec: bucket-relative uint8 positions, int16 velocities, optional int32 ids.
 
-WHY THE CENTRAL TEST IS A BITWISE ONE. D-v2-14 was ratified on numbers measured
-by `scripts/v2_g2c_accum_gate.py` (job 896160) -- max |dP/P| 4.123e-4 and
-dP2/P0 2.035e-3 at bucket_cells=2, a 15x margin on D-v2-9's 3e-2 bar. That gate
-does not implement a codec: it applies `_rt_pos_lattice`, a float round trip on
-a global lattice, and says so in its own docstring ("measures REPRESENTATION
-error only; storage layout is a build decision"). This module takes the storage
-decision. If the shipped encoder is not numerically IDENTICAL to that round
-trip, then job 896160's numbers quietly stop describing what we ship, and the
-ADR is left resting on a measurement of something else.
-
-So the probe is imported unmodified as the oracle, and the assertion is exact
-elementwise equality over all three ratified bucket sizes. Tolerances would
-defeat the point: the two paths compute the same product from the same
-operands, so anything other than equality means the arithmetic diverged.
-
-x64 throughout, because the gate that produced the ratified numbers runs f64.
-The library never sets it -- callers do (house rule), so there is a fixture.
+Covers byte coverage, exact re-encode idempotence, half-quantum decode error, modular wrap
+at the box seam and bucket edges (never clamping), layout refusals, the int16 velocity
+range, and the id-tier boundary. x64 throughout via a fixture; the library never sets it.
 """
 
 
@@ -26,7 +12,7 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """Enable x64 for this module only, then restore (test_bispectrum.py pattern)."""
+    """Enable x64 for this module only, then restore."""
     import jax
 
     prev = jax.config.jax_enable_x64
@@ -35,12 +21,11 @@ def _x64():
     jax.config.update("jax_enable_x64", prev)
 
 
-# The ratified bucket ladder, as bucket side in PARTICLE cells. c=2 is D-v2-14's
-# choice; c=1 and c=4 are the arms that bracket it and also passed.
+# Bucket side in particle cells: 2 is the production choice, 1 and 4 bracket it.
 BUCKET_ARMS = (1, 2, 4)
 
 L_BOX = 128.0
-N_PART = 64  # -> n_fine 128, the probe's smoke geometry
+N_PART = 64  # -> n_fine 128
 
 
 def _positions(seed, n=8192, box=L_BOX):
@@ -58,14 +43,13 @@ def _layout(bucket_cells, n_part=N_PART, box=L_BOX):
     return T9Layout(box_size=box, n_part=n_part, bucket_cells=bucket_cells)
 
 
-# ------------------------------------------------------- the ratified gate
+# ------------------------------------------------------- input coverage
 
 
 @pytest.mark.parametrize("bucket_cells", BUCKET_ARMS)
 def test_offsets_use_the_whole_byte_and_the_input_is_not_degenerate(bucket_cells):
-    """Guards the gate above against passing vacuously. Two ways it could: an
-    all-zero position array would make any two codecs agree, and an offset field
-    that never leaves a corner of the byte would not exercise the encode."""
+    """Anti-vacuity: the test positions span the box and the encoded offsets span the
+    full byte, so the round-trip tests below exercise the whole encode."""
     import jax.numpy as jnp
 
     from inexor.codec import encode_positions
@@ -85,8 +69,8 @@ def test_offsets_use_the_whole_byte_and_the_input_is_not_degenerate(bucket_cells
 
 @pytest.mark.parametrize("bucket_cells", BUCKET_ARMS)
 def test_roundtrip_is_exactly_idempotent(bucket_cells):
-    """Re-encoding a decoded position must reproduce the same bytes. EXACT
-    integer equality -- this is a lattice identity, not an approximation."""
+    """Re-encoding a decoded position reproduces the same bytes exactly (a lattice
+    identity)."""
     import jax.numpy as jnp
 
     from inexor.codec import decode_positions, encode_positions
@@ -114,8 +98,7 @@ def test_decode_error_is_within_half_a_quantum(bucket_cells):
 
 @pytest.mark.parametrize("bucket_cells", BUCKET_ARMS)
 def test_decoded_position_lies_inside_its_own_bucket(bucket_cells):
-    """The offset is meaningless without this: it says the bucket index and the
-    stored byte describe the same point."""
+    """The bucket index and the stored byte describe the same point."""
     import jax.numpy as jnp
 
     from inexor.codec import decode_positions, encode_positions
@@ -129,12 +112,12 @@ def test_decoded_position_lies_inside_its_own_bucket(bucket_cells):
     assert bool(jnp.all(xd < lo + lay.bucket_size))
 
 
-# ------------------------------------------------- wrap, never clamp (D-007)
+# ------------------------------------------------------- wrap, never clamp
 
 
 def test_wrap_at_the_box_seam_is_modular_not_saturating():
-    """A particle pushed past the box edge must reappear at the low edge, not
-    pile up on the last lattice site."""
+    """A particle past the box edge reappears at the low edge rather than piling up on
+    the last lattice site."""
     import jax.numpy as jnp
 
     from inexor.codec import encode_positions, lattice_index, roundtrip_positions
@@ -154,8 +137,7 @@ def test_wrap_at_the_box_seam_is_modular_not_saturating():
 
 
 def test_crossing_a_bucket_edge_changes_the_bucket_not_the_byte_range():
-    """Migration, not saturation: stepping one quantum past a bucket's top
-    offset must land on offset 0 of the NEXT bucket."""
+    """One quantum past a bucket's top offset lands on offset 0 of the next bucket."""
     import jax.numpy as jnp
 
     from inexor.codec import LEVELS_PER_BUCKET, encode_positions
@@ -180,8 +162,8 @@ def test_layout_refuses_a_bucket_that_does_not_tile_the_box():
 
 
 def test_layout_refuses_a_non_power_of_two_lattice():
-    """Without this the quantum does not divide the box exactly and the seam
-    wrap saturates -- the failure D-007 exists to forbid."""
+    """Otherwise the quantum does not divide the box exactly and the seam wrap
+    saturates."""
     from inexor.codec import T9Layout
 
     with pytest.raises(ValueError, match="not a power of two"):
@@ -189,23 +171,17 @@ def test_layout_refuses_a_non_power_of_two_lattice():
 
 
 def test_layout_derives_the_ratified_c_gh_numbers():
-    """The arithmetic D-v2-14 is written in, checked end to end at the real
-    config: 2048^3 particles in 1024 Mpc/h, bucket 1.0 Mpc/h, quantum
-    fine_cell/64 with a 0.25 Mpc/h fine cell.
-
-    The index is the one number here that MOVED after ratification: 2.15 GB at
-    uint16, 4.29 GB now that it is uint32. Both are asserted -- the ratified
-    figure because D-v2-14 clause 2 is written in it, and the current default
-    because that is what a run costs."""
+    """Layout arithmetic at C-gh (2048^3 particles in 1024 Mpc/h): bucket 1.0 Mpc/h,
+    quantum fine_cell/64 with a 0.25 Mpc/h fine cell. Bucket index 2.15 GB at uint16,
+    4.29 GB at the uint32 default (0.50 B/particle)."""
     lay = _layout(bucket_cells=2, n_part=2048, box=1024.0)
-    fine_cell = lay.spacing / 2  # mesh ratio 2x (plan-plan Sec. 2)
+    fine_cell = lay.spacing / 2  # fine mesh is 2x the particle grid
     assert lay.spacing == pytest.approx(0.5)
     assert lay.bucket_size == pytest.approx(1.0)
     assert lay.quantum == pytest.approx(fine_cell / 64)
     assert lay.n_buckets_side == 1024
     assert lay.index_bytes(dtype=np.uint16) / 1e9 == pytest.approx(2.15, abs=0.01)
     assert lay.index_bytes() / 1e9 == pytest.approx(4.29, abs=0.01)
-    # 0.50 B/p against the ratified 0.25, on 2048^3 particles
     assert lay.index_bytes() / 2048**3 == pytest.approx(0.50, rel=0.01)
 
 
@@ -213,13 +189,8 @@ def test_layout_derives_the_ratified_c_gh_numbers():
 
 
 def test_probe_velocity_scale_escapes_int16_when_the_extremum_is_positive():
-    """A recorded finding, not a complaint about the probe. `_rt_vel_int16_max`
-    uses q = 2*max|v|/65536, so +max|v| maps to index +32768 -- one past int16.
-    In a float round trip that is invisible; in storage it is fatal, and whether
-    it bites depends on the SIGN of the extremum. Pinned here because the
-    shipped codec deviates from the probe on exactly this point, and the
-    deviation needs a reason that stays true.
-    """
+    """Why the codec does not use q = 2*max|v|/65536: +max|v| maps to +32768, one past
+    int16, so it escapes when the extremum is positive and fits when negative."""
     import jax.numpy as jnp
 
     rng = np.random.default_rng(7)
@@ -234,8 +205,8 @@ def test_probe_velocity_scale_escapes_int16_when_the_extremum_is_positive():
 
 
 def test_encoded_velocity_always_fits_int16():
-    """The property the probe's scale does not have, asserted on both signs of
-    the extremum and on a degenerate all-zero field."""
+    """The codec's scale keeps both signs of the extremum inside [-32767, 32767], and an
+    all-zero field gets a positive scale."""
     import jax.numpy as jnp
 
     from inexor.codec import assert_int16_range, encode_velocities, rint_i
@@ -255,9 +226,7 @@ def test_encoded_velocity_always_fits_int16():
 
 
 def test_velocity_does_not_clip_the_extremes():
-    """D-007 again, on the axis where a naive max-range codec is most tempted to
-    clamp: the fastest particle must decode back to itself, not to a saturated
-    edge value."""
+    """The fastest particle decodes back to itself, not to a saturated edge value."""
     import jax.numpy as jnp
 
     from inexor.codec import decode_velocities, encode_velocities

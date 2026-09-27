@@ -1,39 +1,20 @@
 """The pool executor: the engine's tile loop over persistent worker processes.
 
-Promoted from `scripts/v2_m6_c2_pool.py` (canary C2 of the wall plan), which
-keeps its own copy as the ratified skeleton. The design constraints, each
-measured or asserted rather than assumed:
-
-- **spawn, never fork** -- jax is loaded in the parent.
-- **Affinity BEFORE jax exists in the worker.** XLA-CPU sizes its spin-waiting
-  pool by the VISIBLE cores and ignores every thread env var (umbrella:
-  thread-count-is-part-of-the-pin). Job 466 measured the un-pinned
-  consequence on antares: walls GROWING with W (9.05 -> 11.50 s, W=2 -> 16)
-  as 16 workers each spun a 28-core pool. This is why nothing in this module
-  imports jax (or anything that imports jax) at module level: the spawned
-  child imports this module before `_worker_init` runs.
-- **The parent's `SlotState` arrays are ADOPTED into shared memory** at pool
-  creation and the parent's fields rebound to the shm views, so every
-  in-place mutation the parent makes (apply, migrate, the in-place repack) is
-  visible to workers with zero per-step copies. `repack` writes `brick_start`
-  and `occupancy` by contents for exactly this reason; the scalar
-  `arena_base` it moves rides the per-step task header instead.
-- **Why concurrent parent writes cannot change a consumed value:** the kick
-  consumes velocities only at OWNED rows, a brick is written only by the tile
-  that owns it, and positions are untouched by the kick -- so the
-  buffer-brick velocities a worker may decode mid-application are discarded
-  in every arm. The bitwise executor-identity gate is what certifies this.
-- **One backend per run.** cuFFT and XLA-CPU FFTs are not bitwise
-  interchangeable, so the pool is the CPU lane by construction: creation
-  REFUSES a non-CPU parent backend, and workers are spawned with
-  `JAX_PLATFORMS=cpu`. A device lane is a different executor (wall plan W3).
-- **Results are applied in ARRIVAL order**, deliberately: the canary's
-  bitwise gate passed that way on three architectures, which is the strong
-  form of the disjointness claim, and buffering for a fixed order would cost
-  W x cap x 14 B for auditability the partition assertion already provides.
-- **Transport is pickled results** (canary transport A, the configuration the
-  gg 10.4x was measured at); the shm-slab return path is the priced fallback
-  if a readout's idle numbers implicate pickling.
+- spawn, never fork (jax is loaded in the parent).
+- Affinity is set before jax loads in a worker: XLA-CPU sizes its spin-wait pool by the
+  visible cores and ignores thread env vars. Hence nothing here imports jax at module level
+  (a spawned child imports this module before `_worker_init` runs).
+- The parent's `SlotState` arrays are adopted into shared memory and its fields rebound to
+  the views, so parent in-place mutations (apply, migrate, repack) reach workers with no
+  per-step copy. `repack` writes `brick_start`/`occupancy` by contents for this reason;
+  the scalar `arena_base` rides the per-step header.
+- Concurrent parent writes cannot change a consumed value: the kick reads velocities only
+  at owned rows, each brick is written only by its owning tile, and positions are untouched,
+  so buffer-brick velocities a worker may see mid-apply are discarded. Pinned by the
+  bitwise executor-identity test.
+- CPU only: cuFFT and XLA-CPU FFTs are not bitwise interchangeable, so a non-CPU parent is
+  refused and workers run with `JAX_PLATFORMS=cpu`.
+- Results are applied in arrival order (tile writes are disjoint) and returned pickled.
 """
 
 import mmap
@@ -49,36 +30,21 @@ __all__ = ["SHM_FIELDS", "TilePool", "shm_backend", "has_memfd", "shm_capacity",
            "shm_terms", "preflight_shared_memory", "create_segment", "open_segment",
            "SHM_DIR"]
 
-# POSIX shared memory lives on a tmpfs, and its size is a SEPARATE budget from
-# host RAM -- the kernel default is half of it. `inexor.plan` priced the run
-# against the node's RAM and said FITS at 0.74x while the pool's share alone
-# was 1.16x of the tmpfs, because no table had ever named this budget. Vista
-# 920910 found it the expensive way: the 2048^3 ICs generated fine (rc=0, 90
-# min) and stepping took a SIGBUS 196 s later, inside pool construction,
-# having asked for 148.5 GB of a measured 127.6 GB /dev/shm (job 922332).
-#
-# The failure mode is why it has to be checked UP FRONT: `SharedMemory` sizes
-# lazily, so `create=True` succeeds for a segment the tmpfs cannot back and
-# the process dies on first TOUCH, with a bus error and no traceback.
+# POSIX shared memory lives on a tmpfs whose size is a separate budget from host RAM (half
+# of it by default). It must be checked up front: `SharedMemory` sizes lazily, so an
+# over-budget segment is created fine and the process dies with SIGBUS on first touch.
 SHM_DIR = "/dev/shm"
 
-# Every array field of SlotState the step reads or writes. `ids` is absent on
-# purpose: the tile loop never touches ids, so they stay parent-side and the
-# executor-identity gate proves they evolve identically. The POOLED MIGRATE
-# does touch ids (eject reads them, insert writes them), so a pool built on a
-# state that carries ids shares them too -- that is the per-instance `_fields`
-# list, not this constant, which keeps its meaning (and its script consumers).
+# The SlotState array fields the step reads or writes. `ids` is not here (the tile loop
+# never reads it); a pool on a state with ids adds it to its per-instance `_fields`, since
+# the pooled migrate reads and writes ids.
 SHM_FIELDS = ("off", "w", "occupancy", "brick_start", "vel_scale", "arena_bucket")
 
-# The migrate scratch (`stage_migrate`): one rolling window of K slab slots,
-# each holding a slab's ejected rows as keep-prefix + emig-suffix in the eject
-# output order (global brick-major -- ORDER IS CORRECTNESS, `_insert_slab`
-# walks it). `mig_scales` is the pass-start vel_scale snapshot: it rides shm
-# because the header is pickled per task and the snapshot is 8 B x n_bricks.
-
-# Bytes per (K, R) entry of the migrate scratch: int64 dest + 3 x uint8 off +
-# 3 x int16 w + int32 src. `mig_scales` is n_bricks, not K x R, so it is
-# priced separately; `mig_ids` adds 4 when the state carries ids.
+# The migrate scratch (`stage_migrate`) is a rolling window of K slab slots, each holding a
+# slab's ejected rows as keep-prefix + emig-suffix in eject output order (brick-major; the
+# order `_insert_slab` relies on). `mig_scales`, the pass-start vel_scale snapshot, is in
+# shm rather than the pickled header.
+# Bytes per (K, R) entry: int64 dest + 3 x uint8 off + 3 x int16 w + int32 src; +4 for ids.
 MIG_BYTES_PER_ENTRY = 8 + 3 * 1 + 3 * 2 + 4
 MIG_IDS_BYTES_PER_ENTRY = 4
 
@@ -86,11 +52,8 @@ MIG_IDS_BYTES_PER_ENTRY = 4
 def shm_capacity(path=SHM_DIR):
     """(total, available) bytes of the tmpfs backing POSIX shared memory.
 
-    `f_bavail`, not `f_bfree`: the unprivileged figure is the one this process
-    can actually get, and a run that dies for want of the root reserve dies
-    just as hard. Returns (None, None) where there is no such mount, which is
-    every non-Linux developer machine -- the caller then cannot check, and
-    says so rather than inventing a budget.
+    Available is `f_bavail` (what an unprivileged process can get). Returns (None, None)
+    where there is no such mount (e.g. macOS).
     """
     try:
         s = os.statvfs(path)
@@ -103,11 +66,8 @@ def shm_terms(*, n_rows, index_bytes, n_arena, n_bricks, n_coarse,
               coarse_itemsize, has_ids=False, mig_window=None, mig_rows=None):
     """The model of what `TilePool` puts in shared memory, term by term.
 
-    Geometry in, bytes out, so `inexor.plan` can price a configuration that
-    has never been built. The pool itself does NOT use this: it measures its
-    own arrays (`_shm_demand`), because a model standing between the check
-    and the allocation is a model that can be wrong in the direction that
-    matters. `test_executor.py` holds the two against each other.
+    Geometry in, bytes out, for `inexor.plan`. The pool itself checks its measured arrays
+    (`_shm_demand`), not this model; tests hold the two against each other.
     """
     t = {
         "off (n_rows,3) uint8": n_rows * 3 * 1,
@@ -132,16 +92,11 @@ def _fmt_gb(b):
 
 
 def check_shm_budget(terms, path=SHM_DIR, headroom=1.0):
-    """Refuse now, with a table, rather than take a bus error on first touch.
+    """Raise `MemoryError` (with a table) if `terms` do not fit the /dev/shm tmpfs.
 
-    `headroom` is a MULTIPLIER on the demand, not a subtracted constant: the
-    thing left out of `terms` (the migrate scratch, when the caller prices
-    only construction) scales with the run, not with the machine.
-
-    Returns the (demand, available) pair when it fits, so a caller can record
-    what it was standing on. Raises `MemoryError` when it does not, and does
-    nothing at all where the tmpfs cannot be read -- an absent check must not
-    read as a passed one, so it says which of the two happened.
+    `headroom` multiplies the demand (the unpriced migrate scratch scales with the run).
+    Returns `(demand, available)`; `available` is None where the tmpfs cannot be read, so an
+    unperformed check is distinguishable from a passed one.
     """
     demand = sum(terms.values())
     total, avail = shm_capacity(path)
@@ -179,19 +134,10 @@ _MEMFD_FN = None
 
 
 def _memfd_fn():
-    """`memfd_create`, from wherever this interpreter can reach it.
+    """`memfd_create` via `os` or, failing that, the runtime libc; None if absent (macOS).
 
-    **`hasattr(os, "memfd_create")` IS NOT THE CAPABILITY.** CPython gates
-    that attribute on a configure-time check against the BUILD sysroot, and
-    conda-forge builds against an old one: the gpu env's Python 3.14.6 has no
-    `os.memfd_create` while the system Python 3.9 on the same Vista node
-    does, and the kernel has had the syscall throughout. Trusting the
-    attribute silently put job 922557 back on the capped mount after the
-    whole point of the change was to leave it.
-
-    The runtime libc has the symbol regardless, so go through it. Cached
-    because the miss path is a `CDLL` load. Returns None where there really
-    is no memfd, which is macOS.
+    `os.memfd_create` depends on CPython's build-time sysroot, so it can be missing on a
+    kernel that has the syscall; libc has the symbol regardless. Cached.
     """
     global _MEMFD_FN
     if _MEMFD_FN is None:
@@ -222,11 +168,7 @@ _HAS_MEMFD = None
 
 
 def has_memfd():
-    """Whether this process can actually create a memfd, by CREATING one.
-
-    A probe, not an attribute test, for the reason above: the attribute lied
-    on the exact machine this runs on. One syscall, cached.
-    """
+    """Whether this process can create a memfd, tested by creating one. Cached."""
     global _HAS_MEMFD
     if _HAS_MEMFD is None:
         fn = _memfd_fn()
@@ -246,8 +188,7 @@ def has_memfd():
 def available_ram():
     """`MemAvailable` in bytes, or None where /proc/meminfo is not readable.
 
-    The budget for the `memfd` path. Not `MemFree`: page cache is reclaimable
-    and counting it as spoken-for would refuse runs that fit.
+    The budget for the `memfd` path (not `MemFree`, which counts reclaimable page cache).
     """
     try:
         with open("/proc/meminfo") as fh:
@@ -260,24 +201,11 @@ def available_ram():
 
 
 def adoption_peak(terms, adopted=()):
-    """Bytes this process must find ON TOP of what it already holds.
+    """Bytes needed above what the process already holds: `max(largest adopted, sum fresh)`.
 
-    **The demand is not the cost, and job 922682 was refused for the
-    difference.** The state arrays already exist in the parent when the pool
-    is built: `_share` copies each into a segment and rebinds `st`, dropping
-    the last reference to the private array, so an ADOPTED field releases its
-    own bytes as it is copied and nets to zero. Only two things are new --
-    the one field duplicated while its copy is in progress, and the segments
-    with no private counterpart (the coarse meshes).
-
-    So the peak above baseline is `max(largest adopted field, sum of fresh)`,
-    not `sum(everything)`. At c-gh that is the difference between 78.3 GB and
-    161.4 GB, and the second number refused a run the node could hold.
-
-    This is a MODEL of the release, and it is the one assumption here worth
-    naming: it holds only while nothing outside `st` still references those
-    arrays. `TilePool` is constructed before the step loop for exactly that
-    reason.
+    An adopted field is copied into a segment and its private array released, netting zero
+    except for the one field mid-copy; fresh segments (the coarse meshes) are all new.
+    Assumes nothing outside `st` still references the adopted arrays.
     """
     fresh = {k: v for k, v in terms.items() if k not in adopted}
     biggest_adopted = max((v for k, v in terms.items() if k in adopted), default=0)
@@ -285,21 +213,11 @@ def adoption_peak(terms, adopted=()):
 
 
 def preflight_shared_memory(terms, backend=None, headroom=1.0, adopted=()):
-    """Check the demand against whichever budget the backend actually has.
+    """Check the demand against the backend's own ceiling; raises `MemoryError` if over.
 
-    THE TWO BACKENDS HAVE DIFFERENT CEILINGS, and using the wrong one is how
-    this check would become decoration: `/dev/shm` is a hard tmpfs cap that
-    `memfd` is exempt from, while `memfd` is bounded by RAM, which `/dev/shm`
-    charges against as well but is not the first thing it hits.
-
-    They also differ in what ADOPTION buys. The tmpfs must hold every segment
-    at once no matter what the parent is holding, so posix is checked on the
-    total. RAM is not: an adopted field frees its private copy as it goes, so
-    memfd is checked on `adoption_peak`.
-
-    Returns (demand, budget, what) so a caller can record what it stood on;
-    `what` is None when nothing could be read, because an absent check must
-    not be recorded as a passed one.
+    `posix`: the total against the /dev/shm tmpfs cap (which must hold every segment).
+    `memfd`: exempt from that cap, so `adoption_peak` against `MemAvailable`.
+    Returns `(demand, budget, what)`; `what` is None when no budget could be read.
     """
     backend = backend or shm_backend()
     demand = sum(terms.values())
@@ -339,26 +257,11 @@ def preflight_shared_memory(terms, backend=None, headroom=1.0, adopted=()):
 def shm_backend():
     """`memfd` where the kernel has it, `posix` otherwise.
 
-    **`memfd` is the reason the c-gh run fits at all.** Both mechanisms hand
-    out the same thing -- anonymous RAM-backed shared pages, no device, no
-    I/O -- but `shm_open` puts them on the `/dev/shm` mount, whose size is
-    capped (half of RAM by default: 127.55 GB on a Vista gg node), while
-    `memfd_create` uses the kernel's internal shm mount, which has no size
-    limit at all. MEASURED on Vista: 2.147 GB of memfd raised `Shmem` by
-    2.139 GB (1.00x, so it really is those pages) and moved `/dev/shm` used
-    by 0.000. The state was never too big for the node; it was too big for
-    one doorway.
-
-    `posix` remains for every machine without `memfd_create`, which is every
-    macOS developer box, so the local suite exercises the fallback and the
-    cluster exercises the production path. The `/dev/shm` budget check
-    applies to that path ONLY -- see `check_shm_budget`.
-
-    `INEXOR_SHM_BACKEND` forces one. It exists because the choice is
-    otherwise made by the platform, which means the memfd path CANNOT be
-    exercised where this is developed and the posix path cannot be exercised
-    where it runs -- a gate neither machine can fail. It is also the escape
-    hatch if a node turns out not to expose `/proc/<pid>/fd` to a job.
+    Both give anonymous RAM-backed shared pages, but `shm_open` places them on the size-capped
+    `/dev/shm` mount while `memfd_create` uses the kernel's internal, uncapped shm mount.
+    `posix` is the fallback (e.g. macOS) and the only path the /dev/shm check applies to.
+    `INEXOR_SHM_BACKEND=memfd|posix` forces one, so each path can be exercised on any platform
+    (and as an escape hatch where `/proc/<pid>/fd` is not exposed).
     """
     forced = os.environ.get("INEXOR_SHM_BACKEND")
     if forced:
@@ -377,12 +280,8 @@ def shm_backend():
 class _Seg:
     """One shared mapping: created by the parent, opened by each worker.
 
-    The handle is what crosses the process boundary. For `posix` it is the
-    segment's name, as before. For `memfd` it is `(pid, fd)`, because the
-    object HAS no name -- a worker reaches it through `/proc/<pid>/fd/<n>`,
-    which is a second reference to the same file, not a copy. Verified with a
-    spawned interpreter: the child read what the parent wrote and the parent
-    saw the child's write back.
+    The handle crosses the process boundary: the segment name for `posix`; `(pid, fd)` for the
+    nameless `memfd`, which a worker opens via `/proc/<pid>/fd/<n>` (same file, not a copy).
     """
 
     __slots__ = ("kind", "buf", "handle", "nbytes", "_fd", "_shm")
@@ -403,9 +302,7 @@ class _Seg:
             self._shm.close()
 
     def unlink(self):
-        """No-op for memfd: it is ANONYMOUS, so it dies with its last
-        reference and there is no name left behind to remove. 920910 leaked
-        six `/dev/shm` segments on the way down; this kind cannot."""
+        """Unlink a posix segment; no-op for memfd (anonymous, freed with its last reference)."""
         if self.kind == "posix":
             self._shm.unlink()
 
@@ -432,8 +329,7 @@ def open_segment(handle):
     kind = handle[0]
     if kind == "memfd":
         _, pid, fd, nbytes = handle
-        # a NEW descriptor onto the same object; the mapping outlives it, and
-        # holding it open would pin a descriptor per worker per segment
+        # a new descriptor, closed once mapped (the mapping outlives it)
         dup = os.open(f"/proc/{pid}/fd/{fd}", os.O_RDWR)
         try:
             buf = mmap.mmap(dup, nbytes, mmap.MAP_SHARED,
@@ -449,16 +345,8 @@ def open_segment(handle):
 def malloc_trim():
     """Hand glibc's retained free arenas back to the OS. True if it did work.
 
-    `free()` does not shrink the process. After the slab loader releases ~86
-    GB of per-slab payload the allocator keeps those arenas, and the pool's
-    segments are FRESH KERNEL PAGES that cannot be served from them -- so the
-    two costs stack instead of cancelling. Job 922723 was OOM-killed 41 s into
-    pool construction with exactly that shape.
-
-    Not a no-op by assumption: it reports whether the call happened, so a
-    caller can record "trimmed" rather than infer it. glibc only; returns
-    False on macOS, where the allocator is different and this question does
-    not arise.
+    Needed because shared segments are fresh kernel pages that cannot reuse the arenas glibc
+    retains after the loader frees its per-slab payload. glibc only; False elsewhere.
     """
     try:
         import ctypes
@@ -473,17 +361,10 @@ def malloc_trim():
 
 
 class SharedAllocator:
-    """Hands out ndarray views backed by shared segments, so a producer can
-    write the state STRAIGHT into the memory the workers will read.
+    """ndarray views backed by shared segments, so a loader writes the state directly into the
+    memory the workers read (the state then exists once, not private + shared copy).
 
-    **This is what stops the state existing twice.** Before it, the loader
-    built ~135 GB of private arrays and `TilePool` then copied them into
-    another ~135 GB of segments, so a node had to hold both at once; at c-gh
-    on a 255 GB box, with the loader's own peak on top, it did not.
-
-    The registry is by `id()` of the view, which is sound only because the
-    allocator OWNS those buffers and keeps them alive for its lifetime -- an
-    id is reusable once its object dies, and none of these die early.
+    Registered by `id()` of the view, sound because the allocator keeps every view alive.
     """
 
     def __init__(self, backend=None):
@@ -506,8 +387,7 @@ class SharedAllocator:
         return view
 
     def segment_of(self, arr):
-        """The segment backing `arr`, or None if this allocator did not make
-        it. Identity, not equality: a copy of a shared array is not shared."""
+        """The segment backing `arr` (by identity), or None if this allocator did not make it."""
         hit = self._by_id.get(id(arr))
         return None if hit is None or hit[1] is not arr else hit[0]
 
@@ -530,13 +410,7 @@ _G = {}
 def worker_rss_bytes(pool):
     """Summed RSS of a Pool's worker processes, read from /proc.
 
-    THE PARENT CANNOT SEE THEM ANY OTHER WAY -- `ru_maxrss` is per-process,
-    and at cdev8 the workers held 21x the parent. The existing path rides
-    `rss_mb` back on tile results, which is a step too late: job 922905 died
-    in the nineteen seconds between the workers spawning and the first tile,
-    with MemAvailable going 74.1 -> 0.0 GB. Reading /proc needs no dispatch,
-    so it works before any task has run.
-
+    Needs no dispatch, so it works before any task has run (`ru_maxrss` is per-process).
     Returns (n_workers, total_bytes), or (n, None) off Linux.
     """
     procs = [p for p in getattr(pool, "_pool", []) if p.pid]
@@ -567,16 +441,9 @@ def _worker_init(shm_handles, shapes, dtypes, fields, small, fn_args, x64,
                  core_sets, rank_counter, paint_only=False):
     """Pin affinity, then attach shm views and build the jitted tile program.
 
-    `x64` replicates the PARENT's jax_enable_x64 into the worker -- the
-    library's never-touch-jax.config rule is about not overriding the caller's
-    choice, and a spawned worker starts without the caller's runtime, so
-    replicating it is how the choice propagates rather than being made here.
-
-    `paint_only` skips BOTH halves of the force arm: the three coarse-force
-    views and `make_tile_force_fn`. A coarse-paint-only consumer reads neither
-    (`_worker_coarse_task` touches the state and the painting kernel and
-    nothing else), and at c-hero the kernels are the larger per-worker term of
-    the two by a wide margin.
+    `x64` replicates the parent's jax_enable_x64 (propagating the caller's choice into a
+    fresh spawned process, not making one). `paint_only` skips the coarse-force views and
+    the tile kernel build, which `_worker_coarse_task` does not use.
     """
     if core_sets is not None and hasattr(os, "sched_setaffinity"):
         with rank_counter.get_lock():
@@ -609,10 +476,8 @@ def _worker_init(shm_handles, shapes, dtypes, fields, small, fn_args, x64,
 def _ensure_facade(C):
     """The worker's read-only SlotState, rebuilt once per DISPATCH EPOCH.
 
-    Not per task: the facade's lazy brick->arena index would otherwise be
-    reconstructed O(n_arena) per tile. And it must not survive an epoch
-    boundary, because migrate moves the arena and repack moves `arena_base`
-    between dispatches -- the header carries both the epoch and the scalar.
+    Not per task (its lazy brick->arena index is O(n_arena) to build), and never across an
+    epoch, since migrate and repack move the arena and `arena_base` between dispatches.
     """
     if _G["step"] != C["step"]:
         from inexor.state import SlotState
@@ -632,9 +497,7 @@ def _ensure_facade(C):
 def _ensure_scratch(M):
     """Attach the migrate scratch segments, re-attached when they are rebuilt.
 
-    Keyed on `mig_id`, which the parent bumps only when a segment is recreated
-    (the slot window or the slab capacity grew) -- names are stable otherwise,
-    so the common pass re-uses the open handles."""
+    Keyed on `mig_id`, which the parent bumps only when it recreates the segments."""
     if _G.get("mig_id") != M["mig_id"]:
         for seg in _G.get("mig_segs", ()):
             seg.close()
@@ -652,10 +515,10 @@ def _ensure_scratch(M):
 
 
 def _worker_migrate_eject(arg):
-    """Eject one slab into its scratch slot. NO shared bookkeeping is touched:
-    `release_arena=False` leaves the arena free list to the parent's serial
-    replay, and the slot's keep-prefix + emig-suffix layout preserves the eject
-    output order that `_insert_slab` depends on."""
+    """Eject one slab into its scratch slot, touching no shared bookkeeping.
+
+    `release_arena=False` leaves the arena free list to the parent's serial replay; the slot
+    layout preserves the eject output order `_insert_slab` depends on."""
     s, slot, M = arg
     st = _ensure_facade(M)
     scr = _ensure_scratch(M)
@@ -692,18 +555,17 @@ def _worker_migrate_eject(arg):
     return dict(
         kind="eject", s=int(s), slot=int(slot), n_keep=nk, n_emig=ne,
         realized_reach=rr, busy_s=time.perf_counter() - t0, worker=os.getpid(),
-        # the compiled-kernel receipt travels WITH the result: the parent's own
-        # eject_jax.CALLS cannot see a worker's, so a pooled card reading the
-        # parent counter would always say 0 and look like a broken instrument
+        # the parent's eject_jax.CALLS cannot see a worker's calls
         eject_jax_calls=eject_jax.CALLS - calls0,
     )
 
 
 def _worker_migrate_insert(arg):
-    """Insert one destination slab from scratch views. Brick payloads land in
-    shm directly (the C13-censused disjoint writes); arena SPILLS come back as
-    rows for the parent to claim at this brick's serial point, because slot
-    assignment is lowest-free-first and therefore order-dependent."""
+    """Insert one destination slab from scratch views.
+
+    Brick payloads are written to shm directly (disjoint per slab); arena spills are returned
+    for the parent to claim in serial order, since arena slot assignment is lowest-free-first
+    and therefore order-dependent."""
     d, slot_map, M = arg
     st = _ensure_facade(M)
     scr = _ensure_scratch(M)
@@ -743,7 +605,7 @@ def _worker_migrate_insert(arg):
 
 
 def _worker_alive(_):
-    """A no-op whose only job is to prove the initializer finished."""
+    """No-op task; its completion proves the initializer finished."""
     return os.getpid()
 
 
@@ -751,9 +613,6 @@ def _worker_task(arg):
     """One tile of the kick; the writes ride back for the parent to apply."""
     t, bricks, C = arg
     if _G["one_tile"] is None:
-        # the parent refuses this too (`TilePool._refuse_force`); the worker
-        # says it in its own voice so a dispatch that got past the parent does
-        # not surface as `NoneType is not callable` from inside tile_task
         raise RuntimeError(
             "tile task on a paint_only worker: this pool was built without the "
             "force arm, so there is no tile kernel and no coarse mesh here"
@@ -768,12 +627,10 @@ def _worker_task(arg):
 
 
 def _worker_coarse_task(arg):
-    """One coarse-paint chunk: decode -> sub-block integer paint (W2 Stage C).
+    """One coarse-paint chunk: decode -> sub-block integer paint; returns the sub-block.
 
-    The ACCUMULATION stays in the parent, where integer associativity makes
-    any application order bitwise the serial one; a worker only ever returns
-    its chunk's bounded sub-block. Mirrors the sub-block branch of
-    `engine.coarse_delta_streamed` line for line."""
+    The parent accumulates, where integer associativity makes any arrival order bitwise the
+    serial one. Mirrors the sub-block branch of `engine.coarse_delta_streamed`."""
     gi, bricks, H = arg
     st = _ensure_facade(H)
     import jax.numpy as jnp
@@ -807,29 +664,20 @@ def _worker_coarse_task(arg):
 class TilePool:
     """W persistent workers sharing the caller's state through shared memory.
 
-    Lifecycle: `run` creates one per pooled run and MUST `close()` it (run's
-    `finally` does) -- creation rebinds the caller's `SlotState` fields to shm
-    views, and `close()` gives them regular memory back before unlinking, so
-    the state object outlives the pool either way.
+    Construction rebinds the caller's `SlotState` fields to shm views; `close()` (which `run`
+    always calls) gives pool-created fields regular memory back before unlinking, so the state
+    outlives the pool. `allocator` fields already in shared memory are adopted without copy.
 
-    `paint_only=True` builds the COARSE-PAINT half and nothing else: no coarse
-    force meshes in the parent, no force kernels in the workers. It exists for
-    consumers that stream the paint without ever computing a force -- the P(k)
-    card is the one -- and it is not an optimisation but an admissibility
-    condition at hero scale: the three f32 meshes are `3 * n_coarse**3`, which
-    is 103.1 GB at c-hero, against the ~186 GB the card leg has free over its
-    839.5 GB peak (measured, gb 1010938). The force entry points refuse in
-    this mode rather than reading a mesh nobody published.
+    `paint_only=True` builds only the coarse-paint half (no coarse force meshes, no tile
+    kernels), for consumers like the P(k) card; at large n_coarse the three meshes would not
+    fit beside the state. Force entry points then raise.
     """
 
     def __init__(self, st, cfg, allocator=None, paint_only=False):
         import jax
 
         if jax.default_backend() != "cpu":
-            # a CUDA parent with CPU workers would put the two force arms on
-            # backends whose FFTs are not bitwise-interchangeable -- and the
-            # mesh-ladder precedent (antares 409) is that a wrong backend must
-            # VOID the run loudly, not degrade it
+            # CPU workers under a GPU parent would mix non-bitwise-interchangeable FFT backends
             raise ValueError(
                 f"TilePool is the CPU lane and the parent backend is "
                 f"{jax.default_backend()!r}; the device lane is a different executor"
@@ -841,10 +689,7 @@ class TilePool:
         self._segs = []
         self._adopted = []
         self._names, self._shapes, self._dtypes, self._views = {}, {}, {}, {}
-        # ids join the shared set only when the state carries them: the tile
-        # loop never touches ids, but the pooled migrate reads them at eject
-        # and writes them at insert, and a facade with `ids=None` would strand
-        # the parent's column silently.
+        # ids are shared when present: the pooled migrate reads and writes them
         self._fields = SHM_FIELDS + (("ids",) if st.ids is not None else ())
         self._mig_segs = {}
         self._mig_views = {}
@@ -852,15 +697,8 @@ class TilePool:
         self._mig_id = 0
         self._M = None
         n = int(cfg.n_coarse)
-        # BEFORE the first `SharedMemory(create=True)`, because after it the
-        # failure is a bus error on touch rather than an exception. Measured
-        # from the arrays themselves, not modelled: this is the check, and a
-        # check that prices something other than what it is about to allocate
-        # is the shape of a gate that cannot fail.
-        # Arrays the allocator already made are ALREADY in shared memory: the
-        # loader wrote them there. They cost nothing to adopt and must not be
-        # priced as if they did, or the check refuses a run whose whole point
-        # was to avoid the second copy.
+        # Preflight before any segment is created (after, an overrun is a SIGBUS), from the
+        # actual arrays. Arrays the allocator already placed in shared memory cost nothing.
         self._alloc = allocator
         self._preshared = {
             f for f in self._fields
@@ -876,16 +714,10 @@ class TilePool:
             self._shm_demand["coarse force g0,g1,g2"] = int(
                 3 * n**3 * np.dtype(cfg.np_coarse_dtype).itemsize
             )
-        # The migrate scratch is staged per step and its (K, R) is not known
-        # until the first `stage_migrate`, so it cannot be measured here. It
-        # is real all the same, so the construction demand is held to a
-        # margin rather than to the bare ceiling.
+        # margin for the migrate scratch, whose (K, R) is unknown until `stage_migrate`
         self._shm_headroom = 1.10 if cfg.tile_workers > 1 else 1.0
         self._shm_backend = shm_backend()
-        # `self._fields` are ADOPTED: they exist in the parent right now and
-        # each releases its private copy as `_share` rebinds it. The coarse
-        # meshes are fresh. That distinction is the whole check on the memfd
-        # path -- see `adoption_peak`.
+        # fields free their private copy as they are shared; the coarse meshes are fresh
         self._shm_receipt = preflight_shared_memory(
             self._shm_demand, backend=self._shm_backend,
             headroom=self._shm_headroom,
@@ -895,13 +727,12 @@ class TilePool:
             arr = np.asarray(getattr(st, f))
             seg = None if self._alloc is None else self._alloc.segment_of(arr)
             if seg is not None:
-                # already in shared memory; register its handle and DO NOT copy
+                # already in shared memory: register, do not copy
                 self._adopt(f, seg, arr)
                 continue
             view = self._share(f, np.asarray(getattr(st, f)))
             setattr(st, f, view)
-        # the parent's cached brick->arena index maps into the OLD array;
-        # values are equal but the invariant is identity, so rebuild lazily
+        # the cached brick->arena index refers to the old arrays
         st._invalidate_arena_index()
         if not self.paint_only:
             for i in range(3):
@@ -921,10 +752,8 @@ class TilePool:
                          for i in range(self.workers)]
         ctx = mp.get_context("spawn")
         rank_counter = ctx.Value("i", 0)
-        # inherited at spawn, which is the only reliable channel: the child
-        # imports numpy (module import) before any initializer code runs, so
-        # setting these inside the worker would be too late. Restored after
-        # the workers exist so the parent's environment is not repainted.
+        # Set for the children via the inherited environment (they import numpy before the
+        # initializer runs), then restored in the parent.
         saved = {k: os.environ.get(k) for k in ("OMP_NUM_THREADS", "JAX_PLATFORMS")}
         os.environ["OMP_NUM_THREADS"] = "1"
         os.environ["JAX_PLATFORMS"] = "cpu"
@@ -942,11 +771,8 @@ class TilePool:
                 else:
                     os.environ[k] = v
         if os.environ.get("INEXOR_LOAD_TRACE"):
-            # AFTER A BARRIER. `ctx.Pool()` returns when the processes exist,
-            # not when `_worker_init` has finished importing jax and building
-            # kernels, so reading /proc here measured newborn processes: job
-            # 922991 reported 0.01 GB per worker and then died as they grew.
-            # A dispatched task cannot run until the initializer has returned.
+            # Barrier first: `ctx.Pool()` returns before `_worker_init` finishes, and a task
+            # cannot run until it has.
             self._pool.map(_worker_alive, range(4 * self.workers))
             n, tot = worker_rss_bytes(self._pool)
             avail = available_ram()
@@ -958,13 +784,8 @@ class TilePool:
     def _adopt(self, key, seg, arr):
         """Register an array the allocator already put in shared memory.
 
-        The zero-copy path. `st` is not rebound because the array it holds IS
-        the shared view.
-
-        Deliberately NOT added to `self._segs`: that list is what `close()`
-        closes and unlinks, and these segments belong to the allocator. The
-        pool freeing them would pull the state out from under a caller that
-        is still using it -- and a segmented run resumes into exactly that."""
+        Zero-copy; `st` already holds the shared view. Not added to `self._segs`: the segment
+        belongs to the allocator, and `close()` must not unlink state a caller still uses."""
         self._adopted.append(seg)
         self._names[key], self._shapes[key], self._dtypes[key] = (
             seg.handle, tuple(arr.shape), str(arr.dtype))
@@ -988,18 +809,14 @@ class TilePool:
     def g_views(self):
         """The three coarse-force shm views, for a caller that can solve INTO them.
 
-        `TilePool` allocates these at construction and the workers read them
-        every tile, so a caller that writes its solve straight here saves the
-        whole parent-side triple: `stage_step` then finds `a is buf` and copies
-        nothing. At C-gh that is 12.9 GB of the 25.8 the old jax-list-then-numpy
-        -copy shape carried. Returned as a list in component order.
+        Solving into these saves a parent-side copy of the triple: `stage_step` then sees
+        `a is buf` and copies nothing. A list in component order.
         """
         self._refuse_force("g_views")
         return [self._views[f"g{i}"] for i in range(3)]
 
     def _refuse_force(self, what):
-        """A paint-only pool has no force arm, and must say so rather than
-        KeyError on a mesh that was never allocated."""
+        """Raise if this is a paint-only pool (no force meshes, no tile kernel)."""
         if self.paint_only:
             raise RuntimeError(
                 f"{what} on a paint_only TilePool: this pool has no coarse "
@@ -1019,11 +836,7 @@ class TilePool:
                     f"pool's {buf.shape}/{buf.dtype} -- the mesh geometry moved "
                     "under a live pool"
                 )
-            # `is`, not `==`: a caller that solved into `g_views()` has already
-            # written the segment, and `buf[...] = buf` would be a full
-            # self-copy of a 4.3 GB mesh for nothing. Identity is the right test
-            # because it is exactly the question being asked -- did this array
-            # come from here.
+            # identity: a solve into `g_views()` already wrote the segment
             if a is not buf:
                 buf[...] = a
         self._step += 1
@@ -1038,10 +851,8 @@ class TilePool:
         return self._pool.imap_unordered(_worker_task, [(t, b, C) for t, b in tasks])
 
     def stage_coarse(self, H):
-        """Publish the coarse-paint header (W2 Stage C). No arrays move: the
-        workers read state through shm and the mesh accumulates parent-side.
-        Its own epoch, distinct from the tile loop's, so the facade is rebuilt
-        after the migrate that ended the previous step."""
+        """Publish the coarse-paint header. No arrays move; the mesh accumulates parent-side.
+        Starts a new epoch so the worker facade is rebuilt after the previous migrate."""
         self._step += 1
         self._H = dict(H, step=self._step, arena_base=int(self.st.arena_base))
 
@@ -1068,13 +879,10 @@ class TilePool:
     def stage_migrate(self, c_drift, kernel, r, slot_rows, window):
         """Publish one migrate pass: scratch window, scales snapshot, header.
 
-        Scratch is sized PER PASS (`repack` moves `brick_start`, so slab
-        capacities change between steps) and recreated only when the
-        requirement grows; `mig_id` tells workers when to re-attach. The
-        `vel_scale` snapshot is written here, before any task is dispatched --
-        inserts rewrite the live array while later ejects must decode at
-        pre-pass scales, exactly the serial pass's copy at state.py's
-        `drift_and_migrate`."""
+        Scratch is sized per pass (slab capacities change with `repack`) and recreated only when
+        it must grow; `mig_id` tells workers to re-attach. The `vel_scale` snapshot is taken
+        before dispatch because inserts rewrite the live array while later ejects must decode
+        at pre-pass scales (as in the serial `drift_and_migrate`)."""
         has_ids = self.st.ids is not None
         K, R = int(window), int(slot_rows)
         n_bricks = int(np.atleast_1d(self.st.vel_scale).shape[0])
@@ -1123,9 +931,7 @@ class TilePool:
         )
 
     def next_migrate_result(self):
-        """Blocking arrival-order get; a worker exception is re-raised HERE, in
-        the driver's loop, so a failed pass dies loudly instead of hanging the
-        backpressure window."""
+        """Blocking arrival-order get; re-raises a worker exception here rather than hanging."""
         item = self._mig_q.get()
         if isinstance(item, BaseException):
             raise item
@@ -1136,16 +942,8 @@ class TilePool:
             self._pool.close()
             self._pool.join()
             self._pool = None
-        # Give the caller's state regular memory back BEFORE unlinking, or the
-        # arrays would be views into freed segments.
-        #
-        # ONLY the fields THIS POOL SHARED. An ADOPTED field is the allocator's
-        # segment, which `close()` deliberately does not unlink (see `_adopt`),
-        # so copying it back buys nothing and costs a second whole state: at
-        # c-hero that is 754.6 GB on top of the 754.6 already resident, on a
-        # 1026 GB node. The same "state exists twice" fault that OOM-killed
-        # 922723 at construction, in the teardown instead -- and invisible
-        # below hero scale, where the state is 1.4 GB and the copy is free.
+        # Copy pool-shared fields back to regular memory before unlinking. Allocator-owned
+        # fields stay in their (not unlinked) segments; copying them would double the state.
         for f in self._fields:
             if f in self._preshared:
                 continue

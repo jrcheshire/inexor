@@ -1,43 +1,21 @@
-"""Compiled twin of `_eject_slab`'s row work: drift, re-home, and partition.
+"""Compiled twin of `SlotState._eject_slab`'s row work: drift, re-home, and partition.
 
-**Why this is a separate module.** `state.py` must not import jax at module
-level. `executor.TilePool` sets worker CPU affinity BEFORE jax exists in the
-process (M-v2-6 Stage B), and `state` is imported by every worker, so a
-module-level `import jax` there would defeat that ordering. Everything here is
-imported lazily, on the first call that asks for the compiled path.
+Separate from `state.py` because state must not import jax at module level (`executor.TilePool`
+sets worker CPU affinity before jax loads); everything here is imported lazily. The arithmetic
+is duplicated rather than shared on purpose: the gate is elementwise equality against the numpy
+path, which only means something if the two implementations are independent.
 
-**Why it duplicates the arithmetic rather than sharing it.** The umbrella record
-`ab_arms_sharing_code_are_policy_blind` is the reason: an A/B whose arms run the
-same lines cannot see a change to those lines. The gate for this module is
-elementwise equality against `SlotState._eject_slab`'s own numpy, so the two
-implementations are deliberately independent and the duplication IS the control.
+The partition is global and stable: every keeper in brick-major order, then every leaver in
+brick-major order, which is the order `_eject_slab`'s concatenation produces, so both results are
+contiguous slices of one buffer. Stability is required: `_insert_slab` assigns slots by walking
+this order, so any reordering changes the physical layout and breaks bitwise equality.
 
-**What is compiled, and what is not.** Section 5n decomposed `_eject_slab` on two
-architectures: the drift/re-home arithmetic is 27.6-35.1% of the call and the
-keep/leave partition is 30.2-30.5%, both 20-80x above the machine's measured
-single-core traffic floor. Those two are here. Slot resolution, the slot gather
-and the arena splice (29-31%) stay in `state.py`: they are pointer-chasing and
-sit at 8-30x the floor, where much less is available.
+Padding: `n + 1` rows are padded onto `forces.capacity_shape`'s ladder at `PAD_RUNGS_PER_OCTAVE`
+so slabs with nearby counts share one compiled program; the `+ 1` guarantees at least one padded
+row. Padded rows are neither keepers nor leavers and land at positions the host never reads.
 
-**The partition is GLOBAL and STABLE, and the "global" is what makes it cheap.**
-`_eject_slab` builds per-brick keeper and leaver lists and hands them to `_cat`,
-which concatenates all bricks' keepers into one array and all bricks' leavers
-into another. So the target order is not per-brick at all: it is every keeper in
-brick-major order, then every leaver in brick-major order. Producing exactly that
-makes both results contiguous SLICES of one buffer, so the host does no gather
-and no concatenate. Stability is a correctness requirement rather than a
-preference: `_insert_slab` assigns slots by walking this order, so a reordering
-changes the state's physical layout and breaks the bitwise chain even though no
-particle is lost.
-
-**Padding.** Row counts per slab drift as occupancy evolves, and a fresh shape is
-a fresh XLA compilation (umbrella `jax_shape_recompile_cache`). `n + 1` rows are
-padded up onto `forces.capacity_shape`'s global ladder at `PAD_RUNGS_PER_OCTAVE`
-(<= 6% extra rows), so slabs whose counts differ by a fraction of a percent share
-one program -- a multiple of 4096 gave nearly every 4096^3 slab its own. The `+ 1`
-keeps at least one padded row in every call, so the masking is never dead code.
-Padded rows are marked not-real, are counted as neither keepers nor leavers, and
-are parked at output positions the host slice never reads.
+`device/migrate.py` reuses `_build`, `_padded` and `_CACHE` with the same key: a change to the
+signature or key must land in both.
 """
 
 from __future__ import annotations
@@ -50,11 +28,7 @@ PAD_RUNGS_PER_OCTAVE = 12
 
 _CACHE: dict = {}
 
-#: RECEIPT, not telemetry. A knob that selects this path must be able to prove it
-#: applied -- a run whose `eject_kernel="jax"` silently fell back would read as a
-#: null result for the compiled path rather than as a broken instrument, and this
-#: milestone has already shipped one card whose arm never ran. Probes read this
-#: before and after a timed region and put the delta on the card.
+#: Call count: lets a run that selects `eject_kernel="jax"` prove the compiled path ran.
 CALLS = 0
 
 
@@ -65,13 +39,11 @@ def _padded(n):
 
 
 def require_x64():
-    """x64 or nothing, and it must be LOUD.
+    """Raise unless jax_enable_x64 is on.
 
-    `jax_enable_x64` is the caller's choice by this repo's convention and library
-    code never toggles it. But with it off, `jnp.int64` silently becomes int32,
-    the global lattice index overflows, and destinations are wrong with no
-    exception and a bitwise gate that fails without saying why. So the compiled
-    path refuses to exist rather than degrade.
+    The library never toggles x64 (callers opt in), but with it off `jnp.int64`
+    silently becomes int32 and the lattice index overflows, so compiled paths
+    refuse rather than degrade.
     """
     import jax
 
@@ -96,12 +68,10 @@ def _build(t9, nb, n_pad, has_ids):
 
     @jax.jit
     def kernel(off, bijk, w, ids, scale, c_drift, brick_id, real):
-        # built INSIDE the trace: outside, it is a captured constant of n_pad
-        # int64s baked into the executable (2.15 GB at a 4096^3 slab)
+        # built inside the trace; outside it would be a constant baked into the executable
         idx_all = jnp.arange(n_pad, dtype=jnp.int64)
-        # --- the drift, in the integer domain (D-007). The expression SHAPE is
-        # held identical to state._eject_slab's so equality is by construction
-        # rather than by an exponent coincidence ---
+        # the drift, in the integer domain; expression shape identical to
+        # state._eject_slab's so equality holds by construction
         i = bijk * LEVELS_PER_BUCKET + off.astype(jnp.int64)
         x = i.astype(jnp.float64) * q
         v = w.astype(jnp.float64) * scale
@@ -114,25 +84,18 @@ def _build(t9, nb, n_pad, has_ids):
         wf = (within[:, 0] * per + within[:, 1]) * per + within[:, 2]
         dest = bf * p3 + wf
 
-        # A padded row is neither a keeper nor a leaver, so it cannot shift any
-        # real row's rank in either run.
-        #
-        # TWO GUARDS, REDUNDANT SINGLY AND LOAD-BEARING TOGETHER, and this is
-        # measured rather than asserted: mutation-testing removed `real` here
-        # (7/7 still pass, the -1 brick sentinel catches it) and separately
-        # changed the sentinel to 0 (7/7 still pass, `real` catches it), while
-        # removing BOTH fails 5 of 7. So no test can defend either one alone.
-        # Do not "simplify" one away on the strength of a green suite.
+        # Padded rows are excluded by two guards, `real` and the -1 brick sentinel. Each
+        # alone suffices, so no test can defend either singly: do not remove one because
+        # the suite stays green.
         stay = jnp.logical_and((dest // p3) == brick_id, real)
         leave = jnp.logical_and(jnp.logical_not(stay), real)
 
-        # --- the global stable partition: keepers, then leavers ---
+        # global stable partition: keepers, then leavers
         ex_keep = jnp.cumsum(stay) - stay
         ex_leave = jnp.cumsum(leave) - leave
         n_keep = ex_keep[-1] + stay[-1]
         pos_real = jnp.where(stay, ex_keep, n_keep + ex_leave)
-        # padded rows keep their own index, which is >= the real row count by
-        # construction, so they can never collide with a real row's position
+        # padded rows keep their own index (>= the real row count): no collision
         pos = jnp.where(real, pos_real, idx_all)
 
         order = jnp.zeros(n_pad, dtype=jnp.int64).at[pos].set(idx_all)
@@ -181,8 +144,7 @@ def eject_rows(t9, nb, off, bijk, w, ids, scale, c_drift, brick_id):
         jnp.asarray(_pad(ids, 0)) if has_ids else None,
         jnp.asarray(_pad(scale, 1.0)),
         float(c_drift),
-        # -1 can match no brick, so a padded row cannot be classified a keeper
-        # even before `real` masks it
+        # -1 matches no brick
         jnp.asarray(_pad(brick_id, -1)),
         jnp.asarray(real),
     )

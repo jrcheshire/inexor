@@ -1,27 +1,25 @@
-"""Check a P(k) card's nonlinear boost against CAMB halofit / HMcode.
+"""Check a P(k) card's nonlinear boost against CAMB halofit / HMcode and EuclidEmulator2.
 
     pixi exec --spec camb --spec matplotlib --spec numpy -- \
-        python scripts/compare/pk_boost_reference.py runs/v2/d7f_1013309_hero_pk.json \
-        -o figures/hero_pk_boost.png
+        python scripts/compare/pk_boost_reference.py RUN/pk_card.json \
+        --cosmology RUN/export.json -o figures/hero_pk_boost.png
 
-Run through `pixi exec`, not the project env: camb is a one-off reference here,
-not a dependency of the engine, and adding it would move `pixi.lock`.
+Run through `pixi exec`, not the project env: camb is a one-off reference, not an
+engine dependency, and adding it would move `pixi.lock`. EuclidEmulator2 is used if
+`euclidemu2` imports (see `ee2_ratio_figure.py` for its install), else skipped.
 
-THE COMPARED QUANTITY IS THE BOOST, B(k) = P_nl(k) / P_lin(k), each side
-against ITS OWN linear theory. The card's oracle is full EH98 (`cosmology.py`,
-Eq. 16, sigma8-normalized) and CAMB's is a Boltzmann solve; they differ by a
-few percent in shape and in the wiggles, and that difference is not what this
-is measuring. Taking a ratio of ratios cancels most of it. Comparing P to P
-directly would fold the transfer-function difference into the answer and read
-as a nonlinear-modeling discrepancy.
+The compared quantity is the boost B(k) = P_nl(k) / P_lin(k), each side against its
+own linear theory: the card's oracle is EH98 (`cosmology.py`, sigma8-normalized) and
+CAMB's is a Boltzmann solve. They differ by a few percent in shape and wiggles; the
+ratio of ratios cancels most of that, where P vs P would read it as a nonlinear-
+modeling discrepancy.
 
-WHAT THIS CAN AND CANNOT SETTLE. HMcode2020 is quoted at a few percent for
-LCDM over the k and z here, so this is a sanity check at the several-percent
-level -- enough to say whether a boost of ~5x at k = 1 is the right size, not
-enough to validate one. And at the top of the band the card is measured on the
-coarse mesh, where PM force resolution and mass assignment both suppress power
-while real nonlinearity raises it; agreement there mixes the two. The band this
-argument is clean over is roughly k < 0.5 h/Mpc.
+Scope: HMcode2020 is quoted at a few percent for LCDM here, so this is a sanity
+check at the several-percent level (is a ~5x boost at k = 1 the right size), not a
+validation. At the top of the band the card is on the coarse mesh, where PM force
+resolution and mass assignment suppress power while nonlinearity raises it; the
+comparison is clean for roughly k < 0.5 h/Mpc. The cosmology must come from the card
+or `--cosmology`; there is no default.
 """
 
 import argparse
@@ -45,15 +43,13 @@ def camb_boost(cos, z, kmax, version):
         omch2=(cos["Omega_m"] - cos["Omega_b"]) * h * h,
         ns=cos["n_s"],
         TCMB=cos.get("T_cmb_K", 2.7255),
-        # the engine's Cosmology carries no neutrino mass, so match it rather
-        # than inherit CAMB's default 0.06 eV
+        # the engine's Cosmology has massless neutrinos; CAMB defaults to 0.06 eV
         mnu=0.0, num_massive_neutrinos=0, omk=0.0,
         halofit_version=version,
     )
     pars.set_matter_power(redshifts=[z], kmax=max(kmax * 2.0, 10.0))
 
-    # sigma8 is an OUTPUT of a Boltzmann solve, so hit the target by rescaling
-    # the primordial amplitude: P ~ As, sigma8 ~ sqrt(As).
+    # sigma8 is an output of the solve: rescale As to hit it (sigma8 ~ sqrt(As))
     pars.NonLinear = camb.model.NonLinear_none
     s8 = camb.get_results(pars).get_sigma8_0()
     pars.InitPower.As = pars.InitPower.As * (cos["sigma8"] / s8) ** 2
@@ -68,13 +64,11 @@ def camb_boost(cos, z, kmax, version):
 
 
 def ee2_boost(cos, z, k, A_s):
-    """EuclidEmulator2's boost at `cos`. Emitted natively, so nothing is
-    divided here -- EE2 emulates B(k) directly, which is why it needs no
-    Boltzmann solve and why it is the closest match to what the card reports.
+    """EuclidEmulator2's boost B(k) at `cos` and redshift `z`, evaluated at `k`.
 
-    `A_s` comes from the CAMB solve rather than being asked for: the engine's
-    Cosmology is normalized by sigma8 and EE2 is parameterized by A_s, so the
-    two have to be tied together by an actual calculation.
+    EE2 emulates B(k) directly, so nothing is divided here. `A_s` comes from a CAMB
+    solve: the engine is sigma8-normalized and EE2 is parameterized by A_s. Refuses a
+    cosmology outside EE2's training range (an emulator off-range returns silently).
     """
     import euclidemu2
 

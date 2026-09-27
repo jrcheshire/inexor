@@ -2,24 +2,23 @@
 
     pixi exec --spec python=3.12 --spec camb --spec matplotlib --spec numpy --spec scipy \
         --spec gsl --spec pip -- bash -c "pip install -q euclidemu2; \
-        python scripts/compare/ee2_ratio_figure.py runs/v2/lcw_1023904_k120.json \
-        runs/v2/nfl_1024882_nf2048.json --cosmology runs/v2/d7g_1011376_export.json \
+        python scripts/compare/ee2_ratio_figure.py RUN_A/pk_card.json RUN_B/pk_card.json \
+        --cosmology RUN_A/export.json \
         --labels '0.25 Mpc/h fine cell' '0.125 Mpc/h fine cell' \
-        -o figures/inexor_512_over_ee2.png"
+        -o figures/inexor_over_ee2.png"
 
 euclidemu2 is pip-only, and its wheel needs `gsl` in the env to load.
 
-Plots B_inexor / B_EE2 for one or more cards with B = P / P_lin, each side against its own linear
-theory (see `pk_boost_reference.py` for why the boost, not P, is compared).
-Two bands around unity:
-  - +-1 sigma Gaussian sample variance of ONE realization, sqrt(2 / n_modes) per
-    bin from the card. A floor: non-Gaussian covariance raises it at high k.
+Plots B_inexor / B_EE2 for up to three cards, B = P / P_lin with each side against its
+own linear theory (see `pk_boost_reference.py` for why the boost, not P, is compared).
+All cards must share k bins and redshift. Two bands around unity:
+  - +-1 sigma Gaussian sample variance of ONE realization, sqrt(2 / n_modes) per bin,
+    from the first card's mode counts. A floor: non-Gaussian covariance raises it at
+    high k.
   - EE2's quoted accuracy, 1% for 0.01 <= k <= 10 h/Mpc at z <= 3
     (Knabenhans et al. 2021, arXiv:2010.11288, abstract).
-EE2 is trained on paired-and-fixed simulations, so its boost carries almost no
-realization scatter; a single Gaussian realization carries all of it. Cards on the
-same ICs share that scatter, so their difference is read without it; the band is
-drawn from the first card's mode counts.
+EE2 (trained on paired-and-fixed sims) carries almost no realization scatter; cards on
+the same ICs share theirs, so their difference is read without it.
 """
 
 import argparse

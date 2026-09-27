@@ -1,10 +1,9 @@
-"""icgen.py: the streamed T9 generator and loader (M-v2-5, D-v2-15 clause 3).
+"""icgen.py: the streamed T9 generator, writer, loader and staging cleanup.
 
-THE THIRD M-v2-5 IDENTITY GATE at unit scale: generate_t9_slabs -> disk ->
-load_slot_state must be bitwise SlotState.build fed the monolithic
-linear_density -> lpt_ics chain on the same seed. Everything else here is the
-refusal surface: the manifest-last contract, crc corruption, and the
-displacement bound, each proven able to fire.
+generate_t9_slabs -> disk -> load_slot_state must be bitwise SlotState.build fed the
+monolithic linear_density -> lpt_ics chain on the same seed. The rest is the writer's
+round trip on an evolved state and the refusal surface (manifest-last, crc corruption,
+the displacement bound), each proven able to fire.
 """
 
 import json
@@ -67,9 +66,7 @@ def test_streamed_build_is_bitwise_the_monolithic_one(tmp_path, f_NL):
     occ = np.asarray(st.occupancy, np.int64)
     assert occ.max() >= 2 * max(occ[occ > 0].mean(), 1)
     assert man["ic_stream"] == ic.IC_STREAM
-    # the manifest keeps ONE number, and it must be the max over the per-brick
-    # scales: bricks partition the particles, so the largest brick scale is the
-    # global max|v|/INT16_MAX the manifest records.
+    # bricks partition the particles, so the manifest's one scale is the max brick scale
     assert man["vel_scale"] == pytest.approx(st.vel_scale.max())
     assert st.vel_scale.shape == (NB**3,)
     assert st.vel_scale.min() < st.vel_scale.max(), (
@@ -79,7 +76,7 @@ def test_streamed_build_is_bitwise_the_monolithic_one(tmp_path, f_NL):
 
 
 def test_slab_rows_sort_relative_to_their_slab_past_2_to_the_32():
-    """Vista 997280: slab 128 of 256 at 4096^3 carried keys from 2^32; the radix refuses them."""
+    """Slab 128 of 256 at 4096^3 carries keys from 2^32, which the radix refuses."""
     from inexor.layout import _stable_sort_index
 
     rng = np.random.default_rng(0)
@@ -127,10 +124,8 @@ def test_loader_refuses_crc_corruption(tmp_path):
     np.savez(victim, meta=meta, occupancy=occ, off=off, w=w, scale=sc)
     icgen.load_slot_state(str(tmp_path)).check()
 
-    # the SCALE array is covered too. It is new, it is per brick, and a silently
-    # wrong scale decodes every velocity in that brick by a wrong factor without
-    # touching a single payload byte -- so leaving it out of the crc would be the
-    # one corruption the loader could not see.
+    # the per-brick scale is covered too: a wrong scale mis-decodes a whole brick's
+    # velocities without touching a payload byte.
     sc = sc.copy()
     sc[0] *= 1.5
     np.savez(victim, meta=meta, occupancy=occ, off=off, w=w, scale=sc)
@@ -162,9 +157,8 @@ def test_manifest_is_written_last(tmp_path):
 
 
 def test_slab_files_carry_their_own_integrity(tmp_path):
-    """Every slab file's crc block matches its arrays (the loader checks this,
-    but here it is asserted directly so a writer bug cannot hide behind a
-    reader bug)."""
+    """Every slab file's crc block matches its arrays, asserted directly so a writer bug
+    cannot hide behind a reader bug."""
     cosmo = Cosmology()
     man = icgen.generate_t9_slabs(
         str(tmp_path), jax.random.PRNGKey(0), N, L, cosmo, A_INIT, NB, fdtype=np.float64
@@ -179,14 +173,12 @@ def test_slab_files_carry_their_own_integrity(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# M-v2-6 Stage 4(a): the writer, and the round trip on an EVOLVED state
+# the writer, and the round trip on an EVOLVED state
 
 
 def _evolved_state(seed=3, n_part=16, nb=4, box=16.0, steps=3, arena_frac=0.05, slack=0.02):
-    """A state that has actually been through the engine's exchange: live
-    spares occupied and, at this slack, a populated arena. Both are things a
-    freshly loaded state never has, and both are what the writer has to
-    compact away."""
+    """A state after a few migrates: live spares occupied and a populated arena, both of
+    which the writer must compact away."""
     rng = np.random.default_rng(seed)
     g = (np.arange(n_part) + 0.5) * (box / n_part)
     q = np.stack(np.meshgrid(g, g, g, indexing="ij"), axis=-1).reshape(-1, 3)
@@ -228,11 +220,9 @@ def _crcs(workdir):
 
 
 def test_write_t9_slabs_round_trips_an_evolved_state(tmp_path):
-    """The Stage 4(a) gate. Not array equality against `st`: the writer
-    compacts, so `brick_start` and intra-bucket row order legitimately move,
-    and D-v2-21 established that order carries no physics. The invariant is a
-    FIXED POINT -- write, load, write again, byte for byte -- plus particle
-    level conservation across the trip."""
+    """The writer compacts, so `brick_start` and intra-bucket order legitimately move
+    (order carries no physics). The invariant is a FIXED POINT -- write, load, write
+    again, byte for byte -- plus particle-level conservation across the trip."""
     st = _evolved_state()
     assert st.arena_used > 0, "vacuous: this state has no arena residents to fold back"
     assert st.n_live == st.n_particles
@@ -254,11 +244,8 @@ def test_write_t9_slabs_round_trips_an_evolved_state(tmp_path):
 
 
 def test_write_t9_slabs_does_not_recompute_vel_scale(tmp_path):
-    """`generate_t9_slabs` derives each brick's scale from the velocities it is
-    encoding. Doing that here would re-encode `w` against a new scale and lose
-    bits on any brick whose membership changed, so the scales must ride out
-    verbatim. Planting a perturbed scale proves the writer copies rather than
-    derives."""
+    """The writer copies the scales verbatim (re-deriving them would re-encode `w` and
+    lose bits); a planted perturbed scale must survive the trip."""
     st = _evolved_state()
     st.vel_scale[:] = st.vel_scale * 1.5
     icgen.write_t9_slabs(st, str(tmp_path))
@@ -268,8 +255,8 @@ def test_write_t9_slabs_does_not_recompute_vel_scale(tmp_path):
 
 
 def test_write_t9_slabs_refuses_to_drop_ids_silently(tmp_path):
-    """IDs are not in the schema, so writing a state that carries them loses
-    data. It must say so rather than succeed quietly."""
+    """IDs are not in the schema: writing a state that carries them refuses unless
+    `drop_ids=True`."""
     st = _evolved_state()
     st.ids = np.arange(len(st.off), dtype=np.int64)
     with pytest.raises(ValueError, match="drop_ids"):
@@ -322,12 +309,9 @@ class _CountingBuckets(np.ndarray):
 
 
 def test_write_t9_slabs_groups_the_arena_once_not_once_per_slab(tmp_path):
-    """The arena is PROVISIONED at a fraction of the particles whatever it holds
-    (687M rows = 5.5 GB at C-hero, against 327 actually occupied at step 8), so
-    selecting a slab's residents with `lo <= arena_bucket < hi` inside the slab
-    loop walks that array twice per slab -- 256 times over a checkpoint, for an
-    answer that is one row. This is the defect `arena_slots_of_brick` was
-    written to avoid, and the writer had reintroduced it."""
+    """The arena is provisioned at a fraction of the particles whatever it holds (5.5 GB
+    at c-hero), so selecting residents with `lo <= arena_bucket < hi` per slab would
+    walk it twice per slab. The writer must group it at most once."""
     st = _evolved_state()
     assert st.n_arena and int(np.sum(st.arena_bucket >= 0)) > 0, "vacuous: empty arena"
     st.arena_bucket = st.arena_bucket.view(_CountingBuckets)
@@ -341,10 +325,8 @@ def test_write_t9_slabs_groups_the_arena_once_not_once_per_slab(tmp_path):
 
 
 def test_write_t9_slabs_hashes_the_buffers_without_copying_them(tmp_path):
-    """`crc32(a.tobytes())` copied the whole payload to hash it -- 2.7 GB a slab
-    at C-hero. `zlib.crc32` takes the buffer itself; this pins that the recorded
-    checksums are unchanged by that, since a wrong one only shows up as a
-    refusal to load much later."""
+    """The writer hashes buffers in place (no 2.7 GB/slab copy at c-hero); the recorded
+    checksums must equal crc32 of the bytes."""
     st = _evolved_state()
     d = str(tmp_path / "w")
     icgen.write_t9_slabs(st, d)
@@ -375,7 +357,7 @@ def test_write_t9_slabs_surfaces_a_failure_from_the_writer_thread(tmp_path):
     assert calls, "the writer thread never ran"
     assert not os.path.exists(str(tmp_path / "w" / icgen.MANIFEST))
 
-# ------------------------------------------------- staging cleanup (M-v2-6 S4)
+# ------------------------------------------------- staging cleanup
 
 
 def _generate(tmp_path, **kw):
@@ -386,10 +368,8 @@ def _generate(tmp_path, **kw):
 
 
 def test_staged_names_matches_what_the_generator_actually_writes(tmp_path):
-    """The drift guard, and the reason `staged_names` derives the phi_ij list
-    from lpt's own component tuples. A name the cleanup does not know is a
-    34.4 GB file left behind per run at C-gh, and the rmdir turns it into a
-    refusal rather than a leak -- but only if the list is right."""
+    """`staged_names` is exactly what the generator stages. An unknown name is a 34.4 GB
+    file left behind per run at c-gh (the rmdir then refuses rather than leaks)."""
     _generate(tmp_path, keep_stage=True)
     stage = os.path.join(str(tmp_path), icgen.STAGE_DIR)
     assert set(os.listdir(stage)) == set(icgen.staged_names())
@@ -415,9 +395,8 @@ def test_keep_stage_keeps_it(tmp_path):
 
 
 def test_cleanup_leaves_a_stray_file_and_the_directory_standing(tmp_path):
-    """Named files only, then rmdir. The rmdir failing is the DESIGN: a file
-    the generator did not put there means someone else is using this directory,
-    and a recursive delete there is not recoverable."""
+    """Named files only, then rmdir: a file the generator did not write keeps the
+    directory standing, since a recursive delete is not recoverable."""
     _generate(tmp_path, keep_stage=True)
     stage = os.path.join(str(tmp_path), icgen.STAGE_DIR)
     stray = os.path.join(stage, "someone_elses_notes.txt")
@@ -440,8 +419,7 @@ def test_cleanup_is_idempotent_and_refuses_a_missing_dir_when_told_to(tmp_path):
 
 
 def test_the_generation_still_loads_after_its_stage_is_gone(tmp_path):
-    """The cleanup must not touch the product. Deleted intermediates, intact
-    slabs, and the loader's own crc checks confirm it."""
+    """The cleanup must not touch the product: the slabs still load and check."""
     man = _generate(tmp_path)
     st = icgen.load_slot_state(str(tmp_path))
     assert st.n_particles == man["n_particles"] == N**3
@@ -449,10 +427,8 @@ def test_the_generation_still_loads_after_its_stage_is_gone(tmp_path):
 
 
 def test_a_failed_generation_keeps_its_working_set(tmp_path):
-    """The completeness marker is what licenses the delete. A generation that
-    refused mid-flight left 687 GB of intermediates at C-gh AND the reason it
-    failed; cleaning those on the way out of an exception would destroy the
-    only diagnostic material a multi-hour run produced."""
+    """Only a complete generation deletes its stage: a refused one keeps its
+    intermediates (687 GB at c-gh) as diagnostic material and writes no manifest."""
     wild = Cosmology(sigma8=25.0)
     with pytest.raises(ValueError, match="sliding window"):
         icgen.generate_t9_slabs(
@@ -464,9 +440,8 @@ def test_a_failed_generation_keeps_its_working_set(tmp_path):
 
 
 def test_load_slot_state_drops_the_page_cache_of_every_slab_it_reads(tmp_path, monkeypatch):
-    """The cache competes with the state rather than serving it (gb 1003657), so the
-    loader drops each slab as it goes -- in BOTH passes, which is why the count is twice
-    the file count. Off by default."""
+    """With `drop_cache=True` the loader drops each slab's page cache (which competes with
+    the state) in BOTH passes, hence twice the file count. Off by default."""
     st = _evolved_state()
     d = str(tmp_path)
     icgen.write_t9_slabs(st, d)

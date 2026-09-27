@@ -1,17 +1,10 @@
-"""Background + linear-theory cosmology: the host float64 precision island.
+"""Background and linear-theory cosmology: the host float64 precision island.
 
-STRICTLY jax-free (numpy/scipy only; mbody "precision island" pattern) so any
-caller can import it before or without configuring JAX. Everything here is a
-constant of the run, computed in float64 and consumed by the integrator
-coefficient tables (integrate.py) and the IC generators (ic.py / lpt.py).
-
-Migrated from scripts/_m0_common.py (M0-verdicted bits) and mbody (sigma_R).
-The second-order growth D2 is the LCDM ODE solution, which the BullFrog weights
-need to be consistent (Rampf, List & Hahn 2024, Sec. 4.4); the EdS -(3/7) D^2
-survives only as an explicit option.
-linear_power gains a backend dispatch: "eh98" (analytic, self-contained) or
-"table" (tabulated (k, P) at z=0, e.g. a CAMB dump from the parity env --
-the M1 CAMB-parity hook, plan 2026-07-13).
+numpy/scipy only (no JAX), so it can be imported before JAX is configured. Everything here is a
+constant of the run consumed by the integrator tables and IC generators. The second-order growth
+D2 solves the LCDM ODE, which the BullFrog weights need (Rampf, List & Hahn 2024,
+arXiv:2409.19049, Sec. 4.4); EdS -(3/7) D^2 is an explicit option. `linear_power` backends: "eh98"
+(analytic, Eisenstein & Hu 1998) or "table" (tabulated z=0 (k, P), e.g. from CAMB).
 """
 
 import math
@@ -22,14 +15,11 @@ from scipy.integrate import quad, simpson
 
 from .config import PLANCK, Cosmology  # noqa: F401  (re-exported for callers)
 
-# Constant the EH98 reference C code uses in place of Euler's e; kept verbatim
-# so the port reproduces the original formula bit-for-bit (mbody convention).
+# The EH98 reference C code uses this in place of Euler's e; kept to reproduce it exactly.
 _E_EH98 = 2.718282
 
 
-# ============================================================================
 # Background + linear growth (exact flat LCDM, radiation neglected)
-# ============================================================================
 
 
 def E_of_a(a, cosmo):
@@ -43,8 +33,7 @@ def _growth_integrand(a, Om, OL):
 
 
 def _growth_unnorm(a, cosmo):
-    # D(a) propto (5 Om / 2) E(a) * integral_0^a da' / (a' E(a'))^3 (exact flat LCDM).
-    # Tends to a as a -> 0 (matter domination), which is the MD normalization.
+    # D(a) = (5 Om / 2) E(a) integral_0^a da' / (a' E(a'))^3; tends to a as a -> 0.
     integral, _ = quad(_growth_integrand, 0.0, a, args=(cosmo.Omega_m, cosmo.Omega_Lambda))
     return 2.5 * cosmo.Omega_m * E_of_a(a, cosmo) * integral
 
@@ -69,12 +58,10 @@ def growth_rate_a(a, cosmo):
 
 
 def growth_factor_md(a, cosmo):
-    """Growth factor normalized to D = a in matter domination (mbody port).
+    """Growth factor normalized to D -> a in matter domination.
 
-    This is the convention used in the local-f_NL relation between the
-    primordial potential and the linear density, delta(k) = M(k, z) phi(k).
-    It is the unnormalized growth integral, which tends to a as a -> 0; it
-    differs from growth_factor_a by the constant 1 / lim_{a->0} [D(a)/a].
+    The convention of the local-f_NL relation delta(k) = M(k, z) phi(k); differs from
+    growth_factor_a by the constant D0 = _growth_unnorm(1).
     """
     return _growth_unnorm(float(a), cosmo)
 
@@ -170,13 +157,11 @@ def growth2_and_slope(a, cosmo):
     return float(E) / D0**2, float(Ex / Dx) / D0
 
 
-# ============================================================================
-# EH98 transfer + sigma8-normalized linear P(k)  (verbatim _m0_common port)
-# ============================================================================
+# EH98 transfer + sigma8-normalized linear P(k)
 
 
 class _EH98:
-    """Scalar EH98 parameters for one cosmology (mbody port of TFset_parameters)."""
+    """Scalar EH98 parameters for one cosmology (TFset_parameters of the reference code)."""
 
     def __init__(self, cosmo):
         Om, Ob, h = cosmo.Omega_m, cosmo.Omega_b, cosmo.h
@@ -234,10 +219,7 @@ class _EH98:
 
 
 def transfer_eh98(k_hmpc, cosmo):
-    """Full EH98 transfer function T(k), k in h/Mpc; T -> 1 as k -> 0.
-
-    Verbatim mbody port (Eq. 16 of Eisenstein & Hu 1998; TFfit_onek).
-    """
+    """Full EH98 transfer function T(k), k in h/Mpc; T -> 1 as k -> 0 (Eisenstein & Hu 1998, Eq. 16)."""
     k_arr = np.atleast_1d(np.asarray(k_hmpc, dtype=np.float64))
     p = _EH98(cosmo)
     k = k_arr * p.h  # Mpc^-1
@@ -295,7 +277,7 @@ def linear_power(k_hmpc, cosmo, z=0.0, backend="eh98", table=None):
 
     backend="eh98": analytic EH98, sigma8-normalized (self-contained default).
     backend="table": tabulated z=0 spectrum, table = (k_table, P_table) arrays
-    (e.g. a CAMB dump from the parity env); log-log interpolated, refuses k
+    (e.g. a CAMB dump); log-log interpolated, refuses k
     outside the table range (loud, never extrapolates). Both backends scale to
     z with growth_factor_a**2.
     """
@@ -307,8 +289,7 @@ def linear_power(k_hmpc, cosmo, z=0.0, backend="eh98", table=None):
             raise ValueError("backend='table' requires table=(k_table, P_table)")
         k_t = np.asarray(table[0], dtype=np.float64)
         P_t = np.asarray(table[1], dtype=np.float64)
-        # 1-ulp slack: exact-endpoint queries (e.g. sigma_R on the table's own
-        # k range) must not trip the guard
+        # relative slack so exact-endpoint queries do not trip the guard
         if k_arr.min() < k_t.min() * (1 - 1e-12) or k_arr.max() > k_t.max() * (1 + 1e-12):
             raise ValueError(
                 f"requested k in [{k_arr.min():.3e}, {k_arr.max():.3e}] outside the "
@@ -337,15 +318,11 @@ def sigma_R(R, cosmo, z=0.0, backend="eh98", table=None):
     return math.sqrt(s2) * growth_factor_a(1.0 / (1.0 + z), cosmo)
 
 
-# ============================================================================
-# The M-v2-5 1D |k| table (D-v2-15 clause 2)
-# ============================================================================
+# 1D |k| table for IC generation
 
 
 def _refuse_outside(k_arr, k_lo, k_hi, what):
-    # Same guard as linear_power's table backend: 1-ulp slack so exact-endpoint
-    # queries do not trip it; loud refusal, never extrapolation. An EMPTY query
-    # is a legitimate no-op (a slab-streamed caller's k-cut can empty a slab).
+    # As linear_power's table guard; an empty query (a k-cut can empty a slab) is a no-op.
     if k_arr.size == 0:
         return
     if k_arr.min() < k_lo * (1 - 1e-12) or k_arr.max() > k_hi * (1 + 1e-12):
@@ -356,20 +333,12 @@ def _refuse_outside(k_arr, k_lo, k_hi, what):
 
 
 class ICKTable:
-    """1D log-spaced |k| table of the linear power AND the transfer function.
+    """1D log-spaced |k| table of linear P(k, z=0) and transfer T(k).
 
-    D-v2-15 clause 2: P(k) and T(k) are functions of |k| alone, so the IC
-    colour and the Poisson/transfer factor never need a 3D |k| grid -- the
-    measured ~90 B/p host term (job 896159) collapses to O(slab). Interpolation:
-    P is log-log linear (positive by construction); T is LINEAR in ln k (a
-    transfer function may cross zero in principle, so log-log is only safe for
-    P). Both refuse k outside the table range, exactly like
-    `linear_power(backend="table")`.
-
-    Deliberately NOT cached and NOT hashable: built once per run by
-    `ic_k_table` and passed explicitly, so no cache can alias across
-    cosmologies. Plain class rather than a frozen dataclass for the same
-    reason -- ndarray fields make generated __eq__/__hash__ traps.
+    Lets IC colouring evaluate P and T per slab without a 3D |k| grid. P is interpolated
+    log-log (positive); T linearly in ln k (it may cross zero). Both refuse k outside the table.
+    Deliberately not cached or hashable: built once per run by `ic_k_table` and passed
+    explicitly, so nothing can alias across cosmologies.
     """
 
     __slots__ = ("k", "P", "T", "_lnk", "_lnP")
@@ -404,43 +373,21 @@ class ICKTable:
         )
 
 
-# The universal table node range, h/Mpc -- the same span _eh98_amplitude's
-# normalization integral uses. UNIVERSAL, NOT PER-GRID, and that is
-# load-bearing: with nodes derived from (n_mesh, box_size), two resolutions
-# or box sizes carry two different tables, and the interpolation error at the
-# SAME physical k no longer cancels between them. G5b's shared-modes check
-# caught exactly that on first contact (2026-08-10): matched-phase rungs
-# coloured through per-grid tables disagreed at 3-6e-9 where the analytic
-# colour left 1e-15-class residuals. Fixed nodes make the interp error a
-# function of physical k alone, so it cancels in every shared-k comparison --
-# cross-resolution matched phase, box-ladder transport, all of them.
+# Universal table node range, h/Mpc (same span as the sigma8 integral). Fixed rather than
+# per-grid so the interpolation error depends on physical k alone and cancels between runs at
+# different resolutions or box sizes that share modes.
 K_TABLE_MIN = 1e-4
 K_TABLE_MAX = 1e2
 
 
 def ic_k_table(cosmo, n_mesh, box_size, n_points=32768, backend="eh98", table=None):
-    """Build the ICKTable for a production rfft grid, on UNIVERSAL nodes.
+    """Build the ICKTable on n_points universal log nodes over [K_TABLE_MIN, K_TABLE_MAX].
 
-    Nodes are n_points log-spaced over [K_TABLE_MIN, K_TABLE_MAX] regardless
-    of the grid (see the block comment above for why); (n_mesh, box_size) are
-    used to REFUSE a grid whose realized |k| range [2*pi/L, sqrt(3)*pi*n/L]
-    the universal range does not cover -- loud at build time, not at first
-    interpolation (every production config sits comfortably inside; a box
-    under ~0.07 Mpc/h or a cell under ~0.036 Mpc/h would not).
-
-    backend="eh98": P from `linear_power` (analytic, sigma8-normalized), T from
-    `transfer_eh98`. backend="table": P resampled from a (k, P) dump (CAMB),
-    which must cover the universal range; T stays eh98 -- the ic.py M1 scope
-    note stands (the table P(k) backend carries no T(k);
-    f_NL-with-CAMB-transfer is out of scope), and pretending to derive T from
-    a P dump would manufacture one silently.
-
-    n_points=32768 default: log-log linear interpolation error goes as the
-    square of the node spacing in ln k, and the universal range spans ~6
-    decades against the per-grid ~3.5, so the density is sized to keep the
-    measured error in the few x 1e-7 class (512 KB; probe
-    `v2_m5_table_bar.py` measures the scaling rather than trusting this
-    arithmetic).
+    (n_mesh, box_size) are used only to refuse at build time a grid whose |k| range
+    [2 pi/L, sqrt(3) pi n/L] the universal range does not cover. backend="eh98": P from
+    `linear_power`; backend="table": P resampled from a (k, P) dump that must cover the range.
+    T is always EH98 (a P dump carries no transfer function). The default n_points keeps the
+    interpolation error (quadratic in node spacing) at the few x 1e-7 level.
     """
     n_mesh = int(n_mesh)
     if n_mesh < 2:

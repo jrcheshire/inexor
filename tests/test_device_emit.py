@@ -1,8 +1,7 @@
-"""D6b: T9 emission on the cards (`device.emit.emit_t9_slabs_cards`) vs the host emission.
+"""T9 emission on the cards (`device.emit.emit_t9_slabs_cards`) vs host `icgen._emit_t9_slabs`.
 
-The host emission `icgen._emit_t9_slabs` is the oracle: on the CPU backend every slab
-file's payload must be bitwise the same. Card counts above the backend's device count
-replicate handles; run with `--xla_force_host_platform_device_count=4` for a true
+On the CPU backend every slab file's payload must be bitwise the host's. Card counts above the
+device count replicate handles; `--xla_force_host_platform_device_count=4` gives a true
 multi-device gate.
 """
 
@@ -119,7 +118,7 @@ def test_card_counts_and_plane_chunks_are_bitwise_on_any_backend(tmp_path):
 
 
 def test_the_seam_and_slab_crossers_are_exercised(tmp_path):
-    """Anti-vacuity: the fixture must move rows across slabs, and across x = 0, both ways."""
+    """Control: the fixture must move rows across slabs, and across x = 0, both ways."""
     n, nb = 32, 4
     box = float(n)
     t9 = T9Layout(box, n, 2)

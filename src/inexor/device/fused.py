@@ -1,44 +1,23 @@
-"""M4: the device migrate and repack fused into one visit per slab, bitwise the two
-passes run one after the other.
+"""Device migrate and repack fused into one visit per slab, bitwise the two passes in sequence.
 
-WHAT MOVES. `migrate.drift_and_migrate_device` writes each inserted slab back to its
-OLD slot range, and `repack.repack_device` then uploads that range again to write
-its NEW block. Here the insert's outputs stay on the card and the slab's new block
-is built from them directly, so a slab crosses once each way instead of twice.
+The insert's outputs stay on the card and the slab's new block is built from them directly, so a
+slab crosses the bus once each way instead of twice. The repack can run before the migrate ends:
+- its only global input, `new_start`, comes from the destination census (`device.window`, counted
+  with the migrate's own eject kernel) via `repack.capacity_from_counts`;
+- it folds arena residents into their bricks and zeroes everything past the new allocation, so the
+  migrate's arena layout leaves no trace; the fold-in depends only on each brick's (bucket, slot)
+  resident order, which is the spill order of that slab's single insert (`_to_arena` claims the
+  lowest free slots ascending).
 
-WHY THE REPACK CAN RUN BEFORE THE MIGRATE HAS FINISHED.
-- Its only global input is `new_start`, a prefix sum over each brick's
-  post-migrate membership. The destination census (`device.window`, in the tile
-  loop) counts that membership before the migrate starts, with the migrate's own
-  eject kernel; `repack.capacity_from_counts` turns it into `new_start`.
-- A repack folds every arena resident into its brick and zeroes everything past
-  the new allocation, arena included, so the arena layout the migrate leaves
-  behind leaves no trace in the state.
-- What the fold-in DOES depend on is each brick's resident order, (bucket, slot).
-  Every resident of brick b after a migrate is a spill of the one insert of b's
-  slab, and `SlotState._to_arena` claims the lowest free slots ascending within
-  that call, so slot order is that insert's spill order: the order the kernel
-  already returns them in.
+`state._replay_arena_pass` still runs as in the device migrate (consumed-emigrant census,
+arena-full refusal, stats); its arena writes are erased by the repack tail, except where the new
+allocation reaches past the old `arena_base`, whose rows are saved across the replay and restored.
 
-WHAT IS STILL THE MIGRATE'S. The end-of-pass `state._replay_arena_pass` runs as the
-device migrate runs it, for the census of consumed emigrants, the arena-full
-refusal and the migrate's stats; its arena writes are erased by the repack's tail.
-Except where the new allocation reaches past the old `arena_base`: there the blocks
-were written BEFORE the replay's claims, where the two passes write them after, so
-those rows are saved across the replay and restored.
-
-THE CHECK THAT STOPS A WRONG CENSUS. Before a slab's block is written, every brick's
-inserted membership (run + spills) must equal its census count; a mismatch refuses
-naming the brick. A slab written earlier on ANOTHER card has already used the
-census prefix, so a refusal leaves the state invalid, as every mid-pass refusal of
-the separate passes does.
-
-THE OVERRUN HAZARD. A slab's new block can overlap the old range of a later slab.
-On its own card that slab's window is uploaded (and the transfer completed) before
-the write, from the host view, and ejected later from that upload; across cards
-every such slab is uploaded by its owner before any card writes
-(`repack._cross_card_slabs`). An ejected slab's transfer is already complete: its
-eject ends in a read that depends on it.
+Before a block is written, every brick's inserted membership must equal its census count, else it
+refuses; earlier slabs may already be written, so a refusal leaves the state invalid (as any
+mid-pass refusal does). A new block may overlap a later slab's old range: on the same card that
+slab is uploaded first; across cards every such slab is uploaded before any card writes
+(`repack._cross_card_slabs`).
 """
 
 from __future__ import annotations
@@ -48,18 +27,16 @@ import numpy as np
 from . import migrate as _m
 from .repack import _cross_card_slabs, _repack_program, capacity_from_counts
 
-#: RECEIPT: fused passes run through this module.
+#: Call count of fused passes.
 CALLS = 0
 
-#: The device repack's measured peak per slab row (Vista 995813, record sec. 33),
-#: the fused block's charge in the per-slab budget. Estimate only.
+#: Estimated device peak bytes per slab row of the repack block, charged to the per-slab budget.
 REPACK_B_PER_SLAB_ROW = 70.0
 
 
 def _block_inputs_program(cap_i, cap_s, w_cap, nb2, p3, has_ids):
-    """The repack program's inputs from one slab's insert on the card: the post-insert
-    slot window (written rows at their slots relative to the slab's first, spills
-    appended at `span`) and the per-brick index."""
+    """Repack inputs from one slab's insert on the card: the post-insert slot window (written
+    rows at their slab-relative slots, spills appended at `span`) and the per-brick index."""
 
     def make():
         import jax
@@ -211,8 +188,7 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
         off_win = w_win = ids_win = occ = live = row_offsets = ar_offsets = ar_bucket = None
         clock.mark("fused: block program", out_off, out_w, out_ids, occ_s)
 
-        # THE hazard: every later slab of this card whose old range this write
-        # overlaps is on the card first (another card's were read before any wrote)
+        # upload every later slab of this card whose old range this write overlaps
         t = d + 1
         while t < card["hi"] and int(old_start[t * nb2]) < n_hi:
             if t not in card["ejected"] and t not in card["pre"]:

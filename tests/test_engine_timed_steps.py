@@ -1,5 +1,5 @@
-"""D7: `engine.run(timed_steps=)` -- the synced per-phase breakdown of the device
-passes on named steps only, and a timed run bitwise an untimed one."""
+"""`engine.run(timed_steps=)`: a synced per-phase breakdown of the device passes on the named
+steps only, and a timed run bitwise an untimed one."""
 
 import pytest
 
@@ -40,8 +40,7 @@ def test_a_timed_step_is_bitwise_and_the_only_one_with_a_breakdown(cards, fused)
     for card in t["tile"].values():
         for key in ("window: stage", "window: tiles", "window: guards", "window: write-back"):
             assert card.get(key, 0) > 0, (key, card)
-    # the folded kernel is the default, so the solve's parts are the forward, the
-    # kernel riding the inverse's axis-0 pass, and the inverse's plane pass
+    # default folded kernel: forward, kernel inside the inverse's axis-0 pass, inverse plane pass
     for key in ("forward: pass1", "forward: pass2", "kernel + axis-0 pass",
                 "inverse: pass1"):
         assert t["solve"].get(key, 0) > 0, (key, t["solve"])

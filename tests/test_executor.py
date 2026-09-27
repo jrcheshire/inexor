@@ -1,11 +1,9 @@
-"""Executor identity: the pool executor is bitwise the serial loop (W2).
+"""The pool executor is bitwise the serial loop.
 
-The seam analysis says tile writes are disjoint (ownership is a partition) and
-every value a worker reads while the parent applies another tile's writes is
-discarded -- these tests are what CERTIFY that, at the smoke config, across
-the machinery the pool actually adds: shm adoption, the per-step header, the
-repack copy-back, worker-side arena decode. The cluster legs repeat the same
-identity at cdev8/cdev scale.
+Tile writes are disjoint and any value a worker reads while the parent applies another tile's
+writes is discarded; these tests check that at the smoke config across what the pool adds (shm
+adoption, the per-step header, repack copy-back, worker-side arena decode, the pooled migrate),
+plus the shared-memory budget checks and backing-store (memfd/posix) selection.
 """
 
 import os
@@ -18,8 +16,7 @@ from inexor.codec import T9Layout
 from inexor.config import Cosmology
 from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
 
-# the smoke rung: smallest geometry whose tile+buffer decomposition is not
-# degenerate (same constants as test_engine.py)
+# smallest geometry whose tile+buffer decomposition is not degenerate (as in test_engine.py)
 L_BOX, N_PART, N_FINE, N_COARSE, N_TILE, B_FINE = 32.0, 32, 64, 16, 16, 8
 
 FIELDS = ("off", "w", "occupancy", "brick_start", "vel_scale", "arena_bucket")
@@ -75,8 +72,7 @@ def _assert_states_identical(s1, s2):
 
 
 def test_the_pool_executor_is_bitwise_the_serial_loop():
-    """W=2 against serial over a K=3 run with a repack every step, so the
-    brick_start/occupancy copy-back is exercised at every step boundary."""
+    """W=2 equals serial over a K=3 run with a repack every step (copy-back at every boundary)."""
     s1, out1 = _run(1)
     s2, out2 = _run(2)
     _assert_states_identical(s1, s2)
@@ -88,11 +84,10 @@ def test_the_pool_executor_is_bitwise_the_serial_loop():
 
 
 def test_the_pool_executor_identity_with_a_resident_arena():
-    """Zero BUILD slack concentrates overflow into the arena from the first
-    migrate (the measured lever -- a larger drift only moves particles BETWEEN
-    bricks), and `repack_every` past K keeps residents in place across every
-    later step boundary, so the worker-side arena decode and the `arena_base`
-    header are load-bearing here rather than idle."""
+    """Pool identity with arena residents live across every step boundary.
+
+    Zero build slack spills into the arena on the first migrate (a larger drift only moves
+    particles between bricks), and `repack_every` > K keeps residents in place."""
     kw = dict(build_slack=0.0, arena_frac=0.20, repack_every=4)
     s1, _ = _run(1, seed=5, **kw)
     assert (np.asarray(s1.arena_bucket) >= 0).any(), (
@@ -104,12 +99,8 @@ def test_the_pool_executor_identity_with_a_resident_arena():
 
 
 def test_the_pooled_coarse_paint_is_bitwise_the_serial_one():
-    """Stage C in isolation: the same mesh, chunk by chunk, from workers.
-
-    Integer accumulation is associative, so the arrival-order adds must give
-    the EXACT serial mesh -- the same property the streamed paint itself
-    stands on. Compared through the decoded float delta, which is what the
-    solver consumes."""
+    """The pooled coarse paint gives exactly the serial mesh (integer adds are associative in
+    any arrival order), compared on the decoded float delta the solver consumes."""
     from inexor.executor import TilePool
 
     cfg = _cfg(tile_workers=2)
@@ -126,12 +117,10 @@ def test_the_pooled_coarse_paint_is_bitwise_the_serial_one():
         pool.close()
     n = int((np.asarray(ref) != np.asarray(got)).sum())
     assert n == 0, f"{n} of {ref.size} coarse cells differ between executors"
-    # the knob must prove it applied, in both directions
     assert stats_ser["coarse_pooled_workers"] == 0
     assert stats_pool["coarse_pooled_workers"] == 2
     assert stats_pool["coarse_subblock_chunks"] == stats_ser["coarse_subblock_chunks"] > 0
-    # census routes SERIAL regardless of the pool: the gate instrument must
-    # never read a pooled mesh
+    # census always routes serial, so it never reads a pooled mesh
     pool2 = TilePool(st, cfg)
     stats_census = {}
     try:
@@ -142,18 +131,14 @@ def test_the_pooled_coarse_paint_is_bitwise_the_serial_one():
 
 
 def test_the_pool_survives_and_restores_state_ownership():
-    """After a pooled run the state must be backed by ordinary memory again
-    (the shm segments are unlinked), and still usable."""
+    """After a pooled run the state is back in ordinary memory and usable: repack exercises the
+    rebound arrays and check() raises on corruption."""
     s2, _ = _run(2, seed=7, k=2)
-    # a post-run mutation must not touch shm (it is gone); repack exercises
-    # the rebound arrays end to end, and check() raises on corruption
     s2.repack(brick_slack=0.10)
     s2.check()
 
 
-# ---------------------------------------------------------------------------
-# the pooled migrate (idle-half Stage 2): drift_and_migrate_pooled vs serial
-# ---------------------------------------------------------------------------
+# --------------------------------------- the pooled migrate: drift_and_migrate_pooled vs serial
 
 C_DRIFT = 1.0  # sized so brick_reach == 1 at this geometry (asserted in-test)
 
@@ -185,11 +170,10 @@ def _pooled_vs_serial(st_pool, st_ser, cfg, kernel, window=6):
 
 @pytest.mark.parametrize("kernel", ["numpy", "jax"])
 def test_the_pooled_migrate_is_bitwise_the_serial_one(kernel):
-    """The whole contract at W=2: every state array (ids included) and the
-    ENTIRE stats dict equal key for key, with a window smaller than nb so slot
-    reuse is actually exercised, and an anti-vacuity guard that particles
-    really crossed bricks (the nb=2 trap: at this geometry nb=8 and reach 1,
-    so the reach window does NOT cover every slab)."""
+    """At W=2 every state array (ids included) and the full stats dict match serial.
+
+    The window (6) is below nb (8) so slot reuse is exercised; reach 1 means the reach window
+    does not cover every slab, and particles are asserted to have crossed bricks."""
     import copy
 
     st_p, cfg = _mig_state()
@@ -197,8 +181,7 @@ def test_the_pooled_migrate_is_bitwise_the_serial_one(kernel):
     out_p, out_s = _pooled_vs_serial(st_p, st_s, cfg, kernel)
     mp = out_p.pop("migrate_pool")
     assert mp["workers"] == 2 and mp["window"] == 6
-    # the compiled-kernel receipt, summed from the workers: nb calls on the
-    # jax arm, 0 on numpy (the parent's own counter cannot see workers)
+    # eject_jax calls summed over workers: nb on jax, 0 on numpy
     want_calls = st_s.bricks_per_side if kernel == "jax" else 0
     assert mp["eject_jax_calls"] == want_calls
     assert out_p == out_s
@@ -209,24 +192,23 @@ def test_the_pooled_migrate_is_bitwise_the_serial_one(kernel):
 
 
 def test_pooled_migrate_window_floor_refuses():
-    """A window below the deadlock floor must refuse loudly, before any task
-    is dispatched (a knob that cannot apply must not silently move)."""
+    """A window below the deadlock floor refuses before any task is dispatched."""
     import copy
 
     st_p, cfg = _mig_state()
     st_s = copy.deepcopy(st_p)
     with pytest.raises(ValueError, match="deadlock floor"):
-        # the check precedes every pool interaction, so a stub suffices
+        # the check precedes any pool use, so pool=None suffices
         state.drift_and_migrate_pooled(st_p, C_DRIFT, pool=None, window=2)
     del st_s
 
 
 @pytest.mark.parametrize("kernel", ["numpy", "jax"])
 def test_the_pooled_migrate_identity_with_a_resident_arena(kernel):
-    """Both shared-surface paths provably exercised (the C13 arena_probed
-    lesson): a zero-slack build overflows into the arena on a serial priming
-    pass, so the pooled pass must (a) replay RELEASES of resident rows and
-    (b) replay CLAIMS for fresh spills -- both guarded non-vacuous."""
+    """Pooled migrate identity through both arena replays, each guarded non-vacuous.
+
+    A zero-slack build primed by one serial pass has arena residents, so the pooled pass
+    replays releases of resident rows and claims for fresh spills."""
     import copy
 
     st_p, cfg = _mig_state(seed=5, build_slack=0.0, arena_frac=0.20)
@@ -248,8 +230,7 @@ def test_the_pooled_migrate_identity_with_a_resident_arena(kernel):
 
 
 def test_the_pooled_migrate_without_ids():
-    """A state built with_ids=False: the scratch drops the ids column and the
-    facade binds None, end to end."""
+    """Pooled migrate identity with with_ids=False; ids stay None on both arms."""
     import copy
 
     st_p, cfg = _mig_state(seed=7, with_ids=False)
@@ -264,24 +245,20 @@ def test_the_pooled_migrate_without_ids():
 
 
 def test_migrate_pooled_knob_refuses_without_a_pool():
-    """A knob that cannot apply must refuse at validate(), not silently run
-    the serial path under a pooled-looking config. EXPLICIT True only: the
-    None default is auto and falls back to serial by design."""
+    """Explicit migrate_pooled=True without a pool refuses at validate() (None means auto)."""
     with pytest.raises(ValueError, match="needs a pool"):
         _cfg(tile_workers=1, migrate_pooled=True).validate()
 
 
 def test_migrate_pooled_auto_default_validates_without_a_pool():
-    """The counterpart to the refusal above: the default must NOT refuse at
-    tile_workers=1, or every single-process config in the package breaks."""
+    """The auto default validates at tile_workers=1."""
     assert _cfg(tile_workers=1).validate()
 
 
 def test_migrate_pooled_auto_default_pools_and_is_bitwise_the_serial_arm():
-    """The C14 default flip (Vista 918684). An unnamed knob now POOLS wherever
-    a pool exists, and False is the only way back to the serial arm. Both
-    directions carry a receipt, and the two arms must still be bitwise: a
-    default that moved the answer would be a regression, not a speedup."""
+    """The default pools wherever a pool exists, False forces serial, and the two are bitwise.
+
+    Both directions are checked by per-step worker counts."""
     s_auto, out_auto = _run(2)
     s_ser, out_ser = _run(2, migrate_pooled=False)
     _assert_states_identical(s_ser, s_auto)
@@ -295,9 +272,8 @@ def test_migrate_pooled_auto_default_pools_and_is_bitwise_the_serial_arm():
 
 
 def test_the_pooled_migrate_engine_run_is_bitwise_the_serial_one():
-    """The knob end to end: a whole K=3 run with repack every step, lead-drift
-    routing, kick/migrate epoch alternation on one pool, and the shm ids
-    copy-back -- against the plain serial run. Receipts in both directions."""
+    """A K=3 engine run with migrate_pooled=True (repack every step, kick/migrate sharing one
+    pool, ids copy-back) is bitwise the serial run, with worker counts checked both ways."""
     s1, out1 = _run(1)
     s2, out2 = _run(2, migrate_pooled=True)
     _assert_states_identical(s1, s2)
@@ -310,8 +286,8 @@ def test_the_pooled_migrate_engine_run_is_bitwise_the_serial_one():
 
 
 def test_pooled_migrate_arena_full_refuses():
-    """D-007: when the arena cannot absorb a spill, BOTH arms refuse with the
-    same ValueError; the pooled raise comes from the parent's claim replay."""
+    """When the arena cannot absorb a spill, both arms raise the same ValueError (never clamp);
+    the pooled raise comes from the parent's claim replay."""
     import copy
 
     from inexor.executor import TilePool
@@ -329,20 +305,14 @@ def test_pooled_migrate_arena_full_refuses():
 
 
 # --------------------------------------------------------------- shm budget
-# Vista 920910 generated the 2048^3 ICs and then took a SIGBUS 196 s into
-# stepping, inside `TilePool.__init__`, having asked for 148.5 GB of a
-# measured 127.6 GB /dev/shm (job 922332). `SharedMemory` sizes lazily, so
-# `create=True` succeeds for a segment the tmpfs cannot back and the process
-# dies on first TOUCH with no traceback. These are the tests for the check
-# that turns that into a refusal.
+# `SharedMemory` sizes lazily: `create=True` succeeds for a segment the tmpfs cannot back and
+# the process dies with SIGBUS on first touch. The budget check turns that into a refusal.
 
 
 def test_the_shm_model_reproduces_what_the_pool_actually_allocates():
-    """The model and the allocation are two implementations of one formula.
+    """`shm_terms` (used by the planner) sums to exactly what `TilePool` allocates.
 
-    `inexor.plan` prices a configuration nobody has built, so it cannot use
-    the pool's own measurement; that is exactly how a planner and a runtime
-    drift apart. This holds them together at a geometry where both are real.
+    The planner prices unbuilt configurations, so the two implementations must agree.
     """
     from inexor.executor import TilePool, shm_terms
 
@@ -373,7 +343,7 @@ def test_the_shm_model_reproduces_what_the_pool_actually_allocates():
 
 
 def test_the_shm_check_refuses_a_demand_that_cannot_fit(tmp_path):
-    """And the refusal NAMES the terms, because the levers are among them."""
+    """An oversized demand refuses, naming the terms (largest first) and the arena_frac lever."""
     from inexor.executor import check_shm_budget
 
     huge = {"w (n_rows,3) int16": 8 * 10**18, "vel_scale": 17}
@@ -382,16 +352,14 @@ def test_the_shm_check_refuses_a_demand_that_cannot_fit(tmp_path):
     msg = str(e.value)
     assert "w (n_rows,3) int16" in msg
     assert "arena_frac" in msg, "the refusal must name the lever, not just the miss"
-    # ordered by size: the binding term is the one a reader acts on
+    # ordered by size
     assert msg.index("w (n_rows,3) int16") < msg.index("vel_scale")
 
 
 def test_a_missing_tmpfs_reports_that_it_could_not_check(tmp_path):
-    """An absent check must not read as a passed one.
+    """A missing tmpfs reports capacity None (could not check), never a number.
 
-    macOS has no /dev/shm, so every developer machine takes this path -- and
-    a silent return there would mean the guard's tests pass locally while the
-    guard is inert on the one platform that has the problem.
+    macOS has no /dev/shm, so local runs take this path.
     """
     from inexor.executor import check_shm_budget, shm_capacity
 
@@ -402,12 +370,10 @@ def test_a_missing_tmpfs_reports_that_it_could_not_check(tmp_path):
 
 
 def test_the_pilot_configuration_would_now_be_refused():
-    """The regression: the exact geometry that took the bus error.
+    """A 2048^3 geometry (slack 0.20, arena_frac 0.20, alloc_margin 0.10) demands 148.5 GB,
+    above a 127.6 GB measured /dev/shm, so the budget check would refuse it.
 
-    Numbers are the pilot's own invocation (`--slack 0.20 --arena-frac 0.20`,
-    alloc_margin 0.10, 16 workers) against the gg node's MEASURED /dev/shm.
-    If a change to the layout brings c-gh under that ceiling this test fails,
-    which is the right time to re-read it.
+    If a layout change brings the demand under that ceiling this test fails, prompting a re-read.
     """
     from inexor.executor import shm_terms
 
@@ -421,7 +387,7 @@ def test_the_pilot_configuration_would_now_be_refused():
         n_rows=n_alloc + n_arena, index_bytes=1024**3 * 4, n_arena=n_arena,
         n_bricks=n_bricks, n_coarse=1024, coarse_itemsize=4,
     )
-    gg_shm = 249116032 * 1024 // 2  # measured, Vista job 922332
+    gg_shm = 249116032 * 1024 // 2  # measured /dev/shm capacity
     demand = sum(terms.values())
     assert demand / 1e9 == pytest.approx(148.5, abs=0.5)
     assert demand > gg_shm, (
@@ -430,20 +396,13 @@ def test_the_pilot_configuration_would_now_be_refused():
 
 
 # ------------------------------------------------------------ the backing store
-# The pool's shared arrays sit on `memfd` where the kernel has it and POSIX
-# `/dev/shm` otherwise. The two are the same pages; the difference is that
-# `/dev/shm` is a mount with a size cap and memfd is not, which is the whole
-# reason c-gh fits. The platform picks, so WITHOUT the env override neither
-# machine can exercise both paths: this suite would only ever see posix and
-# the cluster only ever memfd.
+# Shared arrays sit on `memfd` where the kernel has it, POSIX `/dev/shm` otherwise. memfd has
+# no mount size cap. INEXOR_SHM_BACKEND lets one machine exercise both paths.
 
 from inexor.executor import has_memfd  # noqa: E402
 
-# has_memfd() PROBES; it does not read an attribute. Job 922557 passed this
-# whole file 24/24 while exercising posix only, because conda-forge's Python
-# 3.14 has no `os.memfd_create` even where the kernel does, and the parametrise
-# list silently collapsed to one entry. A gate that quietly stops covering the
-# path it exists for is worse than no gate.
+# has_memfd() probes the syscall rather than reading `os.memfd_create`, which some Python
+# builds lack on kernels that support it; otherwise this list would silently drop memfd.
 BACKENDS = ["posix"] + (["memfd"] if has_memfd() else [])
 
 
@@ -460,7 +419,8 @@ def _child_reads(handle, nbytes):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_a_spawned_process_maps_the_same_pages(backend):
-    """Both directions, because a one-way check passes on a private copy."""
+    """A spawned process sees the parent's writes and vice versa (one direction alone would pass
+    on a private copy)."""
     import multiprocessing as mp
 
     from inexor.executor import create_segment
@@ -511,11 +471,8 @@ def test_a_bad_backend_override_refuses():
 
 @pytest.mark.skipif(has_memfd(), reason="needs a machine without memfd")
 def test_memfd_is_not_silently_downgraded():
-    """Asking for memfd where there is none must fail loudly.
-
-    Falling back would put the c-gh run back on the capped mount and it would
-    die exactly as 920910 did, having been told it was on the new path.
-    """
+    """Requesting memfd where it is unavailable refuses rather than falling back to the capped
+    /dev/shm mount."""
     from inexor.executor import shm_backend
 
     os.environ["INEXOR_SHM_BACKEND"] = "memfd"
@@ -528,7 +485,7 @@ def test_memfd_is_not_silently_downgraded():
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_the_pool_is_bitwise_the_serial_loop_on_either_backend(backend, monkeypatch):
-    """The identity gate, re-run against the backing store it is standing on."""
+    """Pool (W=4) is bitwise serial on each backing store."""
     monkeypatch.setenv("INEXOR_SHM_BACKEND", backend)
     s_serial, _ = _run(1)
     s_pool, _ = _run(4)
@@ -536,19 +493,16 @@ def test_the_pool_is_bitwise_the_serial_loop_on_either_backend(backend, monkeypa
 
 
 def test_memfd_is_detected_by_probe_not_by_attribute():
-    """The regression for job 922557.
+    """memfd is chosen by probing the syscall, not by `hasattr(os, "memfd_create")`.
 
-    `os.memfd_create` is gated on CPython's BUILD sysroot, so conda-forge
-    ships without it on a kernel that has the syscall -- the gpu env's Python
-    3.14.6 says no while the system 3.9 on the same node says yes. Anything
-    that reads the attribute to decide is deciding on the wrong question.
+    `os.memfd_create` depends on CPython's build sysroot and can be absent on a kernel that has
+    the syscall; the interesting case is capability present, attribute absent.
     """
     from inexor import executor
 
     if not has_memfd():
         pytest.skip("no memfd here either way")
     if not hasattr(os, "memfd_create"):
-        # the interesting platform: capability present, attribute absent
         assert executor.shm_backend() == "memfd", (
             "has_memfd() is True but the backend chose posix, which is exactly "
             "the silent downgrade that put 922557 back on the capped mount"
@@ -562,10 +516,10 @@ def test_memfd_is_detected_by_probe_not_by_attribute():
 
 
 def test_adoption_peak_is_not_the_total():
-    """The regression for job 922682, which was refused for this difference.
+    """`adoption_peak` is the larger of the biggest adopted field and the fresh total, not the sum.
 
-    Adopted fields release their private copies as they are copied, so they
-    net to zero; only the in-flight duplicate and the fresh segments are new.
+    Adopted fields release their private copies as they are copied, so only the in-flight
+    duplicate and fresh segments are new.
     """
     from inexor.executor import adoption_peak
 
@@ -574,11 +528,9 @@ def test_adoption_peak_is_not_the_total():
              "coarse force g0,g1,g2": 12_885_000_000}
     adopted = {"w", "off", "arena_bucket", "occupancy"}
     assert sum(terms.values()) == pytest.approx(148.4e9, rel=1e-3)
-    # the largest adopted field, not the sum, and not the fresh total either
     assert adoption_peak(terms, adopted) == 78_346_000_000
-    # with nothing adopted it degrades to the total, which is the posix case
+    # nothing adopted: the total (the posix case)
     assert adoption_peak(terms, ()) == sum(terms.values())
-    # fresh dominates when the adopted set is small
     assert adoption_peak({"a": 5, "big_fresh": 100}, {"a"}) == 100
 
 
@@ -600,20 +552,15 @@ def test_the_memfd_preflight_checks_the_peak_not_the_demand(monkeypatch):
 
 
 def test_posix_is_still_checked_on_the_total(monkeypatch):
-    """Adoption buys nothing on a tmpfs: it must hold every segment at once,
-    whatever the parent happens to be holding.
+    """posix is checked on the total demand, since a tmpfs holds every segment at once.
 
-    `shm_capacity` is stubbed rather than pointed at a real directory because
-    macOS has no /dev/shm at all, and the unstubbed call there returns "could
-    not check" -- which is the right answer for the platform and useless for
-    testing the arithmetic.
+    `shm_capacity` is stubbed because macOS has no /dev/shm (it would report "could not check").
     """
     from inexor import executor
 
     monkeypatch.setattr(executor, "shm_capacity",
                         lambda path=None: (100_000_000_000, 100_000_000_000))
     terms = {"w": 78_000_000_000, "off": 39_000_000_000}
-    # the same terms and the same adoption that PASS on memfd
     executor.preflight_shared_memory(dict(terms), backend="memfd",
                                      adopted={"w", "off"}) if False else None
     with pytest.raises(MemoryError, match="does not fit /dev/shm"):
@@ -623,11 +570,8 @@ def test_posix_is_still_checked_on_the_total(monkeypatch):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_a_preshared_state_is_adopted_without_a_second_copy(backend, monkeypatch):
-    """The state must exist ONCE. Job 922723 died because it existed twice.
-
-    Identity, not equality: if the pool copied, `st.off` would be a different
-    object afterwards and the peak would be twice the state. Equality would
-    pass on a copy, which is exactly the failure being excluded.
+    """A state already in shared memory is adopted, not copied: object identity is checked,
+    since equality would pass on a copy, and only the coarse meshes are charged.
     """
     monkeypatch.setenv("INEXOR_SHM_BACKEND", backend)
     from inexor.executor import SharedAllocator, TilePool
@@ -640,7 +584,6 @@ def test_a_preshared_state_is_adopted_without_a_second_copy(backend, monkeypatch
                                arena_frac=0.05)
     alloc = SharedAllocator()
     try:
-        # put the payload where the loader would have put it
         for f in FIELDS:
             a = np.asarray(getattr(st, f))
             view = alloc.empty(a.shape, a.dtype, f)
@@ -652,7 +595,6 @@ def test_a_preshared_state_is_adopted_without_a_second_copy(backend, monkeypatch
             after = {f: id(np.asarray(getattr(st, f))) for f in FIELDS}
             assert before == after, "the pool copied an array that was already shared"
             assert pool._preshared == set(FIELDS)
-            # only the coarse meshes are charged
             assert set(pool._shm_demand) == {"coarse force g0,g1,g2"}
         finally:
             pool.close()
@@ -661,8 +603,7 @@ def test_a_preshared_state_is_adopted_without_a_second_copy(backend, monkeypatch
 
 
 def test_the_loader_fills_shared_memory_and_is_otherwise_unchanged(tmp_path):
-    """Same state, whichever allocator: the shared path is a placement
-    change, not a numerical one."""
+    """Loading into shared memory gives the same state as a plain load, placed in shm."""
     from inexor import icgen
     from inexor.executor import SharedAllocator
 
@@ -691,14 +632,10 @@ def test_the_loader_fills_shared_memory_and_is_otherwise_unchanged(tmp_path):
 
 
 def test_engine_run_carries_the_allocator_all_the_way_to_the_pool(tmp_path):
-    """END TO END, because the unit test above passed while the run OOMed.
+    """`engine.run(..., allocator=)` hands the allocator to the pool, so a loaded shared state
+    is not shared a second time (the allocator does not grow during the run).
 
-    `test_a_preshared_state_is_adopted_without_a_second_copy` builds the pool
-    directly, so it could not see that `v2_m6_realization.py` was calling
-    `engine.run` WITHOUT the allocator -- an edit that silently did not apply.
-    The state then went into shared memory once in the loader and again in
-    the pool, Shmem went 110 -> 217.8 GB in thirty seconds, and job 922819
-    was OOM-killed. The hand-off is the thing that has to be tested.
+    The adoption unit test above builds the pool directly and cannot see this hand-off.
     """
     from inexor import icgen
     from inexor.executor import SharedAllocator
@@ -720,7 +657,6 @@ def test_engine_run_carries_the_allocator_all_the_way_to_the_pool(tmp_path):
         a = a_grid(0.1, 1.0, 3, "log")
         co = bullfrog_float_coeffs(bullfrog_table(a, Cosmology()))
         engine.run(st, cfg, co, allocator=alloc)
-        # the pool must not have put the state in shared memory a SECOND time
         state_bytes = sum(np.asarray(getattr(st, f)).nbytes for f in FIELDS)
         assert alloc.bytes_held() == held_after_load, (
             "the allocator grew during the run: the pool re-shared the state, "
@@ -732,14 +668,10 @@ def test_engine_run_carries_the_allocator_all_the_way_to_the_pool(tmp_path):
 
 
 def test_bounding_ejects_in_flight_is_bitwise_the_unbounded_pass():
-    """The knob may cost wall; it may not change an answer.
+    """`eject_inflight` (None, 2, and the floor 1) does not change the migrated state.
 
-    `eject_inflight` only decides WHEN a slab's eject is dispatched. The pass's
-    arena interleave and bookkeeping run in the parent's serial replay at fixed
-    schedule points regardless, so dispatch order cannot reach the result --
-    which is the same argument that licenses the pooled migrate at all, and it
-    is worth a gate rather than an appeal to it. Includes the floor value 1,
-    where only one eject is ever outstanding.
+    It only sets when a slab's eject is dispatched; arena bookkeeping runs in the parent's
+    serial replay at fixed points.
     """
     import jax
 

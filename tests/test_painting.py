@@ -1,6 +1,6 @@
-"""painting.py: CIC paints (int + f32 twins), reads, and the one-interface
-wrapper (promotes M0 self-check 6; R3's determinism check becomes a permanent
-test -- trivially true on CPU, authoritative when run on deneb CUDA)."""
+"""painting.py: CIC paints (int and f32 twins), reads, the `density_contrast` wrapper,
+and the sub-block TSC paint. The determinism test is trivial on CPU and meaningful on a
+GPU, where the paint uses atomics."""
 
 import jax
 import jax.numpy as jnp
@@ -28,8 +28,8 @@ def _positions(seed, n=20000):
 
 
 def test_paint_int_vs_f32_fixed_point_bound():
-    # M0 self-check 6, verbatim bound: each corner deposit errs <= 2^-(F+1);
-    # a cell collects ~lambda*8 deposits (lambda ~ 5 here) -> 32 deposits' worth.
+    # each corner deposit errs <= 2^-(F+1); a cell collects ~8 * lambda deposits
+    # (lambda ~ 0.6 particles per cell here), bounded by 32 deposits' worth
     pos = _positions(3)
     F = 12
     mi = counts_from_int(paint_int(pos, N, L, frac_bits=F), F)
@@ -44,8 +44,8 @@ def test_f32_mass_conservation_exact_class():
 
 
 def test_int_paint_per_particle_weight_sum():
-    # R3's mass-conservation arm: the 8 quantized corner weights of one particle
-    # sum to 2^F up to 8 half-ulp roundings (measured 7.3e-4 relative at F=12).
+    # the 8 quantized corner weights of one particle sum to 2^F up to 8 half-ulp
+    # roundings (measured 7.3e-4 relative at F=12)
     pos = _positions(5, n=8192)
     F = 12
     base, frac = _cic_pieces(pos, N, L)
@@ -81,9 +81,8 @@ def test_cic_read_vector_matches_manual_gather():
 
 
 def test_paint_int_repeat_and_retrace_determinism():
-    """R3's core check as a permanent test: repeated dispatch AND a fresh trace
-    give bit-identical int meshes. Trivial on CPU; run on deneb CUDA (pixi run
-    -e gpu pytest -k retrace) for the authoritative atomics arm."""
+    """Repeated dispatch and a fresh trace give bit-identical int meshes. Trivial on CPU;
+    on a GPU (`pixi run -e gpu pytest -k retrace`) it exercises the atomics."""
     pos = _positions(8)
     ref = paint_int(pos, N, L)
     for _ in range(3):
@@ -113,18 +112,16 @@ def test_headroom_guard_fires():
     # 2^20 particles in one cell x 2^12 = 2^32 >= 2^31: accumulator would overflow
     with pytest.raises(ValueError, match="headroom"):
         check_int_paint_headroom(2**30, frac_bits=12, max_cell_particles=2.0**20)
-    check_int_paint_headroom(1024**3, frac_bits=12)  # flagship class w/ arch budget: fine
+    check_int_paint_headroom(1024**3, frac_bits=12)  # 1024^3 at the default cell cap: fine
 
 
 # ------------------------------------------------- the sub-block TSC paint
 
 
 def test_the_subblock_tsc_paint_is_bitwise_the_global_one():
-    """Weights global, index rebased: every per-corner integer contribution
-    must be bit-identical to `paint_tsc_int`'s, scattered into the block's
-    place. Exercised where the trap lives: an interior block, a block
-    WRAPPING the periodic boundary, a degenerate full-axis block, and masked
-    pad rows."""
+    """`paint_tsc_int_subblock`, placed back into the box, is bitwise `paint_tsc_int`:
+    interior block, masked pad rows, a block wrapping the periodic boundary, and a
+    full-axis block."""
     from inexor import painting
 
     N, box = 16, 32.0

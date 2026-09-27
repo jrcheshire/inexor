@@ -1,9 +1,8 @@
-"""The coarse kernel multiply folded into the inverse's axis-0 pass (`fold_kernel`).
+"""The coarse kernel multiply folded into the inverse FFT's axis-0 pass (`fold_kernel`).
 
-The fold removes a host traversal of the whole half-grid per component -- 85 s of a
-123 s coarse solve at 4096^3 (gb 1003657). What it must not move is the force: the
-association `(pref * ik) * mf` is carried into `ooc_fft.ArrayKernel` unchanged, so the
-two arms are compared BITWISE rather than to a tolerance.
+The fold saves a host traversal of the half-grid per component (85 s of a 123 s coarse solve at
+4096^3). `ooc_fft.ArrayKernel` keeps the association `(pref * ik) * mf`, so folded and
+unfolded arms are compared bitwise.
 """
 
 import numpy as np
@@ -47,7 +46,8 @@ def test_folded_kernel_is_bitwise_the_host_multiply_on_host_meshes(dtype):
 
 
 def test_folded_kernel_is_bitwise_on_card_shards_and_at_four_cards():
-    """The engine's real lane: force meshes written straight onto the cards."""
+    """Bitwise with meshes written onto card shards, at 1 and 4 cards (4 needs emulated
+    devices), and the folded arm is independent of card count."""
     from inexor.device.coarse import CardShards
 
     n, box = 16, 32.0
@@ -69,14 +69,13 @@ def test_folded_kernel_is_bitwise_on_card_shards_and_at_four_cards():
                 x = np.asarray(outs[(cards, False)][k]["meshes"][i])
                 y = np.asarray(outs[(cards, True)][k]["meshes"][i])
                 assert int(np.count_nonzero(x != y)) == 0, (cards, i, k)
-    # and the card count still does not matter, on the folded arm
     one = np.concatenate([np.asarray(s["meshes"][0]) for s in outs[(1, True)]])
     four = np.concatenate([np.asarray(s["meshes"][0]) for s in outs[(4, True)]])
     assert int(np.count_nonzero(one != four)) == 0
 
 
 def test_array_kernel_block_product_is_the_host_kernel_slab():
-    """`ArrayKernel` is `coarse_kernel_slab`'s expression, cut on the pencil axis."""
+    """`ArrayKernel` blocks are bitwise `coarse_kernel_slab`, cut on the pencil axis."""
     n, box = 8, 16.0
     parts, _kwargs = _kw(n, box)
     cdtype = np.complex64
@@ -90,8 +89,7 @@ def test_array_kernel_block_product_is_the_host_kernel_slab():
 
 
 def test_the_unfolded_arm_still_calls_the_shipped_kernel_builder():
-    """The unfolded arm is the ORACLE the folded one is gated against, and a gate
-    against an oracle that has quietly moved is no gate."""
+    """The unfolded arm (the oracle) still calls `coarse_kernel_slab` on every axis."""
     n, box = 8, 16.0
     d = _delta(n)
     parts, kw = _kw(n, box)
@@ -106,8 +104,7 @@ def test_the_unfolded_arm_still_calls_the_shipped_kernel_builder():
 
 
 def test_the_engine_step_folds_by_default_and_the_arms_agree():
-    """Through `engine.step`, not just the solve: the knob must reach the force, and
-    the two arms must land on the same state."""
+    """Folding is the engine default, and a run lands on the same state with either arm."""
     from tests.test_engine_device_backend import _coeffs, _same
     from tests.test_engine_device_backend import _state as _estate
     from tests.test_engine_device_step import _cfg

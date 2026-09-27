@@ -1,5 +1,5 @@
-"""E4: the coarse solve's inverse written onto the cards, gated BITWISE against the
-host-slab path followed by `device.coarse.shard_coarse_meshes`.
+"""`ooc_fft.inverse_to_card_shards`: the coarse solve's inverse written onto the cards,
+gated bitwise against the host-slab path followed by `device.coarse.shard_coarse_meshes`.
 
 Card counts above the backend's device count replicate device handles, as in
 `test_ooc_fft_cards`; with `--xla_force_host_platform_device_count=4` the same
@@ -37,7 +37,7 @@ def _spec(field, n=N):
 
 
 def _host_mesh(field, n=N):
-    """The host-slab path the engine ran before E4."""
+    """The reference: the host-slab inverse assembled into one host mesh."""
     spec = _spec(field, n)
     out = None
     for lo, blk in ooc_fft.inverse_to_slabs_device(spec, n, slab=8):
@@ -48,7 +48,7 @@ def _host_mesh(field, n=N):
 
 
 def _card_ranges(w, n=N):
-    """One card per tile-plane group, halo on each side, as E3 will ask."""
+    """One card per tile-plane group, with a halo on each side."""
     return [(lo - HALO, hi - lo + 2 * HALO, d)
             for (lo, hi), d in zip(ooc_fft.partition_units(n, w, 1), _devices(w))]
 
@@ -118,14 +118,11 @@ def test_refusals(field32):
 
 
 def test_no_host_mesh_is_assembled_and_the_bar_can_fail():
-    """Host allocation during the card inverse stays under an eighth of one real
-    mesh: the legitimate host work is per plane (O(n^2)), a host mesh is n^3. The
-    host-slab path assembling its mesh must exceed the same bar.
+    """Host allocation during the card inverse stays under an eighth of one mesh (host work
+    is per plane, O(n^2)); the host-slab path assembling its mesh must exceed the same bar.
 
-    Both paths are WARMED first. A first call's compile holds jax's own objects
-    (pxla, pjit, partial_eval: ~350 KB at n=64, measured, most of it retained by
-    the program cache), which tracemalloc counts and which is not the transform's
-    working set."""
+    Both paths are warmed first: a first call's compile allocates ~350 KB of jax objects at
+    n=64 (mostly retained by the program cache), which tracemalloc would count."""
     n = 64
     f = np.random.default_rng(23).standard_normal((n, n, n), dtype=np.float32)
     bar = n**3 * f.itemsize / 8

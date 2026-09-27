@@ -1,19 +1,11 @@
 """The device step executor: `coarse_backend` / `tile_backend` route `engine.step`
 through the device paint and the device tile loop.
 
-ROUTING, gated bitwise. Each device phase has its own identity gate in its own
-suite (`test_device_paint_cards.py`, `test_device_tile.py`); this file gates that
-the engine calls them where it says it does, with the inputs the host lane would
-have used. With the eager tile, every knob alone and all together must reproduce
-the host engine particle for particle over a run with a lead drift, repacks and
-arena spills.
-
-THE COMPILED TILE is not bitwise the eager one (record sec. 17), so its run cannot
-be compared with the host run field by field. What is gated instead: the step
-writes exactly what `tile_loop_device` writes when called directly on the same
-inputs; no code moves by more than one against the eager executor; one program
-per shape; and a split run resumes bitwise into the uninterrupted one on the
-same backend.
+Routing is gated bitwise (each phase's own identity gate lives in its own suite): with the eager
+tile, every knob alone and together reproduces the host engine particle for particle over a run
+with a lead drift, repacks and arena spills. The compiled tile is not bitwise the eager one, so
+instead: the step writes what `tile_loop_device` writes directly, no code moves by more than one
+against eager, one program per shape, and a split run resumes bitwise on the same backend.
 """
 
 import copy
@@ -144,7 +136,7 @@ def test_the_device_paint_chunk_length_moves_no_state_bit():
 
 
 def test_the_comparison_can_fail(monkeypatch):
-    """Anti-vacuity: one chunk's block dropped on the card must move the run."""
+    """Control: one chunk's block dropped on the card must move the run."""
     from inexor.device import paint as dpaint
 
     real = dpaint.CardInt64Accumulator.add
@@ -177,9 +169,8 @@ def _step_inputs(cfg, co):
 
 
 def test_the_compiled_step_writes_what_the_tile_loop_writes_directly():
-    """Routing identity for the compiled lane: at `tile_loop_end` the step's state
-    is bitwise `tile_loop_device` called by hand on the same coarse meshes,
-    header, shapes and card shard."""
+    """At `tile_loop_end` the compiled step's state is bitwise `tile_loop_device` called by hand
+    on the same coarse meshes, header, shapes and card shard."""
     import jax.numpy as jnp
 
     from inexor.device import coarse as dcoarse
@@ -242,7 +233,6 @@ def test_the_compiled_step_moves_no_code_by_more_than_one_against_eager():
     assert not np.array_equal(snaps["e"][0], w0), "vacuous: the eager step wrote nothing"
     dw = np.abs(snaps["j"][0].astype(np.int32) - snaps["e"][0].astype(np.int32))
     assert dw.max() <= 1, "a velocity code moved by more than one"
-    # a max over the same bricks' scales on both lanes, each within the floor
     assert out_j["n_tiles"] == out_e["n_tiles"]
     assert out_j["vel_scale_kick_max"] > 0 and out_e["vel_scale_kick_max"] > 0
 

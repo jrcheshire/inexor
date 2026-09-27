@@ -1,37 +1,18 @@
-"""Integrator coefficient tables and never-quantized float reference steppers.
+"""Integrator coefficient tables and float reference steppers.
 
-The host float64 coefficient layer -- BullFrog weights, exact/FastPM KDK
-factors, the D-time <-> a-time momentum conversion -- plus the float steppers
-that consume them. This is the half of the v1 integrator that survived the halt:
-it is pure cosmology arithmetic and knows nothing about state representation.
+Host float64 coefficients (BullFrog weights, exact and FastPM KDK factors, the D-time <-> a-time
+momentum conversion) plus float steppers that consume them; independent of state representation.
 
-**What used to be here and is gone (2026-08-08, v1 retirement).** The reversible
-integer step kernels (`step_fwd`/`step_rev`/`step_kdk_*`), their STE float twins,
-the `run_scan`/`run_perstep` drivers, and the `evolve`/`evolve_float`/
-`replay_roundtrip`/`simulate` public API were the v1 thesis: a bit-exactly
-reversible integer trajectory whose adjoint is an exact replay. That premise
-measured false on 2026-07-14 (`docs/retrospective.md`); v2 is a memory-floor
-forward mock engine and does not use them. The v2 engine's own driver lands at
-M-v2-3 (D-v2-18), so there is deliberately no end-to-end driver in the package
-between the codec/force milestones and that one.
+Integrator families:
+- "bullfrog": DKD with an affine kick (Rampf, List & Hahn 2024, arXiv:2409.19049). Weights use
+  the LCDM second-order growth by default; the EdS -(3/7) D^2 form (`growth2="eds"`) converges
+  to a different solution in LCDM (their Sec. 4.4).
+- "fastpm": growth-corrected KDK (Feng et al. 2016).
+- "exact": KDK with literal background integrals; ~2% growth deficit at low step count.
 
-Three integrator families, all still live as coefficient sources:
-- "bullfrog": DKD with an affine kick (Rampf, List & Hahn 2024). The flagship.
-  Its weights take the LCDM second-order growth by default; the EdS
-  -(3/7) D^2 form converges to a different, EdS-coupled solution (paper Sec. 4.4)
-  and is kept only as `growth2="eds"`.
-- "fastpm":   growth-corrected KDK (Feng et al. 2016).
-- "exact":    KDK with literal background integrals (mbody "exact"); the
-  fallback. ~2% growth deficit at low step count -- expected, tested at the
-  converged limit only.
-
-Units: the public surface speaks D-time velocity v = dx/dD throughout. The KDK
-families work in a-time momentum p (H0=1 units) internally; convert at the
-boundary via G_f = a^3 E D' (`v_to_p` / `p_to_v`).
-
-Every float stepper takes the force callable EXPLICITLY -- there is no internal
-`make_force_fn` call, which is what lets the v2 probes drive these steppers with
-a two-level force.
+Units: the public surface uses D-time velocity v = dx/dD. KDK families use a-time momentum p
+(H0 = 1) internally; convert with G_f = a^3 E D' (`v_to_p` / `p_to_v`). Float steppers take the
+force callable explicitly.
 """
 
 from typing import NamedTuple
@@ -48,9 +29,7 @@ from .cosmology import (
     growth_rate_a,
 )
 
-# ============================================================================
 # Coefficient tables (host numpy/scipy float64 island; constants of the run)
-# ============================================================================
 
 
 def a_grid(a_init, a_final, n_steps, spacing="log"):
@@ -63,14 +42,11 @@ def a_grid(a_init, a_final, n_steps, spacing="log"):
 
 
 def _bullfrog_weights(D0, D1, e=None):
-    """BullFrog (alpha, beta, dD, D_mid) for a step D0 -> D1 (Rampf, List & Hahn
-    2024, Eqs. 2.3-2.4).
+    """BullFrog (alpha, beta, dD, D_mid) for a step D0 -> D1 (Rampf, List & Hahn 2024, Eqs. 2.3-2.4).
 
-    `e = (E0, E0', E1')` is the second-order growth at D0 and its slope dE/dD at
-    D0 and D1, from `cosmology.growth2_and_slope`. The weights are invariant under
-    D -> cD, E -> c^2 E, so any consistent normalization works. `e=None` is the
-    EdS special case E = -(3/7) D^2, E' = -(6/7) D, the closed form Eq. 2.3 reduces
-    to at Omega_m = 1; in LCDM it is not consistent (paper Sec. 4.4).
+    `e = (E0, E0', E1')`: second-order growth at D0 and its slope dE/dD at D0 and D1
+    (`cosmology.growth2_and_slope`); invariant under D -> cD, E -> c^2 E. `e=None` is the EdS
+    case E = -(3/7) D^2, not consistent in LCDM.
     """
     dD = D1 - D0
     D_mid = D0 + 0.5 * dD
@@ -97,10 +73,8 @@ class BullFrogTable(NamedTuple):
 def bullfrog_table(a_steps, cosmo, D_of_a=None, growth2="lcdm"):
     """BullFrog weights for a schedule.
 
-    growth2="lcdm" (default) takes the second-order growth from the LCDM ODE;
-    "eds" uses -(3/7) D^2, only to reproduce runs made with it. D_of_a overrides
-    the linear growth (the EdS pin test) and so requires growth2="eds": an
-    overridden D has no matching LCDM second-order growth.
+    growth2: "lcdm" (default, LCDM ODE) or "eds" (-(3/7) D^2). A D_of_a override of the linear
+    growth requires growth2="eds", having no matching LCDM second-order growth.
     """
     if growth2 not in GROWTH2_MODELS:
         raise ValueError(f"growth2 must be one of {GROWTH2_MODELS}, got {growth2!r}")
@@ -146,7 +120,7 @@ def _g_f(a, cosmo, rel=1e-5):
 
 
 def fastpm_drift_factor(a0, a1, a_r, cosmo):
-    """FastPM drift coefficient (Feng et al. 2016, Eq. 24). Verbatim mbody port."""
+    """FastPM drift coefficient (Feng et al. 2016, Eq. 24)."""
     D0 = growth_factor_a(a0, cosmo)
     D1 = growth_factor_a(a1, cosmo)
     fr = growth_rate_a(a_r, cosmo)
@@ -156,17 +130,18 @@ def fastpm_drift_factor(a0, a1, a_r, cosmo):
 
 
 def fastpm_kick_factor(a0, a1, a_r, cosmo):
-    """FastPM kick coefficient (Feng et al. 2016, Eq. 25). Verbatim mbody port."""
+    """FastPM kick coefficient (Feng et al. 2016, Eq. 25)."""
     num = _G_f(a1, cosmo) - _G_f(a0, cosmo)
     den = a_r**2 * E_of_a(a_r, cosmo) * _g_f(a_r, cosmo)
     return 1.5 * cosmo.Omega_m * num / den
 
 
 def kdk_table(a_steps, cosmo, integrator="exact"):
-    """Per-step KDK (k1, drift, k2) coefficients, (K, 3) float64 (mbody
-    _step_coeffs port). k1 kicks over [a0, a_mid], drift over [a0, a1], k2
-    over [a_mid, a1]. integrator: "exact" or "fastpm" (FastPM reference
-    scales: a0 / a_mid / a1, mbody convention)."""
+    """Per-step KDK (k1, drift, k2) coefficients, (K, 3) float64.
+
+    k1 kicks over [a0, a_mid], drift over [a0, a1], k2 over [a_mid, a1]. integrator: "exact" or
+    "fastpm" (reference scale factors a0 / a_mid / a1 for k1 / drift / k2).
+    """
     a_steps = np.asarray(a_steps, dtype=np.float64)
     co = np.empty((len(a_steps) - 1, 3))
     for i in range(len(a_steps) - 1):
@@ -199,14 +174,11 @@ def p_to_v(p, a, cosmo):
     return p * np.float32(1.0 / _G_f(a, cosmo))
 
 
-# ============================================================================
-# Never-quantized float reference steppers (physical units; parity arms)
-# ============================================================================
+# Float reference steppers (physical units)
 
 
 def float_step_bullfrog(x, v, coeff, force_fn, box_size):
-    """One float BullFrog DKD step on (x, v_D) in physical units (mbody
-    _bullfrog_forward port). coeff = (dD_half, alpha, beta_over_Dmid)."""
+    """One float BullFrog DKD step on (x, v_D), physical units; coeff = (dD/2, alpha, beta/D_mid)."""
     dD_half, alpha, bcoef = coeff
     x = jnp.mod(x + dD_half * v, box_size)
     g = force_fn(x)

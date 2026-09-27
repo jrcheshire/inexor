@@ -1,62 +1,30 @@
-"""D2e: one tile of the kick, on the device.
+"""One tile of the kick on the device: the `engine.tile_task` contract.
 
-WHAT THIS REPLACES. `engine.tile_task` end to end: the host decode, the
-tile-local shift and ownership, the short force (already jax), the host packing
-of owned rows for the long gather, and the numpy kick and per-brick quantize.
-`tile_task_device` takes the same arguments and returns the same dict, so
-`engine.apply_result` consumes it unchanged.
+`tile_task_device` takes `engine.tile_task`'s arguments and returns the dict
+`engine.apply_result` consumes. It composes `device.decode.decode_core`, the caller's
+`one_tile` short force, `forces.gather_coarse_subblock` (deferred guard) and
+`device.kick.quantize_per_brick`.
 
-The pieces are the ones earlier rungs put on the device, composed rather than
-rewritten: `device.decode.decode_core` (D2a), the caller's `one_tile`,
-`forces.gather_coarse_subblock` with its deferred guard (D2c), and
-`device.kick.quantize_per_brick` (D2b).
+Differences from the host form that do not change the result:
+- The short arm gets the host's padding (rows cycled from the real ones, `np.resize`
+  order), so the tile paint sees the host's input.
+- The long gather reads rows in row order with `live=owned`; the gather is per row, so
+  the host's packing of owned rows is transport only.
+- The kick uses the host's operands and order, so an f32 force arm promotes as on the
+  host (`device.kick.kick_and_quantize` casts to f64 first and so differs).
+- The int16 range refusal is not on this path: the extremes land on +-32767 by
+  construction; `kick.assert_int16_range_device` is the explicit check.
 
-WHAT MOVES AND WHAT DOES NOT, relative to the host form.
-- Padded rows decode slot 0 on the device. The short arm is handed the host's
-  own padding instead -- rows cycled from the real ones, `np.resize` order -- so
-  the tile paint sees exactly the input it sees on the host.
-- The long gather reads the tile's rows IN ROW ORDER with `live=owned`, where the
-  host packs owned rows to the front of a buffer. The gather is per row, so the
-  packing is transport, not arithmetic.
-- The kick is written with the host's operands and in its order, so the dtype
-  promotion of an f32 force arm is the host's and not a cast of this module's
-  choosing. `device.kick.kick_and_quantize` casts both arms to f64 first, which
-  differs from the host whenever the fine arm is f32.
-- The coarse sub-blocks are staged on the host (`stage_coarse_subblock`) and
-  copied per tile, unless `coarse_shard=` holds the meshes on the card, where the
-  design keeps them (record sec. 23).
-- D-007's int16 range refusal is not on this path, as in D2b: by construction
-  the extremes land on +-32767, and `kick.assert_int16_range_device` is the
-  explicit check for gates.
+Jitted (`jit=`), decode, force, gather, kick and quantize are one program at fixed
+per-step shapes (`tile_step_shapes`), with tile index, origins and kick coefficients as
+runtime values. Coefficients enter as 0-d arrays in the dtype the host's Python float
+takes, and the quantize divisor is passed in because CPU XLA turns an in-program scalar
+divisor into a reciprocal multiply.
 
-EAGER OR JITTED (`jit=`). Jitted, the decode, force, gather, kick and quantize
-are one program at fixed per-step shapes (`tile_step_shapes`), with the tile
-index, origins and kick coefficients as runtime values, so every tile of every
-step reuses one executable. The coefficients enter as 0-d arrays cast to the
-dtype the host's Python-float operand takes (a weak float adopts the array's
-dtype), and the quantize's scale divisor is passed in: a divisor built inside
-the program folds back to a scalar, which CPU XLA computes as a reciprocal
-multiply (record sec. 16).
-
-THE STATE ON THE DEVICE (`device_state=`). The jitted path decodes against the
-whole `off` / `w` / `vel_scale` / `arena_bucket`. Unless the caller passes them
-already on the device (`stage_state_on_device`), every call uploads them: 1.58 GB
-per tile at a 512^3 state (Vista 993754). The 4096^3 design supplies a streamed
-window here instead; the tile's bricks are not a contiguous slot range, so
-`device.paint.slab_window` does not apply as is.
-
-THE RESULTS ON THE DEVICE (`tile_loop_device`). Returning a tile's owned slots
-and codes to the host costs a readback of padded rows and two boolean-mask
-gathers over them: 62 + 214 ms of a 389 ms tile at P=576 (Vista 993817). The
-step-level loop instead writes each tile's codes and per-brick scales into the
-device state inside the same program, returns only scalars, and copies the
-state back to the host once, after every guard has been resolved and the
-ownership partition checked. Order cannot matter: a tile writes only rows it
-owns, and a later tile reads those rows only as buffer, whose velocities are
-decoded and never used.
-
-`engine.step` calls `tile_loop_device` under `EngineConfig(tile_backend="device")`,
-and the eager `tile_task_device` under `device_tile_jit=False`.
+`tile_loop_device` runs a step's tiles writing codes and per-brick scales into the
+device state inside each program, returns only scalars, and copies the state back once
+after every guard and the ownership partition are checked. Tile order cannot matter: a
+tile writes only rows it owns and reads other rows only as buffer.
 """
 
 from __future__ import annotations
@@ -66,24 +34,21 @@ import time
 
 import numpy as np
 
-# One compiled tile program per set of static parameters, and a count of
-# traces: the receipt that one executable served every tile. The lock guards
-# the cache when one thread per card asks for the program first.
+# Compiled tile programs by static parameters, and a trace count; the lock guards the
+# cache against concurrent per-card threads.
 _KERNELS = {}
 _TRACES = [0]
 _KERNEL_LOCK = threading.Lock()
 
-#: RECEIPT: step-level tile loops run through this module (see `migrate.CALLS`).
+#: Count of `tile_loop_device` calls (see `migrate.CALLS`).
 CALLS = 0
 
 STATE_FIELDS = ("off", "w", "vel_scale", "arena_bucket")
 
 
 def owned_rows_device(brick_of_row, tijk, n_tile, n_brick, nb):
-    """The jnp twin of `forces.owned_mask_from_bricks`: integer, so exact.
-
-    `tijk` may be a traced int array.
-    """
+    """The jnp twin of `forces.owned_mask_from_bricks` (integer, exact); `tijk` may be
+    traced."""
     import jax.numpy as jnp
 
     b = jnp.asarray(brick_of_row, dtype=jnp.int64)
@@ -100,7 +65,7 @@ def tile_step_shapes(st, floor=None):
 
     Every tile of a step has the same brick count and `cap`; only the widest
     per-brick arena varies, so it sits on `forces.capacity_shape`'s ladder and
-    `floor` keeps it monotone across steps. O(bricks + arena).
+    `floor` keeps it monotone across steps.
     """
     from ..forces import capacity_shape
     from .paint import _arena_per_brick
@@ -115,9 +80,8 @@ def stage_state_on_device(st, device=None):
     """The state arrays the jitted tile decodes against, COPIED onto `device`
     (None: jax's default device) once, for `device_state=`. Blocks until placed.
 
-    A copy on every backend, never a view of the host arrays: `tile_loop_device`
-    donates `w` and `vel_scale` to its program, and a donated buffer that aliased
-    numpy memory would be overwritten under the host state.
+    Always a copy, never a view: `tile_loop_device` donates `w` and `vel_scale`, and a
+    donated buffer aliasing numpy memory would overwrite the host state.
     """
     import jax
     import jax.numpy as jnp
@@ -149,9 +113,8 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
     def tile(starts, occ, live_counts, arena_slots, row_offsets, bricks, off, w,
              vel_scale, arena_bucket, arena_base, n_rows, origin, tijk, o_cells,
              sub_x, sub_y, sub_z, alpha_k, bcoef, scale_div, *shard_x0):
-        # With `coarse_extent` set, sub_x/y/z arrive as the card's coarse SHARD
-        # meshes and the tile gathers its own blocks (`device.coarse`); otherwise
-        # they are the host-staged blocks.
+        # with `coarse_extent`, sub_x/y/z are the card's coarse shard meshes and the
+        # tile gathers its own blocks; otherwise they are host-staged blocks
         _TRACES[0] += 1  # trace time only
         if coarse_extent is not None:
             sub_x, sub_y, sub_z = subblock_device((sub_x, sub_y, sub_z), shard_x0[0],
@@ -188,24 +151,19 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
     def body_write(*args):
         out = tile(*args)
         w, vel_scale, bricks = args[7], args[8], args[5]
-        # codes: widen, subtract the stored code, mask to owned rows, narrow --
-        # the codec's modular rule (`codec.isub`). Adding that difference back
-        # gives the new code exactly, and a row this tile does not own (padding
-        # included, all at slot 0) adds exactly zero, so repeated indices cannot
-        # collide the way a scatter-SET would
+        # codes: an add of the modular difference (widen, subtract, narrow), which
+        # yields the new code exactly; unowned rows (padding at slot 0 included) add
+        # zero, so repeated indices cannot collide as a scatter-set would
         slots, owned = out["slots"], out["owned"]
         inc = jnp.where(owned[:, None],
                         out["w_codes"].astype(jnp.int32) - w[slots].astype(jnp.int32), 0)
         w_new = w.at[slots].add(inc.astype(w.dtype), mode="promise_in_bounds")
-        # scales: a set on the tile's own bricks (unique within a tile), keeping
-        # the stored scale where the tile owns no rows
+        # scales: set on the tile's own (unique) bricks, kept where it owns no rows
         keep_old = out["counts"] == 0
         vs_new = vel_scale.at[bricks].set(
             jnp.where(keep_old, vel_scale[bricks], out["scales"]), mode="promise_in_bounds")
         sc = {k: out[k] for k in ("n_own", "n_out", "lo", "hi")}
-        # the largest scale this tile WROTE (-inf when it wrote none): the host
-        # loop's `vel_scale_kick_max` is a max over exactly these values, so a max
-        # of them is the same float
+        # largest scale written (-inf if none): the host `vel_scale_kick_max` input
         sc["scale_max"] = jnp.max(jnp.where(keep_old, -jnp.inf, out["scales"]))
         return w_new, vs_new, sc
 
@@ -223,23 +181,20 @@ def tile_task_device(st, one_tile, C, g_coarse, t, bricks, jit=False, shapes=Non
     needs `shapes` from `tile_step_shapes`.
 
     `with_forces=True` adds `forces`: `g_short`, `g_long` and `v_new` at the
-    owned rows, in row order. A gate instrument; it costs a readback.
+    owned rows, in row order (a test instrument; costs a readback).
 
     `device_state` (jit only) is `stage_state_on_device(st)`; without it every
     call uploads the state arrays.
 
-    `timings`, if a dict (jit only), receives per-phase seconds, each phase
-    ended by a device sync: `plan`, `stage` (host), `h2d_tile`, `h2d_state`,
-    `compute`, `d2h`, `result` (host). The syncs are taken only when it is
-    passed, so the timed call is not the production call's scheduling.
+    `timings`, if a dict (jit only), receives synced per-phase seconds (`plan`, `stage`,
+    `h2d_tile`, `h2d_state`, `compute`, `d2h`, `result`); syncs happen only then.
 
     `coarse_shard` (jit only) is a `device.coarse` shard of the coarse force
     meshes on the device; the program then gathers the tile's sub-blocks there
     and `g_coarse` is not read.
 
-    JIT IS NOT BITWISE THE EAGER PATH, and is accepted on a tolerance (record
-    sec. 17): the compiled coarse gather differs by roundoff, a few eps of the
-    long force. The eager path is the bitwise oracle against `engine.tile_task`.
+    Jit is not bitwise the eager path: the compiled coarse gather differs by a few eps
+    of the long force. The eager path is bitwise `engine.tile_task`.
     """
     import jax.numpy as jnp
 
@@ -283,7 +238,7 @@ def tile_task_device(st, one_tile, C, g_coarse, t, bricks, jit=False, shapes=Non
     dec = decode_rows(plan, st.off, st.w, st.vel_scale, st.arena_bucket,
                       st.arena_base, st.t9, nb, cap)
     live = dec["live"]
-    # the host's padding: row r reads real row r mod m
+    # host padding: row r reads real row r mod m
     cyc = jnp.arange(cap, dtype=jnp.int64) % m
     u = jnp.mod(dec["x"][cyc] - jnp.asarray(origin), C["box"])
     own = owned_rows_device(dec["brick_of_row"], t, C["n_tile"], C["n_brick"], nb) & live
@@ -459,10 +414,9 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
     its compiled program, which donates the old `w` and `vel_scale`; the dict is
     updated in place. Only scalars come back per tile.
 
-    After the loop, every tile's stencil guard is resolved and, for a full step,
-    the owned total checked against `st.n_particles` -- both BEFORE anything is
-    used. Then, if `write_host`, `st.w` and `st.vel_scale` are overwritten from
-    the device once.
+    After the loop every stencil guard is resolved and, for a full step, the owned
+    total is checked against `st.n_particles`, before `write_host` copies `st.w` and
+    `st.vel_scale` back once.
 
     Returns `n_owned`, `n_out`, `tiles_run`, `device_state` and
     `vel_scale_kick_max` (the largest per-brick scale written, None when no tile
@@ -473,8 +427,8 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
 
     `device` places every per-tile input, and a default `device_state`, on that
     device (None: jax's default); a caller-supplied `device_state` and
-    `coarse_shard` must already live there. One thread per card, each with its
-    own `device`, state copy and tiles, is the four-card form.
+    `coarse_shard` must already live there. Multi-card use is one thread per card,
+    each with its own `device`, state copy and tiles.
     """
     import jax.numpy as jnp
 
@@ -530,7 +484,7 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
         check_stencil_guard([(lo_h[i], hi_h[i], extents[i], "tsc") for i in range(len(los))])
         n_owned = int(np.asarray(jnp.sum(jnp.stack(owns))))
         n_out = int(np.asarray(jnp.sum(jnp.stack(outs))))
-        # a max of maxima is the max: no reduction order can move it
+        # a max of maxima: no reduction order can move it
         m = float(np.asarray(jnp.max(jnp.stack(smax))))
         kick_max = m if np.isfinite(m) else None
     else:

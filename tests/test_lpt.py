@@ -55,14 +55,9 @@ def test_div_psi1_equals_minus_delta(delta0):
 
 
 def test_force_equals_za_identity(delta0):
-    """THE M1 gate (roadmap): the force solve and the ZA displacement are the
-    same ik/k^2 kernel via different code paths. Painted delta of the
-    UNPERTURBED grid is exactly zero, so instead: force of a grid displaced by
-    an infinitesimal Psi equals the analytic linearized expectation is a
-    CIC-limited statement. The machine-precision arm compares the kernel
-    APPLICATIONS: za of delta == force-solve mesh path of the same delta."""
-    # zeldovich_displacement applies (ik/k^2) via lpt's composition; replicate
-    # the force path's spectral composition on the same delta and compare.
+    """The force solve and the ZA displacement apply the same ik/k^2 kernel via
+    different code paths: ZA of delta equals the force path's spectral composition
+    (`k_components`) on the same delta, at f32 roundoff."""
     from inexor.forces import k_components
 
     psi1 = zeldovich_displacement(delta0, L)
@@ -85,7 +80,7 @@ def test_2lpt_source_quadratic_scaling(delta0):
 def test_2lpt_skewness_sign(delta0):
     """2LPT positions must have MORE skewed density than ZA at the same D
     (collapse enhancement) -- the sign test that validates the Psi2 sign
-    convention (mbody pattern)."""
+    convention."""
     a_late = 1.0  # exaggerate the second-order effect
     x1, _ = lpt_ics(delta0, L, a_late, PLANCK, order=1)
     x2, _ = lpt_ics(delta0, L, a_late, PLANCK, order=2)
@@ -144,8 +139,7 @@ def test_lagrangian_grid_forces_vanish(delta0):
 
 
 def test_low_and_mid_residency_are_bitwise_identical(delta0, tmp_path):
-    """THE SECOND M-v2-5 IDENTITY GATE at unit scale: the disk-staged "low"
-    policy is a pure memory knob. Both policies must execute the identical
+    """The disk-staged "low" residency policy is a pure memory knob. Both policies must execute the identical
     per-element op sequence, so delta2 and the full lpt_ics state agree BIT
     FOR BIT -- and the six staged derivative files existing on disk is the
     structural proof that "low" never held them resident."""

@@ -1,35 +1,16 @@
-"""Portable particle export: the evolved state as plain float arrays.
+"""Portable particle export: the evolved T9 state as plain float `.npy` arrays.
 
-M-v2-6 Stage 4, the SECOND writer. `icgen.write_t9_slabs` writes the state in
-the engine's own T9 encoding, which is what a checkpoint and a restart need and
-what nothing outside this package can read: int8 offsets into a bucket, int16
-velocity codes against a per-brick scale, on a brick-sorted slot layout. A halo
-finder or a mock pipeline wants six floats per particle. This module writes
-those, streamed, so the file is 206 GB at C-gh and the memory to produce it is
-one brick chunk.
+Writes `x.npy`, `v.npy` (and `ids.npy` when the state carries ids) plus an `export.json`
+header with box, units, crc32 sums and provenance. Files are streamed as raw bytes after a
+hand-written `.npy` header (not `open_memmap`, whose dirty pages would count against the
+process), so peak memory is one brick chunk and consumers can `np.load(..., mmap_mode="r")`.
 
-What comes out is standard `.npy` -- `x.npy`, `v.npy`, and `ids.npy` when the
-state carries ids -- plus an `export.json` header carrying the box, the units,
-the integrity sums and the provenance. `.npy` because it is the most portable
-thing that is also memory-mappable: a consumer opens the 103 GB position array
-with `np.load(..., mmap_mode="r")` and touches only the pages it reads. The
-files are written by streaming raw bytes after a hand-written header rather than
-through `open_memmap`, because a 206 GB memmap fills with dirty pages that count
-against the process and would land on top of a run already holding 164.6 GB.
+Row order is brick-major (the engine's spatial layout) and carries no Lagrangian identity;
+export ids (`with_ids=True`) for cross-matching.
 
-**Row order is the engine's spatial order and carries no particle identity.**
-Rows come out brick-major, which is the state's own layout, so the export is
-spatially coherent and arbitrary within a bucket. Nothing recovers the
-Lagrangian index from it. That costs a halo finder nothing and costs
-cross-matching everything, which is why a state built `with_ids=True` gets its
-ids exported alongside and a state without them says so in the header.
-
-**Units.** Positions are comoving Mpc/h in [0, box_size). Velocities are the
-engine's native D-time `v = dx/dD` (Mpc/h per unit growth factor), which is what
-the state holds and is NOT what any consumer assumes. Pass `a` and `cosmo` to
-convert to peculiar km/s on the way out; either way `units` in the header names
-what was written, and the conversion factor rides along so a D-time file can be
-converted after the fact without re-deriving it.
+Units: positions comoving Mpc/h in [0, box_size). Velocities are the native D-time
+`dx/dD` (Mpc/h per unit growth factor) unless `a` and `cosmo` convert them to peculiar km/s;
+the header names the units and records the conversion factor.
 """
 
 import dataclasses
@@ -50,18 +31,8 @@ HEADER = "export.json"
 def peculiar_velocity_factor(a, cosmo):
     """Multiply D-time velocity by this to get peculiar velocity in km/s.
 
-    The engine's velocity is `v_D = dx/dD` with `x` comoving in Mpc/h. Peculiar
-    velocity is `v_pec = a dx/dt`, and
-
-        dx/dt = (dx/dD)(dD/da)(da/dt) = v_D * (f D / a) * (a H)
-
-    using `f = dlnD/dlna`, so `v_pec = a f(a) D(a) H(a) v_D`. With H = 100 h E(a)
-    km/s/Mpc and lengths in Mpc/h the `h` cancels exactly, leaving
-
-        v_pec [km/s] = 100 * a * f(a) * D(a) * E(a) * v_D
-
-    a pure function of the output epoch. `tests/test_export.py` pins it against
-    a finite-difference `dD/da` rather than against itself.
+    `v_pec = a dx/dt = a f D H v_D` with `f = dlnD/dlna`; with lengths in Mpc/h the h cancels:
+    `v_pec [km/s] = 100 a f(a) D(a) E(a) v_D`.
     """
     a = float(a)
     return 100.0 * a * growth_rate_a(a, cosmo) * growth_factor_a(a, cosmo) * E_of_a(a, cosmo)
@@ -70,10 +41,8 @@ def peculiar_velocity_factor(a, cosmo):
 class _StreamedNpy:
     """A `.npy` file of known shape, written in row chunks.
 
-    numpy's own writers want the whole array. This writes the standard header
-    for the final shape up front and then appends raw C-order bytes, so the
-    result is a file `np.load` opens normally while the peak memory is one
-    chunk. crc32 accumulates over the appended bytes for free.
+    Writes the standard header for the final shape up front, then appends raw C-order bytes
+    and accumulates their crc32.
     """
 
     def __init__(self, path, shape, dtype):
@@ -94,23 +63,17 @@ class _StreamedNpy:
         b = np.ascontiguousarray(block, dtype=self.dtype)
         if b.shape[1:] != self.shape[1:]:
             raise ValueError(f"block shape {b.shape} does not match {self.shape} past axis 0")
-        # A flat byte VIEW of the cast block, not a second copy of it. `tobytes()`
-        # duplicated every block on its way out -- 1.65 TB of copying over a
-        # C-hero export, for bytes that `write` and `crc32` both take as a buffer.
-        # Same defect, same fix as `crc32(a.tobytes())` in `icgen.write_t9_slabs`.
+        # A byte view, not a `tobytes()` copy; `write` and `crc32` both take a buffer.
         raw = b.reshape(-1).data.cast("B")
         self._fh.write(raw)
         self.crc = zlib.crc32(raw, self.crc)
         self.rows += b.shape[0]
 
     def close(self):
-        """Refuses a short file, which is the export's CONSERVATION check.
+        """Close; raises on a short file. This is the export's conservation check.
 
-        The declared shape comes from `st.n_live`, so a writer that lost rows --
-        a brick missing from the sweep, arena residents not folded in -- lands
-        here rather than producing a file that loads clean and is short. Both
-        defects were planted and both are caught here, which is why there is no
-        second count check downstream: it could not fire.
+        The declared row count is `st.n_live`, so any lost rows (a skipped brick, arena
+        residents not folded in) fail here instead of producing a short file that loads clean.
         """
         self._fh.close()
         if self.rows != self.shape[0]:
@@ -134,49 +97,19 @@ def write_particles(
 ):
     """Write `st` as portable `(x, v)` float arrays under `workdir`.
 
-    Streams in groups of `chunk_bricks` bricks through `SlotState.decode_bricks`,
-    which is the engine's own decode -- the same call the streamed coarse paint
-    makes -- so the exported positions are the positions the force saw, arena
-    residents included, rather than a second decode path that could drift from
-    it. Peak float memory is one chunk: ~4 M particles at the default and C-gh
-    geometry, about 200 MB in f64 before the narrowing cast.
+    Streams groups of `chunk_bricks` bricks through `SlotState.decode_bricks` (the engine's own
+    decode, arena residents included), so the exported positions are those the force saw.
+    Decode is f64; `dtype` is the on-disk type, and f32 resolves the T9 position quantum
+    `box / n_levels` with margin (the margin shrinks as the box grows).
 
-    `dtype` is the ON-DISK float type and defaults to f32, which resolves the
-    T9 position quantum with room to spare: the stored position is a lattice
-    index times `box / n_levels`, f32's spacing at magnitude `box` is
-    `box * 2**-23`, and the ratio is **32x at C-gh and 16x at C-hero**
-    (measured, `tests/test_export.py`). It shrinks as the box grows, so it is a
-    property of the config rather than a constant, and the test carries the
-    numbers. Pass `np.float64` to double the file and gain nothing the state
-    holds. The DECODE is f64 either way.
+    `a` and `cosmo` together convert velocities to peculiar km/s; one without the other raises.
+    One writer thread at depth one overlaps a chunk's write with the next chunk's decode (at
+    most two chunks live). `timings`, if a dict, accumulates `decode`, `write` (time blocked on
+    the writer, so parts sum to the wall), `write thread` (writer busy time, the one to take
+    throughput against) and `chunks`. `progress` is called once per chunk.
 
-    `a` and `cosmo` together convert velocities to peculiar km/s; giving one
-    without the other is refused rather than silently ignored, since the failure
-    would be a file whose header claims units it does not carry.
-
-    **One writer thread, depth one**, so a chunk's write overlaps the NEXT
-    chunk's decode. The decode is the host term at scale and the write is the
-    disk term, and they were strictly serial: measured 133-149 us per brick at
-    C-hero's 4096 particles/brick, a 16.8M-brick decode is 40-55 min against a
-    ~2,200 s write of 1.65 TB, so overlapping them takes the leg from their sum
-    to their max. Same pattern, and same depth, as `icgen.write_t9_slabs`;
-    `submit` blocks on the previous write, so at most two chunks are live.
-
-    `timings`, if a dict, accumulates seconds per part: `decode` (the main
-    thread's own work), `write` (the time it spends BLOCKED on the writer, so
-    the parts still sum to the wall) and `write thread` (the writer's own busy
-    time, which is what a throughput figure has to be taken against), plus
-    `chunks`. Reading `write` as the write's duration understates the disk by
-    the whole overlap; that misreading cost a wrong NFS rate once already.
-
-    `progress(stage, done, total)`, if given, is called once per chunk; see
-    `inexor.progress.Heartbeat`. At 4096^3 this loop is 16,384 chunks and over
-    an hour long, and it used to report nothing until it returned.
-
-    Returns the header dict. It is written LAST and removed FIRST, so its
-    presence marks a complete export -- the same contract as the T9 manifest,
-    for the same reason: an interrupted export otherwise leaves full-looking
-    arrays that load clean and are short.
+    Returns the header dict. The header is removed first and written last, so its presence
+    marks a complete export.
     """
     if (a is None) != (cosmo is None):
         raise ValueError(
@@ -211,15 +144,9 @@ def write_particles(
             timings[key] = timings.get(key, 0.0) + clock() - t0
 
     def _write_chunk(x, v, ids_block):
-        """The writer thread's whole job: cast, checksum, write, in stream order.
-
-        Row order across chunks is the file's order, so this must run on ONE
-        worker and the caller must not submit chunk k+1 before chunk k is done.
-        """
+        """Writer-thread body. Must run on one worker, one chunk at a time (row order)."""
         t0 = clock()
         streams["x"].append(x)
-        # The scale rides in the f64 decode, so a km/s file is the D-time file
-        # times one number and carries no extra rounding beyond the output cast.
         streams["v"].append(v)
         if ids_block is not None:
             streams["ids"].append(ids_block)
@@ -235,7 +162,7 @@ def write_particles(
             return
         f, pending = pending, None
         t0 = clock()
-        dt = f.result()             # the only place a write error surfaces
+        dt = f.result()             # where a write error surfaces
         _add("write", t0)
         if timings is not None:
             timings["write thread"] = timings.get("write thread", 0.0) + dt
@@ -244,8 +171,6 @@ def write_particles(
         bricks = range(st.n_bricks)
         n_groups = (st.n_bricks + chunk_bricks - 1) // chunk_bricks
         for gi, lo in enumerate(range(0, st.n_bricks, chunk_bricks)):
-            # `gi` chunks are complete here; the closing call is after the loop,
-            # where the last write has been joined and the count is true
             if progress is not None:
                 progress("export chunk", gi, n_groups)
             t0 = clock()
@@ -257,8 +182,6 @@ def write_particles(
                 v = v * vfac
             ids_block = st.ids[slots] if "ids" in streams else None
             _add("decode", t0)
-            # Wait for the previous chunk BEFORE queueing this one: depth one
-            # keeps two chunks live rather than the whole export.
             _join()
             pending = pool.submit(_write_chunk, x, v, ids_block)
             n_chunks += 1
@@ -287,15 +210,8 @@ def write_particles(
             velocity="km/s peculiar" if kms else "Mpc/h per unit growth factor (dx/dD)",
         ),
         velocity_is_dtime=not kms,
-        # Recorded whether or not it was applied, so a D-time file can be
-        # converted later without re-deriving the factor or guessing the epoch.
         peculiar_velocity_factor=(float(vfac) if kms else None),
         a=(float(a) if kms else None),
-        # The epoch and the factor were here from the start; the COSMOLOGY that
-        # turns one into the other was not, so a reader could see `a=0.5` and a
-        # factor and still not know which Omega_m produced it. That gap widened
-        # once the CLI let the epoch and the cosmology come from different
-        # places, so the whole dataclass rides along.
         cosmology=(dataclasses.asdict(cosmo) if kms else None),
         row_order="brick-major (the engine's spatial layout); no Lagrangian identity",
         has_ids="ids" in streams,
@@ -310,10 +226,8 @@ def write_particles(
 def load_particles(workdir, mmap=True):
     """Read an export back: `(header, x, v, ids)`, `ids` None when absent.
 
-    Refuses a missing header (an incomplete export) and any crc mismatch. The
-    crc check reads every byte, so it is skipped under `mmap=True` -- the whole
-    point of mapping a 103 GB array is not to read it -- and the arrays come
-    back as memmaps. `mmap=False` loads and verifies.
+    Raises on a missing header (incomplete export). `mmap=True` returns memmaps and skips the
+    crc check (it would read every byte); `mmap=False` loads and verifies crc32.
     """
     hpath = os.path.join(workdir, HEADER)
     if not os.path.exists(hpath):
@@ -343,32 +257,11 @@ def load_particles(workdir, mmap=True):
 def _resolve_epoch(man, args):
     """Pick the output epoch and cosmology for the CLI. Returns `(a, cosmo, why)`.
 
-    `why` is carried into the export header's provenance, so a file always says
-    where its units came from rather than leaving a reader to infer it from
-    whether a number looks like km/s.
-
-    Precedence, and each rung exists for a reason:
-
-    1. `--d-time` -- an explicit request for the engine's native `dx/dD`.
-    2. `--a` -- an explicit epoch, which overrides a recorded one. Re-exporting
-       a checkpoint at a different epoch is wrong, but `--a` is also how the
-       banked pre-epoch artifacts get km/s at all, so this cannot refuse.
-    3. the checkpoint's own `a` + `cosmology` -- the default, and the point of
-       the exercise.
-    4. neither -- D-time, ANNOUNCED. A silent fallback is the failure this whole
-       change is about, so the caller is told which rung it landed on.
-
-    `--omega-m` / `--h` override individual cosmology fields on top of whichever
-    of 2 or 3 supplied the rest. Passing them with nothing to attach them to is
-    refused rather than ignored: the request was to change a number that is not
-    being used, and honouring it silently would write a header claiming a
-    cosmology that did not enter the file.
-
-    **An IC directory's `a_init` is deliberately NOT read as rung 3.** The
-    generator records `a_init` at manifest top level but no cosmology, so half
-    the conversion is missing; and exporting unevolved ICs to a halo finder is
-    not a use for this tool. Falling back for them is correct. This note exists
-    so the asymmetry reads as a choice rather than an oversight.
+    `why` goes into the header's provenance. Precedence: `--d-time` (native dx/dD); `--a`
+    (overrides a recorded epoch; needed for checkpoints that record none); the checkpoint's
+    own `provenance.a` + `cosmology`; else D-time, announced. `--omega-m`/`--h` override
+    single cosmology fields and are refused when no epoch is in use. An IC directory's
+    top-level `a_init` is deliberately not used: it records no cosmology.
     """
     from .config import Cosmology
 
@@ -411,9 +304,6 @@ def _resolve_epoch(man, args):
     else:
         why = "checkpoint epoch"
     if overrides:
-        # Named explicitly: with `--omega-m`/`--h` usable on their own, the
-        # epoch and the cosmology can now come from different places, and a
-        # line that reported only the epoch would leave that invisible.
         why += "; cosmology overridden: " + ", ".join(
             f"{k}={v!r}" for k, v in sorted(overrides.items())
         )
@@ -423,17 +313,10 @@ def _resolve_epoch(man, args):
 def _main(argv=None):
     """Turn a T9 checkpoint on disk into a portable export.
 
-    The engine writes its own encoding every step; this is how that becomes the
-    thing a halo finder reads, without re-running anything. `checkpoint_dir` is
-    a directory holding a `manifest.json` -- either a `genN` directory under a
-    run's `checkpoint_dir`, or any `write_t9_slabs` output.
-
-    **Peculiar km/s is the default output**, because a halo finder is the
-    consumer and km/s is what it expects. That is only possible when the
-    checkpoint knows its own epoch, which one written by `engine.run(epoch=...)`
-    does; see `engine.epoch_record`. `--a` overrides the recorded epoch,
-    `--d-time` asks for the engine's native velocity, and a checkpoint carrying
-    no epoch falls back to D-time and says so on stdout.
+    `checkpoint_dir` holds a `manifest.json` (a run's `genN` checkpoint or any
+    `write_t9_slabs` output). Velocities default to peculiar km/s at the epoch the
+    checkpoint records (`engine.run(epoch=...)`); `--a` overrides it, `--d-time` writes the
+    native dx/dD velocity, and a checkpoint with no epoch falls back to D-time and says so.
     """
     import argparse
 
@@ -469,9 +352,6 @@ def _main(argv=None):
                         epoch_source=why),
     )
     gb = head["n_particles"] * 6 * np.dtype(args.dtype).itemsize / 1e9
-    # The epoch leads, because it is the number that silently makes the file
-    # wrong: a velocity converted at a neighbouring scale factor is off by tens
-    # of percent and looks entirely reasonable on inspection.
     if a is not None:
         print(f"  velocities: km/s peculiar at a={a:.6g}, Omega_m={cosmo.Omega_m!r}, "
               f"h={cosmo.h!r} ({why})")
@@ -484,7 +364,5 @@ def _main(argv=None):
     return 0
 
 
-# Guarded, and not only by convention: an unguarded module here re-imports
-# recursively under `spawn` if anything downstream ever starts a pool.
 if __name__ == "__main__":
     raise SystemExit(_main())

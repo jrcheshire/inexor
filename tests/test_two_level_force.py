@@ -1,24 +1,10 @@
-"""M-v2-2: the promoted two-level force must be BITWISE the probe.
+"""Two-level (long/short split) force: kernels, tile paint/gather, coarse sub-block staging,
+and the integer (order-independent) paints.
 
-WHY BITWISE AND NOT A TOLERANCE. D-v2-10, D-v2-11 and D-v2-12 are measurements
-OF `scripts/v2_g5_core.py`. If the promoted engine is merely close to it, those
-three ratified records quietly stop describing the shipped artifact -- which is
-the failure D-v2-16 clause 7 exists to prevent. So the probe stays UNMODIFIED
-and is imported here as the oracle, and equality is exact.
-
-WHAT MAKES A BITWISE ASSERTION WORTH ANYTHING. It has to be able to fail. Two
-ways this class of check has already been caught passing vacuously in this
-project:
-
-  - on all-zero arrays, because `r_s=None` makes the short kernel identically
-    zero (V4 parity check, 2026-08-07);
-  - on a degenerate fixture, where the quantity under test is constant by
-    construction (the equilateral control's window arm, deneb 361).
-
-So every comparison here goes through `_agree`, which asserts dynamic range
-FIRST, and there is an explicit test that a 1e-9 perturbation breaks equality.
-An assertion that cannot discriminate is worse than an absent one: it reads as
-evidence.
+Tiling and staging are memory decisions and must not move a number, so parity is asserted
+bitwise, not to a tolerance. Every bitwise comparison goes through `_agree`, which first
+asserts the oracle carries signal: equality on all-zero or constant arrays passes vacuously
+(e.g. `r_s=None` makes the short kernel identically zero).
 """
 
 
@@ -31,9 +17,8 @@ from inexor import forces, painting  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """The probe builds its kernels in f64 and the gate arms run x64; a promoted
-    twin compared under f32 would differ for a reason that has nothing to do
-    with the promotion."""
+    """Run x64: the kernels are built in f64, and an f32 comparison would differ for
+    reasons unrelated to the property under test."""
     import jax
 
     prev = jax.config.jax_enable_x64
@@ -87,17 +72,12 @@ def _membership(pos, n_fine, n_tile, b_fine):
 
 
 def _agree(mine, theirs, what, min_range=1e-6, min_nonzero_frac=0.5):
-    """Bitwise equality, but only after proving the arrays carry signal.
+    """Bitwise equality, after asserting the oracle (`theirs`) carries signal.
 
-    `min_range` is on the peak absolute value of the ORACLE, so an all-zero or
-    constant array fails here rather than passing the equality trivially.
-
-    `min_nonzero_frac` is the second half of that, and it has to be an argument
-    rather than a constant because TILE-LOCAL quantities are legitimately mostly
-    zero: a tile's padded box holds an eighth of the volume per side, so ~7/8 of
-    the gather rows are out-of-box and zero BY CONSTRUCTION, and most cells of a
-    sparse tile mesh are empty. Lowering it for those is fine; lowering it to 0
-    is not, which is why it is stated per call site with a reason.
+    `min_range` bounds the oracle's peak |value| and `min_nonzero_frac` its nonzero
+    fraction, so an all-zero or constant oracle fails instead of passing trivially. The
+    fraction is per call site because tile-local quantities are legitimately mostly zero
+    (out-of-box gather rows, empty cells); lower it with a reason, never to 0.
     """
     mine = np.asarray(mine)
     theirs = np.asarray(theirs)
@@ -132,9 +112,8 @@ def test_k2_true_keeps_a_genuine_dc_zero_and_k2_safe_does_not():
 
 
 def test_long_plus_short_is_exactly_mono():
-    """Floor F1, and the reason `split_factor` must keep its `1.0 - S` form. If
-    this ever needs a tolerance, someone has rewritten it as -expm1 and every
-    error this engine reports has stopped being attributable."""
+    """long + short == mono bitwise, which is why `split_factor` keeps its `1.0 - S` form;
+    an -expm1 rewrite would need a tolerance and make the split error unattributable."""
     _, _, _, k2_true, _ = forces.kernel_grids((12,) * 3, 0.5)
     s_long = forces.split_factor(k2_true, R_S, "long")
     s_short = forces.split_factor(k2_true, R_S, "short")
@@ -144,9 +123,8 @@ def test_long_plus_short_is_exactly_mono():
 
 
 def test_windowed_families_are_not_reachable_from_the_package():
-    """They measured ~10x worse in the coarse arm and D-v2-10 froze the gaussian
-    family. Asserted so a later caller cannot quietly resurrect a branch that
-    the ratified records do not cover."""
+    """Only the gaussian split family is exposed; the windowed families measured ~10x
+    worse in the coarse arm and are not reachable from `split_kernels`."""
     import inspect
 
     assert "family" not in inspect.signature(forces.split_kernels).parameters
@@ -156,9 +134,8 @@ def test_windowed_families_are_not_reachable_from_the_package():
 
 
 def test_tsc_weights_are_a_partition_of_unity():
-    """Not a parity check but the property that makes TSC a mass-conserving
-    assignment at all: if the three per-axis weights stop summing to 1, the
-    paint silently loses or invents mass and every downstream number moves."""
+    """The three per-axis TSC weights sum to 1 (to 1e-15), which makes the paint
+    mass-conserving."""
     import jax.numpy as jnp
 
     pos = jnp.asarray(_positions(4))
@@ -171,8 +148,8 @@ def test_tsc_weights_are_a_partition_of_unity():
 
 
 def test_force_global_long_plus_short_recovers_mono_at_the_f1_floor():
-    """The identity that makes the split's error attributable, end to end
-    through paint, solve and gather rather than at the kernel alone."""
+    """long + short == mono to 1e-12 relative end to end (paint, solve, gather), not
+    only at the kernel."""
     import jax.numpy as jnp
 
     pos = jnp.asarray(_positions(8))
@@ -189,8 +166,7 @@ def test_force_global_long_plus_short_recovers_mono_at_the_f1_floor():
 
 
 def test_the_vacuity_guard_rejects_an_all_zero_oracle():
-    """The other half: `_agree` must refuse to pass on the degenerate arrays
-    that made the original check meaningless, even when they are equal."""
+    """`_agree` refuses an all-zero oracle even when both arrays are equal."""
     zeros = np.zeros((64,))
     with pytest.raises(AssertionError, match="vacuous"):
         _agree(zeros, zeros, "all-zero")
@@ -200,9 +176,8 @@ def test_the_vacuity_guard_rejects_an_all_zero_oracle():
 
 
 def test_padded_size_refuses_a_degenerate_tile():
-    """A padded tile at least as big as the box does more FFT work than the
-    monolithic solve it replaces, and with the brick wrap it is where the
-    double-count bug lives."""
+    """A padded tile at least as big as the box is refused: it does more FFT work than
+    the monolithic solve, and with the brick wrap it double-counts particles."""
     with pytest.raises(ValueError, match="degenerate"):
         forces.padded_size(64, 40, n_fine=64)
 
@@ -210,14 +185,10 @@ def test_padded_size_refuses_a_degenerate_tile():
 # ------------------------------------------------------- the tile paint/gather
 
 
-# The tile fixture needs its own geometry, and BOTH constraints below are
-# load-bearing. FFT_FRIENDLY starts at 32, so a padded tile cannot be smaller
-# than that. And P must be strictly LESS than n_fine, or the padded box covers
-# the whole volume, no particle is ever outside a tile, and the `ok` mask plus
-# the n_out contract go untested -- which is exactly how the first version of
-# this fixture (n_fine=32, P=32) passed while exercising nothing.
-# n_fine=64 with T=16/b=8 gives P=32 and n_side=4, so 64 tiles each covering an
-# eighth of the box per side.
+# Tile fixture geometry. A padded tile is at least 32 (FFT_FRIENDLY starts there), and P
+# must be strictly less than n_fine: otherwise the padded box covers the whole volume, no
+# particle is ever outside a tile, and the `ok` mask and n_out contract go untested.
+# n_fine=64 with T=16, b=8 gives P=32 and 4^3 = 64 tiles, each an eighth of the box per side.
 N_FINE_T, N_TILE_T, B_FINE_T, N_PART_T = 64, 16, 8, 16
 
 
@@ -235,9 +206,8 @@ def _tile_fixture(seed, n_tile=N_TILE_T, b_fine=B_FINE_T, n_fine=N_FINE_T):
 
 
 def test_tile_paint_conserves_mass_over_the_in_box_rows():
-    """The property the CIC weights exist to have. If the corner weights stop
-    summing to 1 the paint silently loses mass, which no parity check against a
-    twin carrying the same bug would ever show."""
+    """Painted mass equals the in-box particle count (rel 1e-12). A parity check against
+    a twin with the same weight bug could not show a mass loss."""
     u, live, shape, cell = _tile_fixture(13)
     mean = N_PART_T**3 / float(N_FINE_T) ** 3
     mesh, n_out = forces.tile_paint_f64(u, live, shape, cell, mean)
@@ -250,9 +220,8 @@ def test_tile_paint_conserves_mass_over_the_in_box_rows():
 
 @pytest.mark.detflag
 def test_the_two_padding_fills_agree_bitwise():
-    """Stated as its own assertion because it is the premise of the A/B: the
-    fills differ only in which mesh addresses the zero-weight scatter-adds
-    contend for, so any difference in the FORCE means a pad row is being counted.
+    """pad_fill='cycle' and 'zero' give bitwise-identical forces: the fills differ only in
+    which addresses the zero-weight scatter-adds hit, so a difference means a pad row counts.
     """
     n_tile, b_fine = N_TILE_T, B_FINE_T
     pos = _positions(15, N_PART_T)
@@ -264,9 +233,8 @@ def test_the_two_padding_fills_agree_bitwise():
 
 
 def test_one_tile_equals_the_whole_box_identity():
-    """The tile-identity rung: one tile covering the box with no buffer must
-    reproduce the global short solve. This is the check that caught the dropped
-    cell layer at 4.6e-1 when the paint required base < P-1."""
+    """One tile covering the box with no buffer reproduces the global short solve (rel
+    < 1e-13). A paint that drops the last cell layer fails this at ~4.6e-1."""
     import jax.numpy as jnp
 
     pos = _positions(16, N_PART_T)
@@ -285,9 +253,8 @@ def test_one_tile_equals_the_whole_box_identity():
 
 
 def test_the_accumulate_sink_refuses_a_production_sized_box():
-    """D-v2-16 clause 1: the global (n,3) array is 206 GB at C-gh and deleting
-    two of them is what makes C-gh runnable. The test path must not become the
-    production path by default."""
+    """The accumulate sink materializes the global (n, 3) force (206 GB at C-gh), so it
+    refuses above `max_accumulate_bytes` rather than becoming the production path."""
     pos = _positions(17, N_PART_T)
     member_fn, cap = _membership(pos, N_FINE_T, N_TILE_T, B_FINE_T)
     with pytest.raises(ValueError, match="accumulate sink would allocate"):
@@ -299,9 +266,8 @@ def test_the_accumulate_sink_refuses_a_production_sized_box():
 
 @pytest.mark.detflag
 def test_the_tile_local_sink_sees_every_particle_exactly_once():
-    """The production path. Ownership is a partition, so a tile-local sink must
-    receive each particle exactly once across all tiles and reconstruct exactly
-    what the global accumulator would have built -- without ever holding it."""
+    """The production path: ownership is a partition, so a tile-local sink receives each
+    particle exactly once and reconstructs the accumulate result bitwise."""
     n_tile, b_fine = N_TILE_T, B_FINE_T
     pos = _positions(18, N_PART_T)
     member_fn, cap = _membership(pos, N_FINE_T, n_tile, b_fine)
@@ -321,15 +287,13 @@ def test_the_tile_local_sink_sees_every_particle_exactly_once():
     _agree(rebuilt, reference, "tile-local sink vs accumulate")
 
 
-# ------------------------------------------- regressions for the measured bugs
+# --------------------------------------------------------- pinned failure modes
 
 
 def test_regression_brick_span_refuses_the_wrapping_double_count():
-    """Measured 2026-07-15: tile membership walks bricks by MODULAR index, so
-    once span > nb the same brick is visited twice and its particles are painted
-    TWICE. At n_fine=64, n_tile=32, b=20 that gave span=6 against nb=4 and a
-    3.29 RELATIVE short-force error -- silent density corruption that reads like
-    a catastrophic tiling failure rather than a bookkeeping bug."""
+    """Membership walks bricks by modular index, so span > nb visits a brick twice and
+    paints its particles twice (n_fine=64, n_tile=32, b=20: span 6 vs nb 4, a 3.29
+    relative short-force error). `brick_span` refuses it."""
     from inexor.layout import brick_span
 
     with pytest.raises(ValueError, match="wraps the box and would double-count"):
@@ -337,10 +301,9 @@ def test_regression_brick_span_refuses_the_wrapping_double_count():
 
 
 def test_regression_the_last_cell_layer_of_the_padded_box_is_painted():
-    """Measured: requiring base < P-1 silently discarded the last cell layer of
-    every padded box, producing 4.6e-1 on the tile identity and a fake buffer
-    plateau that mimicked kernel ringing. Pin it directly -- a particle in the
-    final cell layer must carry weight."""
+    """A particle in the last cell layer of the padded box carries its full weight and
+    is not counted outside. Dropping that layer gives 4.6e-1 on the tile identity and a
+    buffer plateau that mimics kernel ringing."""
     import jax.numpy as jnp
 
     P, cell = 16, 1.0
@@ -355,11 +318,9 @@ def test_regression_the_last_cell_layer_of_the_padded_box_is_painted():
 
 
 def test_regression_padding_rows_do_not_funnel_onto_flat_index_zero():
-    """Measured 2026-08-07 (`eba91ab`): `where(ok, flat, 0)` sent every padded
-    row to flat index 0, so ~2e6 zero-weight f64 atomics per tile contended for
-    ONE address -- 2.218x on the device phase. The fix is that `flat` is returned
-    UNMASKED and only the weight is zeroed, which is asserted here directly
-    because the cost is invisible to any correctness check."""
+    """Masked rows keep their real `flat` index; only the weight is zeroed. Sending them
+    all to index 0 makes ~2e6 zero-weight f64 atomics per tile contend for one address
+    (2.2x on the device phase), a cost no correctness check sees."""
     import jax.numpy as jnp
 
     base = jnp.asarray([[5, 6, 7], [5, 6, 7]], dtype=jnp.int32)
@@ -372,7 +333,7 @@ def test_regression_padding_rows_do_not_funnel_onto_flat_index_zero():
     assert float(w[0]) > 0.0 and float(w[1]) == 0.0, "masking must be on the WEIGHT"
 
 
-# ================================ coarse sub-block staging (D-v2-16 clause 3)
+# ===================================================== coarse sub-block staging
 
 
 def _coarse_setup(seed=30):
@@ -387,9 +348,8 @@ def _coarse_setup(seed=30):
 
 
 def test_the_staged_subblock_is_a_verbatim_periodic_slice():
-    """The premise everything else rests on. If the slice is not exactly the
-    cells the global mesh holds at those (wrapped) indices, the gather cannot be
-    bitwise and the whole staging idea is a change in physics."""
+    """The staged sub-block is exactly the global mesh at the wrapped indices, including
+    a block straddling the low boundary."""
     g, _, n_coarse, _ = _coarse_setup()
     origin, extent = forces.coarse_subblock_origin_extent(
         (0, 0, 0), N_TILE_T, n_coarse, N_FINE_T
@@ -407,22 +367,13 @@ def test_the_staged_subblock_is_a_verbatim_periodic_slice():
 
 
 def test_staging_allocates_the_block_and_not_a_slab():
-    """The transient, which is what the axis-by-axis spelling got wrong.
+    """Staging allocates at block scale, not slab scale (tracemalloc).
 
-    Taking axis by axis materializes (extent, n, n) before the second axis
-    narrows it. That is invisible at test sizes and enormous at c-hero -- 2.21
-    GB per call to deliver 9.20 MB, 12,288 calls a step -- so the VALUE tests
-    above could never have caught it. This one watches the allocation instead.
-
-    The bar is the SLAB, not a multiple of the output, because the honest
-    floor here is not the output: numpy broadcasts the `np.ix_` index arrays
-    over the output shape, and an int64 index is twice the bytes of an f32
-    value, so a correct 3-D gather legitimately peaks at ~4.6x its output
-    (measured: 0.25 MB for 0.055 MB). That is inherent to fancy indexing and
-    not a defect, and a bar set off the output would be policing it. What the
-    gate has to exclude is SLAB-scale allocation, which is 6.3 MB here -- 115x
-    the output and 25x what the gather actually uses. A quarter of the slab
-    sits an order clear of both sides.
+    An axis-at-a-time gather materializes (extent, n, n) first: 2.21 GB per call for a
+    9.20 MB block at c-hero, 12,288 calls a step, invisible to value tests. The bar is a
+    quarter of the slab (6.3 MB here), not a multiple of the output, because a correct
+    `np.ix_` gather peaks at ~4.6x its output (int64 indices broadcast over the output;
+    measured 0.25 MB for 0.055 MB). The bar sits an order clear of both.
     """
     import tracemalloc
 
@@ -448,10 +399,8 @@ def test_staging_allocates_the_block_and_not_a_slab():
 
 
 def test_staging_matches_an_axis_at_a_time_gather_bitwise():
-    """The change that removed the slab is an IDENTITY -- same elements, same
-    order -- so the retired spelling is kept here as the oracle and must agree
-    to the bit, including where the block straddles the periodic boundary and
-    where the origin is negative."""
+    """Bitwise identical to an axis-at-a-time gather (the oracle), including blocks that
+    straddle the periodic boundary and negative origins; a one-ulp bump must break it."""
     rng = np.random.default_rng(4)
     n, extent = 32, 7
     g = rng.standard_normal((n, n, n)).astype(np.float64)
@@ -477,13 +426,8 @@ def test_staging_matches_an_axis_at_a_time_gather_bitwise():
 
 
 def test_the_deferred_guard_is_the_same_guard():
-    """`guard_out` must change WHEN the refusal happens, not WHETHER it does.
-
-    Three properties, because a deferred guard that quietly stopped guarding is
-    the failure mode this whole change could have: it refuses exactly what the
-    eager form refuses, it accepts exactly what the eager form accepts, and the
-    forces it returns are BITWISE what the eager path returns.
-    """
+    """`guard_out` defers the stencil check without changing it: same refusals, same
+    acceptances, bitwise-identical forces."""
     import jax.numpy as jnp
 
     g, _, n_coarse, cell = _coarse_setup()
@@ -520,13 +464,8 @@ def test_the_deferred_guard_is_the_same_guard():
 
 
 def test_the_deferred_guard_stays_quiet_when_every_row_is_padding():
-    """The all-dead case, which the host form handled with `if keep.any()`.
-
-    On device the dead rows are pushed to sentinels, and the arithmetic has to
-    come back BELOW zero for the max and ABOVE it for the min so that an
-    all-padded tile raises nothing. Getting that backwards would make every
-    empty tile throw.
-    """
+    """With every row dead the deferred guard raises nothing: dead rows go to sentinels
+    that land below zero for the max and above it for the min."""
     import jax.numpy as jnp
 
     g, _, n_coarse, cell = _coarse_setup()
@@ -545,8 +484,8 @@ def test_the_deferred_guard_stays_quiet_when_every_row_is_padding():
 
 
 def test_the_subblock_is_far_smaller_than_the_global_mesh():
-    """The reason it exists. Asserted as a ratio so a later halo change that
-    quietly ate the saving shows up here."""
+    """At C-gh size the sub-block is >1000x smaller than the global coarse mesh; a halo
+    change that ate the saving fails here."""
     n_coarse = 1024  # C-gh
     _, extent = forces.coarse_subblock_origin_extent((0, 0, 0), 256, n_coarse, 4096)
     assert extent == 64 + 2 * forces.COARSE_HALO
@@ -555,12 +494,8 @@ def test_the_subblock_is_far_smaller_than_the_global_mesh():
 
 @pytest.mark.parametrize("assign", ["cic", "tsc"])
 def test_gathering_from_the_subblock_is_bitwise_the_global_gather(assign):
-    """The contract: staging is a memory decision and must not move a number.
-
-    Checked on OWNED rows of several tiles, including tile 0 whose block
-    straddles the periodic boundary -- the case where an index-shift bug would
-    hide.
-    """
+    """Gathering from the staged sub-block is bitwise the global gather on owned rows,
+    including tile 0, whose block straddles the periodic boundary."""
     import jax.numpy as jnp
 
     g, pos, n_coarse, cell_c = _coarse_setup()
@@ -590,9 +525,8 @@ def test_gathering_from_the_subblock_is_bitwise_the_global_gather(assign):
 
 
 def test_the_subblock_gather_refuses_rows_it_cannot_serve():
-    """A row outside the tile's core reads wrapped values from the far side of
-    the block, silently and plausibly. That is the exact shape of bug the halo
-    exists to prevent, so it raises instead."""
+    """A row outside the tile core would silently read wrapped values from the far side
+    of the block, so the gather raises instead."""
     import jax.numpy as jnp
 
     g, pos, n_coarse, cell_c = _coarse_setup()
@@ -605,10 +539,9 @@ def test_the_subblock_gather_refuses_rows_it_cannot_serve():
 
 
 def test_the_halo_is_wide_enough_for_tsc_rounding():
-    """halo=2 is not decoration. TSC's base comes from round(), not floor(), so a
-    core-edge particle reaches one cell further than a CIC bound suggests --
-    checked by driving rows to both extremes of the core and confirming the
-    stencil still fits."""
+    """halo=2 covers TSC: its base comes from round(), not floor(), so a core-edge
+    particle reaches one cell further than a CIC bound suggests. Rows at both core
+    extremes must still fit."""
     import jax.numpy as jnp
 
     g, _, n_coarse, cell_c = _coarse_setup()
@@ -624,15 +557,13 @@ def test_the_halo_is_wide_enough_for_tsc_rounding():
     assert np.all(np.isfinite(np.asarray(out)))
 
 
-# ============================================= paint_tsc_int (D-v2-16 clause 2)
+# ================================================================ paint_tsc_int
 
 
 def test_paint_tsc_int_is_order_independent():
-    """The whole point. `paint_tsc_f64` accumulates through order-dependent f64
-    `.at[].add`, so the ratified coarse arm violates D-006 today; integer
-    addition is associative, so this must be bit-identical under a permutation of
-    particle order. That is not hypothetical for us -- the brick-sorted layout
-    reorders particles every single step."""
+    """`paint_tsc_int` is bitwise invariant under particle permutation (integer addition
+    is associative), unlike `paint_tsc_f64`. The brick-sorted layout reorders particles
+    every step."""
     import jax.numpy as jnp
 
     pos = _positions(20, N_PART_T)
@@ -646,17 +577,9 @@ def test_paint_tsc_int_is_order_independent():
 
 
 def test_the_f64_tsc_paint_really_is_order_dependent_on_this_fixture():
-    """The control for the test above, and it is not a formality.
-
-    If the f64 twin happened to be order-invariant here, the integer test would
-    be comparing two arrays that agree for a reason having nothing to do with
-    integer arithmetic -- a pass proving nothing, which is the failure mode this
-    file exists to avoid. Measured on THIS fixture, and it is visible even on
-    CPU with no atomics involved: permuting the particles moves 770 of 4096 cells
-    at 4.4e-16, purely from the changed accumulation order.
-
-    So the defect D-v2-16 clause 2 names is real at f64 on any backend, and the
-    GPU-atomics story is an amplifier rather than the cause.
+    """Control: the f64 TSC paint is order-dependent on this fixture, so the integer test
+    above discriminates. Visible even on CPU without atomics: a permutation moves 770 of
+    4096 cells at 4.4e-16, from accumulation order alone.
     """
     import jax.numpy as jnp
 
@@ -691,19 +614,17 @@ def test_paint_tsc_int_matches_the_f64_twin_within_the_quantization_bound():
 
 
 def test_tsc_headroom_bound_is_the_derived_one_and_refuses_a_real_overflow():
-    """The 27-corner stencil's bound is 5.359375x the cell occupancy, not CIC's
-    implicit 1x. Both directions asserted: the shipped configuration must pass,
-    and a frac_bits that genuinely overflows must raise."""
+    """TSC's cell-weight bound is 5.359375x occupancy, not CIC's implicit 1x. The default
+    frac_bits passes; a frac_bits that overflows int32 raises."""
     assert painting.TSC_CELL_WEIGHT_BOUND == pytest.approx(5.359375)
-    painting.check_tsc_paint_headroom(N_PART_T**3, 12)  # production: ~9.8x headroom
+    painting.check_tsc_paint_headroom(N_PART_T**3, 12)  # the default frac_bits
     with pytest.raises(ValueError, match="TSC int-paint headroom"):
         painting.check_tsc_paint_headroom(10**9, 16)
 
 
 def test_the_tsc_headroom_bound_is_not_below_a_measured_worst_case():
-    """A derived bound is a claim. Check it against a construction that drives
-    one cell as hard as the stencil allows: every particle at the same cell
-    centre, where each contributes 0.75^3 to that cell."""
+    """The derived bound holds against a worst-case construction: every particle at one
+    cell centre, each contributing 0.75^3 to that cell."""
     import jax.numpy as jnp
 
     n = 500
@@ -718,35 +639,23 @@ def test_the_tsc_headroom_bound_is_not_below_a_measured_worst_case():
     )
 
 
-# ========================== tile_paint_int: the SHORT arm's D-006 twin (M-v2-3)
+# ============================================ tile_paint_int: the short arm's integer paint
 #
-# D-v2-16 clause 2 named only the coarse `paint_tsc_int`. The short arm has the
-# same defect and no document said so: `tile_paint_f64` accumulates through
-# order-dependent f64 `.at[].add`, and D-v2-14 clause 4 admits the brick-sorted
-# layout ONLY because the paint is order-independent. The layout reorders every
-# step, so the arm carrying most of the force was the non-reproducible one.
+# `tile_paint_f64` accumulates through order-dependent f64 `.at[].add`; the brick-sorted
+# layout reorders particles every step, so the short arm needs an order-independent paint.
 #
-# WHICH FIXTURE CAN SEE THIS, measured before the tests below were written.
-# Floating-point reassociation needs enough contributions per cell to bite:
-# summing 8 CIC weights into one cell is bitwise identical under permutation,
-# 64 is not (7.1e-15), 4096 is not (6.1e-12). The standard perturbed-lattice
-# `_positions` fixture puts ~8 corner writes in each occupied tile cell, so the
-# f64 tile paint is order-INVARIANT on it -- 0 of 32768 cells move under a
-# shuffle. A shuffle test built on that fixture passes for BOTH paints and
-# proves nothing.
-#
-# That is not true of the coarse arm, and the difference is the stencil: TSC's
-# 27 corners on a dense mesh already clear the threshold, which is why
-# `test_the_f64_tsc_paint_really_is_order_dependent_on_this_fixture` works on
-# the ordinary fixture and its short-arm counterpart below needs a CLUMP.
+# Reassociation only shows with enough contributions per cell: 8 CIC weights summed into one
+# cell are permutation-invariant bitwise, 64 are not (7.1e-15), 4096 are not (6.1e-12).
+# `_positions` puts ~8 corner writes per occupied tile cell, so on it the f64 tile paint is
+# order-invariant (0 of 32768 cells move) and a shuffle test passes for both paints. The
+# short-arm tests therefore use a clump. The coarse arm needs none: TSC's 27 corners on a
+# dense mesh already clear the threshold.
 
 
 def _clustered_tile_fixture(n=4096, seed=50):
-    """A tight clump inside one padded tile: ~2000 particles' worth in one cell.
-
-    This is the regime D-v2-19 measured as real (cdev8's peak bucket population
-    was 5943 by the end of a run), and it is the only regime in which the f64
-    short-arm paint's order dependence is visible at all. See the note above.
+    """A tight clump inside one padded tile, dense enough that the f64 tile paint's order
+    dependence is visible (see the section note). Real runs reach such densities
+    (measured peak bucket populations of ~5900).
     """
     import jax.numpy as jnp
 
@@ -761,7 +670,7 @@ def _clustered_tile_fixture(n=4096, seed=50):
 
 
 def test_tile_paint_int_is_order_independent():
-    """The whole point, and the precondition D-v2-14 clause 4 assumed."""
+    """`tile_paint_int` is bitwise invariant under particle permutation on the clump."""
     import jax.numpy as jnp
 
     u, live, shape, cell, perm = _clustered_tile_fixture()
@@ -774,13 +683,8 @@ def test_tile_paint_int_is_order_independent():
 
 
 def test_the_f64_tile_paint_really_is_order_dependent_on_this_fixture():
-    """The control, and here it is doing more work than the coarse arm's.
-
-    Measured on this clump: permuting the particles moves 23 of the 27 occupied
-    cells at 1.5e-10. On the ordinary `_positions` fixture it moves NONE, which
-    is why the clump exists -- without it the test above would be comparing two
-    arrays that agree for a reason unrelated to integer arithmetic.
-    """
+    """Control: on the clump the f64 tile paint moves 23 of 27 occupied cells at 1.5e-10
+    under a permutation, so the integer test above discriminates."""
     import jax.numpy as jnp
 
     u, live, shape, cell, perm = _clustered_tile_fixture(seed=51)
@@ -799,11 +703,8 @@ def test_the_f64_tile_paint_really_is_order_dependent_on_this_fixture():
 
 @pytest.mark.detflag
 def test_a_uniform_fixture_cannot_discriminate_order_which_is_why_the_clump_exists():
-    """Pins the measurement the two tests above are built on.
-
-    If someone later 'simplifies' `_clustered_tile_fixture` to the ordinary
-    perturbed lattice, the order-independence test keeps passing and silently
-    stops testing anything. This fails first and says why.
+    """Pins that the f64 tile paint is order-invariant on the ordinary `_tile_fixture`,
+    which is why the clump fixture is needed. If this fails, the clump may be unnecessary.
     """
     import jax.numpy as jnp
 
@@ -835,9 +736,8 @@ def test_tile_paint_int_matches_the_f64_twin_within_the_quantization_bound():
 
 
 def test_tile_paint_int_conserves_mass_within_the_fixed_point_rounding():
-    """`tile_paint_conserves_mass_over_the_in_box_rows`' integer counterpart. The
-    8 corner weights sum to 1 exactly in f64; after per-corner rounding they sum
-    to 1 +- 8 * 2^-(frac_bits+1), so mass is conserved to that, not exactly."""
+    """Integer counterpart of the tile mass test: after per-corner rounding the 8 weights
+    sum to 1 +- 8 * 2^-(frac_bits+1), so mass is conserved to that bound."""
     u, live, shape, cell, _ = _clustered_tile_fixture(seed=55)
     mesh, n_out = forces.tile_paint_int(u, live, shape, cell)
     n_in = int(np.asarray(live).sum()) - int(n_out)
@@ -846,8 +746,8 @@ def test_tile_paint_int_conserves_mass_within_the_fixed_point_rounding():
 
 
 def test_tile_paint_headroom_uses_the_strict_cic_bound_and_refuses_an_overflow():
-    """CIC's strict factor is 8, not the 1 `check_int_paint_headroom` assumes by
-    default. Both directions: production passes, a real overflow raises."""
+    """The tile headroom check uses CIC's strict factor 8, not the default 1 of
+    `check_int_paint_headroom`: the default frac_bits passes, a real overflow raises."""
     assert painting.CIC_CELL_WEIGHT_BOUND == 8.0
     forces.check_tile_paint_headroom(N_PART_T**3, 12)
     with pytest.raises(ValueError, match="int-paint headroom"):
@@ -860,7 +760,8 @@ def test_tile_paint_headroom_uses_the_strict_cic_bound_and_refuses_an_overflow()
 
 
 def test_the_int_tile_arm_is_reachable_through_force_short_tiled():
-    """The knob is wired, the default is unchanged, and the two arms differ."""
+    """`paint='int'` is wired through `force_short_tiled`, the default stays 'f64', and the
+    arms differ by more than 0 and less than 2% of peak."""
     pos = _positions(56, N_PART_T)
     member_fn, cap = _membership(pos, N_FINE_T, N_TILE_T, B_FINE_T)
     args = (pos, N_FINE_T, L_BOX, N_PART_T**3, N_TILE_T, B_FINE_T, member_fn, cap)
@@ -875,9 +776,8 @@ def test_the_int_tile_arm_is_reachable_through_force_short_tiled():
 
 
 def test_force_global_can_reach_the_int_tsc_paint_and_refuses_int_cic():
-    """`force_global(assign='tsc')` called `paint_tsc_f64` directly, so the
-    D-006-compliant coarse paint existed and was unreachable from any force path.
-    The default stays f64 so D-v2-10/11/12's oracle comparisons are untouched."""
+    """`force_global(assign='tsc', paint='int')` reaches the integer TSC paint, the default
+    stays 'f64', and `paint='int'` with CIC is refused."""
     pos = _positions(57, N_PART_T)
     n_tot = N_PART_T**3
     a, _ = forces.force_global(pos, N_MESH, L_BOX, n_tot, "long", r_s=R_S, assign="tsc")
@@ -896,12 +796,10 @@ def test_force_global_can_reach_the_int_tsc_paint_and_refuses_int_cic():
 
 
 def test_the_live_mask_is_a_no_op_when_every_row_is_live():
-    """Padding must not move a number.
+    """A masked gather reproduces the unmasked one bitwise and padded rows gather zero.
 
-    The engine pads every tile's rows to a fixed capacity so that ONE XLA shape
-    serves all of them -- without it, each tile keyed a new shape and the step
-    spent 24.1 s of 32.7 s recompiling. That padding is only admissible because a
-    masked run reproduces the unmasked one EXACTLY, which is what this asserts.
+    The engine pads every tile's rows to a fixed capacity so one XLA shape serves all tiles
+    (per-tile shapes cost 24.1 s of a 32.7 s step in recompiles); this is what admits that.
     """
     import jax.numpy as jnp
 
@@ -935,21 +833,11 @@ def test_the_live_mask_is_a_no_op_when_every_row_is_live():
 
 
 def test_jitting_the_subblock_gather_would_break_its_bitwise_contract():
-    """A measured negative result, kept so it is not rediscovered.
+    """Pins the bitwise contract that jitting the sub-block gather would break.
 
-    The gather is the largest remaining term in an engine step (4.9 s of 11.4 s)
-    and it runs EAGER, so wrapping it in `jax.jit` is the obvious next
-    optimization -- worth about 1.7x. It was tried and REFUSED: under jit, XLA
-    fuses and reassociates the corner accumulation, and the result stopped being
-    bitwise the global gather -- 86 of 189 elements at 2.220e-16.
-
-    That is physically irrelevant and fatal to the parity gate, which is exactly
-    the trade this function's docstring already records rejecting once at
-    8.9e-16. Staging is a memory decision and must not move a number.
-
-    This test does not re-run the jit; it pins the CONTRACT the jit broke, so
-    that any future attempt fails here rather than silently shipping a 2e-16
-    drift into three ratified records.
+    Under `jax.jit` XLA reassociates the corner accumulation and the gather stops matching
+    the global gather bitwise (86 of 189 elements at 2.220e-16), so it runs eager despite
+    being the largest step term (4.9 s of 11.4 s; jit would give ~1.7x). No jit is run here.
     """
     import jax.numpy as jnp
 

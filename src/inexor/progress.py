@@ -1,18 +1,7 @@
-"""A heartbeat for the long opaque loops.
+"""Wall-time-throttled progress lines for long single-call loops (card, export).
 
-The card and the export are each ONE call that runs for hours at hero scale and
-prints nothing until it returns. gb 1010938 spent 3 h 23 min inside
-`pk_summary_card` against a 56-minute estimate and was cancelled with no way to
-say how far through it was, or even which of its three stages it was in -- the
-overrun was only visible once the wall was in sight. The same shape as the
-`PhaseTracer` card that never printed: the work was measured, and nothing came
-out.
-
-`Heartbeat` is what the library's loops report to. Throttled by WALL TIME rather
-than iteration count, so the line rate does not depend on how big the loop is;
-flushed on every line, because a SIGKILL strands a buffered one; and the rate it
-quotes is the CURRENT stage's, never a running average over stages that count
-different things.
+Lines are throttled by wall time, not iteration count, flushed on every line so a SIGKILL
+does not strand a buffered one, and the quoted rate is the current stage's only.
 """
 
 import sys
@@ -27,14 +16,9 @@ def _hms(s):
 class Heartbeat:
     """`hb(stage, done, total)` -- a progress line at most every `every` seconds.
 
-    Pass one as `progress=` to `coarse_delta_streamed`, `forward_from_slabs`,
-    `binned_power` or `write_particles`; they call it once per unit of work and
-    are unchanged when it is None.
-
-    The first and last call of a stage always print, so a stage that fits inside
-    one interval still leaves its cost on the page rather than vanishing. Stages
-    are delimited by the name changing: each gets its own clock, and `elapsed`
-    on the closing line is that stage's whole wall.
+    Passed as `progress=` to `coarse_delta_streamed`, `forward_from_slabs`, `binned_power`
+    and `write_particles`, which call it once per unit of work. A change of `stage` name
+    starts a new clock; the first and last call of each stage always print.
     """
 
     def __init__(self, every=60.0, out=None, clock=time.monotonic, prefix="  [hb]"):
@@ -59,8 +43,7 @@ class Heartbeat:
         el = now - self._t0
         pct = f"{100.0 * done / total:5.1f}%" if total > 0 else "  ? %"
         line = f"{self.prefix} {stage}: {done:,}/{total:,} {pct} in {_hms(el)}"
-        # A rate needs at least one completed unit and a clock that has moved;
-        # printing "inf/s" on the opening line reads as a measurement.
+        # No rate until a unit is done and the clock has moved (never "inf/s").
         if done > 0 and el > 0.0:
             rate = done / el
             line += f", {rate:.3g}/s"

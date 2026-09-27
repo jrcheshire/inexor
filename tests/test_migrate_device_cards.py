@@ -1,4 +1,4 @@
-"""R3a: the device migrate split across cards, gated BITWISE against the serial
+"""The device migrate split across cards, gated BITWISE against the serial
 numpy pass.
 
 Every state array and the whole stats dict are compared after every pass, at 2, 3

@@ -1,64 +1,30 @@
-"""D3b R1: the migrate on the device, slab by slab, bitwise the serial numpy pass.
+"""The migrate on the device, slab by slab, bitwise the serial numpy pass.
 
-WHAT MOVES. `state.drift_and_migrate` ejects and inserts each x-slab with numpy
-(or with the compiled kernels fed and emptied by per-row host work). Here each
-slab's raw bytes -- its slot range, its arena residents, its occupancy slice --
-go to the device once. A device program enumerates the slab's rows, the existing
-compiled kernels (`eject_jax`, `insert_jax`, gated bitwise against numpy on a
-GB200) run on device arrays, keepers and emigrants stay on the device until
-their insert, and the written rows are scattered into the slab's original bytes,
-which come back to the host as one slice. The host does O(bricks + arena) index
-work per slab and replays the arena at the end.
+Each x-slab's slot range, arena residents and occupancy slice go to the device once; a
+program enumerates the slab's rows, the compiled `eject_jax` / `insert_jax` kernels run on
+device arrays, keepers and emigrants stay on the device until their insert, and the written
+rows are scattered into the slab's window, which returns to the host as one slice.
 
-WHY IT CAN BE BITWISE.
-- An insert writes only inside its own slab's slot range (plus arena claims), and
-  `brick_start` changes only in repack, so every slab's range is fixed for the
-  pass and its original bytes are still valid when its insert writes them.
-- Every order-dependent arena mutation (releases at ejects, claims at inserts) is
-  deferred to `state._replay_arena_pass`, as the pooled migrate does. A resident
-  of a slab not yet ejected is never overwritten by a claim, so reading residents
-  from the pre-pass host state is exact.
-- The kernels are called with exactly the padded inputs their public wrappers
-  (`eject_rows`, `insert_rows`) build, including the pad fill values.
+Why it is bitwise:
+- An insert writes only inside its own slab's slot range (plus arena claims) and
+  `brick_start` changes only in repack, so each slab's range is fixed for the pass.
+- Every order-dependent arena mutation is deferred to `state._replay_arena_pass`, so
+  residents read from the pre-pass host state are exact.
+- Kernels get exactly the padded inputs (and pad fills) of `eject_rows` / `insert_rows`.
+Row order is the reference's: per brick, the live run then arena residents by slot; insert
+input is the slab's keepers, then its sources' emigrants in `sorted({(d + o) % nb})` order.
 
-ROW ORDER is the reference's: per brick, the live run then arena residents in
-ascending slot; insert input is the slab's keepers, then the emigrants of its
-source slabs in `sorted({(d + o) % nb})` order.
+A staged slab keeps its eject output until its own insert, then its emigrants alone.
+`device_budget_bytes` refuses a slab whose estimated footprint (held arrays plus the
+kernels' per-padded-row bytes) exceeds it. Row buffers use each kernel's `_padded`; other
+shapes use `forces.capacity_shape`. The window is `w_cap` rows uploaded as a view of the
+host state (copied only where it would run off the end); rows past the slab are never read.
+Every device-to-host read goes through `_host`, counted in `READS`.
 
-WHAT IS HELD. A staged slab keeps its whole eject output only until its own
-insert, then its emigrants alone; row buffers and the insert's compacted inputs
-are released as soon as their kernel returns (retention probe
-`scripts/v2_d3_retention.py`).
-
-THE BUDGET. `device_budget_bytes` refuses a slab whose estimated footprint --
-every array the pass already holds, plus the kernel's measured bytes per padded
-row (`EJECT_B_PER_PADDED_ROW`, `INSERT_B_PER_PADDED_ROW`) -- exceeds it. The
-largest estimate is on the receipt either way, so a device run can compare it
-with the measured peak.
-
-SHAPES. Row buffers use each kernel's `_padded`; the slab window, arena arrays and
-staged emigrants use `forces.capacity_shape`, so slabs of nearby size share every
-program.
-
-THE WINDOW is the slot range uploaded straight from the host state: `w_cap` rows
-from the slab's first slot, a view, so no host copy. Rows past the slab's own
-belong to later slabs (or another card's thread may be writing them); nothing
-reads them. Arena residents go up as their own `a_cap` array. Only where the view
-would run off the end of the state is the slot range copied into a padded buffer
-(`window_copied_slabs` on the receipt).
-
-READS. Every device-to-host read goes through `_host`, counted in `READS` by
-phase. The eject reads `n_keep`, its realized reach and its emigrants' count per
-destination slab in one read; the insert's census is host arithmetic on those.
-
-SEVERAL CARDS (R3, `devices=`). Because every order-dependent arena change is
-replayed at the end and a slab's work touches only its own rows, slabs may run on
-any card in any order. Card k owns a contiguous run of slabs. It first ejects its
-`r` lowest and `r` highest slabs and hands emigrant-only copies to the neighbour
-that inserts from them; then each card sweeps its own slabs as the one-card pass
-does, one thread per card, and the parent replays the arena once. A card holding
-fewer than `2r + 1` slabs cannot separate its boundaries, and the pass falls back
-to one card (on the receipt).
+With several cards (`devices=`), card k owns a contiguous run of slabs: it first ejects its
+`r` lowest and highest slabs and hands emigrant-only copies to neighbours, then sweeps its
+own slabs on its own thread; the arena is replayed once. A card with fewer than `2r + 1`
+slabs cannot separate its boundaries, and the pass falls back to one card.
 """
 
 from __future__ import annotations
@@ -70,21 +36,18 @@ import numpy as np
 
 INT16_MAX = 32767
 
-#: Device bytes per PADDED row of one kernel call, its uploaded inputs included:
-#: the peaks Vista 995435 measured at a 4096^3 slab (record sec. 29 -- eject 114.4,
-#: insert 78.4-83.0 over the bracket, the largest taken). Estimate only.
+#: Device bytes per padded row of one kernel call, uploaded inputs included (measured
+#: peaks at a 4096^3 slab). Estimate only.
 EJECT_B_PER_PADDED_ROW = 114.4
 INSERT_B_PER_PADDED_ROW = 83.0
-#: The estimate read against the MEASURED device peak in one process, cgh64 on a
-#: GB200 (Vista 995813, record sec. 33): estimate / measured = 0.762 and 0.760 on
-#: two passes. The kernel coefficients above were measured alone; what the pass
-#: holds around them under-reads by this factor. Applied to every estimate.
+#: Measured estimate / device-peak ratio of a whole pass: the kernel coefficients were
+#: measured alone and the pass's surrounding arrays under-read by this factor.
 ESTIMATE_OVER_MEASURED = 0.76
 
 _PROGRAMS: dict = {}
 _PROGRAM_LOCK = threading.Lock()
 
-#: RECEIPT: passes run through this module (see `eject_jax.CALLS`).
+#: Count of device migrate passes (see `eject_jax.CALLS`).
 CALLS = 0
 
 
@@ -92,8 +55,8 @@ class _Clock:
     """Synced phase timer for `timings=`; a no-op when `timings` is None.
 
     `mark(key, *arrays)` blocks until the arrays are ready, then charges the wall
-    since the previous mark to `key`. Syncing moves the wall, so a timed pass is
-    a breakdown, not the pass's cost.
+    since the previous mark to `key`. Syncing moves the wall, so a timed pass is a
+    breakdown, not the pass's cost.
     """
 
     def __init__(self, timings):
@@ -155,8 +118,7 @@ def _ladder(n):
 
 
 def _put(a, dev, dtype=None):
-    """`a` as a device array on `dev`; None is jax's default device via
-    `jnp.asarray`, exactly the one-card pass's call."""
+    """`a` as a device array on `dev` (None: `jnp.asarray` on jax's default device)."""
     import jax
     import jax.numpy as jnp
 
@@ -168,7 +130,7 @@ def _put(a, dev, dtype=None):
 
 
 def _zeros(shape, dtype, dev):
-    """Zeros built on `dev` (None: `jnp.zeros`, the one-card pass's call)."""
+    """Zeros built on `dev` (None: `jnp.zeros`)."""
     import jax.numpy as jnp
 
     if dev is None:
@@ -191,7 +153,7 @@ def _arange(n, dev):
     return fn(jax.device_put(np.int64(0), dev))
 
 
-#: RECEIPT: device-to-host reads by phase (see READS above).
+#: Device-to-host reads by phase.
 READS: dict = {}
 _READS_LOCK = threading.Lock()
 
@@ -210,8 +172,8 @@ def _host(x, what):
 def pass_arena_index(st):
     """(slots, bricks): arena residents ordered by brick, ascending slot within.
 
-    The grouping `SlotState._build_arena_index` makes, vectorized over the whole
-    arena once. Valid for a pass whose releases and claims are deferred.
+    The grouping of `SlotState._build_arena_index`, vectorized; valid for a pass whose
+    releases and claims are deferred.
     """
     p3 = int(st.buckets_per_brick)
     ab = np.asarray(st.arena_bucket)
@@ -249,9 +211,8 @@ def _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids):
             rank = r - row_offsets[bi]
             lc = live[bi]
             is_ar = rank >= lc
-            # live rows: the bucket is how many of the row's own brick's prefix
-            # sums are <= its rank, counted with one searchsorted over prefix sums
-            # lifted brick by brick (the device decode's method, O(rows))
+            # live rows: bucket = count of the brick's prefix sums <= rank, via one
+            # searchsorted over per-brick-lifted prefix sums (as the device decode)
             occ_cum = jnp.cumsum(occ.astype(jnp.int64), axis=1)
             keys = (occ_cum + (jnp.arange(nb2, dtype=jnp.int64) * lift)[:, None]).reshape(-1)
             within = jnp.searchsorted(keys, bi * lift + rank, side="right").astype(jnp.int64)
@@ -355,6 +316,8 @@ def _write_program(cap_i, w_cap, has_ids):
     return _program(("write", cap_i, w_cap, has_ids), make)
 
 
+# These share `eject_jax._CACHE` / `insert_jax._CACHE` and their key and `_build`
+# signatures: a change to either must land in both files.
 def _eject_kernel(t9, nb, cap, has_ids):
     from .. import eject_jax
 
@@ -444,10 +407,9 @@ def _eject_rows(st, ix, c_drift, off_win, w_win, ids_win, ar_rows, starts_rel, s
 
 def _upload_slab(st, s, ar_slots, ar_bricks, clock, dev=None, block=False):
     """Slab s's index and its window on `dev`: the slot range as a view of the host
-    state (see THE WINDOW) and the arena residents as their own array. `block` is
-    for a caller about to write host rows this window covers: the slot range is
-    COPIED (a CPU-backend upload of a view aliases the host) and the transfer is
-    waited for. Returns a dict for `_eject_slab(pre=)`."""
+    state and the arena residents as their own array. `block=True`, for a caller about
+    to write host rows this window covers, copies the slot range (a CPU-backend upload
+    of a view aliases the host) and waits for the transfer. Returns `_eject_slab(pre=)`."""
     import jax
 
     has_ids = st.ids is not None
@@ -510,8 +472,7 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=
     if not keep_window:
         off_win = w_win = ids_win = None
 
-    # n_keep, the realized x-reach over this slab's emigrants (as the serial pass
-    # reports it) and where they go, in one read: the inserts' census reads `to`
+    # n_keep, realized x-reach and per-destination emigrant counts in one read
     sc = _host(_eject_scalars_program(cap, nb, p3)(
         dest, n_keep, _put(n_rows, dev, jnp.int64), _put(s, dev, jnp.int64)), "eject: scalars")
     n_keep, rr, to = int(sc[0]), int(sc[1]), sc[2:]
@@ -578,7 +539,7 @@ def _insert_on_card(st, d, reach, staged, scales_dev, clock, budget, dev=None):
         )
     nw = int(_host(out["n_write"], "insert: scalars"))
     ns = int(_host(out["n_spill"], "insert: scalars"))
-    # the compacted inputs are not read past the kernel; only its outputs are
+    # release the compacted inputs; only the kernel outputs are read from here
     bufs = b_dest = b_off = b_w = b_ids = b_src = s_old = real = None
     return out, nw, ns, consumed, cap_i
 
@@ -594,8 +555,7 @@ def _spills(st, out, nw, ns, cap_i, dev):
     spills = []
     if not ns:
         return spills, None
-    # rows [nw, nw + ns) gathered onto the ladder by the compaction program: a
-    # device slice sized by the spill count keys a new op on every slab
+    # gather onto the ladder: a slice sized by the spill count would compile per slab
     cap_s = _ladder(ns)
     sbufs = (_zeros(cap_s, jnp.int64, dev), _zeros((cap_s, 3), jnp.uint8, dev),
              _zeros((cap_s, 3), jnp.int16, dev),
@@ -651,9 +611,8 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget, dev=None):
 def _emigrants_only(e, has_ids, dev=None):
     """A staged slab cut to its emigrants once its own insert has run.
 
-    Its keepers and its window are read by that insert alone; later inserts read
-    only rows [n_keep, n_rows). Those rows are compacted in order onto the ladder,
-    so the staged slab shrinks to the emigrant share.
+    Later inserts read only rows [n_keep, n_rows), so those are compacted in order
+    onto the ladder.
     """
     import jax.numpy as jnp
 
@@ -686,9 +645,8 @@ def _moved(e, dev):
 
 def _sweep(st, lo, hi, reach, c_drift, scales, ar_slots, ar_bricks, dev, staged, ejected,
            clock, budget, insert=None, card=None, keep_window=True):
-    """One card's pass over its own slabs [lo, hi): today's schedule, with any
-    slabs already in `staged` (its boundary ejects, the neighbours' emigrants)
-    used as they are. `insert(st, d, reach, staged, scales_dev, clock, budget, dev,
+    """One card's pass over its own slabs [lo, hi), using any slabs already in
+    `staged` (its boundary ejects, the neighbours' emigrants) as they are. `insert(st, d, reach, staged, scales_dev, clock, budget, dev,
     card)` runs each destination (default: `_insert_slab`); `card["pre"]` holds
     windows uploaded ahead of their eject. Returns (insert_res, peak staged)."""
     nb = int(st.bricks_per_side)
@@ -780,8 +738,8 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
 
     segments = moved_bytes = 0
     if W > 1:
-        # PHASE 1: every card ejects its r lowest and r highest slabs, and cuts
-        # emigrant-only copies for the neighbours that insert from them
+        # every card ejects its r lowest and r highest slabs and cuts emigrant-only
+        # copies for the neighbours that insert from them
         def boundary(k):
             lo, hi = parts[k]
             out = {}
@@ -813,7 +771,7 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
     if before_sweep is not None:
         before_sweep(ctx)
 
-    # PHASE 2: each card sweeps its own slabs
+    # each card sweeps its own slabs
     swept = run(lambda k: _sweep(st, parts[k][0], parts[k][1], reach, c_drift, scales,
                                  ar_slots, ar_bricks, devs[k], staged[k], ejected[k],
                                  clocks[k], budgets[k], insert=insert, card=cards[k],
@@ -863,22 +821,20 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
                              device_budget_bytes=None, devices=None):
     """`state.drift_and_migrate` with every slab's row work on the device.
 
-    Same contract, mutations and stats dict (plus a `migrate_device` receipt),
-    gated bitwise against the serial numpy pass (`tests/test_migrate_device.py`,
-    and `tests/test_migrate_device_cards.py` across cards). Needs `jax_enable_x64`.
-    Arena-full and census refusals raise from the end-of-pass replay rather than
-    mid-pass, as the pooled migrate's do.
+    Same contract, mutations and stats dict (plus a `migrate_device` receipt), bitwise
+    the serial numpy pass. Needs `jax_enable_x64`. Arena-full and census refusals raise
+    from the end-of-pass replay, as the pooled migrate's do.
 
     `timings`, if a dict, accumulates synced wall per phase (see `_Clock`); on
     several cards each key is prefixed with its card.
 
     `device_budget_bytes` refuses a slab whose estimated device footprint exceeds
-    it (see THE BUDGET above), per card. A refusal after the first slab has been
+    it, per card. A refusal after the first slab has been
     written leaves the state invalid, as the serial pass's mid-pass refusals do.
     `migrate_device["peak_estimate_bytes"]` reports the largest estimate.
 
     `devices` is a sequence of jax devices, one per card (None: one card, jax's
-    default device). See SEVERAL CARDS above; `migrate_device` then also reports
+    default device); `migrate_device` then also reports
     `cards`, `slabs_per_card`, `cross_card_segments` / `_bytes` and `fallback`.
     """
     from .. import state as _state

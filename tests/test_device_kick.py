@@ -1,16 +1,9 @@
-"""D2b: the kick and per-brick quantize on the device, gated against `tile_task`.
+"""The device kick and per-brick quantize, gated bitwise against the real `tile_task`.
 
-THE ORACLE IS THE REAL HOST CODE, not a transcription of it. `engine.tile_task`
-takes its short-force kernel as an argument, so a stub `one_tile` returning
-forces this file chooses -- plus zero coarse meshes, which make the long arm
-contribute exactly zero -- drives the genuine host kick, run scan and quantize
-over inputs the device arm is then given verbatim. Re-spelling those four lines
-as the oracle would have been testing the transcription, in a repo whose own
-records say two implementations of one formula is how they drift apart.
-
-Bitwise, and it can be: `max` over floats is exact and associative, so a
-segmented max cannot disagree with a run scan whatever order it reduces in, and
-the division and round-half-even that follow are IEEE-exact.
+The oracle is the host code itself: a stub short-force kernel and zero coarse meshes drive the
+genuine host kick, run scan and quantize, and the device arm gets the same inputs. Bit equality
+holds because float `max` is exact and order-free, and the division and round-half-even that
+follow are IEEE-exact.
 """
 
 import numpy as np
@@ -21,12 +14,8 @@ from inexor.codec import T9Layout
 
 pytest.importorskip("jax")
 
-# The geometry `tests/test_engine.py` uses, verbatim. Hand-picking a smaller one
-# produced a tile whose brick span exceeded the brick grid, which
-# `layout.brick_span` refuses for a good reason (a tile that wraps visits the
-# same brick twice and paints its particles twice) -- and the failure surfaced as
-# a stencil-containment error three layers down rather than as "your geometry is
-# inconsistent". Take a validated one.
+# The validated geometry of tests/test_engine.py; a tile whose brick span exceeds the brick grid
+# is refused by `layout.brick_span`.
 L_BOX, N_PART, N_FINE, N_COARSE, N_TILE, B_FINE = 32.0, 32, 64, 16, 16, 8
 TILE = (0, 0, 0)
 
@@ -65,7 +54,7 @@ def _built(**kw):
 
 
 def _header(cfg, cap):
-    """`C` exactly as `engine.step` builds it (engine.py:1260)."""
+    """`C` exactly as `engine.step` builds it."""
     return dict(cap=int(cap), n_tile=cfg.n_tile, n_brick=cfg.n_brick,
                 n_fine=cfg.n_fine, n_coarse=cfg.n_coarse, box=cfg.box_size,
                 coarse_cell=cfg.coarse_cell, cell=cfg.fine_cell,
@@ -73,13 +62,8 @@ def _header(cfg, cap):
 
 
 def _run_host(cfg, st, bricks, cap, g_short_full):
-    """The real `tile_task`, with a stub short force and zero coarse meshes.
-
-    The stub returns the caller's forces at the padded shape and echoes the
-    ownership mask it is handed, which is what the real `one_tile` does; the
-    zero coarse meshes make `gather_coarse_subblock` contribute exactly zero, so
-    `g_tot` is the array this file chose and the kick is the genuine one.
-    """
+    """The real `tile_task` with a stub short force (echoing the ownership mask, as the real
+    `one_tile` does) and zero coarse meshes, so the total force is `g_short_full`."""
     import jax.numpy as jnp
 
     def one_tile(u, live, own):
@@ -107,11 +91,9 @@ def _run_device(cfg, st, bricks, cap, g_short_full, res_owned_rows):
 
 
 def _setup(seed=3):
-    """A state, a tile's bricks, a cap, chosen forces, and the owned mask.
+    """A state, a tile's bricks, a cap, chosen forces, and the host run.
 
-    Ownership is taken from the host run rather than recomputed, so both arms
-    are kicking exactly the same rows -- an ownership mask derived twice is the
-    fault `forces.owned_mask_from_bricks` exists to prevent.
+    Ownership comes from the host run so both arms kick exactly the same rows.
     """
     cfg, st = _built(arena_frac=0.25)
     bricks = st.tile_bricks(TILE, cfg.n_tile, cfg._b_realized, cfg.n_brick,
@@ -143,11 +125,9 @@ def test_the_kick_and_quantize_are_bitwise_the_host_tile_task():
 
     _plan, dec, out = _run_device(cfg, st, bricks, cap, g_short_full, own)
     w_dev = np.asarray(out["w_codes"])
-    # host `w_codes` are packed to owned rows in row order; the device keeps
-    # row alignment, so select the same rows to compare like with like
+    # host codes are packed to owned rows; the device keeps row alignment
     assert np.array_equal(w_dev[own], res["w_codes"]), "velocity codes differ"
 
-    # the per-brick scales, for the bricks the host actually wrote
     scales_dev = np.asarray(out["scales"])
     counts = np.asarray(out["owned_counts"])
     got = {int(bricks[i]): float(scales_dev[i])
@@ -158,7 +138,7 @@ def test_the_kick_and_quantize_are_bitwise_the_host_tile_task():
 
 
 def test_the_comparison_can_fail():
-    """Anti-vacuity: a different short force must move the codes."""
+    """Control: a different short force must move the codes."""
     cfg, st, bricks, cap, g_short_full, res = _setup()
     own = _owned_rows_from(st, bricks, res, cap)
     _p, _d, out = _run_device(cfg, st, bricks, cap, g_short_full, own)
@@ -170,12 +150,10 @@ def test_the_comparison_can_fail():
 
 
 def test_the_scale_is_the_brick_max_and_the_extremes_land_on_int16_ends():
-    """The T9 contract: scale = max|v| / 32767, so the extremes are exactly
+    """scale = max|v| / 32767: the extreme code is exactly 32767 and all codes fit int16.
 
-    representable and nothing needs clamping. D-007 forbids a saturating op on
-    integer state, so a code outside int16 would have to WRAP -- silently
-    misrepresenting the fastest particles in the brick, which are the ones that
-    matter. Checked rather than assumed.
+    Integer state wraps and never clamps, so an out-of-range code would silently corrupt the
+    fastest particles.
     """
     from inexor.device import kick as dkick
 
@@ -189,16 +167,12 @@ def test_the_scale_is_the_brick_max_and_the_extremes_land_on_int16_ends():
 
 
 def test_a_brick_with_no_owned_rows_takes_scale_one_and_is_reported_empty():
-    """`segment_max` seeds an empty segment at -inf; left alone that would make
+    """An empty brick gets scale 1 (as `encode_velocities` does), zero codes and count 0.
 
-    the scale -inf/32767 and every code in the brick a nan. The all-zero branch
-    of `encode_velocities` is what it must match instead, and the caller needs
-    to be told the brick is empty so it does not write a scale for a brick this
-    tile does not own.
+    `segment_max` seeds empty segments at -inf, which would otherwise give nan codes.
     """
     cfg, st, bricks, cap, g_short_full, res = _setup()
     own = _owned_rows_from(st, bricks, res, cap)
-    # force one brick to have no owned rows
     _p, dec, _o = _run_device(cfg, st, bricks, cap, g_short_full, own)
     bi = np.asarray(dec["brick_index"])
     victim = int(bi[np.flatnonzero(own)[0]])
@@ -222,13 +196,10 @@ def test_masked_and_padded_rows_write_zero_codes():
 
 
 def test_the_segmented_max_does_not_need_contiguous_runs():
-    """The host form is only correct because a brick's rows are contiguous --
+    """A permuted row order gives the same per-brick scales.
 
-    it scans runs, and a brick appearing twice would let the second run
-    overwrite the first one's scale. The device form reduces on the brick index
-    and has no such assumption, so a permuted row order must give the same
-    per-brick scales. That is a real robustness difference and worth pinning,
-    not a restatement of the gate above.
+    The host run scan needs contiguous brick runs; the device reduces on the brick index and
+    must not.
     """
     from inexor.device import kick as dkick
 

@@ -1,12 +1,9 @@
-"""ooc_fft.py: the out-of-core FFT layer (M-v2-5, D-v2-15 clause 4).
+"""ooc_fft.py: the out-of-core FFT layer.
 
-The layer's whole license is that streamed and monolithic are the SAME
-computation at different loop bounds, so nearly everything here is a bitwise
-assertion plus the perturbation twin that proves it can fail. The one-plane
-compute unit exists because the batched alternative FAILED this file's
-invariance test on first contact (pocketfft results are batch-size dependent
-at the bit level -- 341/68 differing elements on a 32^3 field for pass 1/2;
-module docstring); these tests are what keep that from regressing.
+Streamed and monolithic transforms are the same computation at different loop bounds, so
+most assertions are bitwise, each with a perturbation twin showing it can fail. The host
+path transforms one plane at a time because pocketfft is batch-size dependent at the bit
+level (341/68 differing elements on a 32^3 field for pass 1/2).
 """
 
 import numpy as np
@@ -35,8 +32,7 @@ def _fwd(field, slab):
 
 
 def test_forward_is_bitwise_invariant_to_slab_thickness(field64, field32):
-    """Thickness 1 / ragged 7 / 8 / N all produce the identical spectrum --
-    the decomposition-invariance half of the M-v2-5 exit gate, at the FFT."""
+    """Slab thickness 1 / ragged 7 / 8 / N all give the bitwise-identical spectrum."""
     for field in (field64, field32):
         ref = ooc_fft.rfftn_ooc(field)
         for slab in (1, 7, 8, N):
@@ -62,8 +58,7 @@ def test_inverse_is_bitwise_invariant_to_slab(field64):
 
 
 def test_invariance_can_fail(field64):
-    """Anti-vacuity: a ulp-level perturbation of one plane must change the
-    spectrum, or the bitwise comparisons above assert nothing."""
+    """A one-ulp perturbation of one element must change the spectrum."""
     ref = ooc_fft.rfftn_ooc(field64)
     bumped = field64.copy()
     bumped[13, 0, 0] = np.nextafter(bumped[13, 0, 0], np.inf)
@@ -71,8 +66,7 @@ def test_invariance_can_fail(field64):
 
 
 def test_inverse_mutates_its_input(field64):
-    """The documented ownership handoff: inverse_to_slabs runs its axis-0 pass
-    in place, so the caller's spectrum is consumed."""
+    """inverse_to_slabs runs its axis-0 pass in place, consuming the caller's spectrum."""
     spec = ooc_fft.rfftn_ooc(field64)
     keep = spec.copy()
     list(ooc_fft.inverse_to_slabs(spec, N))
@@ -96,9 +90,7 @@ def test_roundtrip_f32_dtype_and_floor(field32):
 
 
 def test_matches_numpy_rfftn_at_tolerance(field64):
-    """Tolerance ONLY, by design: a different transform order rounds
-    differently, and claiming bitwise here would be claiming someone else's
-    implementation detail."""
+    """Tolerance only (1e-13 of peak): a different transform order rounds differently."""
     mine = ooc_fft.rfftn_ooc(field64)
     theirs = np.fft.rfftn(field64)
     scale = np.max(np.abs(theirs))
@@ -162,8 +154,8 @@ def test_grad_and_deriv2_match_full_grid_and_are_slab_invariant(field64):
 
 def test_plan_bytes_terms_and_policies():
     p = ooc_fft.plan_bytes(2048, np.float32, "forward")
-    # one complex64 half-grid at 2048^3 is ~34.4 GB; forward peak is spec +
-    # O(slab) buffers, i.e. the D-v2-15 design point of ~35.5 GB
+    # one complex64 half-grid at 2048^3 is ~34.4 GB; the forward peak is spec plus
+    # O(slab) buffers, ~35.5 GB
     assert 34e9 < p["spec"] < 35e9
     assert p["peak"] < 37e9
     d = ooc_fft.plan_bytes(2048, np.float32, "derivative")
@@ -175,23 +167,20 @@ def test_plan_bytes_terms_and_policies():
 
 
 def test_require_fits_refuses_loudly():
-    """The refusal fires with the arithmetic in the message (D-007 discipline),
-    and f64 derivative streams at 2048^3 are over a 116 GB host by DESIGN."""
+    """require_fits raises MemoryError with the arithmetic in the message; f64 derivative
+    streams at 2048^3 exceed a 116 GB host, f32 fits."""
     with pytest.raises(MemoryError, match="refusing rather than paging"):
         ooc_fft.require_fits(2048, np.float64, "derivative", budget_bytes=116e9)
     plan = ooc_fft.require_fits(2048, np.float32, "derivative", budget_bytes=116e9)
     assert plan["peak"] < 116e9
 
 
-# ------------------------------------------------------- the device path (D1)
+# ----------------------------------------------------------------- the device path
 #
-# Same factorization on an accelerator, so the same discipline: BITWISE for
-# anything that must be invariant WITHIN a backend, tolerance only across two.
-# Cross-backend bitwise is deliberately NOT asserted -- on this laptop's CPU
-# jax the device path happens to reproduce scipy exactly, and a test that
-# pinned that would fail on the GPU this code exists for, for a legitimate
-# reason. `MAX_DEVICE_TRANSFORM_ELEMENTS` is the one gate that is about
-# correctness rather than reproducibility.
+# Bitwise for anything invariant within a backend, tolerance across backends. Cross-backend
+# bitwise is not asserted: CPU jax happens to reproduce scipy exactly, but the GPU
+# legitimately need not. `MAX_DEVICE_TRANSFORM_ELEMENTS` is the one gate about correctness
+# rather than reproducibility.
 
 pytest.importorskip("jax")
 
@@ -202,12 +191,8 @@ def _fwd_dev(field, slab, **kw):
 
 
 def test_device_forward_is_bitwise_invariant_to_slab_thickness(field32):
-    """Streaming stays an OUTER LOOP BOUND on device too.
-
-    This is the property the whole design rests on: the spectrum of a 2048^3
-    field must not depend on how many planes were resident at a time, or a
-    checkpoint/resume or a different window size silently changes the physics.
-    """
+    """On device too the spectrum is bitwise independent of how many planes are resident,
+    so resume or a different window size cannot change the physics."""
     ref = _fwd_dev(field32, N)
     for slab in (1, 7, 8, N):
         got = _fwd_dev(field32, slab)
@@ -228,23 +213,12 @@ def test_device_inverse_is_bitwise_invariant_to_slab(field32):
 
 
 def test_device_invariance_can_fail(field32):
-    """Anti-vacuity for the two above.
+    """A four-ulp bump of one element must change the device spectrum.
 
-    FOUR ulps, not one, and the number is MEASURED rather than picked. At f32 a
-    one-ulp change to a single element of a 32^3 field is genuinely invisible
-    through the transform -- n_diff 0 of 17,408 spectral elements -- because
-    2.98e-08 against a spectrum of order 5 is below f32 eps. The ladder reads
-    1 -> 0, 4 -> 314, 64 -> 4,230, 1024 -> 17,344. So four is the smallest
-    perturbation that this comparison can actually see, which is the strongest
-    honest form of the arm; a bigger bump would prove less.
-
-    Two traps sit in writing it. `np.nextafter(x_f32, np.inf)` promotes to
-    float64 (np.inf is a Python float) and storing it back into an f32 array
-    rounds it to the value it started from, so the destination dtype has to be
-    in the call -- the f64 twin higher in this file does not have that problem,
-    which is why it reads `np.inf`. And the assert below that the perturbation
-    changed the input is not decoration: without it, both forms of no-op above
-    would have made the two invariance gates vacuous instead of failing here.
+    Four is the smallest bump the f32 transform can see on a 32^3 field (measured ulps ->
+    n_diff of 17,408: 1 -> 0, 4 -> 314, 64 -> 4,230, 1024 -> 17,344). The bump uses
+    `np.float32(np.inf)`: a bare `np.inf` promotes to f64 and rounds back to a no-op on
+    store, which the input-changed assert catches.
     """
     ref = _fwd_dev(field32, N)
     bumped = field32.copy()
@@ -255,11 +229,8 @@ def test_device_invariance_can_fail(field32):
 
 
 def test_device_matches_the_host_path_at_tolerance(field32):
-    """Across backends, tolerance -- and the tolerance is checked against the
-
-    spectrum's own scale, not an absolute number, so it cannot pass by the
-    array being small.
-    """
+    """Device vs host agree to 1e-5 of the spectrum's rms, a relative bar that cannot pass
+    by the array being small."""
     host = ooc_fft.rfftn_ooc(field32.copy())
     dev = _fwd_dev(field32, 8)
     scale = np.sqrt(np.mean(np.abs(host) ** 2))
@@ -268,7 +239,7 @@ def test_device_matches_the_host_path_at_tolerance(field32):
 
 
 def test_device_preserves_single_precision(field32):
-    """The dtype ledger on the seam where a silent precision change would hide."""
+    """f32 in, complex64 spectrum, f32 back out on the device path."""
     spec = _fwd_dev(field32, 8)
     assert spec.dtype == np.complex64
     out = np.empty_like(field32)
@@ -278,11 +249,8 @@ def test_device_preserves_single_precision(field32):
 
 
 def test_f64_on_device_refuses_rather_than_narrowing(field64):
-    """With x64 off jax would transform an f64 field at f32 and hand it back in
-
-    an f64 container: a wrong answer wearing the right dtype. Same contract as
-    `eject_jax.require_x64`, and the suite runs x64-off by default.
-    """
+    """With x64 off an f64 field is refused, not transformed at f32 and returned in an f64
+    container. The suite runs x64-off by default."""
     import jax
 
     if jax.config.read("jax_enable_x64"):
@@ -292,18 +260,14 @@ def test_f64_on_device_refuses_rather_than_narrowing(field64):
 
 
 def test_a_transform_at_the_silent_wrong_bound_is_refused():
-    """The measured failure this whole factorization exists to make unreachable.
-
-    1536^3 f32 (3.6e9 elements) came back SILENTLY WRONG on jax 0.10.2 + GB200
-    -- roundtrip 3.8e+3 against 1024^3's 2.9e-6, same peak ratio, plausible
-    wall. Refuse the regime rather than report a receipt from inside it.
-    """
+    """Transforms of >= 2^31 elements are refused: 1536^3 f32 (3.6e9 elements) came back
+    silently wrong on jax 0.10.2 + GB200 (roundtrip 3.8e+3 vs 2.9e-6 at 1024^3)."""
     with pytest.raises(ValueError, match="silently"):
         ooc_fft.refuse_oversize_device_transform(2**31, "test")
     with pytest.raises(ValueError, match="silently"):
         ooc_fft.refuse_oversize_device_transform(1536**3, "the measured case")
-    # anti-vacuity: the bound is a bound, not a blanket refusal. One 2048^2
-    # plane -- the unit the coarse solve actually runs -- is three orders under.
+    # the bound is not a blanket refusal: just under it passes, as does one 2048^2 plane
+    # (the coarse solve's unit, three orders under)
     ooc_fft.refuse_oversize_device_transform(2**31 - 1, "just under")
     ooc_fft.refuse_oversize_device_transform(2048 * 2048, "one coarse plane")
 
@@ -315,10 +279,8 @@ def test_the_batch_knobs_cannot_reach_the_bound_unnoticed(field32):
 
 
 def test_the_receipt_is_plane_keyed_so_the_field_is_slab_independent():
-    """If the receipt's field depended on the slab, the invariance gates above
-
-    would be comparing two different fields and would pass by construction.
-    """
+    """plane_noise is keyed by plane index and seed, so the receipt's field does not
+    depend on the slab."""
     a = ooc_fft.plane_noise(N, 5, np.float32, seed=3)
     b = ooc_fft.plane_noise(N, 5, np.float32, seed=3)
     c = ooc_fft.plane_noise(N, 6, np.float32, seed=3)
@@ -327,12 +289,8 @@ def test_the_receipt_is_plane_keyed_so_the_field_is_slab_independent():
 
 
 def test_the_roundtrip_receipt_reads_the_f32_floor_on_both_paths():
-    """The instrument the 2048^3 measurement will be read off, exercised small.
-
-    Reported as a number, not asserted into a verdict: what counts as a pass at
-    a given n is a gate's decision. Here it must simply be at the f32 floor and
-    nowhere near the 3.8e+3 the wrong regime produced.
-    """
+    """roundtrip_residual reads the f32 floor (< 1e-4) on both paths at small n, on a
+    non-trivial field, and carries its configuration beside the number."""
     dev = ooc_fft.roundtrip_residual(N, np.float32, slab=8, device=True)
     host = ooc_fft.roundtrip_residual(N, np.float32, slab=8, device=False)
     assert dev["residual"] < 1e-4, dev
@@ -343,18 +301,15 @@ def test_the_roundtrip_receipt_reads_the_f32_floor_on_both_paths():
 
 
 # ---------------------------------------------------------------------------
-# splitting a pass across devices (owed off D1: every D1 number is one GB200)
+# splitting a pass across devices
 # ---------------------------------------------------------------------------
 
 
 def _devices(w):
     """`w` device handles, replicating if the backend has fewer.
 
-    Replication is not a weaker gate for the BITWISE properties below: the
-    partition, the threads and the write-through views are all exercised either
-    way, and the arithmetic cannot depend on which handle it ran under. Run the
-    suite with `--xla_force_host_platform_device_count=4` (or on a four-GPU
-    node) and the same tests become a true multi-device gate.
+    Replication still exercises the partition, threads and write-through views. With
+    `--xla_force_host_platform_device_count=4` (or four GPUs) the tests are truly multi-device.
     """
     import jax
 
@@ -375,8 +330,8 @@ def test_partition_units_reproduces_the_unpartitioned_batch_sequence():
 
 
 def test_partition_units_refuses_a_width_it_cannot_realize():
-    """A part with no work is a device that silently did not participate, which
-    reads downstream as 'it did not scale'. Refuse instead."""
+    """A width that would leave a part empty (a device silently not participating) is
+    refused, as is n_parts=0."""
     with pytest.raises(ValueError, match="only 1 whole units"):
         ooc_fft.partition_units(32, 4, 64)
     with pytest.raises(ValueError, match="n_parts"):
@@ -385,13 +340,8 @@ def test_partition_units_refuses_a_width_it_cannot_realize():
 
 @pytest.mark.parametrize("w", [2, 4])
 def test_device_split_is_bitwise_identical_to_one_device(field32, w):
-    """W devices == 1 device, to the bit, forward AND inverse.
-
-    This is the identity the four-GPU reading is measured against: the
-    factorization has no inter-device communication, so a split is a partition
-    of a loop and cannot touch a value. Anything else and a wall measured at
-    W=4 is a wall for a different transform.
-    """
+    """W devices == 1 device bitwise, forward and inverse: there is no inter-device
+    communication, so a split only partitions a loop."""
     devs = _devices(w)
     for pb, yb in ((1, 1), (1, 8), (2, 4)):
         kw = dict(plane_batch=pb, pencil_batch=yb)
@@ -411,16 +361,11 @@ def test_device_split_is_bitwise_identical_to_one_device(field32, w):
 
 
 def test_a_misaligned_split_really_does_move_bits():
-    """Anti-vacuity for the alignment rule, MEASURED rather than argued.
+    """A split that strands a size-1 batch moves bits, so `partition_units`' alignment rule
+    guards something.
 
-    jax's batch-size dependence is real but not monotone: on this backend at
-    N=64, plane_batch 1, 2 and 3 each give a distinct spectrum while 4 and 8
-    agree (n_diff 538 / 722 / 520 against batch 1, 0 between 4 and 8). So a
-    misaligned cut sometimes happens not to bite -- splitting a 16-plane batch
-    of 8 at plane 4 gives sizes (4, 8, 4) and reads n_diff 0 purely because
-    4 and 8 agree here. That coincidence is exactly why the rule cannot be
-    'align when it seems to matter': the case below strands a size-1 batch and
-    moves 1,062 f32 words.
+    jax's batch-size dependence is not monotone (CPU, N=64: plane_batch 1, 2, 3 each differ,
+    4 and 8 agree), so some misaligned cuts happen not to bite. This one moved 1,062 f32 words.
     """
     n, t, pb = 64, 16, 2
     planes = np.stack([ooc_fft.plane_noise(n, i, np.float32, 3) for i in range(t)])
@@ -436,14 +381,8 @@ def test_a_misaligned_split_really_does_move_bits():
 
 @pytest.mark.parametrize("w", [1, 2])
 def test_transfer_policy_changes_the_route_not_a_bit(field32, w):
-    """`staged` and `pageable` differ in WHERE the host buffer lives, nothing else.
-
-    The policy picks whether the driver copies the buffer into its own staging
-    memory (pageable) or we hand it page-locked memory it can DMA from (staged).
-    Same bytes, same kernels, same order -- so anything but bitwise equality
-    means the policy is doing something it was not asked to do, and any wall
-    measured under it would be a wall for a different computation.
-    """
+    """`staged` (page-locked host buffer) and `pageable` (driver-staged copy) give bitwise
+    identical results, forward and inverse. Accelerator-only: CPU jax refuses pinned_host."""
     if not ooc_fft.staging_supported():
         pytest.skip("backend has no host -> pinned_host -> device round trip "
                     "(jax CPU refuses it); this gate runs on the accelerator")
@@ -465,8 +404,7 @@ def test_transfer_policy_changes_the_route_not_a_bit(field32, w):
 
 
 def test_an_unknown_transfer_policy_is_refused():
-    """A typo'd policy must not fall through to the default and be timed as if
-    it applied -- an arm that did not change anything is worse than no arm."""
+    """An unknown transfer policy is refused rather than falling through to the default."""
     with pytest.raises(ValueError, match="transfer must be one of"):
         ooc_fft.rfft2_planes_device(
             np.zeros((2, 8, 8), np.float32), transfer="pinned")

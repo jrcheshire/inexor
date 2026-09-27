@@ -1,52 +1,18 @@
-"""D2d: the coarse paint, on the device.
+"""The coarse paint on the device: decode, containment bounds and integer TSC paint per chunk.
 
-WHAT THIS REPLACES. `engine.coarse_delta_streamed` decodes each chunk of bricks
-on the host (`SlotState.decode_bricks`), pads it, checks stencil containment in
-numpy and only then paints -- a per-particle host pass per chunk. Here the host
-resolves per-brick INDICES and hands over one contiguous slice of the state;
-the decode, the containment bounds and the integer sub-block paint all run on
-the device.
+The host resolves per-brick indices and hands over one contiguous slice of the state
+(`slab_window`); the chunk unit defaults to a quarter x-slab of bricks
+(`default_chunk_bricks`), and any chunk length whose bricks form a cuboid is accepted.
 
-THE UNIT IS A QUARTER OF AN X-SLAB OF BRICKS by default
-(`default_chunk_bricks`). The host path paints `cfg.chunk_bricks` (64) bricks at
-a time, which at 4096^3 is 262,144 chunks and so 262,144 device launches per
-step; a quarter-slab is 1,024. A whole x-slab (256 launches) was the first
-choice and does not fit a card EAGER: at 266 B per padded row (Vista 993139) it
-is 90 GB at 4096^3, 1.15x a card. Jitted it is 62 B per row and fits; the
-default stays a quarter-slab until chunk time is measured at 4096^3's block
-shape (record sec. 13). Any chunk length whose bricks form a cuboid is accepted
-(`engine._chunk_cuboid`).
+Bitwise `engine.coarse_delta_streamed`: positions decode bitwise, the kernel is the same
+`paint_tsc_int_subblock`, and accumulation is integer addition, so neither chunk size nor
+chunk order can move a bit. `jit=True` (default) compiles decode + containment + paint into
+one program per step at fixed shapes (`step_shapes`) with a traced sub-block origin.
 
-BITWISE against the host paint, and it can be. Positions decode bitwise
-(`device.decode`), the paint kernel is the same `paint_tsc_int_subblock` with
-the same padding mask, and the accumulation is integer addition -- so neither
-the chunk size nor the order chunks arrive in can move a bit.
-
-EAGER OR JITTED (`jit=`). Eager runs the decode and paint op by op, which holds
-every intermediate a Python name keeps alive: 266 B per padded row measured on
-a card. `jit=True` compiles decode + containment + paint into ONE program per
-step. For that the chunk's inputs are padded to fixed per-step shapes
-(`step_shapes`) -- the live slice, the arena rectangle and the arena rows -- and
-the sub-block origin is a traced value, so every chunk of a step reuses one
-executable. XLA is free to fuse the TSC weight arithmetic, which could move a
-rounded integer weight, so jit was adopted only on a bitwise gate: on a GB200
-(Vista 993294) the jitted density hash-equals a CPU-only host engine at cdev,
-plain and with 61,879 arena residents, and every jitted chunk block up to 268M
-rows equals the host decode. It holds 62 B per padded row against eager's 266
-and is the DEFAULT; `jit=False` is the eager path.
-
-THE COARSE MESH LIVES ON THE CARDS (JC, record sec. 23). `coarse_delta_cards`
-shards it along x: each card owns a contiguous run of x-planes, paints the
-chunks whose bricks start there into an int64 `CardInt64Accumulator` carrying
-the ghost planes a chunk at its edge writes past it, folds those ghosts into
-the neighbour that owns them, and decodes its own planes to the density on the
-card. Integer addition makes every split bitwise the host mesh.
-`HostInt64Accumulator` and `coarse_delta_device` remain the host-mesh form.
-
-SCOPE. The containment check comes back as device scalars and is resolved at
-the sync the accumulator performs anyway, before the block is added -- the same
-arrangement as the tile gather's deferred guard. `engine.step` calls
-`coarse_delta_cards` under `EngineConfig(coarse_backend="device")`.
+`coarse_delta_cards` shards the mesh along x: each card paints the chunks starting in its
+planes into a `CardInt64Accumulator` with ghost planes, folds ghosts into their owner, and
+decodes its planes on the card. Containment bounds come back as device scalars and are
+resolved (`check_containment`) before each block is added.
 """
 
 from __future__ import annotations
@@ -55,28 +21,20 @@ import threading
 
 import numpy as np
 
-# One compiled chunk program per distinct set of static parameters, and a count
-# of how many times any of them was TRACED. The count is the receipt that one
-# executable served a whole step: a per-chunk shape would retrace every chunk.
+# Compiled chunk programs by static parameters, and a trace count (one per step means one
+# executable served every chunk). The card path's small programs share the lock.
 _KERNELS = {}
 _TRACES = [0]
-# the card path's small programs (accumulate, fold, decode); one lock guards
-# both caches, since each card's thread may ask for a program first
 _CARD_KERNELS = {}
 _KERNEL_LOCK = threading.Lock()
 
-#: RECEIPT: card paints run through this module (see `migrate.CALLS`).
+#: Count of `coarse_delta_cards` calls (see `migrate.CALLS`).
 CALLS = 0
 
 
 def default_chunk_bricks(bricks_per_side):
-    """A quarter of an x-slab of bricks, or a whole x-slab where a quarter does
-    not tile into cuboids (bricks per side not divisible by 4).
-
-    A quarter-slab is (1, nb/4, nb) bricks, which `engine._chunk_cuboid`
-    accepts whenever 4 divides nb -- at every production config nb is 32 or
-    more and a power of two.
-    """
+    """A quarter x-slab of bricks, (1, nb/4, nb), or a whole x-slab when 4 does not
+    divide nb."""
     nb = int(bricks_per_side)
     return nb * nb // 4 if nb % 4 == 0 else nb * nb
 
@@ -91,11 +49,7 @@ def _arena_per_brick(st):
 
 
 def chunk_rows(st, chunk_len):
-    """Member rows (live + arena) in each chunk of `chunk_len` consecutive bricks.
-
-    One vectorized pass over the index and the arena, not a Python loop over
-    bricks: at 4096^3 there are 16.8M bricks.
-    """
+    """Member rows (live + arena) in each chunk of `chunk_len` consecutive bricks."""
     p3 = int(st.buckets_per_brick)
     n_b = int(st.n_bricks)
     per_brick = st.occupancy.reshape(n_b, p3).sum(axis=1, dtype=np.int64)
@@ -108,9 +62,8 @@ def step_shapes(st, chunk_len, pad, floor=None):
 
     `live_w` bounds every chunk's slot span, `arena_n` its arena residents and
     `arena_rect` the residents of any one brick; each sits on
-    `forces.capacity_shape`'s ladder, as `pad` does, and `floor` (a previous
-    step's shapes) keeps them monotone across steps for the same reason.
-    O(bricks + arena) on the host.
+    `forces.capacity_shape`'s ladder, and `floor` (a previous step's shapes) keeps
+    them monotone across steps.
     """
     from ..forces import capacity_shape
 
@@ -132,16 +85,10 @@ def step_shapes(st, chunk_len, pad, floor=None):
 def slab_window(st, bricks):
     """(plan, off, arena_bucket, arena_base) re-based onto one contiguous slice.
 
-    In slot order the live runs of consecutive bricks are one contiguous range,
-    `[brick_start[b0], brick_start[b_last + 1])`, spare slots included. Their
-    arena residents live elsewhere (slots >= `arena_base`) and are appended
-    after it. The decode plan's slots are re-based so `device.decode.decode_rows`
-    reads this window exactly as it would read the whole state: live starts
-    shift by the window's origin, and arena residents become rows
-    `span, span+1, ...` whose buckets sit at those offsets past `arena_base = span`.
-
-    Host cost is O(bricks + arena) plus one slice; the whole state never goes
-    to the device.
+    Consecutive bricks' live runs are one slot range `[brick_start[b0],
+    brick_start[b_last + 1])`; their arena residents are appended after it at rows
+    `span, span+1, ...` with `arena_base = span`. The plan is re-based so
+    `device.decode.decode_rows` reads the window exactly as it reads the whole state.
     """
     from .decode import tile_decode_plan
 
@@ -173,8 +120,8 @@ def slab_window_fixed(st, bricks, shapes):
     The live slice is padded to `live_w` rows and arena residents follow at row
     `live_w`, so `arena_base` is the same for every chunk of the step. The
     arena rectangle is padded to `arena_rect` columns and the arena rows to
-    `arena_n`. Padding is never read for a live row. Refuses a chunk that
-    exceeds the step's shapes rather than truncating it.
+    `arena_n`. Padding is never read for a live row. Refuses (never truncates) a
+    chunk that exceeds the step's shapes.
     """
     from .decode import tile_decode_plan
 
@@ -209,8 +156,7 @@ def slab_window_fixed(st, bricks, shapes):
     p3 = int(st.buckets_per_brick)
     return dict(
         starts=plan["starts"] - s0,
-        # the index itself, not the int64 copy the plan makes: a view, 4 B per
-        # bucket over the bus, widened on the device
+        # the uint32 index view, not the plan's int64 copy; widened on the device
         occ=np.asarray(st.occupancy).reshape(-1, p3)[b0:b0 + L],
         live_counts=plan["live_counts"], arena_slots=rect,
         row_offsets=plan["row_offsets"], bricks=bricks, off=off,
@@ -320,7 +266,7 @@ def _chunk_kernel(*, cap, lift, p3, per, nb, arena_base, extent, n_coarse, box,
 
     def body(starts, occ, live_counts, arena_slots, row_offsets, bricks, off,
              arena_bucket, n_rows, origin):
-        _TRACES[0] += 1  # runs at trace time only: the one-compile receipt
+        _TRACES[0] += 1  # trace time only
         _slots, x, _bor, _bi, live = decode_core(
             starts, occ, live_counts, arena_slots, row_offsets, bricks, off,
             arena_bucket, arena_base, n_rows, cap=cap, lift=lift, p3=p3, per=per,
@@ -414,12 +360,8 @@ def _paint_chunk_jit(st, bricks, origin, extent, cfg, shapes, guard_out,
 
 
 class HostInt64Accumulator:
-    """The coarse mesh as the engine keeps it today: int64, on the host.
-
-    `add` reads the device block back (the sync the containment check rides)
-    and adds it through per-axis wrapped indices, exactly as
-    `engine.coarse_delta_streamed` does.
-    """
+    """The coarse mesh as an int64 host array. `add` reads the device block back and
+    adds it through per-axis wrapped indices, as `engine.coarse_delta_streamed` does."""
 
     def __init__(self, n_coarse):
         self.n = int(n_coarse)
@@ -451,8 +393,8 @@ def coarse_delta_device(st, cfg, stats=None, pad_shape=0, chunk_bricks=None,
     the eager path.
 
     `stats`, if a dict, receives `coarse_pad`, `coarse_pad_true`,
-    `coarse_peak_int`, `coarse_device_chunks` (the receipt that this path
-    painted the mesh), `coarse_chunk_bricks`, `coarse_device_jit`, and with jit
+    `coarse_peak_int`, `coarse_device_chunks`, `coarse_chunk_bricks`,
+    `coarse_device_jit`, `coarse_dead_rows`, and with jit
     `coarse_jit_shapes` and `coarse_jit_traces` (compilations during this call),
     plus the census fields when `census`.
     """
@@ -518,14 +460,10 @@ def _chunking(st, cfg, chunk_bricks):
     return n_b, L
 
 
-# ===========================================================================
-# the coarse mesh on the cards
-# ===========================================================================
+# --- the coarse mesh on the cards ---
 
-#: Ghost planes a card's accumulator carries below and above the x-planes it
-#: owns. A chunk's block starts one plane before its first coarse cell and ends
-#: two after its last (`extent = span + 3`), so a chunk at a card's edge writes
-#: exactly these past it.
+#: Ghost planes below/above a card's owned x-planes: a chunk block spans one plane before
+#: its first cell to two after its last (`extent = span + 3`).
 ACC_GHOST_LO = 1
 ACC_GHOST_HI = 2
 
@@ -539,8 +477,8 @@ def _cached(key, build):
 
 
 def _zeros_on(shape, dtype, device):
-    """A zero array built ON `device` by a program, never staged from the host or
-    from jax's default device (17 GB per card at 4096^3)."""
+    """A zero array built on `device` by a program, never staged from the host or the
+    default device."""
     import jax
     import jax.numpy as jnp
 
@@ -614,8 +552,7 @@ def _card_add_kernel(n, extent):
             xi = lx + r[0]
             yi = (origin[1] + r[1]) % n
             zi = (origin[2] + r[2]) % n
-            # indices are unique per axis (extent < n, or the full axis from 0),
-            # so the add is the host's `mesh[np.ix_] += sub`
+            # indices are unique per axis, so this is the host's `mesh[np.ix_] += sub`
             return mesh.at[xi[:, None, None], yi[None, :, None],
                            zi[None, None, :]].add(sub.astype(jnp.int64))
         return jax.jit(body, donate_argnums=0)
@@ -626,10 +563,9 @@ def _card_add_kernel(n, extent):
 def fold_ghosts(accs, stats=None):
     """Add every card's ghost planes into the card that owns each plane.
 
-    Exact: integer addition. Every ghost plane is read before any card is
-    written, so a card that owns its own ghosts (one card, wrapping) folds the
-    same as four. `stats` receives `coarse_ghost_planes_nonzero`, the receipt
-    that some chunk actually wrote past a card's edge.
+    Exact (integer addition). Every ghost plane is read before any card is written,
+    so one card owning its own wrapped ghosts folds the same as many. `stats`
+    receives `coarse_ghost_planes_nonzero`.
     """
     import jax
     import jax.numpy as jnp
@@ -670,9 +606,9 @@ def _delta_on_cards(accs, cfg, census=False):
     """(deltas, peak, inexact): each card's owned planes as the coarse density,
     on that card, in `cfg`'s coarse dtype.
 
-    The arithmetic of `engine._delta_from_accumulated`, plane by plane, with the
-    mean passed in as a plane-shaped runtime array: CPU XLA computes a scalar
-    divisor as a reciprocal multiply, one ulp off numpy's division.
+    The arithmetic of `engine._delta_from_accumulated`, plane by plane. The mean is a
+    plane-shaped runtime array because CPU XLA turns a scalar divisor into a reciprocal
+    multiply, one ulp off numpy.
     """
     import jax
     import jax.numpy as jnp
@@ -734,9 +670,8 @@ def coarse_delta_cards(st, cfg, devices=None, stats=None, pad_shape=0, chunk_bri
     any card count and any `chunk_bricks` that tiles the brick grid into cuboids.
 
     `devices` is a sequence of jax devices, one per card (None: one card on jax's
-    default device). Each card owns the chunks whose bricks start in its x range
-    and paints them, jitted, on its own thread. `fold=False` skips the ghost
-    fold and exists only for the gate that proves the fold matters.
+    default device). Each card paints the chunks whose bricks start in its x range,
+    jitted, on its own thread. `fold=False` drops the ghosts' mass (a test instrument).
 
     `stats`, if a dict, receives `coarse_device_chunks` in total and
     `coarse_card_chunks` per card, `coarse_cards`, `coarse_card_ranges`,
@@ -805,7 +740,7 @@ def coarse_delta_cards(st, cfg, devices=None, stats=None, pad_shape=0, chunk_bri
         fold_ghosts(accs, stats=fold_stats)
     else:
         for a in accs:
-            a.folded = True  # gate instrument: the ghosts' mass is dropped
+            a.folded = True  # test instrument: the ghosts' mass is dropped
     deltas, peak, inexact = _delta_on_cards(accs, cfg, census=census)
     if stats is not None:
         stats["coarse_pad"] = pad

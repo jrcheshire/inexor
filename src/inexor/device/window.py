@@ -1,52 +1,29 @@
-"""E2: the tile loop against a window of x-slabs, not the whole state.
+"""The device tile loop against a window of x-slabs, not the whole state.
 
-WHAT THIS REPLACES. `tile.tile_loop_device` decodes against the WHOLE state on
-the card (`stage_state_on_device`): right at development scale, ~724 GB against a
-199 GB card at 4096^3. A tile draws its rows from `span` consecutive x-slabs of
-bricks (`layout.brick_span`: 18 of 256 at 4096^3), and every tile of one tile
-PLANE -- tiles sharing an x index -- draws from the same `span` slabs. So the loop
-walks tile planes in x order and holds one plane's slabs on the card at a time.
+Every tile of one tile plane (tiles sharing an x index) draws its rows from the same `span`
+consecutive x-slabs (`layout.brick_span`), so the loop walks planes in x order and holds one
+plane's slabs on the card at a time. Per plane: stage the window (the slabs' slot ranges of
+`off` and `w`, then their bricks' arena residents), run the plane's tiles through
+`tile._tile_kernel` with plans rebased into window rows, resolve the stencil guards, check
+the plane owned exactly the particles of its core slabs, and only then copy back the rows
+it owns. `vel_scale` stays whole on the card and returns once at the end.
 
-PER PLANE: stage the window (the slabs' slot ranges of `off` and `w`, then the
-arena residents of their bricks), run the plane's tiles through
-`tile._tile_kernel` with their decode plans rebased into window rows, resolve the
-plane's stencil guards, check that the plane owned exactly the particles stored
-in its core slabs, and only then copy back the rows it OWNS: its core slabs' runs
-and their bricks' residents. `vel_scale` stays whole on the card for the loop
-(8 B per brick, the kernel indexes it by global brick id) and the planes' core
-bricks return once, at the end.
+Bitwise the whole-state loop: a tile writes only rows and bricks it owns, a plane owns
+exactly its `per` core slabs, `off` never changes, and buffer rows' velocities are decoded
+but never used. Only the core returns because a buffer slab of one plane is a core slab of
+another: write-backs are disjoint, which makes concurrent per-card threads safe.
 
-WHY IT IS BITWISE the whole-state loop. A tile writes only rows and bricks it
-owns; the rows a plane owns are exactly those of its `per` core slabs, and every
-slab belongs to one plane. `off` never changes in the loop, and buffer rows'
-velocities are decoded but never used. So a window staged from the host reads, in
-every row that matters, what the whole-state loop reads.
-
-WHY ONLY THE CORE RETURNS. Planes on different cards run concurrently (E3). A
-buffer slab of one plane is a core slab of another, so copying a whole window
-back would race a neighbour's write-back with stale codes. Each plane's
-write-back is disjoint from every other's, which is what makes the cards' threads
-safe; a concurrent read of a neighbour's core rows while it writes lands only in
-buffer velocities, which are never used.
-
-SHAPES. The window is padded to per-step `rows` and `arena` on
-`forces.capacity_shape`'s ladder (`window_shapes`), so every plane of a step runs
-one program.
-
-THE DESTINATION CENSUS (`census=c_drift`). After a plane's tiles have kicked and
-before its write-back, every core slab's rows go through the migrate's own rows
-program and compiled eject kernel (`migrate._slab_index`, `migrate._eject_rows`)
-against the window, and each real row's destination brick is counted on the card.
-Same executable, same values in every row it reads, so the counts are the
-post-migrate per-brick membership the migrate will produce, before it runs: what
-a fused migrate + repack needs for the repack's `new_start`.
+Window shapes sit on `forces.capacity_shape`'s ladder (`window_shapes`), so every plane of a
+step runs one program. With `census=c_drift`, each core slab's rows then go through the
+migrate's rows program and eject kernel against the window and destination bricks are
+counted on the card: the post-migrate per-brick membership, before the migrate runs.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-#: RECEIPT: windowed tile loops run through this module (see `migrate.CALLS`).
+#: Count of `tile_loop_windowed` calls (see `migrate.CALLS`).
 CALLS = 0
 
 
@@ -145,14 +122,12 @@ def stage_window(st, slabs, shapes, device=None):
     across x = 0 is two ranges, concatenated), padded to `W = shapes["rows"]`;
     rows `W ..` are the arena residents of the slabs' bricks in ascending slot,
     padded to `shapes["arena"]`. Returns the device arrays (`off`, `w`,
-    `arena_bucket`: the tile program donates `w`) and the host maps `rebase_plan`
-    and the write-back read. Refuses a window past its shapes.
+    `arena_bucket`; the tile program donates `w`) and the host maps `rebase_plan` and
+    the write-back read. Refuses a window past its shapes.
 
-    NO HOST COPY OF THE WINDOW. Each slab goes up as a view of the state `L =
-    capacity_shape(its rows)` long (copied only where that would run off the array)
-    and is written into a device buffer at its window row; the rows past the slab are
-    unread and the next slab overwrites them, which is why `window_shapes` leaves
-    room for the largest pad. The residents are the one host gather, O(arena).
+    Each slab goes up as a host view `capacity_shape(its rows)` long (copied only where
+    it would run off the array); rows past the slab are overwritten by the next, which
+    is why `window_shapes` leaves room for the largest pad.
     """
     import jax
 
@@ -347,15 +322,14 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
     tile of `members` with that x index. Per plane the stencil guards are resolved
     and the owned count checked against the particles stored in its core slabs
     BEFORE its rows return to the host. `coarse_shard` and `device` as in
-    `tile_loop_device`; one thread per card, each with its own planes, is the
-    four-card form.
+    `tile_loop_device`; multi-card use is one thread per card, each with its own planes.
 
     `timings`, if a dict, accumulates synced wall per part of a plane (`window:
     stage`, `window: tiles`, `window: guards`, `window: census`, `window: write-back`)
     and `window: scales to host` (see `migrate._Clock`).
 
-    `census`, if given, is the step's fused drift `c_drift`: see THE DESTINATION
-    CENSUS above. It adds `census_counts` (int64 per brick, this call's core slabs
+    `census`, if given, is the step's fused drift `c_drift` (see the module docstring).
+    It adds `census_counts` (int64 per brick, this call's core slabs
     only) and `census_slabs`.
 
     Returns `n_owned`, `n_out`, `tiles_run`, `planes_run`, `vel_scale_kick_max`

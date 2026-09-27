@@ -5,83 +5,41 @@
 #SBATCH -n 1
 #SBATCH -t 08:00:00
 #SBATCH -o d7f-hero-card-%j.log
-# D7f: the P(k) card off gb 1009133's step-40 checkpoint, and NOTHING ELSE.
-# Successor to v2_d7e_hero_product_vista.sbatch, which paired the card with the
-# export in one 5 h job. gb 1010938 ran that pairing and was cancelled 3 h 56 min
-# in with the card still inside `pk_summary_card` and the export leg never
-# reached. Two changes came out of it and both are here.
+# The P(k) card of an evolved 4096^3 realization's final checkpoint, and nothing else.
+# The export reads the same checkpoint independently (hero_export_vista.sbatch), so it
+# does not queue behind a card that might overrun.
 #
-# (1) THE CARD IS ITS OWN JOB. The export does not depend on the card and reads
-#     the same checkpoint, so queueing it behind a card that might overrun buys
-#     nothing and costs the export its whole wall. See v2_d7g_hero_export.
+# Requires INEXOR_RUNS (run root), SRC_RUN (the realization directory holding
+# hero-ckpt/), K_STEPS (schedule length; the newest checkpoint must be at this step),
+# PROD_DIR (product directory; the card is written there), and INEXOR_SRC or submission
+# from the inexor checkout. The account is passed with `sbatch -A`:
+#   INEXOR_RUNS=$SCRATCH/inexor_runs SRC_RUN=$SCRATCH/inexor_runs/hero-k120 K_STEPS=120 \
+#     PROD_DIR=$SCRATCH/inexor_runs/hero-k120-prod \
+#     sbatch -A <account> scripts/run/hero_card_vista.sbatch
 #
-# (2) THE WALL COMES FROM THE cgh64 ANCHOR, NOT FROM THE PARTS. D7e's estimate
-#     was built bottom-up -- decode 2366 s from a rate measured ON THE LAPTOP,
-#     plus carries for the paint and the transform -- and came to 56 min against
-#     an actual that passed 3 h 23 min without finishing. The anchor that was in
-#     the same log all along: the cgh64 card took 60 s ON THIS NODE, and c-hero
-#     is exactly 512x it in both particles and coarse cells.
+# Wall comes from the cgh64 anchor, not from summing parts: c-hero is exactly 512x cgh64
+# in particles and coarse cells, and the cgh64 card takes ~60 s serial on this node, so
+# the serial hero card is ~8.5 h. Legs ~3 min, cgh64 card arms ~2 min, loading the
+# 687 GB state ~28 min. The card is three stages (streamed paint over 16,384 chunks,
+# out-of-core transform, binning) and only the paint is pooled; the coarse paint pools
+# 8.5-13x at W=16. At a 60-75% paint share the card takes 3.1-4.2 h; at 40% it takes
+# 5.6 h. The heartbeat times the three stages separately, so the cgh64 legs measure the
+# split before the hero leg starts. 8 h covers the pessimistic branch.
 #
-# TIME: the cgh64 anchor, scaled, with the paint pooled.
-#   legs (fingerprint, pytest, cgh64 ICs, cgh64 run to 24) ......  196 s  measured, 1010730/938
-#   cgh64 card, BOTH arms (serial + pooled) .....................  120 s  serial measured, 1010938
-#   hero: load the 687 GB state ................................. 1663 s  measured, 1010938
-#   hero: the card itself
-#     serial reference = 512x the cgh64 anchor .................. 30720 s  8.5 h
-#     of which the streamed paint, pooled at W=16 ............... see below
-#   CENTRAL 4.0 h.  REQUESTED 8:00.  ~4 SU at the central.
+# Pooling cannot move a number: workers return bounded sub-blocks and the parent
+# accumulates integers, so arrival order is bitwise the serial order (gated in
+# tests/test_card_pool.py). The pool is `paint_only` for memory: a full TilePool
+# allocates three coarse force meshes (3 x 2048^3 x f32 = 103 GB) the card never reads,
+# and the card leg peaks ~840 GB of 1026. The state is loaded through a SharedAllocator
+# so the pool adopts it rather than copying ~755 GB.
 #
-#   WHAT THE POOLING DOES AND WHAT IS STILL A GUESS. The card is three stages
-#   and only the first parallelises: the streamed paint over 16,384 chunks,
-#   then the out-of-core transform, then the binning. W2's C5 measured the
-#   engine's coarse paint pooling 8.5-13.0x at W=16 -- better than the tile
-#   loop -- and the card runs the SAME `coarse_delta_streamed` chunks through
-#   the same workers. What is NOT measured anywhere is how the 8.5 h splits
-#   across the three. At a 60-75% paint share, pooling at 8x takes the card to
-#   3.1-4.2 h and the residual is the serial transform and binning; at a 40%
-#   share it takes it to 5.6 h and pooling was the wrong lever. THE SPLIT IS
-#   WHAT THE cgh64 LEGS BELOW MEASURE, both arms, before the hero leg starts --
-#   the heartbeat names the three stages separately, so their ratio is readable
-#   off the log rather than assumed. 8:00 covers the pessimistic branch.
+# Layout parameters must match the run, not the script defaults: `load_checkpoint`
+# re-derives the allocation geometry from the occupancy plus --slack / --arena-frac
+# (a checkpoint stores no geometry). The run used 0.10 / 0.01 (83.85e9 slots); the
+# defaults 0.20 / 0.20 would provision ~13.7e9 arena rows instead of 687M.
 #
-#   The pooling CANNOT move a number: workers return bounded sub-blocks and the
-#   parent accumulates, so integer associativity makes arrival order bitwise the
-#   serial order. That is gated in `tests/test_card_pool.py`, at the mesh and at
-#   the card, with the dispatch counted so a dropped `pool=` cannot pass.
-#
-#   MEMORY IS WHY THE POOL IS `paint_only`. A full TilePool allocates three
-#   coarse force meshes -- 3 x 2048^3 x f32 = 103.1 GB -- and builds a tile
-#   kernel in every worker, and the card reads neither; the card leg measured
-#   839.5 GB of 1026 on 1010938, so 103 GB is most of what it has left. Two
-#   further conditions, both fixed here rather than hoped for: the state is
-#   loaded THROUGH a SharedAllocator so the pool adopts it instead of copying
-#   754.6 GB, and `TilePool.close()` no longer copies adopted fields back into
-#   private memory on the way out, which was a second 754.6 GB at teardown.
-#
-# THE LAYOUT PARAMETERS ARE NOT THE SCRIPT'S DEFAULTS AND MUST NOT BE.
-# `load_checkpoint` re-derives the allocation geometry from the occupancy plus
-# `--slack` / `--arena-frac` (the checkpoint preserves no geometry, D-v2-19).
-# 1009133 ran slack 0.10 / arena-frac 0.01 -> 83.85e9 slots. The script's own
-# defaults of 0.20 / 0.20 would provision ~13.7e9 arena rows instead of 687M.
-# MEASURED on 1010938 with these values: the card leg peaks 839.5 GB of 1026
-# (0.82x), against the 756 GB D7e predicted -- 11% over, and still clear.
-#
-# HOST MEMORY IS BOUND TO THE CPU SOCKETS, as in every D7 job since 1003511.
-#
-# PRE-REGISTERED QUESTIONS:
-#   1. What are the three stages' rates at hero scale, and how do they compare
-#      with 512x the cgh64 rates? This is the first time any of them is measured
-#      above cgh64, and it is what prices every later card.
-#   2. What does the paint pool buy at cgh64 (both arms run below), and does
-#      that transport to hero scale, where the chunk count is 512x and the
-#      sub-block each worker ships back is the same shape?
-#   3. Does the card finish inside 8 h, and if not, at what fraction and in
-#      which stage?
-#   4. What does the card say below k_nonlinear (0.2520 h/Mpc at a = 1)? NO
-#      verdict is emitted: the band this run is trusted over is JC's call.
-#
-# Submit from the Vista checkout:
-#   sbatch scripts/run/hero_card_vista.sbatch
+# Host memory is bound to the CPU sockets (`numactl --membind=0,1`). No verdict is
+# emitted on the card.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
@@ -97,7 +55,6 @@ unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
 
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
-# SRC_RUN / PROD_DIR / K_STEPS override the run this reads; the defaults are 1009133's
 SRC=${SRC_RUN:?set SRC_RUN to the realization directory}
 K_STEPS=${K_STEPS:?set K_STEPS to the schedule length}
 export K_STEPS
@@ -108,28 +65,25 @@ DRIVER=scripts/run/device_run.py
 TAG=d7f_$SLURM_JOB_ID
 MEM_CSV=$CARDS/${TAG}_mem.csv
 BIND="numactl --membind=0,1"
-# `_require_cpu` refuses unless jax's first device is CPU, and on this node it is
-# not. Scoped per leg rather than exported: the cgh64 ICs and the cgh64 run are
-# the DEVICE engine and must see the cards, and every card leg -- including the
-# gate that certifies them -- must not.
+# `_require_cpu` refuses unless jax's first device is CPU. Scoped per leg, not exported:
+# the cgh64 ICs and run use the device engine and must see the GPUs; every card leg,
+# including the tests that certify it, must not.
 CPU="env JAX_PLATFORMS=cpu"
 LAYOUT="--slack 0.10 --arena-frac 0.01"
-# W=16 is W2's operating point (W=32 bought 1.2% and broke its own neutrality
-# bound); named rather than left to the driver default so the receipt the card
-# prints can be read against it.
+# W=16: W=32 bought only 1.2%. Named, not left to the driver default, so the card's
+# printed receipt can be read against it.
 W="--tile-workers 16"
-# 60 s between progress lines: at the cgh64 rates that is ~30 lines over a 9 h
-# hero leg, and at 16,384 chunks the throttle is a clock read per chunk against
-# a chunk costing ~0.4 s.
+# 60 s between progress lines: a few hundred over the hero leg; the throttle is one clock
+# read per ~0.4 s chunk.
 HB="--heartbeat 60"
 mkdir -p "$WORK" "$PROD"
 export PROD
 
-# `_ckpt_dir` is `<workdir>/ckpt` and 1009133 wrote `hero-ckpt`, so point one at
-# the other rather than moving 1.3 TB or touching the source job's directory.
+# `_ckpt_dir` is `<workdir>/ckpt` and the run wrote `hero-ckpt`: link rather than move
+# 1.3 TB or touch the source directory.
 ln -sfn "$SRC/hero-ckpt" "$PROD/ckpt"
-# the NEWEST complete generation must be the schedule's last step; which generation
-# holds it depends on how the run was segmented, so it is read, not assumed
+# the newest generation must be at the schedule's last step; which generation holds it
+# depends on the segmentation, so it is read, not assumed
 HEAD_MAN=$(python3 -c "
 import json, os
 best = None
@@ -182,14 +136,10 @@ run_leg () {
   return $rc
 }
 
-# THE FINGERPRINT GUARD, before anything expensive.
-# `load_checkpoint` refuses a fingerprint mismatch, and the fingerprint hashes
-# `coeffs.tobytes()` -- which come from `scipy.integrate.quad` (QUADPACK), so the
-# bytes ride on the platform's libm. It is a SAME-MACHINE contract: the same
-# snippet on the osx-arm64 laptop produces a different digest against this
-# checkpoint's c28f7507..., with all fifteen fingerprinted CONFIG fields
-# identical. Verified matching on c672-003 and c672-017; kept because the
-# contract is per node, not per cluster, and it costs one import.
+# Fingerprint guard, before anything expensive. `load_checkpoint` refuses a mismatch, and
+# the fingerprint hashes `coeffs.tobytes()` from `scipy.integrate.quad`, so the bytes
+# depend on the platform's libm (osx-arm64 gives a different digest with identical config
+# fields). The contract is per node, so it is checked on every node.
 run_leg fingerprint-guard \
   $CPU pixi run -e gpu python -c '
 import sys, json, argparse
@@ -209,44 +159,24 @@ sys.exit(0 if want == have else 1)
 ' \
   || { echo "FATAL: this node computes a different schedule than the one that wrote the checkpoint"; exit 1; }
 
-# The pooled paint and the heartbeat are the newest code in this job, and the
-# pooled card's bitwise gate is in here: it runs in 6 s at the smoke rung and
-# the thing it certifies is the whole basis for pooling the hero leg.
-#
-# THE GATE RUNS IN THE LANE IT GATES, which is what gb 1011375 got wrong.
-# `TilePool` VOIDS a non-CPU parent by design (`executor.py`, the antares 409
-# precedent; 995764 already found one test asking it to), and `cmd_card` calls
-# `_require_cpu`, so the card is the CPU lane by contract and every card leg
-# below wears $CPU. This leg did not -- it was written to "still see the cards"
-# -- so all six of test_card_pool.py's tests died at second 63 on the same
-# ValueError and the job never reached a card. The laptop gate is structurally
-# blind to it: with no second backend to pick, the wrong lane is unreachable
-# there. JAX_PLATFORMS is process-wide and read at backend init, so the lane is
-# chosen HERE and cannot be set per test. Nothing in these three files wants a
-# card -- no importorskip, no device assertion, no detflag marker -- so forcing
-# the lane changes what runs in exactly one way: it lets the pool exist.
+# The card tests, including the pooled card's bitwise gate (~6 s), in the lane they gate.
+# `TilePool` refuses a non-CPU parent (`executor.py`) and `cmd_card` calls `_require_cpu`,
+# so the card is the CPU lane and these tests must run under $CPU too. JAX_PLATFORMS is
+# process-wide and read at backend init, so the lane is chosen here, not per test.
 run_leg pytest-cpu-lane \
   $CPU pixi run -e gpu python -m pytest -q -rs tests/test_summary.py tests/test_progress.py \
     tests/test_card_pool.py \
   || { echo "FATAL: the card gates failed"; exit 1; }
 
-# --- cgh64: the card end to end, on the same NFS, before the hero leg.
+# --- cgh64: the card end to end, on the same filesystem, before the hero leg.
 #
-# STEP 24, NOT 3, AND THE EPOCH IS THE REASON. The card leg reads the epoch it
-# stops at, and the bins it can compare against linear theory are the ones below
-# the nonlinear scale. At step 3 (a = 0.1189) the linear Delta^2 peaks at 0.26,
-# so there IS no nonlinear scale and the card takes a branch the hero leg never
-# will -- which is how 1010730 shipped a `float(None)` into the guard leg while
-# leaving the hero's own path unexercised. Nothing in this schedule is nonlinear
-# before step 15; by step 24 (a = 0.3981) the scale is 1.34 h/Mpc and falls
-# INSIDE the band, which stops at half Nyquist = 1.57 h/Mpc here, so the smoke
-# splits its bins either side of it exactly as the hero card at a = 1 will
-# (0.2520 h/Mpc against the same 1.57 ceiling). --stop-at must stay a multiple
-# of --checkpoint-every.
-#
-# It is also THE ANCHOR THIS JOB'S WALL IS BUILT ON, and with the heartbeat it
-# now reports its three stages separately. Read those rates against the hero
-# leg's: 512x is the scaling this job assumes and has never tested.
+# Stop at step 24 because the card's branches depend on the epoch: before step 15 there is
+# no nonlinear scale (at step 3, a = 0.1189, linear Delta^2 peaks at 0.26), so the card
+# would take a branch the hero never does. At step 24 (a = 0.3981) the nonlinear scale is
+# 1.34 h/Mpc, inside the band (half Nyquist = 1.57 h/Mpc), so bins split on either side of
+# it as the hero card's do at a = 1 (0.2520 h/Mpc). --stop-at must stay a multiple of
+# --checkpoint-every. These legs are also the wall anchor; compare their stage rates with
+# the hero leg's to test the 512x scaling.
 run_leg cgh64-ics \
   $BIND pixi run -e gpu python scripts/run/realization.py ics --config cgh64 \
     --workdir "$WORK/cgh64" --generator device \
@@ -256,17 +186,14 @@ run_leg cgh64-ics \
     --checkpoint-dir "$WORK/cgh64-ckpt" --checkpoint-every 3
 [ $? -ne 0 ] && { echo "FATAL: the cgh64 control failed"; exit 1; }
 
-# The checkpoint dir is a SIBLING of the IC dir, not a child: the D7 driver
-# refuses to write a checkpoint under the ICs (`5322c25`, containment by path
-# component), which is what killed gb 1010700 at second 70.
+# The checkpoint dir is a sibling of the IC dir, not a child: the driver refuses to write
+# a checkpoint under the ICs (containment by path component).
 mkdir -p "$WORK/cgh64-prod"
 ln -sfn "$WORK/cgh64-ckpt" "$WORK/cgh64-prod/ckpt"
 
-# BOTH ARMS. The serial one is the anchor this job's wall is scaled from and
-# the pooled one is what the hero leg will actually run; their ratio is the
-# pooled speedup at a config where both are affordable, and the heartbeat's
-# three stage timings inside each are the split the projection needs. The
-# IDENTITY is gated in pytest above, not here -- these two arms are timing.
+# Both arms: serial (the wall anchor) and pooled (what the hero leg runs). Their ratio is
+# the pooled speedup; the stage timings in each give the split. Identity is gated in the
+# pytest leg; these arms are timing only.
 run_leg cgh64-card-serial \
   $CPU $BIND pixi run -e gpu python scripts/run/realization.py card --config cgh64 \
     --workdir "$WORK/cgh64-prod" $LAYOUT $HB --serial-card --allow-partial \
@@ -277,8 +204,7 @@ run_leg cgh64-card-pooled \
     --workdir "$WORK/cgh64-prod" $LAYOUT $HB $W --card-pool --allow-partial \
   || { echo "FATAL: the pooled card path is broken at cgh64; the hero leg would find it 4 h in"; exit 1; }
 
-# --- THE 4096^3 CARD. One call, hours long; the heartbeat is the only thing
-# that will say where it got to.
+# --- The 4096^3 card. One call, hours long; the heartbeat says where it got to.
 run_leg hero-card \
   $CPU $BIND pixi run -e gpu python scripts/run/realization.py card --config c-hero \
     --workdir "$PROD" --k-steps "$K_STEPS" $LAYOUT $HB $W --card-pool

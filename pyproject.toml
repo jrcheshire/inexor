@@ -6,12 +6,10 @@ maintainers = [{ name = "James Cheshire", email = "cheshire@caltech.edu" }]
 requires-python = ">=3.11"
 readme = "README.md"
 license = "BSD-3-Clause"
-# SINGLE SOURCE OF TRUTH for the version; src/inexor/__init__.py reads it back
-# via importlib.metadata. Declared statically ON PURPOSE: pixi must read this
-# package's metadata to solve foreign-platform envs (the linux-aarch64 gpu env
-# for Vista), and `dynamic = ["version"]` forces it to execute hatchling with an
-# interpreter it cannot have for a platform it cannot run -- the solve dies with
-# "no compatible Python interpreter". Do not reintroduce dynamic version.
+# Single source of truth for the version; src/inexor/__init__.py reads it back via
+# importlib.metadata. Static on purpose: pixi reads this metadata to solve foreign-platform
+# envs (linux-aarch64 for Vista), and `dynamic = ["version"]` would make it run hatchling
+# with an interpreter it cannot have ("no compatible Python interpreter").
 version = "0.0.1.dev0"
 
 dependencies = [
@@ -31,9 +29,8 @@ packages = ["src/inexor"]
 
 # ---------------------------------------------------------------------------
 # pixi config. `pixi.lock` is committed; co-commit it on any dependency change.
-# default env = CPU jax (osx-arm64 dev + linux CI); gpu env = CUDA 12 on BOTH
-# linux-64 (deneb / generic x86 CUDA) and linux-aarch64 (TACC Vista
-# Grace-Hopper). The aarch64 platform landed at M2 S4 -- see docs/roadmap.md.
+# default env = CPU jax (osx-arm64 dev + linux CI); gpu env = CUDA 12 on both linux-64
+# (generic x86 CUDA) and linux-aarch64 (TACC Vista Grace-Hopper).
 # ---------------------------------------------------------------------------
 [tool.pixi.workspace]
 channels = ["conda-forge"]
@@ -54,15 +51,11 @@ inexor = { path = ".", editable = true }
 [tool.pixi.feature.jax.dependencies]
 jax = "*"            # conda-forge jaxlib is CPU-only in the default env
 
-# GPU env: CUDA on linux-64 (deneb RTX 3050 6 GB / generic CUDA node) AND
-# linux-aarch64 (TACC Vista GH200, xcat pattern -- conda-forge ships an
-# aarch64 CUDA jaxlib, so this is a committed-lock install with no native
-# solve on Vista). The two platforms share one spec set; cuda = "12" is a
-# driver FLOOR, satisfied by deneb's 13.3 and Vista's 12.x alike.
-# NOTE: pixi 0.72 warns that [system-requirements] is deprecated for inline
-# platform tables, but 0.72 does not yet PARSE the inline form (errors:
-# "expected a string, found table") -- keep this form until pixi accepts the
-# replacement, then migrate.
+# GPU env: CUDA on linux-64 and linux-aarch64 (TACC Vista); conda-forge ships an aarch64
+# CUDA jaxlib, so Vista installs from the committed lock with no native solve. One spec
+# set for both; cuda = "12" is a driver floor (CUDA 12.x and 13.x drivers satisfy it).
+# pixi 0.72 warns [system-requirements] is deprecated for inline platform tables but cannot
+# parse the inline form yet ("expected a string, found table"); migrate once it can.
 [tool.pixi.feature.gpu]
 platforms = ["linux-64", "linux-aarch64"]
 [tool.pixi.feature.gpu.system-requirements]
@@ -77,17 +70,15 @@ default = ["jax"]
 gpu = ["gpu"]
 
 [tool.pixi.tasks]
-# `-n auto` (pytest-xdist) parallelizes across cores; OMP_NUM_THREADS=1 pins one
-# thread per worker -- JAX-CPU otherwise grabs every core per process and
-# oversubscribes (same rationale + measured win as sfbfs/jht). env is per-task.
+# `-n auto` (pytest-xdist) parallelizes across cores; OMP_NUM_THREADS=1 pins one thread
+# per worker, since JAX-CPU otherwise grabs every core per process and oversubscribes.
 test = { cmd = "pytest -n auto", env = { OMP_NUM_THREADS = "1" } }
 test-fast = { cmd = "pytest -m 'not slow' -n auto", env = { OMP_NUM_THREADS = "1" } }
-# `detflag` tests assert BIT equality and need XLA deterministic ops on GPU (the
-# f32 scatter-add is otherwise nondeterministic -- M2 S4, deneb jobs 14/15).
-# XLA_FLAGS is process-wide and read at backend init, so they need their OWN
-# process: `test` skips them visibly on GPU (tests/conftest.py), `test-det` runs
-# them. env is per-task, so the flag cannot leak into `test` -- which is exactly
-# why this is depends-on and not `test && test-det` in one cmd string.
+# `detflag` tests assert bit equality and need XLA deterministic ops on GPU (the f32
+# scatter-add is otherwise nondeterministic). XLA_FLAGS is process-wide and read at backend
+# init, so they run in their own process: `test` skips them visibly on GPU
+# (tests/conftest.py), `test-det` runs them. env is per-task, so `test-all` uses depends-on
+# rather than `test && test-det` to keep the flag out of `test`.
 test-det = { cmd = "pytest -m detflag -n auto", env = { OMP_NUM_THREADS = "1", XLA_FLAGS = "--xla_gpu_deterministic_ops=true" } }
 test-all = { depends-on = ["test", "test-det"] }
 lint = "ruff check"

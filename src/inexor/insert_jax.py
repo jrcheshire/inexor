@@ -1,40 +1,26 @@
-"""Compiled twin of `_insert_slab`'s row work: group, scale, rescale, and order.
+"""Compiled twin of `SlotState._insert_slab`'s row work: group, scale, rescale, and order.
 
-**Why a separate module, and why the arithmetic is duplicated.** The same two
-reasons as `eject_jax`: `state.py` must not import jax at module level, and the
-gate is elementwise equality against `SlotState._insert_slab`'s own numpy, so the
-two implementations are deliberately independent (umbrella
-`ab_arms_sharing_code_are_policy_blind`).
+Separate from `state.py` and deliberately independent of its numpy arithmetic for the same
+reasons as `eject_jax`. One call handles one destination slab; rows arrive as the numpy path
+concatenates them (the slab's keepers, then each reaching slab's immigrants in source order):
 
-**What one call does, for one destination slab.** The rows arrive as the numpy
-path concatenates them -- the slab's keepers, then the immigrants of every
-reaching slab in source order -- and the program:
+  1. keep rows bound for this slab and stable-sort them by destination bucket (per brick:
+     keepers before immigrants, then `_stable_order` by bucket);
+  2. take each brick's velocity scale over its keepers and immigrants,
+     `max(|w| * s_old) / 32767`, 1.0 for an empty brick;
+  3. re-express codes at the brick's scale, `rint(w * s_old / s_new)`, reporting the largest
+     magnitude so the caller can refuse an int16 escape;
+  4. rank rows within their brick: rank < allocation is written at `brick_start + rank`, the
+     rest spill, in order.
 
-  1. keeps the rows bound for this slab and stable-sorts them by destination
-     bucket. Per brick that is exactly the numpy order: keepers before
-     immigrants, then `_stable_order` by bucket within the brick;
-  2. takes each brick's velocity scale over the union of its keepers and
-     immigrants, `max(|w| * s_old) / 32767`, with 1.0 for an empty brick;
-  3. re-expresses every row's codes at its brick's scale, `rint(w * s_old /
-     s_new)`, and reports the largest magnitude so the caller can refuse an
-     int16 escape;
-  4. ranks rows within their brick: a row whose rank fits the brick's allocation
-     is written at `brick_start + rank`, the rest spill, in order.
+Every float op matches numpy's: both divisions are by full-shape runtime arrays because CPU XLA
+turns division by a scalar/broadcast into a reciprocal multiply (one ulp off), and the rescale
+is one multiply then `rint`, so no FMA can form. The host (`SlotState._insert_slab_jax`) keeps
+the old-scale gather, the state writes and the arena claims, whose order is the arena layout.
+Padding is as in `eject_jax`.
 
-**Every float operation matches numpy's by construction.** The scale's max is
-exact on any backend; its division by 32767 and the rescale's division are both
-by full-shape RUNTIME arrays, because CPU XLA computes a division by a scalar or
-broadcast divisor as a reciprocal multiply, one ulp off numpy (umbrella
-`xla_scalar_division_is_reciprocal`). The rescale is one multiply then `rint`, so
-no fused multiply-add can form.
-
-**What stays on the host** (`SlotState._insert_slab_jax`): the consumption
-census, each row's old-scale gather, the writes into the state, and every arena
-claim, replayed brick by brick in the numpy path's order -- claims take the
-lowest free slots, so their order IS the arena layout.
-
-**Padding.** As in `eject_jax`: `n + 1` rows padded onto the capacity ladder at
-`PAD_RUNGS_PER_OCTAVE`, marked not real, and neither written nor spilled.
+`device/migrate.py` reuses `_build` and `_CACHE` with the same key: a change to the signature or
+key must land in both.
 """
 
 from __future__ import annotations
@@ -47,8 +33,7 @@ PAD_RUNGS_PER_OCTAVE = 12
 
 _CACHE: dict = {}
 
-#: RECEIPT, not telemetry: a run that selects the compiled insert must be able
-#: to prove it applied (see `eject_jax.CALLS`).
+#: Call count (see `eject_jax.CALLS`).
 CALLS = 0
 
 
@@ -61,14 +46,8 @@ def _padded(n):
 def narrow_key_ok(p3, nb2, n_pad):
     """May this slab's sort use the uint32 key and int32 index?
 
-    Separated from `_build` because THE BRANCH IT GUARDS CANNOT BE RUN at any
-    testable size -- tripping it needs `nb2 * p3 >= 2**32`, whose occupancy array
-    alone is 34 GB -- so a test of the wide path would be a test no machine can
-    fail. The decision is testable even though the branch is not, which is the
-    part worth pinning.
-
-    Production is nowhere near either bound: at 4096^3 `nb2 * p3` is 33,554,432
-    (128x under) and `n_pad` is ~7e8 (3x under).
+    Separate from `_build` so the decision is testable: the wide branch it guards
+    needs `nb2 * p3 >= 2**32`, far beyond any testable (or production) size.
     """
     return int(nb2) * int(p3) < 2**32 and int(n_pad) < 2**31
 
@@ -78,42 +57,24 @@ def _build(p3, nb2, n_pad, has_ids):
     import jax.numpy as jnp
 
     big = int(np.iinfo(np.int64).max)
-    # THE SORT KEY IS SLAB-RELATIVE, AND NARROW. A destination inside this slab is
-    # bounded by `nb2 * p3` -- 33,554,432 at 4096^3, 128x under the uint32 ceiling
-    # -- and a narrow integer key is what puts a sort on a radix path instead of a
-    # comparison path. The permutation is IDENTICAL, not merely equivalent:
-    # subtracting a constant is order-preserving on the in-slab rows, every other
-    # row takes ONE sentinel strictly above all of them, and a stable sort agrees
-    # on ties. That is the same argument, and the same checked-range-with-fallback
-    # policy, as `state._stable_order`, where the identical change bought migrate's
-    # numpy sort 5.3x and the phase 1.67x end to end.
-    #
-    # Both bounds are STATIC and the fallback is the wide form, never a refusal.
-    # What they prevent is measured rather than asserted: at `nb2 * p3 == 2**32`
-    # the sentinel itself wraps to 0 and the out-of-slab rows sort FIRST.
+    # Slab-relative uint32 sort key (a radix sort path). The permutation is identical to
+    # the wide form: subtracting a constant preserves order on in-slab rows, all other rows
+    # take one sentinel above them, and the sort is stable. The bounds are static and fall
+    # back to the wide form; at `nb2 * p3 == 2**32` the sentinel would wrap to 0.
     narrow = narrow_key_ok(p3, nb2, n_pad)
-    # THE INDEX FAMILY IS int32 UNDER THE SAME GUARD. Every one of these counts
-    # rows within one slab and is bounded by `n_pad`, so at 4096^3 they are ~2.7e8
-    # and 3x under the int32 ceiling. They are also `n_pad` LONG, which is what
-    # makes the width matter: `idx_all` alone is 2.15 GB per slab at int64, and the
-    # prefix partition above adds four more arrays of the same length.
-    #
-    # `pos` is the one quantity that must stay wide, and it does so by promotion
-    # rather than by luck: it is `starts[bl] + rank`, `starts` holds GLOBAL slot
-    # indices (~7.5e10 at 4096^3, far past int32), and int64 + int32 -> int64 is
-    # verified in `test_the_written_positions_stay_int64`. Narrowing `starts`
-    # would be the silent truncation this comment exists to prevent.
+    # Row indices within the slab are int32 under the same guard (bounded by n_pad).
+    # `pos = starts[bl] + rank` stays int64 by promotion because `starts` holds global
+    # slot indices: never narrow `starts`.
     idt = jnp.int32 if narrow else jnp.int64
 
     @jax.jit
     def kernel(dest, off, w, ids, s_old, real, lo_b, starts, div):
-        # inside the trace, not a captured constant (see `eject_jax._build`)
+        # inside the trace, not a captured constant
         idx_all = jnp.arange(n_pad, dtype=idt)
         brick = dest // p3
         inslab = real & (brick >= lo_b) & (brick < lo_b + nb2)
         if narrow:
-            # the `where` runs in int64 and both of its branches already sit in
-            # [0, nb2 * p3], so the cast can never see a value that wraps
+            # both `where` branches lie in [0, nb2 * p3], so the cast cannot wrap
             key = jnp.where(inslab, dest - lo_b * p3, nb2 * p3).astype(jnp.uint32)
             order = jnp.argsort(key, stable=True, dtype=jnp.int32)
         else:
@@ -128,12 +89,8 @@ def _build(p3, nb2, n_pad, has_ids):
         write = in_s & fits
         spill = in_s & jnp.logical_not(fits)
 
-        # the scale over the union, as `_insert_slab`: |w| max per row times the
-        # row's source scale. Widened to f64 BEFORE abs and max: every int16 is
-        # exact in f64, so the value is numpy's, and the int16 form
-        # `abs(w).max(1).astype(f64)` came back wrong in 5,293 of 15,898 rows
-        # jitted on a GB200 (eager and CPU XLA exact; Vista 995228), shrinking
-        # 27 of 64 brick scales until the rescale escaped int16
+        # per-row max |w| times source scale. Widen to f64 before abs/max: the jitted
+        # int16 form `abs(w).max(1)` is miscompiled on GB200 GPUs
         m_row = jnp.abs(w_s.astype(jnp.float64)).max(axis=1) * s_s
         vmax = jnp.zeros(nb2, dtype=jnp.float64).at[bl].max(jnp.where(in_s, m_row, 0.0))
         s_b = vmax / div
@@ -145,16 +102,10 @@ def _build(p3, nb2, n_pad, has_ids):
 
         occ = jnp.zeros(nb2 * p3, dtype=jnp.int64).at[
             jnp.where(write, dest_s - lo_b * p3, 0)].add(write.astype(jnp.int64))
-        # Written rows first, then spills, each in brick-then-rank order. This is a
-        # THREE-CLASS STABLE PARTITION, and `jnp.argsort` charged a full radix sort
-        # for it -- eight passes over a 64-bit key and a 64-bit payload to separate
-        # three values. The exclusive-prefix form is the SAME PERMUTATION by
-        # construction, not merely an equivalent one: a stable sort lists class 0 in
-        # input order, then class 1, then class 2, which is exactly what placing
-        # each row at its rank within its own class produces. It is also the form
-        # `eject_jax._build` already uses for its keeper/leaver partition.
-        # Counts are cast explicitly -- a bool reduction promotes to float32 on
-        # this stack, and these become scatter indices.
+        # Written rows, then spills, then the rest, each in brick-then-rank order: a
+        # three-class stable partition by exclusive prefix sums (the same permutation a
+        # stable argsort gives, far cheaper). Counts are cast explicitly because they
+        # become scatter indices.
         w_i = write.astype(idt)
         s_i = spill.astype(idt)
         ex_w = jnp.cumsum(w_i) - w_i

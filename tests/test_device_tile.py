@@ -1,12 +1,9 @@
-"""D2e: one tile of the kick on the device, gated BITWISE against `tile_task`.
+"""The device tile kick (`tile_task_device`, the step loop, multi-card threads), gated against
+the real host `engine.tile_task`.
 
-The oracle is the real host code with the real short force: `engine.tile_task`
-and `tile_task_device` get the same state, the same jitted `one_tile`, the same
-header and the same coarse meshes, and must return the same writes. On the CPU
-jax backend both run the same FFTs, so equality is the bar, not a tolerance.
-
-The arena branch must run: the state is built with no spare so a migrate forces
-residents, and the test asserts they reached the tiles it compares.
+Both arms get the same state, `one_tile`, header and coarse meshes. Eager results must match
+bitwise (same FFTs on CPU); jitted results are held to a measured floor on the long force. The
+state has no brick spare, so a migrate puts residents in the arena; tests assert they are there.
 """
 
 import copy
@@ -22,7 +19,7 @@ from inexor.device import kick as dkick  # noqa: E402
 from inexor.device import tile as dtile  # noqa: E402
 from inexor.device.decode import tile_decode_plan  # noqa: E402
 
-# `tests/test_engine.py`'s validated smoke geometry, verbatim.
+# tests/test_engine.py's validated smoke geometry.
 L_BOX, N_PART, N_FINE, N_COARSE, N_TILE, B_FINE = 32.0, 32, 64, 16, 16, 8
 
 DTYPES = [("float64", "float64"), ("float64", "float32"),
@@ -131,7 +128,7 @@ def test_a_whole_step_of_tiles_writes_the_same_state():
 
 
 def test_the_comparison_can_fail():
-    """Anti-vacuity on each force arm: changing either must move the codes."""
+    """Control on each force arm: changing either must move the codes."""
     cfg, st, members, one_tile, C, g_coarse = _setup()
     t = cfg.tiles[0]
     base = dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t])
@@ -148,8 +145,8 @@ def test_the_comparison_can_fail():
 
 
 def test_the_codes_use_the_whole_int16_range():
-    """D-007 is off this path, so check what makes it unnecessary: every written
-    brick's extreme lands on +-32767 and nothing exceeds it."""
+    """Each written brick's extreme code is +-32767 and nothing exceeds int16, so wrapping never
+    arises."""
     cfg, st, members, one_tile, C, g_coarse = _setup()
     res = dtile.tile_task_device(st, one_tile, C, g_coarse, cfg.tiles[0],
                                  members[cfg.tiles[0]])
@@ -160,12 +157,10 @@ def test_the_codes_use_the_whole_int16_range():
 
 # ---------------------------------------------------------------- jit, tolerance
 #
-# The jitted tile is NOT bitwise the eager one: XLA compiles the coarse gather to
-# a different rounding (record sec. 17). Measured over every tile of this state
-# at all four dtype pairs, the long force differs by at most 4.48 eps x rms at an
-# f64 coarse arm and 5.88 at f32, and nothing upstream of the gather differs.
-# JIT_LONG_FORCE_EPS is that floor rounded up to a whole eps (JC, 2026-09-12).
-# Everything else below is exact or an identity, not a tolerance.
+# The jitted tile is not bitwise the eager one: XLA compiles the coarse gather with different
+# rounding. Over every tile of this state at all four dtype pairs, the long force differs by at
+# most 4.48 eps x rms (f64 coarse) and 5.88 (f32); nothing upstream of the gather differs.
+# JIT_LONG_FORCE_EPS is that floor rounded up to a whole eps. Everything else below is exact.
 JIT_LONG_FORCE_EPS = 6.0
 
 
@@ -191,8 +186,7 @@ def _jit_within_floor(j, e, st, bricks, t, cfg):
     dw = np.abs(j["w_codes"].astype(np.int32) - e["w_codes"].astype(np.int32))
     assert dw.max() <= 1, "a velocity code moved by more than one"
 
-    # a max is 1-Lipschitz: a brick's scale cannot move further than its largest
-    # velocity change / 32767, plus one ulp of the division
+    # max is 1-Lipschitz: a scale moves at most max|dv| / 32767 plus one ulp
     plan = tile_decode_plan(st, np.asarray(bricks, dtype=np.int64))
     bor = np.repeat(plan["bricks"], plan["member_counts"])
     nb = N_FINE // cfg.n_brick
@@ -289,8 +283,8 @@ def test_a_device_step_writes_the_state_the_host_apply_path_writes():
 
 
 def test_a_skipped_tile_leaves_its_rows_and_the_host_untouched():
-    """Anti-vacuity on the write: a tile left out keeps its stored codes and
-    scales, and the donated device buffers never alias the host state."""
+    """Control on the write: a tile left out keeps its stored codes and scales, and the donated
+    device buffers never alias the host state."""
     cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
     shapes = dtile.tile_step_shapes(st)
     st_d = copy.deepcopy(st)
@@ -367,9 +361,8 @@ def test_a_device_coarse_shard_step_writes_the_host_staged_state():
 
 
 def _devices(w):
-    """`w` device handles, replicating if the backend has fewer (as in
-    `test_ooc_fft._devices`); with `--xla_force_host_platform_device_count=4`
-    they are distinct devices."""
+    """`w` device handles, replicated if the backend has fewer; distinct with
+    `--xla_force_host_platform_device_count=4`."""
     import jax
 
     devs = jax.devices()
@@ -420,8 +413,7 @@ def test_a_threaded_four_card_step_writes_the_one_device_state(coarse_on_cards):
 
 
 def test_the_jit_floor_can_fail():
-    """Anti-vacuity: coarse meshes moved by 1e-13 relative (~450 f64 eps) must
-    exceed the floor."""
+    """Control: coarse meshes moved by 1e-13 relative (~450 f64 eps) must exceed the floor."""
     cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float64")
     shapes = dtile.tile_step_shapes(st)
     t = cfg.tiles[0]
@@ -444,8 +436,8 @@ def test_ownership_twin_is_the_host_rule():
 
 
 def test_a_stencil_outside_the_block_is_refused():
-    """The deferred guard must still fire: a coarse halo of zero cannot contain a
-    TSC stencil, so the tile must raise rather than read wrapped values."""
+    """A zero coarse halo cannot contain a TSC stencil: the tile raises rather than read
+    wrapped values."""
     cfg, st, members, one_tile, C, g_coarse = _setup()
     t = cfg.tiles[0]
     orig = forces.COARSE_HALO

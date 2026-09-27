@@ -22,44 +22,38 @@ def _geom(cfg, tile=None, buf=32):
     return g
 
 
-
 TRIM_MODES = ("off", "all", "step")
-
 
 
 # `engine.step`'s first phase, emitted unconditionally once per step
 STEP_BOUNDARY_PHASE = "coarse_paint"
 
 
-
 # The phase names `engine.step` and `engine.run` emit, in the order a step
-# visits them. Listed here so the probe REFUSES a name it does not know rather
-# than silently reporting a partial decomposition if the engine gains a phase.
+# visits them. A name not listed here is recorded as unknown and reported, so a
+# new engine phase cannot silently leave the decomposition partial.
 PHASES = (
     "kernel_build", "lead_drift", "coarse_paint", "coarse_solve", "membership",
     # the device lane's compiled tile loop has ONE boundary where the host lane's
-    # per-tile pipeline has four (caa2533); both lanes appear here
+    # per-tile pipeline has four; both lanes appear here
     "tile_loop",
     "tile_decode", "tile_short", "tile_long", "tile_reduce",
     "tile_loop_end", "reconcile", "migrate", "repack", "checkpoint",
 )
 
 
-
 def _require_linux():
-    """`VmHWM` and `clear_refs` are procfs. There is no macOS equivalent.
+    """Refuse a non-Linux host: `VmHWM` and `clear_refs` are procfs-only.
 
-    This is not a portability gap worth papering over: the umbrella record
-    already has macOS peaks reading ~3x low and one laptop point moving 6.484
-    -> 9.855 GB minutes apart, so a Darwin fallback would produce numbers that
-    look like measurements and are not.
+    No Darwin fallback: macOS peaks have read ~3x low and moved 6.5 -> 9.9 GB
+    between identical runs, so a fallback would produce numbers that are not
+    measurements.
     """
     if sys.platform != "linux":
         raise SystemExit(
             f"FATAL: {sys.platform} has no /proc/self/clear_refs, so a per-phase "
             "high-water mark cannot be taken. Run this on antares/deneb."
         )
-
 
 
 def _status_kb(field):
@@ -70,15 +64,12 @@ def _status_kb(field):
     raise RuntimeError(f"{field} absent from /proc/self/status")
 
 
-
 def _hwm():
     return _status_kb("VmHWM:") * 1024
 
 
-
 def _rss():
     return _status_kb("VmRSS:") * 1024
-
 
 
 def _reset_hwm():
@@ -87,27 +78,20 @@ def _reset_hwm():
         fh.write("5\n")
 
 
-
 def _malloc_trim():
     import ctypes
 
     ctypes.CDLL("libc.so.6").malloc_trim(0)
 
 
-
 def phase_growth(series):
     """Per phase, the trend in its OWN increment: last visit's delta minus first.
 
-    **This was wrong in job 446 and the correction is the useful part.** It read
-    the trend in each phase's ABSOLUTE peak, and every phase's absolute peak
-    rises simply because the process's resident set ratchets upward through the
-    run -- so it reported +1233 to +1308 MB for `membership`, `coarse_solve`,
-    `coarse_paint` and `tile_decode` alike, which is one process-wide climb
-    restated twelve times, not an attribution. A phase that is itself
-    accumulating allocates MORE each visit, so the trend has to be read on the
-    increment, which is invariant to what everyone else has left resident.
-
-    `step_ladder` carries the process-wide climb, once, where it belongs.
+    Read on the increment, not the absolute peak: every phase's absolute peak
+    rises with the process-wide resident set, so a trend in it is one climb
+    restated per phase. A phase that itself accumulates allocates more each
+    visit, which the increment shows. `step_ladder` carries the process-wide
+    climb.
     """
     if not series:
         return {}
@@ -124,16 +108,12 @@ def phase_growth(series):
     }
 
 
-
 def step_ladder(series, split="coarse_paint"):
     """Per STEP: the resident set it started from, and the maximum it reached.
 
-    The process-wide climb, reported once. A working set is K-independent, so a
-    ladder that keeps rising means something accumulates; one that flattens
-    means the run was warming an allocator up. That distinction decides whether
-    job 445's cdev fit (0.157 GB PER STEP + 6.200 fixed, from K=5 and K=10
-    alone) may be extrapolated to a production K at all, and nothing measured
-    it -- two rungs cannot tell a slope from the start of a curve.
+    The process-wide climb, reported once. A working set is independent of the
+    step count, so a ladder that keeps rising means something accumulates; one
+    that flattens means an allocator warming up. Steps are split at `split`.
     """
     steps, cur = [], None
     for rec in series or []:
@@ -147,7 +127,6 @@ def step_ladder(series, split="coarse_paint"):
         steps.append(cur)
     return [dict(start=s[0][1] - s[0][2], peak=max(r[1] for r in s), boundaries=len(s))
             for s in steps]
-
 
 
 class PhaseTracer:
@@ -167,15 +146,10 @@ class PhaseTracer:
     `delta` -- that is a phase running while someone ELSE's memory is resident,
     and it is exactly the distinction differencing two maxima cannot make.
 
-    A per-visit SERIES is kept beside the maxima, because a max over visits
-    cannot show a trend and the question that needs one is open: job 445's cdev
-    K-ladder fit 0.157 GB PER STEP + 6.200 GB fixed, so something in the step
-    accumulates, and `coarse_delta_streamed` takes a new `pad` -- hence a new
-    XLA shape -- on every step (measured at the smoke config: ten distinct
-    shapes over ten steps, against one for `cap` since the Stage 0 ladder).
-    Whether that churn is what grows the peak is what the series answers: if it
-    is, `coarse_paint`'s per-visit peak rises step over step and no other
-    phase's does.
+    A per-visit SERIES (name, peak, delta) is kept beside the maxima, because a
+    max over visits cannot show a trend; `phase_growth` and `step_ladder` read
+    it. `trim` in `TRIM_MODES` calls `malloc_trim` at every boundary ("all") or
+    once per step ("step").
     """
 
     def __init__(self, trim="off", series=True):
@@ -191,34 +165,23 @@ class PhaseTracer:
         self.order = []
         self.unknown = []
         self.series = [] if series else None
-        # THE RUN PEAK, and it has to be accumulated here rather than read at the
-        # end. `clear_refs` resets `mm->hiwater_rss`, and BOTH `VmHWM` and
-        # getrusage's `ru_maxrss` read that same field -- so after a traced run
-        # `ru_maxrss` reports the peak since the LAST boundary, not the run's.
-        # Job 446 shipped that mistake: it read cdev8's traced peak as 1.824 GB
-        # against 2.010 actual, i.e. 0.19 GB BELOW an untraced control, which
-        # looked like the instrument lowering the peak and was the instrument
-        # mismeasuring it. Each boundary's reading is the max since the previous
-        # reset, so the max over boundaries is exactly the run's high-water and
-        # costs no extra syscall.
+        # The run peak must be accumulated here, not read at the end:
+        # `clear_refs` resets `mm->hiwater_rss`, which both `VmHWM` and
+        # `ru_maxrss` read, so after a traced run `ru_maxrss` is the peak since
+        # the LAST boundary. The max over boundary readings is the run's
+        # high-water exactly.
         self.run_peak = 0
         self._trim_if_asked()
         _reset_hwm()
         self._start = _rss()
 
     def _trim_if_asked(self, name=None):
-        """`all` = every boundary (263 per step at cdev8); `step` = ONCE per step.
+        """`all` = trim at every boundary (263 per step at cdev8); `step` = once per step.
 
-        The two are a factor of 263 apart in call count, which is why `trim` alone
-        could not price a step-boundary default: job 452 measured -41% peak at
-        +15% wall for the 263x schedule and that bounds the most aggressive
-        possible version of the intervention, not the proposed one.
-
-        `step` keys on `coarse_paint` because it is `engine.step`'s FIRST phase
-        and is unconditional. `repack` would be the natural other end and is
-        wrong: it fires only when `cfg.repack_every` divides the step index
-        (`engine.py:781`), so a `repack`-keyed trim would silently become
-        every-Nth-step, or never.
+        `all` measured -41% peak at +15% wall at cdev8. `step` keys on
+        `coarse_paint` because it is `engine.step`'s first and unconditional
+        phase; `repack` fires only when `cfg.repack_every` divides the step
+        index, so keying on it would trim every Nth step or never.
         """
         if self.trim == "off":
             return
@@ -260,13 +223,11 @@ class PhaseTracer:
         )
 
 
-
 TIMER_PHASES = (
     "kernel_build", "lead_drift", "coarse_paint", "coarse_solve", "membership",
     "tile_decode", "tile_short", "tile_long", "tile_reduce",
     "tile_loop_end", "reconcile", "migrate", "repack",
 )
-
 
 
 class PhaseTimer:
@@ -311,14 +272,12 @@ class PhaseTimer:
         )
 
 
-
 def _maxrss_bytes():
-    """Peak RSS of this process. KB on Linux, BYTES on macOS (the v4d note)."""
+    """Peak RSS of this process in bytes (`ru_maxrss` is KB on Linux, bytes on macOS)."""
     import resource
 
     r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return r if sys.platform == "darwin" else r * 1024
-
 
 
 def _require_cpu():

@@ -1,23 +1,13 @@
-"""The compiled eject path must be BITWISE the numpy one, or it is not adoptable.
+"""The compiled eject path must be BITWISE the numpy one.
 
-D-007 forbids a saturating op anywhere near integer state, and the whole M-v2-3
-gate rests on the migration producing the same bits from different orderings. A
-compiled twin that is merely *close* would move the state's physical layout,
-which is why every assertion here is exact equality and none is a tolerance.
-
-The three properties, in the order they can fail:
-
-1. `_eject_slab_jax` returns exactly what `_eject_slab` returns, keys, dtypes,
-   shapes and values, on a state where BOTH keepers and leavers exist and the
-   arena is occupied. Anti-vacuity is asserted, not assumed: a slab with no
-   leavers reproduces trivially and would pass a broken partition.
-2. A whole `drift_and_migrate` through the compiled path leaves the state
-   elementwise identical, which is the property `_insert_slab` actually depends
-   on -- (1) can hold while the ORDER inside a run differs.
-3. The x64 guard fires. With x64 off the lattice index narrows silently, so the
-   refusal is the only thing between that and wrong destinations.
+Migration must produce the same bits from different orderings, and a compiled twin that is
+merely close would move the state's physical layout, so every assertion is exact equality.
+Covered: `_eject_slab_jax` matches `_eject_slab` (keys, dtypes, shapes, values) on a slab with
+both keepers and leavers and an occupied arena; a whole `drift_and_migrate` leaves the state
+elementwise identical (slab equality can hold while the order inside a run differs); the
+padded-row path is live; the engine default routes to the compiled path; the x64 guard fires
+(with x64 off the lattice index would narrow silently).
 """
-
 import copy
 
 import numpy as np
@@ -63,8 +53,7 @@ def test_eject_slab_jax_is_bitwise(x64, fraction):
     a_keep, a_emig = copy.deepcopy(st)._eject_slab(bx, c, scales)
     b_keep, b_emig = copy.deepcopy(st)._eject_slab(bx, c, scales, kernel="jax")
 
-    # ANTI-VACUITY, before any comparison: a slab with no leavers, or no
-    # keepers, reproduces under a broken partition
+    # anti-vacuity: a slab with no leavers or no keepers passes a broken partition
     assert len(a_keep["dest"]) > 0, "no keepers -- the partition is untested"
     assert len(a_emig["dest"]) > 0, "no leavers -- the partition is untested"
 
@@ -82,11 +71,10 @@ def test_eject_slab_jax_is_bitwise(x64, fraction):
 
 
 def test_arena_is_actually_exercised(x64):
-    """The arena splice is where this function lost a particle before.
+    """With arena residents present, the arena splice is bitwise between kernels.
 
-    `brick_slack=0.0` plus a drift large enough to overflow bricks is the recipe
-    that puts residents in the arena; the assertion is that they are THERE, so
-    the comparison above is not silently testing the empty-arena path.
+    `brick_slack=0.0` plus a brick-overflowing drift puts residents in the arena; asserting
+    they are there keeps this from silently testing the empty-arena path.
     """
     st = _state(brick_slack=0.0)
     c = _c_drift(st, 2.85)
@@ -125,13 +113,9 @@ def test_whole_migration_is_bitwise(x64):
 
 
 def test_padding_path_is_exercised_and_bitwise(x64):
-    """The pad was once DEAD in every test here, and a mutation proved it.
+    """At least one padded row is present, and the result is bitwise with it.
 
-    A slab of this fixture holds exactly 8,192 rows, a multiple of the old
-    4096 pad multiple, so `pad` was 0 everywhere and corrupting the padded rows'
-    brick id changed nothing. `_padded` now pads `n + 1` onto the capacity
-    ladder, so every call carries at least one padded row; this asserts that
-    stays true for this fixture and that the result is bitwise with it.
+    If this fixture's row count needed no padding, corrupting padded rows would go undetected.
     """
     from inexor import eject_jax
 
@@ -160,14 +144,9 @@ def test_padding_path_is_exercised_and_bitwise(x64):
 
 
 def test_engine_default_is_jax_and_actually_routes(x64):
-    """The DEFAULT must reach the compiled path, not merely name it.
+    """The default `eject_kernel` is "jax" AND a call with it actually reaches `eject_jax`.
 
-    Flipping `EngineConfig.eject_kernel` to "jax" changed nothing that ran,
-    because `v2_m6_phase_time.py` carried its own `eject_kernel="numpy"` default
-    that shadowed the library's -- and the full suite stayed green through the
-    flip, because nothing asserted the default was exercised. So this asserts
-    both halves: the declared default, and a CALL COUNT proving a default-config
-    engine step went through `eject_jax`.
+    The call count guards against a default that names the compiled path but is shadowed.
     """
     from inexor import eject_jax, engine
 
@@ -197,7 +176,7 @@ def test_x64_guard_fires():
             eject_jax.require_x64()
     finally:
         jax.config.update("jax_enable_x64", prev)
-    # and the guard passes in the other direction, so the test is two-sided
+    # and passes with x64 on
     jax.config.update("jax_enable_x64", True)
     try:
         eject_jax.require_x64()

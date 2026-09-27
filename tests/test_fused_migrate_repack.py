@@ -1,4 +1,4 @@
-"""M4 F2: the fused device migrate + repack, gated BITWISE against the two passes.
+"""The fused device migrate + repack, gated BITWISE against the two passes.
 
 Every state array (spare, freed and arena rows included), `arena_base`, the migrate's
 stats and the repack's stats are compared against BOTH the host pair

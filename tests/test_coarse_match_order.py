@@ -1,11 +1,8 @@
 """The coarse match factor's assignment order.
 
-The coarse arm paints and gathers TSC while the ratified factor divides out a
-CIC window, so the long force keeps sinc^2 per axis of the coarse window.
-`coarse_match_order=3` corrects it and is the default; 2 is the legacy arm the
-probe parity gates are pinned to. These tests pin both halves: order 2 is the
-ratified expression unchanged, and the corrected arm meets its Ewald target
-where the ratified one measurably does not.
+The coarse arm paints and gathers TSC; order 2 divides out a CIC window and leaves sinc^2 per
+axis of the coarse window in the long force. Order 3 (the default) corrects it. Pinned: order 2
+is unchanged bitwise, and order 3 meets its Ewald target where order 2 does not.
 """
 
 import itertools
@@ -45,9 +42,8 @@ def test_order_two_spelled_out_is_bitwise_the_ratified_factor():
 
 
 def test_order_three_is_the_tsc_over_cic_ratio():
-    """An identity, not a tolerance: the factor is W_cic(fine)^2 / W_tsc(coarse)^2
-    with W = prod sinc^order, and differs from the ratified one by exactly the
-    sinc^2 per axis the ratified one leaves behind."""
+    """Order 3 is W_cic(fine)^2 / W_tsc(coarse)^2 (W = prod sinc^order): it differs from
+    order 2 by exactly one coarse sinc^2 per axis, to float64 round-off."""
     n, L, dc, df = 16, 16.0, 1.0, 0.25
     m2 = forces.coarse_kernel_parts(n, L, "long", r_s=1.0, match=(dc, df))["mf"]
     m3 = forces.coarse_kernel_parts(n, L, "long", r_s=1.0, match=(dc, df, 3, 2))["mf"]
@@ -67,9 +63,8 @@ def test_only_orders_two_and_three_are_accepted():
 
 
 def test_the_order_two_fingerprint_is_the_pre_knob_one():
-    """Every checkpoint on disk, the 4096^3 generations included, was written at
-    order 2 before the knob existed and must still resume at order 2 -- and never
-    under the order-3 default."""
+    """The order-2 fingerprint equals the hash without the knob, so existing order-2
+    checkpoints resume at order 2 and are refused under the order-3 default."""
     import hashlib
     import json
 
@@ -115,9 +110,8 @@ def _ewald_total(d, L):
 
 
 def _long_arm_error(order):
-    """Mean long-arm error as a fraction of the total Ewald force, over
-    r = 1.6-3.4 Mpc/h, at production cells (fine 0.25, coarse 1.0, r_s 1.0) in
-    a 32 Mpc/h box. The window where the ratified arm is most wrong."""
+    """Mean long-arm error as a fraction of the total Ewald force over r = 1.6-3.4 Mpc/h (where
+    order 2 is most wrong), at production cells (fine 0.25, coarse 1.0, r_s 1.0), 32 Mpc/h box."""
     L, n_fine, n_coarse = 32.0, 128, 32
     fine, coarse, r_s = L / n_fine, L / n_coarse, 1.0
     n_total = 64**3
@@ -145,16 +139,13 @@ def _long_arm_error(order):
 
 
 def test_the_corrected_long_arm_meets_its_ewald_target():
-    """Against a continuum reference, not a parity. The bar is 1% of the total
-    force; measured -0.47% for the corrected arm and -3.71% for the ratified one
-    (2026-09-23)."""
+    """Order 3 is within 1% of the total Ewald force (measured -0.47%; order 2 reads -3.71%)."""
     err3 = _long_arm_error(3)
     assert abs(err3) < 1e-2, f"order-3 long arm off its Ewald target by {err3:+.4f}"
 
 
 def test_the_ewald_gate_can_fail():
-    """Control: the same gate on the ratified factor must FAIL, or the test
-    above cannot tell the two arms apart."""
+    """Control: order 2 must fail the gate above, or it cannot tell the two orders apart."""
     err2 = _long_arm_error(2)
     assert err2 < -2e-2, f"ratified long arm reads {err2:+.4f}; the gate lost its power"
 

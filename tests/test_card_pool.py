@@ -1,17 +1,9 @@
-"""The pooled P(k) card: bitwise the serial one, and cheap enough to be it.
+"""The pooled P(k) card is bitwise the serial card, and the pool stays cheap.
 
-The card was the one streamed-paint consumer nobody pooled. Pooling it is a
-WALL knob and must move no number -- the workers return bounded sub-blocks and
-the parent accumulates, so integer associativity makes any arrival order
-bitwise the serial order, exactly as it does for the engine's own paint.
-
-Two things here are about hero scale rather than about correctness, and both
-are memory conditions the smoke config cannot fail on its own: a `paint_only`
-pool must not allocate the three coarse force meshes (103.1 GB at c-hero) and
-must not build a tile kernel per worker, and `close()` must not copy an
-ADOPTED field back into private memory (754.6 GB at c-hero, on a 1026 GB node).
-Both are pinned by inspection of what was allocated, not by a byte count the
-smoke rung cannot make large.
+Workers return integer sub-blocks the parent accumulates, so arrival order cannot move a bit.
+Two memory conditions matter only at scale and are pinned by inspecting what was allocated
+(a byte count at this size could not fail): a `paint_only` pool allocates no coarse force
+meshes, and `close()` does not copy an allocator-adopted field back into private memory.
 """
 
 import numpy as np
@@ -27,17 +19,9 @@ FIELDS = ("off", "w", "occupancy", "brick_start", "vel_scale", "arena_bucket")
 
 
 def _require_cpu_lane():
-    """This file is the CPU lane, and it FAILS off it rather than skipping.
-
-    `TilePool` voids a non-CPU parent by design and `cmd_card` calls
-    `_require_cpu`, so every test here needs the same lane the card itself runs
-    in. It does not skip: the bitwise gate is the entire basis for pooling the
-    hero card, and a gate that goes inert on the node that runs the job is no
-    gate -- gb 1011375 put this file in a GPU-backend process and spent 63 s
-    emitting the same ValueError six times. The lane is a property of the
-    PROCESS (`JAX_PLATFORMS` is read at backend init, so it cannot be set per
-    test, same as `XLA_FLAGS` in conftest), which is why the remedy is the
-    invocation and this is only here to name it.
+    """Fail (not skip) at import off the CPU lane: `TilePool` and `cmd_card` require a CPU
+    parent, and a bitwise gate must not go silently inert. The backend is fixed per process
+    at init, so the remedy is the invocation named in the error.
     """
     import jax
 
@@ -71,8 +55,8 @@ def _cfg(**kw):
 
 
 def _state(cfg, seed=3, steps=3, alloc=None):
-    """A state that has been through the exchange, so the arena is populated --
-    arena residents are the rows a chunked decode can silently drop."""
+    """A state after several exchanges, so the arena (rows a chunked decode could drop) is
+    populated. With `alloc`, the fields are moved into the allocator's segments."""
     rng = np.random.default_rng(seed)
     g = (np.arange(N_PART) + 0.5) * (L_BOX / N_PART)
     q = np.stack(np.meshgrid(g, g, g, indexing="ij"), axis=-1).reshape(-1, 3)
@@ -85,9 +69,7 @@ def _state(cfg, seed=3, steps=3, alloc=None):
     for _ in range(steps):
         state.drift_and_migrate(st, 0.5)
     if alloc is not None:
-        # where the loader would have put the payload: `load_checkpoint(alloc=)`
-        # writes into the allocator's segments, which is what makes the pool's
-        # adoption zero-copy. Done AFTER the exchange, since migrate reallocates.
+        # as `load_checkpoint(alloc=)` would; after the exchange, since migrate reallocates
         for f in FIELDS:
             a = np.asarray(getattr(st, f))
             view = alloc.empty(a.shape, a.dtype, f)
@@ -107,8 +89,7 @@ def _card(st, cfg, pool=None):
 
 
 def test_the_pooled_card_is_bitwise_the_serial_card():
-    """The gate. Not `allclose`: the accumulation is integer and the claim is
-    that arrival order cannot reach the answer."""
+    """Every card output is bitwise equal pooled vs serial (integer accumulation)."""
     serial = _card(_state(_cfg(tile_workers=1)), _cfg(tile_workers=1))
     assert serial["n_bins"] > 0, "vacuous: the serial card must have measured something"
 
@@ -116,9 +97,7 @@ def test_the_pooled_card_is_bitwise_the_serial_card():
     alloc = SharedAllocator()
     st = _state(cfg, alloc=alloc)
     pool = TilePool(st, cfg, allocator=alloc, paint_only=True)
-    # THE KNOB MUST PROVE IT APPLIED. Two identical cards are exactly what a
-    # dropped `pool=` produces, so count the dispatch: without this the test
-    # passes when the card never reaches the pool at all.
+    # count the dispatch: a dropped `pool=` would also give two identical cards
     dispatched = []
     real_imap = pool.imap_coarse
     pool.imap_coarse = lambda tasks: real_imap(dispatched.append(len(tasks)) or tasks)
@@ -138,8 +117,7 @@ def test_the_pooled_card_is_bitwise_the_serial_card():
 
 
 def test_the_streamed_mesh_itself_is_bitwise_under_pooling():
-    """One level below the card, so a failure says WHERE. The mesh is the
-    integer accumulation; the card is everything downstream of it."""
+    """The streamed coarse mesh itself is bitwise under pooling, so a card failure localizes."""
     cfg1 = _cfg(tile_workers=1)
     s_serial = {}
     d_serial = engine.coarse_delta_streamed(_state(cfg1), cfg1, stats=s_serial)
@@ -153,9 +131,7 @@ def test_the_streamed_mesh_itself_is_bitwise_under_pooling():
         d_pooled = engine.coarse_delta_streamed(st, cfg, pool=pool, stats=s_pooled)
     finally:
         pool.close()
-    # THE KNOB MUST PROVE IT APPLIED. Without this the test passes just as
-    # happily when `pool=` is dropped on the floor and both arms run serial,
-    # which is the one failure it is here to catch.
+    # the pooled arm must actually have pooled, or both arms ran serial
     assert s_pooled["coarse_pooled_workers"] == 2
     assert s_serial["coarse_pooled_workers"] == 0
     assert s_pooled["coarse_subblock_chunks"] == s_serial["coarse_subblock_chunks"] > 0
@@ -163,9 +139,8 @@ def test_the_streamed_mesh_itself_is_bitwise_under_pooling():
 
 
 def test_a_paint_only_pool_allocates_no_coarse_force_mesh():
-    """103.1 GB of it at c-hero, for a consumer that computes no force. Read
-    off what was SHARED, not off a total: at this rung the meshes are 32 KB and
-    any byte-count bar would pass with them present."""
+    """A paint_only pool shares no g0/g1/g2 meshes (a full pool does); checked by name, since
+    the meshes are 32 KB here and a byte bar would pass with them present."""
     cfg = _cfg(tile_workers=2)
     alloc = SharedAllocator()
     st = _state(cfg, alloc=alloc)
@@ -185,8 +160,7 @@ def test_a_paint_only_pool_allocates_no_coarse_force_mesh():
 
 
 def test_the_force_entry_points_refuse_on_a_paint_only_pool():
-    """A mesh that was never allocated must not surface as a KeyError three
-    frames down, and a paint-only worker must not be handed a tile."""
+    """Force entry points on a paint_only pool raise a clear RuntimeError."""
     cfg = _cfg(tile_workers=2)
     alloc = SharedAllocator()
     st = _state(cfg, alloc=alloc)
@@ -203,11 +177,8 @@ def test_the_force_entry_points_refuse_on_a_paint_only_pool():
 
 
 def test_close_leaves_an_adopted_field_in_the_allocators_segment():
-    """`close()` copied EVERY field back into private memory, including the
-    ones the allocator owns and `close()` deliberately does not unlink. At
-    c-hero that is a second 754.6 GB state against a 1026 GB node. The adopted
-    fields must come back as the same shared arrays, with their values intact.
-    """
+    """`close()` leaves allocator-owned fields in their shared segments, values intact; copying
+    them back would double the state in host memory."""
     cfg = _cfg(tile_workers=2)
     alloc = SharedAllocator()
     st = _state(cfg, alloc=alloc)
@@ -227,10 +198,8 @@ def test_close_leaves_an_adopted_field_in_the_allocators_segment():
 
 
 def test_close_still_privatises_what_the_pool_itself_shared():
-    """The other half of the contract, and the reason the copy-back exists:
-    with no allocator every field IS one of the pool's own segments, which
-    close() unlinks, so those must be private afterwards or they are views
-    into freed memory."""
+    """With no allocator, close() unlinks the pool's own segments, so fields must be private
+    copies afterwards, still usable and decodable."""
     cfg = _cfg(tile_workers=2)
     st = _state(cfg)
     before = {f: np.asarray(getattr(st, f)).copy() for f in FIELDS}
@@ -241,8 +210,6 @@ def test_close_still_privatises_what_the_pool_itself_shared():
     for f in FIELDS:
         arr = np.asarray(getattr(st, f))
         np.testing.assert_array_equal(arr, before[f])
-        # it must still be usable after the segments are gone
         assert arr.sum() == before[f].sum()
-    # and the state still decodes, which is what "usable" means here
     _, x, _ = st.decode_bricks(list(range(min(4, st.n_bricks))))
     assert np.isfinite(x).all()

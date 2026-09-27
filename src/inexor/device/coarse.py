@@ -1,27 +1,14 @@
-"""D2e: the coarse force meshes resident on the device, and a tile's sub-block gathered there.
+"""Coarse force meshes resident on the device, and a tile's sub-block gathered there.
 
-WHAT THIS REPLACES. With the coarse meshes on the host, every tile stages its
-three sub-blocks (`forces.stage_coarse_subblock`, ~23 ms per tile at P=576, flat
-in mesh size: Vista 993849) and uploads them. With the meshes on the card, the
-tile program gathers the blocks itself from a resident shard, and neither the
-staging nor the upload exists.
+A card holds a shard: a contiguous run of x-planes `x0 .. x0 + nx - 1` (global indices mod `n`)
+covering the sub-blocks of the tiles it runs, halo included; `whole_mesh_shard` is the single-card
+form (whole mesh plus `COARSE_HALO` planes wrapped onto each end). The tile program gathers its
+sub-blocks from the shard, so the host never stages or uploads them.
 
-THE SHARD. The design decomposes the coarse mesh along x across the cards, so a
-card holds a contiguous run of x-planes, `x0 .. x0 + nx - 1` (global indices,
-taken modulo `n`), wide enough to contain the sub-blocks of the tiles it runs,
-halo included. `whole_mesh_shard` is the single-card development form: the
-whole mesh plus `COARSE_HALO` planes wrapped onto each end.
-
-THE GATHER IS ONE 3-D INDEX GATHER, for the reason `stage_coarse_subblock` is:
-slicing axis by axis materializes an (extent, n, n) intermediate, 2.21 GB per
-block at 4096^3, before the later axes narrow it. The x index is local to the
-shard and never wraps -- the shard carries the planes a block needs -- and y and
-z wrap modulo `n` exactly as the host staging does. Integer indexing of the same
-values, so the block is bitwise the host's.
-
-CONTAINMENT IS CHECKED ON THE HOST (`check_covers`): a tile's origin is a host
-integer, and an x index past the shard would be clamped by the gather rather
-than refused, silently reading the wrong planes.
+The gather is one 3-D index gather (axis-by-axis slicing would materialize an (extent, n, n)
+intermediate). x is shard-local and never wraps; y and z wrap mod `n` as the host staging does,
+so the block is bitwise the host's. Containment is checked on the host (`check_covers`) because
+an out-of-shard x index would be clamped by the gather, silently reading the wrong planes.
 """
 
 from __future__ import annotations

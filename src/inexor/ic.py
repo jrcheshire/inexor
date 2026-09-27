@@ -1,36 +1,16 @@
-"""Initial-condition fields: Gaussian linear density + local f_NL in the
-potential (mbody ic.py lineage; rebuilt in place at M-v2-5 on the plane-keyed
-noise stream, the 1D |k| table and the out-of-core FFT layer -- D-v2-15
-clauses 2/4/5, replace-in-place JC-ratified 2026-08-10).
+"""Initial-condition fields: Gaussian linear density plus local f_NL in the potential.
 
-Local non-Gaussianity is defined in the primordial potential:
+    phi(x) = phi_G(x) + f_NL [phi_G(x)^2 - <phi_G^2>],   delta(k) = M(k, z) phi(k),
+    M = (2/3) (c/H0)^2 k^2 T(k) D_md(z) / Omega_m,
 
-    phi(x) = phi_G(x) + f_NL [phi_G(x)^2 - <phi_G^2>],
+with D_md normalized to D = a in matter domination. delta_G is sigma8-normalized, divided by M
+to get phi_G (~1e-5, a normalization check), transformed, and multiplied back; at f_NL = 0 the
+round trip recovers the Gaussian field to FFT round-off.
 
-tied to the density by the Poisson/transfer relation delta(k) = M(k, z) phi(k)
-with M = (2/3) (c/H0)^2 k^2 T(k) D_md(z) / Omega_m and D_md the growth
-normalized to D = a in matter domination. delta_G is generated
-sigma8-normalized, divided by M to get the physical phi_G (~1e-5 COBE scale
--- a normalization check), transformed, and multiplied back. At f_NL = 0 the
-round trip recovers the Gaussian field to FFT round-off, and f_NL enters as
-one multiplicative term.
-
-Everything here is HOST NUMPY through `ooc_fft`'s canonical factorization, so
-the monolithic conveniences below are the streamed generator at slab = N --
-one field per (seed, N), bitwise, whichever path produced it. Two v1-era
-contracts retired with that (JC, 2026-08-10): jax.grad through linear_density
-(the v2 engine never differentiates ICs; `colour_white` is the seam a jnp
-twin would be built behind IF differentiable ICs are ever needed, gated
-then), and the pre-M-v2-5 `jax.random.normal(key, (N,N,N))` stream (a seed
-now denotes a DIFFERENT realization -- IC_STREAM is the identity cards carry,
-and readouts refuse to pool across it).
-
-The IC encode (ste_round boundary) does NOT live here -- ic/lpt are pure
-float producers.
-
-M1 scope note, still standing: the transfer is eh98-sourced even when P
-comes from a CAMB dump (the table backend carries no T(k);
-f_NL-with-CAMB-transfer is out of scope).
+Host numpy through `ooc_fft`'s canonical factorization, so the monolithic conveniences here are
+bitwise the streamed generator at slab = N. Not differentiable (`colour_white` is the seam for a
+jnp twin). The IC encode does not live here; ic/lpt are pure float producers. The transfer is
+always EH98, even when P(k) comes from a CAMB table (which carries no T(k)).
 """
 
 import jax
@@ -40,57 +20,33 @@ import numpy as np
 from . import ooc_fft
 from .cosmology import growth_factor_md, ic_k_table, linear_power, transfer_eh98
 
-# c / H0 in Mpc/h: c = 299792.458 km/s, H0 = 100 h km/s/Mpc, and the h cancels
-# when lengths are measured in Mpc/h, so this is just c[km/s] / 100.
+# c / H0 in Mpc/h (the h cancels): c[km/s] / 100.
 C_OVER_H0 = 299792.458 / 100.0
 
-# The noise-stream identity (M-v2-5, D-v2-15 clause 5). A seed denotes a
-# realization only relative to a stream; cards record this constant so a
-# readout can refuse to pool measurements across streams. Bump it if the
-# construction below ever changes in any bit-visible way.
+# Noise-stream identity: a seed denotes a realization only relative to a stream. Cards record it
+# so readouts refuse to pool across streams; bump it on any bit-visible change below.
 IC_STREAM = "m5-foldin-1"
-# The same plane-keyed construction drawn on the card that transforms the plane
-# (`ooc_fft.noise_forward_cards`, D6). The normal transform's bits are not
-# specified across backends, so on a GPU it is a DIFFERENT stream and carries
-# its own tag; readouts refuse to pool across the two exactly as across streams.
+# The same construction drawn on the GPU (`ooc_fft.noise_forward_cards`). The normal transform's
+# bits are not specified across backends, so this is a different stream with its own tag.
 IC_STREAM_DEVICE = "m5-foldin-1-card"
 
-# poisson_factor materializes a full (N, N, N//2+1) float64 grid -- exactly
-# the object D-v2-15 clause 2 retires from the production path. It survives
-# as a small-n diagnostic helper (local_bispectrum_binned's oracle) behind
-# this loud ceiling.
+# poisson_factor materializes a full (N, N, N//2+1) float64 grid; small-n diagnostic only.
 _POISSON_FACTOR_MAX_N = 512
 
 
 # ============================================================================
-# Plane-keyed white noise (M-v2-5; D-v2-15 clause 5)
+# Plane-keyed white noise
 #
-# The canonical noise unit is ONE plane along array axis 0 (the C-order slab
-# axis shared by the out-of-core FFT and the state layer's brick slabs; axis
-# reading JC-ratified 2026-08-10), keyed by `jax.random.fold_in(key, i)`.
-# Each plane's bits depend only on (base key, plane index, (N, N), dtype), so
-# ANY slab decomposition assembles the identical field -- invariance to slab
-# thickness is a property of the construction, not of the code path, and the
-# M-v2-5 gate tests the theorem. Deliberately a Python loop of per-plane
-# draws, never a vmap over folded keys: the per-plane stream is the one
-# construction in play.
-#
-# NOT bit-identical to the pre-M-v2-5 monolithic `jax.random.normal(key,
-# (N,N,N))` stream at any seed (clause 5: the stream is shape-dependent), and
-# not resolution-independent: fixed-phase cross-resolution comparison still
-# requires equal N.
+# The noise unit is one plane along array axis 0 (the C-order slab axis), keyed by
+# `jax.random.fold_in(key, i)`. Each plane's bits depend only on (base key, plane index, (N, N),
+# dtype), so any slab decomposition assembles the identical field. A Python loop of per-plane
+# draws, never a vmap over folded keys. Not resolution-independent: fixed-phase comparison across
+# resolutions requires equal N.
 # ============================================================================
 
 
 def _require_stream_config(fdtype):
-    """Refuse silent stream or dtype drift, never degrade.
-
-    `fold_in`'s derived keys depend on `jax_threefry_partitionable` (True on
-    the pinned jax); a run under the other setting would be a DIFFERENT stream
-    carrying the same IC_STREAM tag, so it is refused rather than recorded.
-    An f64 request without x64 would silently come back f32 -- the engine's
-    `_refuse_f64_without_x64` logic, applied at the generator boundary.
-    """
+    """Refuse stream drift (`fold_in` keys depend on jax_threefry_partitionable) or f64 without x64."""
     if not jax.config.jax_threefry_partitionable:
         raise RuntimeError(
             "jax_threefry_partitionable is False; the m5-foldin stream is defined "
@@ -112,12 +68,9 @@ def plane_key(key, i):
 def white_plane(key, i, n_mesh, fdtype=np.float32):
     """One (N, N) unit-normal plane of the canonical stream, host numpy.
 
-    Drawn on the CPU BACKEND EXPLICITLY, whatever device jax defaulted to:
-    everything else in the generator is host numpy, and letting the one jax
-    call float to CUDA would let a GPU node silently produce a different
-    stream (the normal transform's bits are not specified across backends).
-    Cross-MACHINE CPU identity is a reported check (the plane-0 fingerprint
-    on every card), not an assumption.
+    Drawn on the CPU backend explicitly, whatever jax's default device: the normal transform's
+    bits are not specified across backends, so a GPU draw would be a different stream.
+    Cross-machine CPU identity is checked (plane-0 fingerprint on every card), not assumed.
     """
     _require_stream_config(fdtype)
     jdt = jnp.dtype(np.dtype(fdtype))
@@ -128,8 +81,7 @@ def white_plane(key, i, n_mesh, fdtype=np.float32):
 def white_slab(key, lo, hi, n_mesh, fdtype=np.float32):
     """Planes lo..hi-1 stacked along axis 0, (hi-lo, N, N) host numpy.
 
-    Random access by construction: generating planes [lo, hi) never touches
-    any other plane, and the result is bitwise the same rows of a full build.
+    Random access: bitwise the same rows as a full build, touching no other plane.
     """
     if not (0 <= lo <= hi <= n_mesh):
         raise ValueError(f"plane range [{lo}, {hi}) outside [0, {n_mesh})")
@@ -150,8 +102,7 @@ def white_noise(key, n_mesh, fdtype=np.float32):
 
 
 def _colour_fn(table, n_mesh, box_size):
-    """sqrt(P(|k|) * N^3 / L^3) from the 1D table -- the numpy-convention
-    colour whose square recovers linear_power in the measured P(k)."""
+    """sqrt(P(|k|) N^3 / L^3) from the 1D table: numpy-convention colour recovering linear_power."""
 
     def f(kk):
         return np.sqrt(table.P_of_k(kk) * n_mesh**3 / box_size**3)
@@ -170,17 +121,11 @@ def _poisson_fn(cosmo, table, z=0.0, inverse=False):
 
 
 def colour_white(white, box_size, cosmo, amplitude=1.0, backend="eh98", table=None):
-    """delta from a GIVEN white-noise field -- the noise-injection seam.
+    """delta from a given white-noise field: `gaussian_delta` minus the draw.
 
-    This is `gaussian_delta` minus the draw, exposed so probes that need
-    matched or manipulated phases (G5b's truncation ladder and friends) call
-    the package instead of mirroring it -- a mirror's license dies the day the
-    implementation moves, which is exactly what happened at M-v2-5.
-
-    Convention: delta_k = rfft(white) * sqrt(P(|k|) * N^3 / L^3), DC zeroed,
-    so the measured P(k) of the returned field matches cosmology.linear_power
-    (permanent test). amplitude is a sigma8/A_s proxy. All host numpy through
-    the canonical ooc_fft factorization; output dtype follows the white field.
+    For callers that need matched or manipulated phases. delta_k = rfft(white) *
+    sqrt(P(|k|) N^3 / L^3), DC zeroed, so the measured P(k) matches cosmology.linear_power.
+    amplitude is a sigma8/A_s proxy; output dtype follows the white field.
     """
     n_mesh = white.shape[0]
     tab = ic_k_table(cosmo, n_mesh, box_size, backend=backend, table=table)
@@ -196,9 +141,10 @@ def colour_white(white, box_size, cosmo, amplitude=1.0, backend="eh98", table=No
 def gaussian_delta(
     key, n_mesh, box_size, cosmo, fdtype=np.float32, amplitude=1.0, backend="eh98", table=None
 ):
-    """Seeded z=0 linear density on the mesh: plane-keyed white noise coloured
-    by P(k) from the 1D table. Monolithic convenience -- the streamed generator
-    at slab = N, bitwise (the M-v2-5 invariance gate)."""
+    """Seeded z=0 linear density: plane-keyed white noise coloured by P(k) from the 1D table.
+
+    Monolithic convenience, bitwise the streamed generator at slab = N.
+    """
     return colour_white(
         white_noise(key, n_mesh, fdtype), box_size, cosmo,
         amplitude=amplitude, backend=backend, table=table,
@@ -208,16 +154,9 @@ def gaussian_delta(
 def poisson_M(k, cosmo, z=0.0, table=None):
     """M(k, z) = (2/3) (c/H0)^2 k^2 T(k) D_md(z) / Omega_m, for arbitrary k.
 
-    The Poisson/transfer factor relating potential and density,
-    delta_lin(k, z) = M(k, z) phi(k). Accepts scalar or array k (h/Mpc),
-    preserves shape; k = 0 maps to a safe transfer placeholder (M -> 0 there
-    via the k^2 anyway). Host float64 (precision island).
-
-    table: an ICKTable (D-v2-15 clause 2). With one, T comes from the 1D
-    interpolated table -- O(len(k)) with no half-grid transfer evaluation --
-    and the k = 0 placeholder is the table's own smallest node (in range by
-    construction; the value never matters, k^2 zeroes it). table=None keeps
-    the analytic transfer for scalar/diagnostic callers.
+    delta_lin(k, z) = M(k, z) phi(k). Scalar or array k (h/Mpc), shape preserved, host float64.
+    k = 0 uses a placeholder transfer (M = 0 there via k^2). table: an ICKTable to interpolate T
+    from (placeholder = its smallest node); None uses the analytic EH98 transfer.
     """
     k = np.asarray(k, dtype=np.float64)
     if table is not None:
@@ -234,11 +173,8 @@ def poisson_M(k, cosmo, z=0.0, table=None):
 def poisson_factor(n_mesh, box_size, cosmo, z=0.0):
     """M(k, z) on the rfftn half-grid, float64 numpy (N, N, N//2+1).
 
-    SMALL-N DIAGNOSTIC ONLY (the bin-averaged bispectrum oracle's grid): it
-    materializes the full half-grid f64 array D-v2-15 clause 2 retired from
-    the production path, so it refuses above n_mesh = 512 rather than quietly
-    costing gigabytes. The k = 0 entry is 1 as a safe placeholder (callers
-    keep the density DC mode at zero, so it never matters).
+    Small-n diagnostic only: refuses above n_mesh = 512 rather than materializing gigabytes.
+    The k = 0 entry is a placeholder 1 (callers keep the density DC mode at zero).
     """
     if n_mesh > _POISSON_FACTOR_MAX_N:
         half_gb = n_mesh * n_mesh * (n_mesh // 2 + 1) * 8 / 1e9
@@ -264,16 +200,11 @@ def poisson_factor(n_mesh, box_size, cosmo, z=0.0):
 def sq_sum_by_plane(field, tot=0.0):
     """Sum of field^2: per-plane f64 sums folded into ONE running scalar.
 
-    THE canonical reduction for any global moment a streamed generator must
-    reproduce. Each plane's sum is numpy's pairwise tree over a fixed (N, N)
-    shape; the plane sums then fold LEFT, one at a time, into a single running
-    f64. A streamed caller THREADS the running total through its slabs
-    (`tot = sq_sum_by_plane(slab, tot)`), which replays the identical sequence
-    of scalar additions whatever the slab grouping -- summing each slab
-    separately and adding subtotals would re-associate and move last bits
-    (measured: a 16-plane grouping differs from the monolithic fold at 1e-16
-    relative), exactly the drift the invariance gate exists to catch. Divide
-    once at the end; never form per-slab means.
+    The canonical reduction for any global moment a streamed generator must reproduce: each
+    plane is a pairwise sum over a fixed (N, N) shape, folded left into one running f64. Streamed
+    callers thread the total (`tot = sq_sum_by_plane(slab, tot)`) to replay the identical
+    addition sequence; adding per-slab subtotals re-associates and moves last bits. Divide once
+    at the end.
     """
     for i in range(field.shape[0]):
         p = field[i]
@@ -291,8 +222,7 @@ def mean_sq_by_plane(field):
 def primordial_potential(key, n_mesh, box_size, cosmo, fdtype=np.float32):
     """Gaussian primordial potential phi_G(x), with delta_G = M phi_G.
 
-    Returns a real (N,N,N) field at the ~1e-5 scale of the physical primordial
-    potential -- a sanity check that M is normalized correctly.
+    Returns a real (N,N,N) field at the ~1e-5 physical scale (a check that M is normalized).
     """
     N, L = n_mesh, box_size
     tab = ic_k_table(cosmo, N, L)
@@ -305,12 +235,10 @@ def primordial_potential(key, n_mesh, box_size, cosmo, fdtype=np.float32):
 def linear_density(key, n_mesh, box_size, cosmo, f_NL=0.0, fdtype=np.float32):
     """Linear density with optional local primordial non-Gaussianity.
 
-    delta_G -> phi_G = delta_G/M -> phi = phi_G + f_NL (phi_G^2 - <phi_G^2>) ->
-    delta = M phi. At f_NL = 0 equals gaussian_delta to FFT round-off, and
-    f_NL enters as one multiplicative term (linearity is a permanent test).
-    <phi_G^2> uses the plane-ordered canonical reduction, so the field is
-    decomposition-invariant at every f_NL. Overall amplitude scaling belongs
-    OUTSIDE this function (mbody convention: amplitude * linear_density(...)).
+    delta_G -> phi_G = delta_G/M -> phi = phi_G + f_NL (phi_G^2 - <phi_G^2>) -> delta = M phi.
+    At f_NL = 0 equals gaussian_delta to FFT round-off. <phi_G^2> uses the plane-ordered
+    reduction, so the field is decomposition-invariant. Amplitude scaling is applied by the
+    caller (amplitude * linear_density(...)).
     """
     N, L = n_mesh, box_size
     tab = ic_k_table(cosmo, N, L)
@@ -332,9 +260,8 @@ def local_bispectrum_template(triangles, cosmo, f_NL, z=0.0):
 
     B(k1,k2,k3) = 2 f_NL [ M3/(M1 M2) P1 P2 + M2/(M1 M3) P1 P3
                                             + M1/(M2 M3) P2 P3 ],
-    the exact tree prediction for linear_density's field (mbody ic.py port;
-    the test oracle for the bispectrum estimator). triangles is a sequence of
-    (k1, k2, k3) in h/Mpc; returns float64, one entry each.
+    the tree prediction for linear_density's field. triangles: sequence of (k1, k2, k3) in
+    h/Mpc; returns float64, one entry each.
     """
     tris = np.atleast_2d(np.asarray(triangles, dtype=np.float64))
     ks = np.unique(tris)

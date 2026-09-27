@@ -1,4 +1,4 @@
-"""Frozen, hashable configuration dataclasses (architecture.md Module layout).
+"""Frozen, hashable configuration dataclasses.
 
 Hashability is load-bearing: Cosmology keys the lru_cache'd growth/amplitude
 constants in cosmology.py, and BoxConfig keys per-box kernel caches in
@@ -48,7 +48,7 @@ class BoxConfig:
     n_particles is the PER-DIMENSION count (mbody convention); the LPT/IC code
     path assumes one particle per Lagrangian cell (n_particles == n_mesh), which
     together with n_mesh | 2^16 makes every Lagrangian site an exact uint16
-    lattice multiple (architecture.md Sec. 3 identity).
+    lattice multiple.
     """
 
     n_mesh: int = 128

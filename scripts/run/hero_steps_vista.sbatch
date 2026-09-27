@@ -6,42 +6,32 @@
 #SBATCH -t 11:00:00
 #SBATCH -o d8-hero-k120-%j.log
 #SBATCH --signal=B:USR1@900
-# D8: the 4096^3 realization on the 120-step schedule (LCDM weights, D-v2-25), run
-# as THREE segments of 40 steps because 120 steps do not fit gb's 12 h MaxWall.
-# One script, three submissions, each chained afterok on the one before:
-#   sbatch --export=ALL,EXPECT_STEP=0,SEG_STOP=40   ... (depends on the IC job)
-#   sbatch --export=ALL,EXPECT_STEP=40,SEG_STOP=80  ...
-#   sbatch --export=ALL,EXPECT_STEP=80,SEG_STOP=120 ...
-# EXPECT_STEP=0 starts from the ICs and refuses if the checkpoint dir already holds
-# a checkpoint; otherwise the driver resumes from the newest checkpoint and refuses
-# unless it is at EXPECT_STEP, so a mis-chained segment dies in seconds instead of
-# redoing finished steps. Checkpoints every 20 steps: two per segment, so each
-# segment ends on its own write and has a mid-segment resume point.
-# The segments compose bitwise into the uninterrupted run (engine gate
-# test_a_run_split_into_segments_is_bitwise_the_uninterrupted_one; the driver's own
-# in tests/test_d7_driver.py). Resume at 4096^3 has not run before this.
+# The 4096^3 realization on the 120-step schedule, run as three 40-step segments because
+# 120 steps do not fit gb's 12 h MaxWall. One script, three submissions, each chained
+# afterok on the one before (the first on the IC job):
+#   sbatch -A <account> --export=ALL,EXPECT_STEP=0,SEG_STOP=40 \
+#     --dependency=afterok:<ic job> scripts/run/hero_steps_vista.sbatch
+#   sbatch -A <account> --export=ALL,EXPECT_STEP=40,SEG_STOP=80   --dependency=afterok:<prev> ...
+#   sbatch -A <account> --export=ALL,EXPECT_STEP=80,SEG_STOP=120  --dependency=afterok:<prev> ...
+# Requires INEXOR_RUNS, HERO_IC_DIR (ICs), REAL_DIR (the realization's fixed home:
+# checkpoints, plus per-job scratch), EXPECT_STEP, SEG_STOP, and INEXOR_SRC or
+# submission from the inexor checkout.
 #
-# Otherwise this is v2_d7d_hero_k40_vista.sbatch (1009133): same env, samplers,
-# membind, instruments, pytest set, 32^3 smoke and cgh64 control on every segment,
-# so each segment's node gets its own comparable control.
+# EXPECT_STEP=0 starts from the ICs and refuses if the checkpoint dir already holds a
+# checkpoint; otherwise the driver resumes from the newest checkpoint and refuses unless
+# it is at EXPECT_STEP, so a mis-chained segment dies in seconds instead of redoing
+# finished steps. Checkpoints every 20 steps: each segment ends on its own write and has a
+# mid-segment resume point. Segments compose bitwise into the uninterrupted run
+# (tests/test_engine.py::test_a_run_split_into_segments_is_bitwise_the_uninterrupted_one).
+# Every segment runs its own 32^3 smoke and cgh64 control, so each node has a comparable
+# control.
 #
-# TIME, per segment, from 1009133's measured phases x this segment's loop counts:
-#   legs ~300 s; load 1842 s (ICs) / ~1700 s (checkpoint, 1663 measured by the card
-#   job); kernel + lead drift ~450 s (segment 1; the kernel alone ~63 s on resume);
-#   40 steps x 590-667 s (1009133: steps 4-9 vs 32-39; the arena creep follows the
-#   epoch, and segment 3 covers the late epochs) = 23,600-26,700 s;
-#   2 checkpoints x 950 s = 1900 s.  CENTRAL ~8.2-9.0 h per segment.
-#   REQUESTED 11:00 each against gb's 12 h MaxWall (~9 SU central, max 11).
+# Wall per segment: legs ~5 min; load ~30 min; kernel + lead drift ~8 min; 40 steps at
+# 590-667 s (later epochs are slower) = 6.6-7.4 h; 2 checkpoints x ~16 min. ~8.2-9.0 h
+# central; 11 h requested against the 12 h MaxWall.
 #
-# PRE-REGISTERED QUESTIONS (nothing at 4096^3 is gated; this job measures):
-#   1. Does the resume hold at 4096^3: the segment loads the checkpoint, the
-#      fingerprint matches on this node, and the first step's time and host peak
-#      sit with the steps that preceded it?
-#   2. Per-step time on the 120-step schedule against 1009133's 40-step one (smaller
-#      steps mean fewer migrants per step; the arena follows the epoch).
-#   3. Host peak against 1009133's 951.0 GB of 1026.
-#
-# HOST MEMORY IS BOUND TO THE CPU SOCKETS (`numactl --membind=0,1`), as in 1009133.
+# Host memory is bound to the CPU sockets (`numactl --membind=0,1`); the previous 40-step
+# hero run peaked at 951 GB of 1026. USR1 900 s before the wall triggers driver stack dumps.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
@@ -61,8 +51,7 @@ unset CUDA_VISIBLE_DEVICES
 
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 HERO=${HERO_IC_DIR:?set HERO_IC_DIR to the IC directory}
-# the realization's home is FIXED across the three segments; each job's own scratch
-# (smoke, control) is under it by job id
+# fixed across the three segments; each job's scratch (smoke, control) is under it by job id
 REAL=${REAL_DIR:?set REAL_DIR to the realization directory (checkpoints)}
 WORK=$REAL/job-$SLURM_JOB_ID
 CKPT=$REAL/hero-ckpt
@@ -157,9 +146,8 @@ run_leg preflight \
     --card $CARDS/${TAG}_preflight.json --scratch "$RUNS" $MEMBIND \
   || { echo "FATAL: preflight refused"; exit 1; }
 
-# The timed solve and the REWRITTEN checkpoint writer, on the GPU backend,
-# before anything runs on it. The writer is the newest code in this job and it
-# first fires on the hero state 2.5 h in, so its gates run at second 75.
+# The timed solve and the checkpoint writer on the GPU backend before anything runs: the
+# writer first fires on the hero state ~2.5 h in, so its tests run first.
 run_leg pytest-gpu \
   pixi run -e gpu python -m pytest -q -rs tests/test_engine_timed_steps.py \
     tests/test_coarse_solve_folded_kernel.py \
@@ -186,10 +174,9 @@ rc_smoke=$?
 summarize $CARDS/${TAG}_smoke.json
 [ $rc_smoke -ne 0 ] && { echo "FATAL: the smoke failed"; exit 1; }
 
-# The cgh64 control: a known phase table, same node, same driver -- and now one
-# REAL checkpoint (134M rows, 1.2 GB, 128 slabs) onto the same NFS scratch the
-# hero leg will use, which measures the write bandwidth the 641 GB writes will
-# get before the job commits 2.5 h to reaching the first of them.
+# The cgh64 control: a known phase table, same node, same driver, plus one real checkpoint
+# (134M rows, 1.2 GB, 128 slabs) onto the same scratch the hero leg uses, measuring the
+# write bandwidth the 641 GB hero writes will get before committing ~2.5 h to the first.
 run_leg cgh64-ics \
   $BIND pixi run -e gpu python scripts/run/realization.py ics --config cgh64 \
     --workdir "$WORK/cgh64" --generator device \
@@ -201,9 +188,9 @@ rc_control=$?
 summarize $CARDS/${TAG}_cgh64.json
 [ $rc_control -ne 0 ] && { echo "FATAL: the cgh64 control failed"; exit 1; }
 
-# THE 4096^3 SEGMENT. Two checkpoint generations alternate in $CKPT (~1.4 TB beside
-# the 641 GB of ICs). The step-120 write is the deliverable: the evolved state, in
-# the t9-slabs-2 schema the ICs use, which the card and export jobs read.
+# The 4096^3 segment. Two checkpoint generations alternate in $CKPT (~1.4 TB beside the
+# 641 GB of ICs). The step-120 write is the deliverable: the evolved state in the ICs'
+# t9-slabs-2 schema, read by the card and export jobs.
 for g in 0 1; do
   [ -f "$CKPT/gen$g/manifest.json" ] && python3 -c "import json;p=json.load(open('$CKPT/gen$g/manifest.json'))['provenance'];print('  gen$g: step', p['step'], 'of', p['n_steps'])"
 done

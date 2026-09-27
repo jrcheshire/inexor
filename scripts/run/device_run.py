@@ -1,27 +1,42 @@
-"""D7: the device step on four GB200s at a preset's full shape, K steps from ICs on disk, instrumented to leave a readable record whatever happens.
+"""Device-lane stepping driver: a preset on N GPUs from ICs (or a checkpoint), instrumented.
 
-    preflight  refuse early: devices, the allocator's receipt, host memory against
-               the planner's load peak, the IC manifest, scratch space
-    run        load the ICs, run K steps of the 40-step schedule on the device lane
-               (window and fused pass on auto), the last or every step timed; then,
-               optionally, a partial checkpoint write timed per part and a
-               malloc_trim probe
+Subcommands:
+
+    preflight  refuse early: device count and backend, the allocator's receipt, the
+               planner's host/load peak against the CPU NUMA nodes' memory, the IC
+               manifest (shape, slab count, growth2), the memory binding, scratch space
+    run        load the ICs or resume a checkpoint, step to `--stop-at` on the device
+               lane (coarse, tile and migrate on the cards; window and fused pass on
+               the config's auto), optionally timed per pass; then optionally a
+               partial checkpoint write timed per part and a malloc_trim probe
     summarize  after the fact, no jax: the run card against the job's sampler CSVs,
                per phase (card memory max per GPU, host MemAvailable min, utilization)
 
-WHAT SURVIVES A FAILURE, and why each piece exists:
+Usage (as the Vista job scripts call it):
+
+    python scripts/run/device_run.py preflight --preset c-hero --workdir $ICS \
+        --card pre.json --scratch $RUNS --membind-nodes 0,1
+    python scripts/run/device_run.py run --preset c-hero --workdir $ICS --card run.json \
+        --k-steps 120 --expect-step 0 --stop-at 20 --checkpoint-dir $CKPT \
+        --checkpoint-every 20 --membind-nodes 0,1
+    python scripts/run/device_run.py summarize --card run.json --gpu-csv gpu.csv \
+        --mem-csv mem.csv --out summary.json
+
+Refusals in `run`: a card or checkpoint under the IC directory; a checkpoint dir that
+already holds a checkpoint unless `--expect-step` (resume) is given; a resume whose
+newest checkpoint is not at `--expect-step`; a memory binding that did not apply.
+
+What survives a failure:
 - Every engine phase boundary prints one line when it is crossed (wall clock, step,
   seconds, host VmRSS / per-phase VmHWM / MemAvailable, each card's allocator bytes),
-  and the card JSON is rewritten atomically at every boundary. A killed run leaves
-  every boundary it reached.
+  and the card JSON is rewritten atomically at every boundary.
 - A heartbeat thread prints every `--beat` seconds: the last boundary and the time
-  since it, host memory, Lustre bytes read/written, each card's allocator bytes. A
-  long compile, a slow phase and a hang look different in it.
-- Each boundary also records where the host memory is and what the kernel did to
-  get it: the process's anon / file / shmem / locked / pinned RSS, page faults
-  (getrusage), `/proc/vmstat` counters (direct-reclaim stalls and scans, compaction
-  stalls, NUMA misses), per NUMA node file pages, dirty and writeback, and with
-  `--numa-maps` the process's pages per node. The instruments' own seconds are
+  since it, host memory, bytes read/written, each card's allocator bytes, so a long
+  compile, a slow phase and a hang look different.
+- Each boundary also records where host memory is and what the kernel did to get it:
+  RSS by kind (anon / file / shmem / locked / pinned), page faults, `/proc/vmstat`
+  reclaim, compaction and NUMA counters, per-node file/dirty/writeback pages, and
+  with `--numa-maps` the process's pages per node. The instruments' own seconds are
   recorded per boundary and kept out of the phase's.
 - `STEP_JSON` per step: the engine's stats with every receipt.
 - Any exception writes the traceback, every card's full `memory_stats()` and the last
@@ -155,7 +170,7 @@ NODE_KEYS = ("FilePages", "Active(file)", "Inactive(file)", "AnonPages", "Shmem"
 def numa_memory():
     """Per NUMA node (MemTotal, MemFree) in bytes, split into nodes with CPUs and nodes
     without (a GB200's HBM appears as CPU-less nodes, and `MemAvailable` sums both, which
-    hid the CPU-side limit in gb 1002020), plus `detail[node]` = the `NODE_KEYS` fields.
+    hides the CPU-side limit), plus `detail[node]` = the `NODE_KEYS` fields.
     MemFree excludes page cache; FilePages is the cache. None off Linux."""
     root = os.environ.get("D7_NUMA_ROOT", "/sys/devices/system/node")
     if not os.path.isdir(root):
@@ -229,11 +244,11 @@ def memory_policy():
 def membind_refusals(nodes, policy=None):
     """Refusals if this process is not bound to `nodes` (a set of NUMA node ids).
 
-    gb 1003511 died here: with the CPU sockets full of page cache from the IC load, the
-    kernel placed 197 GB of the process's memory on a card's HBM node rather than reclaim
-    the cache, and a 2 GiB device allocation then failed on a card whose own allocator
-    held 24 GB. The binding is what keeps host memory on the host, and a knob must prove
-    it applied."""
+    Unbound, with the CPU nodes full of page cache from the IC load, the kernel has placed
+    197 GB of host memory on a card's HBM node rather than reclaim the cache, and a later
+    2 GiB device allocation failed on a card holding 24 GB. The binding keeps host memory
+    on the host; this checks it actually applied. Refuses if under 90% of mappings are
+    bound to `nodes`, or any is bound elsewhere."""
     pol = memory_policy() if policy is None else policy
     if not pol:
         return ["no /proc/self/numa_maps: the memory policy cannot be read"]
@@ -537,9 +552,8 @@ def _signals(card_path):
 
 
 def under(path, root):
-    """Is `path` inside directory `root`? By PATH COMPONENT, never by string prefix:
-    prefix matching called `.../smoke-ckpt-probe` a child of `.../smoke` and refused a
-    write that was fine (gb 1003378, a gate leg)."""
+    """Is `path` inside directory `root`? By PATH COMPONENT after realpath, never by
+    string prefix (which would call `.../smoke-ckpt-probe` a child of `.../smoke`)."""
     if not path:
         return False
     a, b = os.path.realpath(path), os.path.realpath(root)
@@ -752,9 +766,8 @@ def cmd_run(args):
                              rows=int(st.off.shape[0]), n_arena=int(st.n_arena))
         mon("load")
         if args.membind_nodes:
-            # the state is on the host now: prove it is ON THE HOST'S nodes. Without a
-            # binding the kernel put 197 GB of it on a card's HBM (gb 1003511), which
-            # only shows up later as a device OOM on a card holding almost nothing.
+            # the state is on the host now: check it is on the CPU nodes. State on a
+            # card's HBM only shows up later as a device OOM on a nearly empty card.
             nmaps, nm = numa_maps(), numa_memory()
             off, where = pages_off_the_cpu_nodes(nmaps, nm)
             card["load_pages_off_cpu_nodes"] = dict(bytes=off, by_node=where)

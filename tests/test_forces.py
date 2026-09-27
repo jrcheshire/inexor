@@ -1,6 +1,6 @@
-"""forces.py: kernel identity vs an independent reference, exact-zero force on
-the uniform grid, paint-path agreement, and the shared-object cache contract
-(architecture Sec. 5: step_fwd/step_rev must receive the SAME force object)."""
+"""forces.py: kernel vs an independent reference, exact-zero force on the uniform grid,
+paint-path agreement, and the coarse long-range solve (hoisted kernel build, factorized
+transform, oversize guard)."""
 
 import pytest
 
@@ -16,11 +16,8 @@ BOX = BoxConfig(n_mesh=N, box_size=L)
 
 
 def test_kernel_matches_independent_reference():
-    """ik/k^2 kernel vs a from-scratch reference built with a different
-    composition (meshgrid instead of broadcast reshapes). Machine precision at
-    the storage dtype: the library never enables x64, so jnp.asarray narrows
-    the returned arrays to f32 -- compare at f32 tolerances. The force == ZA
-    IDENTITY test (same kernel via lpt.za_psi) lands with S3."""
+    """ik/k^2 kernel matches a meshgrid-built reference. The library never enables x64,
+    so the returned arrays are f32: tolerances are f32 round-off."""
     ikx, iky, ikz, inv_k2 = k_components(N, L, np.float64)
     kvec = 2.0 * np.pi * np.fft.fftfreq(N, d=L / N)
     kzv = 2.0 * np.pi * np.fft.rfftfreq(N, d=L / N)
@@ -64,13 +61,10 @@ def test_int_vs_f32_paint_force_agreement():
 
 
 def _reference_coarse_solve(delta, n, box, r_s, match, fdtype):
-    """The pre-M-v2-6 shape, kept here as the oracle it now has to match.
+    """Oracle: build all three complex kernels, apply the match, then solve.
 
-    Build all three complex kernels, match them all, then solve into a list --
-    which is exactly what `coarse_force_meshes` did before the build was hoisted
-    out of the step and the solve was made one component at a time. The change
-    is a reassociation of WHEN, never of what is multiplied by what, so this
-    must agree bitwise and not merely to a tolerance.
+    Same products as the hoisted per-component solve, only formed at a different time,
+    so the two must agree bitwise.
     """
     from inexor.forces import cic_match_factor, split_kernels
 
@@ -93,13 +87,10 @@ def x64():
 @pytest.mark.parametrize("n", [16, 24, 32])
 @pytest.mark.parametrize("fdtype", [np.float32, np.float64])
 def test_the_hoisted_coarse_build_is_bitwise_the_build_it_replaced(n, fdtype, x64):
-    """M-v2-6: the whole point is that this saves memory and changes NOTHING.
+    """The hoisted kernel build is bitwise the all-at-once build.
 
-    `coarse_kernel_parts` keeps only the real half-grids and the complex kernel
-    is formed inside the solve, one component at a time. That reorders
-    allocation, not arithmetic: the expression is still `(pref * ik) * mf`, and
-    folding the match into `pref` -- which would save another 4 B per half-grid
-    element -- is exactly the reassociation this refuses to make.
+    `coarse_kernel_parts` keeps only real half-grids and forms each complex kernel inside
+    the solve as `(pref * ik) * mf`; folding `mf` into `pref` would reassociate and fail.
     """
     from inexor.forces import coarse_force_meshes, coarse_kernel_parts
 
@@ -112,11 +103,7 @@ def test_the_hoisted_coarse_build_is_bitwise_the_build_it_replaced(n, fdtype, x6
 
     want = _reference_coarse_solve(delta, n, box, r_s, match, fdtype)
     parts = coarse_kernel_parts(n, box, "long", r_s=r_s, match=match, fdtype=fdtype)
-    # `transform="monolithic"` is LOAD-BEARING, not leftover. The oracle above is
-    # the pre-hoist spelling and it transforms monolithically; once the shipping
-    # default became the factorized form, leaving this to the default compared a
-    # monolithic reference against a factorized subject and moved two variables
-    # at once. The knob under test is the kernel HOIST, so the transform is held.
+    # The oracle transforms monolithically; hold the transform so only the hoist varies.
     got = coarse_force_meshes(jnp.asarray(delta), n, box, "long", r_s=r_s,
                               match=match, fdtype=fdtype, parts=parts,
                               transform="monolithic")
@@ -148,9 +135,8 @@ def test_the_hoisted_build_and_the_per_call_build_agree():
 
 
 def test_parts_refuse_a_geometry_they_were_not_built_for():
-    """A cached build outliving its configuration is silent corruption: the
-    dtype merely promotes and the shapes broadcast wherever they happen to
-    match. It has to refuse, not coerce."""
+    """Parts built for another geometry are refused, not coerced: dtype would promote and
+    shapes broadcast silently."""
     from inexor.forces import coarse_force_meshes, coarse_kernel_parts
 
     parts = coarse_kernel_parts(16, 16.0, "long", r_s=2.0, fdtype=np.float32)
@@ -161,10 +147,8 @@ def test_parts_refuse_a_geometry_they_were_not_built_for():
 
 
 def test_the_solve_writes_into_the_buffers_it_is_given():
-    """`out=` is how the engine puts the solve straight into the pool's shm
-    views. The identity matters, not just the values: `stage_step` skips its
-    copy on `a is buf`, so a solve that quietly allocated its own would cost
-    the copy back AND leave the workers reading a stale mesh."""
+    """`out=` buffers are returned by identity: `stage_step` skips its copy on `a is buf`,
+    so a solve that allocated its own would leave workers reading a stale shm mesh."""
     from inexor.forces import coarse_force_meshes
 
     n, box = 16, 16.0
@@ -178,9 +162,8 @@ def test_the_solve_writes_into_the_buffers_it_is_given():
 
 
 def test_the_parts_hold_only_real_half_grids():
-    """The saving IS this: three complex kernels are 24 B per half-grid element
-    and the two real grids kept in their place are 8. If a complex array ever
-    ends up in `parts`, the hoist has silently become a 3x cost."""
+    """`parts` holds 8 B per half-grid element (two real grids), not the 24 B of three
+    complex kernels; a complex array here would silently triple the cost."""
     from inexor.forces import coarse_kernel_parts
 
     n = 32
@@ -190,29 +173,22 @@ def test_the_parts_hold_only_real_half_grids():
     kept = parts["pref"].nbytes + parts["mf"].nbytes
     assert not np.iscomplexobj(parts["pref"]) and not np.iscomplexobj(parts["mf"])
     assert kept == 8 * half, f"{kept / half:.2f} B/half held, expected 8.00"
-    # the ik grids are low-rank broadcasts and must stay that way, or the hoist
-    # would keep three more full grids without anyone noticing
+    # ik grids must stay low-rank broadcasts, not three more full grids
     for a in parts["iks"]:
         assert a.size <= n, f"ik grid is full-rank ({a.size} elements)"
 
 
 def test_the_monolithic_coarse_solve_refuses_the_silent_wrong_size():
-    """`ooc_fft` refuses a device transform above 2**31 elements; the module the
-    engine's coarse solve actually calls did not, and c-hero's 2048^3 coarse
-    mesh is 4x that bound.
-
-    The exemption is the interesting half: the bound was measured on cuFFT and
-    refusing on CPU would be inventing a limit rather than enforcing one, so the
-    check is on the backend about to run the transform. Both halves are pinned,
-    since a guard that fires everywhere would be as wrong as one that fires
-    nowhere.
+    """The coarse solve refuses a device transform above 2**31 elements (a 2048^3 mesh is
+    4x that), but only off CPU: the bound is a cuFFT wrong-result limit. Both halves are
+    pinned, since a guard firing everywhere is as wrong as one firing nowhere.
     """
     import jax
 
     from inexor import forces, ooc_fft
 
-    below = 1024  # c-gh's coarse mesh; the size that read 2.9e-6 correctly
-    at_or_above = 2048  # c-hero's
+    below = 1024  # measured correct on GPU (2.9e-6)
+    at_or_above = 2048
     assert below**3 < ooc_fft.MAX_DEVICE_TRANSFORM_ELEMENTS <= at_or_above**3, (
         "the test sizes no longer bracket the bound")
 
@@ -237,18 +213,11 @@ def _coarse_parity_setup(fdtype, n=32, box=64.0, seed=5):
 
 @pytest.mark.parametrize("fdtype", [np.float32, np.float64])
 def test_the_factorized_coarse_solve_agrees_with_monolithic_at_roundoff(fdtype):
-    """The parity gate for the port, in units of EPS rather than a picked number.
+    """Factorized and monolithic coarse solves agree to round-off, in units of eps.
 
-    Bitwise is unavailable by construction: a different transform order rounds
-    differently, which `ooc_fft` says outright about `np.fft.rfftn`. So the
-    honest bar is that the disagreement is ROUNDOFF, and the way to show that is
-    that it scales with the dtype's epsilon instead of sitting at some absolute
-    level. Measured ~6 eps at f64 and ~7 eps at f32 -- the same relative size at
-    two precisions two orders apart, which a bug would not do.
-
-    The cap is 50 eps: an order clear of what both precisions actually read, and
-    three orders under the 1e-3-ish level any real error in a Poisson solve
-    would land at.
+    A different transform order rounds differently, so bitwise is unavailable; instead the
+    disagreement must scale with eps (measured ~6 eps at f64, ~7 at f32). The 50 eps cap
+    is an order above that and far below the ~1e-3 of a real Poisson-solve error.
     """
     import jax
 
@@ -273,16 +242,10 @@ def test_the_factorized_coarse_solve_agrees_with_monolithic_at_roundoff(fdtype):
 
 
 def test_the_per_slab_kernel_is_bitwise_the_whole_grid_kernel():
-    """The one piece of the port that CAN be bitwise, so it is.
+    """Per-slab kernels concatenate bitwise to the whole-grid kernel.
 
-    `iks` are low-rank broadcasts whose x-component is the only one that
-    slices, `pref` and `mf` are real half-grids sliced on the same axis, and the
-    expression is `(pref * ik) * mf` element for element -- the association
-    `coarse_kernel_parts` deliberately refuses to fold. Nothing reduces across
-    x, so a slab cannot see its neighbours and the slice is an identity.
-
-    Without this, the factorized solve's tolerance gate above would be covering
-    for a kernel that quietly differed per slab.
+    The kernel is elementwise `(pref * ik) * mf` with no reduction across x, so slicing
+    is exact; this keeps the round-off gate above from hiding a per-slab kernel error.
     """
     from inexor import forces
 
@@ -301,9 +264,8 @@ def test_the_per_slab_kernel_is_bitwise_the_whole_grid_kernel():
 
 
 def test_the_factorized_solve_is_bitwise_invariant_to_slab_thickness():
-    """Streaming is an OUTER LOOP BOUND here too: how many x-slabs are resident
-    at a time must not touch a value, or a checkpoint resumed with a different
-    window would change the physics."""
+    """Slab thickness is only a loop bound: it must not change a bit, or a checkpoint
+    resumed with a different window would change the physics."""
     from inexor import forces
 
     n, box, fdtype = 32, 64.0, np.float32
@@ -330,15 +292,8 @@ def test_an_unknown_transform_is_refused():
 
 @pytest.mark.parametrize("fdtype", [np.float32, np.float64])
 def test_the_hoisted_build_is_bitwise_on_the_factorized_path_too(fdtype, x64):
-    """The hoist property, on the path that now ships.
-
-    The test above holds the transform at monolithic because its oracle is the
-    pre-hoist monolithic spelling. That leaves the shipping path ungated for the
-    same property, so this pins it there with the function's own per-call build
-    as the oracle: passing prebuilt `parts` must be bitwise identical to letting
-    it build them, because hoisting reorders WHEN a kernel is formed and never
-    what is multiplied by what.
-    """
+    """The hoist is bitwise on the default factorized path too, with the per-call build
+    as oracle (the monolithic test above cannot cover this path)."""
     from inexor.forces import coarse_force_meshes, coarse_kernel_parts
 
     fdtype = np.dtype(fdtype)

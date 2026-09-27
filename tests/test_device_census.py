@@ -1,10 +1,9 @@
-"""M4 F1: the destination census in the windowed tile loop.
+"""The destination census in the windowed tile loop.
 
-The census counts, per brick, the rows the migrate is about to place there, before
-the migrate runs. A fused migrate + repack sizes every new brick range from it, so
-it must equal the membership the reference migrate produces EXACTLY. Gated against
-the host `drift_and_migrate` followed by `repack_geometry`'s counts, on one card and
-split across cards, with a mutated drift as the control that must fail.
+The census counts, per brick, the rows the coming migrate will place there; a fused migrate +
+repack sizes new brick ranges from it, so it must equal exactly the membership of host
+`drift_and_migrate` + `repack_geometry`, on one card and split across cards. A wrong drift is
+the control that must fail.
 """
 
 import copy

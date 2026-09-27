@@ -1,18 +1,9 @@
-"""Scoccimarro bispectrum estimator (diagnostics.bispectrum), ported from mbody
-fields.py:174 / ic.py:151 to numpy-coefficients + JAX-fields at f64.
+"""Scoccimarro bispectrum estimator (diagnostics.bispectrum) at f64.
 
-TOLERANCES ARE NOT INHERITED FROM MBODY. mbody's plane-wave bound is 1e-4
-carrying a measured ~5e-8 float32 floor; at f64 the same check reaches ~1e-13,
-so keeping 1e-4 would ship a test that has lost its power. Every deterministic
-bound here is set at 100x a floor measured on this code, and the measured value
-is quoted next to it. The seeded bound cannot transfer at all -- mbody's fields
-come from MLX Threefry and JAX's stream is different -- so it is re-measured
-over 48 seed pairs, a count chosen so the test can REJECT the bin-centre oracle
-rather than merely accept the binned one (see the discrimination control).
-
-x64 is process-global in jax 0.10.2 (no jax.experimental.enable_x64 context
-manager), so it is flipped per test and restored, rather than at import: this
-module must not change the dtype defaults other test modules run under.
+Deterministic bounds sit at ~100x the f64 floor measured on this code, with the measured value
+quoted beside each. The seeded f_NL test uses 48 seed pairs, enough that it rejects the
+bin-centre oracle rather than merely accepting the binned one. x64 is process-global, so it is
+enabled per test and restored.
 """
 
 import math
@@ -39,7 +30,6 @@ N_SMALL = 16
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """Enable x64 for this test only, then restore. See the module docstring."""
     import jax
 
     prev = jax.config.jax_enable_x64
@@ -59,18 +49,10 @@ def _plane_wave_field(n, m1, m2, m3, a):
 
 
 def _brute_n_tri(n, centers, dk_mult=1.0):
-    """Count full-grid mode-triplets with |k_i| in shell i and k1+k2+k3 = 0 (mod N).
+    """Count full-grid mode triplets with |k_i| in shell i and k1+k2+k3 = 0 (mod N).
 
-    Independent of the FFT J-product, so it is a real cross-check on the
-    estimator's n_tri rather than a restatement of it.
-
-    GENERALIZED from mbody tests/test_bispectrum.py:43, which takes one scalar
-    dk_mult and then HARDCODES 0.5 for the third shell (its line 57). That is
-    harmless there because its only call site uses dk_mult = 1.0, where
-    0.5*dk_mult == 0.5. It is not harmless here: the gate needs a per-shell dk,
-    and the un-generalized version would silently count the third shell at a
-    width the estimator never used, certifying the port against binning it does
-    not implement. dk_mult is a scalar or a 3-sequence, honoured on all three.
+    Independent of the FFT J-product, so a real cross-check on n_tri. dk_mult (shell width in
+    units of k_f) is a scalar or a 3-sequence, honoured on all three shells.
     """
     w = np.asarray(dk_mult, dtype=np.float64)
     w = np.full(3, float(w)) if w.ndim == 0 else w
@@ -90,26 +72,17 @@ def _brute_n_tri(n, centers, dk_mult=1.0):
 
 
 def test_brute_n_tri_honours_per_shell_width():
-    """The generalization itself, before anything is certified against it.
-
-    mbody's version ignores dk_mult on the third shell, so widening only shell 3
-    would leave its count unchanged. If this test passes vacuously the per-shell
-    cross-check below is worthless, so assert the count actually MOVES.
-    """
+    """The brute counter honours a per-shell width: widening only shell 3 must change the
+    count, or the per-shell n_tri cross-check below is vacuous."""
     narrow = _brute_n_tri(N_SMALL, [3, 4, 5], dk_mult=[1.0, 1.0, 1.0])
     wide3 = _brute_n_tri(N_SMALL, [3, 4, 5], dk_mult=[1.0, 1.0, 3.0])
     assert wide3 > narrow, "widening shell 3 must admit more triplets"
-    # And the un-generalized behaviour (0.5 fixed on shell 3) is what `narrow` is.
     assert _brute_n_tri(N_SMALL, [3, 4, 5], dk_mult=1.0) == narrow
 
 
 def test_normalization_deterministic():
-    """Closed 3-4-5 triangle of distinct-magnitude modes.
-
-    Each shell holds exactly one populated mode pair, so I_i = a cos(q_i x) and
-    sum_x I1 I2 I3 = a^3 N^3 / 4, giving B = L^6 a^3 / (4 n_tri) exactly. Tests
-    the V^2/N^9 prefactor, the data path and the count together.
-    """
+    """Closed 3-4-5 plane-wave triangle: each shell holds one mode pair, so
+    B = L^6 a^3 / (4 n_tri) exactly. Pins the V^2/N^9 prefactor, data path and count."""
     n, a = N_SMALL, 0.5
     kf = 2.0 * np.pi / L_BOX
     field = _plane_wave_field(n, (3, 0, 0), (0, 4, 0), (-3, -4, 0), a)
@@ -120,19 +93,13 @@ def test_normalization_deterministic():
 
     predicted = L_BOX**6 * a**3 / (4.0 * n_brute)
     rel = abs(b[0] / predicted - 1.0)
-    # Measured f64 floor: 6.7e-16 at N=16 (this test), 1.7e-15 at N=32. Bound is
-    # ~150x the N=16 value. mbody's f32 floor was ~5e-8 under a 1e-4 bound, so
-    # inheriting 1e-4 here would have left 11 orders of slack.
+    # measured f64 floor 6.7e-16 at N=16 (1.7e-15 at N=32); bound ~150x the N=16 value
     assert rel < 1e-13, f"plane-wave normalization off by {rel:.3e}"
 
 
 def test_n_tri_matches_brute_force_at_per_shell_dk():
-    """n_tri against the independent counter, at a NON-uniform per-leg dk.
-
-    The uniform-dk case is covered above; this is the one that would catch a
-    per-shell width that reached the counter but not the estimator (or the
-    reverse), which is the specific failure the generalization exists to avoid.
-    """
+    """n_tri against the independent counter at a non-uniform per-leg dk, which catches a
+    per-shell width reaching the counter but not the estimator (or the reverse)."""
     n = N_SMALL
     kf = 2.0 * np.pi / L_BOX
     dk = (1.0 * kf, 1.0 * kf, 3.0 * kf)
@@ -149,13 +116,8 @@ def field_ones(n):
 
 
 def test_non_closing_triple_is_guarded():
-    """A bin triple that cannot form a triangle returns n_tri = 0 and B = NaN.
-
-    mbody documents n_tri = 0 here but still evaluates alpha * S / norm, which
-    in f32 round-off returns a large finite number that reads as a measurement.
-    At f64 the shell product can reach exact zero and raise instead. Neither is
-    acceptable, so the port guards and returns NaN.
-    """
+    """A bin triple that cannot close returns n_tri = 0 and B = NaN, not a round-off
+    number that reads as a measurement; a closing triple in the same call is unaffected."""
     n = N_SMALL
     kf = 2.0 * np.pi / L_BOX
     rng = np.random.default_rng(0)
@@ -163,19 +125,13 @@ def test_non_closing_triple_is_guarded():
     b, n_tri = bispectrum(field, L_BOX, [(1 * kf, 2 * kf, 8 * kf), (3 * kf, 4 * kf, 5 * kf)])
     assert n_tri[0] == 0.0
     assert np.isnan(b[0])
-    # the closing companion in the same call must be unaffected
     assert n_tri[1] > 0
     assert np.isfinite(b[1])
 
 
 def test_triple_product_reduction_matches_fsum():
-    """jnp.sum against math.fsum on the actual band fields.
-
-    mbody reduces on a CPU stream in f64 because the triple product of zero-mean
-    band-limited fields cancels heavily and f32 accumulation is unsafe. At f64
-    with pairwise summation that escape hatch should be unnecessary -- this is
-    the check that says so rather than assuming it.
-    """
+    """jnp.sum of the triple product against math.fsum: the zero-mean band fields cancel
+    heavily, and this checks f64 pairwise summation is accurate enough without compensation."""
     import jax.numpy as jnp
 
     n = N_SMALL
@@ -190,25 +146,17 @@ def test_triple_product_reduction_matches_fsum():
     fast = float(jnp.sum(jnp.asarray(prod)))
     exact = math.fsum(prod.tolist())
     rel = abs(fast - exact) / max(abs(exact), 1e-300)
-    # Measured worst 4.7e-16 over N in (16, 32) x 4 seeds; several draws are
-    # bit-exact. So f64 pairwise summation needs no CPU-stream escape hatch, and
-    # mbody's accurate_sum has no analogue to port. Bound is ~200x the worst.
+    # measured worst 4.7e-16 over N in (16, 32) x 4 seeds; bound ~200x that
     assert rel < 1e-13, f"reduction differs from fsum by {rel:.3e}"
 
 
 def test_band_power_agrees_with_pk_estimator_away_from_nyquist():
-    """band_power must be pk_estimator on the same shell, or R_Q mixes binnings.
-
-    This is the assertion that keeps the two estimators in this module on ONE
-    convention. It is stated away from Nyquist deliberately: the top bin is
-    where a closed-vs-half-open edge would disagree, and _shell_index exists so
-    that it does not.
-    """
+    """band_power equals pk_estimator on the same shells (else R_Q mixes binnings). Compared
+    on interior bins, away from the edge bins."""
     n, ell = 32, 128.0
     rng = np.random.default_rng(2)
     field = rng.normal(size=(n, n, n))
     k_c, p_ref, n_ref = pk_estimator(field, ell)
-    # drop the first and last resolved bins; compare the interior
     sel = slice(1, len(k_c) - 1)
     p_new, n_new = band_power(field, ell, k_c[sel])
     assert np.array_equal(n_new, n_ref[sel].astype(np.float64)), "mode counts differ"
@@ -216,16 +164,9 @@ def test_band_power_agrees_with_pk_estimator_away_from_nyquist():
 
 
 def test_core_is_jittable_and_differentiable():
-    """bispectrum_core is jit/grad/vmap-safe, and jit agrees with eager BITWISE.
-
-    Asserted rather than assumed: the estimator is shared with ichnaea, which
-    needs gradients, and "jit-able" degrades silently -- a stray host-side
-    branch or a numpy call inside the traced region raises only when someone
-    first tries to wrap it, which by then is someone else's bug.
-
-    The cubic scaling is a free correctness check riding along: B is trilinear
-    in delta, so doubling the field must multiply B by exactly 8.
-    """
+    """bispectrum_core is jit/grad/vmap-safe and jit matches eager bitwise; gradient consumers
+    rely on this, and a host-side branch in the traced region would only raise on wrapping.
+    B is cubic in delta, so doubling the field must scale B by 8."""
     import jax
     import jax.numpy as jnp
 
@@ -256,14 +197,11 @@ def test_core_is_jittable_and_differentiable():
 
 @pytest.mark.slow
 def test_squeezed_matches_binned_template():
-    """Matched-phase squeezed f_NL signal against the BIN-AVERAGED oracle.
+    """Matched-phase squeezed f_NL signal against the bin-averaged oracle.
 
-    The antisymmetric combination [B(+f) - B(-f)]/2 at shared phase cancels the
-    Gaussian cosmic-variance term, which otherwise swamps the signal at any
-    affordable seed count. The oracle is local_bispectrum_binned, not
-    ic.local_bispectrum_template: the bin-centre template biases the steep
-    squeezed long side low, so using it would fold a known binning systematic
-    into the calibration and read as an estimator error.
+    [B(+f) - B(-f)]/2 at shared phase cancels the Gaussian cosmic-variance term. The oracle is
+    local_bispectrum_binned: the bin-centre template misstates the steep squeezed long side, a
+    binning systematic that would read as estimator error.
     """
     import jax
     import jax.numpy as jnp
@@ -287,16 +225,9 @@ def test_squeezed_matches_binned_template():
     assert np.all(tmpl > 0), "oracle must be positive for f_NL > 0 in the squeezed limit"
     c_cal = float(np.sum(sig * tmpl) / np.sum(tmpl**2))
 
-    # DISCRIMINATION CONTROL, and the reason n_seed is 48 rather than 16. At 16
-    # seeds the bin-CENTRE template also passes (c_cal 0.875 against a 0.85-1.15
-    # band), so the test could not tell the two oracles apart and its use of the
-    # binned one rested on argument rather than measurement. Measured here:
-    # centre/binned = [1.155, 1.081, 1.002] across the three bins, i.e. the
-    # bin-centre template is 15.5% high on the most squeezed long side and the
-    # systematic vanishes as k_long grows -- the k^2 shell-density effect, right
-    # sign and right shape. At 48 seeds (7.8 s) SEM/signal is 4.4-5.5% and the
-    # two separate: binned 0.979, centre 0.862. The band below EXCLUDES the
-    # centre value, so using the wrong oracle fails rather than passes.
+    # Discrimination control, and why n_seed is 48: at 16 seeds the bin-centre oracle also
+    # passes. Measured centre/binned = [1.155, 1.081, 1.002] over the bins; at 48 seeds
+    # (SEM/signal 4.4-5.5%) binned calibrates to 0.979 and centre to 0.862, outside the band.
     c_centre = float(np.sum(sig * local_bispectrum_template(tris, cosmo, f_nl)) /
                      np.sum(local_bispectrum_template(tris, cosmo, f_nl) ** 2))
     assert not (0.90 < c_centre < 1.10), (
@@ -304,12 +235,10 @@ def test_squeezed_matches_binned_template():
         "has lost its power to reject the wrong oracle; re-measure the seed count"
     )
 
-    # measured 0.979 at 48 seeds (0.992 / 1.003 at 16 / 32); band is ~4x the
-    # spread across those seed counts, and excludes c_centre by construction
+    # measured 0.979 at 48 seeds (0.992 / 1.003 at 16 / 32); band ~4x that spread
     assert 0.90 < c_cal < 1.10, f"calibration {c_cal:.4f}"
-    # measured max per-bin deviation 12.9% at 48 seeds against a 4.4-5.5% SEM;
-    # the residual is consistent with the O(f_NL^3) term the antisymmetric
-    # combination does not cancel at f_NL = 2000. Bound is ~2.3x the measured.
+    # measured max per-bin deviation 12.9% (consistent with the uncancelled O(f_NL^3) term at
+    # f_NL = 2000); bound ~2.3x that
     assert np.all(np.abs(sig / tmpl - 1.0) < 0.30), f"per-bin {sig / tmpl}"
     # the squeezed 1/k_long^2 divergence, ordering only
     assert sig[0] > sig[1] > sig[2] > 0

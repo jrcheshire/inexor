@@ -1,4 +1,4 @@
-"""D6: k-space kernels folded into the device axis-0 pass (`ooc_fft.kspace_pass_device`).
+"""k-space kernels folded into the device axis-0 pass (`ooc_fft.kspace_pass_device`).
 
 Oracles are the host kernels (`grad_invk2_spec`, `deriv2_spec`, `mul_radial_inplace`)
 and the existing device axis-0 pass. Under x64 every single kernel is bitwise its host
@@ -54,8 +54,8 @@ def _radial_host(s, fn, dc):
 
 
 def _host_bitwise_measured_here():
-    """The bitwise-to-numpy kernel claims were measured on CPU XLA (2026-09-14); on a GPU
-    the kernel parity is REPORTED by `scripts/v2_d6_device_ics.py smoke`, not asserted."""
+    """Skip off the CPU backend: kernel == numpy bitwise holds on CPU XLA; on a GPU the
+    kernel parity is reported by `scripts/run/device_ics.py smoke`, not asserted."""
     import jax
 
     if jax.devices()[0].platform != "cpu":
@@ -107,7 +107,7 @@ def test_a_kernel_product_is_bitwise_one_host_pass_with_the_product(x64, table):
     got = ooc_fft.kspace_pass_device([(1.0, s)], N, L, kernel=kern, transform=False)
     ref = _radial_host(s, lambda kk: col(kk) * ipo(kk), 0.0 * 1.0)
     assert np.array_equal(got, ref)
-    # and it is NOT the two-cast chain -- the reason the oracle above is the product
+    # and it is not the two-pass chain, which is why the oracle is one pass with the product
     chain = _radial_host(_radial_host(s, col, 0.0), ipo, 1.0)
     assert not np.array_equal(got, chain)
 

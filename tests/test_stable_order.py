@@ -1,14 +1,9 @@
-"""`_stable_order` must return the SAME permutation as the wide `argsort`.
+"""`_stable_order` must return the same permutation as the wide stable `argsort`.
 
-It exists only to put a small-range integer sort on numpy's radix path, so its
-entire contract is that nothing observable changes. The encode downstream is
-order-dependent through a float max, so an "equivalent" permutation that differs
-on ties would move bits without losing a particle -- the hardest kind of defect
-to notice.
-
-The range check is tested in both directions, because numpy narrows MODULARLY:
-a key of 65536 cast to uint16 stores as 0 and sorts first. D-v2-20 found exactly
-that already live in `migrate` and `repack`, where the narrowing was bare.
+Its only purpose is to put a small-range integer sort on numpy's radix path. The
+downstream encode is order-dependent through a float max, so a permutation that
+differs on ties would change bits without losing a particle. Out-of-range keys are
+tested because numpy narrows modularly (65536 cast to uint16 is 0 and sorts first).
 """
 
 import numpy as np
@@ -69,12 +64,8 @@ def test_negative_keys_fall_back():
 
 
 def test_the_narrow_path_is_actually_taken(monkeypatch):
-    """Anti-vacuity: prove the cast happens, or every test above is a no-op.
-
-    Without this, a `_stable_order` that simply forwarded to `np.argsort` on the
-    wide key would pass all of the above -- the suite would be asserting that a
-    function equals itself.
-    """
+    """Anti-vacuity: the narrow cast is actually taken; a plain forward to the wide
+    `np.argsort` would pass every test above."""
     seen = []
     real = np.argsort
 

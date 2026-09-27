@@ -1,9 +1,5 @@
-"""`Heartbeat`: the throttle, and that the long loops actually call it.
-
-The class is trivial; what is worth pinning is that it cannot go silent for an
-arbitrarily long stretch (the failure it exists to prevent) and cannot flood a
-log either, and that the four loops it was built for are wired to it. A
-heartbeat nobody calls is the same job as no heartbeat.
+"""`Heartbeat`: it neither goes silent for long stretches nor floods a log, and the card's
+and export's long loops are wired to it.
 """
 
 import io

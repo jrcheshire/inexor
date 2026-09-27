@@ -1,4 +1,4 @@
-"""The device migrate must be BITWISE the serial numpy migrate, or it is not adoptable.
+"""The device migrate must be BITWISE the serial numpy migrate.
 
 Every state array (spare and freed rows included) and the whole stats dict are
 compared exactly, after every step. Anti-vacuity is asserted first: rows crossing

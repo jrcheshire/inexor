@@ -1,10 +1,5 @@
-"""SlotState: T9 payload stored in slot order, with the bucket implied (M-v2-3).
-
-The property under test throughout is the one `state.py`'s docstring calls the
-whole correctness statement: for every occupied slot, the bucket DERIVED from
-where the slot sits equals the bucket the stored offset was encoded against.
-Everything else here is either that invariant under a stress, or a guard against
-the two codec implementations (jnp in `codec`, numpy in `state`) drifting apart.
+"""SlotState: T9 payload in slot order with the bucket implied by the slot. Pins that
+invariant under drift, migration, arena overflow and repack, and host/device codec parity.
 """
 
 
@@ -15,11 +10,9 @@ import pytest
 from inexor import layout, state  # noqa: E402
 from inexor.codec import T9Layout  # noqa: E402
 
-# Geometry: 32^3 particles, bucket 2 cells -> 16^3 buckets, 2 bricks/side -> 8
-# bricks of 8^3 = 512 buckets each. 512 buckets per brick is C-gh's own figure,
-# so the occupancy statistics this exercises are the shipped ones rather than a
-# toy's. n_part/bucket_cells must be a power of two (D-007, so the wrap is
-# modular and not saturating), which 32/2 = 16 satisfies.
+# 32^3 particles, bucket 2 cells -> 16^3 buckets, 2 bricks/side -> 8 bricks of 512
+# buckets each (C-gh's buckets per brick). n_part/bucket_cells must be a power of two
+# so the wrap is modular, not saturating.
 L_BOX = 64.0
 N_PART = 32
 BRICKS = 2
@@ -40,7 +33,7 @@ def _t9():
 
 
 def _positions(seed=0, n_part=N_PART):
-    """A perturbed Lagrangian lattice, as everywhere else in this suite."""
+    """A perturbed Lagrangian lattice."""
     rng = np.random.default_rng(seed)
     g = (np.arange(n_part) + 0.5) * (L_BOX / n_part)
     q = np.stack(np.meshgrid(g, g, g, indexing="ij"), axis=-1).reshape(-1, 3)
@@ -60,9 +53,9 @@ def _built(seed=0, **kw):
 
 
 def test_the_host_codec_mirror_is_bitwise_the_device_one():
-    """`state` re-implements encode/decode in numpy because the layout never puts
-    the global position array on the device. Two implementations of one
-    definition that are never compared is exactly how they drift apart."""
+    """The numpy host encode/decode in `state` (the global position array never goes to the
+    device) is bitwise the jnp one in `codec`.
+    """
     import jax.numpy as jnp
 
     from inexor import codec
@@ -77,13 +70,12 @@ def test_the_host_codec_mirror_is_bitwise_the_device_one():
     back_h = state.decode_positions_host(off_h, b_h, t9)
     back_d = np.asarray(codec.decode_positions(off_d, b_d, t9))
     assert np.array_equal(back_h, back_d), "host and device decode differ"
-    # and the fixture must actually exercise the byte, or this proves nothing
+    # anti-vacuity: the fixture spans the byte
     assert len(np.unique(off_h)) > 200, "offsets do not span the byte; fixture is degenerate"
 
 
 def test_the_mirror_check_can_fail():
-    """The paired can-it-fail test: perturb one offset by one quantum and the
-    comparison above must notice."""
+    """Anti-vacuity: a one-quantum offset change is visible to the comparison above."""
     t9 = _t9()
     x = _positions(3)
     off, b = state.encode_positions_host(x, t9)
@@ -104,18 +96,8 @@ def test_the_container_is_structurally_consistent_as_built():
 
 
 def test_the_self_consistency_sweep_would_have_been_a_gate_that_cannot_fail():
-    """Pins the reason `check()` does NOT decode and compare buckets.
-
-    The obvious invariant -- "decode each slot, assert its position falls in the
-    bucket the slot implies" -- is an identity. `decode` rebuilds the lattice
-    index as `bucket * 256 + off` with `off` a uint8, so the recovered bucket is
-    `(bucket * 256 + off) // 256 == bucket` for EVERY value the byte can hold.
-    This corrupts an offset by half a bucket and shows the comparison still
-    agrees, which is what makes that sweep worthless on this container.
-
-    Without this test, someone reads `check()`, thinks the strong invariant is
-    missing, adds it, and ships a gate that cannot fail on the module whose whole
-    premise is that the bucket is implied.
+    """Why `check()` does not decode and compare buckets: `decode` rebuilds `bucket * 256 +
+    off`, so the comparison is an identity and passes on a corrupted offset.
     """
     from inexor.layout import _bucket_ijk
 
@@ -130,13 +112,14 @@ def test_the_self_consistency_sweep_would_have_been_a_gate_that_cannot_fail():
         "a corrupted offset DID move the derived bucket -- if that is real, the "
         "self-consistency sweep is worth having after all and this note is stale"
     )
-    # the structural check is likewise blind to it, and honestly so
+    # the structural check is blind to it too, by design
     assert st.check() is True
 
 
 def test_a_lost_particle_is_caught():
-    """D-007 forbids losing a particle as much as it forbids clamping one, and
-    the count is the only thing that sees it."""
+    """`check()` raises when a particle is unreachable through the layout; the count is the
+    only thing that sees a loss.
+    """
     _, _, st = _built(5)
     for b in range(st.n_bricks):
         p3 = st.buckets_per_brick
@@ -150,8 +133,9 @@ def test_a_lost_particle_is_caught():
 
 
 def test_a_brick_overrunning_its_allocation_is_caught():
-    """The failure that silently reassigns particles to the next brick rather
-    than losing them, so the count test cannot see it."""
+    """`check()` raises when a brick's live rows exceed its allocation, which would silently
+    reassign particles to the next brick without changing the count.
+    """
     _, _, st = _built(13)
     b = next(i for i in range(st.n_bricks) if st.brick_live_count(i))
     p3 = st.buckets_per_brick
@@ -163,11 +147,11 @@ def test_a_brick_overrunning_its_allocation_is_caught():
 
 
 def test_placement_is_checkable_against_a_reference_and_that_check_can_fail():
-    """The question `check` cannot answer: did the particle land in the bucket
-    its POSITION calls for? Needs the reference array and the id tier."""
+    """`check_placement` (reference positions + id tier) confirms each particle sits in the
+    bucket its position calls for, and raises when one reference moves a bucket.
+    """
     x, v, st = _built(14, with_ids=True)
     assert st.check_placement(x) is True
-    # move one reference position a whole bucket and the check must notice
     bad = x.copy()
     bad[0, 0] = np.mod(bad[0, 0] + st.t9.bucket_size, L_BOX)
     with pytest.raises(ValueError, match="other than the one their reference position"):
@@ -195,8 +179,7 @@ def test_the_round_trip_is_exact_to_the_quantum_and_the_velocity_scale():
         got_v[seen : seen + len(slots)] = vb
         seen += len(slots)
     assert seen == n
-    # order is NOT preserved -- that is the point of the container -- so compare
-    # as multisets along each axis
+    # order is not preserved by the container, so compare as multisets per axis
     for ax in range(3):
         a = np.sort(got_x[:, ax])
         e = np.sort(np.mod(np.rint(x[:, ax] / st.t9.quantum), st.t9.n_levels) * st.t9.quantum)
@@ -205,9 +188,9 @@ def test_the_round_trip_is_exact_to_the_quantum_and_the_velocity_scale():
 
 
 def test_ids_follow_their_particle_through_the_reordering():
-    """The opt-in int32 id tier (D-v2-14 cl.5) earns its keep here: it is the
-    handle that lets a test follow a NAMED particle through a layout that
-    deliberately does not preserve order."""
+    """The opt-in int32 id tier follows each particle through the reordering, and ids are a
+    permutation of the particle count.
+    """
     x, v, st = _built(7, with_ids=True)
     for b in range(st.n_bricks):
         slots, xb, _ = st.decode_brick(b)
@@ -220,14 +203,13 @@ def test_ids_follow_their_particle_through_the_reordering():
     assert len(np.unique(st.ids[st.ids >= 0])) == N_PART**3, "ids are not a permutation"
 
 
-# ----------------------------------------------------- the scaffolding is gone
+# ------------------------------------------------------ per-particle cost
 
 
 def test_the_scaffolding_arrays_do_not_exist():
-    """D-v2-20's whole point. `key`, `particle_to_slot` and `slot_to_particle` are
-    ~21 B/p against a ~10.5 B/p budget and cannot be resident at production scale
-    in EITHER integer width, which is why widening `key` was refused rather than
-    done."""
+    """No `key`, `particle_to_slot` or `slot_to_particle` arrays: ~21 B/p against a
+    ~10.5 B/p budget, not residentable at production scale in either integer width.
+    """
     _, _, st = _built(8)
     for name in ("key", "particle_to_slot", "slot_to_particle"):
         assert not hasattr(st, name), f"{name} survived into the engine's container"
@@ -235,26 +217,16 @@ def test_the_scaffolding_arrays_do_not_exist():
 
 
 def test_the_int32_key_ceiling_is_not_reachable_because_key_is_gone():
-    """`layout._refuse_key_overflow` exists because C-hero's 2048^3 bucket grid
-    (8.59e9) overflows the int32 `key` (2.15e9). With no `key`, the ceiling is
-    not raised -- it is absent. Assert the refusal still guards the OLD layout,
-    so this is a statement about the new container and not about a deleted
-    guard."""
+    """`layout._refuse_key_overflow` still guards the layout module's int32 `key` (C-hero's
+    bucket grid, 8.59e9, overflows it); SlotState has no `key`, so the ceiling does not apply.
+    """
     with pytest.raises(ValueError, match="exceeds int32"):
         layout._refuse_key_overflow(2**31)
 
 
 def test_the_all_in_cost_lands_near_the_ratified_figure():
-    """D-v2-20's ~10.54 B/p: payload 9.00 + index 0.50 + brick CSR + slack +
-    arena. The fixture's bucket grid is far coarser per particle than C-gh's, so
-    this is a shape check on the accounting, not a reproduction of the number.
-
-    `brick_scales` JOINED the sum when velocity scales went per brick, so the
-    all-in figure moved -- on this fixture by 0.002 B/p, and at C-gh by 0.0020
-    (16.8 MB over 8.59e9 particles). Recorded here rather than absorbed: the
-    ratified number is a number of record, and it is now larger by a term that
-    bought the deletion of 274.9 GB. The trade is the point, and a silent bump
-    would hide both halves of it.
+    """`bytes_per_particle` totals its terms (payload 9.00, index, brick CSR, slack, arena,
+    ids, per-brick scales). A shape check: this bucket grid is coarser than C-gh's (~10.54 B/p).
     """
     _, _, st = _built(9)
     bpp = st.bytes_per_particle()
@@ -265,8 +237,7 @@ def test_the_all_in_cost_lands_near_the_ratified_figure():
                              "ids", "brick_scales"))
     )
     assert bpp["brick_scales"] > 0.0, "the per-brick scales must be counted, not implied"
-    # slack is the pooled 10%, and pooling per BRICK is what makes it 10% rather
-    # than the 12.5% floor per-bucket granularity forces (D-v2-19 clause 1)
+    # pooled per brick, slack is ~10%; per-bucket granularity would floor it at 12.5%
     assert 0.5 < bpp["slack"] < 1.6, f"slack {bpp['slack']:.3f} B/p is not the pooled 10%"
 
 
@@ -279,9 +250,9 @@ def test_ids_cost_exactly_four_bytes_when_asked_for():
 
 
 def test_bucket_boundaries_are_derived_and_agree_with_the_stored_runs():
-    """D-v2-19 clause 2 deleted a stored int64 slot boundary per bucket -- 1.00
-    B/p at C-gh that the accounting had never counted -- by deriving it from the
-    occupancy prefix sum. This asserts the derivation reproduces the runs."""
+    """Per-bucket slot boundaries derived from the occupancy prefix sum reproduce the
+    stored runs (no stored per-bucket boundary, saving 1.00 B/p at C-gh).
+    """
     _, _, st = _built(11)
     p3 = st.buckets_per_brick
     for b in range(st.n_bricks):
@@ -293,9 +264,9 @@ def test_bucket_boundaries_are_derived_and_agree_with_the_stored_runs():
 
 
 def test_free_slots_need_no_sentinel():
-    """Liveness is a function of `occupancy` alone: a brick's live rows are its
-    first sum(occupancy) slots. A -1 marker would be a second source of truth
-    beside the index, and the two could disagree."""
+    """Liveness follows from `occupancy` alone: a brick's live rows are its first
+    sum(occupancy) slots, so no -1 marker competes with the index.
+    """
     _, _, st = _built(12)
     for b in range(st.n_bricks):
         lo, hi = st.brick_slot_range(b)
@@ -304,23 +275,13 @@ def test_free_slots_need_no_sentinel():
         assert len(st.brick_member_slots(b)) == m + len(st.arena_slots_of_brick(b))
 
 
-# ==================================== drift and re-home (S3/S4, one fused pass)
+# ============================================ drift and re-home (one fused pass)
 
 
 def _drifted_reference(x, v, c, t9, scales, bricks_per_side):
-    """Where every particle should land, computed independently of the pass.
-
-    Starts from what the container actually HOLDS, not from the caller's inputs:
-    the stored position is on the T9 lattice and the stored velocity is an int16
-    code at ITS OWN BRICK's scale. Referencing the raw inputs instead makes
-    particles within half a quantum of a bucket face disagree for a legitimate
-    reason and reads as a bug in the exchange -- which is how this helper was
-    first written.
-
-    The brick is re-derived from the position through `bucket_order_key`, the
-    same definition `SlotState.build` quantizes against, rather than read back
-    out of the container. Reading it back would make this compare the pass with
-    itself.
+    """Destination bucket of every particle, computed independently of the pass: from the
+    stored lattice positions and int16 velocity codes, with the brick re-derived through
+    `bucket_order_key` rather than read back from the container.
     """
     q = t9.quantum
     i0 = np.mod(np.rint(x / q).astype(np.int64), t9.n_levels)
@@ -333,8 +294,9 @@ def _drifted_reference(x, v, c, t9, scales, bricks_per_side):
 
 
 def test_the_pass_conserves_every_particle():
-    """D-007 forbids losing a particle as much as clamping one, and a re-home is
-    where one would go missing."""
+    """`drift_and_migrate` conserves the particle count and passes `check()` over repeated
+    passes.
+    """
     _, _, st = _built(20)
     n0 = st.n_live
     for _ in range(3):
@@ -344,8 +306,7 @@ def test_the_pass_conserves_every_particle():
 
 
 def test_every_particle_lands_in_the_bucket_its_drifted_position_calls_for():
-    """The pass's actual job, checked against an independent computation of the
-    destination rather than against the pass's own arithmetic."""
+    """Every particle lands in the bucket `_drifted_reference` computes."""
     x, v, st = _built(21, with_ids=True)
     c = 0.05
     want = _drifted_reference(x, v, c, st.t9, st.vel_scale, st.bricks_per_side)
@@ -360,11 +321,8 @@ def test_every_particle_lands_in_the_bucket_its_drifted_position_calls_for():
 
 
 def test_particles_cross_bucket_brick_and_the_periodic_seam():
-    """The fixture has to actually exercise the three crossings, or the
-    destination test above passes on a pass that never moves anything.
-
-    Needs a large drift: the bucket is 4 Mpc/h here and a brick side is 32, so
-    the ordinary fixture's ~0.1 Mpc/h step per unit coefficient reaches neither.
+    """Destinations are right across buckets, bricks and the periodic seam, and the fixture
+    is asserted to exercise all three.
     """
     x = _positions(22)
     v = np.random.default_rng(23).normal(scale=40.0, size=(N_PART**3, 3))
@@ -377,8 +335,8 @@ def test_particles_cross_bucket_brick_and_the_periodic_seam():
 
     moved_bucket = np.any(before_b != after_b, axis=1)
     moved_brick = np.any(before_b // per != after_b // per, axis=1)
-    # a seam crossing: the drift is large enough that the SHORT way round the
-    # box is not the way the coordinate moved, i.e. the wrap fired
+    # a seam crossing: the drifted, unwrapped lattice coordinate leaves [0, n_levels),
+    # so the wrap fires
     raw = np.rint(x / st.t9.quantum + (c * v) / st.t9.quantum).astype(np.int64)
     seam = np.any((raw < 0) | (raw >= st.t9.n_levels), axis=1)
 
@@ -401,14 +359,8 @@ def test_particles_cross_bucket_brick_and_the_periodic_seam():
 
 
 def test_a_multi_brick_x_mover_survives_and_lands_right():
-    """The missing particle of 16,777,216 (antares 442), at unit scale.
-
-    `_insert_slab` consumed immigrants from hard-coded +-1 sources while the
-    schedule staged the realized reach, so a particle crossing TWO bricks in x
-    was staged correctly, matched by no insert, and destroyed by the release
-    loop. Needs >= 4 bricks per side: at this suite's usual nb=2, {bx-1,bx,bx+1}
-    mod 2 covers every slab and the defect is invisible -- which is why the
-    suite was green while cdev lost a particle.
+    """Particles crossing two bricks (x, y, diagonal, across the seam) are conserved and land
+    right. Needs >= 4 bricks per side: at nb=2 a +-1 source insert covers every slab.
     """
     nb4 = 4  # brick extent 16.0 at this fixture's box of 64
     x = _positions(30)
@@ -437,12 +389,8 @@ def test_a_multi_brick_x_mover_survives_and_lands_right():
 
 
 def test_the_release_census_fires_on_a_dropped_emigrant(monkeypatch):
-    """The census must be able to FAIL, or it is a gate that cannot fail.
-
-    Reinstate the old defect -- consumption pinned to +-1 sources regardless of
-    the schedule's reach -- and require the release loop to refuse AT the release,
-    naming the unconsumed rows, rather than let the count guard catch it 200
-    lines later (or not at all).
+    """Mutation: pinning `_insert_slab` to +-1 sources regardless of the schedule's reach
+    makes the release loop raise "unconsumed" at the release, not later.
     """
     orig = state.SlotState._insert_slab
 
@@ -460,13 +408,9 @@ def test_the_release_census_fires_on_a_dropped_emigrant(monkeypatch):
 
 
 def test_a_particle_is_drifted_exactly_once():
-    """The dangerous failure in a two-phase exchange: a record inserted into a
-    brick that has not yet been ejected gets drifted again, producing a slightly
-    wrong trajectory with nothing raising. Eject-before-insert makes it
-    structurally impossible; this asserts the structure rather than trusting it.
-
-    Two drifts of c would put a particle at 2c, so comparing against the
-    single-drift reference catches it -- and the ids make it per particle."""
+    """No particle is drifted twice (a record inserted into a not-yet-ejected brick would be):
+    per-id destinations match one drift of c, and the fixture distinguishes c from 2c.
+    """
     x, v, st = _built(23, with_ids=True)
     c = 0.08
     once = _drifted_reference(x, v, c, st.t9, st.vel_scale, st.bricks_per_side)
@@ -482,8 +426,9 @@ def test_a_particle_is_drifted_exactly_once():
 
 
 def test_the_velocity_scale_reconciliation_is_the_exact_global_max():
-    """The claim the whole scheme rests on: tile ownership is a partition, so a
-    max over per-tile scales IS the global scale, not an approximation."""
+    """Tile ownership is a partition, so the max over per-tile scales equals the global
+    scale exactly.
+    """
     rng = np.random.default_rng(24)
     v = rng.normal(size=(5000, 3))
     tile = rng.integers(0, 37, size=5000)
@@ -492,7 +437,9 @@ def test_the_velocity_scale_reconciliation_is_the_exact_global_max():
 
 
 def test_rescaling_a_velocity_code_never_escapes_int16():
-    """Not a margin -- a consequence of s_new being the exact global max."""
+    """Rescaling a tile's int16 code to the global scale stays in int16, since the global
+    scale is the exact max.
+    """
     from inexor.codec import assert_int16_range
 
     rng = np.random.default_rng(25)
@@ -507,11 +454,8 @@ def test_rescaling_a_velocity_code_never_escapes_int16():
 def test_a_changed_velocity_scale_moves_no_particle_further_than_one_quantum():
     x, v, st = _built(26)
     s0 = st.vel_scale.copy()
-    # There is no external scale setter any more: a brick's scale is fixed by
-    # `_insert_slab` over the membership it writes. A zero drift keeps every
-    # particle where it is, so every brick re-derives the SAME scale from the
-    # same rows -- which is the degenerate case worth pinning, because it says
-    # the re-derivation is idempotent rather than drifting a little each step.
+    # A brick's scale is set by `_insert_slab` over the rows it writes. A zero drift
+    # keeps every row, so an idempotent re-derivation returns the same scales.
     state.drift_and_migrate(st, 0.0)
     assert st.check() is True
     assert np.array_equal(st.vel_scale, s0), "a zero drift moved a brick's scale"
@@ -523,18 +467,11 @@ def test_a_changed_velocity_scale_moves_no_particle_further_than_one_quantum():
 
 
 def test_the_arena_absorbs_a_brick_overflow_and_then_refuses():
-    """The D-007 ladder end to end: spare, then arena, then a loud refusal --
-    and never a clamp or a drop.
-
-    `brick_slack=0.0` leaves each brick exactly its build-time count, so any net
-    inflow overflows. The drift converges every particle toward the box centre,
-    which is the physical version of the failure: a collapsing halo outgrowing
-    its brick.
+    """Overflow goes to brick spare, then arena, then a ValueError; never a clamp or drop.
+    brick_slack=0.0 plus convergence on one brick's centre (the box centre is where all eight
+    bricks meet, so inflow there balances).
     """
     x = _positions(27)
-    # Converge on ONE brick's centre, not the box centre: with 2 bricks per side
-    # the box centre is the corner where all eight meet, so convergence there is
-    # roughly balanced and nothing overflows.
     v = (L_BOX * 0.25 - x) * 2.0
     st = state.SlotState.build(x, v, _t9(), BRICKS, brick_slack=0.0, arena_frac=0.30)
     stats = state.drift_and_migrate(st, 0.15)
@@ -548,9 +485,8 @@ def test_the_arena_absorbs_a_brick_overflow_and_then_refuses():
 
 
 def test_arena_residents_are_pulled_back_into_their_brick_run():
-    """An arena particle still BELONGS to its brick. If the pass did not pull it
-    back in, the arena would fill monotonically -- and D-v2-19 clause 4 measured
-    the cost of forgetting an arena resident at 98.4% of the force in its brick.
+    """The arena drains when the flow reverses: residents are pulled back into their brick
+    (a forgotten resident measured at 98.4% of its brick's force).
     """
     x = _positions(29)
     v = (L_BOX * 0.25 - x) * 2.0
@@ -558,7 +494,6 @@ def test_arena_residents_are_pulled_back_into_their_brick_run():
     state.drift_and_migrate(st, 0.15)
     crowded = st.arena_used
     assert crowded > 0
-    # reverse the velocities and let it expand again: the arena must drain
     st.w[:] = -st.w
     state.drift_and_migrate(st, 0.15)
     assert st.check() is True
@@ -567,30 +502,20 @@ def test_arena_residents_are_pulled_back_into_their_brick_run():
 
 
 # ============================================ grouping rows by destination brick
-# M-v2-6. `_insert_slab` used to select each brick's rows with a boolean mask
-# inside the brick loop, so every brick scanned every row of its slab: N x nb^2
-# comparisons per step, N^(5/3) rather than N. Measured on deneb (job 456,
-# particles fixed at 256^3, staging depth pinned at 1) insert time went
-# 3.793 -> 10.756 -> 39.626 s for bricks per side 8 -> 16 -> 32, against 38.6 s
-# predicted for the last rung BEFORE it ran. At C-gh that term alone is ~87 h
-# per step. `_group_by_brick` replaces it with one grouping pass.
+# `_insert_slab` groups a slab's rows by destination brick in one pass
+# (`_group_by_brick`). A boolean mask per brick scans every row per brick, N x nb^2
+# per step: measured 3.793 -> 10.756 -> 39.626 s at 256^3 for 8 -> 16 -> 32 bricks
+# per side, ~87 h per step at C-gh. These tests pin the grouping to the mask.
 
 
 def test_grouping_by_brick_reproduces_the_per_brick_mask_exactly():
-    """The identity that makes the replacement bitwise neutral, not merely
-    equivalent: same rows AND same order within every brick.
-
-    Order is load-bearing downstream -- the destination scale is a max over the
-    brick's rows and the encode that follows is order-dependent through it -- so
-    membership alone would not be enough. `np.array_equal` on the index arrays
-    asserts both at once where a set comparison would pass on a permutation.
+    """`_group_by_brick` gives a per-brick mask's rows in the same order (the encode is
+    order-dependent through the brick's max scale), dropping rows outside the slab.
     """
     rng = np.random.default_rng(5)
     lo_b, hi_b = 12, 28
-    # deliberately spans OUTSIDE the slab: the immigrant buffer carries every
-    # emigrant from every reaching slab and only some are bound for this one.
-    # The mask discarded those by never matching; this must drop them the same
-    # way rather than raising or mis-binning them.
+    # spans outside the slab: the immigrant buffer carries emigrants from every
+    # reaching slab, and rows bound elsewhere must be dropped, not mis-binned
     brick_of_row = rng.integers(lo_b - 6, hi_b + 6, size=2000)
     order, off = state._group_by_brick(brick_of_row, lo_b, hi_b)
 
@@ -606,8 +531,7 @@ def test_grouping_by_brick_reproduces_the_per_brick_mask_exactly():
 
 
 def test_grouping_by_brick_handles_the_empty_and_all_outside_cases():
-    """Both reachable in a real run: a slab with no keepers, and an immigrant
-    buffer none of whose rows are bound for this slab."""
+    """Empty input and all-outside input both give empty groups (both occur in a run)."""
     order, off = state._group_by_brick(np.empty(0, np.int64), 4, 9)
     assert len(order) == 0 and np.array_equal(off, np.zeros(6, dtype=np.int64))
 
@@ -616,11 +540,9 @@ def test_grouping_by_brick_handles_the_empty_and_all_outside_cases():
 
 
 def test_grouping_by_brick_takes_the_radix_path_where_the_range_allows():
-    """The key is cast to uint16 when the brick count fits, because numpy's
-    stable sort is a RADIX sort only for 1- and 2-byte integer types -- the same
-    fact that bought `migrate` 5.3x on its own sort. Asserted through behaviour
-    at both sides of the boundary rather than by reading the cast: the result
-    must be identical either way, which is what says the optimization is safe."""
+    """Grouping gives identical results under and over the uint16 key ceiling, where numpy's
+    stable sort switches between radix and the wide path.
+    """
     rng = np.random.default_rng(11)
     lo_b = 0
     for hi_b in (1 << 10, (1 << 16) + 4):  # under and over the uint16 ceiling
@@ -631,25 +553,15 @@ def test_grouping_by_brick_takes_the_radix_path_where_the_range_allows():
             assert np.array_equal(order[off[j] : off[j + 1]], want)
 
 
-# ================================================== repack, in place (M-v2-6)
-# The out-of-place form allocates 11.1 B/row (measured, flat over 64x in N) and
-# ~115 GB at C-gh -- the largest single term left after the velocity array went.
-# D-v2-19 clause 3 named `BrickPackedLayout.repack` as the in-place form to port
-# on a reported scratch of 0.13-0.52 MB "independent of N", but that counts only
-# its chunk buffers: measured it is 39.4 B/row, so the port would have been a
-# 3.55x regression. The clause's REASONING (a monotone rearrangement, not a
-# sort) is what the replacement uses.
+# ============================================================ repack, in place
+# `repack` is a monotone in-place rearrangement; `_repack_reference` is the
+# out-of-place form (11.1 B/row measured, ~115 GB at C-gh) kept as its oracle.
 
 
 def _repack_pair(seed, nb=4, arena_frac=0.25, drifts=(), brick_slack=0.10):
-    """Two identical states, one repacked each way. Optional drifts first, so
-    the arena is NON-EMPTY -- the arena fold-in is the part with no analogue in
-    the layout module and the part most likely to be got wrong.
-
-    `brick_slack=0.0` is how the arena is forced: spare then floors at ONE slot
-    per occupied brick, so any brick that gains two particles spills. Reaching
-    the arena by drifting harder does not work, because a larger drift moves
-    particles between bricks without concentrating them."""
+    """Two identical states for `repack` vs `_repack_reference`, optionally drifted first.
+    `brick_slack=0.0` is what forces arena spills; a harder drift does not concentrate particles.
+    """
     x = _positions(seed)
     v = np.random.default_rng(seed + 1).normal(scale=0.05, size=(N_PART**3, 3))
     kw = dict(with_ids=True, arena_frac=arena_frac, brick_slack=brick_slack)
@@ -662,14 +574,8 @@ def _repack_pair(seed, nb=4, arena_frac=0.25, drifts=(), brick_slack=0.10):
 
 
 def test_the_in_place_repack_is_elementwise_the_out_of_place_one():
-    """The gate the plan asks for, and it compares against the REFERENCE
-    implementation kept in the module rather than against a property.
-
-    A property ("every particle is in its bucket") can hold for two different
-    layouts; only elementwise equality says the rearrangement is the same one.
-    `ids` is included because it is what makes the comparison per PARTICLE --
-    without it, two states could agree on payload and still have permuted rows
-    within a bucket.
+    """In-place `repack` equals `_repack_reference` on every stored array, ids included
+    (which catches permutations within a bucket).
     """
     a, b = _repack_pair(41)
     ra = a.repack()
@@ -688,10 +594,9 @@ def test_the_in_place_repack_is_elementwise_the_out_of_place_one():
 
 
 def test_the_in_place_repack_matches_with_a_NON_EMPTY_arena():
-    """The arena fold-in is the part `layout.py` has no analogue for. A repack
-    from a freshly built state never exercises it, so this drifts first and
-    asserts the arena was actually populated -- otherwise the test above and
-    this one are the same test."""
+    """Same equality with a populated arena (the arena fold-in has no analogue in
+    `layout.py`), and the arena is empty afterwards.
+    """
     a, b = _repack_pair(43, drifts=(0.4, 0.4), brick_slack=0.0)
     assert a.arena_used > 0, "fixture never spilled to the arena; the case is untested"
     a.repack()
@@ -706,8 +611,7 @@ def test_the_in_place_repack_matches_with_a_NON_EMPTY_arena():
 
 
 def test_the_in_place_repack_conserves_particles_over_repeated_steps():
-    """D-007 forbids dropping, and this container has lost exactly one particle
-    before. Repack repeatedly, interleaved with drifts, and count."""
+    """Particle count is conserved over repeated drift + repack."""
     a, _ = _repack_pair(45, drifts=())
     n0 = a.n_live
     for c in (0.3, 0.3, 0.3):
@@ -718,10 +622,8 @@ def test_the_in_place_repack_conserves_particles_over_repeated_steps():
 
 
 def test_the_in_place_repack_reports_scratch_that_includes_everything():
-    """The reference's `scratch_bytes` omitted three O(N) arrays and so read as
-    a constant while the real cost was linear. This one must report a figure
-    that actually bounds what it allocated, so the same mistake cannot be made
-    twice on the same term.
+    """`repack` reports a positive `scratch_bytes` well under the payload size (a brick plus
+    the lifted arena, not O(rows)).
     """
     a, _ = _repack_pair(47, drifts=(0.4,), brick_slack=0.0)
     n_rows = a.off.shape[0]
@@ -738,20 +640,9 @@ def test_the_in_place_repack_reports_scratch_that_includes_everything():
 
 
 def test_the_arena_caches_are_pure_and_match_a_rebuild_under_migration():
-    """The surgical index update + lazy free-list vs rebuild-on-every-read.
-
-    Two identical arena-heavy states run the same drift chain. The oracle arm
-    (`st_b`) gets an instance-level shim that INVALIDATES before every
-    `arena_slots_of_brick` read, so every index it ever consumes is a fresh
-    O(n_arena) rebuild and every `_to_arena` claim rescans the free list --
-    exactly the pre-5g semantics, mid-migrate included. The fast arm (`st_a`)
-    runs the maintained caches. An impure cache diverges the arena LAYOUT
-    (the free list decides which slot a spilled particle lands in), so
-    elementwise equality of every stored array is the whole claim.
-
-    Built at brick_slack=0.0 because a 0.10-slack uniform state parks nothing
-    in the arena and this would be a gate that cannot fail; the assert on
-    `arena_used` enforces that the test is actually exercising the machinery.
+    """The maintained arena index and free list are pure caches: against an arm that rebuilds
+    the index before every read, every stored array matches over a drift chain, and the caches
+    equal a rebuild. brick_slack=0.0 so the arena is used.
     """
     x, v, st_a = _built(seed=3, brick_slack=0.0, arena_frac=0.30, with_ids=True)
     _, _, st_b = _built(seed=3, brick_slack=0.0, arena_frac=0.30, with_ids=True)
@@ -773,7 +664,6 @@ def test_the_arena_caches_are_pure_and_match_a_rebuild_under_migration():
         for f in fields:
             assert np.array_equal(getattr(st_a, f), getattr(st_b, f)), (k, f)
         assert st_a.arena_used > 0, "arena never exercised; the test is vacuous"
-        # the maintained index must BE a fresh rebuild's content
         maintained = st_a._arena_by_brick
         if maintained is not None:
             fresh = dict(maintained)  # keep a handle; _build replaces the cache
@@ -781,7 +671,6 @@ def test_the_arena_caches_are_pure_and_match_a_rebuild_under_migration():
             assert set(fresh) == set(rebuilt)
             for b in rebuilt:
                 assert np.array_equal(fresh[b], rebuilt[b]), b
-        # the maintained free list must BE the scan's answer
         if st_a._arena_free is not None:
             assert np.array_equal(
                 st_a._arena_free, np.nonzero(st_a.arena_bucket < 0)[0]
@@ -790,15 +679,8 @@ def test_the_arena_caches_are_pure_and_match_a_rebuild_under_migration():
 
 
 def test_the_repack_fast_path_and_the_merge_path_BOTH_fire_and_agree():
-    """The fast path (no arena residents -> no permutation) is a branch, and a
-    branch that never runs is not tested by a green suite.
-
-    C15 measured 89-96% of occupied bricks carrying no residents on the engine's
-    clustered state, which is what makes the branch worth having; here the point
-    is only that BOTH sides run in one call and the result is still elementwise
-    the out-of-place reference. Asserted on the counters the function reports,
-    so a future change that routes every brick one way fails here rather than
-    quietly costing 26x.
+    """One `repack` takes both the fast path (no arena residents; 89-96% of bricks on a
+    clustered state) and the merge path, and still equals the reference.
     """
     a, b = _repack_pair(51, drifts=(0.4,), brick_slack=0.0)
     assert a.arena_used > 0, "fixture never spilled; the merge path is untested"
@@ -816,10 +698,7 @@ def test_the_repack_fast_path_and_the_merge_path_BOTH_fire_and_agree():
 
 
 def test_the_repack_fast_path_counts_every_occupied_brick_when_the_arena_is_empty():
-    """The boundary case the counters exist to make visible: a freshly built
-    state has an empty arena, so every occupied brick must take the fast path
-    and none may take the merge. If this ever reports merges, the arena is being
-    populated somewhere it should not be."""
+    """With an empty arena every occupied brick takes the fast path and none merges."""
     a, _ = _repack_pair(53, drifts=())
     assert a.arena_used == 0, "fixture spilled; this case is about an EMPTY arena"
     r = a.repack()
@@ -828,16 +707,8 @@ def test_the_repack_fast_path_counts_every_occupied_brick_when_the_arena_is_empt
 
 
 def test_an_overlapping_slice_assignment_copies_before_it_writes():
-    """`repack`'s block moves dropped their explicit `.copy()` and lean on numpy
-    to allocate a temporary when the source and destination ranges overlap.
-
-    That is library behaviour, not language semantics, and it is load-bearing:
-    without it a brick that moves less than its own length would read rows it
-    had already overwritten and the payload would be silently corrupted in a way
-    no conservation count could see -- the particle count would be right and the
-    velocities would be wrong. Pinned here in both directions rather than
-    assumed, so a numpy change that withdrew it fails one small test instead of
-    quietly rewriting the state.
+    """numpy copies before writing an overlapping slice, in both directions; `repack`'s block
+    moves rely on it, and the particle count would not see the corruption.
     """
     base = (np.arange(20000, dtype=np.int16).reshape(-1, 1)
             * np.ones((1, 3), dtype=np.int16))
@@ -855,18 +726,8 @@ def test_an_overlapping_slice_assignment_copies_before_it_writes():
 
 
 def test_repack_still_refuses_a_brick_that_outgrows_the_index_dtype():
-    """The overflow refusal moved; it did not go away.
-
-    `repack` used to narrow its output through `layout._to_index` at the end.
-    It now builds that output at the index dtype directly -- which is where the
-    per-bucket int64 arrays went -- and the refusal is pulled forward onto the
-    per-BRICK totals, which bounds every bucket in a brick. That is strictly
-    stronger, but it is a different line of code, so it needs its own gate:
-    narrowing bare in `migrate` and `repack` is precisely the defect
-    `_to_index`'s docstring records being fixed, and numpy narrows MODULARLY --
-    an ungated overflow would not raise, it would shift the derived span of
-    every later bucket in the brick and very likely pass `check()`, which
-    samples three bricks.
+    """`repack` raises when a brick total exceeds the index dtype. numpy narrows modularly,
+    and a shifted per-bucket span would pass `check()`, which checks per-brick totals only.
     """
     n_side, box = 16, 16.0
     rng = np.random.default_rng(4)
@@ -884,18 +745,10 @@ def test_repack_still_refuses_a_brick_that_outgrows_the_index_dtype():
 
 
 def test_repack_is_unchanged_by_the_per_brick_census_rewrite():
-    """The census rewrite is an integer identity and has to behave like one.
-
-    `sum_over_buckets_in_brick(occupancy + arena_per_bucket)` equals
-    `run_counts + arena_per_BRICK`, so counting per brick rather than
-    materializing two n_buckets int64 arrays cannot move a row. Driven from a
-    state that actually HAS arena residents, because the arena term is the half
-    of the identity that is easy to get wrong and an empty arena would make
-    this gate vacuous.
+    """Repack's per-brick census is an integer identity: occupancy + arena and the decoded
+    member count are unchanged, from a clustered state with arena residents.
     """
-    # CLUSTERED, and with no per-brick spare: uniform positions spill nothing,
-    # so the obvious version of this gate would run with an empty arena and
-    # exercise none of the term it exists to check
+    # clustered and with no per-brick spare; uniform positions spill nothing
     n_side, box = 32, 32.0
     rng = np.random.default_rng(9)
     x = (rng.standard_normal((n_side**3, 3)) * 4.0 + box / 2) % box

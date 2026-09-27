@@ -1,12 +1,7 @@
-"""D2d: the coarse paint on the device, gated BITWISE against the host paint.
+"""The device coarse paint, gated bitwise against the host `engine.coarse_delta_streamed`.
 
-The whole-mesh oracle is the real host code, `engine.coarse_delta_streamed`,
-not a transcription. Bitwise is achievable for the same reason the host path's
-own streamed-vs-monolithic pin is: positions decode bitwise, the paint kernel is
-shared, and integer addition does not care about chunk size or order.
-
-As in `test_device_decode.py`, the arena branch must actually run: every arena
-test asserts a nonzero resident count first.
+Bit equality holds because positions decode bitwise, the paint kernel is shared, and integer
+addition is independent of chunk size and order. Arena tests assert nonzero residents first.
 """
 
 import numpy as np
@@ -18,7 +13,7 @@ from inexor import engine, state  # noqa: E402
 from inexor.codec import T9Layout  # noqa: E402
 from inexor.device import paint as dpaint  # noqa: E402
 
-# `tests/test_engine.py`'s validated smoke geometry, verbatim.
+# tests/test_engine.py's validated smoke geometry.
 L_BOX, N_PART, N_FINE, N_COARSE, N_TILE, B_FINE = 32.0, 32, 64, 16, 16, 8
 
 
@@ -50,8 +45,7 @@ def _state(cfg, seed=0, arena=False):
     nb = N_FINE // cfg.n_brick
     if not arena:
         return state.SlotState.build(x, v, _t9(), nb, arena_frac=0.05)
-    # no spare in any brick, so the first migrate across a brick boundary has to
-    # land in the arena
+    # no brick spare, so migrants across a brick boundary land in the arena
     st = state.SlotState.build(x, v, _t9(), nb, brick_slack=0.0, arena_frac=0.30)
     state.drift_and_migrate(st, 2.0)
     return st
@@ -81,7 +75,7 @@ def test_device_density_is_bitwise_the_host_streamed_density():
 
 
 def test_device_density_is_bitwise_WITH_arena_residents():
-    """The branch the obvious fixture never reaches."""
+    """The arena rows of the window, with residents asserted present."""
     cfg = _cfg()
     st = _state(cfg, 4, arena=True)
     assert st.arena_used > 0, (
@@ -94,7 +88,7 @@ def test_device_density_is_bitwise_WITH_arena_residents():
 
 
 def test_the_default_is_the_jitted_paint():
-    """Adopted on the GB200 bitwise gate (Vista 993294); eager is `jit=False`."""
+    """The jitted paint is the default (eager is `jit=False`) and matches the host bitwise."""
     cfg = _cfg()
     st = _state(cfg, 2)
     s = {}
@@ -224,10 +218,8 @@ def test_the_accumulator_is_a_seam():
 
 # ------------------------------------------------------- the jitted chunk
 #
-# jit is adopted only on a bitwise gate: XLA may fuse the TSC weight arithmetic,
-# and a fused multiply-add rounds differently, which could move a rounded
-# integer weight. These gates run on whatever backend the suite runs on; the
-# GPU reading is its own job.
+# jit must stay bitwise: XLA may fuse the TSC weight arithmetic, and a fused multiply-add rounds
+# differently, which could move a rounded integer weight. These run on the suite's backend.
 
 
 @pytest.mark.parametrize("arena", [False, True])
@@ -289,10 +281,8 @@ def test_one_compilation_serves_every_chunk_of_a_step():
 
 @pytest.mark.parametrize("jit", [False, True])
 def test_spreading_the_dead_rows_moves_no_bit(jit):
-    """Padded rows scatter a zero weight; WHERE they scatter it cannot matter.
-    On a jitted run the spread kernel must also be a distinct program, which is
-    the receipt that the switch reached the compiled paint. "spread" is the
-    default, so the second call names nothing."""
+    """Padded rows scatter zero weight, so where they scatter cannot move a bit ("spread" is the
+    default). Under jit the spread kernel must be a distinct program, proving the switch applied."""
     cfg = _cfg()
     st = _state(cfg, 4, arena=True)
     s0, s1 = {}, {}
@@ -357,11 +347,8 @@ def _nbytes(v):
 
 
 def _live_peak(jaxpr):
-    """Peak bytes alive at once under last-use freeing, sub-jaxprs included.
-
-    Inputs and lifted constants are not counted -- only what the program
-    allocates. Literals are skipped when recording uses: they are not buffers.
-    """
+    """Peak bytes alive under last-use freeing, sub-jaxprs included; inputs, constants and
+    literals are not counted."""
     last = {}
     for i, e in enumerate(jaxpr.eqns):
         for v in e.invars:
@@ -388,12 +375,11 @@ def _live_peak(jaxpr):
 
 
 def test_a_chunk_stays_inside_the_traced_per_row_floor():
-    """`plan.PAINT_CHUNK_TRACED_B_PER_ROW` is read off this program, so the program
-    is held to it: re-trace one chunk at two padded row counts, difference out the
-    fixed terms, and fail if the live bytes per row exceed the charge. The floor
-    is the decoded positions (24) plus the three per-axis TSC weight arrays (72),
-    which are alive together through the whole corner loop -- a reading below
-    that means the liveness pass is broken, not that the paint got cheaper."""
+    """A traced chunk's live bytes per row stay within `plan.PAINT_CHUNK_TRACED_B_PER_ROW`.
+
+    Traced at two padded row counts and differenced. The lower bound, 96 B/row (positions 24 +
+    three TSC weight arrays 72, alive together), checks the liveness pass itself.
+    """
     import jax
 
     from inexor import plan as planner

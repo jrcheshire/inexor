@@ -1,15 +1,4 @@
-"""codec.py: the integer lattice primitives and the STE boundary.
-
-Trimmed 2026-08-08 with the v1 retirement. What went with it: the w-frame
-ladder guard and pricing tests, the global uint16 encode/decode round trip, the
-s_w0 policy formula, the int16 headroom monitor, the `imask_*` width knob, and
-the arch Sec. 4 |m| > 1 invertibility lemma -- every one of them a statement
-about machinery that no longer exists. The T9 codec brings its own gates at
-M-v2-1, including a round trip and a wrap-never-clamp assertion.
-
-What remains covers the primitives v2 still stands on. Reversibility assertions
-are EXACT integer equality, never tolerances (house rule).
-"""
+"""codec.py: the integer rounding primitive. Assertions are exact integer equality."""
 
 import jax.numpy as jnp
 import numpy as np

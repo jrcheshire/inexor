@@ -1,13 +1,19 @@
-"""D6: the legs around a device IC generation on a gb node that are not the generation.
+"""Checks and bookkeeping around a device IC generation on a gb node (not the generation).
 
-    preflight  jax devices, scratch free space and quota, the planner's IC stage table
-               at 2048^3 and 4096^3 against a gb node. rc 2 on a refusal.
-    smoke      the device generator on the cards against the host generator at 32^3:
-               4 cards == 1 card bitwise; occupancy exact, codes within 1 (the
-               PROPOSED bars in tests/test_icgen_device.py); scales reported. rc 3 on a
+Subcommands:
+
+    preflight  jax devices and the allocator actually running, scratch free space and
+               quota, the planner's IC stage table at 2048^3 and 4096^3 against a gb
+               node (1026 GB host, 199 GB per card). rc 2 on a refusal.
+    smoke      the device generator against the host generator at 32^3, f_NL 0 and 10:
+               4 cards == 1 card bitwise; occupancy exact, codes within 1 (the bars in
+               tests/test_icgen_device.py); kernel parity vs numpy reported. rc 3 on a
                miss.
-    project    the 2048^3 card -> a 4096^3 projection (every stage x8 log-scaled wall,
-               host peak x8). rc 3 past the pre-registered stop: wall > 9 h or host peak
+    emit-shape one destination slab of the card emission at production shape on ONE
+               card, projected to the whole emission on four cards. rc 3 if the
+               projected card peak exceeds 0.9 x 199 GB.
+    project    an IC card at n^3 -> a (2n)^3 projection (stage walls x 8 log(2n)/log n,
+               host peak x 8). rc 3 if the projected wall > 6 h or host peak
                > 0.9 x 1026 GB.
     allocator-ab
                two IC cards whose manifests record DIFFERENT allocators and the same
@@ -18,6 +24,12 @@
                which refuses if anything else is inside.
 
 The generations themselves run through `scripts/run/realization.py ics --generator device`.
+
+Usage:
+
+    python scripts/run/device_ics.py preflight --root $RUNS --need-gb 1500
+    python scripts/run/device_ics.py smoke --out smoke.json
+    python scripts/run/device_ics.py project --card $W/realization_ics.json --out proj.json
 """
 
 import argparse
@@ -62,12 +74,9 @@ def cmd_preflight(args):
 
     rc = 0
     print(f"jax devices: {jax.devices()}")
-    # The allocator must show WHICH one is running, not merely that a knob was set.
-    # 998798 printed `bytes_limit 0.0 GiB` on all four cards and that read as a
-    # failure to apply the fraction; it is how cuda_async reports -- BFC sets
-    # bytes_limit to fraction x card, CUDA's pool reports none and keeps
-    # peak_bytes_in_use (compute_stats=true). So derive the allocator from the stats
-    # and REFUSE when it disagrees with the one the environment asked for.
+    # Derive WHICH allocator is running from its stats, and REFUSE when it disagrees
+    # with the one the environment asked for: BFC sets bytes_limit to fraction x card;
+    # CUDA's pool (cuda_async) reports no limit and keeps peak_bytes_in_use.
     asked = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc").strip().lower() or "bfc"
     frac = os.environ.get("XLA_CLIENT_MEM_FRACTION", "(unset, compiled default 0.75)")
     print(f"  allocator asked: {asked}; XLA_CLIENT_MEM_FRACTION={frac}")
@@ -306,17 +315,14 @@ def cmd_project(args):
 
 
 def cmd_allocator_ab(args):
-    """Two IC generations, one per allocator, SAME job and same node -> stage ratios.
+    """Two IC generations, one per allocator, run in the SAME job -> stage ratios.
 
-    998798's 1.15x against 997814 crossed two jobs and two node allocations, which is
-    the shape that produced the 8.6% cross-job drift record 5h had to chase down. Both
-    arms here run back to back in one job, so the ratio is the allocator.
-
-    The arms must differ in the allocator and NOTHING else: `manifest.provenance`
-    carries the allocator, so the arm is identified by what the generator recorded
-    rather than by the label the sbatch passed. rc 3 on a mismatched axis or on two
-    arms that turn out to be the same allocator -- a vacuous A/B must not read as a
-    null result.
+    Both arms run back to back in one job on one node, since cross-job comparisons
+    carry node-to-node drift of order 8%. The arms must differ in the allocator and
+    NOTHING else (n_part, generator, commit, host, emission, ic_stream, n_devices);
+    each arm is identified by `manifest.provenance`, not by a job label. rc 3 on a
+    mismatched axis, a missing allocator, a CPU-only arm, or two arms with the same
+    allocator; refused ratios are written to the card but not printed.
     """
     arms = []
     for path in (args.a, args.b):
@@ -334,10 +340,8 @@ def cmd_allocator_ab(args):
     elif a["allocator"] == b["allocator"]:
         print(f"REFUSE: both arms report allocator {a['allocator']} -- not an A/B")
         rc = 3
-    # `allocator` is the environment verbatim, which is the right thing to store and
-    # the wrong thing to trust alone: a CPU-backend generation records the variable it
-    # was handed while no GPU allocator ever ran, so the label would be live and the
-    # quantity vacuous. Caught on the laptop, where exactly that happened.
+    # `allocator` is the environment verbatim: a CPU-backend generation records the
+    # variable it was handed although no GPU allocator ran, so such an arm is refused
     for arm in arms:
         devs = arm["prov"].get("devices")
         if devs is not None and all(d == "cpu" for d in devs):
@@ -362,9 +366,8 @@ def cmd_allocator_ab(args):
               if stage in sb and sa[stage]}
     wall = b["card"]["wall_s"] / a["card"]["wall_s"]
     host = b["card"]["peak_rss_bytes"] / a["card"]["peak_rss_bytes"]
-    # A refused comparison keeps its numbers on the card for the audit trail and OFF
-    # the screen: a ratio printed under a REFUSE line is still the thing a reader
-    # carries away, and these ratios are exactly the shape of a real result.
+    # a refused comparison keeps its numbers on the card and OFF the screen, so a
+    # ratio printed under a REFUSE line cannot be read as a result
     if rc:
         print(f"\nWITHHELD: {len(ratios)} stage ratios computed and written to "
               f"{args.out}, not printed -- the comparison above is refused, so they "
@@ -387,8 +390,7 @@ def cmd_allocator_ab(args):
                host_peak_ratio_b_over_a=host, n_part=a["card"]["n_part"], rc=rc)
     with open(args.out, "w") as fh:
         json.dump(out, fh, indent=2)
-    # reported, not gated: this measures a wall, and which allocator to run is a
-    # capacity question the 4096^3 peak decides, not this ratio
+    # reported, not gated: which allocator to run is decided by peak memory, not wall
     print(f"\ncard -> {args.out}")
     return rc
 

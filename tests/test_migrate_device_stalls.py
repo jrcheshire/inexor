@@ -1,4 +1,4 @@
-"""M3: the device migrate's host stalls removed, and proved removed.
+"""The device migrate makes no host copies or extra reads, proved directly.
 
 The slab window is uploaded as a view of the host state (no host copy), arena
 residents go up as their own array, and the inserts' census reads counts the
