@@ -61,7 +61,7 @@ class T9Layout:
                 f"n_levels = {n_levels} is not a power of two (n_part={self.n_part}, "
                 f"bucket_cells={self.bucket_cells}). quantum * n_levels would not equal "
                 "box_size exactly, so the periodic wrap would saturate instead of wrapping "
-                "-- forbidden by D-007 (wrap-never-clamp)."
+                "-- forbidden (wrap-never-clamp)."
             )
         if self.box_size <= 0.0:
             raise ValueError(f"box_size must be positive, got {self.box_size}")
@@ -160,7 +160,7 @@ def assert_int16_range(w32, what="velocity"):
     if lo < -32768 or hi > INT16_MAX:
         raise ValueError(
             f"{what} index range [{lo}, {hi}] escapes int16 [-32768, {INT16_MAX}]. "
-            "The T9 codec does not clamp (D-007, wrap-never-clamp): a saturating "
+            "The T9 codec does not clamp (wrap-never-clamp): a saturating "
             "encode would silently misrepresent the fastest particles, which are "
             "the ones that matter. Re-derive the scale."
         )

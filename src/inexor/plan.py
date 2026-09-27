@@ -368,14 +368,14 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
     # against `resident` alone, not summed into the phases; they do not coexist (max).
     if fused:
         after_loop = {
-            "migrate_repack_fused_pass (257 B/slab row, sec. 41, 1024^3)": int(
+            "migrate_repack_fused_pass (257 B/slab row, measured at 1024^3)": int(
                 FUSED_DEVICE_B_PER_SLAB_ROW * slab_rows),
         }
     else:
         after_loop = {
-            "migrate_device_pass (320 B/slab row, sec. 31)": int(
+            "migrate_device_pass (320 B/slab row)": int(
                 MIGRATE_DEVICE_B_PER_SLAB_ROW * slab_rows),
-            "repack_device_pass (70 B/slab row, sec. 33)": int(
+            "repack_device_pass (70 B/slab row)": int(
                 REPACK_DEVICE_B_PER_SLAB_ROW * slab_rows),
         }
     return resident, transient, phases, max(in_step, once), slabs, host_mesh, after_loop
@@ -429,7 +429,7 @@ def _device_main(args, ec, t9, n, rows, arena, state):
     _table(f"PER GPU (of {n_gpus}), BY PHASE", phases,
            total_label="sum of ALL phases listed")
     _table(f"PER GPU (of {n_gpus}), AFTER THE TILE LOOP (migrate, then repack; "
-           "not co-resident with the phases above, JC sec. 29)", after_loop,
+           "not co-resident with the phases above)", after_loop,
            total_label="max (the two do not coexist)", reduce=max)
     print(f"  the verdict below charges {_fmt(worst_phase).strip()}, which is "
           "max(the in-step\n  phases summed, the largest once-per-run phase) -- "
@@ -486,16 +486,14 @@ def _device_main(args, ec, t9, n, rows, arena, state):
         print("  no --device-gb given, so no per-card verdict (a GB200 detected "
               "185 GiB = 199 GB)")
     print("\n  NB the same LOWER BOUND caveat as the CPU column, and two more "
-          "that are\n  specific to this one. (1) DEVICE_PLACEMENT is still a "
-          "design assertion\n  rather than a reading of the code, but the "
-          "executor it asserts now EXISTS\n  and is bitwise the host engine at "
-          "cgh64 on four GB200s (996685, 996857),\n  so the placements are "
-          "checked against something. What is NOT checked is\n  this table at "
-          "4096^3 shapes: that is the D7 smoke.\n  (2) The four-way split is "
-          "charged as an exact quarter, which is right for\n  MEMORY -- each "
-          "card holds its quarter however the wall splits -- and wrong\n  for "
-          "WALL, where D5 measured 2.8-3.0x rather than 4x. Do not read a "
-          "per-card\n  byte here as licence for a quarter of a second anywhere.")
+          "that are\n  specific to this one. (1) DEVICE_PLACEMENT is a design "
+          "assertion, checked\n  against the device executor (bitwise the host "
+          "engine at cgh64 on four\n  GB200s) but not at 4096^3 shapes.\n  (2) "
+          "The four-way split is charged as an exact quarter, which is right for\n"
+          "  MEMORY -- each card holds its quarter however the wall splits -- and "
+          "wrong\n  for WALL, where the measured speedup is 2.8-3.0x rather than "
+          "4x. Do not read a\n  per-card byte here as licence for a quarter of a "
+          "second anywhere.")
     return 0
 
 
@@ -550,7 +548,7 @@ def main(argv=None):
     ap.add_argument("--alloc-margin", type=float, default=0.10)
     ap.add_argument("--arena-frac", type=float, default=0.01,
                     help="arena rows as a fraction of N. NOTE the default is "
-                         "`SlotState.build`'s, but `scripts/v2_m6_realization.py` "
+                         "`SlotState.build`'s, but `scripts/run/realization.py` "
                          "runs 0.20, which is 28 GB of shared memory at c-gh.")
     # No default and not derived: `cap` (max padded per-tile rows) includes the clustering
     # spread of tile occupancy, which geometry cannot give, so a derived value would read low.
@@ -732,11 +730,11 @@ def main(argv=None):
         print(f"  device-resident mesh against --device-gb {args.device_gb}: "
               f"{dev / (args.device_gb * GB):.2f}x")
     print("\n  NB this is a LOWER BOUND from arithmetic, not a measurement. It "
-          "charges every\n  in-step phase, not the largest single term -- the largest-"
-          "term form is what\n  called the c-gh run a fit twice. What it still cannot "
+          "charges every\n  in-step phase, not the largest single term. What it still "
+          "cannot "
           "see is XLA's intra-jit\n  scratch, which is invisible to tracemalloc, to "
-          "`live_arrays` and to\n  `memory_stats()` alike on CPU. Vista 923139 lost "
-          "~79 GB inside a phase this\n  prices at 30, so treat it as a sizing floor "
+          "`live_arrays` and to\n  `memory_stats()` alike on CPU, and has measured ~2.6x this figure "
+          "inside one\n  phase, so treat it as a sizing floor "
           "and never as a peak.")
     return 0
 

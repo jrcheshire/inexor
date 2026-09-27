@@ -117,7 +117,7 @@ def _rescale_w(w, s_old, s_new):
             f"velocity code {np.abs(out).max():.0f} escapes int16 under a rescale to a "
             "scale that does not cover it. Per-brick scales make this reachable where a "
             "global scale made it impossible; the caller must fix the destination scale "
-            "over the rows it is about to write. D-007 forbids the clamp."
+            "over the rows it is about to write. Integer state is never clamped."
         )
     return out.astype(np.int16)
 
@@ -324,7 +324,7 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert
                         f"{n_rows} rows unconsumed (reach {r}, consumption offsets "
                         f"{sorted({int(o) for o in reach})}). Destination-slab "
                         f"displacement histogram for this slab's emigrants: {hist}. "
-                        "D-007 forbids dropping; an unconsumed emigrant is a particle "
+                        "Particles are never dropped; an unconsumed emigrant is a particle "
                         "about to be destroyed."
                     )
                 del emig[s2]
@@ -348,7 +348,7 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert
         left = sum(len(v.get("dest", ())) for v in staged.values()) if staged else 0
         raise ValueError(
             f"the migration lost {n_before - n_after} particles ({n_before} -> "
-            f"{n_after} against {st.n_particles} stored). D-007 forbids dropping, "
+            f"{n_after} against {st.n_particles} stored). Particles are never dropped, "
             "so this is corruption, not imprecision.\n"
             f"  {len(staged)} slabs still staged at the end ({left} rows), "
             f"{len(inserted)} of {nb} slabs inserted, arena {st.arena_used}/"
@@ -421,8 +421,8 @@ def _replay_arena_pass(st, reach, r, r_raw, c_drift, scales, n_emig, rr_by_slab,
                     raise AssertionError(
                         f"releasing emig slab {s2} with {n_rows - consumed[s2]} of "
                         f"{n_rows} rows unconsumed (reach {r}, consumption offsets "
-                        f"{sorted({int(o) for o in reach})}). D-007 forbids "
-                        "dropping; an unconsumed emigrant is a particle about to "
+                        f"{sorted({int(o) for o in reach})}). Particles are never "
+                        "dropped; an unconsumed emigrant is a particle about to "
                         "be destroyed." + census_note
                     )
                 emig_sym.discard(s2)
@@ -558,7 +558,7 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
     if n_after != n_before:
         raise ValueError(
             f"the migration lost {n_before - n_after} particles ({n_before} -> "
-            f"{n_after} against {st.n_particles} stored). D-007 forbids dropping, "
+            f"{n_after} against {st.n_particles} stored). Particles are never dropped, "
             "so this is corruption, not imprecision.\n"
             f"  {rep['n_inserted']} of {nb} slabs inserted, arena {st.arena_used}/"
             f"{st.n_arena} (pooled pass)\n"
@@ -1229,7 +1229,7 @@ class SlotState:
                 f"velocity code {res['abs_max']:.0f} escapes int16 under a rescale to a "
                 "scale that does not cover it. Per-brick scales make this reachable where a "
                 "global scale made it impossible; the caller must fix the destination scale "
-                "over the rows it is about to write. D-007 forbids the clamp."
+                "over the rows it is about to write. Integer state is never clamped."
             )
         nw, ns = res["n_write"], res["n_spill"]
         pos = res["pos"][:nw]
@@ -1311,7 +1311,7 @@ class SlotState:
             raise ValueError(
                 f"{len(dest)} particles overflow their brick's capacity and the arena of "
                 f"{self.n_arena} slots has only {len(free)} free. The layout does not clamp "
-                "or drop (D-007). Raise brick_slack or arena_frac."
+                "or drop. Raise brick_slack or arena_frac."
             )
         a = free[: len(dest)]
         self._arena_free = free[len(dest):]

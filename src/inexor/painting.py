@@ -189,7 +189,7 @@ def check_tsc_paint_headroom(n_particles_total, frac_bits, max_cell_particles=1.
             f"frac_bits={frac_bits} (assumed max cell occupancy "
             f"{max_cell_particles:.1e} particles, stencil bound "
             f"{TSC_CELL_WEIGHT_BOUND}); lower frac_bits -- the int32 accumulator would "
-            "overflow (D-007-class corruption, not just imprecision)."
+            "overflow (silent wraparound, not just imprecision)."
         )
 
 

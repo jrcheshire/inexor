@@ -637,7 +637,7 @@ def _delta_on_cards(accs, cfg, census=False):
     if peak >= 2**31:
         raise ValueError(
             f"the accumulated coarse paint reached {peak}, past int32. "
-            "Lower frac_bits -- this is D-007-class corruption, not imprecision."
+            "Lower frac_bits -- int32 overflow corrupts the paint; it is not imprecision."
         )
     mean = float(cfg.n_total) / float(n) ** 3
     scale = 2.0 ** -cfg.frac_bits

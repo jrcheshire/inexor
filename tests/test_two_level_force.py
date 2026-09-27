@@ -767,7 +767,7 @@ def test_the_int_tile_arm_is_reachable_through_force_short_tiled():
     args = (pos, N_FINE_T, L_BOX, N_PART_T**3, N_TILE_T, B_FINE_T, member_fn, cap)
     g_f64, d_f64 = forces.force_short_tiled(*args, r_s=R_S)
     g_int, d_int = forces.force_short_tiled(*args, r_s=R_S, paint="int")
-    assert d_f64["paint"] == "f64", "the default moved; the probe-parity tests now compare arms"
+    assert d_f64["paint"] == "f64", "the paint= default moved off 'f64'"
     assert d_int["paint"] == "int"
     err = float(np.max(np.abs(g_int - g_f64)))
     peak = float(np.max(np.abs(g_f64)))

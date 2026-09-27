@@ -234,7 +234,7 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     if n_after != n_before:
         raise ValueError(
             f"the fused migrate + repack lost {n_before - n_after} particles ({n_before} -> "
-            f"{n_after} against {st.n_particles} stored). D-007 forbids dropping, so this is "
+            f"{n_after} against {st.n_particles} stored). Particles are never dropped, so this is "
             f"corruption, not imprecision. {rep['n_inserted']} of {nb} slabs inserted.")
     _m._merge_card_timings(ctx, timings)
     receipt = _m._pass_receipt(ctx, devices, device_budget_bytes, rep["spill_rows"])

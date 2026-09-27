@@ -59,8 +59,8 @@ def _host_bitwise_measured_here():
     import jax
 
     if jax.devices()[0].platform != "cpu":
-        pytest.skip("kernel == numpy bitwise is a CPU-backend measurement; the GPU reading "
-                    "is the D6 smoke's report")
+        pytest.skip("kernel == numpy bitwise is a CPU-backend measurement; on a GPU, "
+                    "scripts/run/device_ics.py smoke reports it")
 
 
 @pytest.mark.parametrize("inverse", [False, True])

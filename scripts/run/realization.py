@@ -204,8 +204,7 @@ def _geom(cfg_name, n_fine=None, buf=None, n_coarse=None, n_part=None):
             if int(g[k]) != int(ref[k]):
                 raise ValueError(
                     f"geometry tables disagree on {cfg_name}.{k}: plan.PRESETS says "
-                    f"{g[k]}, v2_m3_engine_gate says {ref[k]}. Every engine card on "
-                    "record was measured through the second one."
+                    f"{g[k]}, _instruments.CONFIGS says {ref[k]}."
                 )
         if float(g["L"]) != float(ref["L"]):
             raise ValueError(f"geometry tables disagree on {cfg_name}.L")
@@ -230,7 +229,7 @@ def _geom(cfg_name, n_fine=None, buf=None, n_coarse=None, n_part=None):
         if g["alpha"] < RATIFIED["alpha"]:
             raise SystemExit(
                 f"holding r_s at {r_s:g} Mpc/h needs alpha={g['alpha']:.3f}, below "
-                f"the ratified {RATIFIED['alpha']:g}. The coarse-representation "
+                f"the default {RATIFIED['alpha']:g}. The coarse-representation "
                 f"error exp(-pi^2 alpha^2) would be {math.exp(-math.pi ** 2 * g['alpha'] ** 2):.2e} "
                 "against 5.17e-05, which is larger than anything this is measuring."
             )
@@ -238,7 +237,7 @@ def _geom(cfg_name, n_fine=None, buf=None, n_coarse=None, n_part=None):
     if n_part is not None and int(n_part) != int(g["n_part"]):
         n = int(n_part)
         if n < 2 or n & (n - 1):
-            raise SystemExit(f"n_part {n} is not a power of two (D-007)")
+            raise SystemExit(f"n_part {n} is not a power of two")
         g["n_part"] = n
 
     alpha, beta, e_rep, e_trunc = _split_terms(g)
@@ -863,13 +862,12 @@ def build_parser():
                          "same seed is an UNRELATED realization")
     ap.add_argument("--a-init", type=float, default=A_INIT,
                     help="starting scale factor, for ICs and the step grid alike "
-                         "(default the ratified 0.1, z = 9). Loading ICs made at "
+                         "(default 0.1, z = 9). Loading ICs made at "
                          "another epoch is refused")
     ap.add_argument("--coarse-match-order", type=int, default=3, choices=(2, 3),
                     help="assignment order the coarse match factor divides out. "
                          "The coarse arm paints TSC, so 3 (default) is correct; 2 "
-                         "(CIC) is the legacy arm the probe parities were ratified "
-                         "on. In the checkpoint fingerprint when not 2, so arms "
+                         "(CIC) is the legacy arm. In the checkpoint fingerprint when not 2, so arms "
                          "cannot cross-resume")
     ap.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"),
                     help="second-order growth for the 2LPT ICs and the BullFrog "
@@ -881,13 +879,13 @@ def build_parser():
                     help="override the buffer in FINE CELLS. Changes beta and the "
                          "split's truncation error, both of which get printed")
     ap.add_argument("--bucket-cells", type=int, default=2,
-                    help="ics: position bucket side in particle cells (D-v2-14 "
-                         "ratifies 2). The quantum is bucket/256, so 1 halves it. "
+                    help="ics: position bucket side in particle cells (default "
+                         "2). The quantum is bucket/256, so 1 halves it. "
                          "Recorded in the manifest; run and card inherit it")
     ap.add_argument("--keep-stage", action="store_true",
                     help="keep the IC intermediates (~687 GB at 2048^3)")
     ap.add_argument("--generator", default="host", choices=("host", "device"),
-                    help="ics: the host generator, or the IC stage on the cards (D6)")
+                    help="ics: the host generator, or the IC stage on the cards")
     ap.add_argument("--noise", default="device", choices=("device", "host"),
                     help="ics --generator device: draw the noise on the cards "
                          "(IC_STREAM_DEVICE) or on the CPU (IC_STREAM)")
@@ -940,8 +938,7 @@ def build_parser():
                     help="card: force the serial paint (the A/B's other arm)")
     ap.add_argument("--heartbeat", type=float, default=60.0,
                     help="seconds between progress lines in the card and export "
-                         "loops; 0 turns them off. gb 1010938 ran 3 h 23 min "
-                         "inside the card with no way to read its progress")
+                         "loops; 0 turns them off")
     return ap
 
 

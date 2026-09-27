@@ -333,8 +333,7 @@ def _global_delta_and_kernels(
             raise ValueError(
                 f"assign='cic' has no {paint!r} accumulator: the int CIC path is "
                 "density_contrast's, which carries f32 counts, and the coarse arm "
-                "ratified in D-v2-10 is TSC. Use assign='tsc' for the engine's "
-                "D-006-compliant long arm."
+                "is TSC. Use assign='tsc' for the engine's order-independent long arm."
             )
         delta = density_f64(positions, n_mesh, box_size, n_particles_total, fdtype=fdtype)
     elif assign == "tsc":
@@ -1077,7 +1076,7 @@ def force_short_tiled(
             raise ValueError(
                 f"the global accumulate sink would allocate {need / 1024**3:.1f} GiB for "
                 f"{n} particles, over the {max_accumulate_bytes / 1024**3:.1f} GiB limit. "
-                "That array is what D-v2-16 clause 1 deletes (2 x 206 GB at C-gh); pass a "
+                "That array is O(N); pass a "
                 "tile-local `sink(idx, g_owned)` instead of raising the limit."
             )
         g_out = np.zeros((n, 3), dtype=geom["fdtype"])

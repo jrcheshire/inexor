@@ -60,7 +60,7 @@ def test_the_device_generation_loads_checks_and_says_what_it_is(tmp_path):
 @pytest.mark.parametrize("f_NL", [0.0, 10.0])
 def test_card_emission_is_bitwise_host_emission_in_the_generator(tmp_path, f_NL):
     if jax.devices()[0].platform != "cpu":
-        pytest.skip("a CPU-backend gate; the GPU reading is the D6 smoke's report")
+        pytest.skip("a CPU-backend gate")
     mh, host, _ = _gen(tmp_path, "host", f_NL=f_NL, noise="device", devices=_devices(4),
                        emission="host")
     mc, cards, _ = _gen(tmp_path, "cards", f_NL=f_NL, noise="device", devices=_devices(4))
@@ -107,7 +107,7 @@ SCALE_REL_BAR = {np.float32: 1.0e-6, np.float64: 1.2e-15}
 @pytest.mark.parametrize("f_NL", [0.0, 10.0])
 def test_the_device_generator_matches_the_host_generator_in_code_units(tmp_path, dt, f_NL):
     if jax.devices()[0].platform != "cpu":
-        pytest.skip("these bars are CPU-backend floors; the GPU reading is the D6 smoke's")
+        pytest.skip("these bars are CPU-backend floors")
     _mh, host, _ = _gen(tmp_path, "host", fn=icgen.generate_t9_slabs, fdtype=dt, f_NL=f_NL)
     _md, dev, _ = _gen(tmp_path, "dev", fdtype=dt, f_NL=f_NL, noise="host",
                        devices=_devices(4))

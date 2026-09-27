@@ -52,7 +52,7 @@ def _require_linux():
     if sys.platform != "linux":
         raise SystemExit(
             f"FATAL: {sys.platform} has no /proc/self/clear_refs, so a per-phase "
-            "high-water mark cannot be taken. Run this on antares/deneb."
+            "high-water mark cannot be taken. Run this on a Linux node."
         )
 
 
@@ -287,7 +287,7 @@ def _require_cpu():
     if jax.devices()[0].platform != "cpu":
         raise SystemExit(
             "FATAL: non-CPU backend. ru_maxrss is HOST memory; on CUDA the meshes "
-            "live in VRAM and every ratio reads 1.0 (deneb 409). Run the CPU env."
+            "live in VRAM and every ratio reads 1.0. Run the CPU env."
         )
     return jax
 

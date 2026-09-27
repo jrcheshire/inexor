@@ -326,7 +326,7 @@ def test_the_phase_model_would_have_refused_the_run_that_died():
                  + 3 * half_grid        # monolithic dk, its device copy, their product
                  + 3 * m["coarse_force_copy_transient"])
     assert old_solve / GB_ == pytest.approx(68.8, abs=1.0), (
-        f"the pre-M-v2-6 solve reconstructs to {old_solve / GB_:.1f} GB; if this "
+        f"the monolithic coarse solve reconstructs to {old_solve / GB_:.1f} GB; if this "
         "moved, the reconstruction is stale and the comparison is against nothing"
     )
     assert old_solve / GB_ < 79.0, (
@@ -349,7 +349,7 @@ def test_the_phase_model_would_have_refused_the_run_that_died():
     # the state figure is the c-gh table's own, at arena_frac 0.10
     old_peak = 112.476 * GB_ + resident + sum(in_step.values()) + 8 * 1.12 * GB_
     assert old_peak / GB_ > 237.0, (
-        f"the run that OOM-killed reconstructs to {old_peak / GB_:.1f} GB, which "
+        f"the failing configuration reconstructs to {old_peak / GB_:.1f} GB, which "
         "fits a gg node -- so the corrected model would have passed it too"
     )
 

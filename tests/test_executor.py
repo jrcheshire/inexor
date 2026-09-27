@@ -391,7 +391,7 @@ def test_the_pilot_configuration_would_now_be_refused():
     demand = sum(terms.values())
     assert demand / 1e9 == pytest.approx(148.5, abs=0.5)
     assert demand > gg_shm, (
-        f"c-gh asks {demand / 1e9:.1f} GB of a {gg_shm / 1e9:.1f} GB tmpfs"
+        f"2048^3 geometry asks {demand / 1e9:.1f} GB of a {gg_shm / 1e9:.1f} GB tmpfs"
     )
 
 
@@ -505,7 +505,7 @@ def test_memfd_is_detected_by_probe_not_by_attribute():
     if not hasattr(os, "memfd_create"):
         assert executor.shm_backend() == "memfd", (
             "has_memfd() is True but the backend chose posix, which is exactly "
-            "the silent downgrade that put 922557 back on the capped mount"
+            "the silent downgrade back onto the capped mount"
         )
     seg = executor.create_segment(1 << 16, "probe", backend="memfd")
     try:
@@ -660,7 +660,7 @@ def test_engine_run_carries_the_allocator_all_the_way_to_the_pool(tmp_path):
         state_bytes = sum(np.asarray(getattr(st, f)).nbytes for f in FIELDS)
         assert alloc.bytes_held() == held_after_load, (
             "the allocator grew during the run: the pool re-shared the state, "
-            "which is the 2x that OOM-killed 922819"
+            "which doubles shared memory for the state"
         )
         assert held_after_load >= state_bytes * 0.99
     finally:

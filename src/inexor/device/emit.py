@@ -244,7 +244,7 @@ def emit_t9_slabs_cards(workdir, ux_shards, uy, uz, v_ro, t9, n, box, nb, dt, wi
             _add("dest_s", t0)
             if amax > INT16_MAX:
                 raise ValueError(f"velocity code {amax:.0f} escapes int16 in slab {d}; "
-                                 "D-007 forbids the clamp")
+                                 "integer state is never clamped")
             t0 = time.perf_counter()
             name = _write_t9_slab(workdir, d, occ_h, off_h, w_h, s_h, d * nbp, d * nb2)
             _add("write_s", t0)

@@ -721,7 +721,7 @@ def _delta_from_accumulated(mesh, cfg, census=False):
     if peak >= 2**31:
         raise ValueError(
             f"the accumulated coarse paint reached {peak}, past int32. "
-            "Lower frac_bits -- this is D-007-class corruption, not imprecision."
+            "Lower frac_bits -- int32 overflow corrupts the paint; it is not imprecision."
         )
     # Slabbed decode: the transient is one f64 slab and the result lands at the requested
     # dtype; elementwise, so bitwise the whole-array form. Decode in f64, narrow after `- 1.0`

@@ -735,7 +735,7 @@ def cmd_run(args):
                               coarse_dtype=ec.coarse_dtype, fine_dtype=ec.fine_dtype)
         src = (f"the step-{args.expect_step} checkpoint in {args.checkpoint_dir}"
                if args.expect_step else args.workdir)
-        print(f"== D7 run {args.preset}: {args.cards} cards, steps {args.expect_step} -> "
+        print(f"== device run {args.preset}: {args.cards} cards, steps {args.expect_step} -> "
               f"{args.stop_at} of {args.k_steps}, window={ec.tile_window} "
               f"fused={ec.fused_pass}, from {src}", flush=True)
         mon.start()

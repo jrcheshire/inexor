@@ -184,7 +184,7 @@ def _to_index(counts, dtype, what):
     if hot > limit:
         raise ValueError(
             f"{what} bucket count {hot} exceeds the {np.dtype(dtype).name} index ceiling "
-            f"({limit}). The index does not wrap and does not clamp (D-007): occupancy "
+            f"({limit}). The index does not wrap and does not clamp: occupancy "
             "doubles as the derived bucket boundaries, so a modular narrowing would "
             "silently relocate every later bucket in the brick. Widen index_dtype."
         )
@@ -203,7 +203,7 @@ def _refuse_key_overflow(n_buckets):
         raise ValueError(
             f"bucket grid {int(n_buckets)} exceeds int32 ({np.iinfo(np.int32).max}), which is "
             "what `key` is stored in -- the high buckets would narrow to negative ordinals "
-            "silently. This bites at C-hero. Note the fix is NOT a wider key: at this scale "
+            "silently. The fix is NOT a wider key: at this scale "
             "the per-particle bookkeeping arrays (key, particle_to_slot, slot_to_particle) "
             "are ~21 B/p against ~10.5 B/p of state and cannot be resident at all, so the "
             "layout has to stop materializing them first."
@@ -399,7 +399,7 @@ class BrickPackedLayout:
                 raise ValueError(
                     f"{len(spill)} particles overflow their brick's capacity and the arena "
                     f"of {len(self.arena_bucket)} slots has only {len(free)} free. The layout "
-                    "does not clamp or drop (D-007). Raise brick_slack or arena_frac."
+                    "does not clamp or drop. Raise brick_slack or arena_frac."
                 )
             a = free[: len(spill)]
             self.arena_bucket[a] = spill_b

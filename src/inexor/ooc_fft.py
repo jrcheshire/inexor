@@ -157,8 +157,8 @@ def refuse_oversize_device_transform(n_elements, what="transform"):
         raise ValueError(
             f"{what} of {n_elements:,} elements is at or above the "
             f"{MAX_DEVICE_TRANSFORM_ELEMENTS:,} bound where a device FFT has "
-            "been MEASURED to return a wrong result silently (1536^3 f32 "
-            "roundtrip 3.8e+3 against 1024^3's 2.9e-6, Vista 972737). "
+            "been measured to return a wrong result silently (a 1536^3 f32 "
+            "roundtrip error of 3.8e+3). "
             "Factorize it: the plane is the unit."
         )
 

@@ -106,7 +106,7 @@ class _Budget:
                 f"budget of {self.limit / 1e9:.2f} GB: {held / 1e9:.2f} GB already held, "
                 f"{extra_bytes / 1e9:.2f} GB of window, and {coef:g} B x {padded_rows:,} "
                 "padded rows of kernel. The envelope is what a card has beside the tile "
-                "loop's resident terms (record sec. 29). Use fewer rows per slab or a "
+                "loop's resident terms. Use fewer rows per slab or a "
                 "smaller drift (fewer staged slabs), or raise the budget deliberately."
             )
 
@@ -535,7 +535,7 @@ def _insert_on_card(st, d, reach, staged, scales_dev, clock, budget, dev=None):
             f"velocity code {float(out['abs_max']):.0f} escapes int16 under a rescale to a "
             "scale that does not cover it. Per-brick scales make this reachable where a "
             "global scale made it impossible; the caller must fix the destination scale "
-            "over the rows it is about to write. D-007 forbids the clamp."
+            "over the rows it is about to write. Integer state is never clamped."
         )
     nw = int(_host(out["n_write"], "insert: scalars"))
     ns = int(_host(out["n_spill"], "insert: scalars"))
@@ -852,7 +852,7 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
     if n_after != n_before:
         raise ValueError(
             f"the migration lost {n_before - n_after} particles ({n_before} -> {n_after} "
-            f"against {st.n_particles} stored). D-007 forbids dropping, so this is "
+            f"against {st.n_particles} stored). Particles are never dropped, so this is "
             f"corruption, not imprecision. {rep['n_inserted']} of {nb} slabs inserted, "
             f"arena {st.arena_used}/{st.n_arena} (device pass)"
         )

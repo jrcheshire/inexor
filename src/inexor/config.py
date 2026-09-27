@@ -62,8 +62,8 @@ class BoxConfig:
             raise ValueError(f"n_mesh and box_size must be positive, got {self}")
         if U16_MOD % self.n_mesh != 0:
             raise ValueError(
-                f"n_mesh = {self.n_mesh} must divide 2^16: the exact-Lagrangian-site "
-                "identity (architecture.md Sec. 3) requires the mesh to be a sublattice "
+                f"n_mesh = {self.n_mesh} must divide 2^16: every Lagrangian site "
+                "must be an exact lattice point, so the mesh must be a sublattice "
                 "of the uint16 position lattice."
             )
 

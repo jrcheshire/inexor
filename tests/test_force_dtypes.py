@@ -570,7 +570,7 @@ def test_the_census_counts_round_trips_not_a_magnitude_threshold():
     assert above_threshold == 2, "fixture does not have two cells past 2^24"
     assert round_trip_fails == 1, (
         "the round-trip count agrees with the magnitude threshold here, so the census "
-        "design makes no difference and S3's finding should be re-checked"
+        "design makes no difference and the round-trip vs magnitude argument should be re-checked"
     )
 
 
@@ -639,8 +639,8 @@ def test_the_coarse_meshes_match_the_ratified_budget():
     f32 = engine.EngineConfig(**C_GH, coarse_dtype="float32").mesh_bytes()
     f64 = engine.EngineConfig(**C_GH, coarse_dtype="float64").mesh_bytes()
     assert f32["coarse_force_resident"] / GB == pytest.approx(12.0, abs=0.05), (
-        f"{f32['coarse_force_resident'] / GB:.2f} GiB against D-v2-16 clause 3's 12.9 GB "
-        "(= 12.0 GiB); the f32 coarse residency no longer matches the ratified figure"
+        f"{f32['coarse_force_resident'] / GB:.2f} GiB against the 12.9 GB "
+        "(= 12.0 GiB) budget; the f32 coarse residency no longer matches it"
     )
     assert f64["coarse_force_resident"] == 2 * f32["coarse_force_resident"]
 
@@ -724,6 +724,6 @@ def test_a_gather_accumulator_would_be_defeated_by_an_f64_weight():
 
     got = forces.gather_coarse_subblock(*sub, owned, origin, cell_c, n_coarse, assign="tsc")
     assert _name(got) == "float32", (
-        "an f32 sub-block gathered back to f64 -- S4's `ww.astype(dt)` is missing or has "
+        "an f32 sub-block gathered back to f64 -- the gather's `ww.astype(dt)` is missing or has "
         "been removed, and an f32 arm built on this would silently gather in double"
     )

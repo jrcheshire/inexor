@@ -84,8 +84,7 @@ def _same(a, b):
 
 def _cpu_only():
     if jax.devices()[0].platform != "cpu":
-        pytest.skip("card == host emission bitwise is a CPU-backend gate; the GPU reading "
-                    "is the D6 smoke's report")
+        pytest.skip("card == host emission bitwise is a CPU-backend gate")
 
 
 @pytest.mark.parametrize("n,nb,dt", [(32, 4, np.float32), (32, 4, np.float64),

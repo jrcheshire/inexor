@@ -140,7 +140,7 @@ def cmd_evolve(args):
           f"{'n/a' if peak is None else f'{peak / 1e9:.1f} GB'}", flush=True)
     meta.update(n_mesh=args.n_mesh, precision=args.precision, evolve_wall_s=wall,
                 device_peak_bytes=peak,
-                code="discodj", settings="M1 parity: worder=2, ik grad/laplace, "
+                code="discodj", settings="DISCO-DJ: worder=2, ik grad/laplace, "
                 "no deconvolution, no antialias, bullfrog")
     _save(args.out, x=X, v_d=V, a_steps=a_steps, meta=meta)
     return 0
@@ -259,7 +259,7 @@ def main():
     v.add_argument("--in", dest="inp", required=True)
     v.add_argument("--n-mesh", type=int, required=True)
     v.add_argument("--precision", default="double", choices=("double", "single"),
-                   help="double is the M1 parity setting")
+                   help="double is the cross-check setting")
     v.add_argument("--out", required=True)
     m = sub.add_parser("evolve-mono")
     m.add_argument("--in", dest="inp", required=True)

@@ -147,7 +147,7 @@ def test_the_corrected_long_arm_meets_its_ewald_target():
 def test_the_ewald_gate_can_fail():
     """Control: order 2 must fail the gate above, or it cannot tell the two orders apart."""
     err2 = _long_arm_error(2)
-    assert err2 < -2e-2, f"ratified long arm reads {err2:+.4f}; the gate lost its power"
+    assert err2 < -2e-2, f"order-2 long arm reads {err2:+.4f}; the gate lost its power"
 
 
 if __name__ == "__main__":
