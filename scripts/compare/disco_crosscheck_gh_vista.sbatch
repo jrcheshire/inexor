@@ -4,7 +4,6 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 01:30:00
-#SBATCH -A JPL-SPHEREx
 #SBATCH -o disco-xcheck-%j.log
 # Does a single-mesh PM share the ~14% high-k deficit against EE2?
 #
@@ -44,13 +43,13 @@ export PYTHONUNBUFFERED=1
 export CONDA_OVERRIDE_CUDA=12.0
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
 
-INEXOR=$HOME/src/inexor
-DISCO=$HOME/src/disco-mocks
-RUNS=/scratch/10303/jrc4/inexor_runs
+INEXOR=${INEXOR_SRC:-$SLURM_SUBMIT_DIR}
+DISCO=${DISCO_SRC:?set DISCO_SRC to the disco-mocks checkout}
+RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 WORK=$RUNS/disco-xcheck-$SLURM_JOB_ID
 # IC_DIR overrides the realization (e.g. a chained engine job's fresh ICs); the
 # default is the EdS-era corrected-match realization mo3_1018341_k120 carded
-IC=${IC_DIR:-$RUNS/match-order-1018341/ics}
+IC=${IC_DIR:?set IC_DIR to the IC directory to cross-check}
 DRV=scripts/compare/disco_crosscheck.py
 mkdir -p "$WORK"
 

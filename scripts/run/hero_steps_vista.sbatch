@@ -4,7 +4,6 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 11:00:00
-#SBATCH -A JPL-SPHEREx
 #SBATCH -o d8-hero-k120-%j.log
 #SBATCH --signal=B:USR1@900
 # D8: the 4096^3 realization on the 120-step schedule (LCDM weights, D-v2-25), run
@@ -46,8 +45,9 @@
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
-cd "$SCRATCH/src/inexor" 2>/dev/null || cd "$HOME/src/inexor" || {
-  echo "FATAL: no inexor checkout"; exit 1; }
+# Run from the inexor checkout: INEXOR_SRC, or the directory sbatch was called from.
+cd "${INEXOR_SRC:-$SLURM_SUBMIT_DIR}" && [ -f src/inexor/engine.py ] || {
+  echo "FATAL: not an inexor checkout: ${INEXOR_SRC:-$SLURM_SUBMIT_DIR} (set INEXOR_SRC)"; exit 1; }
 export PYTHONUNBUFFERED=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
@@ -59,11 +59,11 @@ export JAX_LOG_COMPILES=1
 unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
 
-RUNS=/scratch/10303/jrc4/inexor_runs
-HERO=${HERO_IC_DIR:-$RUNS/c-hero-lcdm-r1}
+RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
+HERO=${HERO_IC_DIR:?set HERO_IC_DIR to the IC directory}
 # the realization's home is FIXED across the three segments; each job's own scratch
 # (smoke, control) is under it by job id
-REAL=${REAL_DIR:-$RUNS/d8-hero-k120}
+REAL=${REAL_DIR:?set REAL_DIR to the realization directory (checkpoints)}
 WORK=$REAL/job-$SLURM_JOB_ID
 CKPT=$REAL/hero-ckpt
 : "${EXPECT_STEP:?pass EXPECT_STEP (0, 40 or 80) with --export}"

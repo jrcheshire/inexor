@@ -4,7 +4,6 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 03:00:00
-#SBATCH -A JPL-SPHEREx
 #SBATCH -o d8-hero-ics-%j.log
 # D8, job 1 of the 120-step 4096^3 realization: the ICs, with LCDM second-order
 # growth (D-v2-25), by the device generator on four GB200s, into a NEW directory.
@@ -27,8 +26,9 @@
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
-cd "$SCRATCH/src/inexor" 2>/dev/null || cd "$HOME/src/inexor" || {
-  echo "FATAL: no inexor checkout"; exit 1; }
+# Run from the inexor checkout: INEXOR_SRC, or the directory sbatch was called from.
+cd "${INEXOR_SRC:-$SLURM_SUBMIT_DIR}" && [ -f src/inexor/engine.py ] || {
+  echo "FATAL: not an inexor checkout: ${INEXOR_SRC:-$SLURM_SUBMIT_DIR} (set INEXOR_SRC)"; exit 1; }
 export PYTHONUNBUFFERED=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_CLIENT_MEM_FRACTION=0.95
@@ -38,8 +38,8 @@ export XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=900
 unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
 
-RUNS=/scratch/10303/jrc4/inexor_runs
-HERO=${HERO_IC_DIR:-$RUNS/c-hero-lcdm-r1}
+RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
+HERO=${HERO_IC_DIR:?set HERO_IC_DIR to the directory the ICs are written to}
 CARDS=runs/v2
 TAG=d8_ics_$SLURM_JOB_ID
 GPU_LOG=$CARDS/${TAG}_gpu.csv

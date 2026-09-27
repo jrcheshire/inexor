@@ -4,7 +4,6 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 04:00:00
-#SBATCH -A JPL-SPHEREx
 #SBATCH -o d8-gh-1card-%j.log
 #SBATCH --signal=B:USR1@900
 # D8 on ONE GH200: a whole realization at PRESET (default c-1024 = 1024^3 in 512 Mpc/h,
@@ -35,8 +34,9 @@
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
-cd "$SCRATCH/src/inexor" 2>/dev/null || cd "$HOME/src/inexor" || {
-  echo "FATAL: no inexor checkout"; exit 1; }
+# Run from the inexor checkout: INEXOR_SRC, or the directory sbatch was called from.
+cd "${INEXOR_SRC:-$SLURM_SUBMIT_DIR}" && [ -f src/inexor/engine.py ] || {
+  echo "FATAL: not an inexor checkout: ${INEXOR_SRC:-$SLURM_SUBMIT_DIR} (set INEXOR_SRC)"; exit 1; }
 export PYTHONUNBUFFERED=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
@@ -55,7 +55,7 @@ SLACK=${SLACK:-0.10}
 ALLOC_MARGIN=${ALLOC_MARGIN:-0.10}
 ARENA=${ARENA_FRAC:-0.01}
 K=120
-RUNS=/scratch/10303/jrc4/inexor_runs
+RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 WORK=$RUNS/d8-gh-$PRESET-$SLURM_JOB_ID
 ICS=$WORK/ics
 CKPT=$WORK/ckpt
