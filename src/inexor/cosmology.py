@@ -123,8 +123,8 @@ def _check_model(model):
 def growth_factor_2(a, cosmo, model="lcdm"):
     """Second-order growth factor D2(a) for 2LPT, normalized with growth_factor_a.
 
-    Normalized consistently with growth_factor_a (D1(a=1) = 1), so the Lagrangian
-    displacement is Psi = D1 Psi1 + D2 Psi2 and D2 carries 1/D0^2.
+    Normalized consistently with growth_factor_a (D1(a=1) = 1); D2 < 0 and carries 1/D0^2.
+    In `lpt`'s convention the 2LPT position is x = q + D1 Psi1 - D2 Psi2.
 
     model="lcdm" (default) is the solution of the LCDM second-order growth ODE
     (`_growth2_solution`). model="eds" is the approximation D2 = -(3/7) D1^2

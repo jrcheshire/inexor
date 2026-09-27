@@ -38,8 +38,8 @@ User documentation is in `docs/`; start with `docs/getting_started.md`.
 
 ## Tests and lanes
 
-- Most tests run on the CPU backend. Multi-card tests need four devices; on CPU they get them
-  with `XLA_FLAGS=--xla_force_host_platform_device_count=4` (set inside those tests).
+- Most tests run on the CPU backend. Multi-card tests need four devices and skip otherwise;
+  on CPU, run them with `XLA_FLAGS=--xla_force_host_platform_device_count=4`.
 - `detflag` tests assert bit equality; on a GPU they need `XLA_FLAGS=--xla_gpu_deterministic_ops=true`
   and are skipped visibly without it (`pixi run test-det` runs them). On CPU they always run.
 - Some gates are CPU-backend only and skip on a GPU; the executor's worker pool refuses a
