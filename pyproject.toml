@@ -1,6 +1,6 @@
 [project]
 name = "inexor"
-description = "Exactly reversible, compressed-state differentiable N-body: a JAX particle-mesh code with fixed-point integer phase space and a bit-exact-replay adjoint."
+description = "A memory-lean particle-mesh N-body engine in JAX: compressed fixed-point particle state, a two-level force and streamed initial conditions, sized to fit large realizations on one node."
 authors = [{ name = "James Cheshire", email = "cheshire@caltech.edu" }]
 maintainers = [{ name = "James Cheshire", email = "cheshire@caltech.edu" }]
 requires-python = ">=3.11"
@@ -40,7 +40,7 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 python = ">=3.11"
 numpy = "*"
 scipy = "*"          # host-side float64 background integrals (precision island)
-matplotlib = "*"     # diagnostics / M0 probe plots
+matplotlib = "*"     # diagnostic plots
 pytest = "*"
 pytest-xdist = "*"
 ruff = "*"
