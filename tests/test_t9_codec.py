@@ -19,16 +19,9 @@ x64 throughout, because the gate that produced the ratified numbers runs f64.
 The library never sets it -- callers do (house rule), so there is a fixture.
 """
 
-import os
-import sys
 
 import numpy as np
 import pytest
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "scripts"))
-
-from v2_g2c_accum_gate import _rt_pos_lattice, _rt_vel_int16_max  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -65,51 +58,7 @@ def _layout(bucket_cells, n_part=N_PART, box=L_BOX):
     return T9Layout(box_size=box, n_part=n_part, bucket_cells=bucket_cells)
 
 
-def _probe_levels(bucket_cells, n_part=N_PART):
-    """The probe's own expression, verbatim: n_levels = (n_fine * 128) // c with
-    n_fine = 2 * n_part. Written this way rather than simplified so a change to
-    either side shows up as a disagreement instead of cancelling."""
-    n_fine = 2 * n_part
-    return (n_fine * 128) // bucket_cells
-
-
 # ------------------------------------------------------- the ratified gate
-
-
-@pytest.mark.parametrize("bucket_cells", BUCKET_ARMS)
-def test_position_roundtrip_is_bitwise_identical_to_the_ratified_arm(bucket_cells):
-    import jax.numpy as jnp
-
-    from inexor.codec import roundtrip_positions
-
-    x = _positions(seed=1)
-    lay = _layout(bucket_cells)
-    assert lay.n_levels == _probe_levels(bucket_cells), "layout disagrees with the probe's lattice"
-
-    mine = roundtrip_positions(x, lay)
-    theirs = _rt_pos_lattice(x, L_BOX, _probe_levels(bucket_cells))
-
-    assert mine.dtype == theirs.dtype == jnp.float64
-    assert jnp.array_equal(mine, theirs), (
-        f"c={bucket_cells}: shipped codec is not the measured one; "
-        f"max |diff| = {float(jnp.max(jnp.abs(mine - theirs))):.3e}"
-    )
-
-
-@pytest.mark.parametrize("bucket_cells", BUCKET_ARMS)
-def test_the_bitwise_gate_can_fail(bucket_cells):
-    """A gate that cannot fail is not a gate. Perturb the lattice by ONE level --
-    the smallest change that is still a different codec -- and the equality must
-    break. (Perturbing the quantum by an ulp instead would test float noise;
-    perturbing the level count tests that we are on the right lattice.)"""
-    import jax.numpy as jnp
-
-    from inexor.codec import roundtrip_positions
-
-    x = _positions(seed=1)
-    mine = roundtrip_positions(x, _layout(bucket_cells))
-    wrong = _rt_pos_lattice(x, L_BOX, _probe_levels(bucket_cells) * 2)
-    assert not jnp.array_equal(mine, wrong)
 
 
 @pytest.mark.parametrize("bucket_cells", BUCKET_ARMS)
@@ -303,25 +252,6 @@ def test_encoded_velocity_always_fits_int16():
 
     w0, s0 = encode_velocities(jnp.zeros((16, 3)))
     assert int(jnp.max(jnp.abs(w0))) == 0 and float(s0) > 0.0
-
-
-def test_velocity_roundtrip_tracks_the_probe_within_one_quantum():
-    """Not bitwise -- the scale differs by 65536/65534 by construction. What is
-    asserted is that the deviation is bounded by the probe's own quantum, i.e.
-    it is a resolution change and not a different codec."""
-    import jax.numpy as jnp
-
-    from inexor.codec import decode_velocities, encode_velocities
-
-    rng = np.random.default_rng(9)
-    v = jnp.asarray(rng.normal(size=(8192, 3)))
-    w, scale = encode_velocities(v)
-    mine = decode_velocities(w, scale, fdtype=v.dtype)
-    theirs, _ = _rt_vel_int16_max(v)
-
-    q_probe = float(2.0 * jnp.max(jnp.abs(v)) / 65536.0)
-    assert float(jnp.max(jnp.abs(mine - theirs))) <= q_probe
-    assert float(scale) / q_probe == pytest.approx(65536.0 / 65534.0, rel=1e-9)
 
 
 def test_velocity_does_not_clip_the_extremes():

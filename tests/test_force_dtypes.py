@@ -32,14 +32,10 @@ Both tests carry the reason in their assertion message, so a later
 explanation rather than with a bare dtype mismatch.
 """
 
-import os
-import sys
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "scripts"))
 
 from inexor import engine, forces, painting, state  # noqa: E402
 from inexor.codec import T9Layout  # noqa: E402

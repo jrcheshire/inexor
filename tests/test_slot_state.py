@@ -7,14 +7,10 @@ Everything else here is either that invariant under a stress, or a guard against
 the two codec implementations (jnp in `codec`, numpy in `state`) drifting apart.
 """
 
-import os
-import sys
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "scripts"))
 
 from inexor import layout, state  # noqa: E402
 from inexor.codec import T9Layout  # noqa: E402

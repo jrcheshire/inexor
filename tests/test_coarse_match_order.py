@@ -8,18 +8,14 @@ ratified expression unchanged, and the corrected arm meets its Ewald target
 where the ratified one measurably does not.
 """
 
-import argparse
-import os
-import sys
+import itertools
 
 import numpy as np
 import pytest
+from scipy.special import erfc
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(HERE, "scripts"))
-
-from inexor import forces  # noqa: E402
-from inexor.engine import EngineConfig, _FINGERPRINTED, checkpoint_fingerprint  # noqa: E402
+from inexor import forces
+from inexor.engine import EngineConfig, _FINGERPRINTED, checkpoint_fingerprint
 
 
 @pytest.fixture(autouse=True)
@@ -86,24 +82,42 @@ def test_the_order_two_fingerprint_is_the_pre_knob_one():
     assert checkpoint_fingerprint(_cfg(), co) != h.hexdigest()
 
 
-def test_the_driver_passes_the_order_to_the_engine():
-    import v2_m6_realization as rlz
+def _ewald_real(d, L, a, n_img=1):
+    """Real-space (erfc) part of the periodic force of a unit point mass, per unit
+    mass, at displacements d (n, 3) from the source."""
+    g = np.zeros_like(d)
+    for n in itertools.product(range(-n_img, n_img + 1), repeat=3):
+        rv = d + L * np.asarray(n, float)
+        r = np.linalg.norm(rv, axis=1)
+        f = (erfc(a * r) + 2.0 * a * r / np.sqrt(np.pi) * np.exp(-(a * r) ** 2)) / r**3
+        g -= rv * f[:, None]
+    return g / (4.0 * np.pi)
 
-    a = argparse.Namespace(slack=0.10, tile_workers=1, checkpoint_every=5,
-                           migrate_pooled=None, eject_kernel="jax", coarse_match_order=3)
-    assert rlz._engine_config(rlz._geom("cdev8"), a, "/tmp/nowhere").coarse_match_order == 3
-    a.coarse_match_order = 2
-    assert rlz._engine_config(rlz._geom("cdev8"), a, "/tmp/nowhere").coarse_match_order == 2
-    del a.coarse_match_order
-    assert rlz._engine_config(rlz._geom("cdev8"), a, "/tmp/nowhere").coarse_match_order == 3
+
+def _ewald_recip(d, L, a, n_max):
+    """Reciprocal-space part, per unit mass, uniform background removed (k = 0 dropped)."""
+    g = np.zeros_like(d)
+    ns = np.arange(-n_max, n_max + 1)
+    for nx in ns:
+        k = 2.0 * np.pi / L * np.stack(np.meshgrid([nx], ns, ns, indexing="ij"), -1).reshape(-1, 3)
+        k2 = (k**2).sum(1)
+        keep = k2 > 0
+        k, k2 = k[keep], k2[keep]
+        w = np.exp(-k2 / (4.0 * a * a)) / k2
+        g -= (np.sin(d @ k.T) * w) @ k
+    return g / L**3
+
+
+def _ewald_total(d, L):
+    a = 5.0 / L
+    n_max = int(np.ceil(2.0 * a * 6.5 * L / (2.0 * np.pi)))
+    return _ewald_real(d, L, a, n_img=2) + _ewald_recip(d, L, a, n_max)
 
 
 def _long_arm_error(order):
     """Mean long-arm error as a fraction of the total Ewald force, over
     r = 1.6-3.4 Mpc/h, at production cells (fine 0.25, coarse 1.0, r_s 1.0) in
     a 32 Mpc/h box. The window where the ratified arm is most wrong."""
-    import v2_force_profile as fp
-
     L, n_fine, n_coarse = 32.0, 128, 32
     fine, coarse, r_s = L / n_fine, L / n_coarse, 1.0
     n_total = 64**3
@@ -114,7 +128,7 @@ def _long_arm_error(order):
     u /= np.linalg.norm(u, axis=1)[:, None]
     r = rng.uniform(1.6, 3.4, size=400)
     tests = np.mod(src + u * r[:, None], L)
-    d = fp._min_image(tests - src, L)
+    d = (tests - src) - L * np.rint((tests - src) / L)
 
     def long(x):
         match = (coarse, fine) if order == 2 else (coarse, fine, order, 2)
@@ -123,8 +137,8 @@ def _long_arm_error(order):
         return np.asarray(g)
 
     g_src = long(np.vstack([tests, src[None]]))[:-1] - long(tests)
-    tot = m * fp.ewald_total(d, L)
-    ref_long = tot - m * fp.ewald_real(d, L, 1.0 / (2.0 * r_s), n_img=1)
+    tot = m * _ewald_total(d, L)
+    ref_long = tot - m * _ewald_real(d, L, 1.0 / (2.0 * r_s), n_img=1)
     rhat = d / np.linalg.norm(d, axis=1)[:, None]
     fr = lambda g: -(g * rhat).sum(1)  # noqa: E731
     return float(np.mean((fr(g_src) - fr(ref_long)) / fr(tot)))

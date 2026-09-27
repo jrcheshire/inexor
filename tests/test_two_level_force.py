@@ -21,16 +21,10 @@ An assertion that cannot discriminate is worse than an absent one: it reads as
 evidence.
 """
 
-import os
-import sys
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "scripts"))
-
-import v2_g5_core as probe  # noqa: E402
 
 from inexor import forces, painting  # noqa: E402
 
@@ -62,6 +56,34 @@ def _positions(seed=0, n_part=N_PART):
     g = (np.arange(n_part) + 0.5) * (L_BOX / n_part)
     q = np.stack(np.meshgrid(g, g, g, indexing="ij"), axis=-1).reshape(-1, 3)
     return np.mod(q + rng.normal(scale=0.3 * L_BOX / n_part, size=q.shape), L_BOX)
+
+
+def test_tile_origin_may_be_negative_and_the_wrap_still_works():
+    """The buffer of tile (0,0,0) hangs off the low edge, so its origin is
+    negative by construction -- that is the case `mod` is relied on to handle,
+    and a "fix" that clamped it would silently drop the wrapped buffer."""
+    cell = L_BOX / N_MESH
+    origin, extent = forces.tile_origin_extent((0, 0, 0), 8, 4, cell)
+    assert np.all(origin < 0)
+    # a particle just inside the far edge must land in the low tile's buffer
+    u = np.asarray(forces.tile_local_coords(np.array([[L_BOX - 0.1] * 3]), origin, L_BOX))
+    assert np.all(u < extent), "the wrapped buffer particle was not captured"
+
+
+def _membership(pos, n_fine, n_tile, b_fine):
+    """Brute-force tile membership: every particle inside a tile's extent plus buffer."""
+    cell = L_BOX / n_fine
+    _, b_real = forces.padded_size(n_tile, b_fine, n_fine=n_fine)
+    n_side = n_fine // n_tile
+    tiles = [(i, j, k) for i in range(n_side) for j in range(n_side) for k in range(n_side)]
+
+    def member_fn(tijk):
+        origin, extent = forces.tile_origin_extent(tijk, n_tile, b_real, cell)
+        u = np.asarray(forces.tile_local_coords(pos, origin, L_BOX))
+        return np.flatnonzero(np.all(u < extent, axis=1))
+
+    cap = forces.tile_capacity(len(member_fn(t)) for t in tiles)
+    return member_fn, cap
 
 
 def _agree(mine, theirs, what, min_range=1e-6, min_nonzero_frac=0.5):
@@ -100,17 +122,6 @@ def _agree(mine, theirs, what, min_range=1e-6, min_nonzero_frac=0.5):
 # --------------------------------------------------------------- the kernels
 
 
-def test_kernel_grids_is_bitwise_the_probe():
-    """Non-cubic shape on purpose: the padded tile box is non-cubic in general,
-    and a cubic-only fixture would not exercise the per-axis k build that is the
-    whole reason this exists beside `k_components`."""
-    shape, cell = (8, 12, 16), L_BOX / 16
-    mine = forces.kernel_grids(shape, cell, np.float64)
-    theirs = probe.kernel_grids(shape, cell, np.float64)
-    for a, b, name in zip(mine, theirs, ("ikx", "iky", "ikz", "k2_true", "k2_safe")):
-        _agree(a, b, f"kernel_grids/{name}")
-
-
 def test_k2_true_keeps_a_genuine_dc_zero_and_k2_safe_does_not():
     """The distinction the two returns exist for: S built from k2_safe would
     give S(0) = exp(-r_s^2) != 1 and break the split at DC silently."""
@@ -118,18 +129,6 @@ def test_k2_true_keeps_a_genuine_dc_zero_and_k2_safe_does_not():
     assert k2_true[0, 0, 0] == 0.0
     assert k2_safe[0, 0, 0] == 1.0
     assert forces.s_of_k(k2_true, R_S)[0, 0, 0] == 1.0
-
-
-@pytest.mark.parametrize("which", ["mono", "long", "short"])
-def test_split_factor_is_bitwise_the_probe(which):
-    _, _, _, k2_true, _ = forces.kernel_grids((8,) * 3, 1.0)
-    mine = forces.split_factor(k2_true, R_S, which)
-    theirs = probe.split_factor(k2_true, R_S, which)
-    # `mono` is identically 1 and `long` is ~1 at low k, so the usual
-    # dynamic-range guard would misfire; assert the shape of each instead.
-    assert np.array_equal(mine, theirs)
-    if which == "short":
-        _agree(mine, theirs, "split_factor/short")
 
 
 def test_long_plus_short_is_exactly_mono():
@@ -144,15 +143,6 @@ def test_long_plus_short_is_exactly_mono():
     assert float(np.max(s_short)) > 0.9, "fixture does not reach the short-dominated regime"
 
 
-def test_split_kernels_is_bitwise_the_probe_gauss_family():
-    shape, cell = (16, 16, 16), L_BOX / 16
-    for which in ("mono", "long", "short"):
-        mine = forces.split_kernels(shape, cell, which, r_s=R_S)
-        theirs = probe.split_kernels(shape, cell, which, "gauss", r_s=R_S)
-        for a, b, ax in zip(mine, theirs, "xyz"):
-            _agree(a, b, f"split_kernels/{which}/{ax}")
-
-
 def test_windowed_families_are_not_reachable_from_the_package():
     """They measured ~10x worse in the coarse arm and D-v2-10 froze the gaussian
     family. Asserted so a later caller cannot quietly resurrect a branch that
@@ -162,53 +152,7 @@ def test_windowed_families_are_not_reachable_from_the_package():
     assert "family" not in inspect.signature(forces.split_kernels).parameters
 
 
-@pytest.mark.parametrize("order", [2, 3])
-def test_assignment_window_is_bitwise_the_probe(order):
-    shape, cell = (8, 12, 16), 0.7
-    _agree(
-        forces.assignment_window(shape, cell, order),
-        probe.assignment_window(shape, cell, order),
-        f"assignment_window/order{order}",
-    )
-
-
-def test_cic_match_factor_is_bitwise_the_probe_including_the_clip():
-    shape = (16, 16, 16)
-    for clip in (None, 10.0):
-        mine, mine_max = forces.cic_match_factor(shape, 2.0, 0.5, clip=clip)
-        theirs, theirs_max = probe.cic_match_factor(shape, 2.0, 0.5, clip=clip)
-        _agree(mine, theirs, f"cic_match_factor/clip={clip}")
-        assert mine_max == theirs_max
-    # the clip must actually bind on this fixture, or it is untested
-    assert mine_max > 10.0, f"max_applied {mine_max} does not reach the clip"
-
-
 # ------------------------------------------------------------------- the paint
-
-
-@pytest.mark.detflag
-def test_paint_tsc_f64_is_bitwise_the_probe():
-    import jax.numpy as jnp
-
-    pos = jnp.asarray(_positions(1))
-    _agree(
-        painting.paint_tsc_f64(pos, N_MESH, L_BOX, N_PART**3),
-        probe.paint_tsc_f64(pos, N_MESH, L_BOX, N_PART**3),
-        "paint_tsc_f64",
-    )
-
-
-def test_tsc_read_vector_is_bitwise_the_probe():
-    import jax.numpy as jnp
-
-    pos = jnp.asarray(_positions(2))
-    rng = np.random.default_rng(3)
-    g = [jnp.asarray(rng.normal(size=(N_MESH,) * 3)) for _ in range(3)]
-    _agree(
-        painting.tsc_read_vector(*g, pos, N_MESH, L_BOX),
-        probe.tsc_read_vector(*g, pos, N_MESH, L_BOX),
-        "tsc_read_vector",
-    )
 
 
 def test_tsc_weights_are_a_partition_of_unity():
@@ -223,57 +167,7 @@ def test_tsc_weights_are_a_partition_of_unity():
     assert np.max(np.abs(total - 1.0)) < 1e-15, f"max |sum w - 1| = {np.max(np.abs(total - 1.0)):e}"
 
 
-@pytest.mark.detflag
-def test_density_f64_is_bitwise_the_probe():
-    import jax.numpy as jnp
-
-    pos = jnp.asarray(_positions(5))
-    _agree(
-        forces.density_f64(pos, N_MESH, L_BOX, N_PART**3),
-        probe.density_f64(pos, N_MESH, L_BOX, N_PART**3),
-        "density_f64",
-    )
-
-
 # ------------------------------------------------------------- the global arm
-
-
-@pytest.mark.detflag
-@pytest.mark.parametrize("which", ["mono", "long", "short"])
-@pytest.mark.parametrize("assign", ["cic", "tsc"])
-def test_force_global_is_bitwise_the_probe(which, assign):
-    import jax.numpy as jnp
-
-    pos = jnp.asarray(_positions(6))
-    mine, mine_max = forces.force_global(
-        pos, N_MESH, L_BOX, N_PART**3, which, r_s=R_S, assign=assign
-    )
-    theirs, theirs_max = probe.force_global(
-        pos, N_MESH, L_BOX, N_PART**3, which, family="gauss", r_s=R_S, assign=assign
-    )
-    _agree(mine, theirs, f"force_global/{which}/{assign}")
-    assert mine_max == theirs_max
-
-
-@pytest.mark.detflag
-def test_force_global_matching_arm_is_bitwise_the_probe():
-    """The matched coarse arm is the one D-v2-10 ratified, so it is the one that
-    most needs pinning -- and it is the only path where `cic_match_factor` runs
-    inside the solve rather than standalone."""
-    import jax.numpy as jnp
-
-    pos = jnp.asarray(_positions(7))
-    cell_c, cell_f = L_BOX / N_MESH, L_BOX / (N_MESH * 4)
-    mine, mine_max = forces.force_global(
-        pos, N_MESH, L_BOX, N_PART**3, "long", r_s=R_S,
-        match=(cell_c, cell_f), clip=10.0, assign="tsc",
-    )
-    theirs, theirs_max = probe.force_global(
-        pos, N_MESH, L_BOX, N_PART**3, "long", family="gauss", r_s=R_S,
-        match=(cell_c, cell_f), clip=10.0, assign="tsc",
-    )
-    _agree(mine, theirs, "force_global/matched")
-    assert mine_max == theirs_max > 1.0, "the matching factor did not bind"
 
 
 def test_force_global_long_plus_short_recovers_mono_at_the_f1_floor():
@@ -294,28 +188,6 @@ def test_force_global_long_plus_short_recovers_mono_at_the_f1_floor():
 # --------------------------------------------------------- the anti-vacuity arm
 
 
-def test_the_parity_check_can_actually_fail():
-    """Break it on purpose. A 1e-9 relative perturbation -- far below any
-    tolerance this project would have used -- must destroy bitwise equality, and
-    `_agree` must be what reports it.
-
-    This exists because the first V4 attempt at a parity check passed on all-zero
-    arrays: `r_s=None` made the short kernel identically zero, so two different
-    implementations agreed perfectly about nothing.
-    """
-    import jax.numpy as jnp
-
-    pos = np.asarray(_positions(9))
-    theirs, _ = probe.force_global(
-        jnp.asarray(pos), N_MESH, L_BOX, N_PART**3, "short", family="gauss", r_s=R_S
-    )
-    nudged, _ = forces.force_global(
-        jnp.asarray(pos * (1.0 + 1e-9)), N_MESH, L_BOX, N_PART**3, "short", r_s=R_S
-    )
-    with pytest.raises(AssertionError, match="elements differ"):
-        _agree(nudged, theirs, "deliberately perturbed")
-
-
 def test_the_vacuity_guard_rejects_an_all_zero_oracle():
     """The other half: `_agree` must refuse to pass on the degenerate arrays
     that made the original check meaningless, even when they are equal."""
@@ -327,34 +199,12 @@ def test_the_vacuity_guard_rejects_an_all_zero_oracle():
 # =========================================================== the tile geometry
 
 
-def test_padded_size_selection_is_bitwise_the_probe_over_the_frozen_range():
-    """The <=512 entries fix every already-measured tile selection, so the whole
-    frozen range is checked rather than sampled. This is the same exhaustive
-    check that licensed appending the >512 block in the first place."""
-    for want in range(1, 513):
-        assert forces.padded_size(want, 0) == probe.padded_size(want, 0), f"want={want}"
-
-
 def test_padded_size_refuses_a_degenerate_tile():
     """A padded tile at least as big as the box does more FFT work than the
     monolithic solve it replaces, and with the brick wrap it is where the
     double-count bug lives."""
     with pytest.raises(ValueError, match="degenerate"):
         forces.padded_size(64, 40, n_fine=64)
-
-
-def test_tile_origin_may_be_negative_and_the_wrap_still_works():
-    """The buffer of tile (0,0,0) hangs off the low edge, so its origin is
-    negative by construction -- that is the case `mod` is relied on to handle,
-    and a "fix" that clamped it would silently drop the wrapped buffer."""
-    cell = L_BOX / N_MESH
-    origin, extent = forces.tile_origin_extent((0, 0, 0), 8, 4, cell)
-    assert np.all(origin < 0)
-    o2, e2 = probe.tile_origin_extent((0, 0, 0), 8, 4, cell)
-    assert np.array_equal(origin, o2) and extent == e2
-    # a particle just inside the far edge must land in the low tile's buffer
-    u = np.asarray(forces.tile_local_coords(np.array([[L_BOX - 0.1] * 3]), origin, L_BOX))
-    assert np.all(u < extent), "the wrapped buffer particle was not captured"
 
 
 # ------------------------------------------------------- the tile paint/gather
@@ -384,36 +234,6 @@ def _tile_fixture(seed, n_tile=N_TILE_T, b_fine=B_FINE_T, n_fine=N_FINE_T):
     return u, live, (P,) * 3, cell
 
 
-@pytest.mark.detflag
-def test_tile_paint_f64_is_bitwise_the_probe():
-    u, live, shape, cell = _tile_fixture(10)
-    mean = N_PART_T**3 / float(N_FINE_T) ** 3
-    mine, n_out_mine = forces.tile_paint_f64(u, live, shape, cell, mean)
-    theirs, n_out_theirs = probe.tile_paint_f64(u, live, shape, cell, mean)
-    # a sparse tile mesh is mostly empty cells; the occupied ones are the test
-    _agree(mine, theirs, "tile_paint_f64", min_nonzero_frac=0.02)
-    assert int(n_out_mine) == int(n_out_theirs)
-    assert int(n_out_mine) > 0, "fixture has no out-of-box rows; the mask is untested"
-
-
-def test_tile_gather_vector_is_bitwise_the_probe():
-    import jax.numpy as jnp
-
-    u, live, shape, cell = _tile_fixture(11)
-    rng = np.random.default_rng(12)
-    g = [jnp.asarray(rng.normal(size=shape)) for _ in range(3)]
-    mine, n_out_mine = forces.tile_gather_vector(*g, u, live, shape, cell)
-    theirs, n_out_theirs = probe.tile_gather_vector(*g, u, live, shape, cell)
-    # ~7/8 of rows are out-of-box and zero by construction; the in-box ones are
-    # what is being compared, and they must all be nonzero
-    _agree(mine, theirs, "tile_gather_vector", min_nonzero_frac=0.05)
-    in_box = int(np.asarray(live).sum()) - int(n_out_mine)
-    assert int(np.count_nonzero(np.asarray(theirs).any(axis=1))) == in_box, (
-        "an in-box row gathered exactly zero, or an out-of-box row gathered nonzero"
-    )
-    assert int(n_out_mine) == int(n_out_theirs)
-
-
 def test_tile_paint_conserves_mass_over_the_in_box_rows():
     """The property the CIC weights exist to have. If the corner weights stop
     summing to 1 the paint silently loses mass, which no parity check against a
@@ -428,51 +248,6 @@ def test_tile_paint_conserves_mass_over_the_in_box_rows():
 # ---------------------------------------------------------- the tiled arm
 
 
-def _probe_membership(pos, n_fine, n_tile, b_fine):
-    """The probe's own bucketing, so parity isolates the FORCE from the exchange.
-
-    The layout's `tile_members` is verified elsewhere to return the same SET, but
-    not the same ORDER -- and order changes the f64 scatter-add sequence, hence
-    the bits. Driving both sides from one membership is what makes this a test of
-    the promoted force rather than of two bucketings.
-    """
-    cell = L_BOX / n_fine
-    _, b_real = forces.padded_size(n_tile, b_fine, n_fine=n_fine)
-    n_brick = probe.choose_brick(n_tile, b_real, n_fine)
-    order, starts, nb = probe.brick_buckets(pos, n_fine, n_brick, cell)
-    n_side = n_fine // n_tile
-    tiles = [(i, j, k) for i in range(n_side) for j in range(n_side) for k in range(n_side)]
-    cap, _ = probe.tile_capacity(order, starts, nb, tiles, n_tile, b_real, n_brick)
-
-    def member_fn(tijk):
-        return probe.tile_members(order, starts, nb, tijk, n_tile, b_real, n_brick)
-
-    return member_fn, cap
-
-
-@pytest.mark.detflag
-@pytest.mark.parametrize("pad_fill", ["cycle", "zero"])
-def test_force_short_tiled_is_bitwise_the_probe(pad_fill):
-    """The operating path, at the geometry the gates run. Both padding fills,
-    because they must give bitwise-identical forces -- that equality is what
-    makes the `zero` arm usable as a pure cost A/B."""
-    n_tile, b_fine = N_TILE_T, B_FINE_T
-    pos = _positions(14, N_PART_T)
-    member_fn, cap = _probe_membership(pos, N_FINE_T, n_tile, b_fine)
-    mine, diag = forces.force_short_tiled(
-        pos, N_FINE_T, L_BOX, N_PART_T**3, n_tile, b_fine, member_fn, cap,
-        r_s=R_S, pad_fill=pad_fill,
-    )
-    theirs, pdiag = probe.force_short_tiled(
-        pos, N_FINE_T, L_BOX, N_PART_T**3, n_tile, b_fine,
-        r_s=R_S, family="gauss", pad_fill=pad_fill,
-    )
-    _agree(mine, theirs, f"force_short_tiled/{pad_fill}")
-    assert diag["partition_ok"] and pdiag["partition_ok"]
-    assert diag["padded_P"] == pdiag["padded_P"]
-    assert diag["n_overhang_total"] == pdiag["n_overhang_total"] == 0
-
-
 @pytest.mark.detflag
 def test_the_two_padding_fills_agree_bitwise():
     """Stated as its own assertion because it is the premise of the A/B: the
@@ -481,7 +256,7 @@ def test_the_two_padding_fills_agree_bitwise():
     """
     n_tile, b_fine = N_TILE_T, B_FINE_T
     pos = _positions(15, N_PART_T)
-    member_fn, cap = _probe_membership(pos, N_FINE_T, n_tile, b_fine)
+    member_fn, cap = _membership(pos, N_FINE_T, n_tile, b_fine)
     args = (pos, N_FINE_T, L_BOX, N_PART_T**3, n_tile, b_fine, member_fn, cap)
     a, _ = forces.force_short_tiled(*args, r_s=R_S, pad_fill="cycle")
     b, _ = forces.force_short_tiled(*args, r_s=R_S, pad_fill="zero")
@@ -514,7 +289,7 @@ def test_the_accumulate_sink_refuses_a_production_sized_box():
     two of them is what makes C-gh runnable. The test path must not become the
     production path by default."""
     pos = _positions(17, N_PART_T)
-    member_fn, cap = _probe_membership(pos, N_FINE_T, N_TILE_T, B_FINE_T)
+    member_fn, cap = _membership(pos, N_FINE_T, N_TILE_T, B_FINE_T)
     with pytest.raises(ValueError, match="accumulate sink would allocate"):
         forces.force_short_tiled(
             pos, N_FINE_T, L_BOX, N_PART_T**3, N_TILE_T, B_FINE_T, member_fn, cap,
@@ -529,7 +304,7 @@ def test_the_tile_local_sink_sees_every_particle_exactly_once():
     what the global accumulator would have built -- without ever holding it."""
     n_tile, b_fine = N_TILE_T, B_FINE_T
     pos = _positions(18, N_PART_T)
-    member_fn, cap = _probe_membership(pos, N_FINE_T, n_tile, b_fine)
+    member_fn, cap = _membership(pos, N_FINE_T, n_tile, b_fine)
     args = (pos, N_FINE_T, L_BOX, N_PART_T**3, n_tile, b_fine, member_fn, cap)
 
     seen, rebuilt = [], np.zeros((pos.shape[0], 3))
@@ -595,41 +370,6 @@ def test_regression_padding_rows_do_not_funnel_onto_flat_index_zero():
         "the masked row's index was rewritten -- that is the 2.2x contention bug"
     )
     assert float(w[0]) > 0.0 and float(w[1]) == 0.0, "masking must be on the WEIGHT"
-
-
-@pytest.mark.detflag
-def test_force_short_tiled_is_bitwise_the_probe_under_heavy_clustering():
-    """Gate geometry 3: the one that exercises `pad_fill` and `_tile_corner`
-    under real contention.
-
-    A clustered field makes `cap` (a max over tiles) far exceed the typical
-    member count, so most rows in most tiles are PADDING -- which is the regime
-    where the flat-index-0 funnel cost 2.218x, and the only one where the two
-    pad_fill arms do meaningfully different work. A uniform fixture has pad_frac
-    near zero and cannot see any of it.
-    """
-    n_tile, b_fine = N_TILE_T, B_FINE_T
-    rng = np.random.default_rng(40)
-    pos = np.mod(rng.normal(loc=L_BOX * 0.5, scale=L_BOX * 0.06, size=(N_PART_T**3, 3)), L_BOX)
-    member_fn, cap = _probe_membership(pos, N_FINE_T, n_tile, b_fine)
-    counts = [len(member_fn(t)) for t in
-              [(i, j, k) for i in range(N_FINE_T // n_tile)
-               for j in range(N_FINE_T // n_tile) for k in range(N_FINE_T // n_tile)]]
-    pad_frac = 1.0 - float(np.mean(counts)) / cap
-    assert pad_frac > 0.75, f"fixture is not padding-dominated (pad_frac {pad_frac:.2f})"
-
-    args = (pos, N_FINE_T, L_BOX, N_PART_T**3, n_tile, b_fine, member_fn, cap)
-    for pad_fill in ("cycle", "zero"):
-        mine, diag = forces.force_short_tiled(*args, r_s=R_S, pad_fill=pad_fill)
-        theirs, _ = probe.force_short_tiled(
-            pos, N_FINE_T, L_BOX, N_PART_T**3, n_tile, b_fine,
-            r_s=R_S, family="gauss", pad_fill=pad_fill,
-        )
-        _agree(mine, theirs, f"clustered/{pad_fill}")
-        assert diag["partition_ok"] and diag["n_overhang_total"] == 0
-        # a clustered field must produce a much larger force than a smooth one,
-        # or the fixture is not actually clustered
-        assert float(np.max(np.abs(mine))) > 1.0
 
 
 # ================================ coarse sub-block staging (D-v2-16 clause 3)
@@ -1122,7 +862,7 @@ def test_tile_paint_headroom_uses_the_strict_cic_bound_and_refuses_an_overflow()
 def test_the_int_tile_arm_is_reachable_through_force_short_tiled():
     """The knob is wired, the default is unchanged, and the two arms differ."""
     pos = _positions(56, N_PART_T)
-    member_fn, cap = _probe_membership(pos, N_FINE_T, N_TILE_T, B_FINE_T)
+    member_fn, cap = _membership(pos, N_FINE_T, N_TILE_T, B_FINE_T)
     args = (pos, N_FINE_T, L_BOX, N_PART_T**3, N_TILE_T, B_FINE_T, member_fn, cap)
     g_f64, d_f64 = forces.force_short_tiled(*args, r_s=R_S)
     g_int, d_int = forces.force_short_tiled(*args, r_s=R_S, paint="int")

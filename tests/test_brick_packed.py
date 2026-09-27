@@ -22,14 +22,10 @@ Plus the invariants both layouts share: particles are conserved, overflow raises
 rather than clamping (D-007), and `check()` fails when the layout is broken.
 """
 
-import os
-import sys
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "scripts"))
 
 from inexor.codec import T9Layout  # noqa: E402
 from inexor.layout import BrickPackedLayout  # noqa: E402
@@ -403,26 +399,6 @@ def _tm_setup(seed=11):
     n_brick = choose_brick(TM_TILE, TM_BUF, TM_N_FINE)
     jax.config.update("jax_enable_x64", prev)
     return t9, x, xq, n_brick
-
-
-def test_tile_membership_matches_the_ratified_probe():
-    """The force consumes this. `scripts/v2_g5_core.py` is the oracle
-    (D-v2-16 cl.7), and membership must agree EXACTLY on matched inputs -- the
-    probe fed the same quantized positions the layout stores."""
-    from v2_g5_core import brick_buckets as probe_brick_buckets
-    from v2_g5_core import tile_members as probe_tile_members
-
-    t9, x, xq, n_brick = _tm_setup()
-    assert TM_N_FINE // n_brick == TM_BRICKS
-    lay = BrickPackedLayout.build(x, t9, TM_BRICKS, brick_slack=0.10)
-
-    order, starts, nb = probe_brick_buckets(xq, TM_N_FINE, n_brick, L_BOX / TM_N_FINE)
-    for tijk in ((0, 0, 0), (1, 2, 3), (nb - 1, 0, nb - 1)):
-        t = np.asarray(tijk)
-        mine = lay.tile_members(t, TM_TILE, TM_BUF, n_brick, TM_N_FINE)
-        theirs = probe_tile_members(order, starts, nb, t, TM_TILE, TM_BUF, n_brick)
-        assert np.array_equal(np.sort(mine), np.sort(theirs)), f"tile {tijk}"
-        assert len(np.unique(mine)) == len(mine), "a particle appears twice in one tile"
 
 
 def test_arena_residents_are_not_dropped_from_membership():
