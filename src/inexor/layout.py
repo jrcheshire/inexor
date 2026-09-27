@@ -484,30 +484,6 @@ class BrickPackedLayout:
                 out = np.concatenate([out, self.slot_to_particle[self.arena_base + sel]])
         return out
 
-    def tile_members(self, tijk, n_tile, b_fine, n_brick, n_fine):
-        """Live particle indices covering tile+buffer, as the brick union.
-
-        Same union and same wrap guard as the ratified probe's
-        `v2_g5_core.tile_members`; only the storage differs. Verified equal to it
-        elementwise on matched (quantized) inputs.
-        """
-        nb = int(n_fine) // int(n_brick)
-        if nb != self.bricks_per_side:
-            raise ValueError(
-                f"brick grid {nb} from (n_fine={n_fine}, n_brick={n_brick}) disagrees with "
-                f"the layout's {self.bricks_per_side}"
-            )
-        pad, span = brick_span(n_tile, b_fine, n_brick, nb)
-        lo = np.asarray(tijk, dtype=np.int64) * (int(n_tile) // int(n_brick)) - pad
-        out = []
-        for i in range(span):
-            bi = (lo[0] + i) % nb
-            for j in range(span):
-                bj = (lo[1] + j) % nb
-                for k in range(span):
-                    bk = (lo[2] + k) % nb
-                    out.append(self.brick_members((bi * nb + bj) * nb + bk))
-        return np.concatenate(out) if out else np.empty(0, dtype=np.int64)
 
     def migrate(self, x_new):
         """Rebuild every brick whose contents changed.

@@ -215,16 +215,6 @@ def float_step_bullfrog(x, v, coeff, force_fn, box_size):
     return x, v
 
 
-def float_step_kdk(x, p, coeff, force_fn, box_size):
-    """One float KDK step on (x, p) in physical units (mbody one_step port).
-    coeff = (k1, dr, k2) from kdk_table."""
-    k1, dr, k2 = coeff
-    p = p + k1 * force_fn(x)
-    x = jnp.mod(x + dr * p, box_size)
-    p = p + k2 * force_fn(x)
-    return x, p
-
-
 def bullfrog_float_coeffs(table):
     """(K, 3) float array (dD/2, alpha, beta/D_mid) for float_step_bullfrog."""
     t = table

@@ -108,19 +108,6 @@ def decode_positions_host(off, bucket_ijk, t9):
     return i.astype(np.float64) * t9.quantum
 
 
-def encode_velocities_host(v, scale):
-    """D-time velocities -> int16 at a GIVEN scale. Mirrors
-    `codec.encode_velocities`'s value path (rint at the scale, then int16),
-    with the scale supplied rather than derived -- the streamed builder knows
-    it from the partition-max over its staged slabs, exactly
-    `reconcile_velocity_scale`'s theorem at build time. The pre-cast range is
-    asserted (D-007): the theorem says it cannot fire, and the refusal is what
-    proves that rather than assumes it."""
-    w = np.rint(np.asarray(v, dtype=np.float64) / float(scale))
-    assert_int16_range(w)
-    return w.astype(np.int16)
-
-
 def _alloc_geometry(brick_counts, n_particles, brick_slack, alloc_margin, arena_frac):
     """The D-v2-19 capacity arithmetic: (spare, brick_start, n_alloc, n_arena).
 

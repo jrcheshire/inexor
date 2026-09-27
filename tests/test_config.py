@@ -5,7 +5,7 @@ import math
 
 import pytest
 
-from inexor.config import PLANCK, BoxConfig, Cosmology, QuantConfig, TimeConfig
+from inexor.config import PLANCK, BoxConfig, Cosmology
 
 
 def test_cosmology_hashable_and_frozen():
@@ -47,25 +47,3 @@ def test_box_rejects_nonpositive():
         BoxConfig(n_mesh=64, box_size=-1.0)
 
 
-def test_time_validation():
-    t = TimeConfig()
-    assert t.spacing == "log" and t.integrator == "bullfrog"
-    with pytest.raises(ValueError, match="a_init"):
-        TimeConfig(a_init=1.0, a_final=0.5)
-    with pytest.raises(ValueError, match="spacing"):
-        TimeConfig(spacing="geometric")
-    with pytest.raises(ValueError, match="integrator"):
-        TimeConfig(integrator="leapfrog")
-    with pytest.raises(ValueError, match="n_steps"):
-        TimeConfig(n_steps=0)
-
-
-def test_quant_defaults_are_ratified_values():
-    q = QuantConfig()
-    assert q.c_growth == 2.5  # D-011
-    assert q.alpha_floor == 0.05  # D-012
-    assert q.frac_bits == 12  # R3-validated
-    with pytest.raises(ValueError):
-        QuantConfig(x_bits=12)
-    with pytest.raises(ValueError):
-        QuantConfig(frac_bits=16)

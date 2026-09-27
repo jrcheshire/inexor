@@ -72,37 +72,9 @@ jax = "*"
 jaxlib = { version = "*", build = "*cuda*" }
 cuda-version = "12.*"
 
-# Pallas-GPU env (V1/G1 ONLY): conda-forge's CUDA jaxlib is built WITHOUT the
-# Pallas GPU lowering ("Cannot lower pallas_call on platform: gpu", deneb job
-# 28, 2026-07-15) -- Google's pypi jax[cuda12] wheels carry it. Isolated env
-# so the proven conda-forge `gpu` env (tests, Vista aarch64) stays untouched.
-# Version pinned to the gpu env's jax so G1's XLA-vs-pallas comparison is
-# same-jax.
-[tool.pixi.feature.gpu-pallas]
-platforms = ["linux-64"]
-[tool.pixi.feature.gpu-pallas.pypi-dependencies]
-jax = { version = "==0.10.2", extras = ["cuda12"] }
-
-# Parity env: CAMB (+ pyccl cross-check) for the M1 parity harness ONLY --
-# the default env stays jax+numpy+scipy. mbody and DISCO-DJ are never
-# installed here; the harness exchanges npz files across their own pixi envs
-# (cross-process parity, plan tender-stargazing-map S5).
-[tool.pixi.feature.parity]
-platforms = ["osx-arm64", "linux-64"]
-[tool.pixi.feature.parity.dependencies]
-camb = "*"
-pyccl = "*"
-# camb 1.6.5's BBN-YHe setter chokes on numpy 2.5 + scipy 1.18 (1-element
-# array refuses scalar conversion at model.py:687); mbody's proven combo is
-# numpy 2.4 + scipy 1.17 -- pin this env to that class until camb catches up.
-numpy = "<2.5"
-scipy = "<1.18"
-
 [tool.pixi.environments]
 default = ["jax"]
 gpu = ["gpu"]
-gpu-pallas = ["gpu-pallas"]
-parity = ["jax", "parity"]
 
 [tool.pixi.tasks]
 # `-n auto` (pytest-xdist) parallelizes across cores; OMP_NUM_THREADS=1 pins one

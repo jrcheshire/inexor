@@ -32,7 +32,6 @@ Invariants enforced here:
 
 from dataclasses import dataclass
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -48,35 +47,9 @@ def rint_i(z):
     return jnp.rint(z).astype(jnp.int32)
 
 
-def iadd(state, inc32):
-    """Modular lattice add: widen to int32, add, narrow back (exactly modular)."""
-    return (state.astype(jnp.int32) + inc32).astype(state.dtype)
-
-
-def isub(state, inc32):
-    """Modular lattice subtract; exact inverse of iadd with the same inc32."""
-    return (state.astype(jnp.int32) - inc32).astype(state.dtype)
-
-
 # ============================================================================
 # Straight-through estimators (the autodiff boundary, architecture.md Sec. 8)
 # ============================================================================
-
-
-def ste_round(z):
-    """Straight-through rint: primal == rint(z), Jacobian == identity."""
-    return z + jax.lax.stop_gradient(jnp.rint(z) - z)
-
-
-def ste_wrap_u(z, mod):
-    """Straight-through unsigned modular wrap: primal == z mod M, Jacobian == I."""
-    return z + jax.lax.stop_gradient(jnp.mod(z, mod) - z)
-
-
-def ste_wrap_s(z, mod):
-    """Straight-through signed wrap into [-M/2, M/2): primal wraps, Jacobian == I."""
-    half = mod / 2.0
-    return z + jax.lax.stop_gradient(jnp.mod(z + half, mod) - half - z)
 
 
 # ============================================================================
@@ -194,25 +167,6 @@ def lattice_index(x, layout):
     """
     i = rint_i(x / layout.quantum)
     return jnp.mod(i, layout.n_levels).astype(jnp.int32)
-
-
-def bucket_indices(x, layout):
-    """Physical positions -> per-axis bucket indices, int32 in [0, n_buckets_side)."""
-    return lattice_index(x, layout) // LEVELS_PER_BUCKET
-
-
-def flat_bucket(bucket_ijk, layout):
-    """Per-axis bucket indices (n,3) -> a flat C-order bucket id (n,)."""
-    nb = layout.n_buckets_side
-    b = bucket_ijk.astype(jnp.int32)
-    return (b[:, 0] * nb + b[:, 1]) * nb + b[:, 2]
-
-
-def unflatten_bucket(flat, layout):
-    """Flat C-order bucket id (n,) -> per-axis bucket indices (n,3)."""
-    nb = layout.n_buckets_side
-    f = flat.astype(jnp.int32)
-    return jnp.stack([f // (nb * nb), (f // nb) % nb, f % nb], axis=-1)
 
 
 def encode_positions(x, layout):

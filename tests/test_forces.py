@@ -60,15 +60,6 @@ def test_int_vs_f32_paint_force_agreement():
     assert float(jnp.max(jnp.abs(gi - gf))) < 5e-3 * scale
 
 
-def test_force_fn_cache_identity():
-    # equal args -> the SAME closure object (step_fwd/step_rev sharing contract)
-    f1 = make_force_fn(BOX, paint="int")
-    f2 = make_force_fn(BoxConfig(n_mesh=N, box_size=L), paint="int")
-    assert f1 is f2
-    f3 = make_force_fn(BoxConfig(n_mesh=16, box_size=L), paint="int")
-    assert f3 is not f1
-
-
 # ============================================ the hoisted coarse kernel build
 
 

@@ -198,27 +198,6 @@ def test_ic_k_table_shape_and_scalar_handling():
     assert np.ndim(tab.T_of_k(0.5)) == 0
 
 
-def test_ccl_cross_check():
-    """Optional-import CCL cross-check (mbody test_external_ccl pattern)."""
-    ccl = pytest.importorskip("pyccl")
-    cosmo_ccl = ccl.Cosmology(
-        Omega_c=PLANCK.Omega_cdm,
-        Omega_b=PLANCK.Omega_b,
-        h=PLANCK.h,
-        sigma8=PLANCK.sigma8,
-        n_s=PLANCK.n_s,
-        transfer_function="eisenstein_hu",
-    )
-    for a in (0.25, 0.5, 1.0):
-        assert growth_factor_a(a, PLANCK) == pytest.approx(
-            ccl.growth_factor(cosmo_ccl, a), rel=2e-3
-        )
-        assert growth_rate_a(a, PLANCK) == pytest.approx(ccl.growth_rate(cosmo_ccl, a), rel=2e-3)
-    k = np.geomspace(1e-3, 1.0, 32)
-    P_ccl = ccl.linear_matter_power(cosmo_ccl, k * PLANCK.h, 1.0) * PLANCK.h**3
-    assert np.allclose(linear_power(k, PLANCK), P_ccl, rtol=5e-2)
-
-
 def test_ic_k_table_accepts_empty_queries():
     """A slab-streamed caller's k-cut can empty a slab; an empty query is a
     no-op, not a crash (found by the leg-VI Jensen diagnostic, 2026-08-10)."""

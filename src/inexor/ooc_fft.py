@@ -68,19 +68,6 @@ def _kz(n_mesh, box_size):
 # ---------------------------------------------------------------------------
 
 
-def rfft2_slab(slab, workers=_DEF_WORKERS):
-    """Pass 1 on a slab: per-plane 2D real FFTs, (t, N, N) -> (t, N, N//2+1).
-
-    A loop of single-plane transforms, never one batched call: the batch size
-    would otherwise leak into the bits (module docstring).
-    """
-    t, n = slab.shape[0], slab.shape[1]
-    out = np.empty((t, n, n // 2 + 1), dtype=_cdtype_for(slab.dtype))
-    for i in range(t):
-        out[i] = scipy.fft.rfft2(slab[i], workers=workers)
-    return out
-
-
 def fft_axis0_inplace(spec, inverse=False, workers=_DEF_WORKERS, progress=None):
     """Pass 2: (i)fft along axis 0, one y-pencil-plane at a time, in place.
 

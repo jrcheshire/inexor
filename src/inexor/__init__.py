@@ -31,14 +31,12 @@ House rule: this library NEVER touches jax.config -- callers opt into x64.
 
 from importlib.metadata import version as _metadata_version
 
-from .config import PLANCK, BoxConfig, Cosmology, QuantConfig, TimeConfig
+from .config import PLANCK, BoxConfig, Cosmology
 
 __all__ = [
     "PLANCK",
     "BoxConfig",
     "Cosmology",
-    "QuantConfig",
-    "TimeConfig",
 ]
 
 # Single-sourced from pyproject.toml's [project] version. It is declared there
