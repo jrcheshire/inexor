@@ -499,7 +499,7 @@ def cmd_run(args):
     t_load = time.perf_counter()
     if have is not None:
         st, resume = engine.load_checkpoint(d, ec, co, arena_frac=args.arena_frac,
-                                            alloc=allocator)
+                                            alloc_margin=args.alloc_margin, alloc=allocator)
         src = f"checkpoint at step {int(resume['step'])}"
         if int(resume["step"]) >= args.k_steps:
             print(f"  NOTHING TO DO: the checkpoint is already at step "
@@ -617,8 +617,8 @@ def _state_at_head(args, ec, co, alloc=None):
     have = _newest_checkpoint_step(args)
     if have is None:
         raise SystemExit("no checkpoint to read; run `run` first")
-    st, resume = engine.load_checkpoint(_ckpt_dir(args), ec, co,
-                                        arena_frac=args.arena_frac, alloc=alloc)
+    st, resume = engine.load_checkpoint(_ckpt_dir(args), ec, co, arena_frac=args.arena_frac,
+                                        alloc_margin=args.alloc_margin, alloc=alloc)
     return st, int(resume["step"])
 
 

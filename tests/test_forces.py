@@ -178,10 +178,11 @@ def test_the_parts_hold_only_real_half_grids():
         assert a.size <= n, f"ik grid is full-rank ({a.size} elements)"
 
 
-def test_the_monolithic_coarse_solve_refuses_the_silent_wrong_size():
+def test_the_monolithic_coarse_solve_refuses_the_silent_wrong_size(monkeypatch):
     """The coarse solve refuses a device transform above 2**31 elements (a 2048^3 mesh is
     4x that), but only off CPU: the bound is a cuFFT wrong-result limit. Both halves are
-    pinned, since a guard firing everywhere is as wrong as one firing nowhere.
+    pinned, since a guard firing everywhere is as wrong as one firing nowhere. The refusal is
+    also pinned on a CPU host by stubbing `jax.default_backend` (read at call time).
     """
     import jax
 
@@ -199,6 +200,11 @@ def test_the_monolithic_coarse_solve_refuses_the_silent_wrong_size():
     else:
         with pytest.raises(ValueError, match="MEASURED to return a wrong result"):
             forces.refuse_oversize_coarse_solve(at_or_above)
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    forces.refuse_oversize_coarse_solve(below)  # below the bound: still passes on gpu
+    with pytest.raises(ValueError, match="MEASURED to return a wrong result"):
+        forces.refuse_oversize_coarse_solve(at_or_above)
 
 
 def _coarse_parity_setup(fdtype, n=32, box=64.0, seed=5):
@@ -235,8 +241,12 @@ def test_the_factorized_coarse_solve_agrees_with_monolithic_at_roundoff(fdtype):
                 f"component {i} disagrees by {rel:.3e} = {rel / eps:.1f} eps at "
                 f"{np.dtype(fdtype).name}; roundoff between two factorizations is "
                 "a few eps, so this is a difference in the computation")
-        # anti-vacuity: the comparison can fail
-        assert np.max(np.abs(np.asarray(mono[0]) - np.asarray(fact[1]))) > 0
+        # anti-vacuity: the same metric fails on a single element perturbed by 100 eps x std
+        m = np.asarray(mono[0])
+        bad = np.array(fact[0], copy=True)
+        bad.flat[bad.size // 2] += 100 * eps * float(np.std(m))
+        rel_bad = float(np.max(np.abs(m - bad)) / np.std(m))
+        assert rel_bad > 50 * eps, f"a 100 eps perturbation reads {rel_bad / eps:.1f} eps"
     finally:
         jax.config.update("jax_enable_x64", prev)
 

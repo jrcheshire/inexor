@@ -53,6 +53,7 @@ ICS=$WORK/ics
 CKPT=$WORK/ckpt
 PROD=$WORK/prod
 CARDS=runs/v2
+mkdir -p "$CARDS"
 TAG=d8gh_${PRESET}_$SLURM_JOB_ID
 GPU_CSV=$CARDS/${TAG}_gpu.csv
 MEM_CSV=$CARDS/${TAG}_mem.csv

@@ -6,7 +6,7 @@ hand-written `.npy` header (not `open_memmap`, whose dirty pages would count aga
 process), so peak memory is one brick chunk and consumers can `np.load(..., mmap_mode="r")`.
 
 Row order is brick-major (the engine's spatial layout) and carries no Lagrangian identity;
-export ids (`with_ids=True`) for cross-matching.
+a state built with `with_ids=True` exports `ids.npy` for cross-matching.
 
 Units: positions comoving Mpc/h in [0, box_size). Velocities are the native D-time
 `dx/dD` (Mpc/h per unit growth factor) unless `a` and `cosmo` convert them to peculiar km/s;

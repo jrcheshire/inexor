@@ -208,9 +208,17 @@ def test_uint16_index_is_still_reachable_and_reproduces_the_ratified_cost():
 
 def test_a_bare_narrowing_would_have_wrapped_silently():
     """A bare numpy narrowing wraps (65536 -> 0), which is what `_to_index` guards: occupancy
-    is the boundary prefix sum, so a wrap relocates every later bucket in the brick."""
+    is the boundary prefix sum, so a wrap relocates every later bucket in the brick. The
+    helper must refuse exactly the counts numpy would wrap, and pass the ceiling unchanged."""
+    from inexor.layout import _to_index
+
     counts = np.array([70000, 65536, 65535], dtype=np.int64)
     assert list(counts.astype(np.uint16)) == [4464, 0, 65535]
+    for over in ([70000], [65536], [3, 65536, 7]):
+        with pytest.raises(ValueError, match="exceeds the uint16 index ceiling"):
+            _to_index(np.array(over, dtype=np.int64), np.uint16, "test")
+    ok = _to_index(np.array([0, 65535, 12], dtype=np.int64), np.uint16, "test")
+    assert ok.dtype == np.uint16 and list(ok) == [0, 65535, 12]
 
 
 def test_build_refuses_an_index_overflow():

@@ -199,16 +199,27 @@ def test_close_leaves_an_adopted_field_in_the_allocators_segment():
 
 def test_close_still_privatises_what_the_pool_itself_shared():
     """With no allocator, close() unlinks the pool's own segments, so fields must be private
-    copies afterwards, still usable and decodable."""
+    copies afterwards, still usable and decodable. While open, each field is the pool's own
+    view onto its segment (not owning its data); after close() each owns its data."""
     cfg = _cfg(tile_workers=2)
     st = _state(cfg)
     before = {f: np.asarray(getattr(st, f)).copy() for f in FIELDS}
+    private = {f: getattr(st, f) for f in FIELDS}
 
     pool = TilePool(st, cfg, paint_only=True)
-    pool.close()
+    try:
+        for f in FIELDS:
+            arr = getattr(st, f)
+            assert arr is pool._views[f] and arr is not private[f], (
+                f"{f} is not the pool's shared view while the pool is open")
+            assert not arr.flags.owndata, f"{f} owns its data while shared"
+    finally:
+        pool.close()
 
     for f in FIELDS:
-        arr = np.asarray(getattr(st, f))
+        arr = getattr(st, f)
+        assert isinstance(arr, np.ndarray) and arr.flags.owndata and arr.base is None, (
+            f"{f} still borrows its buffer after close(); the segment is unlinked")
         np.testing.assert_array_equal(arr, before[f])
         assert arr.sum() == before[f].sum()
     _, x, _ = st.decode_bricks(list(range(min(4, st.n_bricks))))

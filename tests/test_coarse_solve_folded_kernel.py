@@ -45,33 +45,36 @@ def test_folded_kernel_is_bitwise_the_host_multiply_on_host_meshes(dtype):
         assert n_diff == 0, f"component {i}: {n_diff} of {np.asarray(x).size} differ"
 
 
-def test_folded_kernel_is_bitwise_on_card_shards_and_at_four_cards():
-    """Bitwise with meshes written onto card shards, at 1 and 4 cards (4 needs emulated
-    devices), and the folded arm is independent of card count."""
+def _on_card_shards(d, n, kw, cards, fold):
     from inexor.device.coarse import CardShards
 
+    devs = jax.devices()
+    per = n // cards
+    shards = CardShards([(k * per, per, devs[k]) for k in range(cards)], n)
+    return forces.coarse_force_meshes(d, n, out=shards, fold_kernel=fold, **kw)
+
+
+@pytest.mark.parametrize("cards", [1, 4])
+def test_folded_kernel_is_bitwise_on_card_shards_and_at_four_cards(cards):
+    """Bitwise with meshes written onto card shards, at 1 and 4 cards (4 needs emulated
+    devices, and only that case skips without them); at 4 cards the folded arm is also
+    bitwise the 1-card one, so it is independent of card count."""
+    if len(jax.devices()) < cards:
+        pytest.skip(f"needs {cards} jax devices")
     n, box = 16, 32.0
     d = _delta(n)
     _parts, kw = _kw(n, box)
-    devs = jax.devices()
-    outs = {}
-    for cards in (1, 4):
-        if len(devs) < cards:
-            pytest.skip(f"needs {cards} jax devices")
-        for fold in (False, True):
-            per = n // cards
-            shards = CardShards([(k * per, per, devs[k]) for k in range(cards)], n)
-            outs[(cards, fold)] = forces.coarse_force_meshes(
-                d, n, out=shards, fold_kernel=fold, **kw)
-    for cards in (1, 4):
-        for i in range(3):
-            for k in range(cards):
-                x = np.asarray(outs[(cards, False)][k]["meshes"][i])
-                y = np.asarray(outs[(cards, True)][k]["meshes"][i])
-                assert int(np.count_nonzero(x != y)) == 0, (cards, i, k)
-    one = np.concatenate([np.asarray(s["meshes"][0]) for s in outs[(1, True)]])
-    four = np.concatenate([np.asarray(s["meshes"][0]) for s in outs[(4, True)]])
-    assert int(np.count_nonzero(one != four)) == 0
+    outs = {fold: _on_card_shards(d, n, kw, cards, fold) for fold in (False, True)}
+    for i in range(3):
+        for k in range(cards):
+            x = np.asarray(outs[False][k]["meshes"][i])
+            y = np.asarray(outs[True][k]["meshes"][i])
+            assert int(np.count_nonzero(x != y)) == 0, (cards, i, k)
+    if cards > 1:
+        one = np.concatenate(
+            [np.asarray(s["meshes"][0]) for s in _on_card_shards(d, n, kw, 1, True)])
+        many = np.concatenate([np.asarray(s["meshes"][0]) for s in outs[True]])
+        assert int(np.count_nonzero(one != many)) == 0
 
 
 def test_array_kernel_block_product_is_the_host_kernel_slab():

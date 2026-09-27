@@ -225,8 +225,8 @@ class PhaseTracer:
 
 TIMER_PHASES = (
     "kernel_build", "lead_drift", "coarse_paint", "coarse_solve", "membership",
-    "tile_decode", "tile_short", "tile_long", "tile_reduce",
-    "tile_loop_end", "reconcile", "migrate", "repack",
+    "tile_loop", "tile_decode", "tile_short", "tile_long", "tile_reduce",
+    "tile_loop_end", "reconcile", "migrate", "repack", "checkpoint",
 )
 
 

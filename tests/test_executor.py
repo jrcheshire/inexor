@@ -554,15 +554,19 @@ def test_the_memfd_preflight_checks_the_peak_not_the_demand(monkeypatch):
 def test_posix_is_still_checked_on_the_total(monkeypatch):
     """posix is checked on the total demand, since a tmpfs holds every segment at once.
 
-    `shm_capacity` is stubbed because macOS has no /dev/shm (it would report "could not check").
+    `shm_capacity` and `available_ram` are stubbed to the same 100 GB, because macOS has no
+    /dev/shm or /proc/meminfo (either would report "could not check"). The same terms pass
+    memfd (peak 78 GB) and are refused by posix (total 117 GB).
     """
     from inexor import executor
 
     monkeypatch.setattr(executor, "shm_capacity",
                         lambda path=None: (100_000_000_000, 100_000_000_000))
+    monkeypatch.setattr(executor, "available_ram", lambda: 100_000_000_000)
     terms = {"w": 78_000_000_000, "off": 39_000_000_000}
-    executor.preflight_shared_memory(dict(terms), backend="memfd",
-                                     adopted={"w", "off"}) if False else None
+    demand, avail, what = executor.preflight_shared_memory(
+        dict(terms), backend="memfd", adopted={"w", "off"})
+    assert (demand, avail, what) == (117_000_000_000, 100_000_000_000, "MemAvailable")
     with pytest.raises(MemoryError, match="does not fit /dev/shm"):
         executor.preflight_shared_memory(terms, backend="posix",
                                          adopted={"w", "off"})

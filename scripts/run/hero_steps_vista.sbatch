@@ -58,6 +58,7 @@ CKPT=$REAL/hero-ckpt
 : "${EXPECT_STEP:?pass EXPECT_STEP (0, 40 or 80) with --export}"
 : "${SEG_STOP:?pass SEG_STOP (40, 80 or 120) with --export}"
 CARDS=runs/v2
+mkdir -p "$CARDS"
 TAG=d8_${SLURM_JOB_ID}_s${EXPECT_STEP}-${SEG_STOP}
 GPU_CSV=$CARDS/${TAG}_gpu.csv
 MEM_CSV=$CARDS/${TAG}_mem.csv

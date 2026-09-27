@@ -1,7 +1,7 @@
 """Check a P(k) card's nonlinear boost against CAMB halofit / HMcode and EuclidEmulator2.
 
     pixi exec --spec camb --spec matplotlib --spec numpy -- \
-        python scripts/compare/pk_boost_reference.py RUN/pk_card.json \
+        python scripts/compare/pk_boost_reference.py RUN/realization_pk.json \
         --cosmology RUN/export.json -o figures/hero_pk_boost.png
 
 Run through `pixi exec`, not the project env: camb is a one-off reference, not an
@@ -122,7 +122,7 @@ def main():
 
     fig, (ax, bx) = plt.subplots(1, 2, figsize=(11.0, 4.3))
     ax.plot(k, boost, ls="-", lw=1.9, color="C0", marker="o", ms=2.8,
-            label=f"inexor 4096$^3$, $z={z:g}$")
+            label=f"inexor {round(s['n_particles'] ** (1 / 3))}$^3$, $z={z:g}$")
 
     styles = {"mead2020": ("C1", "--", "HMcode2020"),
               "takahashi": ("C2", ":", "halofit (Takahashi)")}

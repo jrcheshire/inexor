@@ -451,19 +451,37 @@ def test_rescaling_a_velocity_code_never_escapes_int16():
     assert_int16_range(state._rescale_w(w, s_tile, s_glob))
 
 
+def _decoded_velocities_by_id(st):
+    """(v, s): decoded velocity and its brick's scale per original id, over every brick."""
+    v = np.full((st.n_particles, 3), np.nan)
+    s = np.full(st.n_particles, np.nan)
+    for b in range(st.n_bricks):
+        slots, _, vb = st.decode_brick(b)
+        ids = st.ids[slots]
+        v[ids], s[ids] = vb, st.vel_scale[b]
+    assert np.isfinite(v).all(), "a particle was not decoded exactly once"
+    return v, s
+
+
 def test_a_changed_velocity_scale_moves_no_particle_further_than_one_quantum():
-    x, v, st = _built(26)
+    """A brick's scale is re-derived by `_insert_slab` over the rows it writes, and the codes
+    are re-rounded to it; no decoded velocity may move by more than one quantum of the new
+    scale."""
+    x, v, st = _built(26, with_ids=True)
     s0 = st.vel_scale.copy()
-    # A brick's scale is set by `_insert_slab` over the rows it writes. A zero drift
-    # keeps every row, so an idempotent re-derivation returns the same scales.
+    # a zero drift keeps every row, so an idempotent re-derivation returns the same scales
     state.drift_and_migrate(st, 0.0)
     assert st.check() is True
     assert np.array_equal(st.vel_scale, s0), "a zero drift moved a brick's scale"
-    seen = 0
-    for b in range(st.n_bricks):
-        slots, _, vb = st.decode_brick(b)
-        seen += len(slots)
-    assert seen == st.n_particles
+
+    v_before, _ = _decoded_velocities_by_id(st)
+    state.drift_and_migrate(st, 0.5)
+    assert st.check() is True
+    assert np.any(st.vel_scale != s0), "vacuous: the drift changed no brick's scale"
+    v_after, s_new = _decoded_velocities_by_id(st)
+    excess = np.abs(v_after - v_before) / s_new[:, None]
+    assert excess.max() <= 1.0, (
+        f"a decoded velocity moved by {excess.max():.3f} quanta of its new scale")
 
 
 def test_the_arena_absorbs_a_brick_overflow_and_then_refuses():

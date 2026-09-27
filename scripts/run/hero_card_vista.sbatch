@@ -61,6 +61,7 @@ export K_STEPS
 WORK=$RUNS/d7f-$SLURM_JOB_ID
 PROD=${PROD_DIR:?set PROD_DIR to the product directory}
 CARDS=runs/v2
+mkdir -p "$CARDS"
 DRIVER=scripts/run/device_run.py
 TAG=d7f_$SLURM_JOB_ID
 MEM_CSV=$CARDS/${TAG}_mem.csv

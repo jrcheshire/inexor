@@ -201,8 +201,7 @@ Notes:
 - The scripts exit with an error if a required variable is unset. Pass the account with
   `sbatch -A`. Pass per-submission values with `--export=ALL,VAR=...` or in the environment,
   as shown above.
-- The driver cards and sampler CSVs go to `runs/v2/` inside the checkout. The scripts do not
-  create this directory, so run `mkdir -p runs/v2` in the checkout first.
+- The driver cards and sampler CSVs go to `runs/v2/` inside the checkout (created if absent).
 - To chain segments, use `--dependency=afterok:<previous job id>`. `sbatch --parsable`
   prints the job id alone, so you can capture it. `EXPECT_STEP` must be the step the previous
   segment stopped at; a mis-chained segment is refused.

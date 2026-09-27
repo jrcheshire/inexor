@@ -37,6 +37,7 @@ unset CUDA_VISIBLE_DEVICES
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 HERO=${HERO_IC_DIR:?set HERO_IC_DIR to the directory the ICs are written to}
 CARDS=runs/v2
+mkdir -p "$CARDS"
 TAG=d8_ics_$SLURM_JOB_ID
 GPU_LOG=$CARDS/${TAG}_gpu.csv
 

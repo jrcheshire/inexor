@@ -2,7 +2,7 @@
 
     pixi exec --spec python=3.12 --spec camb --spec matplotlib --spec numpy --spec scipy \
         --spec gsl --spec pip -- bash -c "pip install -q euclidemu2; \
-        python scripts/compare/ee2_ratio_figure.py RUN_A/pk_card.json RUN_B/pk_card.json \
+        python scripts/compare/ee2_ratio_figure.py RUN_A/realization_pk.json RUN_B/realization_pk.json \
         --cosmology RUN_A/export.json \
         --labels '0.25 Mpc/h fine cell' '0.125 Mpc/h fine cell' \
         -o figures/inexor_over_ee2.png"
@@ -73,7 +73,7 @@ def main():
             raise SystemExit(f"{path} has different k bins or redshift from {args.cards[0]}")
         n = round(s["n_particles"] ** (1.0 / 3.0))
         label = (args.labels[i] if args.labels else
-                 f"inexor {n}$^3$, {s['box_size']:g} $h^{{-1}}$Mpc, {card['k_steps']} steps")
+                 f"inexor {n}$^3$, {s['box_size']:g} $h^{{-1}}$Mpc, {card.get('k_steps', '?')} steps")
         series.append((path, label, boost / b_ee2))
     k = k0
     sigma = np.sqrt(2.0 / n_modes)

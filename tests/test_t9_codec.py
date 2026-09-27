@@ -84,6 +84,31 @@ def test_roundtrip_is_exactly_idempotent(bucket_cells):
 
 
 @pytest.mark.parametrize("bucket_cells", BUCKET_ARMS)
+def test_roundtrip_is_bitwise_the_independently_derived_lattice(bucket_cells):
+    """The round trip is bitwise `mod(rint(x / q), nl) * q` in float64, with the lattice
+    derived here from its definition (2 x 128 levels per particle cell per axis, box / nl),
+    not read from the layout. The 2 x nl lattice must differ, so the comparison can fail."""
+    from inexor.codec import roundtrip_positions
+
+    nl = (2 * N_PART * 128) // bucket_cells
+    q = L_BOX / nl
+    lay = _layout(bucket_cells)
+    assert lay.n_levels == nl and lay.quantum == q
+
+    x = _positions(seed=11)
+    got = np.asarray(roundtrip_positions(x, lay))
+    assert got.dtype == np.float64
+    xn = np.asarray(x)
+
+    def lattice(levels):
+        step = L_BOX / levels
+        return np.mod(np.rint(xn / step).astype(np.int64), levels).astype(np.float64) * step
+
+    assert np.array_equal(got.view(np.uint64), lattice(nl).view(np.uint64))
+    assert not np.array_equal(got, lattice(2 * nl)), "vacuous: a finer lattice also matches"
+
+
+@pytest.mark.parametrize("bucket_cells", BUCKET_ARMS)
 def test_decode_error_is_within_half_a_quantum(bucket_cells):
     import jax.numpy as jnp
 

@@ -353,11 +353,9 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert
             f"  {len(staged)} slabs still staged at the end ({left} rows), "
             f"{len(inserted)} of {nb} slabs inserted, arena {st.arena_used}/"
             f"{st.n_arena}\n"
-            "  LEADING CAUSE: the slab schedule releases a staged row once its "
-            "destination is written, which assumes a particle moves at most ONE "
-            "brick per axis per step (this function's docstring, measured at cdev8 "
-            "over 20 steps). A larger drift breaks it -- reduce the step size, or "
-            "generalize the staging to the realized brick displacement."
+            "  LEADING CAUSE: a particle moved farther than the computed brick "
+            "reach, or an insert did not consume every staged emigrant; compare "
+            "brick_reach with brick_reach_realized in the step stats."
         )
     # every brick's scale was already fixed by its own insert
     return dict(n_arena_overflow=n_over, arena_used=st.arena_used,
@@ -562,10 +560,9 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
             "so this is corruption, not imprecision.\n"
             f"  {rep['n_inserted']} of {nb} slabs inserted, arena {st.arena_used}/"
             f"{st.n_arena} (pooled pass)\n"
-            "  LEADING CAUSE: the slab schedule releases a staged row once its "
-            "destination is written, which assumes a particle moves at most ONE "
-            "brick per axis per step. A larger drift breaks it -- reduce the "
-            "step size, or generalize the staging to the realized displacement."
+            "  LEADING CAUSE: a particle moved farther than the computed brick "
+            "reach, or an insert did not consume every staged emigrant; compare "
+            "brick_reach with brick_reach_realized in the step stats."
         )
     row_b = 8 + 3 + 6 + 4 + (4 if st.ids is not None else 0)
     return dict(n_arena_overflow=n_over, arena_used=st.arena_used,
@@ -880,10 +877,6 @@ class SlotState:
                 raise ValueError(
                     f"an arena row names bucket {int(used.max())} of {self.n_buckets}"
                 )
-
-        # 5. the index dtype
-        if self.occupancy.dtype != self.index_dtype:
-            raise ValueError("the occupancy index changed dtype under the container")
         return True
 
     def check_placement(self, x):
@@ -1345,8 +1338,8 @@ class SlotState:
         """Out-of-place repack: the elementwise reference `repack` is tested against.
 
         Never call it on the engine path: it allocates O(N) copies of `off` and `w`. Same
-        result as `repack` (arena folded back, slot order == key order), except that it has
-        no pre-narrowing overflow refusal.
+        result as `repack` (arena folded back, slot order == key order); a bucket that
+        overflows the index dtype is refused when the counts are narrowed at the end.
         """
         p3 = self.buckets_per_brick
         occ = self.occupancy.astype(np.int64)
@@ -1367,7 +1360,7 @@ class SlotState:
         off = np.zeros_like(self.off)
         w = np.zeros_like(self.w)
         ids = None if self.ids is None else np.full_like(self.ids, -1)
-        new_occ = np.zeros(self.n_buckets, dtype=self.index_dtype)
+        new_occ = np.zeros(self.n_buckets, dtype=np.int64)
         for b in range(self.n_bricks):
             slots = self.brick_member_slots(b)
             if not len(slots):
