@@ -50,17 +50,23 @@ def host_sample():
     return (int(out) * 1024 if out else None), None, None, None
 
 
+def _imported(name):
+    """The module if its import has finished, else None. Never imports: an import from this
+    thread while the script is mid-way through importing jax breaks the script's import."""
+    mod = sys.modules.get(name)
+    if mod is None or getattr(getattr(mod, "__spec__", None), "_initializing", False):
+        return None
+    return mod
+
+
 def device_sample():
     """Each local device's allocator counters, or None if no backend is up yet."""
-    if "jax" not in sys.modules:
+    jax, xla_bridge = _imported("jax"), _imported("jax._src.xla_bridge")
+    if jax is None or xla_bridge is None:
         return None
     try:
-        from jax._src import xla_bridge
-
         if not xla_bridge.backends_are_initialized():
             return None
-        import jax
-
         out = []
         for d in jax.local_devices():
             s = d.memory_stats() or {}
