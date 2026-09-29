@@ -117,9 +117,11 @@ DEVICE_PLACEMENT = {
     "coarse_delta": "shard",
     "coarse_force_resident": "shard",
     "coarse_force_copy_transient": "shard",
-    "coarse_kernel_pref": "shard",
-    "coarse_match_factor": "shard",
-    "coarse_kernel_build_f64": "shard",
+    # `forces.coarse_kernel_parts` builds these in numpy and `ooc_fft.ArrayKernel.blocks`
+    # slices them on the host per pencil block; only the block's product reaches a card.
+    "coarse_kernel_pref": "host",
+    "coarse_match_factor": "host",
+    "coarse_kernel_build_f64": "host",
     # The factorized solve keeps the spectrum in numpy and ships planes; each card holds only
     # its own planes in flight.
     "coarse_spectrum": "host",
@@ -177,6 +179,25 @@ MIGRATE_DEVICE_B_PER_SLAB_ROW = 320
 REPACK_DEVICE_B_PER_SLAB_ROW = 70
 # `device.fused.migrate_repack_device` (measured at 1024^3, not production shape).
 FUSED_DEVICE_B_PER_SLAB_ROW = 257
+
+# Host bytes the device lane's tile loop holds above the loop's closing RSS, per card, beyond
+# the priced window write-back: fixed + per slab row. MEASURED, not derived (the host side of
+# card transfers, which the CPU backend does not allocate): 1.9 GB/card at cgh64 on 4 GB200
+# (job 1027664), 2.0 at c-1024 on one GH200 (1029876, not in the fit), 10.5 at c-hero
+# (1003657).
+TILE_LOOP_HOST_FIXED_PER_CARD = 1.9 * GB
+TILE_LOOP_HOST_B_PER_SLAB_ROW = 32
+# The device-lane process's host floor beyond the priced state (CUDA context, jaxlib, XLA's
+# host pools), keyed by cards per node. MEASURED: 4.265 / 4.281 GB on one GH200 at cgh64 /
+# c-1024 (job 1029876, RSS after step 1 minus the priced resident; the smaller is taken, so
+# the resident stays a lower bound); <= 3.2 GB on four GB200
+# (the 32^3 smoke's host peak, job 1027664). Other card counts take the larger.
+PROCESS_BASELINE_BY_CARDS = {1: 4.26 * GB, 4: 3.2 * GB}
+
+# The lead drift's host transient above its closing RSS, per card per slab row, on several
+# cards. MEASURED at c-hero on 4 GB200 only (68 GB, job 1003657); ~0 on one GH200 at cgh64
+# and c-1024 (1029876). The single-card lane is charged nothing.
+LEAD_DRIFT_HOST_B_PER_SLAB_ROW_PER_CARD = 63
 
 
 def device_window_slabs(ec):
@@ -381,6 +402,62 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
     return resident, transient, phases, max(in_step, once), slabs, host_mesh, after_loop
 
 
+def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
+    """Host bytes of the device lane as `(resident, phases)`.
+
+    `resident` is live for the whole run (the state and the host-held coarse kernel arrays);
+    `phases` maps phase -> {term: bytes}, summed within a phase. The host peak is
+    `sum(resident) + max(phase sums)`: the large numpy buffers are returned to the OS when
+    freed, so phases do not accumulate (measured: RSS at phase starts differs by tens of GB).
+    `state` and `step` are the planner's state table and `ec.step_bytes`; `host_mesh` the
+    host-placed mesh terms from `device_budget`.
+    """
+    from .engine import STEP_PHASE
+    from .forces import capacity_shape
+
+    phase_of = ec.mesh_phase()
+    resident, phases = dict(state), {}
+    resident["process baseline (MEASURED, per card count)"] = int(PROCESS_BASELINE_BY_CARDS.get(
+        int(n_gpus), max(PROCESS_BASELINE_BY_CARDS.values())))
+
+    def add(phase, key, v):
+        if v:
+            phases.setdefault(phase, {})[key] = int(v)
+
+    for k, v in host_mesh.items():
+        p = phase_of[k]
+        if p == "resident":
+            resident[f"{k} (host-held)"] = int(v)
+            continue
+        for one in (p,) if isinstance(p, str) else p:
+            add(one, f"{k} (host)", v)
+    nb = max(1, ec.n_fine // ec.n_brick)
+    slab_rows = n / nb
+    for k, v in step.items():
+        if k == "repack_scratch" and fused:
+            continue  # the fused pass writes blocks straight back; its repack phase is empty
+        add(STEP_PHASE[k], f"{k} (host window of the device pass)", v)
+    # the per-bucket occupancy the repack builds beside the old one: inside the fused pass
+    # (`device.fused`), or in the separate repack
+    add("migrate" if fused else "repack", "repack new_occ (a second bucket index)",
+        state["bucket_index"])
+    # the windowed tile loop writes back one core slab of `w` per card at once
+    add("tile_loop", "tile_window write-back (one slab of w per card)",
+        n_gpus * int(capacity_shape(max(1, int(slab_rows)))) * 3 * np.dtype(np.int16).itemsize)
+    add("tile_loop", "tile loop card transfers (MEASURED, per card)",
+        n_gpus * (TILE_LOOP_HOST_FIXED_PER_CARD + TILE_LOOP_HOST_B_PER_SLAB_ROW * slab_rows))
+    if n_gpus > 1:
+        add("lead_drift", "lead drift card transfers (MEASURED at c-hero, per card)",
+            n_gpus * LEAD_DRIFT_HOST_B_PER_SLAB_ROW_PER_CARD * slab_rows)
+    # Before the first step the loader has written the n particle rows only; the slack rows
+    # are first touched by migrate inserts, the lead drift's included (so crediting it the
+    # whole slack keeps it a lower bound).
+    for p in ("kernel_build", "lead_drift"):
+        if p in phases:
+            add(p, "slack rows not yet touched (credit)", -state["slack + alloc_margin"])
+    return resident, phases
+
+
 def _device_main(args, ec, t9, n, rows, arena, state):
     """The host / per-GPU split for the host-state / device-step design.
 
@@ -398,29 +475,21 @@ def _device_main(args, ec, t9, n, rows, arena, state):
         fused=not getattr(args, "separate_passes", False))
 
     step = ec_dev.step_bytes(n, n_rows=rows, cap=args.cap)
-    host = dict(state)
-    for k, v in step.items():
-        if v:
-            host[f"{k} (host window of the device pass)"] = v
-    # Mesh terms held on the host by design (factorized solve's spectrum and work buffer).
-    for k, v in host_mesh.items():
-        if v:
-            host[f"{k} (host by design)"] = v
-    # both repack paths build the new per-bucket occupancy on the host beside the old one
-    host["repack new_occ (a second bucket index)"] = int(state["bucket_index"])
-    # the windowed tile loop writes back one core slab of `w` per card at once (residents
-    # gathered are O(arena))
-    from .forces import capacity_shape
-
-    nb_dev = max(1, ec.n_fine // ec.n_brick)
-    host["tile_window write-back (one slab of w per card)"] = int(
-        n_gpus * int(capacity_shape(max(1, int(n / nb_dev)))) * 3 * np.dtype(np.int16).itemsize)
-    _table("HOST: the state, plus the per-step terms nothing has moved yet", host)
+    fused = not getattr(args, "separate_passes", False)
+    host_res, host_ph = device_host_phases(ec, n=n, state=state, step=step,
+                                           host_mesh=host_mesh, n_gpus=n_gpus, fused=fused)
+    _table("HOST, resident for the whole run", host_res)
     print(f"  state alone: {sum(state.values()) / n:6.2f} B/p")
+    _table("HOST, by phase (summed within a phase; phases do not coexist)",
+           {f"{p}: {k}": v for p, terms in host_ph.items() for k, v in terms.items()},
+           total_label="sum of ALL phases listed")
+    host_phase_sums = {p: sum(t.values()) for p, t in host_ph.items()}
+    worst_host = max(host_phase_sums, key=host_phase_sums.get)
+    print(f"  worst phase: {worst_host} at {_fmt(host_phase_sums[worst_host]).strip()} "
+          "above the resident")
     print("  `migrate_staging` and `repack_scratch` are the HOST windows the device "
-          "migrate\n  and repack build per slab (two slab-sized numpy buffers each, "
-          "from the code);\n  their device-side terms are in the AFTER-THE-LOOP "
-          "table below.")
+          "migrate\n  and repack build per slab (from the code); MEASURED lines are the "
+          "host side of\n  card transfers, which the CPU backend does not allocate.")
 
     _table(f"PER GPU (of {n_gpus}), resident through the tile loop", resident)
     if transient:
@@ -458,7 +527,7 @@ def _device_main(args, ec, t9, n, rows, arena, state):
                   f"{'FITS' if r < 1.0 else 'DOES NOT FIT'} ({r:.2f}x)")
 
     print("\nBINDING TERMS")
-    host_peak = sum(host.values())
+    host_peak = sum(host_res.values()) + host_phase_sums[worst_host]
     dev_peak = sum(resident.values()) + worst_phase
     print(f"  host, a lower bound on the run's peak: {_fmt(host_peak)}")
     print(f"  the LOAD stage peaks at:               {_fmt(load_peak)}"

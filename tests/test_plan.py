@@ -311,7 +311,7 @@ def test_the_phase_model_would_have_refused_the_run_that_died():
     """The phase model refuses the monolithic-coarse-solve configuration that ran out of
     memory (~79 GB lost in the solve).
 
-    Reconstructed from current terms that solve is 68.8 GB, under the measurement as a lower
+    Reconstructed from current terms that solve is 71.0 GB, under the measurement as a lower
     bound must be, and the phase sum exceeds a 237 GB `gg` node. The factorized solve is <half.
     """
     ec = _ec("c-gh")
@@ -325,7 +325,7 @@ def test_the_phase_model_would_have_refused_the_run_that_died():
                  + m["coarse_kernel_pref"] + m["coarse_match_factor"]
                  + 3 * half_grid        # monolithic dk, its device copy, their product
                  + 3 * m["coarse_force_copy_transient"])
-    assert old_solve / GB_ == pytest.approx(68.8, abs=1.0), (
+    assert old_solve / GB_ == pytest.approx(71.0, abs=1.0), (
         f"the monolithic coarse solve reconstructs to {old_solve / GB_:.1f} GB; if this "
         "moved, the reconstruction is stale and the comparison is against nothing"
     )
@@ -691,3 +691,75 @@ def test_the_host_column_charges_one_slab_of_w_per_card_for_the_window_write_bac
     want = 4 * int(capacity_shape(g["n_part"] ** 3 // nb)) * 6 / 1e9
     line = next(ln for ln in out.splitlines() if "tile_window write-back" in ln)
     assert abs(float(line.split()[-2]) - want) < 1e-3
+
+
+# ------------------------------------- the device lane's host column, against measured runs
+
+
+def _device_host(capsys, preset, cards):
+    """(resident GB, {phase: GB above the resident, credits excluded}, peak GB) as printed."""
+    main(["--preset", preset, "--backend", "device", "--n-gpus", str(cards),
+          "--arena-frac", "0.01"])
+    out = capsys.readouterr().out
+    res_block = out.split("HOST, resident for the whole run")[1].split("\n\n")[0]
+    resident = float(next(ln for ln in res_block.splitlines()
+                          if ln.strip().startswith("total")).split()[-2])
+    ph_block = out.split("HOST, by phase")[1].split("\n\n")[0]
+    phases = {}
+    for ln in ph_block.splitlines():
+        if ":" in ln and ln.rstrip().endswith("GB") and "credit" not in ln:
+            p = ln.split(":")[0].strip()
+            phases[p] = phases.get(p, 0.0) + float(ln.split()[-2])
+    peak = float(out.split("host, a lower bound on the run's peak:")[1].split()[0])
+    return resident, phases, peak
+
+
+def test_the_host_phases_match_the_4096_run_they_price(capsys):
+    """c-hero on four GB200s (job 1003657, `runs/v2/d7b_1003657_hero.json`, the planner's
+    default knobs): each code-derived phase's host transient above that phase's closing RSS
+    is within 10% of the measured one, and the resident is at most 5% under the RSS floor
+    after the first step (844.6-865.4 GB), and never over it.
+    """
+    resident, phases, _ = _device_host(capsys, "c-hero", 4)
+    measured = {"kernel_build": 860.6 - 733.4, "coarse_solve": 830.6 - 761.9,
+                "migrate": 895.5 - 855.5}
+    for p, m in measured.items():
+        assert abs(phases[p] / m - 1) <= 0.10, f"{p}: priced {phases[p]:.1f} vs measured {m:.1f}"
+    lo, hi = 844.6, 865.4
+    assert resident <= lo, f"resident {resident:.1f} GB is over the measured floor {lo}"
+    assert resident >= 0.95 * hi, f"resident {resident:.1f} GB is >5% under the floor {hi}"
+
+
+def test_the_process_baseline_closes_the_single_gh200_floor(capsys):
+    """One GH200 (job 1029876): the priced resident, measured baseline included, is within 5%
+    of the RSS after step 1 at both sizes (5.885 GB at cgh64, 17.237 at c-1024), never over."""
+    for preset, floor in (("cgh64", 5.885), ("c-1024", 17.237)):
+        resident, _, _ = _device_host(capsys, preset, 1)
+        assert 0.95 * floor <= resident <= floor, (preset, resident, floor)
+
+
+def test_the_pre_step_phases_are_credited_the_untouched_slack(capsys):
+    """The kernel build and the lead drift run before any insert has touched the slack rows,
+    so both are charged against the resident minus the slack; the credit is printed."""
+    main(["--preset", "c-hero", "--backend", "device", "--arena-frac", "0.01"])
+    out = capsys.readouterr().out
+    credits = [ln for ln in out.splitlines() if "slack rows not yet touched" in ln]
+    assert sorted(ln.split(":")[0].strip() for ln in credits) == ["kernel_build", "lead_drift"]
+    slack = float(next(ln for ln in out.splitlines()
+                       if ln.strip().startswith("slack + alloc_margin")).split()[-2])
+    assert all(abs(float(ln.split()[-2]) + slack) < 1e-3 for ln in credits)
+
+
+def test_the_host_peak_is_printed_once_for_the_preflight_regex(capsys):
+    main(["--preset", "c-hero", "--backend", "device"])
+    out = capsys.readouterr().out
+    assert out.count("host, a lower bound on the run's peak:") == 1
+
+
+def test_the_host_kernel_arrays_are_charged_to_the_host_not_the_cards(capsys):
+    main(["--preset", "c-hero", "--backend", "device"])
+    out = capsys.readouterr().out
+    res_block = out.split("HOST, resident for the whole run")[1].split("\n\n")[0]
+    card_block = out.split("PER GPU (of 4), resident through the tile loop")[1].split("\n\n")[0]
+    for k in ("coarse_kernel_pref", "coarse_match_factor"):
+        assert k in res_block and k not in card_block, k

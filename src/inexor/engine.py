@@ -306,13 +306,17 @@ class EngineConfig:
             # --- coarse, transient
             coarse_accumulator=cells * 8,          # int64 host, dtype-independent
             coarse_decode_slab=slab * nc * nc * 8,  # one f64 slab
-            coarse_kernel_build_f64=3 * half * 8,   # k2_true/k2_safe/fac, the island
+            # the f64 island beyond the kept pref/mf: measured 4.50 f64 half-grids at the peak
+            # of `coarse_kernel_parts` (tracemalloc, nc 256 and 512), of which 1.0 is kept
+            coarse_kernel_build_f64=int(3.5 * half * 8),
             # The factorized solve (one component at a time). Host-resident:
             # `_coarse_solve_factorized` keeps the spectrum in numpy and ships only planes.
             coarse_spectrum=half * 2 * cw,        # the forward's output, held
             coarse_solve_work=half * 2 * cw,      # per component: copy AS multiply
-            # per-slab kernel and the `spec * k` temporary, live together
-            coarse_kernel_slab=2 * slab * nc * (nc // 2 + 1) * 2 * cw,
+            # per-slab kernel and the `spec * k` temporary, live together; the folded solve
+            # forms the kernel per pencil block on the card instead
+            coarse_kernel_slab=(0 if self.coarse_fold_kernel
+                                else 2 * slab * nc * (nc // 2 + 1) * 2 * cw),
             # planes the transform holds on a device; charged at 16 planes, about twice the
             # measured working set
             coarse_device_planes=16 * nc * (nc // 2 + 1) * 2 * cw,
