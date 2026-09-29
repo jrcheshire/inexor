@@ -64,6 +64,11 @@ cuda = "12"
 jax = "*"
 jaxlib = { version = "*", build = "*cuda*" }
 cuda-version = "12.*"
+# Host MPI between nodes. conda-forge ships no external-MPI placeholder for linux-aarch64, so
+# the env carries MPICH; on a cluster the job puts an MPICH-ABI module's libmpi (Vista:
+# mvapich-plus) ahead of it. Imported only by multi-node code; single-node runs never load it.
+mpi4py = "*"
+mpich = "*"
 
 [tool.pixi.environments]
 default = ["jax"]
