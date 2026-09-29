@@ -214,14 +214,17 @@ def device_window_slabs(ec):
     return min(span, nb)
 
 
-def _print_load_and_ic(args, ec, t9, n, rows, arena, shared):
-    """Print the load-path and IC-stage tables (host-side for both backends); return load peak."""
+def _print_load_and_ic(args, ec, t9, n, rows, arena, shared, share=1.0):
+    """Print the load-path and IC-stage tables (host-side for both backends); return load peak.
+
+    `share` is the busiest node's fraction of the rows, buckets and slab files (1 on one
+    node); `n`, `rows`, `arena` are already that node's."""
     idx_itemsize = t9.index_bytes() // max(t9.n_buckets_side**3, 1)
     ld = load_stages(
-        n=n, n_rows=rows + arena, n_buckets=t9.n_buckets_side**3,
+        n=n, n_rows=rows + arena, n_buckets=int(t9.n_buckets_side**3 * share),
         index_itemsize=max(idx_itemsize, 1), n_arena=arena,
         n_bricks=ec.n_brick and (args.n_fine // ec.n_brick) ** 3,
-        n_slabs=args.slabs, shared=shared,
+        n_slabs=max(1, int(args.slabs * share)), shared=shared,
     )
     _table("LOADING THE STATE, peak resident at each stage", ld,
            total_label="PEAK (max, not sum)", reduce=max)
@@ -458,7 +461,56 @@ def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
     return resident, phases
 
 
-def _device_main(args, ec, t9, n, rows, arena, state):
+# Measured cross-card migrate hand-off at c-hero on four GB200 (job 1003657, steps 1-4, reach
+# 1): 0.84-1.06 GB per step over 8 card-to-card segments, i.e. <= 0.49 B per slab row per
+# segment. A node boundary is the same cut, so it is priced per slab row at this rate.
+HANDOFF_B_PER_SLAB_ROW_PER_SEGMENT = 0.49
+# One MPI message is capped at this; a streamed exchange holds a send and a receive chunk.
+MPI_CHUNK_BYTES = 2**30
+
+
+def multinode_terms(ec, *, n, n_nodes, t9, reach=1):
+    """Host bytes per node that exist only across nodes, and bytes sent per node per step.
+
+    A design estimate for the 1-D decomposition in x by whole tile planes (the M1-M3 code
+    does not exist yet). Returns `(phases, sent)`: phase -> {term: bytes} as in
+    `device_host_phases`, and term -> bytes each node sends per step. Every node is assumed
+    to hold 1/N of the coarse spectrum, transposed in place.
+    """
+    from .device.paint import ACC_GHOST_HI, ACC_GHOST_LO
+    from .forces import COARSE_HALO
+
+    N = int(n_nodes)
+    nb = max(1, ec.n_fine // ec.n_brick)
+    slab_rows = n / nb
+    nc = int(ec.n_coarse)
+    cw = ec.np_coarse_dtype.itemsize
+    half_plane = nc * (nc // 2 + 1) * 2 * cw        # one complex x-plane of the spectrum
+    spectrum_node = nc * half_plane / N
+    occ_slab = t9.n_buckets_side**3 // nb * 4       # a slab's per-bucket occupancy (uint32)
+    ghost_slab = slab_rows * 3 + occ_slab           # `off` + occupancy; `w` is never read
+    paint_planes = (ACC_GHOST_LO + ACC_GHOST_HI) * nc * nc * 4   # int32 accumulator planes
+    handoff = 2 * reach * HANDOFF_B_PER_SLAB_ROW_PER_SEGMENT * slab_rows  # both neighbours
+    phases = {
+        "tile_loop": {"ghost slabs received (1 per side)": 2 * ghost_slab},
+        "coarse_paint": {"paint ghost planes, sent + received": 2 * paint_planes},
+        "coarse_solve": {
+            "spectrum halo planes received": 2 * COARSE_HALO * half_plane,
+            "transpose chunks in flight (send + receive)": 2 * MPI_CHUNK_BYTES},
+        "migrate": {"emigrant hand-off, sent + received (MEASURED rate)": 2 * handoff},
+    }
+    sent = {
+        "ghost slabs": 2 * ghost_slab,
+        "paint ghost planes": paint_planes,
+        "spectrum transposes (1 forward + 3 inverse)": 4 * spectrum_node * (N - 1) / N,
+        "spectrum halo planes": 2 * COARSE_HALO * half_plane,
+        "emigrant hand-off": handoff,
+    }
+    return {p: {k: int(v) for k, v in t.items()} for p, t in phases.items()}, \
+        {k: int(v) for k, v in sent.items()}
+
+
+def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     """The host / per-GPU split for the host-state / device-step design.
 
     The host column is the state plus host-side step windows; the per-GPU column is the
@@ -470,16 +522,29 @@ def _device_main(args, ec, t9, n, rows, arena, state):
     ec_dev, _ = build(dev_args)
     n_gpus = max(1, int(args.n_gpus))
 
+    n_nodes = max(1, int(getattr(args, "n_nodes", 1)))
+    # the per-card coarse shard is 1/(cards on all nodes); slab terms do not change with N
     resident, transient, phases, worst_phase, slabs, host_mesh, after_loop = device_budget(
-        ec_dev, n=n, n_gpus=n_gpus, paint_chunk_bricks=args.paint_chunk_bricks,
+        ec_dev, n=n, n_gpus=n_gpus * n_nodes, paint_chunk_bricks=args.paint_chunk_bricks,
         fused=not getattr(args, "separate_passes", False))
 
     step = ec_dev.step_bytes(n, n_rows=rows, cap=args.cap)
     fused = not getattr(args, "separate_passes", False)
+    if n_nodes > 1:
+        global_kernel = sum(v for k, v in host_mesh.items()
+                            if k in ("coarse_kernel_pref", "coarse_match_factor"))
+        # each node holds its pencils (spectrum, work) and its y-block of the kernel arrays
+        host_mesh = {k: int(v / n_nodes) for k, v in host_mesh.items()}
     host_res, host_ph = device_host_phases(ec, n=n, state=state, step=step,
                                            host_mesh=host_mesh, n_gpus=n_gpus, fused=fused)
+    sent = {}
+    if n_nodes > 1:
+        mn_ph, sent = multinode_terms(ec, n=n, n_nodes=n_nodes, t9=t9, reach=args.reach)
+        for p, terms in mn_ph.items():
+            for k, v in terms.items():
+                host_ph.setdefault(p, {})[f"[multi-node] {k}"] = v
     _table("HOST, resident for the whole run", host_res)
-    print(f"  state alone: {sum(state.values()) / n:6.2f} B/p")
+    print(f"  state alone: {sum(state.values()) / (n * share):6.2f} B/p")
     _table("HOST, by phase (summed within a phase; phases do not coexist)",
            {f"{p}: {k}": v for p, terms in host_ph.items() for k, v in terms.items()},
            total_label="sum of ALL phases listed")
@@ -487,6 +552,20 @@ def _device_main(args, ec, t9, n, rows, arena, state):
     worst_host = max(host_phase_sums, key=host_phase_sums.get)
     print(f"  worst phase: {worst_host} at {_fmt(host_phase_sums[worst_host]).strip()} "
           "above the resident")
+    if n_nodes > 1:
+        mn_worst = sum(v for k, v in host_ph[worst_host].items() if k.startswith("[multi-node]"))
+        print(f"\n  PER NODE (busiest of {n_nodes}): {share:.4f} of the rows and buckets; "
+              "brick_start and\n  brick_scales stay global length; the coarse spectrum, work "
+              "and kernel arrays\n  are 1/N (pencils and y-blocks, transposed in place). "
+              "[multi-node] lines are a\n  DESIGN ESTIMATE: that code does not exist yet; "
+              f"{_fmt(mn_worst).strip()} of the worst phase.")
+        print(f"  NB M1 must build the kernel arrays as y-block slices: built whole, every node "
+              f"would\n  hold {_fmt(global_kernel).strip()} of them, and the f64 build "
+              f"{_fmt(host_mesh.get('coarse_kernel_build_f64', 0) * n_nodes).strip()}.")
+        _table("EXCHANGE, bytes each node SENDS per step", sent)
+        if getattr(args, "net_gbs", None):
+            print(f"  at --net-gbs {args.net_gbs}: {sum(sent.values()) / (args.net_gbs * GB):.1f} "
+                  "s per step")
     print("  `migrate_staging` and `repack_scratch` are the HOST windows the device "
           "migrate\n  and repack build per slab (from the code); MEASURED lines are the "
           "host side of\n  card transfers, which the CPU backend does not allocate.")
@@ -509,7 +588,8 @@ def _device_main(args, ec, t9, n, rows, arena, state):
           "so walking tiles in x-order\n  needs that many consecutive slabs live. "
           "It is not a tuning knob.")
 
-    load_peak = _print_load_and_ic(args, ec, t9, n, rows, arena, shared=True)
+    load_peak = _print_load_and_ic(args, ec, t9, int(n * share), int(rows * share),
+                                   int(arena * share), shared=True, share=share)
 
     # the generator runs float32 fields whatever the mesh dtypes; it wants particles per side
     ic_host, ic_card, ic_disk = ic_device_stages(
@@ -593,8 +673,17 @@ def main(argv=None):
                     help="which engine to price. `device` = the host is a byte "
                          "store and the GPUs do the step (Vista gb).")
     ap.add_argument("--n-gpus", type=int, default=4,
-                    help="accelerators the coarse mesh is sharded across, for "
+                    help="accelerators per node the coarse mesh is sharded across, for "
                          "--backend device. A Vista gb node has 4.")
+    ap.add_argument("--n-nodes", type=int, default=1,
+                    help="for --backend device: nodes, split in x by whole tile planes; "
+                         "prices the busiest node")
+    ap.add_argument("--reach", type=int, default=1,
+                    help="with --n-nodes: the migrate's brick reach per drift (a runtime "
+                         "quantity; 1 over every recorded 120-step run)")
+    ap.add_argument("--net-gbs", type=float, default=None,
+                    help="with --n-nodes: host-to-host GB/s per node, to price the "
+                         "exchange in seconds per step")
     ap.add_argument("--separate-passes", action="store_true",
                     help="for --backend device: price the migrate and repack as two "
                          "passes (no census) instead of the fused pass")
@@ -668,6 +757,20 @@ def main(argv=None):
 
     ec, t9 = build(args)
     n = args.n_part**3
+    share = 1.0
+    if args.n_nodes > 1:
+        if args.backend != "device":
+            ap.error("--n-nodes prices the device backend only")
+        planes = ec.tiles_side
+        if planes < args.n_nodes * args.n_gpus:
+            ap.error(f"{planes} tile planes cannot give every one of {args.n_nodes} x "
+                     f"{args.n_gpus} cards a plane")
+        nb = max(1, args.n_fine // ec.n_brick)
+        fewest = nb * (planes // args.n_nodes) // planes
+        if fewest < 2 * args.reach + 1:
+            ap.error(f"a node would hold {fewest} slabs, fewer than 2r + 1 = "
+                     f"{2 * args.reach + 1}: the migrate hands off to neighbours only")
+        share = -(-planes // args.n_nodes) / planes
     print(f"config: n_part={args.n_part}^3 = {n:,} particles, box={args.box} Mpc/h, "
           f"n_fine={args.n_fine}, n_coarse={args.n_coarse}, T={args.tile}, b={args.buf}")
     print(f"        fine cell {ec.fine_cell:.4f} Mpc/h, particle spacing "
@@ -688,12 +791,17 @@ def main(argv=None):
         # one f64 per brick (the per-brick velocity scale), not a per-particle array
         "brick_scales": (ec.n_brick and (args.n_fine // ec.n_brick) ** 3) * 8,
     }
+    if share < 1.0:
+        # the busiest node's rows and buckets; the per-brick arrays stay global length
+        for k in ("t9_payload (9 B/p)", "slack + alloc_margin", "bucket_index",
+                  "arena rows in off/w", "arena_bucket"):
+            state[k] = int(state[k] * share)
     _table("STATE (resident for the whole run)", state)
-    print(f"  {'':<20}  {sum(state.values()) / n:6.2f} B/p")
+    print(f"  {'':<20}  {sum(state.values()) / (n * share):6.2f} B/p")
 
     # The tables below price a host that holds the coarse mesh and runs the tile loop.
     if args.backend == "device":
-        return _device_main(args, ec, t9, n, rows, arena, state)
+        return _device_main(args, ec, t9, n, rows, arena, state, share=share)
 
     mesh = ec.mesh_bytes()
     # Phases come from the engine (the code that allocates each term), not from here.

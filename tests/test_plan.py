@@ -763,3 +763,68 @@ def test_the_host_kernel_arrays_are_charged_to_the_host_not_the_cards(capsys):
     card_block = out.split("PER GPU (of 4), resident through the tile loop")[1].split("\n\n")[0]
     for k in ("coarse_kernel_pref", "coarse_match_factor"):
         assert k in res_block and k not in card_block, k
+
+
+# ------------------------------------------------------------- the node axis (--n-nodes)
+
+_G8192 = ["--n-part", "8192", "--box", "4096", "--n-fine", "16384", "--n-coarse", "4096",
+          "--tile", "512", "--buf", "32", "--backend", "device", "--n-gpus", "4"]
+
+
+def test_one_node_is_the_output_without_the_flag(capsys):
+    for extra in ([], ["--n-nodes", "1"]):
+        main(["--preset", "c-hero", "--backend", "device", "--host-gb", "1026"] + extra)
+        if not extra:
+            without = capsys.readouterr().out
+    assert capsys.readouterr().out == without
+
+
+def test_the_busiest_node_holds_its_planes_share_and_the_brick_arrays_whole(capsys):
+    """8192^3 on 8 nodes: 32 tile planes, 4 per node, so row and bucket terms are 1/8 of the
+    global ones; brick_start stays global length."""
+    main(_G8192)
+    one = capsys.readouterr().out
+    main(_G8192 + ["--n-nodes", "8"])
+    eight = capsys.readouterr().out
+
+    def term(out, name):
+        block = out.split("STATE (resident for the whole run)")[1].split("\n\n")[0]
+        return float(next(ln for ln in block.splitlines() if name in ln).split()[-2])
+
+    for k in ("t9_payload", "bucket_index", "arena_bucket"):
+        # printed to 0.001 GB, on both sides
+        assert term(eight, k) == pytest.approx(term(one, k) / 8, abs=1.5e-3), k
+    assert term(eight, "brick_start") == term(one, "brick_start")
+    assert "[multi-node]" in eight and "[multi-node]" not in one
+    assert "EXCHANGE, bytes each node SENDS per step" in eight
+
+
+def test_the_spectrum_transposes_move_all_but_the_nodes_own_share(capsys):
+    from inexor.plan import engine_config, multinode_terms
+    from inexor.codec import T9Layout
+
+    g = PRESETS["c-hero"]
+    ec = engine_config("c-hero")
+    t9 = T9Layout(g["box"], g["n_part"], 2)
+    half = ec.n_coarse ** 2 * (ec.n_coarse // 2 + 1) * 2 * 4
+    for N in (2, 4, 8):
+        _, sent = multinode_terms(ec, n=ec.n_total, n_nodes=N, t9=t9)
+        want = 4 * half / N * (N - 1) / N
+        assert sent["spectrum transposes (1 forward + 3 inverse)"] == pytest.approx(want, rel=1e-9)
+
+
+def test_decompositions_the_design_cannot_run_are_refused():
+    with pytest.raises(SystemExit):
+        main(["--preset", "c-hero", "--n-nodes", "2"])           # the CPU backend
+    with pytest.raises(SystemExit):
+        main(["--preset", "c-gh", "--backend", "device", "--n-gpus", "4", "--n-nodes", "8"])
+    with pytest.raises(SystemExit):
+        main(["--preset", "cgh64", "--backend", "device", "--n-gpus", "1", "--n-nodes", "4",
+              "--reach", "4"])
+
+
+def test_the_exchange_is_priced_in_seconds_only_given_a_rate(capsys):
+    main(_G8192 + ["--n-nodes", "8"])
+    assert "s per step" not in capsys.readouterr().out
+    main(_G8192 + ["--n-nodes", "8", "--net-gbs", "10"])
+    assert "at --net-gbs 10.0:" in capsys.readouterr().out
