@@ -122,7 +122,7 @@ build_mpi4py () {
 }
 run_leg build-mpi4py build_mpi4py || { echo "FATAL: mpi4py did not build"; exit 1; }
 gate_leg identity mpi_leg identity 300
-gate_leg bandwidth mpi_leg bandwidth 300
+gate_leg bandwidth mpi_leg bandwidth 300 --volume-mib 4096
 gate_leg signal mpi_leg signal 600 --wait 480 --batch-stamp "$OUT/batch_usr1.txt"
 for leg in abort kill; do
   run_leg "$leg" mpi_leg "$leg" 300
