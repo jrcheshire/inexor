@@ -178,9 +178,11 @@ def leg_identity(args):
     rec["jaxlib"] = __import__("jaxlib").__version__
     try:
         with open("/proc/driver/nvidia/version") as fh:
-            rec["driver"] = fh.readline().strip()
+            line = fh.readline().strip()
+        rec["driver_line"] = line  # carries each node's module build host and date
+        rec["driver"] = next((t for t in line.split() if t[:1].isdigit() and "." in t), line)
     except OSError:
-        rec["driver"] = None
+        rec["driver"] = rec["driver_line"] = None
     rec["commit"] = _git_commit()
     rec["mpi4py"] = os.path.realpath(os.path.dirname(os.path.dirname(MPI.__file__)))
     rec["maps"] = _mapped(("libmpi", "libcudart.so.12", "libcudart.so.13", "libcuda.",

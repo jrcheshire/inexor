@@ -180,13 +180,14 @@ REPACK_DEVICE_B_PER_SLAB_ROW = 70
 # `device.fused.migrate_repack_device` (measured at 1024^3, not production shape).
 FUSED_DEVICE_B_PER_SLAB_ROW = 257
 
-# Host bytes the device lane's tile loop holds above the loop's closing RSS, per card, beyond
-# the priced window write-back: fixed + per slab row. MEASURED, not derived (the host side of
-# card transfers, which the CPU backend does not allocate): 1.9 GB/card at cgh64 on 4 GB200
-# (job 1027664), 2.0 at c-1024 on one GH200 (1029876, not in the fit), 10.5 at c-hero
-# (1003657).
-TILE_LOOP_HOST_FIXED_PER_CARD = 1.9 * GB
-TILE_LOOP_HOST_B_PER_SLAB_ROW = 32
+# Host bytes the first tile loop (and any recompile) holds above the loop's closing RSS, per
+# card, beyond the window write-back, keyed by tile size: compiling the tile programs and
+# writing them to the persistent compilation cache. MEASURED: attributed at cgh64 on 4 GB200
+# (job 1034340: jax compilation_cache + zstd traced, the rest untraced compiler memory; the
+# second step's tile loop holds nothing), 2.0 GB/card on one GH200 (1029876); 10.5 GB/card at
+# c-hero (1003657, step 1; steady steps of 1027664 hold ~the write-back alone). It depends
+# on the tile programs, not on the slab. Other tile sizes take the largest.
+TILE_COMPILE_HOST_PER_CARD = {256: 2.9 * GB, 512: 10.5 * GB}
 # The device-lane process's host floor beyond the priced state (CUDA context, jaxlib, XLA's
 # host pools), keyed by cards per node. MEASURED: 4.265 / 4.281 GB on one GH200 at cgh64 /
 # c-1024 (job 1029876, RSS after step 1 minus the priced resident; the smaller is taken, so
@@ -195,8 +196,9 @@ TILE_LOOP_HOST_B_PER_SLAB_ROW = 32
 PROCESS_BASELINE_BY_CARDS = {1: 4.26 * GB, 4: 3.2 * GB}
 
 # The lead drift's host transient above its closing RSS, per card per slab row, on several
-# cards. MEASURED at c-hero on 4 GB200 only (68 GB, job 1003657); ~0 on one GH200 at cgh64
-# and c-1024 (1029876). The single-card lane is charged nothing.
+# cards. MEASURED at c-hero on 4 GB200 only (68 GB, job 1003657); ~0 at cgh64 on 4 GB200
+# (1034340, nothing traced) and on one GH200 at cgh64 and c-1024 (1029876). Unattributed; the
+# slab-row scaling is an assumption. The single-card lane is charged nothing.
 LEAD_DRIFT_HOST_B_PER_SLAB_ROW_PER_CARD = 63
 
 
@@ -447,8 +449,9 @@ def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
     # the windowed tile loop writes back one core slab of `w` per card at once
     add("tile_loop", "tile_window write-back (one slab of w per card)",
         n_gpus * int(capacity_shape(max(1, int(slab_rows)))) * 3 * np.dtype(np.int16).itemsize)
-    add("tile_loop", "tile loop card transfers (MEASURED, per card)",
-        n_gpus * (TILE_LOOP_HOST_FIXED_PER_CARD + TILE_LOOP_HOST_B_PER_SLAB_ROW * slab_rows))
+    add("tile_loop", "tile program compile, first step and recompiles (MEASURED, per card)",
+        n_gpus * TILE_COMPILE_HOST_PER_CARD.get(int(ec.n_tile),
+                                                max(TILE_COMPILE_HOST_PER_CARD.values())))
     if n_gpus > 1:
         add("lead_drift", "lead drift card transfers (MEASURED at c-hero, per card)",
             n_gpus * LEAD_DRIFT_HOST_B_PER_SLAB_ROW_PER_CARD * slab_rows)
