@@ -495,45 +495,61 @@ def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
 # 1): 0.84-1.06 GB per step over 8 card-to-card segments, i.e. <= 0.49 B per slab row per
 # segment. A node boundary is the same cut, so it is priced per slab row at this rate.
 HANDOFF_B_PER_SLAB_ROW_PER_SEGMENT = 0.49
-# One MPI message is capped at this; a streamed exchange holds a send and a receive chunk.
-MPI_CHUNK_BYTES = 2**30
-
-
 def multinode_terms(ec, *, n, n_nodes, t9, reach=1):
     """Host bytes per node that exist only across nodes, and bytes sent per node per step.
 
-    A design estimate for the 1-D decomposition in x by whole tile planes (the M1-M3 code
-    does not exist yet). Returns `(phases, sent)`: phase -> {term: bytes} as in
-    `device_host_phases`, and term -> bytes each node sends per step. Every node is assumed
-    to hold 1/N of the coarse spectrum, transposed in place.
+    Priced from what the exchanges hold, for the 1-D decomposition in x by whole tile planes:
+    the ghost slabs (`device.ghost`: the owner's slot range verbatim, its occupancy and brick
+    starts, `pad` slabs per side), the paint's int64 ghost planes, the solve's pencil
+    transposes (`ooc_fft`: each node holds its y-pencils of the spectrum and work, 1/N, and
+    one component's back-transpose receive at a time), the census and scales boundary
+    exchanges, and the migrate hand-off at its measured card-to-card rate. Derived from the
+    code, not yet measured on a cluster. Returns `(phases, sent)`: phase -> {term: bytes} as
+    in `device_host_phases`, and term -> bytes each node sends per step.
     """
     from .device.paint import ACC_GHOST_HI, ACC_GHOST_LO
     from .forces import COARSE_HALO
+    from .layout import brick_span
 
     N = int(n_nodes)
     nb = max(1, ec.n_fine // ec.n_brick)
+    nb2 = nb * nb
+    pad = brick_span(ec.n_tile, ec._b_realized, ec.n_brick, nb)[0]
     slab_rows = n / nb
     nc = int(ec.n_coarse)
     cw = ec.np_coarse_dtype.itemsize
     half_plane = nc * (nc // 2 + 1) * 2 * cw        # one complex x-plane of the spectrum
     spectrum_node = nc * half_plane / N
+    other_pencils = (N - 1) / N                     # the other nodes' share of a plane's y
     occ_slab = t9.n_buckets_side**3 // nb * 4       # a slab's per-bucket occupancy (uint32)
-    ghost_slab = slab_rows * 3 + occ_slab           # `off` + occupancy; `w` is never read
-    paint_planes = (ACC_GHOST_LO + ACC_GHOST_HI) * nc * nc * 4   # int32 accumulator planes
+    alloc_rows = slab_rows * (1.0 + ec.brick_slack)
+    ghost_slab = alloc_rows * 3 + occ_slab + nb2 * 8   # `off`, occupancy, starts; no `w`
+    ghost_planes = (ACC_GHOST_LO + ACC_GHOST_HI) * nc * nc * 8   # int64 accumulator planes
+    inverse_recv = (nc / N + 2 * COARSE_HALO) * other_pencils * half_plane
+    boundary = 2 * reach * nb2 * 8                  # int64 per brick, both neighbours
     handoff = 2 * reach * HANDOFF_B_PER_SLAB_ROW_PER_SEGMENT * slab_rows  # both neighbours
     phases = {
-        "tile_loop": {"ghost slabs received (1 per side)": 2 * ghost_slab},
-        "coarse_paint": {"paint ghost planes, sent + received": 2 * paint_planes},
+        "tile_loop": {
+            f"ghost slabs received ({pad} per side)": 2 * pad * ghost_slab,
+            "one ghost slab padded for upload": alloc_rows * 3},
+        "coarse_paint": {"paint ghost planes, sent + received": 2 * ghost_planes},
         "coarse_solve": {
-            "spectrum halo planes received": 2 * COARSE_HALO * half_plane,
-            "transpose chunks in flight (send + receive)": 2 * MPI_CHUNK_BYTES},
-        "migrate": {"emigrant hand-off, sent + received (MEASURED rate)": 2 * handoff},
+            "back-transpose receive, one component (the forward's send blocks, freed first, "
+            "are smaller)": inverse_recv},
+        "migrate": {
+            "emigrant hand-off, sent + received (MEASURED rate)": 2 * handoff,
+            "census and scales, boundary slabs sent + received": 2 * 2 * boundary},
+        # the lead half-drift is the same device migrate across nodes, without the census
+        "lead_drift": {
+            "emigrant hand-off, sent + received (MEASURED rate)": 2 * handoff,
+            "scales, boundary slabs sent + received": 2 * boundary},
     }
     sent = {
-        "ghost slabs": 2 * ghost_slab,
-        "paint ghost planes": paint_planes,
+        "ghost slabs": 2 * pad * ghost_slab,
+        "paint ghost planes": ghost_planes,
         "spectrum transposes (1 forward + 3 inverse)": 4 * spectrum_node * (N - 1) / N,
-        "spectrum halo planes": 2 * COARSE_HALO * half_plane,
+        "spectrum halo planes (3 inverse)": 3 * 2 * COARSE_HALO * (N - 1) * half_plane / N,
+        "census and scales, boundary slabs": 2 * boundary,
         "emigrant hand-off": handoff,
     }
     return {p: {k: int(v) for k, v in t.items()} for p, t in phases.items()}, \
@@ -590,9 +606,9 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
         mn_worst = sum(v for k, v in host_ph[worst_host].items() if k.startswith("[multi-node]"))
         print(f"\n  PER NODE (busiest of {n_nodes}): {share:.4f} of the rows and buckets; "
               "brick_start and\n  brick_scales stay global length; the coarse spectrum, work "
-              "and kernel arrays\n  are 1/N (pencils and y-blocks, transposed in place). "
-              "[multi-node] lines are a\n  DESIGN ESTIMATE: that code does not exist yet; "
-              f"{_fmt(mn_worst).strip()} of the worst phase.")
+              "and kernel arrays\n  are 1/N (pencils and y-blocks). [multi-node] lines price "
+              "the exchanges from\n  the code (hand-off at its measured card-to-card rate), "
+              f"not yet measured on a cluster;\n  {_fmt(mn_worst).strip()} of the worst phase.")
         if kernel == "host":
             print(f"  NB with --coarse-kernel host each node builds the kernel arrays whole: "
                   f"it would\n  hold {_fmt(global_kernel).strip()} of them, and the f64 build "
