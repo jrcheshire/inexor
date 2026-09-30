@@ -888,7 +888,7 @@ def _save_slab(path, meta, occ, off, w, scale_d):
 
 
 def write_t9_slabs(st, workdir, provenance=None, drop_ids=False, timings=None,
-                   max_slabs=None):
+                   max_slabs=None, comm=None):
     """Write a `SlotState` as T9 slabs: the exact inverse of `load_slot_state`.
 
     Same schema `generate_t9_slabs` emits. The state is compacted: each brick's live rows plus
@@ -901,21 +901,43 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False, timings=None,
     (main thread blocked on the writer), `write thread` (writer busy time), `arena index`,
     and a `slabs` count. `max_slabs` writes only that many slabs and returns None, with no
     manifest, so the directory cannot load.
+
+    `comm` (`comm.Comm`, default `SerialComm`): every rank calls this with its node-local
+    state, and the ranks' slabs must tile the box in rank order. Rank 0 removes the old
+    manifest, then (after a barrier) each rank writes its own slabs, and rank 0 writes the
+    manifest once every rank has finished. A rank that raises aborts the others, so no
+    manifest is written. The files are the same bytes at any rank count. Returns the manifest
+    on every rank.
     """
     if st.ids is not None and not drop_ids:
         raise ValueError(
             "this state carries ids and the t9-slabs-2 schema has no room for them; "
             "pass drop_ids=True to write the state without them"
         )
+    if comm is None:
+        from .comm import SerialComm
+
+        comm = SerialComm()
+    nb = st.bricks_per_side
+    if max_slabs is not None and comm.size > 1:
+        raise ValueError("the max_slabs probe writes one rank's leading slabs; run it on one rank")
+    spans = comm.allgather(st.owned_slabs)
+    if [lo for lo, _ in spans] != [0] + [hi for _, hi in spans[:-1]] or spans[-1][1] != nb:
+        raise ValueError(
+            f"the ranks' slabs {spans} do not tile [0, {nb}) in rank order; every slab must "
+            "be written by exactly one rank"
+        )
     os.makedirs(workdir, exist_ok=True)
     # remove any old manifest first, so a torn overwrite refuses to load rather than mixing
-    # generations (each slab's crc32 only vouches for its own file)
+    # generations (each slab's crc32 only vouches for its own file); no rank writes a slab
+    # until it is gone
     mpath = os.path.join(workdir, MANIFEST)
-    if os.path.exists(mpath):
+    if comm.rank == 0 and os.path.exists(mpath):
         os.remove(mpath)
-    nb = st.bricks_per_side
+    comm.barrier()
     p3 = st.buckets_per_brick
     nbb = nb * nb                      # bricks per x-slab
+    s_lo, s_hi = st.owned_slabs
     written, n_written = [], 0
 
     clock = time.perf_counter
@@ -950,14 +972,14 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False, timings=None,
                 timings["write thread"] = timings.get("write thread", 0.0) + dt
 
     try:
-        for d in range(nb if max_slabs is None else min(nb, int(max_slabs))):
+        for d in range(s_lo, s_hi if max_slabs is None else min(s_hi, s_lo + int(max_slabs))):
             t0 = clock()
             lo_brick = d * nbb
             lo_bucket = lo_brick * p3
             hi_bucket = lo_bucket + nbb * p3
 
             # the schema stores occupancy as int64
-            occ = st.occupancy[lo_bucket:hi_bucket].astype(np.int64)
+            occ = st._occ(lo_brick, lo_brick + nbb).astype(np.int64)
             counts = occ.reshape(nbb, p3).sum(axis=1)
             starts = st.brick_start[lo_brick : lo_brick + nbb].astype(np.int64)
             base = np.concatenate([[0], np.cumsum(counts)[:-1]])
@@ -1029,11 +1051,12 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False, timings=None,
     # a dropped arena row would be a silently deleted particle
     if n_written != st.n_live:
         raise RuntimeError(f"wrote {n_written} rows for a state holding {st.n_live} particles")
+    done = comm.allgather((written, int(n_written)))
 
     manifest = dict(
         schema=SCHEMA,
-        files=written,
-        n_particles=int(n_written),
+        files=[f for files, _ in done for f in files],
+        n_particles=sum(n for _, n in done),
         box_size=float(st.t9.box_size),
         n_part=int(st.t9.n_part),          # PER SIDE; `n_particles` is the total
         bucket_cells=int(st.t9.bucket_cells),
@@ -1042,6 +1065,8 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False, timings=None,
         provenance=provenance or {},
     )
     # written last: the completeness marker
-    with open(mpath, "w") as fh:
-        json.dump(manifest, fh, indent=1)
+    if comm.rank == 0:
+        with open(mpath, "w") as fh:
+            json.dump(manifest, fh, indent=1)
+    comm.barrier()
     return manifest

@@ -250,3 +250,119 @@ def test_the_loader_maps_files_by_slab_and_refuses_a_bad_list(written, tmp_path)
         with pytest.raises(ValueError, match="not a non-empty range"):
             icgen.load_slot_state(d, slabs=bad)
     icgen.load_slot_state(d).check()
+
+
+# ------------------------------------------------------------ the per-rank writer
+
+
+def _digests(d):
+    """sha256 of every file in `d` (the slab files and the manifest)."""
+    import hashlib
+    import os
+
+    return {f: hashlib.sha256(open(os.path.join(d, f), "rb").read()).hexdigest()
+            for f in sorted(os.listdir(d))}
+
+
+def _write_on_ranks(n_ranks, make_state, d):
+    """`make_state(slabs)` on each of `n_ranks` loopback ranks, then the collective write."""
+    from inexor import icgen
+    from inexor.comm import run_loopback
+
+    def body(comm):
+        st = make_state(rank_slabs(NB, n_ranks)[comm.rank])
+        return icgen.write_t9_slabs(st, d, comm=comm)
+
+    mans = run_loopback(n_ranks, body)
+    assert all(m == mans[0] for m in mans)
+    return mans[0]
+
+
+@pytest.mark.parametrize("n_ranks", [1, 2, 4, 8])
+def test_load_n_then_write_n_is_the_one_rank_bytes(written, n_ranks, tmp_path):
+    from inexor import icgen
+
+    ref = str(tmp_path / "ref")
+    icgen.write_t9_slabs(icgen.load_slot_state(written, arena_frac=0.05), ref)
+    assert _digests(ref) == _digests(written), "the one-rank writer is not a fixed point"
+    d = str(tmp_path / "n")
+    man = _write_on_ranks(
+        n_ranks, lambda s: icgen.load_slot_state(written, arena_frac=0.05, slabs=s), d)
+    assert _digests(d) == _digests(ref)
+    assert man == icgen.read_manifest(ref)
+
+
+@pytest.mark.parametrize("n_ranks", [2, 4, 8])
+def test_cuts_holding_arena_residents_write_the_whole_states_bytes(whole, written, n_ranks,
+                                                                   tmp_path):
+    d = str(tmp_path / "n")
+    _write_on_ranks(n_ranks, lambda s: restrict_to_slabs(whole, s), d)
+    assert _digests(d) == _digests(written)
+
+
+@pytest.mark.parametrize("n_w", [1, 2, 4])
+@pytest.mark.parametrize("n_r", [1, 2, 4])
+def test_n_ranks_write_and_m_ranks_load(whole, written, n_w, n_r, tmp_path):
+    from inexor import icgen
+
+    dw, dr = str(tmp_path / "w"), str(tmp_path / "r")
+    _write_on_ranks(n_w, lambda s: restrict_to_slabs(whole, s), dw)
+    _write_on_ranks(n_r, lambda s: icgen.load_slot_state(dw, arena_frac=0.05, slabs=s), dr)
+    assert _digests(dw) == _digests(dr) == _digests(written)
+
+
+def test_a_rank_failing_mid_write_leaves_no_manifest(whole, written, tmp_path, monkeypatch):
+    import shutil
+
+    from inexor import icgen
+    from inexor.comm import CommAborted, run_loopback
+
+    d = str(tmp_path / "g")
+    shutil.copytree(written, d)            # a complete generation being overwritten
+    real = icgen._save_slab
+
+    def failing(path, *a):
+        if path.endswith("t9_slab_0005.npz"):
+            raise OSError("disk full (injected)")
+        return real(path, *a)
+
+    monkeypatch.setattr(icgen, "_save_slab", failing)
+    seen = {}
+
+    def body(comm):
+        st = restrict_to_slabs(whole, rank_slabs(NB, 4)[comm.rank])
+        try:
+            return icgen.write_t9_slabs(st, d, comm=comm)
+        except BaseException as e:
+            seen[comm.rank] = type(e)
+            raise
+
+    with pytest.raises(OSError, match="injected"):
+        run_loopback(4, body, timeout=20.0)
+    assert seen[2] is OSError                              # slab 5 is rank 2's
+    assert all(issubclass(seen[r], CommAborted) for r in (0, 1, 3)), seen
+    with pytest.raises(FileNotFoundError, match="manifest is written last"):
+        icgen.load_slot_state(d)
+
+
+def test_the_writer_refuses_ranks_that_do_not_tile_the_box(whole, tmp_path):
+    from inexor import icgen
+    from inexor.comm import run_loopback
+
+    part = restrict_to_slabs(whole, rank_slabs(NB, 2)[0])
+    with pytest.raises(ValueError, match="do not tile"):
+        icgen.write_t9_slabs(part, str(tmp_path / "a"))            # one rank, half the box
+
+    def swapped(comm):
+        st = restrict_to_slabs(whole, rank_slabs(NB, 2)[1 - comm.rank])
+        return icgen.write_t9_slabs(st, str(tmp_path / "b"), comm=comm)
+
+    with pytest.raises(ValueError, match="do not tile"):
+        run_loopback(2, swapped)
+
+    def probe(comm):
+        st = restrict_to_slabs(whole, rank_slabs(NB, 2)[comm.rank])
+        return icgen.write_t9_slabs(st, str(tmp_path / "c"), comm=comm, max_slabs=1)
+
+    with pytest.raises(ValueError, match="run it on one rank"):
+        run_loopback(2, probe)
