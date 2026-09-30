@@ -142,10 +142,34 @@ Key flags for `preflight` and `run`:
 | `--timed-last`, `--timed-all` (run) | off | synced per-pass timing breakdown on the last step or on every step |
 | `--drop-ic-cache` (run) | off | drop each IC slab's page cache as it is read |
 | `--beat` (run) | 60 | heartbeat seconds |
+| `--comm` (run) | `serial` | `mpi`: one rank per process across nodes (see below) |
+| `--comm-timeout` (run) | 1800 | seconds a rank may wait at one exchange before it aborts the job |
 
 `run` also refuses to write a card or checkpoint anywhere under the IC directory. The GPU
 driver always starts at a = 0.1 (it has no `--a-init`), and it checks the ICs' `growth2` but
 not their epoch.
+
+**Across nodes.** `run --comm mpi` runs one rank per process, one process per node, under
+MPI:
+
+```bash
+mpiexec -n 2 python -m mpi4py scripts/run/device_run.py run --preset c-gh --workdir $ICS \
+    --card run.json --cards 1 --k-steps 120 --stop-at 40 --checkpoint-dir $CKPT \
+    --checkpoint-every 40 --comm mpi
+```
+
+- Each rank loads its own brick slabs of the ICs or of the checkpoint, writes its own card
+  (`run.rank<r>.json`), and prefixes its log lines with `[rank r]`. `python -m mpi4py` makes a
+  rank that raises end the whole job.
+- All ranks write each checkpoint together, and the files are the same bytes at any rank
+  count: a checkpoint from N nodes resumes on M, one included, and the card and export read it
+  as a single-node checkpoint.
+- Ranks x cards may not exceed the tile planes, and each rank needs at least 2r + 1 brick
+  slabs for a drift that reaches r slabs (3 at r = 1): the migrate hands particles to
+  immediate neighbours only.
+- `D7_FAIL_AT=<phase> D7_FAIL_RANK=<r>` exercises the failure path on one rank.
+- On a laptop, `scripts/run/mpi_lane.sh` runs the tests that need real MPI processes, in a
+  throwaway `pixi exec` env (the lock's jax and numpy, plus mpi4py and MPICH).
 
 **Card and export of a GPU run.** The CPU driver reads `<workdir>/ckpt`, so link the GPU
 run's checkpoint directory there. Use a product directory that is outside the IC directory:
