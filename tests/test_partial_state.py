@@ -366,3 +366,115 @@ def test_the_writer_refuses_ranks_that_do_not_tile_the_box(whole, tmp_path):
 
     with pytest.raises(ValueError, match="run it on one rank"):
         run_loopback(2, probe)
+
+
+# ------------------------------------------------------------------- checkpoints
+
+
+@pytest.fixture(scope="module")
+def ckpt(tmp_path_factory):
+    """A 6-step run checkpointed at steps 3 (gen0) and 6 (gen1), and its coefficients."""
+    import jax
+
+    from tests.test_engine import _cfg, _ck_state, _coeffs
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        d = str(tmp_path_factory.mktemp("ck"))
+        co = _coeffs(6)
+        cfg = _cfg(checkpoint_dir=d, checkpoint_every=3)
+        engine.run(_ck_state(cfg), cfg, co)
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+    return d, co
+
+
+def _reload_and_rewrite(src, co, n_ranks, out, torn=None):
+    """Load the newest checkpoint of `src` on `n_ranks` ranks, rewrite it as gen0 of `out`;
+    returns every rank's `resume`."""
+    from inexor.comm import run_loopback
+    from tests.test_engine import _cfg
+
+    nb = _cfg().n_fine // _cfg().n_brick
+
+    def body(comm):
+        slabs = None if n_ranks == 1 else rank_slabs(nb, n_ranks)[comm.rank]
+        st, res = engine.load_checkpoint(src, _cfg(), co, comm=comm, slabs=slabs)
+        cfg_out = _cfg(checkpoint_dir=out, checkpoint_every=3)
+        engine._write_checkpoint(st, cfg_out, co, res["step"], res["cap_shape"],
+                                 res["pad_shape"], 0, device_shapes=res["device_shapes"],
+                                 comm=comm)
+        return res
+
+    return run_loopback(n_ranks, body)
+
+
+@pytest.mark.parametrize("n_ranks", [1, 2, 4, 8])
+def test_an_n_rank_checkpoint_is_the_one_rank_bytes(ckpt, n_ranks, tmp_path):
+    import os
+
+    src, co = ckpt
+    ref, out = str(tmp_path / "ref"), str(tmp_path / "out")
+    r1 = _reload_and_rewrite(src, co, 1, ref)[0]
+    res = _reload_and_rewrite(src, co, n_ranks, out)
+    assert all(r == r1 for r in res) and r1["step"] == 6 and r1["gen"] == 1
+    assert _digests(f"{out}/gen0") == _digests(f"{ref}/gen0")
+    # writing is a fixed point: the rewrite is the run's own step-6 generation
+    assert _digests(f"{ref}/gen0") == _digests(f"{src}/gen1")
+    assert os.listdir(out) == ["gen0"]
+
+
+def test_every_rank_takes_rank_zeros_generation(ckpt, tmp_path):
+    import os
+    import shutil
+
+    src, co = ckpt
+    d = str(tmp_path / "ck")
+    shutil.copytree(src, d)
+    os.remove(f"{d}/gen1/manifest.json")        # a torn step-6 generation
+    res = _reload_and_rewrite(d, co, 4, str(tmp_path / "out"))
+    assert [r["step"] for r in res] == [3] * 4 and {r["gen"] for r in res} == {0}
+    assert _digests(f"{tmp_path}/out/gen0") == _digests(f"{src}/gen0")
+
+
+@pytest.mark.parametrize("n_w", [1, 2, 4])
+@pytest.mark.parametrize("n_r", [1, 2, 4, 8])
+def test_a_checkpoint_from_n_ranks_resumes_on_m(ckpt, n_w, n_r, tmp_path):
+    src, co = ckpt
+    a, b = str(tmp_path / "a"), str(tmp_path / "b")
+    _reload_and_rewrite(src, co, n_w, a)
+    _reload_and_rewrite(a, co, n_r, b)
+    assert _digests(f"{b}/gen0") == _digests(f"{src}/gen1")
+
+
+def test_checkpoint_refusals_across_ranks(ckpt):
+    from inexor.comm import CommAborted, run_loopback
+    from tests.test_engine import _cfg, _coeffs
+
+    src, co = ckpt
+    nb = _cfg().n_fine // _cfg().n_brick
+    seen = {}
+
+    def foreign(comm):
+        try:
+            engine.load_checkpoint(src, _cfg(), _coeffs(5), comm=comm,
+                                   slabs=rank_slabs(nb, 2)[comm.rank])
+        except BaseException as e:
+            seen[comm.rank] = e
+            raise
+
+    with pytest.raises(ValueError, match="different configuration or schedule"):
+        run_loopback(2, foreign)
+    assert all(isinstance(e, (ValueError, CommAborted)) for e in seen.values()) and \
+        len(seen) == 2
+
+    def overlapping(comm):                       # both ranks load slabs [0, 4)
+        return engine.load_checkpoint(src, _cfg(), co, comm=comm,
+                                      slabs=rank_slabs(nb, 2)[0])
+
+    with pytest.raises(ValueError, match="do not cover the box exactly once"):
+        run_loopback(2, overlapping)
+
+    with pytest.raises(ValueError, match="each must load its own"):
+        run_loopback(2, lambda comm: engine.load_checkpoint(src, _cfg(), co, comm=comm))

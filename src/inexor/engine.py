@@ -1363,13 +1363,29 @@ def checkpoint_fingerprint(cfg, coeffs):
 
 
 def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=None,
-                      device_shapes=None, timings=None):
+                      device_shapes=None, timings=None, comm=None):
     """Write generation `gen` of the rolling pair; returns its directory (the step's receipt).
 
     `epoch` is the optional `(a_steps, cosmo)` from `run` (see `epoch_record`);
-    `device_shapes` are restored on resume."""
+    `device_shapes` are restored on resume. `comm`: every rank calls this with its node-local
+    state (`icgen.write_t9_slabs`); the provenance is the same at any rank count."""
+    import math
+
     from . import icgen
 
+    if comm is None:
+        from .comm import SerialComm
+
+        comm = SerialComm()
+    if st.is_whole:
+        n_arena = int(st.n_arena)
+    else:
+        # the arena a whole-box load of this checkpoint gets, not the sum of the ranks'
+        if st.arena_frac is None:
+            raise ValueError("a node-local state without `arena_frac` cannot record the "
+                             "checkpoint's arena size")
+        n_total = comm.allreduce(int(st.n_live))
+        n_arena = math.ceil(n_total * float(st.arena_frac))
     prov = dict(
         kind="inexor-checkpoint",
         step=int(step),
@@ -1378,12 +1394,12 @@ def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=No
         pad_shape=int(pad_shape),
         device_shapes={name: {k: int(v) for k, v in s.items()}
                        for name, s in (device_shapes or {}).items()},
-        n_arena=int(st.n_arena),
+        n_arena=n_arena,
         fingerprint=checkpoint_fingerprint(cfg, coeffs),
     )
     prov.update(epoch_record(epoch, step))
     d = os.path.join(cfg.checkpoint_dir, f"gen{gen}")
-    icgen.write_t9_slabs(st, d, provenance=prov, timings=timings)
+    icgen.write_t9_slabs(st, d, provenance=prov, timings=timings, comm=comm)
     return d
 
 
@@ -1409,29 +1425,42 @@ def epoch_record(epoch, step):
 
 
 def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=0.10,
-                    arena_frac=None, alloc=None):
+                    arena_frac=None, alloc=None, comm=None, slabs=None):
     """Newest complete checkpoint under `checkpoint_dir` -> `(st, resume)`.
 
     Picks the highest recorded step among generations with a manifest (removed before a
     rewrite, written last, so a torn generation is skipped and the other survives). Raises
     on a fingerprint mismatch, which would otherwise splice two runs silently. Capacity is not
     stored: `brick_slack` defaults to the config's, `arena_frac` to the checkpoint's.
+
+    Across ranks (`comm`, default `SerialComm`), rank 0 picks the generation and every rank
+    loads its own brick x-slabs `slabs` (see `icgen.load_slot_state`); the ranks' particle
+    counts must add up to the checkpoint's.
     """
     from . import icgen
 
+    if comm is None:
+        from .comm import SerialComm
+
+        comm = SerialComm()
+    if comm.size > 1 and slabs is None:
+        raise ValueError(f"{comm.size} ranks: each must load its own `slabs`")
     best = None
-    for gen in (0, 1):
-        d = os.path.join(checkpoint_dir, f"gen{gen}")
-        mpath = os.path.join(d, icgen.MANIFEST)
-        if not os.path.exists(mpath):
-            continue
-        with open(mpath) as fh:
-            man = json.load(fh)
-        prov = man.get("provenance", {})
-        if prov.get("kind") != "inexor-checkpoint":
-            continue
-        if best is None or int(prov["step"]) > int(best[1]["step"]):
-            best = (d, dict(prov, gen=gen), man)
+    if comm.rank == 0:
+        for gen in (0, 1):
+            d = os.path.join(checkpoint_dir, f"gen{gen}")
+            mpath = os.path.join(d, icgen.MANIFEST)
+            if not os.path.exists(mpath):
+                continue
+            with open(mpath) as fh:
+                man = json.load(fh)
+            prov = man.get("provenance", {})
+            if prov.get("kind") != "inexor-checkpoint":
+                continue
+            if best is None or int(prov["step"]) > int(best[1]["step"]):
+                best = (d, dict(prov, gen=gen), man)
+    # one choice for every rank, whatever each rank's view of the filesystem
+    best = comm.bcast(best)
     if best is None:
         raise FileNotFoundError(
             f"no complete inexor checkpoint under {checkpoint_dir}: either nothing ran, or "
@@ -1454,7 +1483,14 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
         alloc_margin=alloc_margin,
         arena_frac=arena_frac,
         alloc=alloc,
+        slabs=slabs,
     )
+    n_all = comm.allreduce(int(st.n_particles))
+    if n_all != int(man["n_particles"]):
+        raise ValueError(
+            f"the ranks loaded {n_all} particles from {d}, which holds {man['n_particles']}: "
+            "their slabs do not cover the box exactly once"
+        )
     return st, dict(prov)
 
 def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
