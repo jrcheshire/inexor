@@ -166,7 +166,8 @@ def test_a_ghost_slab_without_its_occupancy_fails(reference, monkeypatch):
 
     def empty_occ(st, slabs):
         p = real_pack(st, slabs)
-        p["occ"] = np.zeros_like(p["occ"])
+        for k in [k for k in p if k.endswith(":occ")]:
+            p[k] = np.zeros_like(p[k])
         return p
 
     monkeypatch.setattr(dghost, "pack_slabs", empty_occ)

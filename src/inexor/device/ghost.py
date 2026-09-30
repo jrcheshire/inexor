@@ -11,7 +11,8 @@ occupancy and starts relative to the slab, and its arena residents (`off`, bucke
 owner's per-brick ascending slot order, so its spans, and with them every window shape, are
 the owner's. No `w`: buffer rows' velocities are masked out of the kick (`device/kick.py`),
 so they stage as zeros. Ghost rows get ids past the state's rows (live runs slab by slab,
-then residents), so every lookup by row id stays a sorted search.
+then residents), so every lookup by row id stays a sorted search. The sender sends views of
+its state and the receiver keeps the arrays that arrive: two ghost slabs per side of host.
 """
 
 from __future__ import annotations
@@ -22,77 +23,67 @@ from ..state import tile_window_counts
 
 
 def pack_slabs(st, slabs):
-    """The arrays `GhostSlabs` rebuilds brick x-slabs `slabs` (owned by `st`) from."""
+    """The arrays `GhostSlabs` rebuilds brick x-slabs `slabs` (owned by `st`) from, one set
+    per slab under `"<s>:<name>"` keys. The slot range and occupancy are views of the state,
+    so the sender holds no copy of them."""
     from .migrate import pass_arena_index
 
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
     nb2 = nb * nb
     ar_slots, ar_bricks = pass_arena_index(st)
-    parts = dict(off=[], starts=[], occ=[], res_off=[], res_bucket=[], res_count=[])
-    spans = []
+    out = dict(slabs=np.asarray([int(x) for x in slabs], dtype=np.int64),
+               p3=np.asarray([p3], dtype=np.int64))
     for s in (int(x) for x in slabs):
         lo_b, hi_b = st.slab_bricks(s)
         s0, s1 = int(st.brick_start[lo_b]), int(st.brick_start[hi_b])
-        spans.append(s1 - s0)
-        parts["off"].append(st.off[s0:s1])
-        parts["starts"].append(np.asarray(st.brick_start[lo_b:hi_b], dtype=np.int64) - s0)
-        parts["occ"].append(st._occ(lo_b, hi_b))
         a0, a1 = np.searchsorted(ar_bricks, [lo_b, hi_b])
         rows = ar_slots[a0:a1]
-        parts["res_off"].append(st.off[rows])
-        parts["res_bucket"].append(
-            np.asarray(st.arena_bucket, dtype=np.int64)[rows - int(st.arena_base)])
-        parts["res_count"].append(
-            np.bincount(ar_bricks[a0:a1] - lo_b, minlength=nb2).astype(np.int64))
-    empty = dict(off=np.zeros((0, 3), st.off.dtype), starts=np.zeros(0, np.int64),
-                 occ=np.zeros(0, st.index_dtype), res_off=np.zeros((0, 3), st.off.dtype),
-                 res_bucket=np.zeros(0, np.int64), res_count=np.zeros(0, np.int64))
-    out = {k: (np.concatenate(v) if v else empty[k]) for k, v in parts.items()}
-    out.update(slabs=np.asarray([int(x) for x in slabs], dtype=np.int64),
-               span=np.asarray(spans, dtype=np.int64), p3=np.asarray([p3], dtype=np.int64))
+        out.update({
+            f"{s}:off": st.off[s0:s1],
+            f"{s}:starts": np.asarray(st.brick_start[lo_b:hi_b], dtype=np.int64) - s0,
+            f"{s}:occ": st._occ(lo_b, hi_b),
+            f"{s}:res_off": st.off[rows],
+            f"{s}:res_bucket": np.asarray(st.arena_bucket, dtype=np.int64)[
+                rows - int(st.arena_base)],
+            f"{s}:res_count": np.bincount(ar_bricks[a0:a1] - lo_b,
+                                          minlength=nb2).astype(np.int64),
+        })
     return out
 
 
 class GhostSlabs:
     """Brick x-slabs another rank owns, rebuilt from `pack_slabs` parcels, ids from `base`.
 
-    Read through `SlabView`. One backing `off` array: each slab's slot range in parcel
-    order, then every slab's residents in the same order.
+    Read through `SlabView`. Each slab keeps the arrays it arrived in (no copy); its slot
+    range takes ids in parcel order from `base`, and every slab's residents follow.
     """
 
     def __init__(self, parcels, base, bricks_per_side):
         self.base = int(base)
         self.nb = int(bricks_per_side)
         nb2 = self.nb ** 2
-        live, res = [], []
         self._slab = {}
-        at = 0
+        at = self.base
         for p in parcels:
             p3 = int(p["p3"][0])
-            off_at = res_at = 0
-            for k, s in enumerate(p["slabs"].tolist()):
+            for s in p["slabs"].tolist():
                 if s in self._slab:
                     raise ValueError(f"ghost slab {s} arrived twice")
-                span = int(p["span"][k])
-                cnt = p["res_count"][k * nb2:(k + 1) * nb2]
-                n_res = int(cnt.sum())
+                off = p[f"{s}:off"]
+                cnt = p[f"{s}:res_count"]
                 self._slab[s] = dict(
-                    lo=self.base + at, span=span,
-                    starts=self.base + at + p["starts"][k * nb2:(k + 1) * nb2],
-                    occ=p["occ"][k * nb2 * p3:(k + 1) * nb2 * p3].reshape(nb2, p3),
-                    res_count=cnt, res_bucket=p["res_bucket"][res_at:res_at + n_res],
+                    lo=at, span=int(off.shape[0]), off=off, starts=at + p[f"{s}:starts"],
+                    occ=p[f"{s}:occ"].reshape(nb2, p3), res_count=cnt,
+                    res_off=p[f"{s}:res_off"], res_bucket=p[f"{s}:res_bucket"],
                     res_first=np.concatenate(([0], np.cumsum(cnt))))
-                live.append(p["off"][off_at:off_at + span])
-                res.append(p["res_off"][res_at:res_at + n_res])
-                off_at += span
-                res_at += n_res
-                at += span
-        n_live = at
-        for d in self._slab.values():
-            d["res_lo"] = self.base + at
+                at += int(off.shape[0])
+        for s in sorted(self._slab):
+            d = self._slab[s]
+            d["res_lo"] = at
             at += int(d["res_count"].sum())
-        self.off = (np.concatenate(live + res) if live else np.zeros((0, 3), np.uint8))
-        self.n_live = n_live
+        self.n_rows = at - self.base
+        self.nbytes = sum(int(v.nbytes) for d in self._slab.values()
+                          for v in (d["off"], d["occ"], d["res_off"]))
 
     def slabs(self):
         return sorted(self._slab)
@@ -106,6 +97,17 @@ class GhostSlabs:
         if d is None:
             raise IndexError(f"brick {int(b)} (slab {s}) is neither owned nor a ghost")
         return d, i
+
+    def resident_off(self, ids):
+        """`off` rows of resident ids (each slab's residents are one id range)."""
+        ids = np.asarray(ids, dtype=np.int64)
+        out = np.empty((len(ids), 3), dtype=np.uint8)
+        for d in self._slab.values():
+            n = int(d["res_count"].sum())
+            m = (ids >= d["res_lo"]) & (ids < d["res_lo"] + n)
+            if m.any():
+                out[m] = d["res_off"][ids[m] - d["res_lo"]]
+        return out
 
 
 class SlabView:
@@ -158,7 +160,7 @@ class SlabView:
         elif name == "w":
             return np.zeros((L, 3), dtype=self.state.w.dtype)
         else:
-            src, at = self.ghosts.off, lo - self.ghosts.base
+            src, at = self.ghosts._slab[int(s)]["off"], 0
         if window._slab_fits(src.shape[0], at, L):
             return src[at:at + L]
         out = np.zeros((L,) + src.shape[1:], dtype=src.dtype)
@@ -201,8 +203,7 @@ class SlabView:
         k = int(np.searchsorted(ids, st.off.shape[0]))
         out[:k] = getattr(st, name)[ids[:k]]
         if k < len(ids):
-            out[k:len(ids)] = (self.ghosts.off[ids[k:] - self.ghosts.base] if name == "off"
-                               else 0)
+            out[k:len(ids)] = self.ghosts.resident_off(ids[k:]) if name == "off" else 0
         return out
 
     def slab_residents(self, s):
@@ -298,5 +299,4 @@ def exchange_ghosts(st, decomp, comm, pad):
                              f"this rank's windows read {want}")
     ghosts = GhostSlabs([from_left, from_right], st.off.shape[0], st.bricks_per_side)
     nbytes = sum(int(v.nbytes) for d in (from_left, from_right) for v in d.values())
-    return ghosts, dict(ghost_slabs=2 * pad, ghost_rows=int(ghosts.off.shape[0]),
-                        ghost_bytes=nbytes)
+    return ghosts, dict(ghost_slabs=2 * pad, ghost_rows=int(ghosts.n_rows), ghost_bytes=nbytes)

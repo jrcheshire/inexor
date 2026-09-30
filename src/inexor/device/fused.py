@@ -75,17 +75,17 @@ def _block_inputs_program(cap_i, cap_s, w_cap, nb2, p3, has_ids):
 
 
 def census_across_ranks(st, counts, c_drift, comm):
-    """This rank's post-migrate membership from its tile loop's destination census: the
-    counts landing in the neighbours' r boundary slabs are sent to them, theirs for this
-    rank's boundary slabs added here, and every non-owned entry zeroed. A count beyond the
-    neighbours' r slabs is a collective refusal (a particle would skip a rank)."""
+    """This rank's post-migrate membership from its tile loop's destination census `counts`
+    (int64 over every brick, MODIFIED IN PLACE and returned): the counts landing in the
+    neighbours' r boundary slabs are sent to them, theirs for this rank's boundary slabs
+    added here, and every non-owned entry zeroed. A count beyond the neighbours' r slabs is
+    a collective refusal (a particle would skip a rank)."""
     from ..comm import exchange_neighbours
 
     nb = int(st.bricks_per_side)
     nb2 = nb * nb
     lo_s, hi_s = st.owned_slabs
     _r_raw, r = _m.pass_reach(st, c_drift, comm)
-    counts = np.array(counts, dtype=np.int64, copy=True)
     by_slab = counts.reshape(nb, nb2)
     left = [(lo_s - r + i) % nb for i in range(r)]
     right = [(hi_s + i) % nb for i in range(r)]
