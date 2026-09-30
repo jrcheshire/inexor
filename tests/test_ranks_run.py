@@ -85,6 +85,8 @@ def reference(tmp_path_factory):
     h = hashes(d)
     assert sorted({k.split("/")[0] for k in h}) == ["gen0", "gen1"]
     assert out[-1]["ranks"]["n_ranks"] == 1
+    # one rank sends nothing to another rank
+    assert all(e["bytes"] == 0 for e in out[-1]["ranks"]["comm"]["ops"].values())
     return d, h
 
 
@@ -99,6 +101,10 @@ def test_rank_checkpoints_are_the_one_rank_bytes(reference, tmp_path, n_ranks, c
         assert rec["n_ranks"] == n_ranks and rec["ghost_bytes"] > 0
         assert rec["forward_sent_bytes"] > 0 and rec["inverse_sent_bytes"] > 0
         assert sum(o[-1]["ranks"]["emigrant_rows_sent"] for o in outs) > 0
+        # the ledger sees at least the spectrum transposes' bytes
+        a2a = rec["comm"]["ops"]["Alltoallv"]
+        assert a2a["calls"] > 0
+        assert a2a["bytes"] >= rec["forward_sent_bytes"] + rec["inverse_sent_bytes"]
 
 
 @pytest.mark.parametrize("n_write,n_read", [(2, 3), (4, 1), (1, 4)])

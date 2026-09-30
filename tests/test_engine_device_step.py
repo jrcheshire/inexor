@@ -51,6 +51,10 @@ def _same_stats(host, dev, drop=()):
             if key in RECEIPTS or key in drop:
                 continue
             hv, dv = h[key], d[key]
+            if key == "ranks":
+                # the exchange ledger is wall time and lane-dependent call counts, not state
+                hv = {x: y for x, y in hv.items() if x != "comm"}
+                dv = {x: y for x, y in dv.items() if x != "comm"}
             if key == "repack" and hv is not None:
                 skip = ("repack_device", "scratch_bytes")
                 hv = {x: y for x, y in hv.items() if x not in skip}

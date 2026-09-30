@@ -18,6 +18,9 @@ exchange the step's ghost slabs, ghost planes and migrate hand-off use.
 deterministic and the same on every rank and every implementation. `Alltoallv` is a pairwise
 exchange in `chunk_bytes` pieces (M0 measured 40-72 GB/s at 4-256 MiB between gb nodes and
 2-3 GB/s into fresh buffers), built on `Sendrecv`.
+
+Every rank keeps a ledger of its exchanges (`take_ledger`): calls, bytes sent to other ranks
+and seconds per public operation, and the seconds spent blocked waiting on other ranks.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ import pickle
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -83,15 +87,14 @@ def _chunk_bounds(nbytes, chunk):
 
 
 class Comm:
-    """The interface. Subclasses provide `rank`, `size`, `allgather`, `_sendrecv_bytes` and
-    `Abort`; the rest is built on those."""
+    """The interface. Subclasses provide `rank`, `size`, `_allgather`, `_sendrecv_bytes` and
+    `Abort`, and call `_reset_ledger()` on construction; the rest is built on those."""
 
     rank = 0
     size = 1
     chunk_bytes = DEFAULT_CHUNK_BYTES
 
-    def allgather(self, obj):
-        """Every rank's `obj`, as a list in rank order."""
+    def _allgather(self, obj):
         raise NotImplementedError
 
     def _sendrecv_bytes(self, send, dest, recv, source, tag):
@@ -100,33 +103,73 @@ class Comm:
     def Abort(self, code=1):
         raise NotImplementedError
 
+    def _reset_ledger(self):
+        self._ledger, self._wait_s, self._depth = {}, 0.0, 0
+
+    @contextmanager
+    def _entry(self, op, nbytes=0):
+        """Ledger one public call; only the outermost, so nested calls count once."""
+        self._depth += 1
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._depth -= 1
+            if self._depth == 0:
+                e = self._ledger.setdefault(op, [0, 0, 0.0])
+                e[0] += 1
+                e[1] += int(nbytes)
+                e[2] += time.perf_counter() - t0
+
+    def take_ledger(self):
+        """This rank's exchanges since the previous call, then reset: `{"ops": {op: dict(calls,
+        bytes, seconds)}, "wait_s": s}`. `bytes` counts buffer and header bytes sent to other
+        ranks (object collectives count 0); `seconds` is wall time inside the call; `wait_s`
+        is the time blocked waiting on other ranks, which includes both transfer and
+        imbalance."""
+        ops = {k: dict(calls=c, bytes=b, seconds=s) for k, (c, b, s) in self._ledger.items()}
+        out = dict(ops=ops, wait_s=self._wait_s)
+        self._ledger, self._wait_s = {}, 0.0
+        return out
+
+    def allgather(self, obj):
+        """Every rank's `obj`, as a list in rank order."""
+        with self._entry("allgather"):
+            return self._allgather(obj)
+
     def barrier(self):
-        self.allgather(None)
+        with self._entry("barrier"):
+            self._allgather(None)
 
     def bcast(self, obj, root=0):
         """`root`'s `obj` on every rank."""
-        return self.allgather(obj if self.rank == int(root) else None)[int(root)]
+        with self._entry("bcast"):
+            return self._allgather(obj if self.rank == int(root) else None)[int(root)]
 
     def allreduce(self, x, op="sum"):
         """`op` ('sum', 'max', 'min') over ranks, folded in rank order."""
-        return _fold(self.allgather(x), op)
+        with self._entry("allreduce"):
+            return _fold(self._allgather(x), op)
 
     def Sendrecv(self, sendbuf, dest, recvbuf, source, tag=0):
         """Send `sendbuf` to `dest` and receive from `source` into `recvbuf` (same byte size as
         the sender's buffer, or the exchange raises). `tag` must be in [0, MAX_TAG]."""
-        self._sendrecv_bytes(_bytes_view(sendbuf, "sendbuf"), int(dest),
-                             _bytes_view(recvbuf, "recvbuf"), int(source), _user_tag(tag))
+        s = _bytes_view(sendbuf, "sendbuf")
+        with self._entry("Sendrecv", s.size if int(dest) != self.rank else 0):
+            self._sendrecv_bytes(s, int(dest), _bytes_view(recvbuf, "recvbuf"), int(source),
+                                 _user_tag(tag))
 
     def sendrecv(self, obj, dest, source, tag=0):
         """Send the picklable `obj` to `dest`; return the object `source` sent. For small
         headers: one unchunked message each way, its size exchanged first."""
         payload = np.frombuffer(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL),
                                 dtype=np.uint8)
-        n_in = np.zeros(1, dtype=np.int64)
-        self.Sendrecv(np.array([payload.size], dtype=np.int64), dest, n_in, source, tag)
-        buf = np.empty(int(n_in[0]), dtype=np.uint8)
-        self.Sendrecv(payload, dest, buf, source, tag)
-        return pickle.loads(buf.tobytes())
+        with self._entry("sendrecv", payload.size + 8 if int(dest) != self.rank else 0):
+            n_in = np.zeros(1, dtype=np.int64)
+            self.Sendrecv(np.array([payload.size], dtype=np.int64), dest, n_in, source, tag)
+            buf = np.empty(int(n_in[0]), dtype=np.uint8)
+            self.Sendrecv(payload, dest, buf, source, tag)
+            return pickle.loads(buf.tobytes())
 
     def Alltoallv(self, sendbufs, recvbufs):
         """`sendbufs[j]` goes to rank j; `recvbufs[i]` is filled from rank i.
@@ -141,7 +184,13 @@ class Comm:
                              f"{len(sendbufs)} and {len(recvbufs)}")
         sv = [_bytes_view(b, f"sendbufs[{j}]") for j, b in enumerate(sendbufs)]
         rv = [_bytes_view(b, f"recvbufs[{i}]") for i, b in enumerate(recvbufs)]
-        sizes = self.allgather(([int(b.size) for b in sv], [int(b.size) for b in rv]))
+        out = sum(int(b.size) for j, b in enumerate(sv) if j != self.rank)
+        with self._entry("Alltoallv", out):
+            self._alltoallv(sv, rv)
+
+    def _alltoallv(self, sv, rv):
+        n = self.size
+        sizes = self._allgather(([int(b.size) for b in sv], [int(b.size) for b in rv]))
         bad = [(i, j) for i in range(n) for j in range(n) if sizes[i][0][j] != sizes[j][1][i]]
         if bad:
             i, j = bad[0]
@@ -170,8 +219,9 @@ class SerialComm(Comm):
 
     def __init__(self, chunk_bytes=DEFAULT_CHUNK_BYTES):
         self.chunk_bytes = int(chunk_bytes)
+        self._reset_ledger()
 
-    def allgather(self, obj):
+    def _allgather(self, obj):
         return [_copy_obj(obj)]
 
     def _sendrecv_bytes(self, send, dest, recv, source, tag):
@@ -231,8 +281,16 @@ class LoopbackComm(Comm):
         self.size = hub.n
         self.chunk_bytes = int(chunk_bytes)
         self._generation = 0
+        self._reset_ledger()
 
-    def allgather(self, obj):
+    def _hub_wait(self, ready, what):
+        t0 = time.perf_counter()
+        try:
+            self._hub.wait(self.rank, ready, what)
+        finally:
+            self._wait_s += time.perf_counter() - t0
+
+    def _allgather(self, obj):
         h = self._hub
         g = self._generation
         self._generation += 1
@@ -243,7 +301,7 @@ class LoopbackComm(Comm):
             slot = h.slots.setdefault(g, dict(values={}, read=0))
             slot["values"][self.rank] = payload
             h.cv.notify_all()
-            h.wait(self.rank, lambda: len(slot["values"]) == h.n, f"collective {g}")
+            self._hub_wait(lambda: len(slot["values"]) == h.n, f"collective {g}")
             out = [_copy_obj(slot["values"][r]) for r in range(h.n)]
             slot["read"] += 1
             if slot["read"] == h.n:
@@ -262,8 +320,8 @@ class LoopbackComm(Comm):
                 h.wait(self.rank, lambda: False, "Sendrecv")
             h.box.setdefault((self.rank, dest, tag), deque()).append(msg)
             h.cv.notify_all()
-            h.wait(self.rank, lambda: bool(h.box.get(key_in)),
-                   f"Sendrecv from rank {source} (tag {tag})")
+            self._hub_wait(lambda: bool(h.box.get(key_in)),
+                           f"Sendrecv from rank {source} (tag {tag})")
             got = h.box[key_in].popleft()
         if got.size != recv.size:
             raise ValueError(f"Sendrecv: rank {source} sent {got.size} B into rank "
@@ -376,11 +434,13 @@ class MPIComm(Comm):
         self.chunk_bytes = int(chunk_bytes)
         self.timeout = float(timeout)
         self.poll_s = float(poll_s)
+        self._reset_ledger()
 
     def _wait(self, reqs, what):
         """Statuses of `reqs` once all complete; aborts the job past the watchdog."""
         MPI = self._MPI
-        deadline = time.monotonic() + self.timeout
+        t0 = time.monotonic()
+        deadline = t0 + self.timeout
         statuses = [MPI.Status() for _ in reqs]
         while not MPI.Request.Testall(reqs, statuses):
             if time.monotonic() > deadline:
@@ -390,9 +450,10 @@ class MPIComm(Comm):
                       file=sys.stderr, flush=True)
                 self.Abort(3)
             time.sleep(self.poll_s)
+        self._wait_s += time.monotonic() - t0
         return statuses
 
-    def allgather(self, obj):
+    def _allgather(self, obj):
         MPI = self._MPI
         payload = np.frombuffer(bytearray(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)),
                                 dtype=np.uint8)

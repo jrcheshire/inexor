@@ -1084,7 +1084,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     every exchange across ranks: every rank calls `step` with its node-local state (its
     `decomp.slabs`), in the production device lane (`rank_lane_refusal`), with a repack due.
     `devices` are the rank's cards (default the first `cfg.device_cards` jax devices).
-    `stats["ranks"]` records the rank and each exchange's bytes (zeros on one rank).
+    `stats["ranks"]` records the rank and each exchange's bytes (zeros on one rank), and under
+    `"comm"` the rank's exchange ledger since the previous step's record (`Comm.take_ledger`).
     """
     import jax.numpy as jnp
 
@@ -1382,6 +1383,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         hand_off_bytes_sent=int(md.get("rank_hand_off_bytes_sent", 0)))
     rank_rec.setdefault("forward_sent_bytes", 0)
     rank_rec.setdefault("inverse_sent_bytes", 0)
+    rank_rec["comm"] = comm.take_ledger()
     stats["ranks"] = rank_rec
     stats["repack"] = repack_stats
     stats["timings"] = timings

@@ -84,4 +84,34 @@ def neighbour_arrays(c):
     _same(from_right, _to_left(right))
 
 
-CHECKS = [ring_sendrecv, ragged_alltoallv, collectives, object_sendrecv, neighbour_arrays]
+def ledger(c):
+    """The ledger counts each public call once (not the calls nested inside it) with the bytes
+    this rank sent to other ranks, and `take_ledger` resets it."""
+    import pickle
+
+    c.take_ledger()
+    right, left = (c.rank + 1) % c.size, (c.rank - 1) % c.size
+    c.Sendrecv(np.zeros(1000), right, np.zeros(1000), left)
+    c.Alltoallv([_payload(c.rank, j, _count(c.rank, j)) for j in range(c.size)],
+                [np.zeros(_count(i, c.rank), np.int64) for i in range(c.size)])
+    c.allreduce(c.rank)
+    obj = dict(src=c.rank)
+    c.sendrecv(obj, right, left)
+    got = c.take_ledger()
+    other = c.size > 1
+    want_bytes = dict(
+        Sendrecv=8000 * other,
+        Alltoallv=sum(8 * _count(c.rank, j) for j in range(c.size) if j != c.rank),
+        allreduce=0,
+        sendrecv=(len(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)) + 8) * other)
+    assert sorted(got["ops"]) == sorted(want_bytes), got
+    for op, b in want_bytes.items():
+        e = got["ops"][op]
+        assert (e["calls"], e["bytes"]) == (1, b), (op, e)
+        assert e["seconds"] >= 0.0
+    assert got["wait_s"] >= 0.0
+    assert c.take_ledger() == dict(ops={}, wait_s=0.0)
+
+
+CHECKS = [ring_sendrecv, ragged_alltoallv, collectives, object_sendrecv, neighbour_arrays,
+          ledger]

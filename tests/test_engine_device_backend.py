@@ -69,6 +69,9 @@ def _strip(stats):
         d = dict(o)
         d.pop("migrate_backend", None)
         d.pop("migrate_device", None)
+        if d.get("ranks") is not None:
+            # the exchange ledger is wall time, not state
+            d["ranks"] = {k: v for k, v in d["ranks"].items() if k != "comm"}
         r = d.get("repack")
         if r is not None:
             r = dict(r)

@@ -187,6 +187,23 @@ def test_mixed_neighbour_directions_fail_the_check(monkeypatch):
         _run("loopback", 2, comm_checks.neighbour_arrays)
 
 
+def test_the_ledger_puts_imbalance_in_the_waiting_ranks_wait():
+    """Rank 0 arrives 0.3 s late at a barrier: the others' `wait_s` holds the 0.3 s, and rank
+    0's does not."""
+    def fn(c):
+        c.take_ledger()
+        if c.rank == 0:
+            time.sleep(0.3)
+        c.barrier()
+        return c.take_ledger()
+
+    got = run_loopback(3, fn, timeout=10.0)
+    assert got[0]["wait_s"] < 0.1, got[0]
+    for g in got[1:]:
+        assert g["wait_s"] >= 0.25, g
+        assert g["ops"]["barrier"]["seconds"] >= g["wait_s"]
+
+
 def test_user_tags_are_bounded():
     c = SerialComm()
     for bad in (-1, cm.MAX_TAG + 1):
