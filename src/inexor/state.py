@@ -15,6 +15,7 @@ Wrap-never-clamp: no saturating op touches integer state; overflow escalates to 
 arena, then a loud refusal.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -585,6 +586,73 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
 # ===========================================================================
 
 
+def tile_brick_ids(tijk, n_tile, b_fine, n_brick, nb):
+    """The bricks covering tile `tijk` plus its buffer on an nb^3 brick grid, as int64.
+
+    Order is x outer, z inner, each axis ascending from the tile's low buffer edge (mod nb); the
+    decode, and so every row index downstream, follows it.
+    """
+    from .layout import brick_span
+
+    pad, span = brick_span(n_tile, b_fine, n_brick, nb)
+    lo = np.asarray(tijk, dtype=np.int64) * (int(n_tile) // int(n_brick)) - pad
+    bi, bj, bk = ((int(lo[a]) + np.arange(span, dtype=np.int64)) % nb for a in range(3))
+    return ((bi[:, None, None] * nb + bj[None, :, None]) * nb + bk[None, None, :]).reshape(-1)
+
+
+def tile_window_counts(grid, n_tile, b_fine, n_brick, planes=None):
+    """Per-tile sums of a per-brick (nb, nb, nb) int grid over each tile's `tile_brick_ids`:
+    an int64 (planes, s, s) array for tile x-planes `planes` = [lo, hi) (default all).
+
+    Periodic window sums by wrap-extended cumulative sums along each axis; exact.
+    """
+    from .layout import brick_span
+
+    g = np.asarray(grid, dtype=np.int64)
+    nb = g.shape[0]
+    pad, span = brick_span(n_tile, b_fine, n_brick, nb)
+    bpt = int(n_tile) // int(n_brick)
+    s = nb // bpt
+    p_lo, p_hi = (0, s) if planes is None else (int(planes[0]), int(planes[1]))
+
+    def window(a, axis, tiles):
+        ext = np.concatenate([a, np.take(a, np.arange(span), axis=axis)], axis=axis)
+        c = np.cumsum(ext, axis=axis, dtype=np.int64)
+        c = np.concatenate([np.zeros_like(np.take(c, [0], axis=axis)), c], axis=axis)
+        start = (np.asarray(tiles, dtype=np.int64) * bpt - pad) % nb
+        return np.take(c, start + span, axis=axis) - np.take(c, start, axis=axis)
+
+    return window(window(window(g, 0, range(p_lo, p_hi)), 1, range(s)), 2, range(s))
+
+
+class TileMembers(Mapping):
+    """Tile -> its bricks (`SlotState.tile_bricks`), built on access, not held.
+
+    Keys are the tiles of tile x-planes `planes` = [lo, hi) (default all), in `cfg.tiles`
+    order: one rank's tiles under `decomp.Decomp`.
+    """
+
+    def __init__(self, st, n_tile, b_fine, n_brick, n_fine, planes=None):
+        s = int(n_fine) // int(n_tile)
+        lo, hi = (0, s) if planes is None else (int(planes[0]), int(planes[1]))
+        self._st = st
+        self._geom = (n_tile, b_fine, n_brick, n_fine)
+        self._keys = [(i, j, k) for i in range(lo, hi) for j in range(s) for k in range(s)]
+        self._set = frozenset(self._keys)
+
+    def __getitem__(self, t):
+        t = tuple(int(q) for q in t)
+        if t not in self._set:
+            raise KeyError(t)
+        return self._st.tile_bricks(t, *self._geom)
+
+    def __iter__(self):
+        return iter(self._keys)
+
+    def __len__(self):
+        return len(self._keys)
+
+
 @dataclass
 class SlotState:
     """T9 payload stored in slot order; the bucket is implied by the slot."""
@@ -925,27 +993,56 @@ class SlotState:
     # ------------------------------------------------------------ the cost
 
     def tile_bricks(self, tijk, n_tile, b_fine, n_brick, n_fine):
-        """The brick ordinals covering tile+buffer; same union and wrap guard as
-        `BrickPackedLayout.tile_members`, but returning bricks, not particle indices."""
-        from .layout import brick_span
+        """The brick ordinals covering tile+buffer (`tile_brick_ids`); same union and wrap
+        guard as `BrickPackedLayout.tile_members`, but returning bricks, not particle indices."""
+        nb = self._check_brick_grid(n_fine, n_brick)
+        return tile_brick_ids(tijk, n_tile, b_fine, n_brick, nb)
 
+    def _check_brick_grid(self, n_fine, n_brick):
         nb = int(n_fine) // int(n_brick)
         if nb != self.bricks_per_side:
             raise ValueError(
                 f"brick grid {nb} from (n_fine={n_fine}, n_brick={n_brick}) disagrees with "
                 f"the layout's {self.bricks_per_side}"
             )
-        pad, span = brick_span(n_tile, b_fine, n_brick, nb)
-        lo = np.asarray(tijk, dtype=np.int64) * (int(n_tile) // int(n_brick)) - pad
-        out = []
-        for i in range(span):
-            bi = (lo[0] + i) % nb
-            for j in range(span):
-                bj = (lo[1] + j) % nb
-                for k in range(span):
-                    bk = (lo[2] + k) % nb
-                    out.append((bi * nb + bj) * nb + bk)
+        return nb
+
+    def brick_member_counts(self, workers=None):
+        """`brick_member_count` for every brick at once: an int64 (n_bricks,) array.
+
+        Occupancy summed per brick (x-slab chunks on `workers` threads, default the CPU count;
+        integer sums, so the result is exact at any thread count) plus arena residents.
+        """
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+
+        nb, p3 = self.bricks_per_side, self.buckets_per_brick
+        per_slab = nb * nb
+        out = np.empty(self.n_bricks, dtype=np.int64)
+        occ = self.occupancy.reshape(self.n_bricks, p3)
+
+        def slab(bx):
+            lo, hi = bx * per_slab, (bx + 1) * per_slab
+            np.sum(occ[lo:hi], axis=1, dtype=np.int64, out=out[lo:hi])
+
+        w = max(1, min(nb, int(os.cpu_count() or 1) if workers is None else int(workers)))
+        if w == 1:
+            for bx in range(nb):
+                slab(bx)
+        else:
+            with ThreadPoolExecutor(max_workers=w) as ex:
+                list(ex.map(slab, range(nb)))
+        if self.n_arena:
+            b = self.arena_bucket[self.arena_bucket >= 0] // p3
+            out += np.bincount(b, minlength=self.n_bricks).astype(np.int64, copy=False)
         return out
+
+    def tile_member_counts(self, n_tile, b_fine, n_brick, n_fine, planes=None):
+        """Member count of every tile of tile x-planes `planes` (default all), arena residents
+        included: `tile_window_counts` over `brick_member_counts`."""
+        nb = self._check_brick_grid(n_fine, n_brick)
+        return tile_window_counts(self.brick_member_counts().reshape(nb, nb, nb), n_tile,
+                                  b_fine, n_brick, planes=planes)
 
     def decode_bricks(self, bricks, scales=None):
         """(slots, x, v) over a list of bricks, concatenated.

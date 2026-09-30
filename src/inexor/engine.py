@@ -44,7 +44,7 @@ from .forces import (
 )
 from .layout import assert_brick_divides_buffer, choose_brick
 from .painting import check_tsc_paint_headroom, paint_tsc_int, paint_tsc_int_subblock
-from .state import drift_and_migrate, drift_and_migrate_pooled
+from .state import TileMembers, drift_and_migrate, drift_and_migrate_pooled
 
 __all__ = [
     "EngineConfig", "apply_result", "checkpoint_fingerprint", "coarse_delta_streamed",
@@ -993,7 +993,7 @@ def _cards(cfg):
 
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
          phase=None, tile_force=None, pool=None, coarse_parts=None, device_shapes=None,
-         repack_due=False, timings=None, decomp=None):
+         repack_due=False, timings=None, decomp=None, comm=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1-2; `c_drift` is
@@ -1019,7 +1019,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     a per-phase high-water mark. It takes no payload and cannot perturb the step.
 
     `decomp` (`decomp.Decomp`) says which tile planes this rank and each of its cards own;
-    None is one rank over the whole box.
+    None is one rank over the whole box. `comm` (`comm.Comm`, default `SerialComm`) carries
+    the cross-rank reductions: today only the tile capacity.
     """
     import jax.numpy as jnp
 
@@ -1028,6 +1029,10 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         from .decomp import Decomp
 
         decomp = Decomp.build(cfg)
+    if comm is None:
+        from .comm import SerialComm
+
+        comm = SerialComm()
 
     alpha_k, bcoef = float(coeff[0]), float(coeff[1])
 
@@ -1096,12 +1101,13 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
 
     # --- membership, and the capacity one jitted program needs
     b_real = cfg._b_realized
-    members = {
-        t: st.tile_bricks(t, cfg.n_tile, b_real, cfg.n_brick, cfg.n_fine) for t in cfg.tiles
-    }
-    # member count includes arena residents, which `decode_bricks` returns
-    counts = [sum(st.brick_member_count(b) for b in members[t]) for t in cfg.tiles]
-    cap_true = tile_capacity(counts)
+    members = TileMembers(st, cfg.n_tile, b_real, cfg.n_brick, cfg.n_fine,
+                          planes=decomp.planes)
+    # member count includes arena residents, which `decode_bricks` returns; the max is over
+    # every rank's tiles, so all ranks compile one shape
+    counts = st.tile_member_counts(cfg.n_tile, b_real, cfg.n_brick, cfg.n_fine,
+                                   planes=decomp.planes)
+    cap_true = comm.allreduce(tile_capacity(counts.reshape(-1)), "max")
     # Quantize the shape: `cap_true` moves every step, and each new shape grows the XLA
     # executable cache. Geometric ladder, monotone via `cap_shape`; masked, so bitwise neutral.
     cap = capacity_shape(cap_true, rungs=cfg.cap_rungs, floor_shape=cap_shape)
@@ -1131,7 +1137,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # order); compiled device (`tile_loop_device` writes into device state and returns only
     # counts, so nothing reaches the result loop below); eager device (`tile_task_device`
     # returns the `tile_task` dict).
-    tasks = [(t, members[t]) for t in cfg.tiles]
+    tasks = [(t, members[t]) for t in members]
     if cfg.tile_backend == "device" and cfg.device_tile_jit:
         from .device.tile import tile_loop_device, tile_step_shapes
 
