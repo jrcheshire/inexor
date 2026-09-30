@@ -94,7 +94,8 @@ def test_the_kernel_on_the_cards_is_bitwise_the_kernel_on_the_host(w):
     oh = engine.run(sh, ch, co)
     oc = engine.run(sc, cc, co)
     _same(sh, sc, f"kernel on {w} card(s) vs host")
-    _same_stats(oh, oc)
+    # the paint's compile count is a receipt of what ran before (the first arm compiles)
+    _same_stats(oh, oc, drop=("coarse_jit_traces",))
 
 
 def test_the_kernel_knob_is_refused_where_it_cannot_apply():
