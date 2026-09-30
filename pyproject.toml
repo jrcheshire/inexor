@@ -86,6 +86,10 @@ test-fast = { cmd = "pytest -m 'not slow' -n auto", env = { OMP_NUM_THREADS = "1
 # rather than `test && test-det` to keep the flag out of `test`.
 test-det = { cmd = "pytest -m detflag -n auto", env = { OMP_NUM_THREADS = "1", XLA_FLAGS = "--xla_gpu_deterministic_ops=true" } }
 test-all = { depends-on = ["test", "test-det"] }
+# The across-ranks gates (tests/test_ranks_*.py) on 8 emulated devices with a single-threaded
+# XLA-CPU pool: on macOS the threaded pool makes a jitted FFT's bytes vary run to run, so
+# `test` skips them there.
+test-ranks = { cmd = "pytest -n auto tests/test_ranks_coarse.py tests/test_ranks_tile.py tests/test_ranks_migrate.py tests/test_ranks_run.py", env = { OMP_NUM_THREADS = "1", XLA_FLAGS = "--xla_cpu_multi_thread_eigen=false --xla_force_host_platform_device_count=8" } }
 lint = "ruff check"
 format = "ruff format"
 

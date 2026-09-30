@@ -44,7 +44,7 @@ from .forces import (
 )
 from .layout import assert_brick_divides_buffer, choose_brick
 from .painting import check_tsc_paint_headroom, paint_tsc_int, paint_tsc_int_subblock
-from .state import TileMembers, drift_and_migrate, drift_and_migrate_pooled, require_whole
+from .state import TileMembers, drift_and_migrate, drift_and_migrate_pooled
 
 __all__ = [
     "EngineConfig", "apply_result", "checkpoint_fingerprint", "coarse_delta_streamed",
@@ -1020,6 +1020,8 @@ def rank_lane_refusal(cfg):
     """Why `cfg` cannot run across ranks, or None. Across ranks the step runs the production
     device lane only: device paint and folded solve into card shards, the compiled windowed
     tile loop, and the fused migrate + repack on every step."""
+    if cfg is None:
+        return "across ranks the step runs the production device lane only; no configuration"
     need = dict(coarse_backend=cfg.coarse_backend == "device",
                 tile_backend=cfg.tile_backend == "device",
                 device_tile_jit=cfg.device_tile_jit, tile_window=cfg.tile_window,
@@ -1032,18 +1034,22 @@ def rank_lane_refusal(cfg):
         f"differs in {', '.join(bad)}")
 
 
-def _require_rank_lane(st, cfg, comm, decomp, what):
-    """Refuse a node-local state or several ranks outside the device lane, and a state
-    whose slabs are not this rank's."""
+def _require_rank_lane(st, cfg, comm, what):
+    """Refuse a node-local state or several ranks outside the device lane."""
     multi = comm is not None and comm.size > 1
     if st.is_whole and not multi:
         return
     why = rank_lane_refusal(cfg)
     if why:
         raise NotImplementedError(f"{what}: {why}")
-    if decomp is not None and tuple(st.owned_slabs) != tuple(decomp.slabs):
-        raise ValueError(f"{what}: the state holds slabs {st.owned_slabs} but rank "
-                         f"{decomp.rank} of {decomp.n_ranks} owns {decomp.slabs}")
+
+
+def _require_rank_slabs(st, comm, decomp, what):
+    """Refuse a state whose slabs are not this rank's (across ranks only)."""
+    if (st.is_whole and comm.size == 1) or tuple(st.owned_slabs) == tuple(decomp.slabs):
+        return
+    raise ValueError(f"{what}: the state holds slabs {st.owned_slabs} but rank "
+                     f"{decomp.rank} of {decomp.n_ranks} owns {decomp.slabs}")
 
 
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
@@ -1089,17 +1095,16 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         from .comm import SerialComm
 
         comm = SerialComm()
+    if not (st.is_whole and comm.size == 1):
+        _require_rank_lane(st, cfg, comm, "engine.step")
+        if not repack_due:
+            raise ValueError("engine.step across ranks runs the fused migrate + repack, so "
+                             "every step must have a repack due")
     if decomp is None:
         from .decomp import Decomp
 
         decomp = Decomp.build(cfg, n_ranks=comm.size, rank=comm.rank)
-    if st.is_whole and comm.size == 1:
-        require_whole(st, "engine.step")
-    else:
-        _require_rank_lane(st, cfg, comm, decomp, "engine.step")
-        if not repack_due:
-            raise ValueError("engine.step across ranks runs the fused migrate + repack, so "
-                             "every step must have a repack due")
+    _require_rank_slabs(st, comm, decomp, "engine.step")
     rank_rec = dict(rank=int(comm.rank), n_ranks=int(comm.size))
 
     alpha_k, bcoef = float(coeff[0]), float(coeff[1])
@@ -1586,12 +1591,10 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         from .comm import SerialComm
 
         comm = SerialComm()
+    _require_rank_lane(st, cfg, comm, "engine.run")
     if decomp is None:
         decomp = Decomp.build(cfg, n_ranks=comm.size, rank=comm.rank)
-    if st.is_whole and comm.size == 1:
-        require_whole(st, "engine.run")
-    else:
-        _require_rank_lane(st, cfg, comm, decomp, "engine.run")
+    _require_rank_slabs(st, comm, decomp, "engine.run")
     cfg.validate()
     timed_steps = {int(k) for k in timed_steps}
     ph = phase if phase is not None else _no_phase

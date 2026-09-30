@@ -23,10 +23,18 @@ from inexor.decomp import Decomp  # noqa: E402
 from inexor.device import ghost as dghost  # noqa: E402
 from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table  # noqa: E402
 from inexor.plan import engine_config  # noqa: E402
-from tests.ranks_common import PRESET, hashes, rank_cfg, rank_devices, whole_state  # noqa: E402
+from tests.ranks_common import (  # noqa: E402
+    PRESET,
+    RANKS_MARKS,
+    hashes,
+    need_devices,
+    rank_cfg,
+    rank_devices,
+    whole_state,
+)
 from tests.test_partial_state import restrict_to_slabs  # noqa: E402
 
-pytestmark = pytest.mark.slow
+pytestmark = [pytest.mark.slow, *RANKS_MARKS]
 
 K, EVERY = 6, 3
 
@@ -48,6 +56,7 @@ def _coeffs():
 def run_ranks(n_ranks, cards, ckpt_dir, resume=False, stop_at=None):
     """Run on `n_ranks` loopback ranks into `ckpt_dir`: from the whole state, or (`resume`)
     from the newest checkpoint there. Returns each rank's per-step stats."""
+    need_devices(cards)
     cfg = rank_cfg(cards, checkpoint_dir=str(ckpt_dir), checkpoint_every=EVERY)
     co = _coeffs()
     whole = None if resume else whole_state()

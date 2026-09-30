@@ -4,20 +4,45 @@
 `whole_state` is a jittered lattice at that geometry migrated into a populated arena (cached:
 copy it before mutating); `rank_cfg` is the production device lane; `rank_devices` gives a
 rank disjoint emulated devices while the backend has enough.
+
+`RANKS_MARKS` go on every rank test module. They assert bit equality of float results, so on
+GPU they are `detflag` tests; on macOS-arm64 the multithreaded XLA-CPU pool makes a jitted
+FFT's bytes vary run to run at some sizes (cdev8-tile32's 48^3 tile mesh among them), so there
+they need `--xla_cpu_multi_thread_eigen=false` and skip visibly without it (`pixi run
+test-ranks` sets it).
 """
 
 import copy
 import functools
 import hashlib
 import os
+import sys
 
 import numpy as np
+import pytest
 
 from inexor import state
 from inexor.codec import T9Layout
 from inexor.plan import PRESETS, engine_config
 
 PRESET = "cdev8-tile32"
+
+STABLE_FFT_FLAG = "--xla_cpu_multi_thread_eigen=false"
+RANKS_MARKS = [
+    pytest.mark.detflag,
+    pytest.mark.skipif(
+        sys.platform == "darwin" and STABLE_FFT_FLAG not in os.environ.get("XLA_FLAGS", ""),
+        reason=f"macOS XLA-CPU's threaded FFT is not bitwise stable run to run; bit-equality "
+               f"gates need XLA_FLAGS={STABLE_FFT_FLAG} (pixi run test-ranks)"),
+]
+
+
+def need_devices(n):
+    """Skip unless the backend has `n` devices (the config refuses more cards than that)."""
+    import jax
+
+    if len(jax.devices()) < n:
+        pytest.skip(f"needs {n} jax devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)")
 
 
 def rank_cfg(cards, **kw):

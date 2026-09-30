@@ -41,9 +41,16 @@ User documentation is in `docs/`; start with `docs/getting_started.md`.
 - Most tests run on the CPU backend. Multi-card tests need four devices and skip otherwise;
   on CPU, run them with `XLA_FLAGS=--xla_force_host_platform_device_count=4`.
 - `detflag` tests assert bit equality; on a GPU they need `XLA_FLAGS=--xla_gpu_deterministic_ops=true`
-  and are skipped visibly without it (`pixi run test-det` runs them). On CPU they always run.
+  and are skipped visibly without it (`pixi run test-det` runs them). On CPU they run, except
+  the across-ranks gates on macOS (below).
 - Some gates are CPU-backend only and skip on a GPU; the executor's worker pool refuses a
   non-CPU parent, so any test that builds a `TilePool` must run in the CPU lane.
+- The across-ranks gates (`tests/test_ranks_*.py`, loopback ranks) run with `pixi run
+  test-ranks`: 8 emulated devices and `--xla_cpu_multi_thread_eigen=false`. On macOS the
+  threaded XLA-CPU pool makes a jitted FFT's bytes vary run to run (at the 48^3 tile mesh of
+  `cdev8-tile32`), so `test` skips them there.
+- Tests that need real MPI processes (`tests/test_comm_mpi.py`, `tests/test_driver_mpi.py`)
+  skip without mpi4py; `scripts/run/mpi_lane.sh` runs them in a throwaway `pixi exec` env.
 
 ## Cluster notes
 

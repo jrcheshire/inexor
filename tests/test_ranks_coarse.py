@@ -18,11 +18,13 @@ from inexor.decomp import Decomp  # noqa: E402
 from inexor.device.coarse import CardShards  # noqa: E402
 from inexor.device.paint import coarse_delta_cards  # noqa: E402
 from inexor.forces import COARSE_HALO, coarse_force_meshes, coarse_kernel_parts  # noqa: E402
-from tests.ranks_common import rank_cfg, rank_devices, whole_state  # noqa: E402
+from tests.ranks_common import RANKS_MARKS, rank_cfg, rank_devices, whole_state  # noqa: E402
 from tests.test_partial_state import restrict_to_slabs  # noqa: E402
 
 _cfg, _devices = rank_cfg, rank_devices
 
+
+pytestmark = RANKS_MARKS
 
 @pytest.fixture(autouse=True)
 def _x64():

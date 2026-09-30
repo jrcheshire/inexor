@@ -170,9 +170,11 @@ def test_passes_without_a_cross_rank_path_refuse_a_cut(whole):
         state.drift_and_migrate(part, 0.5)
     with pytest.raises(NotImplementedError, match=match):
         state.drift_and_migrate_pooled(part, 0.5, pool=None)
-    with pytest.raises(NotImplementedError, match=match):
+    # the step has a cross-rank path in the production device lane only (tests/test_ranks_run)
+    lane = "production device lane"
+    with pytest.raises(NotImplementedError, match=lane):
         engine.step(part, None, (0.0, 0.0), 0.0)
-    with pytest.raises(NotImplementedError, match=match):
+    with pytest.raises(NotImplementedError, match=lane):
         engine.run(part, None, np.zeros((1, 3)))
     from inexor.executor import TilePool
 

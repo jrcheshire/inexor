@@ -23,11 +23,13 @@ from inexor.device import window as dwin  # noqa: E402
 from inexor.device.coarse import shard_coarse_meshes  # noqa: E402
 from inexor.device.migrate import pass_arena_index  # noqa: E402
 from inexor.forces import COARSE_HALO, capacity_shape, make_tile_force_fn, tile_capacity  # noqa: E402
-from tests.ranks_common import rank_cfg, rank_devices, whole_state  # noqa: E402
+from tests.ranks_common import RANKS_MARKS, rank_cfg, rank_devices, whole_state  # noqa: E402
 from tests.test_partial_state import restrict_to_slabs  # noqa: E402
 
 C_DRIFT = 0.4
 
+
+pytestmark = RANKS_MARKS
 
 @pytest.fixture(autouse=True)
 def _x64():
