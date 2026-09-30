@@ -49,12 +49,9 @@ def _arena_per_brick(st):
 
 
 def chunk_rows(st, chunk_len):
-    """Member rows (live + arena) in each chunk of `chunk_len` consecutive bricks."""
-    p3 = int(st.buckets_per_brick)
-    n_b = int(st.n_bricks)
-    per_brick = st.occupancy.reshape(n_b, p3).sum(axis=1, dtype=np.int64)
-    per_brick = per_brick + _arena_per_brick(st)
-    return per_brick.reshape(-1, int(chunk_len)).sum(axis=1)
+    """Member rows (live + arena) in each chunk of `chunk_len` consecutive bricks (0 for a
+    chunk of bricks this state does not own)."""
+    return st.brick_member_counts().reshape(-1, int(chunk_len)).sum(axis=1)
 
 
 def step_shapes(st, chunk_len, pad, floor=None):
@@ -157,7 +154,7 @@ def slab_window_fixed(st, bricks, shapes):
     return dict(
         starts=plan["starts"] - s0,
         # the uint32 index view, not the plan's int64 copy; widened on the device
-        occ=np.asarray(st.occupancy).reshape(-1, p3)[b0:b0 + L],
+        occ=st._occ(b0, b0 + L).reshape(-1, p3),
         live_counts=plan["live_counts"], arena_slots=rect,
         row_offsets=plan["row_offsets"], bricks=bricks, off=off,
         arena_bucket=arena_bucket, n_rows=int(plan["n_rows"]),

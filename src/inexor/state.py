@@ -816,6 +816,20 @@ class SlotState:
         p3 = self.buckets_per_brick
         return self.occupancy[(lo_b - blo) * p3 : (hi_b - blo) * p3]
 
+    def brick_occ(self, bricks):
+        """Occupancy rows `(len(bricks), buckets_per_brick)` of `bricks` (any order, a copy
+        in the index dtype). Raises for a brick outside the owned range, as `_occ` does."""
+        b = np.asarray(bricks, dtype=np.int64)
+        blo, bhi = self.owned_bricks
+        p3 = self.buckets_per_brick
+        if len(b) and (int(b.min()) < blo or int(b.max()) >= bhi):
+            bad = b[(b < blo) | (b >= bhi)]
+            raise IndexError(
+                f"{len(bad)} brick(s) (first {int(bad[0])}) are outside this state's owned "
+                f"bricks [{blo}, {bhi}) (slabs {self.owned_slabs})"
+            )
+        return np.asarray(self.occupancy).reshape(-1, p3)[b - blo]
+
     @property
     def index_dtype(self):
         """The occupancy array's dtype."""

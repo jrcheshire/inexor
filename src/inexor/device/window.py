@@ -348,7 +348,6 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
     )
     from . import tile as dtile
     from .decode import tile_decode_plan
-    from .paint import _arena_per_brick
 
     global CALLS
     require_x64()
@@ -357,9 +356,7 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
     nb2 = nb * nb
     planes = list(range(nb // per)) if planes is None else [int(p) for p in planes]
     cap = int(C["cap"])
-    p3 = int(st.buckets_per_brick)
-    stored = (np.asarray(st.occupancy).reshape(-1, p3).sum(axis=1, dtype=np.int64)
-              + _arena_per_brick(st))
+    stored = st.brick_member_counts()
     vs = (jax.block_until_ready(jnp.array(st.vel_scale, copy=True)) if device is None
           else jax.block_until_ready(jax.device_put(np.array(st.vel_scale, copy=True), device)))
     no_mark = dtile._clock(None)

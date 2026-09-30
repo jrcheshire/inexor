@@ -160,8 +160,11 @@ def repack_device(st, brick_slack=0.10, timings=None, devices=None):
 
     from ..eject_jax import require_x64
     from ..ooc_fft import partition_units
+    from ..state import require_whole
 
     global CALLS
+    # across ranks the repack runs fused with the migrate (`device.fused`)
+    require_whole(st, "device.repack.repack_device")
     require_x64()
     CALLS += 1
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)

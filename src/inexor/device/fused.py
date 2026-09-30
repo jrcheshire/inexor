@@ -105,7 +105,9 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
                          f"{st.n_particles} particles stored")
     new_start, n_alloc = capacity_from_counts(st, counts, brick_slack)
     old_start = np.asarray(st.brick_start, dtype=np.int64).copy()
+    # the owned buckets only; `bucket_lo` is the flat ordinal of `new_occ[0]`
     new_occ = np.zeros(st.n_buckets, dtype=st.index_dtype)
+    bucket_lo = int(st.bucket_lo)
     row_bytes = st.off.itemsize * 3 + st.w.itemsize * 3 + (st.ids.itemsize if has_ids else 0)
     accs = {}
 
@@ -203,7 +205,8 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
         st.w[n_lo:n_hi] = _m._host(out_w, "fused: block")[:m]
         if has_ids:
             st.ids[n_lo:n_hi] = _m._host(out_ids, "fused: block")[:m]
-        new_occ[lo_b * p3: hi_b * p3] = _m._host(occ_s, "fused: occupancy")
+        new_occ[lo_b * p3 - bucket_lo: hi_b * p3 - bucket_lo] = _m._host(occ_s,
+                                                                         "fused: occupancy")
         st.vel_scale[lo_b:hi_b] = scales_h
         a["blocks"] += 1
         a["scratch"] = max(a["scratch"], m * row_bytes)

@@ -29,7 +29,7 @@ def tile_decode_plan(st, bricks):
     n_b = len(bricks)
 
     # slice before widening: widening first would copy the whole index
-    occ = np.asarray(st.occupancy).reshape(-1, p3)[bricks].astype(np.int64)
+    occ = st.brick_occ(bricks).astype(np.int64)
     live_counts = occ.sum(axis=1)
     starts = np.asarray(st.brick_start, dtype=np.int64)[bricks]
 

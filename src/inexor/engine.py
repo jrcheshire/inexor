@@ -773,13 +773,16 @@ def _diagnose_partition(st, cfg):
     """Where the ownership deficit is, for the assertion's message.
 
     Failure path only: reports which rows are unclaimed, aliased or double-claimed, and where
-    the occupancy / member-count / decode censuses disagree.
+    the occupancy / member-count / decode censuses disagree. On a node-local state the
+    censuses cover its owned bricks and the tile claims are skipped (tiles read other ranks'
+    bricks), so "unclaimed" is not reported there.
     """
     b_real = cfg._b_realized
     nb = cfg.n_fine // cfg.n_brick
     claimed = np.zeros(st.off.shape[0], dtype=np.int32)
     misaligned = []
-    for t in cfg.tiles:
+    b_lo, b_hi = st.owned_bricks
+    for t in (cfg.tiles if st.is_whole else ()):
         members = st.tile_bricks(t, cfg.n_tile, b_real, cfg.n_brick, cfg.n_fine)
         slots, _, _ = st.decode_bricks(members)
         counts = [st.brick_member_count(b) for b in members]
@@ -793,28 +796,28 @@ def _diagnose_partition(st, cfg):
     # distinct slots, since `SlotState.check` compares counts and an aliased slot passes it
     seen = np.zeros(st.off.shape[0], dtype=np.int64)
     total_decoded = 0
-    for b in range(st.n_bricks):
+    for b in range(b_lo, b_hi):
         s = np.asarray(st.decode_brick(b)[0])
         total_decoded += len(s)
         np.add.at(seen, s, 1)
     live = seen > 0
     aliased = np.nonzero(seen > 1)[0]
-    unclaimed = np.nonzero(live & (claimed == 0))[0]
+    unclaimed = np.nonzero(live & (claimed == 0))[0] if st.is_whole else np.empty(0, np.int64)
     twice = np.nonzero(claimed > 1)[0]
     # Three per-brick censuses that must agree: occupancy vs member_count disagreeing is a
     # counting bug, member_count vs decode a span/decode bug.
     p3 = st.buckets_per_brick
     occ = st.occupancy.astype(np.int64)
-    occ_per_brick = occ.reshape(st.n_bricks, p3).sum(axis=1)
+    occ_per_brick = occ.reshape(b_hi - b_lo, p3).sum(axis=1)
     mc_per_brick = np.array(
-        [st.brick_member_count(b) for b in range(st.n_bricks)], dtype=np.int64
+        [st.brick_member_count(b) for b in range(b_lo, b_hi)], dtype=np.int64
     )
     dec_per_brick = np.array(
-        [len(st.decode_brick(b)[0]) for b in range(st.n_bricks)], dtype=np.int64
+        [len(st.decode_brick(b)[0]) for b in range(b_lo, b_hi)], dtype=np.int64
     )
     bad = np.nonzero((occ_per_brick != mc_per_brick) | (mc_per_brick != dec_per_brick))[0]
     detail = [
-        (int(b), int(occ_per_brick[b]), int(mc_per_brick[b]), int(dec_per_brick[b]))
+        (int(b) + b_lo, int(occ_per_brick[b]), int(mc_per_brick[b]), int(dec_per_brick[b]))
         for b in bad[:4]
     ]
     lines = [
@@ -832,7 +835,7 @@ def _diagnose_partition(st, cfg):
     ]
     for s in aliased[:5]:
         s = int(s)
-        bricks_with = [b for b in range(st.n_bricks)
+        bricks_with = [b for b in range(b_lo, b_hi)
                        if s in set(int(q) for q in st.decode_brick(b)[0])]
         lines.append(
             f"  aliased slot {s}: seen {int(seen[s])}x in bricks {bricks_with[:6]}, "

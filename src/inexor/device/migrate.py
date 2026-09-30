@@ -356,7 +356,7 @@ def _slab_index(st, s, ar_slots, ar_bricks):
     nb2 = nb * nb
     lo_b, hi_b = st.slab_bricks(s)
     s0, s1 = int(st.brick_start[lo_b]), int(st.brick_start[hi_b])
-    occ = np.asarray(st.occupancy)[lo_b * p3: hi_b * p3].reshape(nb2, p3)
+    occ = st._occ(lo_b, hi_b).reshape(nb2, p3)
     live = occ.sum(axis=1, dtype=np.int64)
     a0, a1 = np.searchsorted(ar_bricks, [lo_b, hi_b])
     rows_a = ar_slots[a0:a1]
@@ -583,7 +583,6 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget, dev=None):
 
     from ..layout import _to_index
 
-    p3 = int(st.buckets_per_brick)
     has_ids = st.ids is not None
     lo_b, hi_b = st.slab_bricks(d)
     out, nw, ns, consumed, cap_i = _insert_on_card(st, d, reach, staged, scales_dev, clock,
@@ -599,8 +598,8 @@ def _insert_slab(st, d, reach, staged, scales_dev, clock, budget, dev=None):
     if has_ids:
         st.ids[s0:s1] = _host(ids_win, "insert: slot range")[:span]
     clock.mark("insert: slot range to host")
-    st.occupancy[lo_b * p3: hi_b * p3] = _to_index(_host(out["occupancy"], "insert: occupancy"),
-                                                    st.index_dtype, "migrated")
+    st._occ(lo_b, hi_b)[...] = _to_index(_host(out["occupancy"], "insert: occupancy"),
+                                         st.index_dtype, "migrated")
     st.vel_scale[lo_b:hi_b] = _host(out["scales"], "insert: scales")
     clock.mark("insert: occupancy + scales to host")
     spills, _rows = _spills(st, out, nw, ns, cap_i, dev)
