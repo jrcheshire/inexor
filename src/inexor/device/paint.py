@@ -712,6 +712,7 @@ def coarse_delta_cards(st, cfg, devices=None, stats=None, pad_shape=0, chunk_bri
     """
     from concurrent.futures import ThreadPoolExecutor
 
+    from ..comm import allreduce_shapes
     from ..eject_jax import require_x64
     from ..engine import _chunk_cuboid
     from ..forces import capacity_shape
@@ -746,11 +747,7 @@ def coarse_delta_cards(st, cfg, devices=None, stats=None, pad_shape=0, chunk_bri
         pad_true = comm.allreduce(pad_true, "max")
     pad = (capacity_shape(pad_true, rungs=cfg.cap_rungs, floor_shape=pad_shape)
            if cfg.pad_ladder else pad_true)
-    shapes = step_shapes(st, L, pad, floor=shape_floor)
-    if multi:
-        keys = sorted(shapes)
-        top = comm.allreduce(np.array([shapes[k] for k in keys], dtype=np.int64), "max")
-        shapes = {k: int(v) for k, v in zip(keys, top)}
+    shapes = allreduce_shapes(comm, step_shapes(st, L, pad, floor=shape_floor))
     by_card = [[] for _ in range(W)]
     for gi in range(n_b // L):
         if rows[gi] == 0:

@@ -215,9 +215,8 @@ def test_the_write_back_downloads_a_slab_at_a_time():
     reads = migrate.READS.get("window: write-back", 0) - before
     # reference: a whole-window download
     dwin_rows = np.asarray(w_dev)
-    edges = win["edges"]
     for s in range(0, per):
-        lo, hi, r = int(edges[s]), int(edges[s + 1]), int(win["slab_win"][s])
+        (lo, hi), r = win["ranges"][s], int(win["slab_win"][s])
         st_b.w[lo:hi] = dwin_rows[r:r + hi - lo]
     b = win["res_bricks"]
     k = np.flatnonzero((b >= 0) & (b < per * nb * nb))
@@ -228,7 +227,7 @@ def test_the_write_back_downloads_a_slab_at_a_time():
     # aliases the device buffer and allocates ~nothing). Per plane: one core slab's ladder of
     # `w`, then the core residents' ladder of `w` and its int64 index; 1.5x covers the
     # reading's own copies.
-    slab = max(dwin._ladder(int(edges[s + 1] - edges[s])) for s in range(per))
+    slab = max(dwin._ladder(win["ranges"][s][1] - win["ranges"][s][0]) for s in range(per))
     res = dwin._ladder(len(k))
     expected = slab * st.w.itemsize * 3 + res * (st.w.itemsize * 3 + 8)
     assert 1.5 * expected < 0.5 * whole, "VACUOUS: a slab is most of this window"

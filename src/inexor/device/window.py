@@ -42,41 +42,32 @@ def window_slabs(plane, per, pad, span, nb):
     return [int((int(plane) * per - pad + s) % nb) for s in range(span)]
 
 
-def _slab_edges(st):
-    """Slot index where each x-slab's live runs start, and the end: (nb + 1,)."""
-    nb = int(st.bricks_per_side)
-    return np.asarray(st.brick_start, dtype=np.int64)[::nb * nb][:nb + 1]
-
-
-def _arena_rows(st):
-    """(arena row indices, the brick of each) for occupied arena rows."""
-    if not st.n_arena:
-        e = np.empty(0, dtype=np.int64)
-        return e, e
-    ab = np.asarray(st.arena_bucket, dtype=np.int64)
-    rows = np.flatnonzero(ab >= 0)
-    return rows, ab[rows] // int(st.buckets_per_brick)
-
-
 def window_shapes(st, n_tile, b_real, n_brick, planes=None, floor=None):
     """Fixed per-step window shapes: `rows` bounds every plane's live slot span and
     `arena` its residents, each on `forces.capacity_shape`'s ladder with `floor`
-    (a previous step's shapes) keeping them monotone. O(slabs + arena)."""
-    from ..forces import capacity_shape
+    (a previous step's shapes) keeping them monotone. O(slabs + arena).
 
-    nb, pad, span, per = plane_geometry(st, n_tile, b_real, n_brick)
+    `st` may be a `device.ghost.SlabView`; `planes` are then this rank's, and the shapes
+    every rank compiles are the maxima over ranks."""
+    from ..forces import capacity_shape
+    from .ghost import as_view
+
+    view = as_view(st)
+    nb, pad, span, per = plane_geometry(view, n_tile, b_real, n_brick)
     planes = range(nb // per) if planes is None else planes
-    rows = np.diff(_slab_edges(st))
-    _r, res_brick = _arena_rows(st)
-    res = (np.bincount(res_brick // (nb * nb), minlength=nb) if len(res_brick)
-           else np.zeros(nb, dtype=np.int64))
+    rows, res = {}, {}
     live_max = res_max = 0
     for p in planes:
         s = window_slabs(p, per, pad, span, nb)
+        for q in s:
+            if q not in rows:
+                lo, hi = view.slab_range(q)
+                rows[q] = hi - lo
+                res[q] = view.slab_residents(q)
         # the slabs go up as ladder-length chunks and the last one's pad must fit
-        pads = max(_ladder(int(n)) - int(n) for n in rows[s])
-        live_max = max(live_max, int(rows[s].sum()) + pads)
-        res_max = max(res_max, int(res[s].sum()))
+        pads = max(_ladder(rows[q]) - rows[q] for q in s)
+        live_max = max(live_max, sum(rows[q] for q in s) + pads)
+        res_max = max(res_max, sum(res[q] for q in s))
     floor = floor or {}
     return dict(rows=int(capacity_shape(max(live_max, 1), floor_shape=int(floor.get("rows", 0)))),
                 arena=int(capacity_shape(max(res_max, 1), floor_shape=int(floor.get("arena", 0)))))
@@ -128,61 +119,57 @@ def stage_window(st, slabs, shapes, device=None):
     Each slab goes up as a host view `capacity_shape(its rows)` long (copied only where
     it would run off the array); rows past the slab are overwritten by the next, which
     is why `window_shapes` leaves room for the largest pad.
+
+    `st` may be a `device.ghost.SlabView`: slabs another rank owns are then staged from
+    its ghost copies (their `w` as zeros), their residents after the owned ones.
     """
     import jax
 
+    from .ghost import as_view
     from .migrate import _put, _zeros
 
-    nb = int(st.bricks_per_side)
-    nb2 = nb * nb
+    view = as_view(st)
+    st = view.state
+    nb = int(view.bricks_per_side)
     W, A = int(shapes["rows"]), int(shapes["arena"])
-    edges = _slab_edges(st)
-    n_state = int(st.off.shape[0])
     off_d = _zeros((W + A, 3), st.off.dtype, device)
     w_d = _zeros((W + A, 3), st.w.dtype, device)
     slab_abs = np.full(nb, -1, dtype=np.int64)
     slab_win = np.full(nb, -1, dtype=np.int64)
+    ranges = {}
     r = copied = 0
     for s in slabs:
-        lo, hi = int(edges[s]), int(edges[s + 1])
+        lo, hi = view.slab_range(s)
         L = _ladder(hi - lo)
         if r + L > W:
             raise ValueError(f"window over slabs {slabs} holds more than rows={W} rows with "
                              "its slabs' pads; rebuild the shapes with window_shapes")
-        direct = _slab_fits(n_state, lo, L)
-        copied += not direct
-        for src, buf in ((st.off, "off"), (st.w, "w")):
-            if direct:
-                chunk = src[lo:lo + L]
-            else:
-                chunk = np.zeros((L,) + src.shape[1:], dtype=src.dtype)
-                chunk[:hi - lo] = src[lo:hi]
-            place, _take = _window_programs(L, W + A, 1, src.dtype)
-            if buf == "off":
+        chunks = {name: view.slab_chunk(name, s, L) for name in ("off", "w")}
+        copied += not (view.owns(s) and _slab_fits(int(st.off.shape[0]), lo, L))
+        for name, chunk in chunks.items():
+            place, _take = _window_programs(L, W + A, 1, chunk.dtype)
+            if name == "off":
                 off_d = place(off_d, _put(chunk, device), _put(r, device, np.int64))
             else:
                 w_d = place(w_d, _put(chunk, device), _put(r, device, np.int64))
         slab_abs[s], slab_win[s] = lo, r
+        ranges[int(s)] = (lo, hi)
         r += hi - lo
 
-    rows_a, brick_a = _arena_rows(st)
-    in_win = np.zeros(nb, dtype=bool)
-    in_win[list(slabs)] = True
-    keep = in_win[brick_a // nb2] if len(rows_a) else np.zeros(0, dtype=bool)
-    rows_a, brick_a = rows_a[keep], brick_a[keep]
-    n_res = len(rows_a)
+    res_slots, brick_a, bucket_a = view.residents(slabs)
+    n_res = len(res_slots)
     if n_res > A:
         raise ValueError(f"window over slabs {slabs} holds {n_res} arena residents > "
                          f"arena={A}; rebuild the shapes with window_shapes")
-    res_slots = int(st.arena_base) + rows_a
     arena_bucket = np.zeros(max(A, 1), dtype=st.arena_bucket.dtype)
     if n_res:
-        arena_bucket[:n_res] = st.arena_bucket[rows_a]
+        arena_bucket[:n_res] = bucket_a
         if A:
-            for src, name in ((st.off, "off"), (st.w, "w")):
-                res = np.zeros((A,) + src.shape[1:], dtype=src.dtype)
-                res[:n_res] = src[res_slots]
-                place, _take = _window_programs(A, W + A, 1, src.dtype)
+            for name in ("off", "w"):
+                dt = getattr(st, name).dtype
+                res = np.zeros((A, 3), dtype=dt)
+                view.resident_rows(name, res_slots, res)
+                place, _take = _window_programs(A, W + A, 1, dt)
                 if name == "off":
                     off_d = place(off_d, _put(res, device), _put(W, device, np.int64))
                 else:
@@ -190,7 +177,7 @@ def stage_window(st, slabs, shapes, device=None):
     ab_d = _put(arena_bucket, device)
     jax.block_until_ready((off_d, w_d, ab_d))
     return dict(dev=dict(off=off_d, w=w_d, arena_bucket=ab_d),
-                slabs=list(slabs), slab_abs=slab_abs, slab_win=slab_win, edges=edges,
+                slabs=list(slabs), slab_abs=slab_abs, slab_win=slab_win, ranges=ranges,
                 res_slots=res_slots, res_bricks=brick_a, W=W, A=A, live_rows=r,
                 n_res=n_res, wrapped=list(slabs) != sorted(slabs), copied_slabs=copied)
 
@@ -226,10 +213,9 @@ def _write_core(st, win, w_dev, plane, per, nb, device=None):
     from .migrate import _host, _put
 
     nb2 = nb * nb
-    edges = win["edges"]
     rows = int(w_dev.shape[0])
     for s in range(plane * per, (plane + 1) * per):
-        lo, hi, r = int(edges[s]), int(edges[s + 1]), int(win["slab_win"][s])
+        (lo, hi), r = win["ranges"][s], int(win["slab_win"][s])
         if hi == lo:
             continue
         L = _ladder(hi - lo)
@@ -298,7 +284,7 @@ def _census_plane(st, win, wd, vs, plane, per, c_drift, ar_index, acc, device):
         ar_rows = (jnp.take(wd["off"], take_d, axis=0), jnp.take(wd["w"], take_d, axis=0),
                    migrate._zeros(ix["a_cap"], st.ids.dtype, device) if has_ids else None)
         starts = (np.asarray(st.brick_start[ix["lo_b"]:ix["hi_b"]], dtype=np.int64)
-                  - int(win["edges"][s]) + int(win["slab_win"][s]))
+                  - int(win["ranges"][s][0]) + int(win["slab_win"][s]))
         sl, add = _census_programs(int(st.n_bricks), nb2, ix["cap"])
         scales_d = sl(vs, migrate._put(ix["lo_b"], device, jnp.int64))
         dest, *_rest = migrate._eject_rows(
@@ -319,7 +305,8 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
 
     `shapes` is `tile.tile_step_shapes` plus `window` from `window_shapes`.
     `planes` selects tile planes (default all, in x order); each plane runs every
-    tile of `members` with that x index. Per plane the stencil guards are resolved
+    tile of `members` with that x index. `st` may be a `device.ghost.SlabView`, whose
+    ghost slabs the windows and decode plans read; everything written is owned. Per plane the stencil guards are resolved
     and the owned count checked against the particles stored in its core slabs
     BEFORE its rows return to the host. `coarse_shard` and `device` as in
     `tile_loop_device`; multi-card use is one thread per card, each with its own planes.
@@ -348,10 +335,13 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
     )
     from . import tile as dtile
     from .decode import tile_decode_plan
+    from .ghost import as_view
 
     global CALLS
     require_x64()
     CALLS += 1
+    view = as_view(st)
+    st = view.state
     nb, pad, span, per = plane_geometry(st, C["n_tile"], C["b_real"], C["n_brick"])
     nb2 = nb * nb
     planes = list(range(nb // per)) if planes is None else [int(p) for p in planes]
@@ -373,7 +363,7 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
     smax_all, wrapped, live_max, residents = [], False, 0, 0
 
     for i in planes:
-        win = stage_window(st, window_slabs(i, per, pad, span, nb), shapes["window"], device)
+        win = stage_window(view, window_slabs(i, per, pad, span, nb), shapes["window"], device)
         wrapped |= win["wrapped"]
         live_max = max(live_max, win["live_rows"])
         residents += win["n_res"]
@@ -382,7 +372,7 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
         los, his, extents, owns, outs = [], [], [], [], []
         for t in (t for t in members if int(t[0]) == i):
             bricks = np.asarray(members[t], dtype=np.int64)
-            plan = tile_decode_plan(st, bricks)
+            plan = tile_decode_plan(view, bricks)
             m = int(plan["n_rows"])
             if m == 0:
                 continue

@@ -20,8 +20,10 @@ class Decomp:
     """The ownership map for rank `rank` of `n_ranks`, each rank driving `cards` cards.
 
     Build with `Decomp.build(cfg, ...)`. Plane, slab and pencil ranges are half-open global
-    indices. Consumers: `engine.step` (tile planes per card, coarse shard ranges, per-rank
-    membership) and the resident coarse kernel (spectrum pencils per card).
+    indices. `pad` is the buffer brick slabs a tile window reads past its core on each side
+    (the ghost slabs a rank receives from each neighbour). Consumers: `engine.step` (tile
+    planes per card, coarse shard ranges, per-rank membership, ghost slabs) and the resident
+    coarse kernel (spectrum pencils per card).
     """
 
     n_ranks: int
@@ -35,15 +37,18 @@ class Decomp:
     pencil_batch: int
     rank_planes: tuple
     rank_pencils: tuple
+    pad: int = 0
 
     @classmethod
     def build(cls, cfg, n_ranks=1, rank=0, reach=1, pencil_batch=1):
         """From an `EngineConfig`'s geometry and `device_cards`.
 
         Refuses fewer tile planes than cards in total, and (across ranks) fewer than
-        `2 * reach + 1` brick slabs per rank: the migrate hands particles to immediate
-        neighbours only.
+        `2 * reach + 1` or `2 * pad` brick slabs per rank: the migrate hands particles to
+        immediate neighbours only, and each neighbour's ghost slabs come from this rank alone.
         """
+        from .layout import brick_span
+
         n_ranks, rank, cards = int(n_ranks), int(rank), int(cfg.device_cards)
         reach, pencil_batch = int(reach), int(pencil_batch)
         if n_ranks < 1:
@@ -57,6 +62,8 @@ class Decomp:
                 "tile planes: a card would run no tiles. Use fewer ranks or cards, or a "
                 "geometry with more tile planes.")
         bpt = int(cfg.n_tile) // int(cfg.n_brick)
+        pad = brick_span(int(cfg.n_tile), int(cfg._b_realized), int(cfg.n_brick),
+                         int(cfg.n_fine) // int(cfg.n_brick))[0]
         rank_planes = tuple(partition_units(s, n_ranks, 1))
         if n_ranks > 1:
             thin = min(hi - lo for lo, hi in rank_planes) * bpt
@@ -65,6 +72,11 @@ class Decomp:
                     f"a rank would own {thin} brick slab(s), fewer than 2 * reach + 1 = "
                     f"{2 * reach + 1}: the migrate hands off to immediate neighbours only. "
                     "Use fewer ranks.")
+            if thin < 2 * pad:
+                raise ValueError(
+                    f"a rank would own {thin} brick slab(s), fewer than 2 * {pad}: its "
+                    f"neighbours' tile windows read {pad} slab(s) from each of its ends. "
+                    "Use fewer ranks.")
         n_coarse = int(cfg.n_coarse)
         return cls(
             n_ranks=n_ranks, rank=rank, cards=cards, tiles_side=s, bricks_per_tile=bpt,
@@ -72,6 +84,7 @@ class Decomp:
             n_coarse=n_coarse, reach=reach, pencil_batch=pencil_batch,
             rank_planes=rank_planes,
             rank_pencils=tuple(partition_units(n_coarse, n_ranks, pencil_batch)),
+            pad=int(pad),
         )
 
     # ------------------------------------------------------------ this rank

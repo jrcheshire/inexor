@@ -13,17 +13,15 @@ import pytest
 pytest.importorskip("jax")
 
 from inexor import comm as cm  # noqa: E402
-from inexor import state  # noqa: E402
-from inexor.codec import T9Layout  # noqa: E402
 from inexor.comm import run_loopback  # noqa: E402
 from inexor.decomp import Decomp  # noqa: E402
 from inexor.device.coarse import CardShards  # noqa: E402
 from inexor.device.paint import coarse_delta_cards  # noqa: E402
 from inexor.forces import COARSE_HALO, coarse_force_meshes, coarse_kernel_parts  # noqa: E402
-from inexor.plan import PRESETS, engine_config  # noqa: E402
+from tests.ranks_common import rank_cfg, rank_devices, whole_state  # noqa: E402
 from tests.test_partial_state import restrict_to_slabs  # noqa: E402
 
-PRESET = "cdev8-tile32"
+_cfg, _devices = rank_cfg, rank_devices
 
 
 @pytest.fixture(autouse=True)
@@ -36,41 +34,9 @@ def _x64():
     jax.config.update("jax_enable_x64", prev)
 
 
-def _cfg(cards):
-    return engine_config(PRESET, coarse_backend="device", tile_backend="device",
-                         migrate_backend="device", device_cards=cards, tile_workers=1)
-
-
 @pytest.fixture(scope="module")
 def whole():
-    """A jittered lattice at the preset's geometry, migrated into a populated arena."""
-    import jax
-
-    jax.config.update("jax_enable_x64", True)
-    p = PRESETS[PRESET]
-    n, box = p["n_part"], p["box"]
-    rng = np.random.default_rng(11)
-    q = (np.arange(n) + 0.5) * (box / n)
-    x = np.stack(np.meshgrid(q, q, q, indexing="ij"), axis=-1).reshape(-1, 3)
-    x = np.mod(x + rng.normal(scale=0.3 * box / n, size=x.shape), box)
-    v = rng.normal(scale=0.5, size=x.shape)
-    cfg = _cfg(1)
-    st = state.SlotState.build(x, v, T9Layout(box_size=box, n_part=n, bucket_cells=2),
-                               cfg.n_fine // cfg.n_brick, brick_slack=0.0, arena_frac=0.3,
-                               with_ids=False)
-    state.drift_and_migrate(st, 0.3)
-    assert st.arena_used > 0, "vacuous: no arena residents"
-    return st
-
-
-def _devices(rank, cards):
-    """Rank `rank`'s cards: disjoint devices while the backend has enough, else reused."""
-    import jax
-
-    if cards == 1:
-        return None
-    devs = jax.devices()
-    return [devs[(rank * cards + k) % len(devs)] for k in range(cards)]
+    return whole_state()
 
 
 def _solve(st, cfg, decomp, comm, devs):

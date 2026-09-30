@@ -830,6 +830,10 @@ class SlotState:
             )
         return np.asarray(self.occupancy).reshape(-1, p3)[b - blo]
 
+    def brick_starts(self, bricks):
+        """`brick_start` of `bricks` as int64 (the reads `device.ghost.SlabView` mirrors)."""
+        return np.asarray(self.brick_start, dtype=np.int64)[np.asarray(bricks, dtype=np.int64)]
+
     @property
     def index_dtype(self):
         """The occupancy array's dtype."""
