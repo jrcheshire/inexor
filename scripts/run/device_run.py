@@ -568,11 +568,14 @@ def under(path, root):
     return a == b or a.startswith(b + os.sep)
 
 
-def _planner(preset, cards, slack, arena, alloc_margin=0.10):
+def _planner(preset, cards, slack, arena, alloc_margin=0.10, n_nodes=1, host_gb=1026.0,
+             device_gb=199.0):
     cmd = [sys.executable, "-m", "inexor.plan", "--preset", preset, "--backend", "device",
-           "--n-gpus", str(cards), "--host-gb", "1026", "--device-gb", "199",
+           "--n-gpus", str(cards), "--host-gb", f"{host_gb:g}", "--device-gb", f"{device_gb:g}",
            "--arena-frac", str(arena), "--slack", str(slack),
            "--alloc-margin", str(alloc_margin)]
+    if n_nodes != 1:
+        cmd += ["--n-nodes", str(n_nodes)]
     out = subprocess.run(cmd, capture_output=True, text=True,
                          env=dict(os.environ, PYTHONPATH=os.path.join(REPO, "src"))).stdout
 
@@ -645,7 +648,8 @@ def cmd_preflight(args):
         refusals.append(f"the ICs were generated with growth2 = {card['manifest']['growth2']!r} "
                         f"and the run asks for {args.growth2!r}")
 
-    plan = _planner(args.preset, args.cards, args.slack, args.arena_frac, args.alloc_margin)
+    plan = _planner(args.preset, args.cards, args.slack, args.arena_frac, args.alloc_margin,
+                    n_nodes=args.n_nodes, host_gb=args.host_gb, device_gb=args.device_gb)
     card["planner"] = plan
     _rss, _hwm, avail = host_memory()
     nm = numa_memory()
@@ -1035,6 +1039,12 @@ def main(argv=None):
                     help="refuse if the planner's host or load peak exceeds this x the CPU "
                          "nodes' MemTotal")
     pf.add_argument("--allow-cpu", action="store_true")
+    pf.add_argument("--n-nodes", type=int, default=1,
+                    help="nodes the run spans; the planner prices the busiest node")
+    pf.add_argument("--host-gb", type=float, default=1026.0,
+                    help="the planner's host memory per node (default a gb node's CPU side)")
+    pf.add_argument("--device-gb", type=float, default=199.0,
+                    help="the planner's memory per card (default a GB200)")
     pr = sub.choices["run"]
     pr.add_argument("--stop-at", type=int, required=True,
                     help="absolute step to stop before (a checkpoint boundary when checkpointing)")
