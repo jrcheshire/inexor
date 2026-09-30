@@ -167,7 +167,13 @@ mpiexec -n 2 python -m mpi4py scripts/run/device_run.py run --preset c-gh --work
 - Ranks x cards may not exceed the tile planes, and each rank needs at least 2r + 1 brick
   slabs for a drift that reaches r slabs (3 at r = 1): the migrate hands particles to
   immediate neighbours only.
+- Each step's record in a rank's card carries that rank's exchanges under `ranks.comm`: calls,
+  bytes sent and seconds per operation, and `wait_s`, the time blocked waiting on other ranks.
 - `D7_FAIL_AT=<phase> D7_FAIL_RANK=<r>` exercises the failure path on one rank.
+- On a cluster, launch each rank through `scripts/run/rank_exec.sh [--membind NODES] [--samples
+  PREFIX] -- CMD ...`. It replaces `@RANK@` in the arguments and in exported variables, so one
+  launch line gives each rank its own card, checkpoint dir or compilation cache. It also starts
+  the node's GPU and NUMA samplers, then becomes the command, so the launcher's signals reach it.
 - On a laptop, `scripts/run/mpi_lane.sh` runs the tests that need real MPI processes, in a
   throwaway `pixi exec` env (the lock's jax and numpy, plus mpi4py and MPICH).
 
@@ -198,6 +204,7 @@ run) before the expensive leg and stops if they fail.
 | `hero_card_vista.sbatch` | gb | P(k) card of the final checkpoint in `$SRC_RUN/hero-ckpt`, written to `$PROD_DIR` | `INEXOR_RUNS`, `SRC_RUN`, `K_STEPS`, `PROD_DIR` |
 | `hero_export_vista.sbatch` | gb | export of the same checkpoint to `$PROD_DIR/export` | `INEXOR_RUNS`, `SRC_RUN`, `K_STEPS`, `PROD_DIR` |
 | `gh_single_card_vista.sbatch` | gh | a whole realization on one GH200: ICs, 120 steps, card, under `$INEXOR_RUNS/d8-gh-<preset>-<job id>/` | `INEXOR_RUNS`. Optional: `PRESET` (`c-1024`), `SLACK` (0.10), `ALLOC_MARGIN` (0.10), `ARENA_FRAC` (0.01) |
+| `multinode_gate_vista.sbatch` | gh, 2 nodes | the multi-node byte gate: the single-node run on each node and the 2-rank run, compared file by file at the split step and at the end (`$INEXOR_RUNS/mn-gate-<preset>-<job id>/`); a split-step mismatch reruns segment 1 with deterministic ops and stops | `INEXOR_RUNS`. Optional: `PRESET` (`c-1024`), `K` (120), `SPLIT` (20), `STOP`, `EVERY`, layout as above |
 
 Every script also needs `INEXOR_SRC` (the inexor checkout), or it must be submitted from the
 checkout. Examples:

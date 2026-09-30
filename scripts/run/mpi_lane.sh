@@ -6,6 +6,8 @@
 #
 #   scripts/run/mpi_lane.sh                      # the MPI test files
 #   scripts/run/mpi_lane.sh tests/test_comm_mpi.py -k raise
+#   scripts/run/mpi_lane.sh --run CMD [ARGS...]  # any command in the same env, e.g. a job
+#                                                # script's REHEARSAL=1 run
 set -euo pipefail
 here=$(cd "$(dirname "$0")/../.." && pwd)
 site="$here/runs/mpi-lane/site"
@@ -16,12 +18,19 @@ import json, sys
 v = {p["name"]: p["version"] for p in json.load(sys.stdin)}
 print(" ".join(f"--spec {k}=={v[k]}" for k in ("python", "jax", "jaxlib", "numpy")))')
 
-if [ "$#" -eq 0 ]; then
+run=0
+if [ "${1:-}" = "--run" ]; then
+  run=1; shift
+  [ "$#" -gt 0 ] || { echo "mpi_lane: --run needs a command" >&2; exit 2; }
+elif [ "$#" -eq 0 ]; then
   set -- tests/test_comm_mpi.py tests/test_driver_mpi.py
 fi
 cd "$here"
 # shellcheck disable=SC2086
-exec pixi exec $pins --spec mpi4py --spec mpich --spec pytest --spec pip --spec hatchling -- \
+exec pixi exec $pins --spec mpi4py --spec mpich --spec pytest --spec pytest-xdist --spec pip \
+  --spec hatchling -- \
   bash -c 'pip install -q --no-deps --no-build-isolation --upgrade --target "$0" "$1" >/dev/null &&
-           PYTHONPATH="$0:$1" OMP_NUM_THREADS=1 python -m pytest -q -p no:cacheprovider "${@:2}"' \
-  "$site" "$here" "$@"
+           export PYTHONPATH="$0:$1" &&
+           if [ "$2" = 1 ]; then exec "${@:3}"; fi &&
+           OMP_NUM_THREADS=1 exec python -m pytest -q -p no:cacheprovider "${@:3}"' \
+  "$site" "$here" "$run" "$@"
