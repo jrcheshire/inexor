@@ -86,17 +86,15 @@ def load_stages(*, n, n_rows, n_buckets, index_itemsize, n_arena, n_bricks,
     without it the state is built privately and then copied (2x while copying). A slab is one
     x-slice of bricks: n/n_slabs rows of the 9 B T9 record plus its share of the index.
     """
+    # a slab file's rows plus its int64 occupancy, narrowed into the index as it is read
     slab = n // max(n_slabs, 1) * 9 + n_buckets // max(n_slabs, 1) * 8
-    occ64 = n_buckets * 8            # the int64 accumulator, both passes
     payload = n_rows * 9             # off + w
     index = n_buckets * index_itemsize
     stages = {
-        "pass 1 (index, one slab live)": occ64 + slab,
-        "allocate off/w": occ64 + payload,
-        "pass 2 (payload, one slab live)": occ64 + payload + slab,
-        # `_to_index` makes the uint32 beside the int64, and a shared build
-        # copies that into a segment before the int64 goes away
-        "build SlotState": occ64 + payload + index * (2 if shared else 1),
+        "pass 1 (index, one slab live)": index + slab,
+        "allocate off/w": index + payload,
+        "pass 2 (payload, one slab live)": index + payload + slab,
+        "build SlotState": index + payload,
     }
     if not shared:
         # TilePool then copies every field into segments, one at a time

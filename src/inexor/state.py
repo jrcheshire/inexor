@@ -977,11 +977,9 @@ class SlotState:
                 f"occupancy holds {len(self.occupancy)} buckets but slabs "
                 f"{self.owned_slabs} own {(bhi - blo) * p3}"
             )
-        occ = self.occupancy.astype(np.int64)
-
         # 1. no brick may hold more live rows than its allocation, and a brick this state
-        # does not own has none
-        live = occ.reshape(bhi - blo, p3).sum(axis=1)
+        # does not own has none (summed in int64 without a widened copy of the index)
+        live = self.occupancy.reshape(bhi - blo, p3).sum(axis=1, dtype=np.int64)
         cap_all = np.diff(self.brick_start)
         foreign = np.nonzero(np.concatenate([cap_all[:blo], cap_all[bhi:]]))[0]
         if len(foreign):

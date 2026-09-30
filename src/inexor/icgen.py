@@ -17,6 +17,7 @@ sliding window's depth.
 
 import json
 import os
+import re
 import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -689,6 +690,28 @@ def read_manifest(workdir):
     return man
 
 
+def slab_files(man, workdir=""):
+    """The manifest's slab files indexed by brick x-slab: `[name of slab 0, ..., slab nb-1]`.
+
+    Files are named `t9_slab_{bx:04d}.npz`; the list order is the writer's (the host IC
+    emitter finalizes out of slab order). Refuses a list that does not name every slab
+    exactly once.
+    """
+    nb = int(man["bricks_per_side"])
+    by_slab = {}
+    for f in man["files"]:
+        m = re.fullmatch(r"t9_slab_(\d+)\.npz", os.path.basename(f))
+        if m is None or int(m.group(1)) in by_slab:
+            raise ValueError(f"{workdir}: manifest file {f!r} is not a distinct t9_slab_NNNN.npz")
+        by_slab[int(m.group(1))] = f
+    if sorted(by_slab) != list(range(nb)):
+        raise ValueError(
+            f"{workdir}: the manifest names slabs {sorted(by_slab)[:8]}... ({len(by_slab)} "
+            f"files) but the state has {nb} brick slabs; the loader needs every slab once"
+        )
+    return [by_slab[d] for d in range(nb)]
+
+
 def drop_file_cache(path):
     """Best-effort drop of `path`'s pages from the page cache; True if the call was made.
 
@@ -715,29 +738,43 @@ def load_slot_state(
     index_dtype=DEFAULT_INDEX_DTYPE,
     alloc=None,
     drop_cache=False,
+    slabs=None,
 ):
     """Reassemble a host-resident SlotState from T9 slabs on disk.
 
     Geometry comes from `state._alloc_geometry`, as in `SlotState.build`: each brick's rows
     land at its `brick_start`, spare rows stay zero, the arena starts empty. Refuses a missing
-    manifest, an unknown schema, and any crc mismatch. `alloc` (optional) places arrays in
-    shared memory; `drop_cache` drops each slab file's page cache after each read. Reads the
-    files twice (index, then payload) so only one slab's payload is live at a time.
+    manifest, an unknown schema, a file list that is not one file per slab in slab order,
+    and any crc mismatch. `alloc` (optional) places arrays in shared memory; `drop_cache`
+    drops each slab file's page cache after each read. Reads the files twice (index, then
+    payload) so only one slab's payload is live at a time.
+
+    `slabs = (lo, hi)` loads only those brick x-slabs' files into a node-local state (see
+    `SlotState`); its arena is `arena_frac` of the local particles.
     """
     man = read_manifest(workdir)
     t9 = T9Layout(man["box_size"], man["n_part"], man["bucket_cells"])
     nb = int(man["bricks_per_side"])
     per3 = (t9.n_buckets_side // nb) ** 3
     n_bricks = nb**3
-    n = int(man["n_particles"])
+    nb2 = nb * nb
+    files = slab_files(man, workdir)
+    s_lo, s_hi = (0, nb) if slabs is None else (int(slabs[0]), int(slabs[1]))
+    if not 0 <= s_lo < s_hi <= nb:
+        raise ValueError(f"slabs {slabs} are not a non-empty range inside [0, {nb})")
+    whole = (s_lo, s_hi) == (0, nb)
+    blo, bhi = s_lo * nb2, s_hi * nb2
 
     n_dropped = [0]
 
-    def _slab(fname):
+    def _slab(d):
+        fname = files[d]
         path = os.path.join(workdir, fname)
         with np.load(path) as z:
             meta = json.loads(str(z["meta"]))
             occ, off, w, sc = z["occupancy"], z["off"], z["w"], z["scale"]
+        if int(meta["bx"]) != d:
+            raise ValueError(f"{fname} holds slab {meta['bx']}, not the slab {d} its name gives")
         for name, arr in (("occupancy", occ), ("off", off), ("w", w), ("scale", sc)):
             crc = zlib.crc32(arr.tobytes())
             if crc != meta["crc32"][name]:
@@ -747,7 +784,7 @@ def load_slot_state(
                 )
         if drop_cache:
             n_dropped[0] += bool(drop_file_cache(path))
-        return int(meta["bx"]), off, w, occ, sc
+        return off, w, occ, sc
 
     _trace = os.environ.get("INEXOR_LOAD_TRACE")
 
@@ -764,26 +801,39 @@ def load_slot_state(
             extra = ""
         print(f"  [load] {msg}{extra}", flush=True)
 
-    # pass 1: occupancy and per-brick scales only
-    _say(f"pass 1 of 2 over {len(man['files'])} slabs (index only)")
-    occupancy = np.empty(n_bricks * per3, dtype=np.int64)
-    vel_scale = np.ones(n_bricks, dtype=np.float64)
-    for _i, fname in enumerate(man["files"]):
-        d, _off, _w, occ, sc = _slab(fname)
-        occupancy[d * nb * nb * per3 : (d + 1) * nb * nb * per3] = occ
-        vel_scale[d * nb * nb : (d + 1) * nb * nb] = sc
-        del _off, _w
-        if _i % 32 == 31:
-            _say(f"pass 1: {_i + 1}/{len(man['files'])} slabs")
+    n_files = s_hi - s_lo
+    # with `alloc`, the index and payload are allocated directly in shared memory
+    _zeros = (lambda shape, dtype, tag: np.zeros(shape, dtype=dtype)) if alloc is None \
+        else alloc.zeros
+    _empty = (lambda shape, dtype, tag: np.empty(shape, dtype=dtype)) if alloc is None \
+        else alloc.empty
 
-    brick_counts = occupancy.reshape(n_bricks, per3).sum(axis=1)
+    # pass 1: occupancy and per-brick scales only, each slab narrowed to the index dtype as
+    # it is read (`_to_index` refuses a count the dtype cannot hold)
+    _say(f"pass 1 of 2 over {n_files} slabs (index only)")
+    occupancy = _empty(((bhi - blo) * per3,), np.dtype(index_dtype), "occupancy")
+    vel_scale = np.ones(n_bricks, dtype=np.float64)
+    brick_counts = np.zeros(n_bricks, dtype=np.int64)
+    for _i, d in enumerate(range(s_lo, s_hi)):
+        _off, _w, occ, sc = _slab(d)
+        j = (d - s_lo) * nb2 * per3
+        occupancy[j : j + nb2 * per3] = _to_index(occ, index_dtype, "initial")
+        brick_counts[d * nb2 : (d + 1) * nb2] = occ.reshape(nb2, per3).sum(axis=1)
+        vel_scale[d * nb2 : (d + 1) * nb2] = sc
+        del _off, _w, occ
+        if _i % 32 == 31:
+            _say(f"pass 1: {_i + 1}/{n_files} slabs")
+
+    n = int(brick_counts.sum())
+    if whole and n != int(man["n_particles"]):
+        raise ValueError(
+            f"{workdir}: the slab files hold {n} rows but the manifest records "
+            f"{man['n_particles']} particles"
+        )
     _, brick_start, n_alloc, n_arena = _alloc_geometry(
         brick_counts, n, brick_slack, alloc_margin, arena_frac
     )
     n_rows = n_alloc + n_arena
-    # with `alloc`, the payload is allocated directly in shared memory
-    _zeros = (lambda shape, dtype, tag: np.zeros(shape, dtype=dtype)) if alloc is None \
-        else alloc.zeros
     _say(f"allocating off/w for {n_rows:,} rows "
          f"({n_rows * 9 / 1e9:.1f} GB, {'shared' if alloc else 'private'})")
     off_all = _zeros((n_rows, 3), np.uint8, "off")
@@ -791,10 +841,10 @@ def load_slot_state(
     _say("allocated; pass 2 of 2 (payload)")
 
     # pass 2: place the payload, one slab live at a time
-    for _i, fname in enumerate(man["files"]):
-        d, off, w, _occ, _sc = _slab(fname)
+    for _i, d in enumerate(range(s_lo, s_hi)):
+        off, w, _occ, _sc = _slab(d)
         row = 0
-        for b in range(d * nb * nb, (d + 1) * nb * nb):
+        for b in range(d * nb2, (d + 1) * nb2):
             cnt = int(brick_counts[b])
             off_all[brick_start[b] : brick_start[b] + cnt] = off[row : row + cnt]
             w_all[brick_start[b] : brick_start[b] + cnt] = w[row : row + cnt]
@@ -803,7 +853,7 @@ def load_slot_state(
             raise ValueError(f"slab bx={d}: placed {row} rows of {len(off)}")
         del off, w, _occ
         if _i % 32 == 31:
-            _say(f"pass 2: {_i + 1}/{len(man['files'])} slabs")
+            _say(f"pass 2: {_i + 1}/{n_files} slabs")
 
     if drop_cache:
         _say(f"dropped the page cache of {n_dropped[0]} slab reads")
@@ -812,8 +862,7 @@ def load_slot_state(
         t9=t9,
         bricks_per_side=nb,
         brick_start=_shared_like(brick_start, alloc, "brick_start"),
-        occupancy=_shared_like(_to_index(occupancy, index_dtype, "initial"),
-                               alloc, "occupancy"),
+        occupancy=occupancy,
         off=off_all,
         w=w_all,
         vel_scale=_shared_like(vel_scale, alloc, "vel_scale"),
@@ -822,6 +871,8 @@ def load_slot_state(
             np.full(n_arena, -1, dtype=np.int64), alloc, "arena_bucket"),
         n_particles=n,
         ids=None,
+        slabs=None if whole else (s_lo, s_hi),
+        arena_frac=float(arena_frac),
     )
     st.check()
     return st

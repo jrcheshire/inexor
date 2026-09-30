@@ -178,3 +178,75 @@ def test_passes_without_a_cross_rank_path_refuse_a_cut(whole):
 
     with pytest.raises(NotImplementedError, match=match):
         TilePool(part, None)
+
+
+# ------------------------------------------------------------------ the node-local loader
+
+
+def _same_state(a, b):
+    for f in ("brick_start", "occupancy", "off", "w", "vel_scale", "arena_bucket"):
+        x, y = getattr(a, f), getattr(b, f)
+        assert x.dtype == y.dtype and x.shape == y.shape, f
+        np.testing.assert_array_equal(x, y, err_msg=f)
+    assert (a.arena_base, a.n_particles, a.owned_slabs, a.arena_frac) == \
+        (b.arena_base, b.n_particles, b.owned_slabs, b.arena_frac)
+
+
+@pytest.fixture(scope="module")
+def written(whole, tmp_path_factory):
+    from inexor import icgen
+
+    d = str(tmp_path_factory.mktemp("whole"))
+    icgen.write_t9_slabs(whole, d)
+    return d
+
+
+@pytest.mark.parametrize("n_ranks", [1, 2, 4, 8])
+def test_a_node_local_load_is_the_cut_of_the_whole_load(written, n_ranks):
+    from inexor import icgen
+
+    full = icgen.load_slot_state(written, arena_frac=0.05)
+    assert full.is_whole and full.slabs is None
+    for slabs in rank_slabs(NB, n_ranks):
+        part = icgen.load_slot_state(written, arena_frac=0.05, slabs=slabs)
+        part.check()
+        _same_state(part, restrict_to_slabs(full, slabs))
+        assert part.occupancy.nbytes * n_ranks == full.occupancy.nbytes
+
+
+def test_the_loader_maps_files_by_slab_and_refuses_a_bad_list(written, tmp_path):
+    import json
+    import os
+    import shutil
+
+    from inexor import icgen
+
+    d = str(tmp_path / "c")
+    shutil.copytree(written, d)
+    mpath = f"{d}/{icgen.MANIFEST}"
+    man = json.load(open(mpath))
+    files = man["files"]
+    # list order is the writer's: a rotated list loads the same state
+    json.dump(dict(man, files=files[1:] + files[:1]), open(mpath, "w"))
+    _same_state(icgen.load_slot_state(d), icgen.load_slot_state(written))
+    json.dump(dict(man, files=files[:-1]), open(mpath, "w"))
+    with pytest.raises(ValueError, match="needs every slab once"):
+        icgen.load_slot_state(d)
+    json.dump(dict(man, files=files[:-1] + files[:1]), open(mpath, "w"))
+    with pytest.raises(ValueError, match="not a distinct"):
+        icgen.load_slot_state(d)
+    # a file whose content is another slab's
+    os.replace(f"{d}/{files[1]}", f"{d}/{files[0]}")
+    shutil.copy(f"{written}/{files[1]}", f"{d}/{files[1]}")
+    json.dump(man, open(mpath, "w"))
+    with pytest.raises(ValueError, match="not the slab 0 its name gives"):
+        icgen.load_slot_state(d)
+    shutil.copy(f"{written}/{files[0]}", f"{d}/{files[0]}")
+    json.dump(dict(man, n_particles=man["n_particles"] + 1), open(mpath, "w"))
+    with pytest.raises(ValueError, match="the manifest records"):
+        icgen.load_slot_state(d)
+    json.dump(man, open(mpath, "w"))
+    for bad in ((2, 2), (-1, 3), (0, NB + 1)):
+        with pytest.raises(ValueError, match="not a non-empty range"):
+            icgen.load_slot_state(d, slabs=bad)
+    icgen.load_slot_state(d).check()
