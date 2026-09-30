@@ -308,10 +308,11 @@ def run_loopback(n, fn, timeout=60.0, chunk_bytes=DEFAULT_CHUNK_BYTES):
 
 def allreduce_shapes(comm, shapes):
     """A dict of compiled-shape ints maximized over ranks, so every rank compiles the programs
-    one rank would (every rank passes the same keys). Unchanged on one rank or `comm` None."""
+    one rank would (every rank passes the same keys, in the same order). The key order is
+    kept, since the shapes are recorded in checkpoints. Unchanged on one rank or `comm` None."""
     if comm is None or comm.size == 1:
         return dict(shapes)
-    keys = sorted(shapes)
+    keys = list(shapes)
     top = comm.allreduce(np.array([int(shapes[k]) for k in keys], dtype=np.int64), "max")
     return {k: int(v) for k, v in zip(keys, top)}
 

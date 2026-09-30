@@ -58,6 +58,9 @@ def _solve(st, cfg, decomp, comm, devs):
 @pytest.fixture(scope="module")
 def reference(whole):
     """plane -> its three force planes, from one rank on one card (a whole-mesh shard)."""
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
     cfg = _cfg(1)
     d = Decomp.build(cfg)
     ((x0, nx, meshes),) = _solve(whole, cfg, d, None, None)

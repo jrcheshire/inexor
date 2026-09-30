@@ -977,16 +977,17 @@ def apply_result(st, res):
     st.vel_scale[res["run_bricks"]] = res["run_scales"]
 
 
-def _migrate_pass(st, cfg, c_drift, pool, timings=None):
+def _migrate_pass(st, cfg, c_drift, pool, timings=None, comm=None, devices=None):
     """Route the step's migrate (and the lead drift) to host serial, host pooled or device.
 
-    Returns the pass's stats dict (the device pass adds a `migrate_device` receipt)."""
+    Returns the pass's stats dict (the device pass adds a `migrate_device` receipt). Across
+    ranks (`comm`) only the device pass has a path; `devices` are the rank's cards."""
     if cfg.migrate_backend == "device":
         from .device.migrate import drift_and_migrate_device
 
         return drift_and_migrate_device(
             st, c_drift, device_budget_bytes=cfg.migrate_device_budget_bytes,
-            devices=_cards(cfg), timings=timings)
+            devices=_cards(cfg) if devices is None else devices, timings=timings, comm=comm)
     if pool is not None and cfg.migrate_pooled is not False:
         return drift_and_migrate_pooled(
             st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window,
@@ -1015,9 +1016,39 @@ def _cards(cfg):
     return list(jax.devices()[: cfg.device_cards])
 
 
+def rank_lane_refusal(cfg):
+    """Why `cfg` cannot run across ranks, or None. Across ranks the step runs the production
+    device lane only: device paint and folded solve into card shards, the compiled windowed
+    tile loop, and the fused migrate + repack on every step."""
+    need = dict(coarse_backend=cfg.coarse_backend == "device",
+                tile_backend=cfg.tile_backend == "device",
+                device_tile_jit=cfg.device_tile_jit, tile_window=cfg.tile_window,
+                migrate_backend=cfg.migrate_backend == "device", fused_pass=cfg.fused_pass,
+                repack_every=cfg.repack_every == 1, coarse_fold_kernel=cfg.coarse_fold_kernel,
+                tile_workers=cfg.tile_workers == 1)
+    bad = [k for k, ok in need.items() if not ok]
+    return None if not bad else (
+        f"across ranks the step runs the production device lane only; this configuration "
+        f"differs in {', '.join(bad)}")
+
+
+def _require_rank_lane(st, cfg, comm, decomp, what):
+    """Refuse a node-local state or several ranks outside the device lane, and a state
+    whose slabs are not this rank's."""
+    multi = comm is not None and comm.size > 1
+    if st.is_whole and not multi:
+        return
+    why = rank_lane_refusal(cfg)
+    if why:
+        raise NotImplementedError(f"{what}: {why}")
+    if decomp is not None and tuple(st.owned_slabs) != tuple(decomp.slabs):
+        raise ValueError(f"{what}: the state holds slabs {st.owned_slabs} but rank "
+                         f"{decomp.rank} of {decomp.n_ranks} owns {decomp.slabs}")
+
+
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
          phase=None, tile_force=None, pool=None, coarse_parts=None, device_shapes=None,
-         repack_due=False, timings=None, decomp=None, comm=None):
+         repack_due=False, timings=None, decomp=None, comm=None, devices=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1-2; `c_drift` is
@@ -1042,22 +1073,34 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     `phase`, if given, is called with a boundary name after each phase, so a caller can take
     a per-phase high-water mark. It takes no payload and cannot perturb the step.
 
-    `decomp` (`decomp.Decomp`) says which tile planes this rank and each of its cards own;
-    None is one rank over the whole box. `comm` (`comm.Comm`, default `SerialComm`) carries
-    the cross-rank reductions: today only the tile capacity.
+    `decomp` (`decomp.Decomp`) says which tile planes this rank and each of its cards own
+    (default: from `comm`'s rank and size). `comm` (`comm.Comm`, default `SerialComm`) carries
+    every exchange across ranks: every rank calls `step` with its node-local state (its
+    `decomp.slabs`), in the production device lane (`rank_lane_refusal`), with a repack due.
+    `devices` are the rank's cards (default the first `cfg.device_cards` jax devices).
+    `stats["ranks"]` records the rank and each exchange's bytes (zeros on one rank).
     """
     import jax.numpy as jnp
 
-    require_whole(st, "engine.step")
-    ph = phase if phase is not None else _no_phase
-    if decomp is None:
-        from .decomp import Decomp
+    from .comm import allreduce_shapes
 
-        decomp = Decomp.build(cfg)
+    ph = phase if phase is not None else _no_phase
     if comm is None:
         from .comm import SerialComm
 
         comm = SerialComm()
+    if decomp is None:
+        from .decomp import Decomp
+
+        decomp = Decomp.build(cfg, n_ranks=comm.size, rank=comm.rank)
+    if st.is_whole and comm.size == 1:
+        require_whole(st, "engine.step")
+    else:
+        _require_rank_lane(st, cfg, comm, decomp, "engine.step")
+        if not repack_due:
+            raise ValueError("engine.step across ranks runs the fused migrate + repack, so "
+                             "every step must have a repack due")
+    rank_rec = dict(rank=int(comm.rank), n_ranks=int(comm.size))
 
     alpha_k, bcoef = float(coeff[0]), float(coeff[1])
 
@@ -1066,8 +1109,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     shapes_in = device_shapes or {}
     shapes_out = {}
     # cards the device step splits across; None = jax's default device
-    devs = None
-    if cfg.device_cards > 1:
+    devs = None if devices is None else list(devices)
+    if devs is None and cfg.device_cards > 1:
         import jax
 
         devs = list(jax.devices()[: cfg.device_cards])
@@ -1078,7 +1121,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         delta = coarse_delta_cards(
             st, cfg, devices=devs, stats=mesh_stats, pad_shape=pad_shape,
             chunk_bricks=cfg.device_paint_chunk_bricks, census=census,
-            shape_floor=shapes_in.get("paint"))
+            shape_floor=shapes_in.get("paint"), decomp=decomp, comm=comm)
         shapes_out["paint"] = {k: int(v) for k, v in mesh_stats["coarse_jit_shapes"].items()}
         # the host path's receipt keys: each device chunk is a sub-block paint, none pooled
         mesh_stats["coarse_subblock_chunks"] = int(mesh_stats["coarse_device_chunks"])
@@ -1119,10 +1162,17 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         parts=coarse_parts,
         out=solve_out,
         timings=None if timings is None else timings.setdefault("solve", {}),
-        fold_kernel=cfg.coarse_fold_kernel,
+        fold_kernel=cfg.coarse_fold_kernel, decomp=decomp, comm=comm, receipt=rank_rec,
     )
     del dj
     ph("coarse_solve")
+
+    # --- the neighbours' boundary slabs this rank's tile windows read (none on one rank)
+    from .device.ghost import SlabView, exchange_ghosts
+
+    ghosts, ghost_rec = exchange_ghosts(st, decomp, comm, decomp.pad)
+    rank_rec.update(ghost_rec)
+    view = SlabView(st, ghosts)
 
     # --- membership, and the capacity one jitted program needs
     b_real = cfg._b_realized
@@ -1130,8 +1180,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
                           planes=decomp.planes)
     # member count includes arena residents, which `decode_bricks` returns; the max is over
     # every rank's tiles, so all ranks compile one shape
-    counts = st.tile_member_counts(cfg.n_tile, b_real, cfg.n_brick, cfg.n_fine,
-                                   planes=decomp.planes)
+    counts = view.tile_member_counts(cfg.n_tile, b_real, cfg.n_brick, cfg.n_fine,
+                                     planes=decomp.planes)
     cap_true = comm.allreduce(tile_capacity(counts.reshape(-1)), "max")
     # Quantize the shape: `cap_true` moves every step, and each new shape grows the XLA
     # executable cache. Geometric ladder, monotone via `cap_shape`; masked, so bitwise neutral.
@@ -1166,7 +1216,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     if cfg.tile_backend == "device" and cfg.device_tile_jit:
         from .device.tile import tile_loop_device, tile_step_shapes
 
-        shapes = tile_step_shapes(st, floor=shapes_in.get("tile"))
+        # every compiled shape is the max over ranks: each rank compiles the one-rank programs
+        shapes = allreduce_shapes(comm, tile_step_shapes(st, floor=shapes_in.get("tile")))
         shapes_out["tile"] = {k: int(v) for k, v in shapes.items()}
         # the force meshes are already on the card; each tile gathers from its shard
         if cfg.tile_window:
@@ -1174,8 +1225,9 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
 
             # one tile plane's x-slabs on the card at a time; one thread per card over its own
             # tile planes (host write-backs are disjoint core slabs)
-            wsh = window_shapes(st, cfg.n_tile, b_real, cfg.n_brick,
-                                floor=shapes_in.get("window"))
+            wsh = allreduce_shapes(comm, window_shapes(
+                view, cfg.n_tile, b_real, cfg.n_brick, planes=range(*decomp.planes),
+                floor=shapes_in.get("window")))
             # the destination census the fused migrate + repack is sized from
             fused_now = bool(repack_due) and cfg.fused_pass
             tile_timings = [dict() for _ in plane_parts]
@@ -1185,7 +1237,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
             def run_card(k):
                 a, b = plane_parts[k]
                 return tile_loop_windowed(
-                    st, one_tile, C, None, members, wshapes, planes=range(a, b),
+                    view, one_tile, C, None, members, wshapes, planes=range(a, b),
                     coarse_shard=g_coarse[k], device=None if devs is None else devs[k],
                     census=float(c_drift) if fused_now else None,
                     timings=None if timings is None else tile_timings[k])
@@ -1271,11 +1323,12 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         mt = None if timings is None else timings.setdefault("migrate", {})
         stats, repack_stats = migrate_repack_device(
             st, c_drift, census_counts, brick_slack=cfg.brick_slack,
-            device_budget_bytes=cfg.migrate_device_budget_bytes, devices=_cards(cfg),
-            timings=mt)
+            device_budget_bytes=cfg.migrate_device_budget_bytes, devices=devs,
+            timings=mt, comm=comm)
     else:
         stats = _migrate_pass(st, cfg, c_drift, pool,
-                              None if timings is None else timings.setdefault("migrate", {}))
+                              None if timings is None else timings.setdefault("migrate", {}),
+                              comm=comm, devices=devs)
     # Receipts that each knob applied, present on every step (0 / None when inactive).
     stats["migrate_repack_fused"] = fused_now
     stats["census_slabs"] = (int(sum(lp.get("census_slabs", 0) for lp in loops))
@@ -1316,6 +1369,15 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         stats["device_cards"] = cfg.device_cards
         stats["tile_cards"] = tile_cards
     stats.update(mesh_stats)
+    md = stats.get("migrate_device") or {}
+    rank_rec.update(
+        paint_ghost_planes_sent=int(mesh_stats.get("coarse_ghost_planes_sent", 0)),
+        emigrant_rows_sent=int(md.get("rank_emigrant_rows_sent", 0)),
+        emigrant_rows_received=int(md.get("rank_emigrant_rows_received", 0)),
+        hand_off_bytes_sent=int(md.get("rank_hand_off_bytes_sent", 0)))
+    rank_rec.setdefault("forward_sent_bytes", 0)
+    rank_rec.setdefault("inverse_sent_bytes", 0)
+    stats["ranks"] = rank_rec
     stats["repack"] = repack_stats
     stats["timings"] = timings
     if collect is not None:
@@ -1497,7 +1559,8 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
     return st, dict(prov)
 
 def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
-        stop_at=None, allocator=None, epoch=None, timed_steps=()):
+        stop_at=None, allocator=None, epoch=None, timed_steps=(), comm=None, decomp=None,
+        devices=None):
     """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`.
 
     Returns the list of per-step stats. `phase` is forwarded to `step`; `run` adds the
@@ -1511,8 +1574,24 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     `epoch = (a_steps, cosmo)` is read only by checkpoints (`epoch_record`), so an export can
     convert velocities to km/s from the directory alone. `timed_steps` names absolute steps
     whose device passes, separate repack and checkpoint are timed into `stats["timings"]`.
+
+    Across ranks (`comm`; `decomp` defaults from its rank and size), every rank runs this
+    with its node-local state (`load_checkpoint(comm=, slabs=)` or `icgen.load_slot_state(
+    slabs=)`), in the production device lane, and the checkpoints are written by all ranks
+    together; their bytes do not depend on the rank count. `devices` are the rank's cards.
     """
-    require_whole(st, "engine.run")
+    from .decomp import Decomp
+
+    if comm is None:
+        from .comm import SerialComm
+
+        comm = SerialComm()
+    if decomp is None:
+        decomp = Decomp.build(cfg, n_ranks=comm.size, rank=comm.rank)
+    if st.is_whole and comm.size == 1:
+        require_whole(st, "engine.run")
+    else:
+        _require_rank_lane(st, cfg, comm, decomp, "engine.run")
     cfg.validate()
     timed_steps = {int(k) for k in timed_steps}
     ph = phase if phase is not None else _no_phase
@@ -1551,14 +1630,17 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     # the long arm's kernel parts, likewise once per run (geometry only); on the cards, each
     # holds the y-pencils its share of the folded solve's kernel pass multiplies
     kernel_cards = None
-    if cfg.kernel_on_cards:
+    if devices is not None:
+        devs = list(devices)
+    elif cfg.device_cards > 1:
         import jax
 
-        from .decomp import Decomp
-
-        devs = [None] if cfg.device_cards == 1 else list(jax.devices()[: cfg.device_cards])
-        kernel_cards = [(lo, hi, dev)
-                        for (lo, hi), dev in zip(Decomp.build(cfg).card_pencils(), devs)]
+        devs = list(jax.devices()[: cfg.device_cards])
+    else:
+        devs = None
+    if cfg.kernel_on_cards:
+        kernel_cards = [(lo, hi, dev) for (lo, hi), dev in zip(
+            decomp.card_pencils(), [None] * cfg.device_cards if devs is None else devs)]
     coarse_parts = coarse_kernel_parts(
         cfg.n_coarse, cfg.box_size, "long", r_s=cfg.r_s,
         match=cfg.coarse_match, fdtype=cfg.np_coarse_dtype, cards=kernel_cards,
@@ -1569,7 +1651,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         # Lead half-drift onto the first midpoint; skipped on resume (the checkpoint is past
         # it). The boundary fires either way.
         if resume is None:
-            _migrate_pass(st, cfg, lead, pool)
+            _migrate_pass(st, cfg, lead, pool, comm=comm, devices=devs)
         ph("lead_drift")
         out = []
         # buffer shapes carried across steps and only grown, so few shapes are compiled
@@ -1611,7 +1693,8 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                          census=census, cap_shape=cap_shape, pad_shape=pad_shape,
                          phase=phase, tile_force=tile_force, pool=pool,
                          coarse_parts=coarse_parts, device_shapes=device_shapes,
-                         repack_due=repack_due, timings=timings)
+                         repack_due=repack_due, timings=timings, decomp=decomp, comm=comm,
+                         devices=devs)
             cap_shape = int(stats["cap"])
             pad_shape = int(stats["coarse_pad"])
             device_shapes = stats["device_shapes"]
@@ -1628,6 +1711,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                     st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2, epoch=epoch,
                     device_shapes=device_shapes,
                     timings=None if timings is None else timings.setdefault("checkpoint", {}),
+                    comm=comm,
                 )
                 n_ckpt += 1
                 ph("checkpoint")

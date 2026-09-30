@@ -42,8 +42,15 @@ def _whole(seed, drift):
 
 
 def whole_state(seed=11, drift=0.3):
-    """A fresh copy of the cached whole state."""
-    return copy.deepcopy(_whole(seed, drift))
+    """A fresh copy of the cached whole state (built with x64 on, whoever asks first)."""
+    import jax
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        return copy.deepcopy(_whole(seed, drift))
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def rank_devices(rank, cards):
