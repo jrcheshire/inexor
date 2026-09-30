@@ -9,6 +9,7 @@ import pytest
 
 from inexor import comm as cm
 from inexor.comm import CommAborted, CommTimeout, SerialComm, run_loopback
+from tests import comm_checks
 
 GROUPS = [("serial", 1), ("loopback", 1), ("loopback", 2), ("loopback", 3), ("loopback", 4)]
 
@@ -163,3 +164,31 @@ def test_serial_refuses_other_ranks_and_mismatched_sizes():
         c.Sendrecv(np.zeros((4, 4))[:, 0], 0, np.zeros(4), 0)
     with pytest.raises(CommAborted):
         c.Abort()
+
+
+@pytest.mark.parametrize("kind,n", GROUPS)
+@pytest.mark.parametrize("check", comm_checks.CHECKS, ids=lambda f: f.__name__)
+def test_shared_checks(kind, n, check):
+    """The checks `tests/mpi_comm_check.py` runs on MPI processes, at two chunk sizes."""
+    for chunk in (cm.DEFAULT_CHUNK_BYTES, 1000):
+        _run(kind, n, check, chunk_bytes=chunk)
+
+
+def test_mixed_neighbour_directions_fail_the_check(monkeypatch):
+    """At two ranks each rank is both neighbours of the other: an exchange that sends the
+    leftward arrays rightward must fail the neighbour check."""
+    good = cm.exchange_neighbours
+
+    def swapped(comm, to_left, to_right):
+        return good(comm, to_right, to_left)
+
+    monkeypatch.setattr(comm_checks, "exchange_neighbours", swapped)
+    with pytest.raises(AssertionError):
+        _run("loopback", 2, comm_checks.neighbour_arrays)
+
+
+def test_user_tags_are_bounded():
+    c = SerialComm()
+    for bad in (-1, cm.MAX_TAG + 1):
+        with pytest.raises(ValueError, match="tag"):
+            c.Sendrecv(np.zeros(1), 0, np.zeros(1), 0, tag=bad)

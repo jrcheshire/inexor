@@ -9,6 +9,10 @@ thread only.
 - `SerialComm`: one rank; a send to itself is a copy. The single-node run.
 - `LoopbackComm`: ranks as threads of one process (`run_loopback`), so N-rank gates run in
   pytest. Receives copy, so aliasing cannot hide a missing exchange.
+- `MPIComm`: one process per node over mpi4py, every wait polled against a watchdog.
+
+`exchange_neighbours` moves named arrays to the left and right ranks of the x ring, the
+exchange the step's ghost slabs, ghost planes and migrate hand-off use.
 
 `allreduce` is an allgather folded in rank order in every implementation, so a float sum is
 deterministic and the same on every rank and every implementation. `Alltoallv` is a pairwise
@@ -58,6 +62,18 @@ def _bytes_view(buf, what):
     return a.reshape(-1).view(np.uint8)
 
 
+#: Largest tag a caller may pass; `Alltoallv` uses negative tags internally, which MPI maps
+#: past this range.
+MAX_TAG = 9999
+
+
+def _user_tag(tag):
+    t = int(tag)
+    if not 0 <= t <= MAX_TAG:
+        raise ValueError(f"tag {t} is outside [0, {MAX_TAG}]")
+    return t
+
+
 def _chunk_bounds(nbytes, chunk):
     """[lo, hi) byte ranges of a message in `chunk`-byte pieces; one empty piece if empty."""
     n, c = int(nbytes), max(1, int(chunk))
@@ -97,9 +113,20 @@ class Comm:
 
     def Sendrecv(self, sendbuf, dest, recvbuf, source, tag=0):
         """Send `sendbuf` to `dest` and receive from `source` into `recvbuf` (same byte size as
-        the sender's buffer, or the exchange raises)."""
+        the sender's buffer, or the exchange raises). `tag` must be in [0, MAX_TAG]."""
         self._sendrecv_bytes(_bytes_view(sendbuf, "sendbuf"), int(dest),
-                             _bytes_view(recvbuf, "recvbuf"), int(source), int(tag))
+                             _bytes_view(recvbuf, "recvbuf"), int(source), _user_tag(tag))
+
+    def sendrecv(self, obj, dest, source, tag=0):
+        """Send the picklable `obj` to `dest`; return the object `source` sent. For small
+        headers: one unchunked message each way, its size exchanged first."""
+        payload = np.frombuffer(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL),
+                                dtype=np.uint8)
+        n_in = np.zeros(1, dtype=np.int64)
+        self.Sendrecv(np.array([payload.size], dtype=np.int64), dest, n_in, source, tag)
+        buf = np.empty(int(n_in[0]), dtype=np.uint8)
+        self.Sendrecv(payload, dest, buf, source, tag)
+        return pickle.loads(buf.tobytes())
 
     def Alltoallv(self, sendbufs, recvbufs):
         """`sendbufs[j]` goes to rank j; `recvbufs[i]` is filled from rank i.
@@ -277,3 +304,110 @@ def run_loopback(n, fn, timeout=60.0, chunk_bytes=DEFAULT_CHUNK_BYTES):
         exc.add_note(f"raised on loopback rank {r} of {n}")
         raise exc
     return results
+
+
+def exchange_neighbours(comm, to_left, to_right):
+    """Send the named arrays `to_left` to the left rank of the x ring and `to_right` to the
+    right one; returns `(from_left, from_right)`: what the left rank sent right and what the
+    right rank sent left, as fresh arrays.
+
+    `to_left` / `to_right` map names to numpy arrays (sent C-contiguous; a name may be absent
+    on some ranks). Every rank must call this, in the same order. The names, dtypes and
+    shapes are allgathered first, then each name moves in two `Alltoallv` calls, one per
+    direction, so at two ranks (each rank both neighbours of the other) the directions never
+    mix. On one rank everything is sent to itself as a copy; the step's callers skip it there.
+    """
+    n, r = comm.size, comm.rank
+    left, right = (r - 1) % n, (r + 1) % n
+
+    def head(d):
+        return {k: (np.asarray(v).dtype.str, tuple(np.shape(v))) for k, v in d.items()}
+
+    heads = comm.allgather((head(to_left), head(to_right)))
+    names = sorted(set().union(*(set(a) | set(b) for a, b in heads)))
+    empty = np.empty(0, dtype=np.uint8)
+    out = dict(left={}, right={})
+    for k in names:
+        # leftward: send to `left`, receive what `right` sent left; rightward the mirror
+        for src, dest, source, h, into in (
+                (to_left, left, right, heads[right][0], out["right"]),
+                (to_right, right, left, heads[left][1], out["left"])):
+            sendbufs = [empty] * n
+            if k in src:
+                sendbufs[dest] = np.ascontiguousarray(src[k])
+            recvbufs = [empty] * n
+            got = None
+            if k in h:
+                got = np.empty(h[k][1], dtype=np.dtype(h[k][0]))
+                recvbufs[source] = got
+            comm.Alltoallv(sendbufs, recvbufs)
+            if got is not None:
+                into[k] = got
+    return out["left"], out["right"]
+
+
+class MPIComm(Comm):
+    """The ranks of an MPI communicator (default `COMM_WORLD`), one process per node.
+
+    Every wait is a nonblocking request polled against `timeout` seconds (the watchdog). A
+    wait past it prints which exchange hung and calls `Abort`, because the other ranks may be
+    blocked where no exception can reach them. A rank that raises ends the job through
+    `python -m mpi4py`. mpi4py is imported on construction, not with this module.
+    """
+
+    def __init__(self, mpi_comm=None, chunk_bytes=DEFAULT_CHUNK_BYTES, timeout=1800.0,
+                 poll_s=0.001):
+        from mpi4py import MPI
+
+        self._MPI = MPI
+        self._c = MPI.COMM_WORLD if mpi_comm is None else mpi_comm
+        self.rank = int(self._c.Get_rank())
+        self.size = int(self._c.Get_size())
+        self.chunk_bytes = int(chunk_bytes)
+        self.timeout = float(timeout)
+        self.poll_s = float(poll_s)
+
+    def _wait(self, reqs, what):
+        """Statuses of `reqs` once all complete; aborts the job past the watchdog."""
+        MPI = self._MPI
+        deadline = time.monotonic() + self.timeout
+        statuses = [MPI.Status() for _ in reqs]
+        while not MPI.Request.Testall(reqs, statuses):
+            if time.monotonic() > deadline:
+                import sys
+
+                print(f"rank {self.rank}: waited {self.timeout:g} s in {what}; aborting the job",
+                      file=sys.stderr, flush=True)
+                self.Abort(3)
+            time.sleep(self.poll_s)
+        return statuses
+
+    def allgather(self, obj):
+        MPI = self._MPI
+        payload = np.frombuffer(bytearray(pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)),
+                                dtype=np.uint8)
+        sizes = np.zeros(self.size, dtype=np.int64)
+        self._wait([self._c.Iallgather(np.array([payload.size], dtype=np.int64), sizes)],
+                   "allgather (sizes)")
+        displs = np.zeros(self.size, dtype=np.int64)
+        np.cumsum(sizes[:-1], out=displs[1:])
+        recv = np.empty(int(sizes.sum()), dtype=np.uint8)
+        counts = (sizes.tolist(), displs.tolist())
+        self._wait([self._c.Iallgatherv([payload, MPI.BYTE], [recv, counts, MPI.BYTE])],
+                   "allgather")
+        return [pickle.loads(recv[d:d + s].tobytes()) for d, s in zip(*counts[::-1])]
+
+    def _sendrecv_bytes(self, send, dest, recv, source, tag):
+        MPI = self._MPI
+        # `Alltoallv`'s internal tags are negative; MPI tags are not
+        t = int(tag) if tag >= 0 else MAX_TAG + 1 - int(tag)
+        rreq = self._c.Irecv([recv, MPI.BYTE], source=int(source), tag=t)
+        sreq = self._c.Isend([send, MPI.BYTE], dest=int(dest), tag=t)
+        st_r, _st_s = self._wait([rreq, sreq], f"Sendrecv to {dest} / from {source} (tag {tag})")
+        got = st_r.Get_count(MPI.BYTE)
+        if got != recv.size:
+            raise ValueError(f"Sendrecv: rank {source} sent {got} B into rank {self.rank}'s "
+                             f"{recv.size} B buffer")
+
+    def Abort(self, code=1):
+        self._c.Abort(int(code))
