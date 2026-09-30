@@ -1,9 +1,10 @@
 """`device_run.py run --comm mpi` on real MPI processes: checkpoints byte-identical to one rank.
 
-ICs for `cdev8-tile32` from `realization.py ics`; the driver runs K = 6 steps with a
-checkpoint every 3 under `mpiexec -n N` (one card per rank), and every checkpoint file at
-N = 2 and 4 must equal N = 1's. `D7_FAIL_AT` on rank 1 ends the whole launch. Skipped where
-mpi4py or `mpiexec` is missing; `scripts/run/mpi_lane.sh` runs it on the laptop.
+ICs for `cdev8-tile32` from `realization.py ics`; the driver runs the first 6 steps of a
+40-step schedule with a checkpoint every 3 under `mpiexec -n N` (one card per rank), and
+every checkpoint file at N = 2 and 4 must equal N = 1's. `D7_FAIL_AT` on rank 1 ends the
+whole launch. Skipped where mpi4py or `mpiexec` is missing; `scripts/run/mpi_lane.sh` runs
+it on the laptop.
 """
 
 import os
@@ -32,9 +33,12 @@ ENV = dict(os.environ, OMP_NUM_THREADS="1", JAX_PLATFORMS="cpu",
 @pytest.fixture(scope="module")
 def ics(tmp_path_factory):
     d = tmp_path_factory.mktemp("ics")
+    # a slightly early start: at this box's 2 Mpc/h brick slabs the a = 0.1 displacements
+    # exceed the streamed generator's one-slab window (the driver's schedule still starts at
+    # 0.1; the epoch does not matter to a byte comparison between rank counts)
     p = subprocess.run([sys.executable, REALIZATION, "ics", "--config", PRESET, "--workdir",
-                        str(d), "--tile-workers", "1"], capture_output=True, text=True,
-                       env=ENV, timeout=900)
+                        str(d), "--tile-workers", "1", "--a-init", "0.08"],
+                       capture_output=True, text=True, env=ENV, timeout=900)
     assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
     return d
 
@@ -42,7 +46,10 @@ def ics(tmp_path_factory):
 def _launch(n, ics, out, env=None, timeout=1200):
     cmd = [MPIEXEC, "-n", str(n), sys.executable, "-m", "mpi4py", DRIVER, "run",
            "--preset", PRESET, "--workdir", str(ics), "--card", str(out / "card.json"),
-           "--cards", "1", "--k-steps", "6", "--stop-at", "6",
+           # the first 6 steps of a 40-step schedule, as a production segment runs them
+           "--cards", "1", "--k-steps", "40", "--stop-at", "6",
+           # the CPU driver's roomier layout (not fingerprinted) for the early ICs
+           "--slack", "0.20", "--arena-frac", "0.20",
            "--checkpoint-dir", str(out / "ckpt"), "--checkpoint-every", "3",
            "--comm", "mpi", "--comm-timeout", "300", "--beat", "600"]
     t0 = time.monotonic()
