@@ -44,7 +44,7 @@ from .forces import (
 )
 from .layout import assert_brick_divides_buffer, choose_brick
 from .painting import check_tsc_paint_headroom, paint_tsc_int, paint_tsc_int_subblock
-from .state import TileMembers, drift_and_migrate, drift_and_migrate_pooled
+from .state import TileMembers, drift_and_migrate, drift_and_migrate_pooled, require_whole
 
 __all__ = [
     "EngineConfig", "apply_result", "checkpoint_fingerprint", "coarse_delta_streamed",
@@ -1045,6 +1045,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     """
     import jax.numpy as jnp
 
+    require_whole(st, "engine.step")
     ph = phase if phase is not None else _no_phase
     if decomp is None:
         from .decomp import Decomp
@@ -1472,6 +1473,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     convert velocities to km/s from the directory alone. `timed_steps` names absolute steps
     whose device passes, separate repack and checkpoint are timed into `stats["timings"]`.
     """
+    require_whole(st, "engine.run")
     cfg.validate()
     timed_steps = {int(k) for k in timed_steps}
     ph = phase if phase is not None else _no_phase

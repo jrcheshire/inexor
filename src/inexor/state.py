@@ -40,6 +40,7 @@ __all__ = [
     "drift_and_migrate",
     "encode_positions_host",
     "reconcile_velocity_scale",
+    "require_whole",
 ]
 
 
@@ -280,6 +281,7 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert
 
     Returns a stats dict (arena overflow, scales, reach bound and realized, peak staging).
     """
+    require_whole(st, "drift_and_migrate")
     nb = st.bricks_per_side
     # snapshot: inserts rewrite brick scales while later ejects must decode at pre-pass scales
     scales = np.array(st.vel_scale, dtype=np.float64, copy=True)
@@ -468,6 +470,7 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
             f"eject_inflight must be >= 1, got {eject_inflight}: at zero no "
             "eject can ever launch and the dispatch loop blocks forever"
         )
+    require_whole(st, "drift_and_migrate_pooled")
     nb = st.bricks_per_side
     p3 = st.buckets_per_brick
     n_before = occupancy_total(st.occupancy) + st.arena_used
@@ -653,14 +656,30 @@ class TileMembers(Mapping):
         return len(self._keys)
 
 
+def require_whole(st, what):
+    """Refuse a node-local state (`SlotState.slabs` set) in a pass that has no cross-rank path."""
+    if not st.is_whole:
+        lo, hi = st.owned_slabs
+        raise NotImplementedError(
+            f"{what} needs a whole-box state; this one holds brick slabs [{lo}, {hi}) of "
+            f"{st.bricks_per_side} (one rank's share), and {what} has no cross-rank path"
+        )
+
+
 @dataclass
 class SlotState:
-    """T9 payload stored in slot order; the bucket is implied by the slot."""
+    """T9 payload stored in slot order; the bucket is implied by the slot.
+
+    A node-local state (`slabs = (lo, hi)`, one rank's brick x-slabs) holds only those slabs'
+    particles: `occupancy` covers the owned buckets (read it through `_occ`), rows and arena
+    are local, and `n_particles` is the local count. Per-brick arrays stay global length; a
+    brick outside the owned range is an empty run with scale 1.0, exactly an empty brick.
+    """
 
     t9: object
     bricks_per_side: int
     brick_start: np.ndarray  # int64 (n_bricks+1,) fixed allocation runs
-    occupancy: np.ndarray  # uint32 (n_buckets,) THE index; also bucket bounds
+    occupancy: np.ndarray  # uint32 (owned buckets,) THE index; also bucket bounds
     off: np.ndarray  # uint8 (n_alloc + n_arena, 3)
     w: np.ndarray  # int16 (n_alloc + n_arena, 3)
     # float64 (n_bricks,): one velocity scale per brick, fixed in `_insert_slab`
@@ -669,6 +688,10 @@ class SlotState:
     arena_bucket: np.ndarray  # int64 (n_arena,) -1 where free
     n_particles: int
     ids: np.ndarray = None  # int32 (n_alloc + n_arena,) or None
+    # owned brick x-slabs [lo, hi); None = the whole box
+    slabs: tuple = None
+    # the arena's fraction of the particles at build or load (None if unknown)
+    arena_frac: float = None
     # caches over `arena_bucket` (None = dirty): brick -> absolute arena rows, and the
     # ascending free arena-relative rows
     _arena_by_brick: dict = None
@@ -748,9 +771,50 @@ class SlotState:
             arena_bucket=np.full(n_arena, -1, dtype=np.int64),
             n_particles=n,
             ids=ids,
+            arena_frac=float(arena_frac),
         )
 
     # ----------------------------------------------------------- geometry
+
+    @property
+    def owned_slabs(self):
+        """The brick x-slabs [lo, hi) this state holds."""
+        if self.slabs is None:
+            return 0, int(self.bricks_per_side)
+        return int(self.slabs[0]), int(self.slabs[1])
+
+    @property
+    def is_whole(self):
+        return self.owned_slabs == (0, int(self.bricks_per_side))
+
+    @property
+    def owned_bricks(self):
+        """The brick ordinals [lo, hi) this state holds (contiguous: slabs are x-major)."""
+        lo, hi = self.owned_slabs
+        nb2 = int(self.bricks_per_side) ** 2
+        return lo * nb2, hi * nb2
+
+    @property
+    def bucket_lo(self):
+        """Flat bucket ordinal of `occupancy[0]`."""
+        return self.owned_bricks[0] * self.buckets_per_brick
+
+    def _occ(self, lo_b, hi_b=None):
+        """View of `occupancy` over bricks [lo_b, hi_b) (default the one brick `lo_b`).
+
+        Raises for any brick outside the owned range, where a shifted slice would wrap or
+        read another brick's buckets silently.
+        """
+        lo_b = int(lo_b)
+        hi_b = lo_b + 1 if hi_b is None else int(hi_b)
+        blo, bhi = self.owned_bricks
+        if not blo <= lo_b <= hi_b <= bhi:
+            raise IndexError(
+                f"bricks [{lo_b}, {hi_b}) are outside this state's owned bricks "
+                f"[{blo}, {bhi}) (slabs {self.owned_slabs})"
+            )
+        p3 = self.buckets_per_brick
+        return self.occupancy[(lo_b - blo) * p3 : (hi_b - blo) * p3]
 
     @property
     def index_dtype(self):
@@ -767,6 +831,7 @@ class SlotState:
 
     @property
     def n_buckets(self):
+        """Buckets `occupancy` indexes: the owned ones."""
         return len(self.occupancy)
 
     @property
@@ -791,10 +856,7 @@ class SlotState:
         return int(self.brick_start[brick_flat]), int(self.brick_start[brick_flat + 1])
 
     def brick_live_count(self, brick_flat):
-        p3 = self.buckets_per_brick
-        return int(
-            self.occupancy[brick_flat * p3 : (brick_flat + 1) * p3].astype(np.int64).sum()
-        )
+        return int(self._occ(brick_flat).astype(np.int64).sum())
 
     def brick_member_count(self, brick_flat):
         """Live rows plus arena residents: the brick's true membership.
@@ -807,7 +869,7 @@ class SlotState:
         """Absolute slot boundaries (p3 + 1,) of the buckets in one brick, derived from
         `occupancy` by prefix sum rather than stored."""
         p3 = self.buckets_per_brick
-        occ = self.occupancy[brick_flat * p3 : (brick_flat + 1) * p3].astype(np.int64)
+        occ = self._occ(brick_flat).astype(np.int64)
         out = np.zeros(p3 + 1, dtype=np.int64)
         np.cumsum(occ, out=out[1:])
         return int(self.brick_start[brick_flat]) + out
@@ -818,7 +880,7 @@ class SlotState:
         """Flat bucket ordinal for each of the brick's live rows, in slot order (a `repeat`
         over the brick's occupancy slice)."""
         p3 = self.buckets_per_brick
-        occ = self.occupancy[brick_flat * p3 : (brick_flat + 1) * p3].astype(np.int64)
+        occ = self._occ(brick_flat).astype(np.int64)
         return brick_flat * p3 + np.repeat(np.arange(p3, dtype=np.int64), occ)
 
     def bucket_ijk_of_live_slots(self, brick_flat):
@@ -909,18 +971,32 @@ class SlotState:
         `check_placement`.
         """
         p3 = self.buckets_per_brick
+        blo, bhi = self.owned_bricks
+        if len(self.occupancy) != (bhi - blo) * p3:
+            raise ValueError(
+                f"occupancy holds {len(self.occupancy)} buckets but slabs "
+                f"{self.owned_slabs} own {(bhi - blo) * p3}"
+            )
         occ = self.occupancy.astype(np.int64)
 
-        # 1. no brick may hold more live rows than its allocation
-        live = occ.reshape(self.n_bricks, p3).sum(axis=1)
-        cap = np.diff(self.brick_start)
+        # 1. no brick may hold more live rows than its allocation, and a brick this state
+        # does not own has none
+        live = occ.reshape(bhi - blo, p3).sum(axis=1)
+        cap_all = np.diff(self.brick_start)
+        foreign = np.nonzero(np.concatenate([cap_all[:blo], cap_all[bhi:]]))[0]
+        if len(foreign):
+            raise ValueError(
+                f"{len(foreign)} brick(s) outside the owned bricks [{blo}, {bhi}) have an "
+                "allocation: a non-owned brick must be an empty run"
+            )
+        cap = cap_all[blo:bhi]
         over = np.nonzero(live > cap)[0]
         if len(over):
-            b = int(over[0])
+            j = int(over[0])
             raise ValueError(
-                f"brick {b} holds {int(live[b])} live rows in an allocation of {int(cap[b])} "
-                f"({len(over)} bricks affected). Its run has overrun the next brick's slots, "
-                "which silently reassigns particles rather than losing them."
+                f"brick {blo + j} holds {int(live[j])} live rows in an allocation of "
+                f"{int(cap[j])} ({len(over)} bricks affected). Its run has overrun the next "
+                "brick's slots, which silently reassigns particles rather than losing them."
             )
 
         # 2. nothing lost, nothing duplicated
@@ -938,12 +1014,14 @@ class SlotState:
                 f"{int(self.brick_start[-1])}: arena rows alias live slots"
             )
 
-        # 4. every occupied arena row names a real bucket
+        # 4. every occupied arena row names an owned bucket
         if self.n_arena:
             used = self.arena_bucket[self.arena_bucket >= 0]
-            if len(used) and int(used.max()) >= self.n_buckets:
+            lo_k, hi_k = self.bucket_lo, self.bucket_lo + self.n_buckets
+            if len(used) and (int(used.min()) < lo_k or int(used.max()) >= hi_k):
                 raise ValueError(
-                    f"an arena row names bucket {int(used.max())} of {self.n_buckets}"
+                    f"an arena row names bucket {int(used.max())} (or {int(used.min())}) "
+                    f"outside the owned buckets [{lo_k}, {hi_k})"
                 )
         return True
 
@@ -1012,26 +1090,32 @@ class SlotState:
 
         Occupancy summed per brick (x-slab chunks on `workers` threads, default the CPU count;
         integer sums, so the result is exact at any thread count) plus arena residents.
+        Bricks this state does not own count 0.
         """
         import os
         from concurrent.futures import ThreadPoolExecutor
 
         nb, p3 = self.bricks_per_side, self.buckets_per_brick
         per_slab = nb * nb
+        s_lo, s_hi = self.owned_slabs
+        blo, bhi = self.owned_bricks
         out = np.empty(self.n_bricks, dtype=np.int64)
-        occ = self.occupancy.reshape(self.n_bricks, p3)
+        out[:blo] = 0
+        out[bhi:] = 0
+        occ = self.occupancy.reshape(bhi - blo, p3)
 
         def slab(bx):
             lo, hi = bx * per_slab, (bx + 1) * per_slab
-            np.sum(occ[lo:hi], axis=1, dtype=np.int64, out=out[lo:hi])
+            np.sum(occ[lo - blo:hi - blo], axis=1, dtype=np.int64, out=out[lo:hi])
 
-        w = max(1, min(nb, int(os.cpu_count() or 1) if workers is None else int(workers)))
+        n_s = s_hi - s_lo
+        w = max(1, min(n_s, int(os.cpu_count() or 1) if workers is None else int(workers)))
         if w == 1:
-            for bx in range(nb):
+            for bx in range(s_lo, s_hi):
                 slab(bx)
         else:
             with ThreadPoolExecutor(max_workers=w) as ex:
-                list(ex.map(slab, range(nb)))
+                list(ex.map(slab, range(s_lo, s_hi)))
         if self.n_arena:
             b = self.arena_bucket[self.arena_bucket >= 0] // p3
             out += np.bincount(b, minlength=self.n_bricks).astype(np.int64, copy=False)
@@ -1327,8 +1411,7 @@ class SlotState:
         self.w[pos] = res["w"][:nw]
         if has_ids:
             self.ids[pos] = res["ids"][:nw]
-        self.occupancy[lo_b * p3 : hi_b * p3] = _to_index(res["occupancy"], self.index_dtype,
-                                                          "migrated")
+        self._occ(lo_b, hi_b)[...] = _to_index(res["occupancy"], self.index_dtype, "migrated")
         self.vel_scale[lo_b:hi_b] = res["scales"]
         if ns:
             sl = slice(nw, nw + ns)
@@ -1385,7 +1468,7 @@ class SlotState:
         self.w[lo : lo + m] = w
         if ids is not None:
             self.ids[lo : lo + m] = ids
-        self.occupancy[b * p3 : (b + 1) * p3] = _to_index(counts, self.index_dtype, "migrated")
+        self._occ(b)[...] = _to_index(counts, self.index_dtype, "migrated")
         return n_over
 
     def _to_arena(self, dest, off, w, ids=None):
@@ -1439,11 +1522,15 @@ class SlotState:
         overflows the index dtype is refused when the counts are narrowed at the end.
         """
         p3 = self.buckets_per_brick
+        blo, bhi = self.owned_bricks
+        k0 = self.bucket_lo
         occ = self.occupancy.astype(np.int64)
         arena_live = np.nonzero(self.arena_bucket >= 0)[0]
         if len(arena_live):
-            occ = occ + np.bincount(self.arena_bucket[arena_live], minlength=self.n_buckets)
-        counts = occ.reshape(self.n_bricks, p3).sum(axis=1)
+            occ = occ + np.bincount(self.arena_bucket[arena_live] - k0,
+                                    minlength=self.n_buckets)
+        counts = np.zeros(self.n_bricks, dtype=np.int64)
+        counts[blo:bhi] = occ.reshape(bhi - blo, p3).sum(axis=1)
         spare = np.ceil(counts * float(brick_slack)).astype(np.int64)
         spare = np.where(counts > 0, np.maximum(spare, 1), spare)
         new_start = np.zeros(self.n_bricks + 1, dtype=np.int64)
@@ -1458,7 +1545,7 @@ class SlotState:
         w = np.zeros_like(self.w)
         ids = None if self.ids is None else np.full_like(self.ids, -1)
         new_occ = np.zeros(self.n_buckets, dtype=np.int64)
-        for b in range(self.n_bricks):
+        for b in range(blo, bhi):
             slots = self.brick_member_slots(b)
             if not len(slots):
                 continue
@@ -1470,7 +1557,7 @@ class SlotState:
             w[lo : lo + m] = self.w[slots[order]]
             if ids is not None:
                 ids[lo : lo + m] = self.ids[slots[order]]
-            new_occ[b * p3 : (b + 1) * p3] = np.bincount(
+            new_occ[b * p3 - k0 : (b + 1) * p3 - k0] = np.bincount(
                 dest[order] - b * p3, minlength=p3
             )
         self.off, self.w = off, w
@@ -1502,8 +1589,11 @@ class SlotState:
         Returns slots used, `scratch_bytes` (all transients), and `bricks_fast`/`bricks_merged`.
         """
         p3 = self.buckets_per_brick
+        blo, bhi = self.owned_bricks
+        k0 = self.bucket_lo
         # per-brick counts, accumulated in int64 without casting the per-bucket index
-        run_counts = self.occupancy.reshape(self.n_bricks, p3).sum(axis=1, dtype=np.int64)
+        run_counts = np.zeros(self.n_bricks, dtype=np.int64)
+        run_counts[blo:bhi] = self.occupancy.reshape(bhi - blo, p3).sum(axis=1, dtype=np.int64)
         arena_live = np.nonzero(self.arena_bucket >= 0)[0]
         counts = run_counts.copy()
         if len(arena_live):
@@ -1550,7 +1640,7 @@ class SlotState:
         # ---- pass A: compact the main runs leftward
         main_pos = np.zeros(self.n_bricks + 1, dtype=np.int64)
         np.cumsum(run_counts, out=main_pos[1:])
-        for b in range(self.n_bricks):
+        for b in range(blo, bhi):
             m = int(run_counts[b])
             src, dst = int(self.brick_start[b]), int(main_pos[b])
             if m == 0 or src == dst:
@@ -1567,7 +1657,7 @@ class SlotState:
         new_occ = np.zeros(self.n_buckets, dtype=self.index_dtype)
         bucket_ids = np.arange(p3, dtype=np.int64)
         n_fast = n_merge = 0
-        for b in range(self.n_bricks - 1, -1, -1):
+        for b in range(bhi - 1, blo - 1, -1):
             m = int(run_counts[b])
             k = int(a_edge[b + 1] - a_edge[b])
             if m + k == 0:
@@ -1581,11 +1671,11 @@ class SlotState:
                 self.w[ns : ns + m] = self.w[mp : mp + m]
                 if self.ids is not None:
                     self.ids[ns : ns + m] = self.ids[mp : mp + m]
-                new_occ[b * p3 : (b + 1) * p3] = self.occupancy[b * p3 : (b + 1) * p3]
+                new_occ[b * p3 - k0 : (b + 1) * p3 - k0] = self._occ(b)
             else:
                 n_merge += 1
                 within = np.repeat(bucket_ids, occ_b := np.asarray(
-                    self.occupancy[b * p3 : (b + 1) * p3], dtype=np.int64))
+                    self._occ(b), dtype=np.int64))
                 del occ_b
                 within = np.concatenate(
                     [within, a_bucket[a_edge[b] : a_edge[b + 1]] - b * p3])
@@ -1604,7 +1694,8 @@ class SlotState:
                     cat_i = np.concatenate(
                         [self.ids[mp : mp + m], a_ids[a_edge[b] : a_edge[b + 1]]])
                     np.take(cat_i, order, axis=0, out=self.ids[ns : ns + m + k])
-                new_occ[b * p3 : (b + 1) * p3] = np.bincount(within[order], minlength=p3)
+                new_occ[b * p3 - k0 : (b + 1) * p3 - k0] = np.bincount(within[order],
+                                                                      minlength=p3)
             # zero the spare (ids -1) so states compare bytewise; it lies above every
             # main block still to be read
             gap_lo, gap_hi = ns + m + k, int(new_start[b + 1])

@@ -682,6 +682,9 @@ class TilePool:
                 f"TilePool is the CPU lane and the parent backend is "
                 f"{jax.default_backend()!r}; the device lane is a different executor"
             )
+        from .state import require_whole
+
+        require_whole(st, "TilePool")
         self.st = st
         self.workers = int(cfg.tile_workers)
         self._step = 0
