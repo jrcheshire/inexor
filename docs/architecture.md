@@ -299,8 +299,11 @@ against the host generator.
 ## 6. Products
 
 **P(k) card** (`summary.pk_summary_card`). The coarse density from the step's streamed
-integer paint is transformed with `ooc_fft` and binned slab by slab with hermitian weights
-(`binned_power`), with no particle array materialized. The TSC window is divided out
+integer paint is transformed with `ooc_fft` and binned with hermitian weights
+(`binned_power`), with no particle array materialized. Each ky-plane's bin sums are formed
+alone and the planes combined per bin with `math.fsum`, so the card is bitwise the same
+however the planes are blocked or split across ranks (`binned_power_partials`,
+`combine_partials`). The TSC window is divided out
 analytically and shot noise `V/N` subtracted. The oracle `D(a_out)^2 P_lin(k)` is averaged
 over each bin's realized modes in the same pass, never evaluated at a bin centre, and
 `z = (P / P_oracle - 1) / sqrt(2 / n_modes)` is reported per bin. The card decides no

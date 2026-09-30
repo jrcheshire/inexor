@@ -125,14 +125,52 @@ def test_the_bin_centre_bias_grows_as_sqrt_of_the_mode_count():
     assert abs(predicted / np.sqrt(8.0) - 1.0) < 0.05
 
 
+def _win(kx, ky, kz):
+    return summary.tsc_window_slab(kx, ky, kz, np.pi * N / BOX)
+
+
 @pytest.mark.parametrize("slab", [1, 7, 16, N])
 def test_slab_is_a_memory_knob_only(slab):
+    """Bitwise: each ky-plane's partial is summed alone, whatever the block."""
     f, p_true = _white()
     spec = ooc_fft.rfftn_ooc(f)
-    ref = summary.binned_power(spec, N, BOX, p_of_k=lambda k: np.full_like(k, p_true), slab=N)
-    got = summary.binned_power(spec, N, BOX, p_of_k=lambda k: np.full_like(k, p_true), slab=slab)
-    for key in ("k_mean", "p", "n_modes", "z", "p_oracle"):
-        np.testing.assert_allclose(got[key], ref[key], rtol=1e-13, atol=0)
+    kw = dict(p_of_k=lambda k: np.full_like(k, p_true), window=_win, shot_noise=1e-3)
+    ref = summary.binned_power(spec, N, BOX, slab=N, **kw)
+    got = summary.binned_power(spec, N, BOX, slab=slab, **kw)
+    for key in ("k_mean", "p", "n_modes", "z", "p_oracle", "window_correction",
+                "shot_fraction"):
+        np.testing.assert_array_equal(got[key], ref[key])
+
+
+@pytest.mark.parametrize("cuts", [(0, 5, 11, N), (0, 1, N - 1, N), (0, N // 2, N)])
+def test_any_split_of_the_planes_is_bitwise_one_part(cuts):
+    """Partials over disjoint ky-ranges (as ranks would hold them), combined in any order,
+    are bitwise the single pass."""
+    f, p_true = _white()
+    spec = ooc_fft.rfftn_ooc(f)
+    kw = dict(p_of_k=lambda k: np.full_like(k, p_true), window=_win, shot_noise=1e-3)
+    ref = summary.binned_power(spec, N, BOX, slab=3, **kw)
+    parts = [summary.binned_power_partials(np.ascontiguousarray(spec[:, a:b]), N, BOX, y0=a,
+                                           slab=4, **kw)
+             for a, b in zip(cuts[:-1], cuts[1:])]
+    for order in (parts, parts[::-1]):
+        got = summary.combine_partials(order)
+        for key in ("k_mean", "p", "n_modes", "z", "p_oracle"):
+            np.testing.assert_array_equal(got[key], ref[key])
+
+
+def test_partials_must_cover_every_plane_once():
+    f, _ = _white()
+    spec = ooc_fft.rfftn_ooc(f)
+    a = summary.binned_power_partials(spec[:, :5], N, BOX, y0=0)
+    b = summary.binned_power_partials(spec[:, 4:], N, BOX, y0=4)
+    with pytest.raises(ValueError, match="exactly once"):
+        summary.combine_partials([a, b])
+    with pytest.raises(ValueError, match="exactly once"):
+        summary.combine_partials([a])
+    c = summary.binned_power_partials(spec[:, 5:], N, BOX, y0=5, shot_noise=1.0)
+    with pytest.raises(ValueError, match="disagree"):
+        summary.combine_partials([a, c])
 
 
 def test_tsc_window_is_the_cic_window_at_exponent_three_halves():
@@ -156,8 +194,8 @@ def test_corrections_are_applied_in_the_painted_order_and_reported():
     spec = np.ones((n, n, n // 2 + 1), dtype=np.complex128)
     shot = 1e-4
 
-    def win(kx_slab, kx, kz):
-        return np.full((len(kx_slab), len(kx), len(kz)), 0.5)
+    def win(kx, ky, kz):
+        return np.full((len(kx), len(ky), len(kz)), 0.5)
 
     plain = summary.binned_power(spec, n, box, min_weight=0.0)
     both = summary.binned_power(spec, n, box, window=win, shot_noise=shot, min_weight=0.0)

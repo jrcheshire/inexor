@@ -35,6 +35,140 @@ def _mode_grid(n_mesh, box_size):
     return kx, kz, wgt
 
 
+_SUMS = ("p", "raw", "oracle", "k", "w", "wcorr")
+
+
+def binned_power_partials(
+    spec,
+    n_mesh,
+    box_size,
+    y0=0,
+    p_of_k=None,
+    edges=None,
+    slab=32,
+    window=None,
+    shot_noise=0.0,
+    progress=None,
+):
+    """Per-ky-plane partial sums of the binned power over the y-pencils `spec` holds.
+
+    `spec[:, j, :]` is ky-plane `y0 + j` of the (N, N, N//2+1) rfft spectrum (the whole
+    spectrum with `y0=0`, or one rank's pencils), read `slab` planes at a time. Each plane's
+    partial is summed in its own element order, so it depends on that plane alone: block size
+    and the split of planes across ranks cannot move a bit. Arguments as `binned_power`.
+
+    Returns dict(n_mesh, y0, n_planes, k_edges, sums): `sums[name]` is (n_planes, n_bins) f64
+    for each of "p", "raw", "oracle", "k", "w", "wcorr". Combine with `combine_partials`.
+    """
+    n = int(n_mesh)
+    kx, kz, wgt_z = _mode_grid(n, box_size)
+    if edges is None:
+        k_nyq = np.pi * n / box_size
+        edges = np.linspace(0.0, 0.5 * k_nyq, 65)
+    edges = np.asarray(edges, dtype=np.float64)
+    nb = len(edges) - 1
+    n_planes = int(spec.shape[1])
+
+    sums = {k: np.zeros((n_planes, nb)) for k in _SUMS}
+    for lo in range(0, n_planes, int(slab)):
+        hi = min(lo + int(slab), n_planes)
+        if progress is not None:
+            progress("bin power", lo, n_planes)
+        ky = kx[y0 + lo:y0 + hi]
+        kk = np.sqrt(
+            kx.reshape(-1, 1, 1) ** 2
+            + ky.reshape(1, -1, 1) ** 2
+            + kz.reshape(1, 1, -1) ** 2
+        )
+        s = spec[:, lo:hi]
+        p = s.real.astype(np.float64) ** 2 + s.imag.astype(np.float64) ** 2
+        p *= box_size**3 / float(n) ** 6
+        raw = p
+        if window is not None:
+            w2 = window(kx, ky, kz) ** 2
+            p = p / w2
+        else:
+            w2 = None
+        w3 = np.broadcast_to(wgt_z, kk.shape)
+
+        flat = kk.ravel()
+        idx = np.digitize(flat, edges) - 1
+        sel = (idx >= 0) & (idx < nb) & (flat > 0.0)
+        if not sel.any():
+            continue
+        # (plane, bin) as one index; bincount adds in element order, which within one plane
+        # is (kx, kz) whatever the block
+        plane = np.broadcast_to(np.arange(hi - lo).reshape(1, -1, 1), kk.shape).ravel()
+        at = plane[sel] * nb + idx[sel]
+        wk = w3.ravel()[sel]
+
+        def add(name, v):
+            sums[name][lo:hi] += np.bincount(at, weights=v, minlength=(hi - lo) * nb
+                                             ).reshape(hi - lo, nb)
+
+        add("p", (p.ravel()[sel] - shot_noise) * wk)
+        add("raw", raw.ravel()[sel] * wk)
+        add("k", flat[sel] * wk)
+        add("w", wk)
+        add("wcorr", (1.0 if w2 is None else w2.ravel()[sel]) * wk)
+        if p_of_k is not None:
+            add("oracle", p_of_k(flat[sel]) * wk)
+    if progress is not None:
+        progress("bin power", n_planes, n_planes)
+    return dict(n_mesh=n, y0=int(y0), n_planes=n_planes, k_edges=edges, sums=sums,
+                oracle=p_of_k is not None, shot_noise=float(shot_noise))
+
+
+def combine_partials(parts, min_weight=100.0):
+    """`binned_power`'s result from `binned_power_partials` over planes covering [0, N) once.
+
+    Per bin, the plane partials are combined with `math.fsum` (correctly rounded), so the
+    result does not depend on the order or grouping of `parts`.
+    """
+    import math
+
+    parts = list(parts)
+    if not parts:
+        raise ValueError("no partials to combine")
+    head = parts[0]
+    n = head["n_mesh"]
+    for q in parts[1:]:
+        if (q["n_mesh"] != n or not np.array_equal(q["k_edges"], head["k_edges"])
+                or q["oracle"] != head["oracle"] or q["shot_noise"] != head["shot_noise"]):
+            raise ValueError("partials disagree on the mesh, the bins, the oracle or the shot "
+                             "noise")
+    cover = np.zeros(n, dtype=np.int64)
+    for q in parts:
+        cover[q["y0"]:q["y0"] + q["n_planes"]] += 1
+    if not np.all(cover == 1):
+        raise ValueError(f"partials cover ky-planes {np.count_nonzero(cover == 0)} times zero "
+                         f"and {np.count_nonzero(cover > 1)} times more than once; each of "
+                         f"the {n} planes must be summed exactly once")
+    nb = len(head["k_edges"]) - 1
+    acc = {}
+    for name in _SUMS:
+        stacked = np.concatenate([q["sums"][name] for q in parts], axis=0)
+        acc[name] = np.array([math.fsum(stacked[:, b]) for b in range(nb)])
+    shot_noise = head["shot_noise"]
+
+    good = acc["w"] > float(min_weight)
+    w = acc["w"][good]
+    out = dict(
+        k_mean=acc["k"][good] / w,
+        p=acc["p"][good] / w,
+        n_modes=w,
+        window_correction=acc["wcorr"][good] / w,
+        shot_fraction=(shot_noise / (acc["raw"][good] / w)) if shot_noise else np.zeros(int(good.sum())),
+        k_edges=head["k_edges"],
+    )
+    if head["oracle"]:
+        out["p_oracle"] = acc["oracle"][good] / w
+        # Gaussian Var(P_hat)/P^2 = 2/N_modes, normalized by the oracle so a low bin does not
+        # get a smaller sigma.
+        out["z"] = (out["p"] / out["p_oracle"] - 1.0) / np.sqrt(2.0 / w)
+    return out
+
+
 def binned_power(
     spec,
     n_mesh,
@@ -47,89 +181,33 @@ def binned_power(
     min_weight=100.0,
     progress=None,
 ):
-    """Slab-streamed, hermitian-weighted binned P(k) of an rfft spectrum.
+    """Hermitian-weighted binned P(k) of an rfft spectrum, streamed by y-pencil blocks.
 
-    `spec` is the (N, N, N//2+1) array `ooc_fft` returns, read slab by slab, never copied.
-    `p_of_k`, if given, is averaged in the same pass over the same modes and weights (the
-    bin-averaged oracle). `window(kx_slab, kx, kz) -> W` divides power by W**2 per mode
-    before binning; `shot_noise` is subtracted after, i.e. `P_raw / W**2 - 1/nbar`.
+    `spec` is the (N, N, N//2+1) array `ooc_fft` returns, read `slab` ky-planes at a time,
+    never copied; the result is bitwise independent of `slab` (`binned_power_partials` then
+    `combine_partials`). `p_of_k`, if given, is averaged in the same pass over the same modes
+    and weights (the bin-averaged oracle). `window(kx, ky_block, kz) -> W` divides power by
+    W**2 per mode before binning; `shot_noise` is subtracted after, i.e. `P_raw / W**2 - 1/nbar`.
     `min_weight` drops bins with fewer modes (100 -> ~7% error on sigma itself).
-    `progress(stage, done, total)` is called once per slab.
+    `progress(stage, done, total)` is called once per block.
 
     Returns a dict of parallel per-bin arrays: `k_mean` (weighted), `p`, `n_modes`,
     `window_correction`, `shot_fraction`, `k_edges`, and `p_oracle`, `z` when `p_of_k` given.
     """
-    n = int(n_mesh)
-    kx, kz, wgt_z = _mode_grid(n, box_size)
-    if edges is None:
-        k_nyq = np.pi * n / box_size
-        edges = np.linspace(0.0, 0.5 * k_nyq, 65)
-    edges = np.asarray(edges, dtype=np.float64)
-    nb = len(edges) - 1
-
-    acc = {k: np.zeros(nb) for k in ("p", "raw", "oracle", "k", "w", "wcorr")}
-    for lo in range(0, n, int(slab)):
-        hi = min(lo + int(slab), n)
-        if progress is not None:
-            progress("bin power", lo, n)
-        kk = np.sqrt(
-            kx[lo:hi].reshape(-1, 1, 1) ** 2
-            + kx.reshape(1, n, 1) ** 2
-            + kz.reshape(1, 1, -1) ** 2
-        )
-        s = spec[lo:hi]
-        p = s.real.astype(np.float64) ** 2 + s.imag.astype(np.float64) ** 2
-        p *= box_size**3 / float(n) ** 6
-        raw = p
-        if window is not None:
-            w2 = window(kx[lo:hi], kx, kz) ** 2
-            p = p / w2
-        else:
-            w2 = None
-        w3 = np.broadcast_to(wgt_z, kk.shape)
-
-        flat = kk.ravel()
-        idx = np.digitize(flat, edges) - 1
-        sel = (idx >= 0) & (idx < nb) & (flat > 0.0)
-        if not sel.any():
-            continue
-        i, wk = idx[sel], w3.ravel()[sel]
-        np.add.at(acc["p"], i, (p.ravel()[sel] - shot_noise) * wk)
-        np.add.at(acc["raw"], i, raw.ravel()[sel] * wk)
-        np.add.at(acc["k"], i, flat[sel] * wk)
-        np.add.at(acc["w"], i, wk)
-        np.add.at(acc["wcorr"], i, (1.0 if w2 is None else w2.ravel()[sel]) * wk)
-        if p_of_k is not None:
-            np.add.at(acc["oracle"], i, p_of_k(flat[sel]) * wk)
-    if progress is not None:
-        progress("bin power", n, n)
-
-    good = acc["w"] > float(min_weight)
-    w = acc["w"][good]
-    out = dict(
-        k_mean=acc["k"][good] / w,
-        p=acc["p"][good] / w,
-        n_modes=w,
-        window_correction=acc["wcorr"][good] / w,
-        shot_fraction=(shot_noise / (acc["raw"][good] / w)) if shot_noise else np.zeros(int(good.sum())),
-        k_edges=edges,
-    )
-    if p_of_k is not None:
-        out["p_oracle"] = acc["oracle"][good] / w
-        # Gaussian Var(P_hat)/P^2 = 2/N_modes, normalized by the oracle so a low bin does not
-        # get a smaller sigma.
-        out["z"] = (out["p"] / out["p_oracle"] - 1.0) / np.sqrt(2.0 / w)
-    return out
+    part = binned_power_partials(spec, n_mesh, box_size, p_of_k=p_of_k, edges=edges,
+                                 slab=slab, window=window, shot_noise=shot_noise,
+                                 progress=progress)
+    return combine_partials([part], min_weight=min_weight)
 
 
-def tsc_window_slab(kx_slab, kx, kz, k_nyq):
-    """The TSC window over one axis-0 slab of modes.
+def tsc_window_slab(kx, ky, kz, k_nyq):
+    """The TSC window over a block of modes (any axis may be a sub-range).
 
-    Same function as `diagnostics.tsc_window` (pinned by tests), built per slab from the
+    Same function as `diagnostics.tsc_window` (pinned by tests), built per block from the
     separable 1D factors to avoid a second full (N, N, N//2+1) f64 array.
     """
-    wx = np.sinc(np.asarray(kx_slab) / (2.0 * k_nyq)) ** 3
-    wy = np.sinc(np.asarray(kx) / (2.0 * k_nyq)) ** 3
+    wx = np.sinc(np.asarray(kx) / (2.0 * k_nyq)) ** 3
+    wy = np.sinc(np.asarray(ky) / (2.0 * k_nyq)) ** 3
     wz = np.sinc(np.asarray(kz) / (2.0 * k_nyq)) ** 3
     return wx.reshape(-1, 1, 1) * wy.reshape(1, -1, 1) * wz.reshape(1, 1, -1)
 
@@ -202,8 +280,8 @@ def pk_summary_card(
 
     k_nyq = np.pi * n / box
 
-    def _window(kx_slab, kx, kz):
-        return tsc_window_slab(kx_slab, kx, kz, k_nyq)
+    def _window(kx, ky, kz):
+        return tsc_window_slab(kx, ky, kz, k_nyq)
 
     n_part_total = int(st.n_particles)
     shot = (box**3 / n_part_total) if subtract_shot_noise else 0.0
