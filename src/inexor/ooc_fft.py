@@ -700,10 +700,11 @@ class ArrayKernel:
 
     For non-analytic kernels such as the engine's coarse kernel (`pref` and the CIC match
     factor are real half-grids from `forces.coarse_kernel_parts`; `ik_j` is low-rank).
-    `terms` are `(kind, array, axis)`: "half" = (N, N, M) real array sliced on the pencil
-    axis; "low" = 1-D array varying along `axis` (0, 1 or 2), sliced when axis is 1. The
-    product is formed left to right, matching the host expression's association
-    `(pref * ik) * mf`. `cdtype` is the complex type of the product.
+    `terms` are `(kind, obj, axis)`: "half" = (N, N, M) real host array sliced on the pencil
+    axis; "card" = the same half-grid already resident on the cards, as a list of
+    `(y_lo, y_hi, device, array)` y-row blocks; "low" = 1-D array varying along `axis`
+    (0, 1 or 2), sliced when axis is 1. The product is formed left to right, matching the host
+    expression's association `(pref * ik) * mf`. `cdtype` is the complex type of the product.
     """
 
     __slots__ = ("terms", "cdtype")
@@ -712,36 +713,48 @@ class ArrayKernel:
         self.terms = tuple(terms)
         self.cdtype = np.dtype(cdtype)
         for kind, obj, axis in self.terms:
-            if kind not in ("half", "low"):
-                raise ValueError(f"term kind {kind!r} is not 'half' or 'low'")
+            if kind not in ("half", "low", "card"):
+                raise ValueError(f"term kind {kind!r} is not 'half', 'low' or 'card'")
             if kind == "low" and axis not in (0, 1, 2):
                 raise ValueError(f"low-rank term varies along axis {axis}, not 0, 1 or 2")
             if obj is None:
                 raise ValueError("a kernel term is None; drop it instead")
 
     @classmethod
-    def coarse(cls, pref, ik, axis, mf, cdtype):
+    def coarse(cls, pref, ik, axis, mf, cdtype, cards=None):
         """`(pref * ik_axis) * mf` -- the engine's coarse kernel, `mf` optional.
 
         `ik` is cast to `cdtype` before it meets `pref`, matching
         `forces.coarse_kernel_slab`'s order (the cast does not commute with the f32
-        multiply)."""
-        terms = [("half", pref, None), ("low", np.asarray(ik).astype(cdtype), axis)]
+        multiply). `cards` (the `cards` entry of `forces.coarse_kernel_parts`) replaces the
+        host `pref` / `mf` with their card-resident blocks."""
+        if cards is not None:
+            pref = [(e["lo"], e["hi"], e["device"], e["pref"]) for e in cards]
+            mf = (None if cards[0]["mf"] is None
+                  else [(e["lo"], e["hi"], e["device"], e["mf"]) for e in cards])
+        kind = "half" if cards is None else "card"
+        terms = [(kind, pref, None), ("low", np.asarray(ik).astype(cdtype), axis)]
         if mf is not None:
-            terms.append(("half", mf, None))
+            terms.append((kind, mf, None))
         return cls(terms, cdtype)
 
     @property
     def key(self):
-        """Program cache key: structure and dtypes, never the arrays' contents."""
-        return tuple((kind, None if kind == "half" else axis,
-                      np.dtype(obj.dtype).str, None if kind == "half" else obj.shape)
+        """Program cache key: structure and dtypes, never the arrays' contents. A card term
+        keys as the host half-grid it replaces: the program is the same."""
+        def dt(kind, obj):
+            return np.dtype((obj[0][3] if kind == "card" else obj).dtype).str
+
+        return tuple(("low" if kind == "low" else "half", axis if kind == "low" else None,
+                      dt(kind, obj), obj.shape if kind == "low" else None)
                      for kind, obj, axis in self.terms) + (self.cdtype.str,)
 
     def blocks(self, lo, hi):
-        """The host arrays for pencil block [lo, hi), in term order."""
+        """The host arrays for pencil block [lo, hi), in term order (host terms only)."""
         out = []
         for kind, obj, axis in self.terms:
+            if kind == "card":
+                raise ValueError("a card-resident term has no host block; use device_blocks")
             if kind == "half":
                 out.append(np.ascontiguousarray(obj[:, lo:hi, :]))
             elif axis == 1:
@@ -750,13 +763,39 @@ class ArrayKernel:
                 out.append(np.ascontiguousarray(obj))
         return tuple(out)
 
+    def device_blocks(self, lo, hi, device, transfer="pageable"):
+        """The term arrays for pencil block [lo, hi) on `device`: host terms uploaded, card
+        terms sliced where they live. Refuses a block no resident range on `device` covers,
+        which would otherwise multiply by another card's rows."""
+        out = []
+        for kind, obj, axis in self.terms:
+            if kind != "card":
+                if kind == "half":
+                    x = np.ascontiguousarray(obj[:, lo:hi, :])
+                elif axis == 1:
+                    x = np.ascontiguousarray(np.asarray(obj).reshape(-1)[lo:hi])
+                else:
+                    x = np.ascontiguousarray(obj)
+                out.append(_to_device(x, device, transfer))
+                continue
+            hit = [(y0, a) for y0, y1, dev, a in obj
+                   if dev == device and y0 <= lo and hi <= y1]
+            if not hit:
+                raise ValueError(
+                    f"pencil block [{lo}, {hi}) on device {device} is inside no resident "
+                    f"kernel range ({[(y0, y1, str(d)) for y0, y1, d, _a in obj]}); the "
+                    "pass's pencil split and the kernel's placement disagree")
+            y0, a = hit[0]
+            out.append(a[:, lo - y0:hi - y0, :])
+        return tuple(out)
+
     def on_card(self, blocks):
         """The product for one block, cast to `cdtype`, from the uploaded `blocks`."""
         import jax.numpy as jnp
 
         m = None
         for (kind, _obj, axis), b in zip(self.terms, blocks):
-            v = b if kind == "half" else jnp.reshape(
+            v = b if kind in ("half", "card") else jnp.reshape(
                 b, (-1, 1, 1) if axis == 0 else (1, -1, 1) if axis == 1 else (1, 1, -1))
             m = v.astype(self.cdtype) if m is None else m * v
         return m
@@ -884,8 +923,8 @@ def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inv
             hi = min(lo + b, z)
             blocks = tuple(_to_device(np.ascontiguousarray(s[:, lo:hi, :]), dev, transfer)
                            for _c, s in srcs)
-            kblocks = () if arr_kernel is None else tuple(
-                _to_device(x, dev, transfer) for x in arr_kernel.blocks(lo, hi))
+            kblocks = () if arr_kernel is None else arr_kernel.device_blocks(
+                lo, hi, dev, transfer)
             d = _from_device(prog(coefs, blocks, kxd, put(kx[lo:hi]), kzd, cst, kblocks),
                              transfer)
             _check_spectral_dtype(d.dtype, cdt, "device k-space pass")

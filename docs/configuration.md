@@ -211,6 +211,7 @@ operating points.
 | `pad_ladder` | `True` | `False`: unpadded coarse chunk shape |
 | `paint_subblock` | `True` | `False`: full-mesh paint per chunk |
 | `coarse_fold_kernel` | `True` | `False`: separate kernel-multiply pass |
+| `coarse_kernel_on_cards` | `None` | `False`: coarse kernel arrays on the host, sliced per pencil block; `None` auto (on the cards wherever the folded solve writes card shards) |
 | `worker_affinity` | `True` | `False`: unpinned workers |
 | `device_tile_jit` | `True` | `False`: eager per-tile device reference |
 | `coarse_match_order` | 3 | 2: legacy CIC-order match |
@@ -251,6 +252,7 @@ pixi run --frozen python -m inexor.plan --n-part 2048 --box 1024 --n-fine 4096 \
 | `--backend cpu\|device` | `cpu` | `device`: the host holds the state, GPUs run the step; adds per-GPU and IC-on-card tables |
 | `--n-gpus` | 4 | cards the coarse mesh is sharded across (`--backend device`) |
 | `--separate-passes` | off | device: price migrate and repack as two passes instead of the fused pass |
+| `--coarse-kernel cards\|host` | `cards` | device: where the coarse kernel arrays live (`coarse_kernel_on_cards`) |
 | `--paint-chunk-bricks` | none | device: bricks per coarse-paint chunk |
 | `--workers` | none | `tile_workers`; unset or > 1 prices the pooled lane (shared memory table, state loaded once) |
 | `--coarse-dtype`, `--fine-dtype` | `float32`, `float64` | mesh dtypes |

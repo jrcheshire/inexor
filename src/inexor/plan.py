@@ -114,13 +114,15 @@ def load_stages(*, n, n_rows, n_buckets, index_itemsize, n_arena, n_bricks,
 #   shard   -- split along x across the GPUs (1/n_gpus each, plus ghost planes).
 #   replica -- every card holds its own copy (each runs whole tiles).
 #   host    -- held in host memory, on no card (the factorized solve's spectrum).
+#   host_block -- a host transient built one card's share at a time (1/n_gpus, any node count).
 #   gone    -- a host pass the device lane does not have.
+# The kernel terms depend on `EngineConfig.coarse_kernel_on_cards`: `device_placement`.
 DEVICE_PLACEMENT = {
     "coarse_delta": "shard",
     "coarse_force_resident": "shard",
     "coarse_force_copy_transient": "shard",
-    # `forces.coarse_kernel_parts` builds these in numpy and `ooc_fft.ArrayKernel.blocks`
-    # slices them on the host per pencil block; only the block's product reaches a card.
+    # Kernel on the host (`coarse_kernel_on_cards=False`): `forces.coarse_kernel_parts` builds
+    # these in numpy and `ooc_fft.ArrayKernel` slices them per pencil block.
     "coarse_kernel_pref": "host",
     "coarse_match_factor": "host",
     "coarse_kernel_build_f64": "host",
@@ -140,6 +142,24 @@ DEVICE_PLACEMENT = {
     # Rows are decoded on the card from the streamed slab; no host decode.
     "coarse_decode_slab": "gone",
 }
+
+# Kernel on the cards (the default): each card holds its y-pencil rows of `pref` / `mf` (no
+# ghosts), and the host builds one card's block at a time.
+KERNEL_ON_CARDS = {
+    "coarse_kernel_pref": "shard",
+    "coarse_match_factor": "shard",
+    "coarse_kernel_build_f64": "host_block",
+}
+
+
+def device_placement(kernel="cards"):
+    """`DEVICE_PLACEMENT` for the coarse kernel on the `"cards"` or the `"host"`."""
+    if kernel not in ("cards", "host"):
+        raise ValueError(f"kernel must be 'cards' or 'host', got {kernel!r}")
+    out = dict(DEVICE_PLACEMENT)
+    if kernel == "cards":
+        out.update(KERNEL_ON_CARDS)
+    return out
 
 
 def shard_halo_planes():
@@ -317,7 +337,8 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
     return host, card, disk
 
 
-def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=True):
+def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=True,
+                  kernel="cards"):
     """Per-GPU bytes for the host-state / device-step design.
 
     Returns `(resident, transient, phases, worst_phase, slabs, host_mesh, after_loop)`, summed
@@ -325,9 +346,12 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
     phases). `host_mesh` holds "host"-placed terms for the host table; `after_loop` the
     post-tile-loop migrate/repack peaks, which do not coexist with the in-step phases.
     `paint_chunk_bricks` None = `device.paint.default_chunk_bricks`. `fused` prices the fused
-    migrate + repack, whose census runs one slab's eject inside the tile loop.
+    migrate + repack, whose census runs one slab's eject inside the tile loop. `kernel`: where
+    the coarse kernel parts live (`device_placement`).
     """
     from .engine import ONCE_PER_RUN_PHASES
+
+    placement = device_placement(kernel)
 
     mesh = ec.mesh_bytes()
     phase_of = ec.mesh_phase()
@@ -335,7 +359,7 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
     halo = shard_halo_planes()
     resident, transient, phases, host_mesh = {}, {}, {}, {}
     for k, v in mesh.items():
-        where = DEVICE_PLACEMENT.get(k)
+        where = placement.get(k)
         if where is None:
             raise KeyError(
                 f"mesh term {k!r} has no entry in DEVICE_PLACEMENT. A new term "
@@ -347,6 +371,9 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
         if where == "host":
             # handed back so the host table charges it
             host_mesh[k] = int(v)
+            continue
+        if where == "host_block":
+            host_mesh[k] = int(v / n_gpus)
             continue
         # 1/n_gpus of x plus ghost planes; sharded terms are whole x-planes, so v // nc is exact
         b = (int(v / n_gpus) + (int(v) // nc) * halo.get(k, 0) if where == "shard"
@@ -529,17 +556,21 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
 
     n_nodes = max(1, int(getattr(args, "n_nodes", 1)))
     # the per-card coarse shard is 1/(cards on all nodes); slab terms do not change with N
+    kernel = getattr(args, "coarse_kernel", "cards")
     resident, transient, phases, worst_phase, slabs, host_mesh, after_loop = device_budget(
         ec_dev, n=n, n_gpus=n_gpus * n_nodes, paint_chunk_bricks=args.paint_chunk_bricks,
-        fused=not getattr(args, "separate_passes", False))
+        fused=not getattr(args, "separate_passes", False), kernel=kernel)
+    per_block = [k for k, w in device_placement(kernel).items() if w == "host_block"]
 
     step = ec_dev.step_bytes(n, n_rows=rows, cap=args.cap)
     fused = not getattr(args, "separate_passes", False)
     if n_nodes > 1:
         global_kernel = sum(v for k, v in host_mesh.items()
                             if k in ("coarse_kernel_pref", "coarse_match_factor"))
-        # each node holds its pencils (spectrum, work) and its y-block of the kernel arrays
-        host_mesh = {k: int(v / n_nodes) for k, v in host_mesh.items()}
+        # each node holds its pencils (spectrum, work) and its y-block of the kernel arrays;
+        # a per-block build is already one card's share
+        host_mesh = {k: v if k in per_block else int(v / n_nodes)
+                     for k, v in host_mesh.items()}
     host_res, host_ph = device_host_phases(ec, n=n, state=state, step=step,
                                            host_mesh=host_mesh, n_gpus=n_gpus, fused=fused)
     sent = {}
@@ -564,9 +595,10 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
               "and kernel arrays\n  are 1/N (pencils and y-blocks, transposed in place). "
               "[multi-node] lines are a\n  DESIGN ESTIMATE: that code does not exist yet; "
               f"{_fmt(mn_worst).strip()} of the worst phase.")
-        print(f"  NB M1 must build the kernel arrays as y-block slices: built whole, every node "
-              f"would\n  hold {_fmt(global_kernel).strip()} of them, and the f64 build "
-              f"{_fmt(host_mesh.get('coarse_kernel_build_f64', 0) * n_nodes).strip()}.")
+        if kernel == "host":
+            print(f"  NB with --coarse-kernel host each node builds the kernel arrays whole: "
+                  f"it would\n  hold {_fmt(global_kernel).strip()} of them, and the f64 build "
+                  f"{_fmt(host_mesh.get('coarse_kernel_build_f64', 0) * n_nodes).strip()}.")
         _table("EXCHANGE, bytes each node SENDS per step", sent)
         if getattr(args, "net_gbs", None):
             print(f"  at --net-gbs {args.net_gbs}: {sum(sent.values()) / (args.net_gbs * GB):.1f} "
@@ -689,6 +721,9 @@ def main(argv=None):
     ap.add_argument("--net-gbs", type=float, default=None,
                     help="with --n-nodes: host-to-host GB/s per node, to price the "
                          "exchange in seconds per step")
+    ap.add_argument("--coarse-kernel", choices=("cards", "host"), default="cards",
+                    help="for --backend device: where the coarse kernel's real half-grids "
+                         "live (EngineConfig.coarse_kernel_on_cards; cards is the default)")
     ap.add_argument("--separate-passes", action="store_true",
                     help="for --backend device: price the migrate and repack as two "
                          "passes (no census) instead of the fused pass")

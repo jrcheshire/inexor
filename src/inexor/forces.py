@@ -196,7 +196,8 @@ def assignment_window(shape, cell, order):
     return w(kx).reshape(nx, 1, 1) * w(ky).reshape(1, ny, 1) * w(kz).reshape(1, 1, nz // 2 + 1)
 
 
-def cic_match_factor(shape, cell_solve, cell_target, clip=None, order_solve=2, order_target=2):
+def cic_match_factor(shape, cell_solve, cell_target, clip=None, order_solve=2, order_target=2,
+                     y=None):
     """(W(k, cell_target) / W(k, cell_solve))^2 on the rfftn half-grid (Hockney-Eastwood matching).
 
     The long arm paints and gathers on the coarse cell and the short arm on the fine cell, so
@@ -204,18 +205,22 @@ def cic_match_factor(shape, cell_solve, cell_target, clip=None, order_solve=2, o
     Correct for the Gaussian split only: S(k) suppresses the long kernel where the ratio grows
     toward the coarse Nyquist; kernels with real high-k content there would be amplified.
     `clip` bounds the factor. Returns (factor, max_applied) so the guard is reported.
+    `y` = (lo, hi) builds only those y rows (1-D factors over the full axis, then sliced, so the
+    rows are bitwise the full build's); `max_applied` is then over those rows.
     """
     nx, ny, nz = (int(s) for s in shape)
     kx = 2.0 * np.pi * np.fft.fftfreq(nx, d=cell_solve)
     ky = 2.0 * np.pi * np.fft.fftfreq(ny, d=cell_solve)
     kz = 2.0 * np.pi * np.fft.rfftfreq(nz, d=cell_solve)
+    ys = slice(None) if y is None else slice(int(y[0]), int(y[1]))
 
     def w_full(cell, order):
         # np.sinc(y) = sin(pi y)/(pi y); squared for paint + gather
         def w(k_1d):
             return np.sinc(k_1d * cell / (2.0 * np.pi)) ** (2 * int(order))
 
-        return w(kx).reshape(nx, 1, 1) * w(ky).reshape(1, ny, 1) * w(kz).reshape(1, 1, nz // 2 + 1)
+        return (w(kx).reshape(nx, 1, 1) * w(ky)[ys].reshape(1, -1, 1)
+                * w(kz).reshape(1, 1, nz // 2 + 1))
 
     ratio = w_full(cell_target, order_target) / w_full(cell_solve, order_solve)
     max_applied = float(ratio.max())
@@ -346,19 +351,27 @@ def _global_delta_and_kernels(
     return delta, kers, max_applied
 
 
-def coarse_kernel_parts(n_mesh, box_size, which, r_s=None, match=None, clip=None,
-                        fdtype=np.float64):
-    """The real half-grids the coarse solve needs, built once per run (they depend on geometry only).
+def coarse_kernel_block(n_mesh, box_size, which, r_s=None, match=None, clip=None,
+                        fdtype=np.float64, y=None):
+    """`pref` and `mf` (None without `match`) of the coarse kernel on y rows `y` = (lo, hi)
+    (default all) of the rfftn half-grid: shape (N, hi - lo, N//2 + 1), fdtype.
 
-    Returns dict(iks, pref, mf, fdtype, n_mesh, which). Only real half-grids are kept: the complex
-    kernels are formed one component at a time inside the solve; the ik_j are low-rank broadcasts.
-    The match factor stays separate from `pref`: the solve computes `(pref * ik) * mf`, and folding
-    it into `pref` would reassociate and move bits. Build peak ~28 B per half-grid element, once.
+    The rows are bitwise the full build's: the 1-D k and window factors are formed over the full
+    axis and sliced, and the 3-D expression is the same element for element. Build peak ~28 B per
+    element of the block.
     """
     fdtype = field_dtype(fdtype)
-    shape = (int(n_mesh),) * 3
+    n = int(n_mesh)
+    lo, hi = (0, n) if y is None else (int(y[0]), int(y[1]))
     cell = box_size / n_mesh
-    ikx, iky, ikz, k2_true, k2_safe = kernel_grids(shape, cell, np.float64)
+    kx = 2.0 * np.pi * np.fft.fftfreq(n, d=cell)
+    ky = 2.0 * np.pi * np.fft.fftfreq(n, d=cell)[lo:hi]
+    kz = 2.0 * np.pi * np.fft.rfftfreq(n, d=cell)
+    k2_true = (kx.reshape(n, 1, 1) ** 2 + ky.reshape(1, -1, 1) ** 2
+               + kz.reshape(1, 1, -1) ** 2).astype(np.float64)
+    k2_safe = k2_true.copy()
+    if lo == 0 and hi > 0:
+        k2_safe[0, 0, 0] = 1.0
     fac = split_factor(k2_true, 0.0 if r_s is None else r_s, which)
     pref = (fac / k2_safe).astype(fdtype, copy=False)
     # free the f64 island before the match factor is built
@@ -366,11 +379,59 @@ def coarse_kernel_parts(n_mesh, box_size, which, r_s=None, match=None, clip=None
     mf = None
     if match is not None:
         # cast: an f64 match factor would promote a complex64 kernel to complex128
-        m, _ = cic_match_factor(shape, match[0], match[1], clip=clip, **_match_orders(match))
+        m, _ = cic_match_factor((n, n, n), match[0], match[1], clip=clip, y=(lo, hi),
+                                **_match_orders(match))
         mf = m.astype(fdtype, copy=False)
         del m
-    return dict(iks=(ikx, iky, ikz), pref=pref, mf=mf,
-                fdtype=fdtype, n_mesh=int(n_mesh), which=which)
+    return pref, mf
+
+
+def _coarse_iks(n_mesh, box_size):
+    """The low-rank ik_j of `kernel_grids` at f64 (complex128)."""
+    n = int(n_mesh)
+    cell = box_size / n_mesh
+    kx = 2.0 * np.pi * np.fft.fftfreq(n, d=cell)
+    kz = 2.0 * np.pi * np.fft.rfftfreq(n, d=cell)
+    return ((1j * kx.reshape(n, 1, 1)).astype(np.complex128),
+            (1j * kx.reshape(1, n, 1)).astype(np.complex128),
+            (1j * kz.reshape(1, 1, n // 2 + 1)).astype(np.complex128))
+
+
+def coarse_kernel_parts(n_mesh, box_size, which, r_s=None, match=None, clip=None,
+                        fdtype=np.float64, cards=None):
+    """The real half-grids the coarse solve needs, built once per run (they depend on geometry only).
+
+    Returns dict(iks, pref, mf, cards, fdtype, n_mesh, which). Only real half-grids are kept: the
+    complex kernels are formed one component at a time inside the solve; the ik_j are low-rank
+    broadcasts. The match factor stays separate from `pref`: the solve computes `(pref * ik) * mf`,
+    and folding it into `pref` would reassociate and move bits.
+
+    `cards`, a list of `(y_lo, y_hi, device)`, keeps each card's y rows resident on that card
+    instead (`pref` and `mf` are then None and `cards` holds `dict(lo, hi, device, pref, mf)`):
+    each block is built on the host (`coarse_kernel_block`), placed, and freed before the next, so
+    the host peak is one block's. Only the folded factorized solve on those cards can use them.
+    """
+    fdtype = field_dtype(fdtype)
+    common = dict(iks=_coarse_iks(n_mesh, box_size), fdtype=fdtype, n_mesh=int(n_mesh),
+                  which=which)
+    if cards is None:
+        pref, mf = coarse_kernel_block(n_mesh, box_size, which, r_s=r_s, match=match,
+                                       clip=clip, fdtype=fdtype)
+        return dict(pref=pref, mf=mf, cards=None, **common)
+    import jax
+    import jax.numpy as jnp
+
+    placed = []
+    for lo, hi, dev in cards:
+        pref, mf = coarse_kernel_block(n_mesh, box_size, which, r_s=r_s, match=match,
+                                       clip=clip, fdtype=fdtype, y=(lo, hi))
+        put = jnp.asarray if dev is None else (lambda a, d=dev: jax.device_put(a, d))
+        entry = dict(lo=int(lo), hi=int(hi), device=dev, pref=put(pref),
+                     mf=None if mf is None else put(mf))
+        jax.block_until_ready([v for v in (entry["pref"], entry["mf"]) if v is not None])
+        placed.append(entry)
+        del pref, mf
+    return dict(pref=None, mf=None, cards=placed, **common)
 
 
 def refuse_oversize_coarse_solve(n_mesh):
@@ -449,6 +510,18 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=No
     _add("forward", None, ft)
     # `out` as `CardShards`: planes land on the cards that hold them; no host mesh
     per_card = [[] for _ in out.ranges] if isinstance(out, CardShards) else None
+    # the folded kernel pass runs on those cards, split by y-pencils like the inverse's pass 2
+    kdevs = None if per_card is None else [dev for _x0, _nx, dev in out.ranges]
+    cards = parts.get("cards")
+    if cards is not None:
+        if not fold_kernel:
+            raise ValueError("card-resident kernel parts need fold_kernel=True: the unfolded "
+                             "multiply is a host pass over host arrays")
+        have = [e["device"] for e in cards]
+        if kdevs is None or have != kdevs:
+            raise ValueError(
+                f"the kernel parts are resident on {[str(d) for d in have]} but this solve "
+                f"runs on {None if kdevs is None else [str(d) for d in kdevs]}")
     # one work buffer for all three components (avoids repeated first-touch page faults)
     work = np.empty_like(spec)
     for axis in range(3):
@@ -458,8 +531,9 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=No
             t0 = time.perf_counter()
             ooc_fft.kspace_pass_device(
                 [(1.0, spec)], n, kernel=ooc_fft.ArrayKernel.coarse(
-                    parts["pref"], parts["iks"][axis], axis, parts["mf"], cdtype),
-                out=work, inverse=True, timings=it)
+                    parts["pref"], parts["iks"][axis], axis, parts["mf"], cdtype,
+                    cards=cards),
+                out=work, inverse=True, devices=kdevs, timings=it)
             _add("kernel + axis-0 pass", t0)
         else:
             t0 = time.perf_counter()
@@ -539,6 +613,9 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
     if transform != "monolithic":
         raise ValueError(
             f"transform must be 'monolithic' or 'factorized', got {transform!r}")
+    if parts.get("cards") is not None:
+        raise ValueError("coarse_force_meshes: card-resident kernel parts have only the "
+                         "factorized solve")
     refuse_oversize_coarse_solve(int(n_mesh))
     dk = jnp.fft.rfftn(delta)
     # one complex kernel alive at a time; `(pref * ik) * mf` keeps it bitwise the slab form

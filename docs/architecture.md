@@ -186,7 +186,9 @@ Production (`plan.RATIFIED`) uses `alpha = 1`, a float32 coarse mesh, float64 fi
   once per run (`coarse_kernel_parts`); each component is `(pref * ik_j) * mf`, one at a
   time. The FFT is `ooc_fft`'s factorization: an `rfft2` per axis-0 plane, then an axis-0
   `fft` per y-pencil plane. The plane is the unit, so slab thickness never moves a bit. The
-  kernel multiply rides the inverse's axis-0 pass (`coarse_fold_kernel`).
+  kernel multiply rides the inverse's axis-0 pass (`coarse_fold_kernel`), split by y-pencils
+  across the cards; each card keeps its rows of `pref` and `mf` resident for the run
+  (`coarse_kernel_on_cards`), built one card's block at a time (`coarse_kernel_block`).
 - **Match factor** (`forces.cic_match_factor`): the long arm paints and gathers TSC on the
   coarse cell, the short arm CIC on the fine cell. The factor
   `prod_i sinc^(2 p_t)(k_i d_fine/2) / sinc^(2 p_s)(k_i d_coarse/2)` removes the coarse window

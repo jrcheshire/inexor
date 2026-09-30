@@ -543,20 +543,22 @@ def test_an_unplaced_mesh_term_is_refused_not_guessed(monkeypatch):
         plan.device_budget(ec, n=ec.n_total, n_gpus=4)
 
 
-def test_one_gpu_charges_every_surviving_term_in_full():
+@pytest.mark.parametrize("kernel", ["cards", "host"])
+def test_one_gpu_charges_every_surviving_term_in_full(kernel):
     """At n_gpus=1 each surviving term is charged in full plus its ghost planes (so /4 is a
     split), and lands in exactly one of the device and host columns.
     """
-    from inexor.plan import DEVICE_PLACEMENT, device_budget, shard_halo_planes
+    from inexor.plan import device_budget, device_placement, shard_halo_planes
 
+    placed = device_placement(kernel)
     ec = _ec("cgh64")
     mesh = ec.mesh_bytes()
     halo = shard_halo_planes()
     resident, transient, _phases, _worst, _slabs, host_mesh, _after = device_budget(
-        ec, n=ec.n_total, n_gpus=1)
+        ec, n=ec.n_total, n_gpus=1, kernel=kernel)
     got = {**resident, **transient}
     kept = {k: v for k, v in mesh.items()
-            if DEVICE_PLACEMENT[k] not in ("gone", "host")}
+            if placed[k] not in ("gone", "host", "host_block")}
     assert kept, "vacuous: no mesh term survives the placement"
     for k, v in kept.items():
         assert got[k] == v + (v // ec.n_coarse) * halo.get(k, 0), k
@@ -564,7 +566,7 @@ def test_one_gpu_charges_every_surviving_term_in_full():
     assert "coarse_decode_slab" not in got
     # every host-placed term is charged to `host_mesh` at full value and not to the
     # device, or it would be charged nowhere
-    on_host = {k: v for k, v in mesh.items() if DEVICE_PLACEMENT[k] == "host"}
+    on_host = {k: v for k, v in mesh.items() if placed[k] in ("host", "host_block")}
     assert on_host, "vacuous: no term is host-placed, so this arm proves nothing"
     for k, v in on_host.items():
         assert host_mesh[k] == v, f"{k} is host-placed but not charged to the host"
@@ -696,10 +698,10 @@ def test_the_host_column_charges_one_slab_of_w_per_card_for_the_window_write_bac
 # ------------------------------------- the device lane's host column, against measured runs
 
 
-def _device_host(capsys, preset, cards):
+def _device_host(capsys, preset, cards, kernel="cards"):
     """(resident GB, {phase: GB above the resident, credits excluded}, peak GB) as printed."""
     main(["--preset", preset, "--backend", "device", "--n-gpus", str(cards),
-          "--arena-frac", "0.01"])
+          "--arena-frac", "0.01", "--coarse-kernel", kernel])
     out = capsys.readouterr().out
     res_block = out.split("HOST, resident for the whole run")[1].split("\n\n")[0]
     resident = float(next(ln for ln in res_block.splitlines()
@@ -718,9 +720,10 @@ def test_the_host_phases_match_the_4096_run_they_price(capsys):
     """c-hero on four GB200s (job 1003657, `runs/v2/d7b_1003657_hero.json`, the planner's
     default knobs): each code-derived phase's host transient above that phase's closing RSS
     is within 10% of the measured one, and the resident is at most 5% under the RSS floor
-    after the first step (844.6-865.4 GB), and never over it.
+    after the first step (844.6-865.4 GB), and never over it. That run held the coarse kernel
+    on the host.
     """
-    resident, phases, _ = _device_host(capsys, "c-hero", 4)
+    resident, phases, _ = _device_host(capsys, "c-hero", 4, kernel="host")
     measured = {"kernel_build": 860.6 - 733.4, "coarse_solve": 830.6 - 761.9,
                 "migrate": 895.5 - 855.5}
     for p, m in measured.items():
@@ -732,9 +735,10 @@ def test_the_host_phases_match_the_4096_run_they_price(capsys):
 
 def test_the_process_baseline_closes_the_single_gh200_floor(capsys):
     """One GH200 (job 1029876): the priced resident, measured baseline included, is within 5%
-    of the RSS after step 1 at both sizes (5.885 GB at cgh64, 17.237 at c-1024), never over."""
+    of the RSS after step 1 at both sizes (5.885 GB at cgh64, 17.237 at c-1024), never over.
+    That run held the coarse kernel on the host."""
     for preset, floor in (("cgh64", 5.885), ("c-1024", 17.237)):
-        resident, _, _ = _device_host(capsys, preset, 1)
+        resident, _, _ = _device_host(capsys, preset, 1, kernel="host")
         assert 0.95 * floor <= resident <= floor, (preset, resident, floor)
 
 
@@ -757,12 +761,32 @@ def test_the_host_peak_is_printed_once_for_the_preflight_regex(capsys):
 
 
 def test_the_host_kernel_arrays_are_charged_to_the_host_not_the_cards(capsys):
-    main(["--preset", "c-hero", "--backend", "device"])
+    main(["--preset", "c-hero", "--backend", "device", "--coarse-kernel", "host"])
     out = capsys.readouterr().out
     res_block = out.split("HOST, resident for the whole run")[1].split("\n\n")[0]
     card_block = out.split("PER GPU (of 4), resident through the tile loop")[1].split("\n\n")[0]
     for k in ("coarse_kernel_pref", "coarse_match_factor"):
         assert k in res_block and k not in card_block, k
+
+
+def test_card_kernel_arrays_move_a_quarter_each_onto_the_cards(capsys):
+    """c-hero on 4 cards: the two f32 half-grids (2048 x 2048 x 1025 x 4 B = 17.2 GB each)
+    leave the host resident and land 1/4 on each card; the f64 build is one card's block."""
+    ec = _ec("c-hero")
+    half = ec.mesh_bytes()["coarse_kernel_pref"]
+    assert half == 2048 * 2048 * 1025 * 4
+    host_res, *_ = _device_host(capsys, "c-hero", 4, kernel="host")
+    card_res, *_ = _device_host(capsys, "c-hero", 4, kernel="cards")
+    assert abs((host_res - card_res) - 2 * half / 1e9) < 0.01, (host_res, card_res)
+    main(["--preset", "c-hero", "--backend", "device"])
+    out = capsys.readouterr().out
+    card_block = out.split("PER GPU (of 4), resident through the tile loop")[1].split("\n\n")[0]
+    for k in ("coarse_kernel_pref", "coarse_match_factor"):
+        ln = next(x for x in card_block.splitlines() if x.strip().startswith(k))
+        assert abs(float(ln.split()[-2]) - half / 4 / 1e9) < 1e-3, ln
+    build = next(x for x in out.splitlines() if "coarse_kernel_build_f64" in x)
+    assert abs(float(build.split()[-2]) - ec.mesh_bytes()["coarse_kernel_build_f64"] / 4 / 1e9
+               ) < 1e-3, build
 
 
 # ------------------------------------------------------------- the node axis (--n-nodes)

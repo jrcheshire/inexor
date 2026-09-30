@@ -141,6 +141,7 @@ class EngineConfig:
         migrate_repack_fused=None,
         coarse_fold_kernel=True,
         coarse_match_order=3,
+        coarse_kernel_on_cards=None,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -211,6 +212,12 @@ class EngineConfig:
         # Fold the coarse kernel multiply into the inverse's axis-0 pass rather than a separate
         # host traversal. Bitwise either way (same association); False is a comparison arm.
         self.coarse_fold_kernel = bool(coarse_fold_kernel)
+        # Keep the coarse kernel's real half-grids (`pref`, `mf`) resident on the cards, each
+        # card its y-pencil rows, instead of on the host sliced per block; bitwise either way.
+        # Tri-state as `device_tile_window` (applies to the folded solve into card shards);
+        # read `kernel_on_cards`.
+        self.coarse_kernel_on_cards = (
+            None if coarse_kernel_on_cards is None else bool(coarse_kernel_on_cards))
         # Assignment order the coarse match factor divides out. The coarse arm paints and
         # gathers TSC, so 3 is correct (default); 2 (CIC order) leaves a residual sinc^2 per
         # axis on the long force and is kept for the reference parity comparisons.
@@ -249,6 +256,14 @@ class EngineConfig:
         tile window both run)."""
         applies = self.migrate_backend == "device" and self.tile_window
         return applies and self.migrate_repack_fused is not False
+
+    @property
+    def kernel_on_cards(self):
+        """Whether the coarse kernel parts live on the cards: `coarse_kernel_on_cards`
+        resolved (None = wherever the folded solve writes card shards)."""
+        applies = (self.tile_backend == "device" and self.device_tile_jit
+                   and self.coarse_fold_kernel)
+        return applies and self.coarse_kernel_on_cards is not False
 
     @property
     def tile_window(self):
@@ -485,6 +500,12 @@ class EngineConfig:
                 "device_tile_window=True windows the COMPILED device tile loop, but "
                 f"tile_backend={self.tile_backend!r}, device_tile_jit={self.device_tile_jit}; "
                 "the knob could not apply.")
+        if self.coarse_kernel_on_cards is True and not self.kernel_on_cards:
+            raise ValueError(
+                "coarse_kernel_on_cards=True keeps the kernel on the cards for the folded solve "
+                f"into card shards, but tile_backend={self.tile_backend!r}, device_tile_jit="
+                f"{self.device_tile_jit}, coarse_fold_kernel={self.coarse_fold_kernel}; the "
+                "knob could not apply.")
         if self.device_cards < 1:
             raise ValueError(f"device_cards must be >= 1, got {self.device_cards}")
         if self.device_cards > 1:
@@ -1486,10 +1507,20 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             r_s=cfg.r_s, paint=cfg.paint_short, frac_bits=cfg.frac_bits,
             fdtype=cfg.np_fine_dtype,
         )
-    # the long arm's kernel parts, likewise once per run (geometry only)
+    # the long arm's kernel parts, likewise once per run (geometry only); on the cards, each
+    # holds the y-pencils its share of the folded solve's kernel pass multiplies
+    kernel_cards = None
+    if cfg.kernel_on_cards:
+        import jax
+
+        from .decomp import Decomp
+
+        devs = [None] if cfg.device_cards == 1 else list(jax.devices()[: cfg.device_cards])
+        kernel_cards = [(lo, hi, dev)
+                        for (lo, hi), dev in zip(Decomp.build(cfg).card_pencils(), devs)]
     coarse_parts = coarse_kernel_parts(
         cfg.n_coarse, cfg.box_size, "long", r_s=cfg.r_s,
-        match=cfg.coarse_match, fdtype=cfg.np_coarse_dtype,
+        match=cfg.coarse_match, fdtype=cfg.np_coarse_dtype, cards=kernel_cards,
     )
     ph("kernel_build")
     try:

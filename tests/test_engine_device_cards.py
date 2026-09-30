@@ -80,3 +80,25 @@ def test_validate_refuses_the_card_counts_that_cannot_apply():
         with pytest.raises(ValueError, match="jax devices"):
             _cfg(device_cards=_n_devices() + 1, **KW).validate()
     assert _cfg(device_cards=1, **KW).validate() is True
+
+
+@pytest.mark.parametrize("w", [1, 2, 4])
+def test_the_kernel_on_the_cards_is_bitwise_the_kernel_on_the_host(w):
+    if _n_devices() < w:
+        pytest.skip(f"needs {w} jax devices (XLA_FLAGS=--xla_force_host_platform_device_count=4)")
+    co = _coeffs(3)
+    ch = _cfg(device_cards=w, coarse_kernel_on_cards=False, **KW)
+    cc = _cfg(device_cards=w, coarse_kernel_on_cards=True, **KW)
+    assert not ch.kernel_on_cards and cc.kernel_on_cards
+    sh, sc = _state(ch), _state(cc)
+    oh = engine.run(sh, ch, co)
+    oc = engine.run(sc, cc, co)
+    _same(sh, sc, f"kernel on {w} card(s) vs host")
+    _same_stats(oh, oc)
+
+
+def test_the_kernel_knob_is_refused_where_it_cannot_apply():
+    with pytest.raises(ValueError, match="coarse_kernel_on_cards=True"):
+        _cfg(coarse_kernel_on_cards=True).validate()
+    assert not _cfg().kernel_on_cards
+    assert _cfg(**KW).kernel_on_cards
