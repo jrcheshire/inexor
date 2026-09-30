@@ -993,7 +993,7 @@ def _cards(cfg):
 
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
          phase=None, tile_force=None, pool=None, coarse_parts=None, device_shapes=None,
-         repack_due=False, timings=None):
+         repack_due=False, timings=None, decomp=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1-2; `c_drift` is
@@ -1017,10 +1017,17 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
 
     `phase`, if given, is called with a boundary name after each phase, so a caller can take
     a per-phase high-water mark. It takes no payload and cannot perturb the step.
+
+    `decomp` (`decomp.Decomp`) says which tile planes this rank and each of its cards own;
+    None is one rank over the whole box.
     """
     import jax.numpy as jnp
 
     ph = phase if phase is not None else _no_phase
+    if decomp is None:
+        from .decomp import Decomp
+
+        decomp = Decomp.build(cfg)
 
     alpha_k, bcoef = float(coeff[0]), float(coeff[1])
 
@@ -1062,14 +1069,12 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     # (`device.coarse.CardShards`), in which case `g_coarse` is shard dicts.
     if cfg.tile_backend == "device" and cfg.device_tile_jit:
         from .device.coarse import CardShards
-        from .ooc_fft import partition_units
 
         # one shard per card: coarse x-planes under its tile planes, COARSE_HALO each side
-        per_tile = cfg.n_tile // (cfg.n_fine // cfg.n_coarse)
-        plane_parts = partition_units(cfg.tiles_side, cfg.device_cards, 1)
+        plane_parts = decomp.card_planes()
         solve_out = CardShards(
-            [(a * per_tile - COARSE_HALO, (b - a) * per_tile + 2 * COARSE_HALO,
-              None if devs is None else devs[k]) for k, (a, b) in enumerate(plane_parts)],
+            [(x0, nx, None if devs is None else devs[k])
+             for k, (x0, nx) in enumerate(decomp.coarse_shards(COARSE_HALO))],
             cfg.n_coarse)
     else:
         solve_out = None if pool is None else pool.g_views()
