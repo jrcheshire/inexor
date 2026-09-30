@@ -21,6 +21,8 @@ import numpy as np
 PRESETS = {
     "smoke": dict(n_part=32, box=32.0, n_fine=64, n_coarse=16, tile=16, buf=8),
     "cdev8": dict(n_part=128, box=64.0, n_fine=256, n_coarse=64, tile=64, buf=32),
+    # cdev8's volume in 8 tile planes over 32 brick slabs: 4 ranks x 2 cards, 4 slabs a card
+    "cdev8-tile32": dict(n_part=128, box=64.0, n_fine=256, n_coarse=64, tile=32, buf=8),
     "cdev": dict(n_part=256, box=128.0, n_fine=512, n_coarse=128, tile=256, buf=32),
     "cgh64": dict(n_part=512, box=256.0, n_fine=1024, n_coarse=256, tile=256, buf=32),
     "c-1024": dict(n_part=1024, box=512.0, n_fine=2048, n_coarse=512, tile=256, buf=32),
