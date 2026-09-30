@@ -681,17 +681,76 @@ def _sweep(st, lo, hi, reach, c_drift, scales, ar_slots, ar_bricks, dev, staged,
     return insert_res, peak
 
 
+def pass_reach(st, c_drift, comm=None, vel_scale=None):
+    """(r_raw, r): the brick reach of this drift from the owned bricks' scales (non-owned
+    bricks carry 1.0, which must not enter the max), maximized over ranks; `r` capped at
+    half the grid. `vel_scale` overrides `st.vel_scale`."""
+    from .. import state as _state
+
+    nb = int(st.bricks_per_side)
+    blo, bhi = st.owned_bricks
+    vs = np.asarray(st.vel_scale if vel_scale is None else vel_scale)
+    r_raw = int(_state.brick_reach(st, c_drift, vs[blo:bhi]))
+    if comm is not None and comm.size > 1:
+        r_raw = int(comm.allreduce(r_raw, "max"))
+    return r_raw, min(r_raw, nb // 2)
+
+
+_EMIGRANT_FIELDS = ("dest", "off", "w", "ids", "src")
+
+
+def _pack_emigrants(slabs):
+    """Host parcel of emigrant-only staged slabs `{s: entry}` for `comm.exchange_neighbours`:
+    exactly the emigrant rows, plus each slab's count, realized reach and per-slab counts."""
+    out = {}
+    for s, e in slabs.items():
+        n = int(e["n_rows"])
+        out[f"{s}:meta"] = np.array([n, int(e["rr"])], dtype=np.int64)
+        out[f"{s}:to"] = np.asarray(e["to"], dtype=np.int64)
+        if n:
+            for k in _EMIGRANT_FIELDS:
+                if e.get(k) is not None:
+                    out[f"{s}:{k}"] = np.ascontiguousarray(_host(e[k], "hand-off: to host")[:n])
+    return out
+
+
+def _unpack_emigrants(parcel, dev):
+    """`{s: entry}` from `_pack_emigrants`, on `dev`, zero-padded to the sender's ladder (the
+    same arrays `_emigrants_only` built there)."""
+    out = {}
+    for s in sorted({int(k.split(":")[0]) for k in parcel}):
+        n, rr = (int(x) for x in parcel[f"{s}:meta"])
+        e = dict(cap=0, n_keep=0, n_rows=n, rr=rr, to=parcel[f"{s}:to"],
+                 **{k: None for k in _EMIGRANT_FIELDS})
+        if n:
+            e["cap"] = cap = _ladder(n)
+            for k in _EMIGRANT_FIELDS:
+                a = parcel.get(f"{s}:{k}")
+                if a is not None:
+                    buf = np.zeros((cap,) + a.shape[1:], dtype=a.dtype)
+                    buf[:n] = a
+                    e[k] = _put(buf, dev)
+        out[s] = e
+    return out
+
 def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=None,
-                 insert=None, keep_window=True, before_sweep=None):
+                 insert=None, keep_window=True, before_sweep=None, comm=None):
     """Every slab's eject and insert on the cards: the part of
     `drift_and_migrate_device` before its arena replay, shared with the fused
     migrate + repack. `insert` and `keep_window` as in `_sweep`; `before_sweep(ctx)`
     runs after the boundary ejects and before any card inserts. Returns the pass
     context (reach, cards, per-slab emigrant counts and reach, insert results, the
-    receipt's terms)."""
+    receipt's terms).
+
+    Across ranks (`comm`; a node-local `st`, every rank calls this): the reach is the max
+    over ranks, the r slabs next to each end send their pre-pass scales to the neighbour
+    (the inserts read their source bricks' scales), the first and last cards' boundary
+    ejects send emigrant-only copies to the neighbour ranks, and each rank reports what its
+    inserts took from the neighbours' slabs (`foreign_consumed`, for their replay)."""
     from concurrent.futures import ThreadPoolExecutor
 
     from .. import state as _state
+    from ..comm import exchange_neighbours
     from ..eject_jax import require_x64
     from ..ooc_fft import partition_units
 
@@ -699,24 +758,43 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
     require_x64()
     CALLS += 1
     nb = int(st.bricks_per_side)
+    nb2 = nb * nb
     has_ids = st.ids is not None
+    multi = comm is not None and comm.size > 1
+    lo_s, hi_s = st.owned_slabs
     n_before = _state.occupancy_total(st.occupancy) + st.arena_used
     scales = np.array(st.vel_scale, dtype=np.float64, copy=True)
-    r_raw = _state.brick_reach(st, c_drift, scales)
-    r = min(r_raw, nb // 2)
+    r_raw, r = pass_reach(st, c_drift, comm, scales)
     reach = range(-r, r + 1)
+    if multi:
+        thin = int(comm.allreduce(hi_s - lo_s, "min"))
+        if thin < 2 * r + 1:
+            raise ValueError(
+                f"the drift reaches {r} brick slab(s) but a rank holds {thin}, fewer than "
+                f"2r + 1 = {2 * r + 1}: particles would skip past a neighbour rank. Use "
+                "fewer ranks or a smaller step.")
+        # the neighbours' boundary slabs' pre-pass scales, for this pass only
+        got_l, got_r = exchange_neighbours(
+            comm, dict(s=scales[lo_s * nb2:(lo_s + r) * nb2]),
+            dict(s=scales[(hi_s - r) * nb2:hi_s * nb2]))
+        for got, first in ((got_l, lo_s - r), (got_r, hi_s)):
+            for i in range(r):
+                t = (first + i) % nb
+                scales[t * nb2:(t + 1) * nb2] = got["s"][i * nb2:(i + 1) * nb2]
     ar_slots, ar_bricks = pass_arena_index(st)
 
     devs = [None] if devices is None else list(devices)
     if not devs:
         raise ValueError("devices= was an empty sequence; pass None for one card")
     fallback = None
-    if len(devs) > 1 and nb // len(devs) < 2 * r + 1:
-        fallback = (f"a card would hold {nb // len(devs)} slabs, fewer than 2r + 1 = "
+    n_own = hi_s - lo_s
+    if len(devs) > 1 and n_own // len(devs) < 2 * r + 1:
+        fallback = (f"a card would hold {n_own // len(devs)} slabs, fewer than 2r + 1 = "
                     f"{2 * r + 1}: one card")
         devs = devs[:1]
     W = len(devs)
-    parts = [(0, nb)] if W == 1 else partition_units(nb, W, 1)
+    parts = ([(lo_s, hi_s)] if W == 1
+             else [(lo_s + a, lo_s + z) for a, z in partition_units(n_own, W, 1)])
 
     t_card = [None] * W if timings is None else [({} if W > 1 else timings) for _ in range(W)]
     clocks = [_Clock(t) for t in t_card]
@@ -736,7 +814,9 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
             return list(ex.map(fn, range(W)))
 
     segments = moved_bytes = 0
-    if W > 1:
+    rank_sent = dict(rows=0, bytes=0)
+    rank_recv = dict(rows=0, bytes=0)
+    if W > 1 or multi:
         # every card ejects its r lowest and r highest slabs and cuts emigrant-only
         # copies for the neighbours that insert from them
         def boundary(k):
@@ -753,13 +833,30 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
         exports = run(boundary)
         for k in range(W):
             lo, hi = parts[k]
+            # the rank's cards form a ring on one rank; across ranks, a line whose ends hand
+            # off to the neighbour ranks below
+            nbrs = ({(k - 1) % W, (k + 1) % W} - {k}) if not multi else (
+                {k - 1, k + 1} & set(range(W)))
             for s, e in exports[k].items():
-                for j in {(k - 1) % W, (k + 1) % W} - {k}:
+                for j in nbrs:
                     jlo, jhi = parts[j]
                     if any(jlo <= (s + o) % nb < jhi for o in reach):
                         staged[j][s], nbytes = _moved(e, devs[j])
                         segments += 1
                         moved_bytes += nbytes
+        if multi:
+            to_l = _pack_emigrants({s: exports[0][s] for s in range(lo_s, lo_s + r)})
+            to_r = _pack_emigrants({s: exports[W - 1][s] for s in range(hi_s - r, hi_s)})
+            got_l, got_r = exchange_neighbours(comm, to_l, to_r)
+            for got, k in ((got_l, 0), (got_r, W - 1)):
+                for s, e in _unpack_emigrants(got, devs[k]).items():
+                    staged[k][s] = e
+                    rank_recv["rows"] += int(e["n_rows"])
+                rank_recv["bytes"] += sum(int(v.nbytes) for v in got.values())
+            rank_sent["rows"] = sum(int(e["n_rows"]) for e in (
+                [exports[0][s] for s in range(lo_s, lo_s + r)]
+                + [exports[W - 1][s] for s in range(hi_s - r, hi_s)]))
+            rank_sent["bytes"] = sum(int(v.nbytes) for d in (to_l, to_r) for v in d.values())
         exports = None
         clocks[0].mark("pass: boundary ejects + hand-off")
 
@@ -782,8 +879,31 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
             n_emig[s], rr_by_slab[s] = ne, rr
             n_direct += bool(direct)
         staged[k].clear()
+    # rows this rank's inserts took from other ranks' slabs, reported to their owners
+    foreign_consumed, taken = {}, 0
+    if multi:
+        side = {}
+        for d, res in insert_res.items():
+            for src, c in res["consumed"].items():
+                if not lo_s <= src < hi_s:
+                    left = (lo_s - src) % nb <= r
+                    side.setdefault("l" if left else "r", []).append((d, src, int(c)))
+                    taken += int(c)
+
+        def parcel(rows):
+            a = np.asarray(rows, dtype=np.int64).reshape(-1, 3)
+            return dict(dsc=a)
+
+        got_l, got_r = exchange_neighbours(comm, parcel(side.get("l", [])),
+                                           parcel(side.get("r", [])))
+        for got in (got_l, got_r):
+            for d, src, c in got["dsc"].tolist():
+                foreign_consumed[(d, src)] = foreign_consumed.get((d, src), 0) + c
+    given = sum(foreign_consumed.values())
     ctx.update(insert_res=insert_res, n_emig=n_emig, rr_by_slab=rr_by_slab, n_direct=n_direct,
-               segments=segments, moved_bytes=moved_bytes)
+               segments=segments, moved_bytes=moved_bytes, foreign_consumed=foreign_consumed,
+               rows_in=taken, rows_out=given, rank_sent=rank_sent, rank_recv=rank_recv,
+               multi=multi, comm=comm)
     return ctx
 
 
@@ -795,10 +915,15 @@ def _merge_card_timings(ctx, timings):
 
 
 def _pass_receipt(ctx, devices, device_budget_bytes, spill_rows):
-    receipt = dict(slabs=ctx["nb"], programs=len(_PROGRAMS), spill_rows=spill_rows,
+    n_own = sum(hi - lo for lo, hi in ctx["parts"])
+    receipt = dict(slabs=n_own, programs=len(_PROGRAMS), spill_rows=spill_rows,
                    peak_estimate_bytes=max(b.peak for b in ctx["budgets"]),
                    budget_bytes=device_budget_bytes, window_direct_slabs=ctx["n_direct"],
-                   window_copied_slabs=ctx["nb"] - ctx["n_direct"])
+                   window_copied_slabs=n_own - ctx["n_direct"],
+                   rank_emigrant_rows_sent=ctx["rank_sent"]["rows"],
+                   rank_emigrant_rows_received=ctx["rank_recv"]["rows"],
+                   rank_hand_off_bytes_sent=ctx["rank_sent"]["bytes"],
+                   rank_hand_off_bytes_received=ctx["rank_recv"]["bytes"])
     if devices is not None:
         receipt.update(cards=ctx["W"], slabs_per_card=[hi - lo for lo, hi in ctx["parts"]],
                        cross_card_segments=ctx["segments"], cross_card_bytes=ctx["moved_bytes"],
@@ -807,17 +932,37 @@ def _pass_receipt(ctx, devices, device_budget_bytes, spill_rows):
 
 
 def _migrate_stats(st, ctx, rep, n_after, receipt):
+    blo, bhi = st.owned_bricks
     return dict(n_arena_overflow=rep["n_over"], arena_used=st.arena_used,
-                vel_scale=float(np.max(st.vel_scale)),
-                vel_scale_min=float(np.min(st.vel_scale)),
+                vel_scale=float(np.max(st.vel_scale[blo:bhi])),
+                vel_scale_min=float(np.min(st.vel_scale[blo:bhi])),
                 n_migrated_checked=n_after, brick_reach=ctx["r"], brick_reach_raw=ctx["r_raw"],
                 brick_reach_realized=rep["realized_reach"],
                 peak_staged_slabs=rep["peak_staged"],
                 migrate_device=receipt)
 
 
+def conserve(st, ctx, n_after, what):
+    """Refuse a pass that lost or made particles: on this rank against the rows it sent and
+    received, and (across ranks) in total; then record a node-local state's new count."""
+    want = ctx["n_before"] - ctx["rows_out"] + ctx["rows_in"]
+    if n_after != want:
+        raise ValueError(
+            f"the {what} holds {n_after} particles on this rank against {want} expected "
+            f"({ctx['n_before']} before, {ctx['rows_out']} sent, {ctx['rows_in']} received). "
+            "Particles are never dropped, so this is corruption, not imprecision.")
+    if ctx["multi"]:
+        comm = ctx["comm"]
+        before, after = comm.allreduce(int(ctx["n_before"])), comm.allreduce(int(n_after))
+        if before != after:
+            raise ValueError(f"the {what} holds {after} particles over all ranks against "
+                             f"{before} before")
+    if not st.is_whole:
+        st.n_particles = int(n_after)
+
+
 def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
-                             device_budget_bytes=None, devices=None):
+                             device_budget_bytes=None, devices=None, comm=None):
     """`state.drift_and_migrate` with every slab's row work on the device.
 
     Same contract, mutations and stats dict (plus a `migrate_device` receipt), bitwise
@@ -835,26 +980,24 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
     `devices` is a sequence of jax devices, one per card (None: one card, jax's
     default device); `migrate_device` then also reports
     `cards`, `slabs_per_card`, `cross_card_segments` / `_bytes` and `fallback`.
+
+    `comm`, with a node-local `st` (every rank calls this): the pass across ranks
+    (`_device_pass`); `st.n_particles` becomes the rank's new count.
     """
     from .. import state as _state
 
     ctx = _device_pass(st, c_drift, timings=timings, device_budget_bytes=device_budget_bytes,
-                       devices=devices)
+                       devices=devices, comm=comm)
     rep = _state._replay_arena_pass(
         st, ctx["reach"], ctx["r"], ctx["r_raw"], c_drift, ctx["scales"], n_emig=ctx["n_emig"],
         rr_by_slab=ctx["rr_by_slab"], insert_res=ctx["insert_res"],
-        max_staged_slabs=max_staged_slabs, census_note=" (Device pass.)")
+        max_staged_slabs=max_staged_slabs, census_note=" (Device pass.)",
+        foreign_consumed=ctx["foreign_consumed"])
     clock = ctx["clocks"][0]
     clock.mark("pass: arena replay")
-    n_before, nb = ctx["n_before"], ctx["nb"]
     n_after = _state.occupancy_total(st.occupancy) + st.arena_used
-    if n_after != n_before:
-        raise ValueError(
-            f"the migration lost {n_before - n_after} particles ({n_before} -> {n_after} "
-            f"against {st.n_particles} stored). Particles are never dropped, so this is "
-            f"corruption, not imprecision. {rep['n_inserted']} of {nb} slabs inserted, "
-            f"arena {st.arena_used}/{st.n_arena} (device pass)"
-        )
+    conserve(st, ctx, n_after, f"migration ({rep['n_inserted']} slabs inserted, arena "
+             f"{st.arena_used}/{st.n_arena}, device pass)")
     clock.mark("pass: final census")
     _merge_card_timings(ctx, timings)
     receipt = _pass_receipt(ctx, devices, device_budget_bytes, rep["spill_rows"])

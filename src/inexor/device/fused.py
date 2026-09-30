@@ -74,14 +74,49 @@ def _block_inputs_program(cap_i, cap_s, w_cap, nb2, p3, has_ids):
     return _m._program(("fused_inputs", cap_i, cap_s, w_cap, nb2, p3, has_ids), make)
 
 
+def census_across_ranks(st, counts, c_drift, comm):
+    """This rank's post-migrate membership from its tile loop's destination census: the
+    counts landing in the neighbours' r boundary slabs are sent to them, theirs for this
+    rank's boundary slabs added here, and every non-owned entry zeroed. A count beyond the
+    neighbours' r slabs is a collective refusal (a particle would skip a rank)."""
+    from ..comm import exchange_neighbours
+
+    nb = int(st.bricks_per_side)
+    nb2 = nb * nb
+    lo_s, hi_s = st.owned_slabs
+    _r_raw, r = _m.pass_reach(st, c_drift, comm)
+    counts = np.array(counts, dtype=np.int64, copy=True)
+    by_slab = counts.reshape(nb, nb2)
+    left = [(lo_s - r + i) % nb for i in range(r)]
+    right = [(hi_s + i) % nb for i in range(r)]
+    own = np.zeros(nb, dtype=bool)
+    own[lo_s:hi_s] = True
+    near = own.copy()
+    near[left + right] = True
+    stray = int(comm.allreduce(int(by_slab[~near].sum())))
+    if stray:
+        raise ValueError(
+            f"{stray} rows' destinations lie beyond the {r} slab(s) next to their rank: the "
+            "hand-off reaches immediate neighbours only")
+    got_l, got_r = exchange_neighbours(
+        comm, dict(c=by_slab[left].reshape(-1)), dict(c=by_slab[right].reshape(-1)))
+    for got, first in ((got_l, lo_s), (got_r, hi_s - r)):
+        by_slab[first:first + r] += got["c"].reshape(r, nb2)
+    by_slab[~own] = 0
+    return counts
+
+
 def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_staged_slabs=None,
-                          timings=None, device_budget_bytes=None, devices=None):
+                          timings=None, device_budget_bytes=None, devices=None, comm=None):
     """`drift_and_migrate_device` followed by `repack_device`, in one pass per slab.
 
     `census_counts` is the per-brick post-migrate membership, int64 over
     `st.n_bricks` (`tile_loop_windowed(census=c_drift)`, summed over cards).
     `brick_slack`, `max_staged_slabs`, `timings`, `device_budget_bytes` and
     `devices` as in the two passes. Same mutations as the two passes in sequence.
+    `comm`, with a node-local `st` (every rank calls this): `census_counts` is this rank's
+    tile loop's census (`census_across_ranks` completes it), and the pass runs across ranks
+    as the device migrate does; `st.n_particles` becomes the rank's new count.
 
     Returns `(migrate_stats, repack_stats)`: the migrate's stats dict with its
     `migrate_device` receipt (plus `fused`), and the repack's dict with a
@@ -100,9 +135,14 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     if counts.dtype != np.int64 or counts.shape != (int(st.n_bricks),):
         raise ValueError(f"census_counts must be int64 over {st.n_bricks} bricks, got "
                          f"{counts.dtype} {counts.shape}")
-    if int(counts.sum()) != int(st.n_particles):
-        raise ValueError(f"the census counts {int(counts.sum())} rows against "
-                         f"{st.n_particles} particles stored")
+    multi = comm is not None and comm.size > 1
+    if multi:
+        counts = census_across_ranks(st, counts, c_drift, comm)
+        got, want = (int(comm.allreduce(int(x))) for x in (counts.sum(), st.n_particles))
+    else:
+        got, want = int(counts.sum()), int(st.n_particles)
+    if got != want:
+        raise ValueError(f"the census counts {got} rows against {want} particles stored")
     new_start, n_alloc = capacity_from_counts(st, counts, brick_slack)
     old_start = np.asarray(st.brick_start, dtype=np.int64).copy()
     # the owned buckets only; `bucket_lo` is the flat ordinal of `new_occ[0]`
@@ -216,7 +256,7 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     card_ar = _m.pass_arena_index(st)
     ctx = _m._device_pass(st, c_drift, timings=timings, device_budget_bytes=device_budget_bytes,
                           devices=devices, insert=insert, keep_window=False,
-                          before_sweep=before_sweep)
+                          before_sweep=before_sweep, comm=comm)
     clock = ctx["clocks"][0]
 
     # the migrate's census, arena-full refusal and stats, exactly as the device
@@ -227,18 +267,18 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     rep = _state._replay_arena_pass(
         st, ctx["reach"], ctx["r"], ctx["r_raw"], c_drift, ctx["scales"], n_emig=ctx["n_emig"],
         rr_by_slab=ctx["rr_by_slab"], insert_res=ctx["insert_res"],
-        max_staged_slabs=max_staged_slabs, census_note=" (Fused pass.)")
+        max_staged_slabs=max_staged_slabs, census_note=" (Fused pass.)",
+        foreign_consumed=ctx["foreign_consumed"])
     for x, k in zip((st.off, st.w, st.ids), kept):
         if x is not None and a_hi > a_lo:
             x[a_lo:a_hi] = k
     clock.mark("pass: arena replay")
-    n_before = ctx["n_before"]
     n_after = _state.occupancy_total(new_occ)
-    if n_after != n_before:
-        raise ValueError(
-            f"the fused migrate + repack lost {n_before - n_after} particles ({n_before} -> "
-            f"{n_after} against {st.n_particles} stored). Particles are never dropped, so this is "
-            f"corruption, not imprecision. {rep['n_inserted']} of {nb} slabs inserted.")
+    if n_after != int(counts.sum()):
+        raise ValueError(f"the fused migrate + repack wrote {n_after} rows on this rank "
+                         f"against a census of {int(counts.sum())}")
+    _m.conserve(st, ctx, n_after,
+                f"fused migrate + repack ({rep['n_inserted']} slabs inserted)")
     _m._merge_card_timings(ctx, timings)
     receipt = _m._pass_receipt(ctx, devices, device_budget_bytes, rep["spill_rows"])
     receipt["fused"] = True
@@ -263,7 +303,8 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     clock.mark("pass: tail")
 
     a_all = [acc(k) for k in range(ctx["W"])]
-    rreceipt = dict(fused=True, slabs=nb, blocks=int(sum(a["blocks"] for a in a_all)),
+    rreceipt = dict(fused=True, slabs=receipt["slabs"],
+                    blocks=int(sum(a["blocks"] for a in a_all)),
                     readahead_uploads=int(sum(a["readahead"] for a in a_all)),
                     empty_slabs=int(sum(a["empty"] for a in a_all)))
     if devices is not None:

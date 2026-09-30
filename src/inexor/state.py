@@ -369,7 +369,7 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert
 
 
 def _replay_arena_pass(st, reach, r, r_raw, c_drift, scales, n_emig, rr_by_slab, insert_res,
-                       max_staged_slabs=None, census_note=""):
+                       max_staged_slabs=None, census_note="", foreign_consumed=None):
     """Replay a migrate pass's arena mutations and bookkeeping in serial order.
 
     For a pass whose ejects and inserts ran out of order or elsewhere, with arena mutations
@@ -383,28 +383,45 @@ def _replay_arena_pass(st, reach, r, r_raw, c_drift, scales, n_emig, rr_by_slab,
     `spills` ((brick, dest, off, w, ids) in ascending brick order) and `n_over`.
     `census_note` is appended to the census failure message.
 
+    On a node-local state only its own slabs are replayed, in the same serial order: arena
+    releases and claims of its own bricks and destinations, and the census of its own
+    sources, where `foreign_consumed[(d, src)]` is how many of source `src`'s emigrants
+    another rank's insert `d` took. Other slabs' ejects and inserts only advance the order.
+
     Returns `n_over`, `peak_staged`, `realized_reach`, `spill_rows`, `spill_bytes`.
     """
     nb = st.bricks_per_side
+    lo_s, hi_s = st.owned_slabs
+    by_dest = {}
+    for (d, src), c in (foreign_consumed or {}).items():
+        by_dest.setdefault(int(d), []).append((int(src), int(c)))
     staged_sym, emig_sym, inserted = set(), set(), set()
     consumed = {}
     n_over, peak_staged, realized_reach = 0, 0, 0
     spill_rows = spill_bytes = 0
     for s in range(nb):
-        lo_b, hi_b = st.slab_bricks(s)
-        for b in range(lo_b, hi_b):
-            st._release_brick_arena(b)
+        if lo_s <= s < hi_s:
+            lo_b, hi_b = st.slab_bricks(s)
+            for b in range(lo_b, hi_b):
+                st._release_brick_arena(b)
+            consumed[s] = 0
+            realized_reach = max(realized_reach, rr_by_slab[s])
         staged_sym.add(s)
         emig_sym.add(s)
-        consumed[s] = 0
-        realized_reach = max(realized_reach, rr_by_slab[s])
         for d in range(nb):
             if d in inserted:
                 continue
             if all(((d + o) % nb) in emig_sym for o in reach):
+                if not lo_s <= d < hi_s:
+                    # another rank's insert: only what it took from this rank's sources
+                    for src, c in by_dest.get(d, ()):
+                        consumed[src] += c
+                    inserted.add(d)
+                    continue
                 res = insert_res[d]
                 for src, c in res["consumed"].items():
-                    consumed[src] += int(c)
+                    if src in consumed:
+                        consumed[src] += int(c)
                 for _b, dest_r, off_r, w_r, ids_r in res["spills"]:
                     spill_rows += len(dest_r)
                     spill_bytes += dest_r.nbytes + off_r.nbytes + w_r.nbytes
@@ -417,6 +434,9 @@ def _replay_arena_pass(st, reach, r, r_raw, c_drift, scales, n_emig, rr_by_slab,
                 staged_sym.discard(s2)
         for s2 in list(emig_sym):
             if all(((s2 + o) % nb) in inserted for o in reach):
+                emig_sym.discard(s2)
+                if s2 not in consumed:
+                    continue
                 n_rows = n_emig[s2]
                 if consumed[s2] != n_rows:
                     raise AssertionError(
@@ -426,7 +446,6 @@ def _replay_arena_pass(st, reach, r, r_raw, c_drift, scales, n_emig, rr_by_slab,
                         "dropped; an unconsumed emigrant is a particle about to "
                         "be destroyed." + census_note
                     )
-                emig_sym.discard(s2)
         peak_staged = max(peak_staged, len(staged_sym))
         if max_staged_slabs is not None and peak_staged > int(max_staged_slabs):
             raise ValueError(
@@ -440,10 +459,11 @@ def _replay_arena_pass(st, reach, r, r_raw, c_drift, scales, n_emig, rr_by_slab,
                 "deliberately -- staging is bounded by (2 * reach + 1) slabs, so "
                 "this is a real memory cost and not a formality."
             )
-    if len(inserted) != nb:
-        raise AssertionError(f"{nb - len(inserted)} slabs were never written back")
+    n_ins = sum(1 for d in inserted if lo_s <= d < hi_s)
+    if n_ins != hi_s - lo_s:
+        raise AssertionError(f"{hi_s - lo_s - n_ins} slabs were never written back")
     return dict(n_over=n_over, peak_staged=peak_staged, realized_reach=realized_reach,
-                spill_rows=spill_rows, spill_bytes=spill_bytes, n_inserted=len(inserted))
+                spill_rows=spill_rows, spill_bytes=spill_bytes, n_inserted=n_ins)
 
 
 def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
