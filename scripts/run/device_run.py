@@ -22,6 +22,13 @@ Usage (as the Vista job scripts call it):
     python scripts/run/device_run.py summarize --card run.json --gpu-csv gpu.csv \
         --mem-csv mem.csv --out summary.json
 
+Across nodes, one process per node under MPI (`--comm mpi`, launched as `mpiexec -n N python
+-m mpi4py scripts/run/device_run.py run ... --comm mpi`): each rank loads its own brick
+slabs of the ICs or checkpoint, writes its own card (`run.rank<r>.json`) and prefixes its
+log lines with its rank; the checkpoints are written by all ranks together and do not
+depend on the rank count. `--comm-timeout` is the watchdog: a rank waiting longer at one
+exchange aborts the job.
+
 Refusals in `run`: a card or checkpoint under the IC directory; a checkpoint dir that
 already holds a checkpoint unless `--expect-step` (resume) is given; a resume whose
 newest checkpoint is not at `--expect-step`; a memory binding that did not apply.
@@ -47,7 +54,8 @@ What survives a failure:
   outside this process, so an OOM kill or a hang cannot silence them; `summarize`
   lines them up against the boundaries recorded here.
 
-`D7_FAIL_AT=<phase>` raises at that boundary, to exercise the failure path.
+`D7_FAIL_AT=<phase>` raises at that boundary, to exercise the failure path (with
+`D7_FAIL_RANK=<r>`, on that rank only).
 """
 
 from __future__ import annotations
@@ -673,10 +681,46 @@ def cmd_preflight(args):
 # ---------------------------------------------------------------------- run
 
 
+class _RankLines:
+    """A stream with every line prefixed by the rank, for an interleaved mpiexec log."""
+
+    def __init__(self, out, rank):
+        self._out, self._pre, self._bol = out, f"[rank {rank}] ", True
+
+    def write(self, s):
+        for part in s.splitlines(keepends=True):
+            if self._bol:
+                self._out.write(self._pre)
+            self._out.write(part)
+            self._bol = part.endswith("\n")
+        return len(s)
+
+    def flush(self):
+        self._out.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._out, name)
+
+
 def cmd_run(args):
+    comm = None
+    if args.comm == "mpi":
+        # MPI comes up before jax does
+        from inexor.comm import MPIComm
+
+        comm = MPIComm(timeout=args.comm_timeout)
+    multi = comm is not None and comm.size > 1
+    if multi:
+        base, ext = os.path.splitext(args.card)
+        args.card = f"{base}.rank{comm.rank}{ext}"
+        sys.stdout = _RankLines(sys.stdout, comm.rank)
+        if args.ckpt_probe_slabs:
+            raise SystemExit("FATAL: the checkpoint probe writes a whole state; one rank only")
+
     import jax
 
     from inexor import engine, icgen
+    from inexor.decomp import Decomp
     from inexor.plan import engine_config
     from realization import _coeffs, _cosmo, _require_ic_growth2
 
@@ -709,7 +753,11 @@ def cmd_run(args):
             args.ckpt_probe_dir):
         # here, not after the run: the writer removes a manifest it finds
         raise SystemExit(f"FATAL: checkpoint probe dir {args.ckpt_probe_dir} is not empty")
-    mon = Monitor(args.card, card, beat_s=args.beat, fail_at=os.environ.get("D7_FAIL_AT"),
+    rank = 0 if comm is None else comm.rank
+    fail_rank = os.environ.get("D7_FAIL_RANK")
+    fail_at = (os.environ.get("D7_FAIL_AT")
+               if fail_rank is None or int(fail_rank) == rank else None)
+    mon = Monitor(args.card, card, beat_s=args.beat, fail_at=fail_at,
                   with_numa_maps=args.numa_maps)
     card["plan"] = dict(stop_at=args.stop_at, k_steps=args.k_steps,
                         expect_step=args.expect_step, timed_last=args.timed_last,
@@ -730,6 +778,12 @@ def cmd_run(args):
                            checkpoint_dir=args.checkpoint_dir if args.checkpoint_every else None,
                            checkpoint_every=args.checkpoint_every)
         ec.validate()
+        if multi and engine.rank_lane_refusal(ec):
+            raise RuntimeError(engine.rank_lane_refusal(ec))
+        decomp = Decomp.build(ec, n_ranks=1 if comm is None else comm.size, rank=rank)
+        slabs = decomp.slabs if multi else None
+        card["ranks"] = dict(rank=rank, n_ranks=decomp.n_ranks, slabs=list(decomp.slabs),
+                             comm=args.comm, comm_timeout=args.comm_timeout)
         card["config"] = dict(tile_window=ec.tile_window, fused_pass=ec.fused_pass,
                               device_cards=ec.device_cards, checkpoint_dir=ec.checkpoint_dir,
                               coarse_dtype=ec.coarse_dtype, fine_dtype=ec.fine_dtype)
@@ -748,7 +802,8 @@ def cmd_run(args):
             # wall redoing finished steps, so the step it resumes from is stated
             st, resume = engine.load_checkpoint(
                 args.checkpoint_dir, ec, co, brick_slack=args.slack,
-                alloc_margin=args.alloc_margin, arena_frac=args.arena_frac)
+                alloc_margin=args.alloc_margin, arena_frac=args.arena_frac, comm=comm,
+                slabs=slabs)
             if int(resume["step"]) != args.expect_step:
                 raise RuntimeError(
                     f"the newest checkpoint under {args.checkpoint_dir} is at step "
@@ -759,7 +814,7 @@ def cmd_run(args):
             st = icgen.load_slot_state(args.workdir, brick_slack=args.slack,
                                        alloc_margin=args.alloc_margin,
                                        arena_frac=args.arena_frac,
-                                       drop_cache=args.drop_ic_cache)
+                                       drop_cache=args.drop_ic_cache, slabs=slabs)
         k0 = 0 if resume is None else int(resume["step"])
         card["start_step"] = k0
         card["state"] = dict(n_particles=st.n_particles, n_bricks=st.n_bricks,
@@ -788,7 +843,8 @@ def cmd_run(args):
                 card["steps"].append(s)
 
         out = engine.run(st, ec, co, phase=mon, resume=resume, stop_at=args.stop_at,
-                         collect=collect, timed_steps=timed, epoch=(a_steps, cosmo))
+                         collect=collect, timed_steps=timed, epoch=(a_steps, cosmo),
+                         comm=comm, decomp=decomp)
         card["finished"] = time.time()
         # a checkpoint is written after the last boundary and has none of its own
         card["after_last_boundary_s"] = card["finished"] - mon.t_last
@@ -1007,6 +1063,11 @@ def main(argv=None):
     pr.add_argument("--checkpoint-dir", default=None)
     pr.add_argument("--checkpoint-every", type=int, default=0,
                     help="0 = no checkpoints; else every this many steps (--stop-at a multiple)")
+    pr.add_argument("--comm", default="serial", choices=("serial", "mpi"),
+                    help="mpi: one rank per process across nodes (launch under mpiexec with "
+                         "python -m mpi4py)")
+    pr.add_argument("--comm-timeout", type=float, default=1800.0,
+                    help="seconds a rank may wait at one exchange before aborting the job")
     ps = sub.add_parser("summarize")
     ps.add_argument("--card", required=True)
     ps.add_argument("--gpu-csv", default=None)

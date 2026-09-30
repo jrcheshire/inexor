@@ -8,6 +8,8 @@ rank disjoint emulated devices while the backend has enough.
 
 import copy
 import functools
+import hashlib
+import os
 
 import numpy as np
 
@@ -61,3 +63,16 @@ def rank_devices(rank, cards):
         return None
     devs = jax.devices()
     return [devs[(rank * cards + k) % len(devs)] for k in range(cards)]
+
+
+def hashes(ckpt_dir):
+    """{gen/file: sha256} over the complete generations (with a manifest) under `ckpt_dir`."""
+    out = {}
+    for gen in ("gen0", "gen1"):
+        d = os.path.join(ckpt_dir, gen)
+        if not os.path.exists(os.path.join(d, "manifest.json")):
+            continue
+        for name in sorted(os.listdir(d)):
+            with open(os.path.join(d, name), "rb") as fh:
+                out[f"{gen}/{name}"] = hashlib.sha256(fh.read()).hexdigest()
+    return out

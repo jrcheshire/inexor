@@ -8,7 +8,6 @@ uninterrupted run. A rank that raises mid-run ends every rank, and the generatio
 progress has no manifest.
 """
 
-import hashlib
 import os
 import shutil
 
@@ -24,7 +23,7 @@ from inexor.decomp import Decomp  # noqa: E402
 from inexor.device import ghost as dghost  # noqa: E402
 from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table  # noqa: E402
 from inexor.plan import engine_config  # noqa: E402
-from tests.ranks_common import PRESET, rank_cfg, rank_devices, whole_state  # noqa: E402
+from tests.ranks_common import PRESET, hashes, rank_cfg, rank_devices, whole_state  # noqa: E402
 from tests.test_partial_state import restrict_to_slabs  # noqa: E402
 
 pytestmark = pytest.mark.slow
@@ -44,19 +43,6 @@ def _x64():
 
 def _coeffs():
     return bullfrog_float_coeffs(bullfrog_table(a_grid(0.1, 1.0, K, "log"), Cosmology()))
-
-
-def hashes(ckpt_dir):
-    """{gen/file: sha256} over the complete generations under `ckpt_dir`."""
-    out = {}
-    for gen in ("gen0", "gen1"):
-        d = os.path.join(ckpt_dir, gen)
-        if not os.path.exists(os.path.join(d, "manifest.json")):
-            continue
-        for name in sorted(os.listdir(d)):
-            with open(os.path.join(d, name), "rb") as fh:
-                out[f"{gen}/{name}"] = hashlib.sha256(fh.read()).hexdigest()
-    return out
 
 
 def run_ranks(n_ranks, cards, ckpt_dir, resume=False, stop_at=None):

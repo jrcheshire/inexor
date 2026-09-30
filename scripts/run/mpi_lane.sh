@@ -17,7 +17,7 @@ v = {p["name"]: p["version"] for p in json.load(sys.stdin)}
 print(" ".join(f"--spec {k}=={v[k]}" for k in ("python", "jax", "jaxlib", "numpy")))')
 
 if [ "$#" -eq 0 ]; then
-  set -- tests/test_comm_mpi.py
+  set -- tests/test_comm_mpi.py tests/test_driver_mpi.py
 fi
 cd "$here"
 # shellcheck disable=SC2086
