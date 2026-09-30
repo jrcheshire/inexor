@@ -475,7 +475,7 @@ def coarse_kernel_slab(parts, axis, lo, hi, cdtype):
 
 
 def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=None,
-                             fold_kernel=True):
+                             fold_kernel=True, decomp=None, comm=None, receipt=None):
     """The coarse solve through `ooc_fft`'s canonical factorization.
 
     Required above the device-transform bound and when the mesh does not fit. Not bitwise the
@@ -485,6 +485,12 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=No
     (`fold_kernel=False` keeps a separate host multiply, the reference arm). `delta` may be per-card
     planes and `out` a `CardShards`, in which case no host mesh exists. `timings`, if a dict,
     accumulates seconds per part summed over components.
+
+    Across ranks (`decomp`, `comm`, the density on the cards, the folded kernel, `out` a
+    `CardShards`): each rank transforms its coarse planes, holds its y-pencils of the
+    spectrum through the kernel pass, and receives the planes its cards' shards hold; the
+    shards are bitwise the one-rank solve's. `receipt`, if a dict, accumulates the bytes sent.
+    Every rank must call this.
     """
     import time
 
@@ -501,9 +507,24 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=No
                 timings[key] = timings.get(key, 0.0) + time.perf_counter() - t0
 
     n = int(n_mesh)
+    multi = comm is not None and comm.size > 1
+    on_cards = isinstance(delta, (list, tuple))
+    if multi and not (on_cards and fold_kernel and isinstance(out, CardShards)):
+        raise ValueError(
+            "across ranks the coarse solve needs the density on the cards, the folded kernel "
+            "and card-shard output: every other form holds a whole-mesh host array")
     ft = {}
-    if isinstance(delta, (list, tuple)):
-        spec = ooc_fft.forward_from_card_planes(delta, n, timings=ft)
+    pencils = None
+    if on_cards:
+        if decomp is None:
+            x_parts, y_parts = [(0, n)], [(0, n)]
+        else:
+            cpt = int(decomp.coarse_per_tile)
+            x_parts = [(lo * cpt, hi * cpt) for lo, hi in decomp.rank_planes]
+            y_parts = [tuple(p) for p in decomp.rank_pencils]
+        pencils = y_parts[0 if comm is None else comm.rank]
+        spec = ooc_fft.forward_card_planes_to_pencils(delta, n, x_parts, y_parts, comm,
+                                                      timings=ft, receipt=receipt)
     else:
         spec = ooc_fft.forward_from_slabs_device(
             lambda lo, hi: delta[lo:hi], n, slab=slab, timings=ft)
@@ -533,7 +554,7 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=No
                 [(1.0, spec)], n, kernel=ooc_fft.ArrayKernel.coarse(
                     parts["pref"], parts["iks"][axis], axis, parts["mf"], cdtype,
                     cards=cards),
-                out=work, inverse=True, devices=kdevs, timings=it)
+                out=work, inverse=True, devices=kdevs, timings=it, pencils=pencils)
             _add("kernel + axis-0 pass", t0)
         else:
             t0 = time.perf_counter()
@@ -541,7 +562,11 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=No
                 hi = min(lo + slab, spec.shape[0])
                 work[lo:hi] = spec[lo:hi] * coarse_kernel_slab(parts, axis, lo, hi, cdtype)
             _add("multiply", t0)
-        if per_card is not None:
+        if per_card is not None and fold_kernel and on_cards:
+            for k, m in enumerate(ooc_fft.inverse_pencils_to_card_shards(
+                    work, n, out.ranges, y_parts, comm, timings=it, receipt=receipt)):
+                per_card[k].append(m)
+        elif per_card is not None:
             for k, m in enumerate(ooc_fft.inverse_to_card_shards(
                     work, n, out.ranges, timings=it, pass2=not fold_kernel)):
                 per_card[k].append(m)
@@ -549,14 +574,16 @@ def _coarse_solve_factorized(delta, n_mesh, parts, cdtype, out, slab, timings=No
             for lo, block in ooc_fft.inverse_to_slabs_device(
                     work, n, slab=slab, timings=it, pass2=not fold_kernel):
                 out[axis][lo:lo + block.shape[0]] = block
-        _add("inverse", None, {k: v for k, v in it.items() if k in ("pass1_s", "pass2_s")})
+        _add("inverse", None, {k: v for k, v in it.items()
+                               if k in ("pass1_s", "pass2_s", "transpose_s")})
     del work
     return out.assemble(per_card) if per_card is not None else out
 
 
 def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, clip=None,
                         fdtype=None, parts=None, out=None, transform="factorized",
-                        slab=None, timings=None, fold_kernel=True):
+                        slab=None, timings=None, fold_kernel=True, decomp=None, comm=None,
+                        receipt=None):
     """The three long-range force meshes from an already-painted delta (solve only, no paint/gather).
 
     Bitwise the solve inside `force_global`. `fdtype=None` infers from `delta.dtype`; an explicit
@@ -565,8 +592,8 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
     `coarse_kernel_parts` dict (built per call if None; refused if built for another n_mesh or
     dtype). `out`: three preallocated meshes (or `CardShards`) written in place. `delta` may be the
     per-card shards of `device.paint.coarse_delta_cards` (factorized only). Components are solved
-    one at a time, so the three meshes never coexist as jax arrays. `timings`, `fold_kernel`: see
-    `_coarse_solve_factorized`.
+    one at a time, so the three meshes never coexist as jax arrays. `timings`, `fold_kernel`,
+    `decomp`, `comm`, `receipt` (across ranks): see `_coarse_solve_factorized`.
     """
     on_cards = isinstance(delta, (list, tuple))
     ddt = np.dtype(delta[0]["delta"].dtype if on_cards else delta.dtype)
@@ -599,7 +626,7 @@ def coarse_force_meshes(delta, n_mesh, box_size, which, r_s=None, match=None, cl
         return _coarse_solve_factorized(
             delta, n_mesh, parts, cdtype, out,
             ooc_fft._DEF_SLAB if slab is None else int(slab), timings=timings,
-            fold_kernel=fold_kernel)
+            fold_kernel=fold_kernel, decomp=decomp, comm=comm, receipt=receipt)
     if on_cards:
         raise ValueError(
             "coarse_force_meshes: a density on the cards has only the factorized "

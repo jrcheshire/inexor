@@ -488,15 +488,6 @@ def _zeros_on(shape, dtype, device):
     return fn(_on(np.zeros((), dtype=dtype), device))
 
 
-def card_x_ranges(n_coarse, n_cards, x_unit):
-    """The [lo, hi) x-plane ranges each card owns: contiguous, tiling [0, n), with
-    boundaries on `x_unit` -- a chunk's x thickness in coarse cells, so every
-    chunk's cells start and end on one card."""
-    from ..ooc_fft import partition_units
-
-    return partition_units(int(n_coarse), int(n_cards), int(x_unit))
-
-
 class CardInt64Accumulator:
     """One card's share of the coarse mesh: int64, resident on that card.
 
@@ -557,55 +548,91 @@ def _card_add_kernel(n, extent):
     return _cached(("add", int(n), tuple(extent)), build)
 
 
-def fold_ghosts(accs, stats=None):
+def fold_ghosts(accs, stats=None, comm=None):
     """Add every card's ghost planes into the card that owns each plane.
 
     Exact (integer addition). Every ghost plane is read before any card is written,
-    so one card owning its own wrapped ghosts folds the same as many. `stats`
-    receives `coarse_ghost_planes_nonzero`.
+    so one card owning its own wrapped ghosts folds the same as many. Across ranks
+    (`comm`, the cards `accs` owning one rank's contiguous planes), a ghost plane no
+    local card owns goes to the neighbour rank on its side (`comm.exchange_neighbours`)
+    and the planes the neighbours send are added here; every rank must call this.
+    `stats` receives `coarse_ghost_planes_nonzero` (local and sent) and
+    `coarse_ghost_planes_sent`.
     """
     import jax
     import jax.numpy as jnp
 
+    from ..comm import exchange_neighbours
+
     n = accs[0].n
+    r_lo, r_hi = min(a.lo for a in accs), max(a.hi for a in accs)
 
     def owner(g):
         for a in accs:
             if a.lo <= g < a.hi:
                 return a
-        raise ValueError(f"no card owns x-plane {g}: the ranges do not tile the mesh")
+        return None
 
     take = _cached(("take",), lambda: jax.jit(lambda m, i: m[i]))
     put = _cached(("plane_add",),
                   lambda: jax.jit(lambda m, i, p: m.at[i].add(p), donate_argnums=0))
-    ghosts = []
+    ghosts, sides = [], dict(left=[], right=[])
     for a in accs:
         if a.folded:
             raise RuntimeError("fold_ghosts called twice would add the ghosts twice")
         locs = list(range(ACC_GHOST_LO)) + list(range(a.nx - ACC_GHOST_HI, a.nx))
         for li in locs:
             g = (a.lo - ACC_GHOST_LO + li) % n
-            ghosts.append((g, take(a.mesh, _on(li, a.device, np.int64))))
-    nonzero = 0
+            plane = take(a.mesh, _on(li, a.device, np.int64))
+            if owner(g) is not None:
+                ghosts.append((g, plane))
+            elif comm is None or comm.size == 1:
+                raise ValueError(f"no card owns x-plane {g}: the ranges do not tile the mesh")
+            elif 0 < (r_lo - g) % n <= ACC_GHOST_LO:
+                sides["left"].append((g, plane))
+            elif 0 <= (g - r_hi) % n < ACC_GHOST_HI:
+                sides["right"].append((g, plane))
+            else:
+                raise ValueError(f"ghost x-plane {g} is next to neither end of this rank's "
+                                 f"planes [{r_lo}, {r_hi})")
+    nonzero = sum(bool(jnp.any(p != 0)) for _g, p in ghosts) if stats is not None else 0
+    sent = 0
+    if comm is not None and comm.size > 1:
+        def parcel(items):
+            planes = (np.stack([np.asarray(p) for _g, p in items]) if items
+                      else np.zeros((0, n, n), np.int64))
+            return dict(g=np.array([g for g, _p in items], dtype=np.int64), planes=planes)
+
+        to_left, to_right = parcel(sides["left"]), parcel(sides["right"])
+        sent = len(to_left["g"]) + len(to_right["g"])
+        if stats is not None:
+            nonzero += sum(bool(p.any()) for d in (to_left, to_right) for p in d["planes"])
+        for got in exchange_neighbours(comm, to_left, to_right):
+            for g, p in zip(got["g"].tolist(), got["planes"]):
+                if owner(g) is None:
+                    raise ValueError(f"a neighbour's ghost x-plane {g} lands outside this "
+                                     f"rank's planes [{r_lo}, {r_hi})")
+                ghosts.append((g, p))
     for g, plane in ghosts:
         t = owner(g)
-        if stats is not None:
-            nonzero += bool(jnp.any(plane != 0))
-        p = plane if t.device is None else jax.device_put(plane, t.device)
+        p = (jax.device_put(plane, t.device) if t.device is not None
+             else jnp.asarray(plane))
         t.mesh = put(t.mesh, _on(g - t.lo + ACC_GHOST_LO, t.device, np.int64), p)
     for a in accs:
         a.folded = True
     if stats is not None:
         stats["coarse_ghost_planes_nonzero"] = nonzero
+        stats["coarse_ghost_planes_sent"] = sent
 
 
-def _delta_on_cards(accs, cfg, census=False):
+def _delta_on_cards(accs, cfg, census=False, comm=None):
     """(deltas, peak, inexact): each card's owned planes as the coarse density,
     on that card, in `cfg`'s coarse dtype.
 
     The arithmetic of `engine._delta_from_accumulated`, plane by plane. The mean is a
     plane-shaped runtime array because CPU XLA turns a scalar divisor into a reciprocal
-    multiply, one ulp off numpy.
+    multiply, one ulp off numpy. Across ranks (`comm`) the peak and the census are over
+    every rank's planes, so the overflow refusal is raised on every rank.
     """
     import jax
     import jax.numpy as jnp
@@ -631,6 +658,8 @@ def _delta_on_cards(accs, cfg, census=False):
         peak = max(peak, int(pk))
         if census:
             inexact += int(ix)
+    if comm is not None and comm.size > 1:
+        peak, inexact = comm.allreduce(peak, "max"), comm.allreduce(inexact)
     if peak >= 2**31:
         raise ValueError(
             f"the accumulated coarse paint reached {peak}, past int32. "
@@ -658,7 +687,8 @@ def _delta_on_cards(accs, cfg, census=False):
 
 
 def coarse_delta_cards(st, cfg, devices=None, stats=None, pad_shape=0, chunk_bricks=None,
-                       census=False, shape_floor=None, dead_rows="spread", fold=True):
+                       census=False, shape_floor=None, dead_rows="spread", fold=True,
+                       decomp=None, comm=None):
     """The coarse density painted, accumulated and decoded on the cards.
 
     Returns one dict per card, `lo`, `hi`, `device` and `delta` (the density on
@@ -670,6 +700,12 @@ def coarse_delta_cards(st, cfg, devices=None, stats=None, pad_shape=0, chunk_bri
     default device). Each card paints the chunks whose bricks start in its x range,
     jitted, on its own thread. `fold=False` drops the ghosts' mass (a test instrument).
 
+    Across ranks (`decomp`, `comm`; every rank calls this), each rank paints its own
+    bricks' chunks into its coarse planes `decomp.coarse_planes`, split over its cards by
+    the same rule as one rank's whole mesh; ghost planes past its ends fold into the
+    neighbours (`fold_ghosts`), and the chunk shapes and the overflow peak are the maxima
+    over ranks, so every rank compiles the one-rank programs.
+
     `stats`, if a dict, receives `coarse_device_chunks` in total and
     `coarse_card_chunks` per card, `coarse_cards`, `coarse_card_ranges`,
     `coarse_ghost_planes_nonzero`, and the fields `coarse_delta_device` reports.
@@ -679,6 +715,7 @@ def coarse_delta_cards(st, cfg, devices=None, stats=None, pad_shape=0, chunk_bri
     from ..eject_jax import require_x64
     from ..engine import _chunk_cuboid
     from ..forces import capacity_shape
+    from ..ooc_fft import partition_units
 
     global CALLS
     require_x64()  # before an int64 accumulator exists: without x64 it would be int32
@@ -692,25 +729,38 @@ def coarse_delta_cards(st, cfg, devices=None, stats=None, pad_shape=0, chunk_bri
     nb = int(st.bricks_per_side)
     chunk_origin_extent(0, L, nb, n)  # refuses a chunk length with no cuboid
     x_unit = int(_chunk_cuboid(0, L, nb, n)[1][0])
-    if W > 1 and x_unit + 3 >= n:
+    multi = comm is not None and comm.size > 1
+    if (W > 1 or multi) and x_unit + 3 >= n:
         raise ValueError(
             f"chunk_bricks {L} paints the full x axis ({x_unit} + 3 >= {n} cells), so "
             "no chunk belongs to one card; use a chunk no thicker than n - 3 in x")
-    ranges = card_x_ranges(n, W, x_unit)
+    # each card's x planes, contiguous with boundaries on `x_unit` (a chunk's x thickness in
+    # coarse cells), so every chunk's cells start and end on one card
+    r_lo, r_hi = (0, n) if decomp is None else decomp.coarse_planes
+    ranges = [(r_lo + a, r_lo + b) for a, b in partition_units(r_hi - r_lo, W, x_unit)]
     accs = [CardInt64Accumulator(n, lo, hi, dev) for (lo, hi), dev in zip(ranges, devs)]
 
     rows = chunk_rows(st, L)
     pad_true = int(rows.max()) if len(rows) else 0
+    if multi:
+        pad_true = comm.allreduce(pad_true, "max")
     pad = (capacity_shape(pad_true, rungs=cfg.cap_rungs, floor_shape=pad_shape)
            if cfg.pad_ladder else pad_true)
     shapes = step_shapes(st, L, pad, floor=shape_floor)
+    if multi:
+        keys = sorted(shapes)
+        top = comm.allreduce(np.array([shapes[k] for k in keys], dtype=np.int64), "max")
+        shapes = {k: int(v) for k, v in zip(keys, top)}
     by_card = [[] for _ in range(W)]
     for gi in range(n_b // L):
         if rows[gi] == 0:
             continue
         c0 = int(_chunk_cuboid(gi, L, nb, n)[0][0])
-        k = next(k for k, (lo, hi) in enumerate(ranges) if lo <= c0 < hi)
-        by_card[k].append(gi)
+        ks = [k for k, (lo, hi) in enumerate(ranges) if lo <= c0 < hi]
+        if not ks:
+            raise ValueError(f"chunk {gi} holds rows but starts at x cell {c0}, outside this "
+                             f"rank's planes [{r_lo}, {r_hi})")
+        by_card[ks[0]].append(gi)
 
     traces0 = _TRACES[0]
 
@@ -734,11 +784,11 @@ def coarse_delta_cards(st, cfg, devices=None, stats=None, pad_shape=0, chunk_bri
 
     fold_stats = {}
     if fold:
-        fold_ghosts(accs, stats=fold_stats)
+        fold_ghosts(accs, stats=fold_stats, comm=comm)
     else:
         for a in accs:
             a.folded = True  # test instrument: the ghosts' mass is dropped
-    deltas, peak, inexact = _delta_on_cards(accs, cfg, census=census)
+    deltas, peak, inexact = _delta_on_cards(accs, cfg, census=census, comm=comm)
     if stats is not None:
         stats["coarse_pad"] = pad
         stats["coarse_pad_true"] = pad_true

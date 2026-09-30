@@ -437,17 +437,48 @@ def forward_from_card_planes(shards, n_mesh, plane_batch=1, pencil_batch=1,
     (one thread per card; no real-space plane crosses the bus); pass 2 is split across
     the same devices. Bitwise equal to the host-slab path at the same batches; card
     boundaries must be `plane_batch` multiples. `timings` receives `pass1_s`, `pass2_s`.
+    The one-rank case of `forward_card_planes_to_pencils`.
+    """
+    n = int(n_mesh)
+    return forward_card_planes_to_pencils(shards, n, [(0, n)], [(0, n)], None,
+                                          plane_batch=plane_batch, pencil_batch=pencil_batch,
+                                          timings=timings, transfer=transfer)
+
+
+def forward_card_planes_to_pencils(shards, n_mesh, x_parts, y_parts, comm=None, plane_batch=1,
+                                   pencil_batch=1, timings=None, transfer="pageable",
+                                   receipt=None):
+    """`forward_from_card_planes` across ranks: this rank's cards hold x-planes
+    `x_parts[rank]` of the field, and it returns y-pencils `y_parts[rank]` = [y0, y1) of the
+    spectrum with the axis-0 FFT done, shape (N, y1 - y0, N // 2 + 1).
+
+    `x_parts` / `y_parts` are every rank's ranges in rank order, each tiling [0, N). Pass 1
+    writes each transformed plane's own y-block straight into the result and the other
+    ranks' blocks into send blocks; one `Alltoallv` delivers them into x-ranges of the
+    result, so nothing is copied into place. Pass 2 splits this rank's pencils over its
+    cards. Bitwise the one-rank spectrum's pencils (batches restart only on batch-aligned
+    boundaries; a transpose is a copy). One rank (`comm` None or of size 1) exchanges
+    nothing. `receipt`, if a dict, accumulates `forward_sent_bytes`; `timings` receives
+    `pass1_s`, `transpose_s`, `pass2_s`. Every rank must call this.
     """
     import jax.numpy as jnp
 
     n = int(n_mesh)
+    r, n_ranks = (0, 1) if comm is None else (int(comm.rank), int(comm.size))
+    x_parts = [(int(a), int(z)) for a, z in x_parts]
+    y_parts = [(int(a), int(z)) for a, z in y_parts]
+    if len(x_parts) != n_ranks or len(y_parts) != n_ranks:
+        raise ValueError(f"{n_ranks} rank(s) but {len(x_parts)} x and {len(y_parts)} y ranges")
+    x_lo, x_hi = x_parts[r]
+    y_lo, y_hi = y_parts[r]
+    m = n // 2 + 1
     shards = sorted(shards, key=lambda s: int(s["lo"]))
     b = max(1, int(plane_batch))
-    edge = 0
+    edge = x_lo
     for s in shards:
         lo, hi = int(s["lo"]), int(s["hi"])
         if lo != edge:
-            raise ValueError(f"card shards do not tile [0, {n}): a shard starts at {lo} "
+            raise ValueError(f"card shards do not tile [{x_lo}, {x_hi}): a shard starts at {lo} "
                              f"where the previous one ended at {edge}")
         if tuple(s["delta"].shape) != (hi - lo, n, n):
             raise ValueError(f"shard [{lo}, {hi}) has shape {tuple(s['delta'].shape)}, "
@@ -458,15 +489,18 @@ def forward_from_card_planes(shards, n_mesh, plane_batch=1, pencil_batch=1,
                 "batches would restart off the unpartitioned sequence and give a "
                 "different spectrum")
         edge = hi
-    if edge != n:
-        raise ValueError(f"card shards do not tile [0, {n}): they end at {edge}")
+    if edge != x_hi:
+        raise ValueError(f"card shards do not tile [{x_lo}, {x_hi}): they end at {edge}")
     dt = np.dtype(shards[0]["delta"].dtype)
     if any(np.dtype(s["delta"].dtype) != dt for s in shards):
         raise TypeError("card shards disagree on dtype")
     _require_x64_for(dt)
     refuse_oversize_device_transform(b * n * n, "device rfft2 batch")
     cd = _cdtype_for(dt)
-    spec = np.empty(_spec_shape(n), dtype=cd)
+    spec = np.empty((n, y_hi - y_lo, m), dtype=cd)
+    # the other ranks' y-blocks of this rank's planes, in x order
+    sends = [None if j == r else np.empty((x_hi - x_lo, y1 - y0, m), dtype=cd)
+             for j, (y0, y1) in enumerate(y_parts)]
     devs = [s["device"] for s in shards]
 
     def pass1(k, _k1, _dev):
@@ -476,20 +510,35 @@ def forward_from_card_planes(shards, n_mesh, plane_batch=1, pencil_batch=1,
             z = min(a + b, w)
             d = _from_device(jnp.fft.rfft2(s["delta"][a:z], axes=(-2, -1)), transfer)
             _check_spectral_dtype(d.dtype, cd, "device rfft2")
-            spec[lo + a:lo + z] = d
+            spec[lo + a:lo + z] = d[:, y_lo:y_hi]
+            for j, (y0, y1) in enumerate(y_parts):
+                if j != r:
+                    sends[j][lo - x_lo + a:lo - x_lo + z] = d[:, y0:y1]
 
     _t0 = _time.perf_counter()
     _run_parts(pass1, [(k, k + 1) for k in range(len(shards))], devs)
     _p1 = _time.perf_counter() - _t0
+
+    _t0 = _time.perf_counter()
+    if n_ranks > 1:
+        empty = np.empty(0, dtype=np.uint8)
+        comm.Alltoallv([empty if j == r else sends[j] for j in range(n_ranks)],
+                       [empty if i == r else spec[a:z] for i, (a, z) in enumerate(x_parts)])
+        if receipt is not None:
+            receipt["forward_sent_bytes"] = receipt.get("forward_sent_bytes", 0) + sum(
+                int(x.nbytes) for x in sends if x is not None)
+    sends = None
+    _tt = _time.perf_counter() - _t0
 
     def pass2(a, z, dev):
         fft_axis0_device_inplace(spec[:, a:z, :], pencil_batch=pencil_batch,
                                  device=dev, transfer=transfer)
 
     _t0 = _time.perf_counter()
-    _run_parts(pass2, partition_units(n, len(devs), pencil_batch), devs)
+    _run_parts(pass2, partition_units(y_hi - y_lo, len(devs), pencil_batch), devs)
     if timings is not None:
         timings["pass1_s"] = _p1
+        timings["transpose_s"] = _tt
         timings["pass2_s"] = _time.perf_counter() - _t0
     return spec
 
@@ -559,7 +608,7 @@ def _card_program(key, build):
 
 
 def inverse_to_card_shards(spec, n_mesh, shards, plane_batch=1, pencil_batch=1,
-                           timings=None, transfer="pageable", pass2=True):
+                           timings=None, transfer="pageable", pass2=True, plane_pieces=None):
     """`inverse_to_slabs_device` with the real-space planes written onto the cards.
 
     `shards` is `(x0, nx, device)` per card: that card receives global x-planes
@@ -571,6 +620,10 @@ def inverse_to_card_shards(spec, n_mesh, shards, plane_batch=1, pencil_batch=1,
     Bitwise `device.coarse.shard_coarse_meshes` of the host-slab mesh at the same
     `pencil_batch`. `plane_batch` must be 1 so a shared plane is never transformed in two
     different batches. `pass2=False` as in `inverse_to_slabs_device`.
+
+    `plane_pieces(g)`, if given, returns plane g as host y-blocks `(1, ny_i, M)` in y order
+    (`inverse_pencils_to_card_shards`); they are uploaded and concatenated on the card, which
+    is exact. None reads `spec[g]` whole.
     """
     import jax
     import jax.numpy as jnp
@@ -614,8 +667,12 @@ def inverse_to_card_shards(spec, n_mesh, shards, plane_batch=1, pencil_batch=1,
         m = zeros(jnp.asarray(z) if dev is None else jax.device_put(z, dev))
         for i in range(nx):
             g = (x0 + i) % n
-            d = jnp.fft.irfft2(_to_device(spec[g:g + 1], dev, transfer), s=(n, n),
-                               axes=(-2, -1))
+            if plane_pieces is None:
+                x = _to_device(spec[g:g + 1], dev, transfer)
+            else:
+                ps = [_to_device(q, dev, transfer) for q in plane_pieces(g)]
+                x = ps[0] if len(ps) == 1 else jnp.concatenate(ps, axis=1)
+            d = jnp.fft.irfft2(x, s=(n, n), axes=(-2, -1))
             _check_spectral_dtype(d.dtype, rdtype, "device irfft2")
             idx = np.int64(i)
             m = put(m, jnp.asarray(idx) if dev is None else jax.device_put(idx, dev), d[0])
@@ -626,6 +683,76 @@ def inverse_to_card_shards(spec, n_mesh, shards, plane_batch=1, pencil_batch=1,
     if timings is not None:
         timings["pass1_s"] = _time.perf_counter() - _t0
         timings["pass2_s"] = _p2
+    return out
+
+
+def _plane_runs(ranges, n):
+    """The x planes covered by `(x0, nx)` ranges (mod n), as maximal runs [a, b) in [0, n)."""
+    planes = sorted({(int(x0) + i) % n for x0, nx in ranges for i in range(int(nx))})
+    runs = []
+    for g in planes:
+        if runs and runs[-1][1] == g:
+            runs[-1][1] = g + 1
+        else:
+            runs.append([g, g + 1])
+    return [tuple(x) for x in runs]
+
+
+def inverse_pencils_to_card_shards(work, n_mesh, shards, y_parts, comm=None, timings=None,
+                                   transfer="pageable", receipt=None):
+    """`inverse_to_card_shards` (after a folded axis-0 pass, `pass2=False`) across ranks:
+    `work` holds this rank's y-pencils `y_parts[rank]` of the spectrum, shape
+    (N, y1 - y0, M), and `shards` are this rank's cards' `(x0, nx, device)` plane ranges.
+
+    Every rank's ranges are allgathered; the planes each rank needs go to it as runs of
+    consecutive planes, sent as views of `work` (one `Alltoallv` per run index). Each plane
+    then reaches its card as the ranks' y-blocks in rank order, the own block read in place,
+    and is concatenated there (exact) before the `irfft2`. One rank exchanges nothing and
+    runs `inverse_to_card_shards` unchanged. `receipt`, if a dict, accumulates
+    `inverse_sent_bytes`; `timings` gains `transpose_s`. Every rank must call this.
+    """
+    n = int(n_mesh)
+    m = n // 2 + 1
+    r, n_ranks = (0, 1) if comm is None else (int(comm.rank), int(comm.size))
+    y_parts = [(int(a), int(z)) for a, z in y_parts]
+    y_lo, y_hi = y_parts[r]
+    if tuple(work.shape) != (n, y_hi - y_lo, m):
+        raise ValueError(f"work has shape {tuple(work.shape)}, want {(n, y_hi - y_lo, m)} "
+                         f"(this rank's pencils [{y_lo}, {y_hi}))")
+    if n_ranks == 1:
+        return inverse_to_card_shards(work, n, shards, timings=timings, transfer=transfer,
+                                      pass2=False)
+    _t0 = _time.perf_counter()
+    mine = _plane_runs([(x0, nx) for x0, nx, _dev in shards], n)
+    runs = comm.allgather(mine)
+    empty = np.empty(0, dtype=np.uint8)
+    recv, sent = {}, 0
+    for k in range(max(len(x) for x in runs)):
+        sendbufs, recvbufs = [empty] * n_ranks, [empty] * n_ranks
+        for j in range(n_ranks):
+            if j != r and k < len(runs[j]):
+                a, z = runs[j][k]
+                sendbufs[j] = work[a:z]
+                sent += int(sendbufs[j].nbytes)
+        if k < len(mine):
+            a, z = mine[k]
+            for i, (y0, y1) in enumerate(y_parts):
+                if i != r:
+                    recv[(i, k)] = recvbufs[i] = np.empty((z - a, y1 - y0, m), dtype=work.dtype)
+        comm.Alltoallv(sendbufs, recvbufs)
+    _tt = _time.perf_counter() - _t0
+    where = {g: (k, g - a) for k, (a, z) in enumerate(mine) for g in range(a, z)}
+
+    def pieces(g):
+        k, o = where[g]
+        return [work[g:g + 1] if i == r else recv[(i, k)][o:o + 1] for i in range(n_ranks)]
+
+    out = inverse_to_card_shards(work, n, shards, timings=timings, transfer=transfer,
+                                 pass2=False, plane_pieces=pieces)
+    if timings is not None:
+        timings["transpose_s"] = _tt
+    if receipt is not None:
+        receipt["inverse_sent_bytes"] = receipt.get("inverse_sent_bytes", 0) + sent
     return out
 
 
@@ -847,7 +974,7 @@ def _kernel_on_card(factors, consts, kx, ky, kz):
 
 def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inverse=False,
                        transform=True, devices=None, pencil_batch=1, timings=None,
-                       transfer="pageable"):
+                       transfer="pageable", pencils=None):
     """Combine spectra, apply a k-space kernel and run the axis-0 (i)fft, on the cards.
 
     `sources` is a sequence of `(coef, spec)`, each spec an (N, N, M) host array of one
@@ -858,6 +985,10 @@ def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inv
     None (identity). `out` may be one of the sources (each thread touches only its own y
     range). Bitwise the same at every card count. Device replacement for
     `mul_radial_inplace` / `grad_invk2_spec` / `deriv2_spec` + `fft_axis0_inplace`.
+
+    `pencils = (y0, y1)`: the sources and `out` hold only global y-pencils [y0, y1), shape
+    (N, y1 - y0, M), one rank's share (`forward_card_planes_to_pencils`); the kernel is
+    evaluated at those global rows. None is the whole half-grid.
     """
     import jax
     import jax.numpy as jnp
@@ -867,8 +998,12 @@ def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inv
         raise ValueError("sources= was empty")
     shape, cdt = srcs[0][1].shape, np.dtype(srcs[0][1].dtype)
     n = int(n_mesh)
-    if shape != _spec_shape(n):
-        raise ValueError(f"source shape {shape} is not the (N, N, N//2+1) half-grid for N={n}")
+    y0, y1 = (0, n) if pencils is None else (int(pencils[0]), int(pencils[1]))
+    if not 0 <= y0 < y1 <= n:
+        raise ValueError(f"pencils [{y0}, {y1}) are not inside [0, {n})")
+    if shape != (n, y1 - y0, n // 2 + 1):
+        raise ValueError(f"source shape {shape} is not the (N, {y1 - y0}, N//2+1) half-grid "
+                         f"pencils [{y0}, {y1}) for N={n}")
     for _c, s in srcs:
         if s.shape != shape or np.dtype(s.dtype) != cdt:
             raise ValueError("sources disagree on shape or dtype")
@@ -924,9 +1059,9 @@ def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inv
             blocks = tuple(_to_device(np.ascontiguousarray(s[:, lo:hi, :]), dev, transfer)
                            for _c, s in srcs)
             kblocks = () if arr_kernel is None else arr_kernel.device_blocks(
-                lo, hi, dev, transfer)
-            d = _from_device(prog(coefs, blocks, kxd, put(kx[lo:hi]), kzd, cst, kblocks),
-                             transfer)
+                y0 + lo, y0 + hi, dev, transfer)
+            d = _from_device(prog(coefs, blocks, kxd, put(kx[y0 + lo:y0 + hi]), kzd, cst,
+                                  kblocks), transfer)
             _check_spectral_dtype(d.dtype, cdt, "device k-space pass")
             out[:, lo:hi, :] = d
 
