@@ -54,7 +54,7 @@ if [ "${REHEARSAL:-0}" = 1 ]; then
   export XLA_FLAGS="--xla_cpu_multi_thread_eigen=false --xla_force_host_platform_device_count=1"
   export XLA_CACHE_ROOT=$RUNS/xla-cache-$SLURM_JOB_ID
   ICS_ARGS=(--tile-workers 1 --a-init 0.08)
-  MEMBIND_RANK=() MEMBIND_CHECK=() MACHINE=(--allow-cpu)
+  BIND0=() MEMBIND_RANK=() MEMBIND_CHECK=() MACHINE=(--allow-cpu)
 else
   [ "$SLURM_JOB_PARTITION" = gh ] || { echo "FATAL: gh only (one GH200 per node)"; exit 1; }
   command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
@@ -71,7 +71,7 @@ else
   [ -x "$PY" ] || { echo "FATAL: no $PY (install the gpu env first)"; exit 1; }
   export CONDA_PREFIX=$ENV
   ICS_ARGS=(--generator device)
-  MEMBIND_RANK=(--membind 0) MEMBIND_CHECK=(--membind-nodes 0)
+  BIND0=(numactl --membind=0) MEMBIND_RANK=(--membind 0) MEMBIND_CHECK=(--membind-nodes 0)
   MACHINE=(--host-gb 116 --device-gb 96)
 fi
 PRESET=${PRESET:-c-1024} K=${K:-120} SPLIT=${SPLIT:-20} STOP=${STOP:-$K} EVERY=${EVERY:-$SPLIT}
@@ -229,12 +229,12 @@ run_leg guard-mpi-lane \
     tests/test_comm_mpi.py tests/test_driver_mpi.py
 
 run_leg ics \
-  "${ON0[@]}" "$PY" scripts/run/realization.py ics --config "$PRESET" --workdir "$ICS" \
-    "${ICS_ARGS[@]}" \
+  "${BIND0[@]}" "${ON0[@]}" "$PY" scripts/run/realization.py ics --config "$PRESET" \
+    --workdir "$ICS" "${ICS_ARGS[@]}" \
   || { echo "FATAL: the IC generation failed"; exit 1; }
 for n in 1 2; do
   run_leg "preflight-$n-node" \
-    "${ON0[@]}" "$PY" "$DRIVER" preflight --preset "$PRESET" --workdir "$ICS" --cards 1 \
+    "${BIND0[@]}" "${ON0[@]}" "$PY" "$DRIVER" preflight --preset "$PRESET" --workdir "$ICS" --cards 1 \
       --card "$CARDS/${TAG}_preflight_n$n.json" --scratch "$RUNS" --n-nodes $n \
       "${MACHINE[@]}" "${MEMBIND_CHECK[@]}" "${LAYOUT[@]}" \
     || { echo "FATAL: preflight refused"; exit 1; }
