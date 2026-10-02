@@ -15,7 +15,8 @@
 #   PREFIX_mem.csv (epoch, NUMA node, has_cpus, MemTotal, MemFree, FilePages, Dirty,
 #   Writeback, Mlocked, all kB; skipped without /sys NUMA nodes) -- the formats of the
 #   single-node job scripts, so `device_run.py summarize` reads them. The samplers stop when
-#   the command's process is gone.
+#   the command's process is gone or a zombie, and hold none of the launcher's pipes: hydra
+#   waits for those to close before it reaps the rank, and an unreaped rank is still a pid.
 set -euo pipefail
 
 membind="" samples=""
@@ -41,16 +42,30 @@ samples=${samples//@RANK@/$rank}
 
 # the command keeps this shell's pid after the exec below
 me=$$
+alive () {
+  local s
+  s=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  case "$s" in *Z*|"") return 1 ;; esac
+}
+# a sampler's first act: let go of every inherited descriptor but its own stdout/stderr
+detach () {
+  local fd
+  exec </dev/null
+  for fd in /dev/fd/*; do
+    fd=${fd##*/}
+    if [ "$fd" -gt 2 ] 2>/dev/null; then { eval "exec $fd>&-"; } 2>/dev/null || true; fi
+  done
+}
 if [ -n "$samples" ]; then
   mkdir -p "$(dirname "$samples")"
   if command -v nvidia-smi >/dev/null; then
-    ( while kill -0 "$me" 2>/dev/null; do t=$(date +%s.%N)
+    ( detach; while alive "$me"; do t=$(date +%s.%N)
         nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits \
           2>/dev/null | sed "s/^/$t, /"
         sleep 5; done ) > "${samples}_gpu.csv" 2>/dev/null &
   fi
   if compgen -G "/sys/devices/system/node/node[0-9]*" >/dev/null; then
-    ( while kill -0 "$me" 2>/dev/null; do t=$(date +%s.%N)
+    ( detach; while alive "$me"; do t=$(date +%s.%N)
         for d in /sys/devices/system/node/node[0-9]*; do
           n=${d##*node}; c=0; [ -n "$(tr -d '[:space:]' < "$d/cpulist")" ] && c=1
           awk -v t="$t" -v n="$n" -v c="$c" '/MemTotal:/{tot=$4} /MemFree:/{fr=$4}

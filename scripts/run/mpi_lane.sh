@@ -23,7 +23,7 @@ if [ "${1:-}" = "--run" ]; then
   run=1; shift
   [ "$#" -gt 0 ] || { echo "mpi_lane: --run needs a command" >&2; exit 2; }
 elif [ "$#" -eq 0 ]; then
-  set -- tests/test_comm_mpi.py tests/test_driver_mpi.py
+  set -- tests/test_comm_mpi.py tests/test_driver_mpi.py tests/test_job_scripts.py
 fi
 cd "$here"
 # shellcheck disable=SC2086
