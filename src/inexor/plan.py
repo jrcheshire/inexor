@@ -200,14 +200,21 @@ REPACK_DEVICE_B_PER_SLAB_ROW = 70
 # `device.fused.migrate_repack_device` (measured at 1024^3, not production shape).
 FUSED_DEVICE_B_PER_SLAB_ROW = 257
 
-# Host bytes the first tile loop (and any recompile) holds above the loop's closing RSS, per
-# card, beyond the window write-back, keyed by tile size: compiling the tile programs and
-# writing them to the persistent compilation cache. MEASURED: attributed at cgh64 on 4 GB200
-# (job 1034340: jax compilation_cache + zstd traced, the rest untraced compiler memory; the
-# second step's tile loop holds nothing), 2.0 GB/card on one GH200 (1029876); 10.5 GB/card at
-# c-hero (1003657, step 1; steady steps of 1027664 hold ~the write-back alone). It depends
-# on the tile programs, not on the slab. Other tile sizes take the largest.
-TILE_COMPILE_HOST_PER_CARD = {256: 2.9 * GB, 512: 10.5 * GB}
+# Host bytes per card at the tile-capacity rung a production run climbs (`capacity_shape`),
+# keyed by tile size; other tile sizes take the largest. Every measured 120-step run climbed
+# at least one rung (c-1024 two), so one is priced. Both are per card and do not depend on
+# the slab (a 2-rank rank and the one-node run measure the same). MEASURED, smallest taken:
+# - the tile loop's jump at the rung step above the step before, beyond the window write-back
+#   (compiling the new tile programs and writing them to the persistent compilation cache).
+#   256: 5.28-5.41 GB (job 1043437, c-1024 on 1 and 2 gh, rungs at steps 74 and 116). 512:
+#   16.3 GB (c-hero on 4 GB200, 1024784, step 61). The first step's compile is smaller
+#   (2.4-3.0 and 10.5 GB). It assumes the cache, which the job scripts set; without it the
+#   jump is 3.6 GB at 256 (1029876).
+# - the rise every in-step phase keeps after it, steps r+3..r+7 against r-5..r-1.
+#   256: 1.67-2.26 GB (1043437, 1029876 at c-1024 and cgh64). 512: 0.51-0.89 GB (1024784;
+#   the two steps after the rung carry up to 6.5 GB, the coarse solve 1.4 GB).
+TILE_RUNG_HOST_PER_CARD = {256: 5.28 * GB, 512: 16.3 * GB}
+TILE_RUNG_KEPT_HOST_PER_CARD = {256: 1.67 * GB, 512: 0.51 * GB}
 # The device-lane process's host floor beyond the priced state (CUDA context, jaxlib, XLA's
 # host pools), keyed by cards per node. MEASURED: 4.265 / 4.281 GB on one GH200 at cgh64 /
 # c-1024 (job 1029876, RSS after step 1 minus the priced resident; the smaller is taken, so
@@ -476,9 +483,9 @@ def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
     # the windowed tile loop writes back one core slab of `w` per card at once
     add("tile_loop", "tile_window write-back (one slab of w per card)",
         n_gpus * int(capacity_shape(max(1, int(slab_rows)))) * 3 * np.dtype(np.int16).itemsize)
-    add("tile_loop", "tile program compile, first step and recompiles (MEASURED, per card)",
-        n_gpus * TILE_COMPILE_HOST_PER_CARD.get(int(ec.n_tile),
-                                                max(TILE_COMPILE_HOST_PER_CARD.values())))
+    add("tile_loop", "tile programs recompiled at a capacity rung (MEASURED, per card)",
+        n_gpus * TILE_RUNG_HOST_PER_CARD.get(int(ec.n_tile),
+                                             max(TILE_RUNG_HOST_PER_CARD.values())))
     if n_gpus > 1:
         add("lead_drift", "lead drift card transfers (MEASURED at c-hero, per card)",
             n_gpus * LEAD_DRIFT_HOST_B_PER_SLAB_ROW_PER_CARD * slab_rows)
@@ -562,6 +569,8 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     The host column is the state plus host-side step windows; the per-GPU column is the
     sharded coarse mesh, one card's tile workspace and the state window a tile plane needs.
     """
+    from .engine import ONCE_PER_RUN_PHASES
+
     dev_args = argparse.Namespace(**vars(args))
     # One process per GPU: fine-arm terms scale with `tile_workers`, so price one.
     dev_args.workers = 1
@@ -598,7 +607,15 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     _table("HOST, by phase (summed within a phase; phases do not coexist)",
            {f"{p}: {k}": v for p, terms in host_ph.items() for k, v in terms.items()},
            total_label="sum of ALL phases listed")
-    host_phase_sums = {p: sum(t.values()) for p, t in host_ph.items()}
+    # Held from the rung on by every in-step phase; the tile loop's rung jump is measured above
+    # the step before, so it does not carry it, and the once-per-run phases run before it.
+    rung_kept = n_gpus * TILE_RUNG_KEPT_HOST_PER_CARD.get(
+        int(ec.n_tile), max(TILE_RUNG_KEPT_HOST_PER_CARD.values()))
+    host_phase_sums = {p: sum(t.values()) + (
+        0 if p == "tile_loop" or p in ONCE_PER_RUN_PHASES else rung_kept)
+        for p, t in host_ph.items()}
+    print(f"  held from the capacity rung on (MEASURED, per card), charged to every in-step "
+          f"phase\n  but the tile loop: {_fmt(rung_kept).strip()}")
     worst_host = max(host_phase_sums, key=host_phase_sums.get)
     print(f"  worst phase: {worst_host} at {_fmt(host_phase_sums[worst_host]).strip()} "
           "above the resident")

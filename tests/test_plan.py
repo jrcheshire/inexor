@@ -742,6 +742,65 @@ def test_the_process_baseline_closes_the_single_gh200_floor(capsys):
         assert 0.95 * floor <= resident <= floor, (preset, resident, floor)
 
 
+def _rung_lines(out):
+    """(tile-loop rung jump GB, held-from-the-rung GB) as printed."""
+    jump = float(next(ln for ln in out.splitlines()
+                      if "recompiled at a capacity rung" in ln).split()[-2])
+    held = float(out.split("but the tile loop:")[1].split()[0])
+    return jump, held
+
+
+@pytest.mark.parametrize("preset,cards,jump,kept", [
+    # per card, the smallest measured: c-1024 on 1 and 2 gh (job 1043437, rungs 74 and 116),
+    # c-hero on 4 GB200 (1024784, rung 61); the kept rise is every phase's, 5 steps on
+    ("c-1024", 1, (5.28, 5.41), (1.67, 2.26)),
+    ("c-hero", 4, (16.3, 16.3), (0.51, 0.89)),
+])
+def test_the_rung_terms_are_the_measured_ones_per_card(capsys, preset, cards, jump, kept):
+    main(["--preset", preset, "--backend", "device", "--n-gpus", str(cards)])
+    got_jump, got_held = _rung_lines(capsys.readouterr().out)
+    assert jump[0] - 0.01 <= got_jump / cards <= jump[1] + 0.01
+    assert kept[0] - 0.01 <= got_held / cards <= kept[1] + 0.01
+
+
+def test_what_the_rung_keeps_is_charged_to_every_in_step_phase_but_the_tile_loop(capsys):
+    """The tile loop's rung jump is measured above the step before, so it already sits on
+    the kept bytes; the kernel build runs once, before any rung. At c-gh on 2 gh the coarse
+    solve binds with them in it."""
+    main(["--preset", "c-gh", "--backend", "device", "--n-gpus", "1", "--n-nodes", "2"])
+    out = capsys.readouterr().out
+    resident = float(next(ln for ln in out.split("HOST, resident for the whole run")[1]
+                          .split("\n\n")[0].splitlines()
+                          if ln.strip().startswith("total")).split()[-2])
+    sums = {}
+    for ln in out.split("HOST, by phase")[1].split("\n\n")[0].splitlines():
+        if ":" in ln and ln.rstrip().endswith("GB"):
+            p = ln.split(":")[0].strip()
+            sums[p] = sums.get(p, 0.0) + float(ln.split()[-2])
+    _, held = _rung_lines(out)
+    want = resident + max(s + (0 if p in ("tile_loop", "kernel_build") else held)
+                          for p, s in sums.items())
+    peak = float(out.split("host, a lower bound on the run's peak:")[1].split()[0])
+    assert abs(peak - want) < 0.01, (peak, want)
+
+
+@pytest.mark.parametrize("args,measured", [
+    # whole-run host peaks, GB per node, of runs with the persistent compilation cache the
+    # rung jump is priced with, each priced as it ran (coarse kernel on the host before
+    # 6519f1e). 1043437: one gh (the smaller of the two reference nodes) and the busier of 2
+    # ranks
+    (["--preset", "c-1024", "--n-gpus", "1"], 25.96),
+    (["--preset", "c-1024", "--n-gpus", "1", "--n-nodes", "2"], 19.26),
+    # c-hero on 4 GB200 over 120 steps (1024783 / 1024784 / 1027664), at the rung
+    (["--preset", "c-hero", "--n-gpus", "4", "--coarse-kernel", "host"], 943.0),
+])
+def test_the_host_peak_stays_under_every_measured_whole_run_peak(capsys, args, measured):
+    main(args + ["--backend", "device"])
+    out = capsys.readouterr().out
+    peak = float(out.split("host, a lower bound on the run's peak:")[1].split()[0])
+    assert peak <= measured, f"priced {peak:.2f} GB over the measured {measured} GB"
+
+
 def test_the_pre_step_phases_are_credited_the_untouched_slack(capsys):
     """The kernel build and the lead drift run before any insert has touched the slack rows,
     so both are charged against the resident minus the slack; the credit is printed."""
