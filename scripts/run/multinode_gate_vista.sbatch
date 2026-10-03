@@ -60,43 +60,9 @@ export PYTHONUNBUFFERED=1
 if [ "${REHEARSAL:-0}" = 1 ]; then
   PRESET=${PRESET:-cdev8-tile32} K=${K:-40} SPLIT=${SPLIT:-3} STOP=${STOP:-6}
   SLACK=${SLACK:-0.20} ARENA=${ARENA_FRAC:-0.20}
-  SLURM_JOB_ID=${SLURM_JOB_ID:-rehearsal-$$}
-  PY=python
-  export JAX_PLATFORMS=cpu OMP_NUM_THREADS=1
-  export XLA_FLAGS="--xla_cpu_multi_thread_eigen=false --xla_force_host_platform_device_count=1"
-  export XLA_CACHE_ROOT=$RUNS/xla-cache-$SLURM_JOB_ID
   ICS_ARGS=(--tile-workers 1 --a-init 0.08)
-  STUBS=$RUNS/stubs-$SLURM_JOB_ID
-  mkdir -p "$STUBS"
-  printf '#!/bin/sh\necho "0, 1, 0"\n' > "$STUBS/nvidia-smi"
-  # numactl --membind=NODES CMD...: CMD
-  cat > "$STUBS/numactl" <<'STUB'
-#!/bin/sh
-while [ $# -gt 0 ]; do case "$1" in --*) shift ;; *) break ;; esac; done
-exec "$@"
-STUB
-  chmod +x "$STUBS/nvidia-smi" "$STUBS/numactl"
-  export PATH="$STUBS:$PATH"
-  # MEMBIND_CHECK stays off: the driver's binding check reads Linux /proc
-  BIND0=(numactl --membind=0) MEMBIND_RANK=(--membind 0) MEMBIND_CHECK=() MACHINE=(--allow-cpu)
 else
-  [ "$SLURM_JOB_PARTITION" = gh ] || { echo "FATAL: gh only (one GH200 per node)"; exit 1; }
-  command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
-  export XLA_PYTHON_CLIENT_PREALLOCATE=false
-  export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
-  export XLA_CLIENT_MEM_FRACTION=0.95
-  # JAX's default host-memory cap is 64 GB, below what host streaming needs here
-  export XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=160
-  export INEXOR_LOAD_TRACE=1
-  export JAX_LOG_COMPILES=1
-  unset JAX_PLATFORMS CUDA_VISIBLE_DEVICES XLA_FLAGS
-  ENV=$SRC/.pixi/envs/gpu
-  PY=$ENV/bin/python3.14  # the versioned launcher: a scratch purge can take `python`
-  [ -x "$PY" ] || { echo "FATAL: no $PY (install the gpu env first)"; exit 1; }
-  export CONDA_PREFIX=$ENV
   ICS_ARGS=(--generator device)
-  BIND0=(numactl --membind=0) MEMBIND_RANK=(--membind 0) MEMBIND_CHECK=(--membind-nodes 0)
-  MACHINE=(--host-gb 116 --device-gb 96)
 fi
 PRESET=${PRESET:-c-1024} K=${K:-120} SPLIT=${SPLIT:-20} STOP=${STOP:-$K} EVERY=${EVERY:-$SPLIT}
 SLACK=${SLACK:-0.10} ALLOC_MARGIN=${ALLOC_MARGIN:-0.10} ARENA=${ARENA:-${ARENA_FRAC:-0.01}}
@@ -105,12 +71,6 @@ LEG_FIXED_S=${LEG_FIXED_S:-600} LEG_STEP_S=${LEG_STEP_S:-100} QUIET_S=${QUIET_S:
 N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 . "$SRC/scripts/run/mpi_env_vista.sh"
 . "$SRC/scripts/run/job_lib.sh"
-# after the module: the env's own MPICH (in its bin) must not shadow the module's launcher
-[ -n "${ENV:-}" ] && export PATH="$PATH:$ENV/bin"
-ON0=(env "JAX_COMPILATION_CACHE_DIR=${JAX_COMPILATION_CACHE_DIR//@RANK@/0}")
-CPU=(env JAX_PLATFORMS=cpu)
-MPIPATH=()
-[ -n "$MPI4PY_DIR" ] && MPIPATH=(env "PYTHONPATH=$MPI4PY_DIR${PYTHONPATH:+:$PYTHONPATH}")
 
 WORK=$RUNS/mn-gate-$PRESET-$SLURM_JOB_ID
 ICS=$WORK/ics
@@ -118,8 +78,6 @@ ICS=$WORK/ics
 LEG_DIR=$WORK/legs
 CARDS=$SRC/runs/v2
 TAG=mngate_${PRESET}_$SLURM_JOB_ID
-DRIVER=$SRC/scripts/run/device_run.py
-RANK_EXEC=$SRC/scripts/run/rank_exec.sh
 LAYOUT=(--slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA")
 mkdir -p "$WORK" "$CARDS"
 
@@ -156,15 +114,6 @@ run_args () {
     --checkpoint-every "$EVERY"
 }
 
-# on_ranks SAMPLES EXTRA CMD...: CMD on every node at once, one process per node, through the
-# launch line of every run leg: rank_exec (membind, samplers) and the job's XLA_FLAGS + EXTRA
-on_ranks () {
-  local samples=$1 extra=$2; shift 2
-  xla_env "$extra"
-  # shellcheck disable=SC2086
-  $LAUNCH "$RANK_EXEC" "${MEMBIND_RANK[@]}" --samples "$samples" -- "${XLA_ENV[@]}" "$@"
-}
-
 # refs ARM FROM STOP [XLA_FLAGS]: the one-node run on every node at once
 refs () {
   local arm=$1 from=$2 stop=$3 extra=${4:-}
@@ -189,23 +138,6 @@ ranks () {
 stop_job () {
   echo "=== stopping: the $1 leg failed; every output is kept under $WORK ==="
   exit "$rc_total"
-}
-
-# summarize every rank's card of one leg against its node's samples
-summarize () {
-  local arm=$1 from=$2 card r
-  for r in 0 1; do
-    case $arm in
-      ref*|det-ref*) card=$CARDS/${TAG}_${arm}${r}_s${from}.json ;;
-      *) card=$CARDS/${TAG}_${arm}_s${from}.rank${r}.json ;;
-    esac
-    [ -f "$card" ] || continue
-    "${CPU[@]}" "$PY" "$DRIVER" summarize --card "$card" \
-      --gpu-csv "$CARDS/${TAG}_${arm}_s${from}_r${r}_gpu.csv" \
-      --mem-csv "$CARDS/${TAG}_${arm}_s${from}_r${r}_mem.csv" \
-      --out "${card%.json}_summary.json" >/dev/null 2>&1 \
-      && echo "  summary ${card%.json}_summary.json"
-  done
 }
 
 # --- guards and inputs (node 0)

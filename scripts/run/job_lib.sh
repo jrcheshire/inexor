@@ -5,6 +5,8 @@
 # The sourcing script sets LEG_DIR (each leg's output is also kept in LEG_DIR/NN-name.log) and
 # rc_total (each failed leg or gate adds one). Optional: LEG_POLL_S (10 s between checks on a
 # running leg), LEG_KILL_GRACE_S (60 s from TERM to KILL).
+# `on_ranks` reads LAUNCH, RANK_EXEC and MEMBIND_RANK, and `summarize` PY, CPU, DRIVER and
+# N_RANKS (all from mpi_env_vista.sh), and CARDS and TAG (the script's card dir and prefix).
 
 LEG_N=0
 LEG_KILLED=0
@@ -21,6 +23,34 @@ xla_env () {
   else
     XLA_ENV=(env -u XLA_FLAGS)
   fi
+}
+
+# on_ranks SAMPLES EXTRA CMD...: CMD on every node at once, one process per node, through the
+# launch line of every run leg: rank_exec (membind, samplers) and the job's XLA_FLAGS + EXTRA
+on_ranks () {
+  local samples=$1 extra=$2; shift 2
+  xla_env "$extra"
+  # shellcheck disable=SC2086
+  $LAUNCH "$RANK_EXEC" "${MEMBIND_RANK[@]}" --samples "$samples" -- "${XLA_ENV[@]}" "$@"
+}
+
+# summarize ARM FROM: every rank's card of one leg against its node's samples. Arms named
+# ref* / det-ref* are one-node runs with a card per node (TAG_ARM<r>_sFROM.json); any other
+# arm is one run across the ranks (TAG_ARM_sFROM.rank<r>.json).
+summarize () {
+  local arm=$1 from=$2 card r
+  for ((r = 0; r < N_RANKS; r++)); do
+    case $arm in
+      ref*|det-ref*) card=$CARDS/${TAG}_${arm}${r}_s${from}.json ;;
+      *) card=$CARDS/${TAG}_${arm}_s${from}.rank${r}.json ;;
+    esac
+    [ -f "$card" ] || continue
+    "${CPU[@]}" "$PY" "$DRIVER" summarize --card "$card" \
+      --gpu-csv "$CARDS/${TAG}_${arm}_s${from}_r${r}_gpu.csv" \
+      --mem-csv "$CARDS/${TAG}_${arm}_s${from}_r${r}_mem.csv" \
+      --out "${card%.json}_summary.json" >/dev/null 2>&1 \
+      && echo "  summary ${card%.json}_summary.json"
+  done
 }
 
 # leg_tree PID: PID and every descendant, children first
@@ -122,6 +152,34 @@ same_ckpt () {
   done < <(cd "$a" && find . -type f | sort)
   echo "  $(cd "$a" && find . -type f | wc -l | tr -d ' ') files, $bad differing: $a vs $b"
   [ $bad -eq 0 ]
+}
+
+# manifest_field GENDIR EXPR: EXPR of GENDIR/manifest.json, loaded as `m`
+manifest_field () {
+  "${PY:-python3}" -c "import json, sys; m = json.load(open(sys.argv[1] + '/manifest.json')); print($2)" "$1"
+}
+
+# ckpt_generations CKPT: "OLDER FROM TO", the generation at the lower step and the two steps.
+# Fails unless both generations have a manifest, at different steps.
+ckpt_generations () {
+  local s0 s1
+  s0=$(manifest_field "$1/gen0" "m['provenance']['step']" 2>/dev/null) || return 1
+  s1=$(manifest_field "$1/gen1" "m['provenance']['step']" 2>/dev/null) || return 1
+  if [ "$s0" -lt "$s1" ]; then echo "gen0 $s0 $s1"
+  elif [ "$s1" -lt "$s0" ]; then echo "gen1 $s1 $s0"
+  else return 1
+  fi
+}
+
+# ckpt_newest CKPT: "GEN STEP" of the generation at the higher step; fails when none has a
+# manifest
+ckpt_newest () {
+  local g s best=-1 newest=""
+  for g in gen0 gen1; do
+    s=$(manifest_field "$1/$g" "m['provenance']['step']" 2>/dev/null) || continue
+    if [ "$s" -gt "$best" ]; then best=$s newest=$g; fi
+  done
+  [ -n "$newest" ] && echo "$newest $best"
 }
 
 # gate NAME DIR...: every DIR's files equal the first's

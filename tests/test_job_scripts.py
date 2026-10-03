@@ -241,3 +241,93 @@ def test_gate_passes_only_identical_checkpoints(tmp_path, case):
         assert "GATE test PASS" in r.stdout and "rc=0" in r.stdout
     else:
         assert "GATE test FAIL" in r.stdout and "rc=1" in r.stdout
+
+
+def _gen(ckpt, g, step, n_particles=8):
+    d = ckpt / g
+    d.mkdir(parents=True)
+    (d / "manifest.json").write_text(
+        f'{{"n_particles": {n_particles}, "provenance": {{"step": {step}, "n_steps": 120}}}}')
+
+
+@pytest.mark.parametrize("steps,want", [
+    ((100, 120), "gen0 100 120"), ((120, 100), "gen1 100 120"),
+    ((100, None), None), ((None, None), None), ((100, 100), None)])
+def test_ckpt_generations_names_the_older_generation_and_both_steps(tmp_path, steps, want):
+    for g, s in zip(("gen0", "gen1"), steps):
+        if s is not None:
+            _gen(tmp_path / "ckpt", g, s)
+    r = _lib(f'ckpt_generations "{tmp_path}/ckpt"; echo "rc=$?"', tmp_path,
+             PY=sys.executable)
+    if want is None:
+        assert r.stdout.strip() == "rc=1", r.stdout
+    else:
+        assert r.stdout.split("\n")[:2] == [want, "rc=0"], r.stdout
+
+
+@pytest.mark.parametrize("steps,want", [
+    ((100, 120), "gen1 120"), ((120, 100), "gen0 120"), ((None, 20), "gen1 20"),
+    ((None, None), None)])
+def test_ckpt_newest_is_the_generation_at_the_higher_step(tmp_path, steps, want):
+    for g, s in zip(("gen0", "gen1"), steps):
+        if s is not None:
+            _gen(tmp_path / "ckpt", g, s)
+    r = _lib(f'ckpt_newest "{tmp_path}/ckpt"; echo "rc=$?"', tmp_path, PY=sys.executable)
+    if want is None:
+        assert r.stdout.strip() == "rc=1", r.stdout
+    else:
+        assert r.stdout.split("\n")[:2] == [want, "rc=0"], r.stdout
+
+
+STEPS = os.path.join(HERE, "scripts", "run", "multinode_steps_vista.sbatch")
+
+
+def _steps_job(tmp_path, **env):
+    """The steps job script up to its first refusal; the inputs exist unless overridden.
+
+    Its environment is only what is set here, so a job's own EXPECT_STEP or PLANT_* (this
+    file runs as a guard inside the job) cannot reach it. Past a refusal it would start legs,
+    this file among them, so `python`, `mpiexec` and `pixi` are stubs that fail at once, and
+    the script runs in its own session, killed on timeout.
+    """
+    for d in ("ics", "ref", "ref_ics"):
+        (tmp_path / d).mkdir(exist_ok=True)
+    stubs = tmp_path / "stubs"
+    stubs.mkdir(exist_ok=True)
+    for name in ("python", "python3", "mpiexec", "pixi"):
+        (stubs / name).write_text("#!/bin/sh\nexit 97\n")
+        (stubs / name).chmod(0o755)
+    e = {k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ}
+    e["PATH"] = f"{stubs}:{os.environ.get('PATH', '')}"
+    e.update(REHEARSAL="1", INEXOR_SRC=HERE, INEXOR_RUNS=str(tmp_path / "runs"),
+             IC_DIR=str(tmp_path / "ics"), REAL_DIR=str(tmp_path / "real"),
+             CONTROL_REF=str(tmp_path / "ref"), CONTROL_ICS=str(tmp_path / "ref_ics"))
+    e.update(env)
+    p = subprocess.Popen([BASH, STEPS], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=e, start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, 9)
+        p.communicate()
+        pytest.fail("the steps job went past its refusals")
+    return subprocess.CompletedProcess(p.args, p.returncode, out, err)
+
+
+def test_the_steps_job_refuses_a_fresh_start_over_a_checkpoint(tmp_path):
+    _gen(tmp_path / "real" / "ckpt", "gen0", 20)
+    r = _steps_job(tmp_path)
+    assert r.returncode == 1
+    assert "already holds a checkpoint; set EXPECT_STEP" in r.stdout
+    assert "=== LEG" not in r.stdout  # before any guard
+
+
+@pytest.mark.parametrize("env,says", [
+    ({"REAL_DIR": "{t}/ics/real"}, "REAL_DIR is under IC_DIR"),
+    ({"CONTROL_REF": "{t}/absent"}, "set CONTROL_REF to an existing directory"),
+    ({"IC_DIR": ""}, "set IC_DIR to an existing directory"),
+])
+def test_the_steps_job_refuses_inputs_it_cannot_use(tmp_path, env, says):
+    r = _steps_job(tmp_path, **{k: v.format(t=tmp_path) for k, v in env.items()})
+    assert r.returncode == 1 and says in r.stdout, r.stdout
+    assert "=== LEG" not in r.stdout
