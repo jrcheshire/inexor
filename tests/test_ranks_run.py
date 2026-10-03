@@ -107,6 +107,23 @@ def test_rank_checkpoints_are_the_one_rank_bytes(reference, tmp_path, n_ranks, c
         assert a2a["bytes"] >= rec["forward_sent_bytes"] + rec["inverse_sent_bytes"]
 
 
+def test_the_rank_record_carries_each_ranks_particle_flux(tmp_path):
+    outs = run_ranks(3, 1, tmp_path)
+    total = sum(o[0]["n_migrated_checked"] for o in outs)
+    moved = 0
+    for k in range(K):
+        assert sum(o[k]["n_migrated_checked"] for o in outs) == total
+        assert sum(o[k]["ranks"]["rows_in"] - o[k]["ranks"]["rows_out"] for o in outs) == 0
+    # each step's migrate changes a rank's count by exactly rows_in - rows_out
+    for o in outs:
+        for k in range(1, K):
+            rec = o[k]["ranks"]
+            assert (o[k]["n_migrated_checked"] - o[k - 1]["n_migrated_checked"]
+                    == rec["rows_in"] - rec["rows_out"])
+            moved += rec["rows_in"]
+    assert moved > 0
+
+
 @pytest.mark.parametrize("n_write,n_read", [(2, 3), (4, 1), (1, 4)])
 def test_a_checkpoint_resumes_on_another_rank_count(reference, tmp_path, n_write, n_read):
     _d, want = reference

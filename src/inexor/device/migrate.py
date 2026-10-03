@@ -923,7 +923,8 @@ def _pass_receipt(ctx, devices, device_budget_bytes, spill_rows):
                    rank_emigrant_rows_sent=ctx["rank_sent"]["rows"],
                    rank_emigrant_rows_received=ctx["rank_recv"]["rows"],
                    rank_hand_off_bytes_sent=ctx["rank_sent"]["bytes"],
-                   rank_hand_off_bytes_received=ctx["rank_recv"]["bytes"])
+                   rank_hand_off_bytes_received=ctx["rank_recv"]["bytes"],
+                   rank_rows_in=int(ctx["rows_in"]), rank_rows_out=int(ctx["rows_out"]))
     if devices is not None:
         receipt.update(cards=ctx["W"], slabs_per_card=[hi - lo for lo, hi in ctx["parts"]],
                        cross_card_segments=ctx["segments"], cross_card_bytes=ctx["moved_bytes"],

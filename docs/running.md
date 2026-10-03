@@ -169,6 +169,10 @@ mpiexec -n 2 python -m mpi4py scripts/run/device_run.py run --preset c-gh --work
   immediate neighbours only.
 - Each step's record in a rank's card carries that rank's exchanges under `ranks.comm`: calls,
   bytes sent and seconds per operation, and `wait_s`, the time blocked waiting on other ranks.
+  `ranks.rows_in` / `rows_out` are the particles the rank gained from and lost to its
+  neighbours in the step's migrate, so its count changes by their difference.
+  `emigrant_rows_sent` / `_received` count only the boundary-eject hand-off, one of the
+  migrate's exchanges, and do not add up to that change.
 - `D7_FAIL_AT=<phase> D7_FAIL_RANK=<r>` exercises the failure path on one rank.
 - On a cluster, launch each rank through `scripts/run/rank_exec.sh [--membind NODES] [--samples
   PREFIX] -- CMD ...`. It replaces `@RANK@` in the arguments and in exported variables, so one

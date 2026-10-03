@@ -1380,7 +1380,9 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         paint_ghost_planes_sent=int(mesh_stats.get("coarse_ghost_planes_sent", 0)),
         emigrant_rows_sent=int(md.get("rank_emigrant_rows_sent", 0)),
         emigrant_rows_received=int(md.get("rank_emigrant_rows_received", 0)),
-        hand_off_bytes_sent=int(md.get("rank_hand_off_bytes_sent", 0)))
+        hand_off_bytes_sent=int(md.get("rank_hand_off_bytes_sent", 0)),
+        # the rank's particle count changes by rows_in - rows_out in the migrate
+        rows_in=int(md.get("rank_rows_in", 0)), rows_out=int(md.get("rank_rows_out", 0)))
     rank_rec.setdefault("forward_sent_bytes", 0)
     rank_rec.setdefault("inverse_sent_bytes", 0)
     rank_rec["comm"] = comm.take_ledger()
