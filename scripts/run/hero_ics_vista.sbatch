@@ -5,20 +5,23 @@
 #SBATCH -n 1
 #SBATCH -t 03:00:00
 #SBATCH -o d8-hero-ics-%j.log
-# 4096^3 ICs (LCDM second-order growth) by the device generator on four GB200s, into a
+# A preset's ICs (LCDM second-order growth) by the device generator on four GB200s, into a
 # new directory. Legs:
 #   1. preflight: devices, scratch space, planner verdicts (a refusal stops the job);
 #   2. smoke at 32^3: device generator vs host generator, 4 cards == 1 card (stops the job);
-#   3. the 4096^3 generation -> $HERO_IC_DIR (refuses if a manifest is already there);
-#   4. manifest check: growth2 = lcdm, 4096^3 particles in 256 slabs;
+#   3. the generation -> IC_DIR (refuses if a manifest is already there);
+#   4. manifest check: growth2 = lcdm, the preset's n_part^3 particles in its brick slabs;
 #   5. the GPU pytest set for the generator.
 #
-# Requires: INEXOR_RUNS (run root), HERO_IC_DIR (IC output directory), and INEXOR_SRC or
-# submission from the inexor checkout. The account is passed with `sbatch -A`:
-#   INEXOR_RUNS=$SCRATCH/inexor_runs HERO_IC_DIR=$SCRATCH/inexor_runs/c-hero-lcdm \
+# Requires: INEXOR_RUNS (run root), IC_DIR (IC output directory; HERO_IC_DIR is read when it
+# is unset), and INEXOR_SRC or submission from the inexor checkout. Optional: PRESET
+# (c-hero), NEED_GB (1500, the free scratch the preflight requires). The account is passed
+# with `sbatch -A`:
+#   INEXOR_RUNS=$SCRATCH/inexor_runs IC_DIR=$SCRATCH/inexor_runs/c-hero-lcdm \
 #     sbatch -A <account> scripts/run/hero_ics_vista.sbatch
 #
-# Wall: the generation takes ~67 min, the smoke ~1 min, the pytest ~3; 3 h leaves margin.
+# Wall: the c-hero generation takes ~67 min, the smoke ~1 min, the pytest ~3; 3 h leaves
+# margin. c-gh has 1/8 the particles.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
@@ -35,7 +38,9 @@ unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
 
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
-HERO=${HERO_IC_DIR:?set HERO_IC_DIR to the directory the ICs are written to}
+HERO=${IC_DIR:-${HERO_IC_DIR:?set IC_DIR to the directory the ICs are written to}}
+PRESET=${PRESET:-c-hero}
+NEED_GB=${NEED_GB:-1500}
 CARDS=runs/v2
 mkdir -p "$CARDS"
 TAG=d8_ics_$SLURM_JOB_ID
@@ -62,7 +67,7 @@ if [ -e "$HERO/manifest.json" ]; then
 fi
 
 run_leg preflight \
-  pixi run -e gpu python scripts/run/device_ics.py preflight --root "$RUNS" --need-gb 1500 \
+  pixi run -e gpu python scripts/run/device_ics.py preflight --root "$RUNS" --need-gb "$NEED_GB" \
   || { echo "FATAL: preflight refused"; exit 1; }
 run_leg smoke \
   pixi run -e gpu python scripts/run/device_ics.py smoke --out $CARDS/${TAG}_smoke.json \
@@ -70,20 +75,24 @@ run_leg smoke \
 
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader -l 10 > "$GPU_LOG" 2>/dev/null &
 SAMPLER=$!
-run_leg ics-4096 \
-  pixi run -e gpu python scripts/run/realization.py ics --config c-hero --workdir "$HERO" \
+run_leg "ics-$PRESET" \
+  pixi run -e gpu python scripts/run/realization.py ics --config "$PRESET" --workdir "$HERO" \
     --generator device
 kill $SAMPLER 2>/dev/null
-[ -f "$HERO/realization_ics.json" ] && cp "$HERO/realization_ics.json" $CARDS/${TAG}_c-hero.json
+[ -f "$HERO/realization_ics.json" ] && cp "$HERO/realization_ics.json" "$CARDS/${TAG}_$PRESET.json"
 
+# the expected counts come from the preset, not from the manifest under test
 run_leg manifest-check \
-  python3 -c "
+  env JAX_PLATFORMS=cpu pixi run -e gpu python -c "
 import json, sys
+from inexor.plan import PRESETS, engine_config
+ec = engine_config('$PRESET')
+want_n, want_slabs = PRESETS['$PRESET']['n_part'] ** 3, ec.n_fine // ec.n_brick
 m = json.load(open('$HERO/manifest.json'))
-print('growth2', m.get('growth2'), 'n_particles', m['n_particles'], 'slabs', len(m['files']),
-      'ic_stream', m.get('ic_stream'))
-sys.exit(0 if (m.get('growth2') == 'lcdm' and m['n_particles'] == 4096 ** 3
-               and len(m['files']) == 256) else 1)
+print('growth2', m.get('growth2'), 'n_particles', m['n_particles'], 'of', want_n,
+      'slabs', len(m['files']), 'of', want_slabs, 'ic_stream', m.get('ic_stream'))
+sys.exit(0 if (m.get('growth2') == 'lcdm' and m['n_particles'] == want_n
+               and len(m['files']) == want_slabs) else 1)
 "
 
 run_leg pytest-gpu \

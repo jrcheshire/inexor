@@ -204,10 +204,10 @@ run) before the expensive leg and stops if they fail.
 
 | Script | Partition | What it does | Required variables |
 |---|---|---|---|
-| `hero_ics_vista.sbatch` | gb | `c-hero` ICs on four cards with the device generator; refuses an existing manifest | `INEXOR_RUNS`, `HERO_IC_DIR` |
+| `hero_ics_vista.sbatch` | gb | a preset's ICs on four cards with the device generator; refuses an existing manifest, and checks the new one's particle and slab counts against the preset | `INEXOR_RUNS`, `IC_DIR` (or `HERO_IC_DIR`). Optional: `PRESET` (`c-hero`), `NEED_GB` (1500, free scratch) |
 | `hero_steps_vista.sbatch` | gb | one segment of `c-hero` on a 120-step schedule, checkpointing every 20 steps into `$REAL_DIR/hero-ckpt` | `INEXOR_RUNS`, `HERO_IC_DIR`, `REAL_DIR`, `EXPECT_STEP`, `SEG_STOP` |
-| `hero_card_vista.sbatch` | gb | P(k) card of the final checkpoint in `$SRC_RUN/hero-ckpt`, written to `$PROD_DIR` | `INEXOR_RUNS`, `SRC_RUN`, `K_STEPS`, `PROD_DIR` |
-| `hero_export_vista.sbatch` | gb | export of the same checkpoint to `$PROD_DIR/export` | `INEXOR_RUNS`, `SRC_RUN`, `K_STEPS`, `PROD_DIR` |
+| `hero_card_vista.sbatch` | gb | P(k) card of the final checkpoint in `$CKPT_DIR`, written to `$PROD_DIR` | `INEXOR_RUNS`, `CKPT_DIR` (or `SRC_RUN`, read as `$SRC_RUN/hero-ckpt`), `K_STEPS`, `PROD_DIR`. Optional: `PRESET` (`c-hero`) |
+| `hero_export_vista.sbatch` | gb | export of the same checkpoint to `$PROD_DIR/export` | `INEXOR_RUNS`, `CKPT_DIR` (or `SRC_RUN`), `K_STEPS`, `PROD_DIR`. Optional: `PRESET` (`c-hero`) |
 | `gh_single_card_vista.sbatch` | gh | a whole realization on one GH200: ICs, 120 steps, card, under `$INEXOR_RUNS/d8-gh-<preset>-<job id>/` | `INEXOR_RUNS`. Optional: `PRESET` (`c-1024`), `SLACK` (0.10), `ALLOC_MARGIN` (0.10), `ARENA_FRAC` (0.01) |
 | `multinode_gate_vista.sbatch` | gh, 2 nodes | the multi-node byte gate: the single-node run on each node and the 2-rank run, compared file by file at the split step and at the end (`$INEXOR_RUNS/mn-gate-<preset>-<job id>/`); a split-step mismatch reruns segment 1 with deterministic ops and stops. The run legs' launch line is tried on every node first; every leg has a time cap, a run leg is also killed after `QUIET_S` of silent output, and a failed run leg stops the job | `INEXOR_RUNS`. Optional: `PRESET` (`c-1024`), `K` (120), `SPLIT` (20), `STOP`, `EVERY`, layout as above, `LEG_FIXED_S` (600) + `LEG_STEP_S` (100) per step (a run leg's cap), `QUIET_S` (600) |
 | `multinode_steps_vista.sbatch` | gh, 2 nodes | one realization across the nodes from ICs made elsewhere, checkpointing every `EVERY` steps into `$REAL_DIR/ckpt`; a lost job is resubmitted with `EXPECT_STEP` at its newest checkpoint (`EXPECT_STEP=0` is refused over an existing one). First a control: the older generation of `CONTROL_REF`, a run that passed the byte gate, is resumed to the newer one's step and must match it byte for byte. Ends by checking the newest checkpoint's step and particle count. Caps, silence limit and stop-on-failure as in the gate | `INEXOR_RUNS`, `IC_DIR`, `REAL_DIR`, `CONTROL_REF`, `CONTROL_ICS`. Optional: `PRESET` (`c-gh`), `K` (120), `EXPECT_STEP` (0), `STOP`, `EVERY` (20), `CONTROL_PRESET` (`c-1024`), layout as above, `LEG_FIXED_S` (600) + `LEG_STEP_S` (300) per step, `QUIET_S` (600) |
@@ -216,7 +216,7 @@ Every script also needs `INEXOR_SRC` (the inexor checkout), or it must be submit
 checkout. Examples:
 
 ```bash
-INEXOR_RUNS=$SCRATCH/inexor_runs HERO_IC_DIR=$SCRATCH/inexor_runs/c-hero-lcdm \
+INEXOR_RUNS=$SCRATCH/inexor_runs IC_DIR=$SCRATCH/inexor_runs/c-hero-lcdm \
   sbatch -A <account> scripts/run/hero_ics_vista.sbatch
 
 INEXOR_RUNS=$SCRATCH/inexor_runs HERO_IC_DIR=$SCRATCH/inexor_runs/c-hero-lcdm REAL_DIR=$SCRATCH/inexor_runs/hero-k120 \

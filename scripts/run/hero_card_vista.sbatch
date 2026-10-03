@@ -5,14 +5,16 @@
 #SBATCH -n 1
 #SBATCH -t 08:00:00
 #SBATCH -o d7f-hero-card-%j.log
-# The P(k) card of an evolved 4096^3 realization's final checkpoint, and nothing else.
+# The P(k) card of an evolved realization's final checkpoint (c-hero, 4096^3, unless
+# PRESET says otherwise), and nothing else.
 # The export reads the same checkpoint independently (hero_export_vista.sbatch), so it
 # does not queue behind a card that might overrun.
 #
-# Requires INEXOR_RUNS (run root), SRC_RUN (the realization directory holding
-# hero-ckpt/), K_STEPS (schedule length; the newest checkpoint must be at this step),
-# PROD_DIR (product directory; the card is written there), and INEXOR_SRC or submission
-# from the inexor checkout. The account is passed with `sbatch -A`:
+# Requires INEXOR_RUNS (run root), CKPT_DIR (the realization's checkpoint dir, holding
+# gen0/ gen1/; SRC_RUN/hero-ckpt when only SRC_RUN is set), K_STEPS (schedule length; the
+# newest checkpoint must be at this step), PROD_DIR (product directory; the card is written
+# there), and INEXOR_SRC or submission from the inexor checkout. Optional: PRESET (c-hero).
+# The account is passed with `sbatch -A`:
 #   INEXOR_RUNS=$SCRATCH/inexor_runs SRC_RUN=$SCRATCH/inexor_runs/hero-k120 K_STEPS=120 \
 #     PROD_DIR=$SCRATCH/inexor_runs/hero-k120-prod \
 #     sbatch -A <account> scripts/run/hero_card_vista.sbatch
@@ -24,7 +26,8 @@
 # out-of-core transform, binning) and only the paint is pooled; the coarse paint pools
 # 8.5-13x at W=16. At a 60-75% paint share the card takes 3.1-4.2 h; at 40% it takes
 # 5.6 h. The heartbeat times the three stages separately, so the cgh64 legs measure the
-# split before the hero leg starts. 8 h covers the pessimistic branch.
+# split before the hero leg starts. 8 h covers the pessimistic branch. c-gh is 64x cgh64:
+# ~1.1 h serial.
 #
 # Pooling cannot move a number: workers return bounded sub-blocks and the parent
 # accumulates integers, so arrival order is bitwise the serial order (gated in
@@ -55,7 +58,10 @@ unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
 
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
-SRC=${SRC_RUN:?set SRC_RUN to the realization directory}
+CKPT=${CKPT_DIR:-${SRC_RUN:+$SRC_RUN/hero-ckpt}}
+[ -n "$CKPT" ] || { echo "FATAL: set CKPT_DIR to the realization's checkpoint dir"; exit 1; }
+PRESET=${PRESET:-c-hero}
+export PRESET
 K_STEPS=${K_STEPS:?set K_STEPS to the schedule length}
 export K_STEPS
 WORK=$RUNS/d7f-$SLURM_JOB_ID
@@ -82,7 +88,7 @@ export PROD
 
 # `_ckpt_dir` is `<workdir>/ckpt` and the run wrote `hero-ckpt`: link rather than move
 # 1.3 TB or touch the source directory.
-ln -sfn "$SRC/hero-ckpt" "$PROD/ckpt"
+ln -sfn "$CKPT" "$PROD/ckpt"
 # the newest generation must be at the schedule's last step; which generation holds it
 # depends on the segmentation, so it is read, not assumed
 HEAD_MAN=$(python3 -c "
@@ -151,7 +157,7 @@ from inexor.engine import checkpoint_fingerprint
 import os
 args = argparse.Namespace(slack=0.10, tile_workers=16, checkpoint_every=10,
                           migrate_pooled=None, eject_kernel="jax")
-ec = _engine_config(_geom("c-hero"), args, os.environ["PROD"] + "/ckpt")
+ec = _engine_config(_geom(os.environ["PRESET"]), args, os.environ["PROD"] + "/ckpt")
 co, _ = _coeffs(_cosmo(), int(os.environ["K_STEPS"]))
 want = checkpoint_fingerprint(ec, co)
 have = json.load(open(os.environ["HEAD_MAN"]))["provenance"]["fingerprint"]
@@ -207,7 +213,7 @@ run_leg cgh64-card-pooled \
 
 # --- The 4096^3 card. One call, hours long; the heartbeat says where it got to.
 run_leg hero-card \
-  $CPU $BIND pixi run -e gpu python scripts/run/realization.py card --config c-hero \
+  $CPU $BIND pixi run -e gpu python scripts/run/realization.py card --config "$PRESET" \
     --workdir "$PROD" --k-steps "$K_STEPS" $LAYOUT $HB $W --card-pool
 rc_card=$?
 

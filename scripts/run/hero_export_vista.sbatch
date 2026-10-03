@@ -5,16 +5,17 @@
 #SBATCH -n 1
 #SBATCH -t 05:00:00
 #SBATCH -o d7g-hero-export-%j.log
-# The portable (x, v) export of an evolved 4096^3 realization's final checkpoint, and
-# nothing else. The checkpoint is the engine's own T9 encoding; this writes it as two
+# The portable (x, v) export of an evolved realization's final checkpoint (c-hero, 4096^3,
+# unless PRESET says otherwise), and nothing else. The checkpoint is the engine's own T9 encoding; this writes it as two
 # plain float32 .npy arrays (~1.65 TB) that any halo finder or analysis code can mmap.
 # Independent of the card job (hero_card_vista.sbatch): same checkpoint, neither reads the
 # other's output, so they may run concurrently or in either order.
 #
-# Requires INEXOR_RUNS (run root), SRC_RUN (the realization directory holding
-# hero-ckpt/), K_STEPS (schedule length; the newest checkpoint must be at this step),
-# PROD_DIR (product directory; the export goes to $PROD_DIR/export), and INEXOR_SRC or
-# submission from the inexor checkout. The account is passed with `sbatch -A`:
+# Requires INEXOR_RUNS (run root), CKPT_DIR (the realization's checkpoint dir, holding
+# gen0/ gen1/; SRC_RUN/hero-ckpt when only SRC_RUN is set), K_STEPS (schedule length; the
+# newest checkpoint must be at this step), PROD_DIR (product directory; the export goes to
+# $PROD_DIR/export), and INEXOR_SRC or submission from the inexor checkout. Optional: PRESET
+# (c-hero). The account is passed with `sbatch -A`:
 #   INEXOR_RUNS=$SCRATCH/inexor_runs SRC_RUN=$SCRATCH/inexor_runs/hero-k120 K_STEPS=120 \
 #     PROD_DIR=$SCRATCH/inexor_runs/hero-k120-prod \
 #     sbatch -A <account> scripts/run/hero_export_vista.sbatch
@@ -23,6 +24,7 @@
 # writer thread overlaps: decode 16,777,216 bricks at ~366 us/brick on Grace = ~1.7 h
 # (2.5x slower than on the laptop, and read at +-25%), write 1.65 TB at 706-807 MB/s
 # = ~35 min. ~2.2 h central, decode-bound; 5 h requested for the uncertain decode rate.
+# c-gh has 1/8 the particles: ~0.3 h central.
 #
 # Layout parameters must match the run, not the script defaults (see
 # hero_card_vista.sbatch): slack 0.10 / arena-frac 0.01. Expected host peak ~690-760 GB.
@@ -43,7 +45,10 @@ unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
 
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
-SRC=${SRC_RUN:?set SRC_RUN to the realization directory}
+CKPT=${CKPT_DIR:-${SRC_RUN:+$SRC_RUN/hero-ckpt}}
+[ -n "$CKPT" ] || { echo "FATAL: set CKPT_DIR to the realization's checkpoint dir"; exit 1; }
+PRESET=${PRESET:-c-hero}
+export PRESET
 K_STEPS=${K_STEPS:?set K_STEPS to the schedule length}
 export K_STEPS
 WORK=$RUNS/d7g-$SLURM_JOB_ID
@@ -60,7 +65,7 @@ HB="--heartbeat 60"
 mkdir -p "$WORK" "$PROD"
 export PROD
 
-ln -sfn "$SRC/hero-ckpt" "$PROD/ckpt"
+ln -sfn "$CKPT" "$PROD/ckpt"
 # the newest generation must be at the schedule's last step; which generation holds it
 # depends on the segmentation, so it is read, not assumed
 HEAD_MAN=$(python3 -c "
@@ -136,7 +141,7 @@ from inexor.engine import checkpoint_fingerprint
 import os
 args = argparse.Namespace(slack=0.10, tile_workers=16, checkpoint_every=10,
                           migrate_pooled=None, eject_kernel="jax")
-ec = _engine_config(_geom("c-hero"), args, os.environ["PROD"] + "/ckpt")
+ec = _engine_config(_geom(os.environ["PRESET"]), args, os.environ["PROD"] + "/ckpt")
 co, _ = _coeffs(_cosmo(), int(os.environ["K_STEPS"]))
 want = checkpoint_fingerprint(ec, co)
 have = json.load(open(os.environ["HEAD_MAN"]))["provenance"]["fingerprint"]
@@ -173,7 +178,7 @@ du -sh "$WORK/cgh64-prod/export"
 
 # --- The 4096^3 export. 1.65 TB, decode-bound, one call.
 run_leg hero-export \
-  $CPU $BIND pixi run -e gpu python scripts/run/realization.py export --config c-hero \
+  $CPU $BIND pixi run -e gpu python scripts/run/realization.py export --config "$PRESET" \
     --workdir "$PROD" --k-steps "$K_STEPS" $LAYOUT $HB --export-dir "$PROD/export"
 rc_export=$?
 
