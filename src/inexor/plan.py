@@ -160,7 +160,6 @@ DEVICE_HELD = {
     "tile_kernels": ("tile_loop",),
     "slab_window": ("tile_loop",),
 }
-CARD0_TILE_KERNELS = "tile_kernels, card 0's default-device copy (MEASURED)"
 
 
 def device_placement(kernel="cards"):
@@ -382,7 +381,7 @@ def device_held_phases(term):
 
 def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=True,
                   kernel="cards"):
-    """Per-GPU bytes for the host-state / device-step design, for the busiest card.
+    """Per-GPU bytes for the host-state / device-step design.
 
     Returns `(resident, transient, phases, worst_phase, slabs, host_mesh, after_loop)`.
     `resident` and `transient` are the term inventories. `phases` maps each phase, and
@@ -432,12 +431,6 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
         for one in (p,) if isinstance(p, str) else p:
             if one != "resident":
                 phases[one] = phases.get(one, 0) + b
-
-    # Card 0 also holds the tile kernels `forces.make_tile_force_fn` builds on jax's default
-    # device, for the whole run (in use on card 0 only, between phases: 0.79 GB at tile 256,
-    # 4.60 at 512, = `tile_kernels`; jobs 1048248, 1045958, 1024783).
-    if "tile_kernels" in resident:
-        resident[CARD0_TILE_KERNELS] = resident["tile_kernels"]
 
     # The state window a tile plane's y-block needs: no CPU counterpart.
     slabs = device_window_slabs(ec)
@@ -703,7 +696,7 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     whole_run = {k: v for k, v in resident.items() if device_held_phases(k) is None}
     held = {f"{k} [{', '.join(device_held_phases(k))}]": v for k, v in resident.items()
             if device_held_phases(k) is not None}
-    _table(f"PER GPU (of {n_gpus}), resident for the whole run (busiest card)", whole_run)
+    _table(f"PER GPU (of {n_gpus}), resident for the whole run", whole_run)
     _table(f"PER GPU (of {n_gpus}), held through the phases in brackets", held)
     if transient:
         _table(f"PER GPU (of {n_gpus}), transient (peak while that phase runs)",

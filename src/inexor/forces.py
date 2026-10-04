@@ -1099,8 +1099,9 @@ def make_tile_force_fn(
                      paint=paint, frac_bits=frac_bits, fdtype=fdtype)
     cell, mean = geom["cell"], geom["mean"]
     P = geom["P"]
-    kers = [jnp.asarray(k) for k in split_kernels((P,) * 3, cell, "short", r_s=r_s,
-                                                  fdtype=fdtype)]
+    # numpy, not jax arrays: the traced program embeds them as constants either way, and a jax
+    # array would also stay resident on jax's default device for the life of `one_tile`
+    kers = split_kernels((P,) * 3, cell, "short", r_s=r_s, fdtype=fdtype)
 
     def one_tile(u, live, owned):
         # `owned` is supplied by the caller (exact integer ownership; see `owning_tile`)

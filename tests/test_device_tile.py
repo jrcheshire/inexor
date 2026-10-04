@@ -447,3 +447,23 @@ def test_a_stencil_outside_the_block_is_refused():
             dtile.tile_task_device(st, one_tile, C, g_coarse, t, members[t])
     finally:
         forces.COARSE_HALO = orig
+
+
+def test_the_tile_force_holds_no_device_array_for_its_kernels():
+    """`make_tile_force_fn` keeps its kernels in numpy: the program embeds them as constants,
+    so building and running it leaves no jax array behind (a jax-array kernel set stayed on
+    jax's default device for the life of `one_tile`: card 0's extra copy on the GPUs)."""
+    import jax
+
+    def held():
+        return sum(a.nbytes for a in jax.live_arrays())
+
+    before = held()
+    one_tile, geom = forces.make_tile_force_fn(N_FINE, L_BOX, N_PART**3, N_TILE, B_FINE,
+                                               paint="int")
+    kernel_bytes = 3 * geom["P"] ** 2 * (geom["P"] // 2 + 1) * 16
+    assert held() - before < kernel_bytes / 10, "VACUOUS unless the kernels are this large"
+    cap = 512
+    u = np.random.default_rng(0).uniform(0, geom["cell"] * geom["P"] * 0.9, (cap, 3))
+    out = jax.block_until_ready(one_tile(u, np.ones(cap, bool), np.ones(cap, bool)))
+    assert held() - before - sum(np.asarray(x).nbytes for x in out) < kernel_bytes / 10
