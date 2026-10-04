@@ -33,10 +33,12 @@ def _devices(w):
     return list(jax.devices()[:w])
 
 
-@pytest.mark.parametrize("w", [2, 3, 4])
-def test_the_migrate_on_w_cards_is_bitwise_the_serial_numpy_pass(w):
+@pytest.mark.parametrize("w,n_y", [(2, 1), (3, 1), (4, 1), (2, 4), (4, 2)])
+def test_the_migrate_on_w_cards_is_bitwise_the_serial_numpy_pass(w, n_y):
+    from inexor.decomp import y_blocks
     from inexor.device.migrate import drift_and_migrate_device
 
+    blocks = y_blocks(4, 4, n_y)  # the 16-brick grid as 4 "tile rows" of 4 bricks
     devs = _devices(w)
     st_a = _state(n_part=64, nb=16, box=32.0)
     st_b = copy.deepcopy(st_a)
@@ -44,8 +46,9 @@ def test_the_migrate_on_w_cards_is_bitwise_the_serial_numpy_pass(w):
     segments = spills = 0
     for step in range(2):
         r_a = state.drift_and_migrate(st_a, c)
-        r_b = drift_and_migrate_device(st_b, c, devices=devs)
+        r_b = drift_and_migrate_device(st_b, c, devices=devs, y_blocks=blocks)
         rec = r_b.pop("migrate_device")
+        assert rec["units"] == 16 * n_y
         _same_state(st_a, st_b, f"W={w} pass {step}")
         assert r_a == r_b, f"W={w} pass {step}: stats differ"
         assert rec["cards"] == w and rec["fallback"] is None

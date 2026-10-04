@@ -132,20 +132,33 @@ def capacity_from_counts(st, counts, brick_slack):
 def _cross_card_slabs(old_start, new_start, parts, nb2):
     """Per card, the slabs whose OLD range intersects a NEW range another card writes.
     `parts` are the cards' contiguous slab ranges (one rank's, which need not start at 0)."""
+    nb = int(round(nb2 ** 0.5))
+    return [[s for s, _j in e]
+            for e in _cross_card_units(old_start, new_start, parts, nb, ((0, nb),))]
+
+
+def _cross_card_units(old_start, new_start, parts, nb, blocks):
+    """`_cross_card_slabs` per unit `(slab, block)`, for slabs cut into the brick-y ranges
+    `blocks` (`decomp.y_blocks`)."""
+    nb2 = nb * nb
+    blocks = tuple(blocks)
+    n_y = len(blocks)
     lo0, hi0 = (parts[0][0], parts[-1][1]) if parts else (0, 0)
-    owner = np.empty(hi0 - lo0, dtype=np.int64)
+    units = [(s, j) for s in range(lo0, hi0) for j in range(n_y)]
+    owner = np.empty(len(units), dtype=np.int64)
     for k, (lo, hi) in enumerate(parts):
-        owner[lo - lo0:hi - lo0] = k
-    e = np.arange(lo0, hi0 + 1) * nb2
-    o_lo, o_hi = old_start[e[:-1]], old_start[e[1:]]
-    n_lo, n_hi = new_start[e[:-1]], new_start[e[1:]]
+        owner[(lo - lo0) * n_y:(hi - lo0) * n_y] = k
+    b_lo = np.asarray([s * nb2 + blocks[j][0] * nb for s, j in units], dtype=np.int64)
+    b_hi = np.asarray([s * nb2 + blocks[j][1] * nb for s, j in units], dtype=np.int64)
+    o_lo, o_hi = old_start[b_lo], old_start[b_hi]
+    n_lo, n_hi = new_start[b_lo], new_start[b_hi]
     early = [[] for _ in parts]
-    for i in range(hi0 - lo0):
+    for i, u in enumerate(units):
         if o_hi[i] <= o_lo[i]:
             continue
         hit = (owner != owner[i]) & (n_lo < o_hi[i]) & (o_lo[i] < n_hi) & (n_hi > n_lo)
         if hit.any():
-            early[owner[i]].append(lo0 + i)
+            early[owner[i]].append(u)
     return early
 
 

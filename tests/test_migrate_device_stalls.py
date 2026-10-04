@@ -68,8 +68,8 @@ def test_an_undercounted_emigrant_is_refused_by_the_census(monkeypatch):
     real = migrate._eject_scalars_program
     done = []
 
-    def undercount(cap, nb, p3):
-        fn = real(cap, nb, p3)
+    def undercount(cap, nb, p3, n_y=1):
+        fn = real(cap, nb, p3, n_y)
 
         def wrapped(*args):
             v = fn(*args)
@@ -89,7 +89,7 @@ def test_an_undercounted_emigrant_is_refused_by_the_census(monkeypatch):
 
 
 def _eject_host_peaks(n_part, monkeypatch, copy_window=False):
-    """Largest traced host allocation inside one `_eject_slab` on a WARM pass (the first
+    """Largest traced host allocation inside one `_eject_unit` on a WARM pass (the first
     pass's compiles allocate on the host), and the smallest slab's slot range in bytes
     (a copied window holds at least that). `copy_window` forces the copied fallback."""
     from inexor.device import migrate as module
@@ -98,7 +98,7 @@ def _eject_host_peaks(n_part, monkeypatch, copy_window=False):
         monkeypatch.setattr(module, "_window_fits", lambda *a: False)
     warm = _state(n_part=n_part, nb=4, box=float(n_part) / 2)
     module.drift_and_migrate_device(warm, _c_drift(warm, 0.9))
-    real = module._eject_slab
+    real = module._eject_unit
     peaks = []
 
     def traced(st, *args, **kw):
@@ -108,7 +108,7 @@ def _eject_host_peaks(n_part, monkeypatch, copy_window=False):
         peaks.append(tracemalloc.get_traced_memory()[1] - base)
         return out
 
-    monkeypatch.setattr(module, "_eject_slab", traced)
+    monkeypatch.setattr(module, "_eject_unit", traced)
     st = _state(n_part=n_part, nb=4, box=float(n_part) / 2)
     row_bytes = st.off.itemsize * 3 + st.w.itemsize * 3 + st.ids.itemsize
     window_bytes = row_bytes * min(

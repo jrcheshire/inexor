@@ -248,29 +248,79 @@ def _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids, n_b=None):
     return _program(("rows", cap, w_cap, a_cap, nb, p3, per, has_ids, n_b), make)
 
 
-def _eject_scalars_program(cap, nb, p3):
-    """(n_keep, realized x-reach, emigrant count per destination slab) as one int64 vector."""
+def _eject_scalars_program(cap, nb, p3, n_y=1):
+    """(n_keep, realized x-reach, emigrant count per destination unit) as one int64 vector.
+    Units are `slab * n_y + block`; `block_of_y` (int64 per brick-y) maps a brick row to its
+    y-block."""
 
     def make():
         import jax
         import jax.numpy as jnp
 
         per_slab = p3 * nb * nb
+        n_units = nb * n_y
 
         @jax.jit
-        def scalars(dest, n_keep, n_rows, s):
+        def scalars(dest, n_keep, n_rows, s, block_of_y):
             idx = jnp.arange(cap, dtype=jnp.int64)
             n_keep = n_keep.astype(jnp.int64)
             em = (idx >= n_keep) & (idx < n_rows)
             to = dest // per_slab
             disp = (to - s + nb // 2) % nb - nb // 2
             rr = jnp.max(jnp.where(em, jnp.abs(disp), 0))
-            counts = jnp.zeros(nb, jnp.int64).at[jnp.where(em, to, nb)].add(1, mode="drop")
+            unit = to * n_y + block_of_y[(dest // p3 // nb) % nb]
+            counts = jnp.zeros(n_units, jnp.int64).at[jnp.where(em, unit, n_units)].add(
+                1, mode="drop")
             return jnp.concatenate([n_keep[None], rr[None].astype(jnp.int64), counts])
 
         return scalars
 
-    return _program(("eject_scalars", cap, nb, p3), make)
+    return _program(("eject_scalars", cap, nb, p3, n_y), make)
+
+
+def _whole_slab(nb):
+    """The one y-block of a pass that does not split slabs."""
+    return ((0, int(nb)),)
+
+
+def _check_blocks(blocks, nb, r):
+    """Refuse y-blocks that do not tile [0, nb) or that a drift of reach `r` bricks could
+    cross in one step (a row must land in its own block or the next one either way)."""
+    blocks = tuple((int(a), int(b)) for a, b in blocks)
+    if (not blocks or blocks[0][0] != 0 or blocks[-1][1] != nb
+            or any(a >= b for a, b in blocks)
+            or any(blocks[k][1] != blocks[k + 1][0] for k in range(len(blocks) - 1))):
+        raise ValueError(f"y-blocks {blocks} do not tile the {nb} brick rows")
+    if len(blocks) > 1 and min(b - a for a, b in blocks) < r:
+        raise ValueError(
+            f"a y-block of {min(b - a for a, b in blocks)} brick rows is narrower than the "
+            f"drift's reach of {r} bricks: a particle could skip a block. Use fewer y-blocks.")
+    return blocks
+
+
+def _unit_bricks(u, blocks, nb):
+    """Bricks [lo, hi) of unit `u = (slab, block index)`."""
+    from ..decomp import unit_bricks
+
+    return unit_bricks(u[0], blocks[u[1]], nb)
+
+
+def _block_of_y(blocks, nb):
+    out = np.zeros(int(nb), dtype=np.int64)
+    for j, (a, b) in enumerate(blocks):
+        out[a:b] = j
+    return out
+
+
+def _sources(v, reach, nb, n_y):
+    """The units whose leavers destination unit `v = (d, i)` takes, in insert order: source
+    slabs ascending, then each slab's blocks ascending (so a slab's leavers stay
+    brick-major)."""
+    from ..decomp import block_neighbours
+
+    d, i = v
+    return [(s, j) for s in sorted({(int(d) + o) % nb for o in reach})
+            for j in block_neighbours(i, n_y)]
 
 
 def _put_program(seg_cap, cap_i, has_ids):
@@ -413,15 +463,16 @@ def _eject_rows(st, ix, c_drift, off_win, w_win, ids_win, ar_rows, starts_rel, s
     return out
 
 
-def _upload_slab(st, s, ar_slots, ar_bricks, clock, dev=None, block=False):
-    """Slab s's index and its window on `dev`: the slot range as a view of the host
-    state and the arena residents as their own array. `block=True`, for a caller about
-    to write host rows this window covers, copies the slot range (a CPU-backend upload
-    of a view aliases the host) and waits for the transfer. Returns `_eject_slab(pre=)`."""
+def _upload_unit(st, lo_b, hi_b, ar_slots, ar_bricks, clock, dev=None, block=False):
+    """Bricks [lo_b, hi_b)'s (a unit's) index and window on `dev`: the slot range as a view
+    of the host state and the arena residents as their own array. `block=True`, for a
+    caller about to write host rows this window covers, copies the slot range (a CPU-backend
+    upload of a view aliases the host) and waits for the transfer. Returns
+    `_eject_unit(pre=)`."""
     import jax
 
     has_ids = st.ids is not None
-    ix = _slab_index(st, s, ar_slots, ar_bricks)
+    ix = _unit_index(st, lo_b, hi_b, ar_slots, ar_bricks)
     s0, s1, span = ix["s0"], ix["s1"], ix["span"]
     n_ar, a_cap, rows_a = ix["n_ar"], ix["a_cap"], ix["rows_a"]
     w_cap = _ladder(span + a_cap)
@@ -453,22 +504,25 @@ def _upload_slab(st, s, ar_slots, ar_bricks, clock, dev=None, block=False):
     return dict(ix=ix, win=win, ar_rows=ar_rows, direct=direct, w_cap=w_cap)
 
 
-def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=None, pre=None,
-                keep_window=True):
-    """Upload slab s's window to `dev` (or take `pre`, an `_upload_slab`), build its
-    rows and eject them. Returns the staged slab; `keep_window=False` releases the
+def _eject_unit(st, u, blocks, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=None,
+                pre=None, keep_window=True):
+    """Upload unit `u = (slab, block)`'s window to `dev` (or take `pre`, an `_upload_unit`),
+    build its rows and eject them. Returns the staged unit; `keep_window=False` releases the
     window with the rows, for a caller whose insert does not write into it."""
     import jax.numpy as jnp
 
+    from ..decomp import block_neighbours
+
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
+    n_y = len(blocks)
     has_ids = st.ids is not None
     if pre is None:
-        pre = _upload_slab(st, s, ar_slots, ar_bricks, clock, dev)
+        pre = _upload_unit(st, *_unit_bricks(u, blocks, nb), ar_slots, ar_bricks, clock, dev)
     ix, w_cap = pre["ix"], pre["w_cap"]
     lo_b, hi_b, s0, s1, span = ix["lo_b"], ix["hi_b"], ix["s0"], ix["s1"], ix["span"]
     n_rows, cap = ix["n_rows"], ix["cap"]
     row_bytes = st.off.itemsize * 3 + st.w.itemsize * 3 + (st.ids.itemsize if has_ids else 0)
-    budget.check(f"ejecting slab {s}", w_cap * row_bytes, EJECT_B_PER_PADDED_ROW, cap)
+    budget.check(f"ejecting unit {u}", w_cap * row_bytes, EJECT_B_PER_PADDED_ROW, cap)
     off_win, w_win, ids_win = pre["win"]
     ar_rows, direct = pre["ar_rows"], pre["direct"]
     pre = None
@@ -481,9 +535,17 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=
         off_win = w_win = ids_win = None
 
     # n_keep, realized x-reach and per-destination emigrant counts in one read
-    sc = _host(_eject_scalars_program(cap, nb, p3)(
-        dest, n_keep, _put(n_rows, dev, jnp.int64), _put(s, dev, jnp.int64)), "eject: scalars")
+    sc = _host(_eject_scalars_program(cap, nb, p3, n_y)(
+        dest, n_keep, _put(n_rows, dev, jnp.int64), _put(u[0], dev, jnp.int64),
+        _put(_block_of_y(blocks, nb), dev)), "eject: scalars")
     n_keep, rr, to = int(sc[0]), int(sc[1]), sc[2:]
+    if n_y > 1:
+        far = np.ones(n_y, dtype=bool)
+        far[block_neighbours(u[1], n_y)] = False
+        n_far = int(to.reshape(nb, n_y)[:, far].sum())
+        if n_far:
+            raise ValueError(f"unit {u}: {n_far} rows land more than one y-block away; the "
+                             "insert takes leavers from neighbouring blocks only")
     clock.mark("eject: reach + scalars")
 
     return dict(dest=dest, off=off_new, w=w_out, ids=ids_out, src=src_out, cap=cap,
@@ -492,31 +554,34 @@ def _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=
                 s0=s0, s1=s1, span=span, w_cap=w_cap, lo_b=lo_b, hi_b=hi_b)
 
 
-def _insert_on_card(st, d, reach, staged, scales_dev, clock, budget, dev=None):
-    """Slab d's insert kernel on `dev` over its keepers and its sources' emigrants.
-    Returns (kernel outputs, n_write, n_spill, consumed, cap_i); nothing is written."""
+def _insert_on_card(st, v, reach, staged, scales_dev, clock, budget, dev=None, blocks=None):
+    """Unit `v = (d, block)`'s insert kernel on `dev` over its keepers and its sources'
+    emigrants (`_sources` order). Returns (kernel outputs, n_write, n_spill, consumed per
+    source unit, cap_i); nothing is written."""
     import jax.numpy as jnp
 
     from .. import insert_jax
 
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
-    nb2 = nb * nb
+    blocks = _whole_slab(nb) if blocks is None else blocks
+    n_y = len(blocks)
     has_ids = st.ids is not None
-    lo_b, hi_b = st.slab_bricks(d)
-    sources = sorted({(int(d) + o) % nb for o in reach})
+    lo_b, hi_b = _unit_bricks(v, blocks, nb)
+    n_b = hi_b - lo_b
+    dest_unit = int(v[0]) * n_y + int(v[1])
 
     consumed = {}
-    segs = [(staged[d], 0, staged[d]["n_keep"], True)]
-    for s in sources:
-        e = staged[s]
+    segs = [(staged[v], 0, staged[v]["n_keep"], True)]
+    for u in _sources(v, reach, nb, n_y):
+        e = staged[u]
         if e["n_rows"] > e["n_keep"]:
-            consumed[s] = int(e["to"][d])
+            consumed[u] = int(e["to"][dest_unit])
             segs.append((e, e["n_keep"], e["n_rows"], False))
     n_in = sum(hi - lo for _e, lo, hi, _k in segs)
     clock.mark("insert: census")
 
     cap_i = insert_jax._padded(n_in)
-    budget.check(f"inserting slab {d}", 0, INSERT_B_PER_PADDED_ROW, cap_i)
+    budget.check(f"inserting unit {v}", 0, INSERT_B_PER_PADDED_ROW, cap_i)
     bufs = (_zeros(cap_i, jnp.int64, dev), _zeros((cap_i, 3), jnp.uint8, dev),
             _zeros((cap_i, 3), jnp.int16, dev),
             _zeros(cap_i, jnp.int32, dev) if has_ids else None, _zeros(cap_i, jnp.int64, dev))
@@ -533,10 +598,10 @@ def _insert_on_card(st, d, reach, staged, scales_dev, clock, budget, dev=None):
     s_old = jnp.where(real, scales_dev[b_src], 1.0)
     clock.mark("insert: compact inputs", b_dest, b_off, b_w, b_ids, s_old, real)
 
-    fn = _insert_kernel(p3, nb2, cap_i, has_ids)
+    fn = _insert_kernel(p3, n_b, cap_i, has_ids)
     out = fn(b_dest, b_off, b_w, b_ids, s_old, real, _put(lo_b, dev, jnp.int64),
              _put(np.asarray(st.brick_start[lo_b:hi_b + 1], dtype=np.int64), dev),
-             _put(np.full(nb2, 32767.0, dtype=np.float64), dev))
+             _put(np.full(n_b, 32767.0, dtype=np.float64), dev))
     clock.mark("insert: kernel", out)
     if float(_host(out["abs_max"], "insert: scalars")) > INT16_MAX:
         raise ValueError(
@@ -585,17 +650,18 @@ def _spills(st, out, nw, ns, cap_i, dev):
     return spills, (g_dest, g_off, g_w, g_ids)
 
 
-def _insert_slab(st, d, reach, staged, scales_dev, clock, budget, dev=None):
-    """Insert slab d on `dev` and write its slot range back. Returns insert_res."""
+def _insert_unit(st, v, reach, staged, scales_dev, clock, budget, dev=None, blocks=None):
+    """Insert unit `v` on `dev` and write its slot range back. Returns insert_res."""
     import jax.numpy as jnp
 
     from ..layout import _to_index
 
     has_ids = st.ids is not None
-    lo_b, hi_b = st.slab_bricks(d)
-    out, nw, ns, consumed, cap_i = _insert_on_card(st, d, reach, staged, scales_dev, clock,
-                                                   budget, dev)
-    e = staged[d]
+    blocks = _whole_slab(st.bricks_per_side) if blocks is None else blocks
+    lo_b, hi_b = _unit_bricks(v, blocks, int(st.bricks_per_side))
+    out, nw, ns, consumed, cap_i = _insert_on_card(st, v, reach, staged, scales_dev, clock,
+                                                   budget, dev, blocks)
+    e = staged[v]
     write = _write_program(cap_i, e["w_cap"], has_ids)
     off_win, w_win, ids_win = write(*e["win"], out["pos"], out["off"], out["w"], out["ids"],
                                     _put(nw, dev, jnp.int64), _put(e["s0"], dev, jnp.int64))
@@ -651,42 +717,66 @@ def _moved(e, dev):
 
 
 def _sweep(st, lo, hi, reach, c_drift, scales, ar_slots, ar_bricks, dev, staged, ejected,
-           clock, budget, insert=None, card=None, keep_window=True):
-    """One card's pass over its own slabs [lo, hi), using any slabs already in
-    `staged` (its boundary ejects, the neighbours' emigrants) as they are. `insert(st, d, reach, staged, scales_dev, clock, budget, dev,
-    card)` runs each destination (default: `_insert_slab`); `card["pre"]` holds
-    windows uploaded ahead of their eject. Returns (insert_res, peak staged)."""
+           clock, budget, insert=None, card=None, keep_window=True, blocks=None):
+    """One card's pass over the units of its own slabs [lo, hi), in ascending brick order,
+    using any units already in `staged` (its boundary ejects, the neighbours' emigrants) as
+    they are. A unit inserts once every unit of `_sources` is staged. `insert(st, v, reach,
+    staged, scales_dev, clock, budget, dev, card)` runs each destination (default:
+    `_insert_unit`); `card["pre"]` holds windows uploaded ahead of their eject. Returns
+    (insert_res per unit, peak staged units)."""
     nb = int(st.bricks_per_side)
+    blocks = _whole_slab(nb) if blocks is None else blocks
+    n_y = len(blocks)
     has_ids = st.ids is not None
     scales_dev = budget.fixed[0]
     card = card if card is not None else dict(pre={})
-    own = range(lo, hi)
+    own = [(s, j) for s in range(lo, hi) for j in range(n_y)]
+    needs = {v: _sources(v, reach, nb, n_y) for v in own}
     inserted, insert_res, peak = set(), {}, 0
-    for s in own:
-        if s not in ejected:
-            staged[s] = _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clock, budget,
-                                    dev, pre=card["pre"].pop(s, None), keep_window=keep_window)
-            ejected[s] = (staged[s]["n_rows"] - staged[s]["n_keep"], staged[s]["rr"],
-                          staged[s]["direct"])
-        for d in own:
-            if d in inserted:
+    for u in own:
+        if u not in ejected:
+            staged[u] = _eject_unit(st, u, blocks, c_drift, scales, ar_slots, ar_bricks, clock,
+                                    budget, dev, pre=card["pre"].pop(u, None),
+                                    keep_window=keep_window)
+            ejected[u] = (staged[u]["n_rows"] - staged[u]["n_keep"], staged[u]["rr"],
+                          staged[u]["direct"])
+        for v in own:
+            if v in inserted:
                 continue
-            if all(((d + o) % nb) in staged for o in reach):
+            if all(x in staged for x in needs[v]):
                 if insert is None:
-                    insert_res[d] = _insert_slab(st, d, reach, staged, scales_dev, clock, budget,
-                                                 dev)
+                    insert_res[v] = _insert_unit(st, v, reach, staged, scales_dev, clock, budget,
+                                                 dev, blocks)
                 else:
-                    insert_res[d] = insert(st, d, reach, staged, scales_dev, clock, budget, dev,
+                    insert_res[v] = insert(st, v, reach, staged, scales_dev, clock, budget, dev,
                                            card)
-                inserted.add(d)
-                staged[d] = _emigrants_only(staged[d], has_ids, dev)
-                clock.mark("insert: shrink staged", staged[d]["dest"])
-        # release what no insert of THIS card can still need
-        for s2 in list(staged):
-            if all(((s2 + o) % nb) in inserted for o in reach if lo <= (s2 + o) % nb < hi):
-                del staged[s2]
+                inserted.add(v)
+                staged[v] = _emigrants_only(staged[v], has_ids, dev)
+                clock.mark("insert: shrink staged", staged[v]["dest"])
+        # release what no insert of THIS card can still need (the relation is symmetric)
+        for u2 in list(staged):
+            if all(v in inserted for v in _sources(u2, reach, nb, n_y) if lo <= v[0] < hi):
+                del staged[u2]
         peak = max(peak, len(staged))
     return insert_res, peak
+
+
+def _per_slab(insert_res, ejected):
+    """The replay's per-slab records from per-unit results: each destination slab's units
+    in block order (spills ascending by brick, consumed summed per source slab, overflow
+    summed), and each source slab's emigrant count (summed) and realized reach (max)."""
+    by_slab = {}
+    for (d, _i), res in sorted(insert_res.items()):
+        r = by_slab.setdefault(d, dict(consumed={}, spills=[], n_over=0))
+        for (src, _j), c in res["consumed"].items():
+            r["consumed"][src] = r["consumed"].get(src, 0) + int(c)
+        r["spills"].extend(res["spills"])
+        r["n_over"] += int(res["n_over"])
+    n_emig, rr_by_slab = {}, {}
+    for (s, _j), (ne, rr, _direct) in ejected.items():
+        n_emig[s] = n_emig.get(s, 0) + int(ne)
+        rr_by_slab[s] = max(rr_by_slab.get(s, 0), int(rr))
+    return by_slab, n_emig, rr_by_slab
 
 
 def pass_reach(st, c_drift, comm=None, vel_scale=None):
@@ -707,48 +797,51 @@ def pass_reach(st, c_drift, comm=None, vel_scale=None):
 _EMIGRANT_FIELDS = ("dest", "off", "w", "ids", "src")
 
 
-def _pack_emigrants(slabs):
-    """Host parcel of emigrant-only staged slabs `{s: entry}` for `comm.exchange_neighbours`:
-    exactly the emigrant rows, plus each slab's count, realized reach and per-slab counts."""
+def _pack_emigrants(units):
+    """Host parcel of emigrant-only staged units `{(s, j): entry}` for
+    `comm.exchange_neighbours`: exactly the emigrant rows, plus each unit's count, realized
+    reach and per-destination-unit counts."""
     out = {}
-    for s, e in slabs.items():
+    for (s, j), e in units.items():
         n = int(e["n_rows"])
-        out[f"{s}:meta"] = np.array([n, int(e["rr"])], dtype=np.int64)
-        out[f"{s}:to"] = np.asarray(e["to"], dtype=np.int64)
+        out[f"{s}:{j}:meta"] = np.array([n, int(e["rr"])], dtype=np.int64)
+        out[f"{s}:{j}:to"] = np.asarray(e["to"], dtype=np.int64)
         if n:
             for k in _EMIGRANT_FIELDS:
                 if e.get(k) is not None:
-                    out[f"{s}:{k}"] = np.ascontiguousarray(_host(e[k], "hand-off: to host")[:n])
+                    out[f"{s}:{j}:{k}"] = np.ascontiguousarray(
+                        _host(e[k], "hand-off: to host")[:n])
     return out
 
 
 def _unpack_emigrants(parcel, dev):
-    """`{s: entry}` from `_pack_emigrants`, on `dev`, zero-padded to the sender's ladder (the
-    same arrays `_emigrants_only` built there)."""
+    """`{(s, j): entry}` from `_pack_emigrants`, on `dev`, zero-padded to the sender's ladder
+    (the same arrays `_emigrants_only` built there)."""
     out = {}
-    for s in sorted({int(k.split(":")[0]) for k in parcel}):
-        n, rr = (int(x) for x in parcel[f"{s}:meta"])
-        e = dict(cap=0, n_keep=0, n_rows=n, rr=rr, to=parcel[f"{s}:to"],
+    for s, j in sorted({tuple(int(x) for x in k.split(":")[:2]) for k in parcel}):
+        n, rr = (int(x) for x in parcel[f"{s}:{j}:meta"])
+        e = dict(cap=0, n_keep=0, n_rows=n, rr=rr, to=parcel[f"{s}:{j}:to"],
                  **{k: None for k in _EMIGRANT_FIELDS})
         if n:
             e["cap"] = cap = _ladder(n)
             for k in _EMIGRANT_FIELDS:
-                a = parcel.get(f"{s}:{k}")
+                a = parcel.get(f"{s}:{j}:{k}")
                 if a is not None:
                     buf = np.zeros((cap,) + a.shape[1:], dtype=a.dtype)
                     buf[:n] = a
                     e[k] = _put(buf, dev)
-        out[s] = e
+        out[(s, j)] = e
     return out
 
 def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=None,
-                 insert=None, keep_window=True, before_sweep=None, comm=None):
-    """Every slab's eject and insert on the cards: the part of
+                 insert=None, keep_window=True, before_sweep=None, comm=None, y_blocks=None):
+    """Every unit's eject and insert on the cards: the part of
     `drift_and_migrate_device` before its arena replay, shared with the fused
     migrate + repack. `insert` and `keep_window` as in `_sweep`; `before_sweep(ctx)`
-    runs after the boundary ejects and before any card inserts. Returns the pass
-    context (reach, cards, per-slab emigrant counts and reach, insert results, the
-    receipt's terms).
+    runs after the boundary ejects and before any card inserts. `y_blocks` are the brick-y
+    ranges each x-slab is cut into (`decomp.y_blocks`; None = whole slabs). Returns the pass
+    context (reach, cards, blocks, per-slab emigrant counts and reach, per-slab insert
+    results for the replay, the receipt's terms).
 
     Across ranks (`comm`; a node-local `st`, every rank calls this): the reach is the max
     over ranks, the r slabs next to each end send their pre-pass scales to the neighbour
@@ -774,6 +867,8 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
     scales = np.array(st.vel_scale, dtype=np.float64, copy=True)
     r_raw, r = pass_reach(st, c_drift, comm, scales)
     reach = range(-r, r + 1)
+    blocks = _check_blocks(_whole_slab(nb) if y_blocks is None else y_blocks, nb, r)
+    n_y = len(blocks)
     if multi:
         thin = int(comm.allreduce(hi_s - lo_s, "min"))
         if thin < 2 * r + 1:
@@ -811,7 +906,8 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
     budgets = [_Budget(device_budget_bytes, staged[k], [_put(scales, devs[k])])
                for k in range(W)]
     cards = [dict(k=k, lo=parts[k][0], hi=parts[k][1], pre={}, ejected=ejected[k],
-                  staged=staged[k], dev=devs[k], clock=clocks[k], budget=budgets[k])
+                  staged=staged[k], dev=devs[k], clock=clocks[k], budget=budgets[k],
+                  blocks=blocks)
              for k in range(W)]
     clocks[0].mark("pass: setup", budgets[0].fixed[0])
 
@@ -825,17 +921,19 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
     rank_sent = dict(rows=0, bytes=0)
     rank_recv = dict(rows=0, bytes=0)
     if W > 1 or multi:
-        # every card ejects its r lowest and r highest slabs and cuts emigrant-only
-        # copies for the neighbours that insert from them
+        # every card ejects the units of its r lowest and r highest slabs and cuts
+        # emigrant-only copies for the neighbours that insert from them
         def boundary(k):
             lo, hi = parts[k]
             out = {}
             for s in sorted(set(range(lo, lo + r)) | set(range(hi - r, hi))):
-                e = _eject_slab(st, s, c_drift, scales, ar_slots, ar_bricks, clocks[k],
-                                budgets[k], devs[k], keep_window=keep_window)
-                staged[k][s] = e
-                ejected[k][s] = (e["n_rows"] - e["n_keep"], e["rr"], e["direct"])
-                out[s] = _emigrants_only(e, has_ids, devs[k])
+                for j in range(n_y):
+                    u = (s, j)
+                    e = _eject_unit(st, u, blocks, c_drift, scales, ar_slots, ar_bricks,
+                                    clocks[k], budgets[k], devs[k], keep_window=keep_window)
+                    staged[k][u] = e
+                    ejected[k][u] = (e["n_rows"] - e["n_keep"], e["rr"], e["direct"])
+                    out[u] = _emigrants_only(e, has_ids, devs[k])
             return out
 
         exports = run(boundary)
@@ -845,25 +943,27 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
             # off to the neighbour ranks below
             nbrs = ({(k - 1) % W, (k + 1) % W} - {k}) if not multi else (
                 {k - 1, k + 1} & set(range(W)))
-            for s, e in exports[k].items():
+            for u, e in exports[k].items():
                 for j in nbrs:
                     jlo, jhi = parts[j]
-                    if any(jlo <= (s + o) % nb < jhi for o in reach):
-                        staged[j][s], nbytes = _moved(e, devs[j])
+                    if any(jlo <= (u[0] + o) % nb < jhi for o in reach):
+                        staged[j][u], nbytes = _moved(e, devs[j])
                         segments += 1
                         moved_bytes += nbytes
         if multi:
-            to_l = _pack_emigrants({s: exports[0][s] for s in range(lo_s, lo_s + r)})
-            to_r = _pack_emigrants({s: exports[W - 1][s] for s in range(hi_s - r, hi_s)})
+            to_l = _pack_emigrants({(s, j): exports[0][(s, j)] for s in range(lo_s, lo_s + r)
+                                    for j in range(n_y)})
+            to_r = _pack_emigrants({(s, j): exports[W - 1][(s, j)]
+                                    for s in range(hi_s - r, hi_s) for j in range(n_y)})
             got_l, got_r = exchange_neighbours(comm, to_l, to_r)
             for got, k in ((got_l, 0), (got_r, W - 1)):
-                for s, e in _unpack_emigrants(got, devs[k]).items():
-                    staged[k][s] = e
+                for u, e in _unpack_emigrants(got, devs[k]).items():
+                    staged[k][u] = e
                     rank_recv["rows"] += int(e["n_rows"])
                 rank_recv["bytes"] += sum(int(v.nbytes) for v in got.values())
             rank_sent["rows"] = sum(int(e["n_rows"]) for e in (
-                [exports[0][s] for s in range(lo_s, lo_s + r)]
-                + [exports[W - 1][s] for s in range(hi_s - r, hi_s)]))
+                [exports[0][(s, j)] for s in range(lo_s, lo_s + r) for j in range(n_y)]
+                + [exports[W - 1][(s, j)] for s in range(hi_s - r, hi_s) for j in range(n_y)]))
             rank_sent["bytes"] = sum(int(v.nbytes) for d in (to_l, to_r) for v in d.values())
         exports = None
         clocks[0].mark("pass: boundary ejects + hand-off")
@@ -871,7 +971,7 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
     ctx = dict(nb=nb, r=r, r_raw=r_raw, reach=reach, scales=scales, n_before=n_before,
                devs=devs, W=W, parts=parts, cards=cards, clocks=clocks, budgets=budgets,
                t_card=t_card, fallback=fallback, ar_slots=ar_slots, ar_bricks=ar_bricks,
-               run=run)
+               run=run, blocks=blocks)
     if before_sweep is not None:
         before_sweep(ctx)
 
@@ -879,14 +979,14 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
     swept = run(lambda k: _sweep(st, parts[k][0], parts[k][1], reach, c_drift, scales,
                                  ar_slots, ar_bricks, devs[k], staged[k], ejected[k],
                                  clocks[k], budgets[k], insert=insert, card=cards[k],
-                                 keep_window=keep_window))
-    insert_res, n_emig, rr_by_slab, n_direct = {}, {}, {}, 0
+                                 keep_window=keep_window, blocks=blocks))
+    unit_res, unit_ejected, n_direct = {}, {}, 0
     for k in range(W):
-        insert_res.update(swept[k][0])
-        for s, (ne, rr, direct) in ejected[k].items():
-            n_emig[s], rr_by_slab[s] = ne, rr
-            n_direct += bool(direct)
+        unit_res.update(swept[k][0])
+        unit_ejected.update(ejected[k])
+        n_direct += sum(bool(direct) for _ne, _rr, direct in ejected[k].values())
         staged[k].clear()
+    insert_res, n_emig, rr_by_slab = _per_slab(unit_res, unit_ejected)
     # rows this rank's inserts took from other ranks' slabs, reported to their owners
     foreign_consumed, taken = {}, 0
     if multi:
@@ -909,6 +1009,7 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
                 foreign_consumed[(d, src)] = foreign_consumed.get((d, src), 0) + c
     given = sum(foreign_consumed.values())
     ctx.update(insert_res=insert_res, n_emig=n_emig, rr_by_slab=rr_by_slab, n_direct=n_direct,
+               n_units=len(unit_ejected),
                segments=segments, moved_bytes=moved_bytes, foreign_consumed=foreign_consumed,
                rows_in=taken, rows_out=given, rank_sent=rank_sent, rank_recv=rank_recv,
                multi=multi, comm=comm)
@@ -925,9 +1026,10 @@ def _merge_card_timings(ctx, timings):
 def _pass_receipt(ctx, devices, device_budget_bytes, spill_rows):
     n_own = sum(hi - lo for lo, hi in ctx["parts"])
     receipt = dict(slabs=n_own, programs=len(_PROGRAMS), spill_rows=spill_rows,
+                   y_blocks=len(ctx["blocks"]), units=ctx["n_units"],
                    peak_estimate_bytes=max(b.peak for b in ctx["budgets"]),
                    budget_bytes=device_budget_bytes, window_direct_slabs=ctx["n_direct"],
-                   window_copied_slabs=n_own - ctx["n_direct"],
+                   window_copied_slabs=ctx["n_units"] - ctx["n_direct"],
                    rank_emigrant_rows_sent=ctx["rank_sent"]["rows"],
                    rank_emigrant_rows_received=ctx["rank_recv"]["rows"],
                    rank_hand_off_bytes_sent=ctx["rank_sent"]["bytes"],
@@ -971,7 +1073,7 @@ def conserve(st, ctx, n_after, what):
 
 
 def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
-                             device_budget_bytes=None, devices=None, comm=None):
+                             device_budget_bytes=None, devices=None, comm=None, y_blocks=None):
     """`state.drift_and_migrate` with every slab's row work on the device.
 
     Same contract, mutations and stats dict (plus a `migrate_device` receipt), bitwise
@@ -992,11 +1094,14 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
 
     `comm`, with a node-local `st` (every rank calls this): the pass across ranks
     (`_device_pass`); `st.n_particles` becomes the rank's new count.
+
+    `y_blocks`: the brick-y ranges each slab's work is cut into (`decomp.y_blocks`; None =
+    whole slabs); bitwise any cut. The receipt's `window_*_slabs` then count units.
     """
     from .. import state as _state
 
     ctx = _device_pass(st, c_drift, timings=timings, device_budget_bytes=device_budget_bytes,
-                       devices=devices, comm=comm)
+                       devices=devices, comm=comm, y_blocks=y_blocks)
     rep = _state._replay_arena_pass(
         st, ctx["reach"], ctx["r"], ctx["r_raw"], c_drift, ctx["scales"], n_emig=ctx["n_emig"],
         rr_by_slab=ctx["rr_by_slab"], insert_res=ctx["insert_res"],

@@ -70,8 +70,11 @@ def _check(want, got):
             assert a == b, f"slab {s}: {name} differ"
 
 
-def _migrate(st, cfg, decomp, comm, devs):
-    dmig.drift_and_migrate_device(st, DRIFT, devices=devs, comm=comm)
+def _migrate(st, cfg, decomp, comm, devs, y_blocks=1):
+    from inexor.decomp import y_blocks as _y_blocks
+
+    blocks = _y_blocks(decomp.tiles_side, decomp.bricks_per_tile, y_blocks)
+    dmig.drift_and_migrate_device(st, DRIFT, devices=devs, comm=comm, y_blocks=blocks)
     st.check()
     return _slabs(st)
 
@@ -101,7 +104,7 @@ def reference():
     return out
 
 
-def _ranks(fn, n_ranks, cards):
+def _ranks(fn, n_ranks, cards, **kw):
     cfg = rank_cfg(cards)
     whole = whole_state()
 
@@ -109,7 +112,7 @@ def _ranks(fn, n_ranks, cards):
         d = Decomp.build(cfg, n_ranks=c.size, rank=c.rank)
         part = whole if c.size == 1 else restrict_to_slabs(whole, d.slabs)
         n0 = c.allreduce(int(part.n_particles))
-        got = fn(part, cfg, d, c, rank_devices(c.rank, cards))
+        got = fn(part, cfg, d, c, rank_devices(c.rank, cards), **kw)
         assert c.allreduce(int(part.n_particles)) == n0 and part.n_live == part.n_particles
         return got
 
@@ -121,6 +124,13 @@ def _ranks(fn, n_ranks, cards):
 @pytest.mark.parametrize("which", sorted(PASSES))
 def test_rank_passes_are_the_one_rank_pass(reference, which, n_ranks, cards):
     _check(reference[which], _ranks(PASSES[which], n_ranks, cards))
+
+
+@pytest.mark.parametrize("y_blocks", [2, 4])
+@pytest.mark.parametrize("cards", [1, 2])
+@pytest.mark.parametrize("n_ranks", [1, 2, 4])
+def test_y_blocked_rank_migrates_are_the_one_rank_pass(reference, n_ranks, cards, y_blocks):
+    _check(reference["migrate"], _ranks(_migrate, n_ranks, cards, y_blocks=y_blocks))
 
 
 def test_particles_cross_the_rank_boundaries(reference):
@@ -161,17 +171,17 @@ def test_a_dropped_hand_off_row_is_caught_by_the_census(monkeypatch):
     def drop_one(slabs):
         out = real(slabs)
         for key in [k for k in out if k.endswith(":meta")]:
-            s = key.split(":")[0]
+            u = key.rsplit(":", 1)[0]  # "<slab>:<block>"
             n = int(out[key][0])
             if n:
-                d = int(out[f"{s}:dest"][n - 1]) // per_slab
+                d = int(out[f"{u}:dest"][n - 1]) // per_slab  # one block: unit = slab
                 out[key] = out[key].copy()
                 out[key][0] = n - 1
-                out[f"{s}:to"] = out[f"{s}:to"].copy()
-                out[f"{s}:to"][d] -= 1
+                out[f"{u}:to"] = out[f"{u}:to"].copy()
+                out[f"{u}:to"][d] -= 1
                 for k in dmig._EMIGRANT_FIELDS:
-                    if f"{s}:{k}" in out:
-                        out[f"{s}:{k}"] = out[f"{s}:{k}"][:n - 1]
+                    if f"{u}:{k}" in out:
+                        out[f"{u}:{k}"] = out[f"{u}:{k}"][:n - 1]
                 break
         return out
 

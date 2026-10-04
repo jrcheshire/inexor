@@ -148,21 +148,21 @@ def test_cross_card_early_uploads_happen_and_stay_bitwise():
                                       parts, 256)
     deep = {t for e in early for t in e} - {s for lo, hi in parts for s in (lo, hi - 1)}
     assert deep, "VACUOUS: every overrun slab is a boundary slab"
-    real = migrate._eject_slab
+    real = migrate._eject_unit
 
-    def late(st_, s, *args, **kw):
-        if s in deep and kw.get("pre") is None:
+    def late(st_, u, *args, **kw):
+        if u[0] in deep and kw.get("pre") is None:
             time.sleep(2.0)
-        return real(st_, s, *args, **kw)
+        return real(st_, u, *args, **kw)
 
     st_h, st_f = copy.deepcopy(st), copy.deepcopy(st)
     state.drift_and_migrate(st_h, c)
     st_h.repack(brick_slack=0.5)
-    migrate._eject_slab = late
+    migrate._eject_unit = late
     try:
         migrate_repack_device(st_f, c, census, brick_slack=0.5, devices=devs)
     finally:
-        migrate._eject_slab = real
+        migrate._eject_unit = real
     _same_state(st_h, st_f, "fused, deep ejects delayed, vs host")
 
 

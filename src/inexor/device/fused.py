@@ -14,10 +14,11 @@ arena-full refusal, stats); its arena writes are erased by the repack tail, exce
 allocation reaches past the old `arena_base`, whose rows are saved across the replay and restored.
 
 Before a block is written, every brick's inserted membership must equal its census count, else it
-refuses; earlier slabs may already be written, so a refusal leaves the state invalid (as any
-mid-pass refusal does). A new block may overlap a later slab's old range: on the same card that
-slab is uploaded first; across cards every such slab is uploaded before any card writes
-(`repack._cross_card_slabs`).
+refuses; earlier units may already be written, so a refusal leaves the state invalid (as any
+mid-pass refusal does). The visit is per unit (x-slab, y-block; whole slabs by default), and units
+go in ascending brick order, which is slot order. A new block may overlap a later unit's old
+range: on the same card that unit is uploaded first; across cards every such unit is uploaded
+before any card writes (`repack._cross_card_units`).
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import migrate as _m
-from .repack import _cross_card_slabs, _repack_program, capacity_from_counts
+from .repack import _cross_card_units, _repack_program, capacity_from_counts
 
 #: Call count of fused passes.
 CALLS = 0
@@ -107,7 +108,8 @@ def census_across_ranks(st, counts, c_drift, comm):
 
 
 def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_staged_slabs=None,
-                          timings=None, device_budget_bytes=None, devices=None, comm=None):
+                          timings=None, device_budget_bytes=None, devices=None, comm=None,
+                          y_blocks=None):
     """`drift_and_migrate_device` followed by `repack_device`, in one pass per slab.
 
     `census_counts` is the per-brick post-migrate membership, int64 over
@@ -117,6 +119,8 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     `comm`, with a node-local `st` (every rank calls this): `census_counts` is this rank's
     tile loop's census (`census_across_ranks` completes it), and the pass runs across ranks
     as the device migrate does; `st.n_particles` becomes the rank's new count.
+    `y_blocks`: the brick-y ranges each slab's visit is cut into (`decomp.y_blocks`; None =
+    whole slabs); bitwise any cut.
 
     Returns `(migrate_stats, repack_stats)`: the migrate's stats dict with its
     `migrate_device` receipt (plus `fused`), and the repack's dict with a
@@ -129,7 +133,6 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     global CALLS
     CALLS += 1
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
-    nb2 = nb * nb
     has_ids = st.ids is not None
     counts = np.asarray(census_counts)
     if counts.dtype != np.int64 or counts.shape != (int(st.n_bricks),):
@@ -157,23 +160,28 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     def before_sweep(ctx):
         if ctx["W"] == 1:
             return
-        early = _cross_card_slabs(old_start, new_start, ctx["parts"], nb2)
+        blocks = ctx["blocks"]
+        early = _cross_card_units(old_start, new_start, ctx["parts"], nb, blocks)
 
         def upload(k):
             card = ctx["cards"][k]
             for t in early[k]:
                 if t not in card["ejected"] and t not in card["pre"]:
-                    card["pre"][t] = _m._upload_slab(st, t, ctx["ar_slots"], ctx["ar_bricks"],
-                                                     card["clock"], card["dev"], block=True)
+                    card["pre"][t] = _m._upload_unit(
+                        st, *_m._unit_bricks(t, blocks, nb), ctx["ar_slots"], ctx["ar_bricks"],
+                        card["clock"], card["dev"], block=True)
                     acc(k)["early"] += 1
 
         ctx["run"](upload)
 
     def insert(st, d, reach, staged, scales_dev, clock, budget, dev, card):
+        blocks = card["blocks"]
+        n_y = len(blocks)
         e = staged[d]
         lo_b, hi_b, s0, span = e["lo_b"], e["hi_b"], e["s0"], e["span"]
+        n_b = hi_b - lo_b
         out, nw, ns, consumed, cap_i = _m._insert_on_card(st, d, reach, staged, scales_dev,
-                                                          clock, budget, dev)
+                                                          clock, budget, dev, blocks)
         scales_h = _m._host(out["scales"], "insert: scales")
         clock.mark("insert: occupancy + scales to host")
         spills, rows = _m._spills(st, out, nw, ns, cap_i, dev)
@@ -184,7 +192,7 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
         a = acc(card["k"])
         if n_rows == 0 and n_hi == n_lo:
             if int(counts[lo_b:hi_b].sum()):
-                raise AssertionError(f"slab {d} inserted no rows against a census of "
+                raise AssertionError(f"unit {d} inserted no rows against a census of "
                                      f"{int(counts[lo_b:hi_b].sum())}")
             a["empty"] += 1
             st.vel_scale[lo_b:hi_b] = scales_h
@@ -196,7 +204,7 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
             rows = (_m._zeros(a_cap, jnp.int64, dev), _m._zeros((a_cap, 3), jnp.uint8, dev),
                     _m._zeros((a_cap, 3), jnp.int16, dev),
                     _m._zeros(a_cap, jnp.int32, dev) if has_ids else None)
-        prep = _block_inputs_program(cap_i, a_cap, w_cap, nb2, p3, has_ids)
+        prep = _block_inputs_program(cap_i, a_cap, w_cap, n_b, p3, has_ids)
         (off_win, w_win, ids_win, occ, live, row_offsets, ar_offsets, ar_bucket,
          members) = prep(out["pos"], out["off"], out["w"], out["ids"], out["occupancy"], *rows,
                          _m._put(nw, dev, jnp.int64), _m._put(ns, dev, jnp.int64),
@@ -211,7 +219,7 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
         if len(bad):
             b = int(bad[0])
             raise AssertionError(
-                f"slab {d}: brick {lo_b + b} holds {int(got[b])} rows after its insert "
+                f"unit {d}: brick {lo_b + b} holds {int(got[b])} rows after its insert "
                 f"against a census of {int(want[b])} ({len(bad)} bricks differ). Its new "
                 "range was sized from the census, so the block is not written.")
         clock.mark("fused: self-check")
@@ -220,8 +228,8 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
         out_cap = _m._ladder(n_hi - n_lo)
         held = sum(sum(int(x.nbytes) for x in p["win"] if x is not None)
                    for p in card["pre"].values())
-        budget.check(f"repacking slab {d}", held, REPACK_B_PER_SLAB_ROW, n_rows)
-        block = _repack_program(cap, w_cap, a_cap, out_cap, nb2, p3, has_ids, st.off.dtype,
+        budget.check(f"repacking unit {d}", held, REPACK_B_PER_SLAB_ROW, n_rows)
+        block = _repack_program(cap, w_cap, a_cap, out_cap, n_b, p3, has_ids, st.off.dtype,
                                 st.w.dtype, None if not has_ids else st.ids.dtype)
         out_off, out_w, out_ids, occ_s = block(
             occ, live, _m._put(old_start[lo_b:hi_b] - s0, dev), row_offsets, ar_offsets,
@@ -230,14 +238,17 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
         off_win = w_win = ids_win = occ = live = row_offsets = ar_offsets = ar_bucket = None
         clock.mark("fused: block program", out_off, out_w, out_ids, occ_s)
 
-        # upload every later slab of this card whose old range this write overlaps
-        t = d + 1
-        while t < card["hi"] and int(old_start[t * nb2]) < n_hi:
+        # upload every later unit of this card whose old range this write overlaps
+        t = (d[0], d[1] + 1) if d[1] + 1 < n_y else (d[0] + 1, 0)
+        while t[0] < card["hi"]:
+            t_lo, t_hi = _m._unit_bricks(t, blocks, nb)
+            if int(old_start[t_lo]) >= n_hi:
+                break
             if t not in card["ejected"] and t not in card["pre"]:
-                card["pre"][t] = _m._upload_slab(st, t, card_ar[0], card_ar[1], clock, dev,
-                                                 block=True)
+                card["pre"][t] = _m._upload_unit(st, t_lo, t_hi, card_ar[0], card_ar[1], clock,
+                                                 dev, block=True)
                 a["readahead"] += 1
-            t += 1
+            t = (t[0], t[1] + 1) if t[1] + 1 < n_y else (t[0] + 1, 0)
         clock.mark("fused: read-ahead")
 
         m = n_hi - n_lo
@@ -256,7 +267,7 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     card_ar = _m.pass_arena_index(st)
     ctx = _m._device_pass(st, c_drift, timings=timings, device_budget_bytes=device_budget_bytes,
                           devices=devices, insert=insert, keep_window=False,
-                          before_sweep=before_sweep, comm=comm)
+                          before_sweep=before_sweep, comm=comm, y_blocks=y_blocks)
     clock = ctx["clocks"][0]
 
     # the migrate's census, arena-full refusal and stats, exactly as the device

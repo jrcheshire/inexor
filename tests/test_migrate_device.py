@@ -55,19 +55,26 @@ def x64():
     jax.config.update("jax_enable_x64", prev)
 
 
-def _device(st, c):
+def _device(st, c, y_blocks=None):
     from inexor.device.migrate import drift_and_migrate_device
 
-    out = drift_and_migrate_device(st, c)
+    out = drift_and_migrate_device(st, c, y_blocks=y_blocks)
     receipt = out.pop("migrate_device")
     assert receipt["slabs"] == int(st.bricks_per_side)
+    n_y = 1 if y_blocks is None else len(y_blocks)
+    assert receipt["y_blocks"] == n_y and receipt["units"] == int(st.bricks_per_side) * n_y
     return out
 
 
 # ------------------------------------------------------------------ the gate
 
+# brick-y cuts of the 8-brick fixture: halves, quarters (2 rows, the drift's reach), uneven
+Y_BLOCKS = [None, ((0, 4), (4, 8)), ((0, 2), (2, 4), (4, 6), (6, 8)), ((0, 2), (2, 5), (5, 8))]
 
-def test_two_migrations_on_the_device_are_bitwise_the_serial_numpy_pass(x64, monkeypatch):
+
+@pytest.mark.parametrize("y_blocks", Y_BLOCKS)
+def test_two_migrations_on_the_device_are_bitwise_the_serial_numpy_pass(x64, monkeypatch,
+                                                                         y_blocks):
     st_a, st_b = _state(), _state()
     c = _c_drift(st_a, 1.9)
 
@@ -96,7 +103,7 @@ def test_two_migrations_on_the_device_are_bitwise_the_serial_numpy_pass(x64, mon
     for step in range(2):
         rehomed += st_a.arena_used
         r_a = state.drift_and_migrate(st_a, c)
-        r_b = _device(st_b, c)
+        r_b = _device(st_b, c, y_blocks)
         overflow += r_a["n_arena_overflow"]
         reach = max(reach, r_a["brick_reach_realized"])
         assert r_a == r_b, f"step {step}: stats differ: {r_a} vs {r_b}"
@@ -124,6 +131,54 @@ def test_migrations_with_a_repack_between_and_no_ids_are_bitwise(x64):
         _same_state(st_a, st_b, f"step {step} repack")
     assert st_b.ids is None
     assert overflow > 0, "VACUOUS: no brick overflowed across the repacked steps"
+
+
+def test_y_blocks_out_of_order_sources_are_not_bitwise(x64, monkeypatch):
+    """The gate can fail: a unit insert fed a source slab's blocks in ring order (j-1, j,
+    j+1) rather than ascending scrambles that slab's leaver order at the wrap."""
+    from inexor.decomp import block_neighbours
+    from inexor.device import migrate
+
+    def ring(v, reach, nb, n_y):
+        d, i = v
+        return [(s, j % n_y) for s in sorted({(int(d) + o) % nb for o in reach})
+                for j in (i - 1, i, i + 1) if n_y > 2 or j in block_neighbours(i, n_y)]
+
+    monkeypatch.setattr(migrate, "_sources", ring)
+    st_a, st_b = _state(), _state()
+    c = _c_drift(st_a, 1.9)
+    state.drift_and_migrate(st_a, c)
+    _device(st_b, c, Y_BLOCKS[2])
+    with pytest.raises(AssertionError, match="differ"):
+        _same_state(st_a, st_b, "ring-order sources")
+
+
+def test_a_unit_whose_leavers_are_skipped_is_refused_by_the_census(x64, monkeypatch):
+    from inexor.device import migrate
+
+    real = migrate._sources
+    skipped = []
+
+    def drop_one(v, reach, nb, n_y):
+        out = real(v, reach, nb, n_y)
+        if v == (3, 1):
+            skipped.append(out.pop())
+        return out
+
+    monkeypatch.setattr(migrate, "_sources", drop_one)
+    st = _state()
+    with pytest.raises(AssertionError, match="unconsumed"):
+        _device(st, _c_drift(st, 1.9), Y_BLOCKS[1])
+    assert skipped, "VACUOUS: no source was dropped"
+
+
+def test_y_blocks_narrower_than_the_reach_or_not_tiling_are_refused(x64):
+    st = _state()
+    with pytest.raises(ValueError, match="narrower than the drift's reach"):
+        _device(st, _c_drift(st, 1.9), ((0, 1), (1, 8)))
+    for bad in (((0, 4),), ((0, 4), (5, 8)), ((1, 8),)):
+        with pytest.raises(ValueError, match="do not tile"):
+            _device(_state(), _c_drift(st, 1.9), bad)
 
 
 def test_an_arena_full_pass_refuses_like_the_serial_one(x64):
