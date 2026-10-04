@@ -79,10 +79,13 @@ def _migrate(st, cfg, decomp, comm, devs, y_blocks=1):
     return _slabs(st)
 
 
-def _fused(st, cfg, decomp, comm, devs):
-    _cap, _shapes, census = tile_pass(st, cfg, decomp, comm, devs)
+def _fused(st, cfg, decomp, comm, devs, y_blocks=1):
+    from inexor.decomp import y_blocks as _y_blocks
+
+    _cap, _shapes, census = tile_pass(st, cfg, decomp, comm, devs, y_blocks)
     migrate_repack_device(st, C_DRIFT, census, brick_slack=cfg.brick_slack, devices=devs,
-                          comm=comm)
+                          comm=comm, y_blocks=_y_blocks(decomp.tiles_side,
+                                                        decomp.bricks_per_tile, y_blocks))
     st.check()
     assert st.arena_used == 0
     return _slabs(st)
@@ -129,8 +132,10 @@ def test_rank_passes_are_the_one_rank_pass(reference, which, n_ranks, cards):
 @pytest.mark.parametrize("y_blocks", [2, 4])
 @pytest.mark.parametrize("cards", [1, 2])
 @pytest.mark.parametrize("n_ranks", [1, 2, 4])
-def test_y_blocked_rank_migrates_are_the_one_rank_pass(reference, n_ranks, cards, y_blocks):
-    _check(reference["migrate"], _ranks(_migrate, n_ranks, cards, y_blocks=y_blocks))
+@pytest.mark.parametrize("which", sorted(PASSES))
+def test_y_blocked_rank_passes_are_the_one_rank_pass(reference, which, n_ranks, cards,
+                                                     y_blocks):
+    _check(reference[which], _ranks(PASSES[which], n_ranks, cards, y_blocks=y_blocks))
 
 
 def test_particles_cross_the_rank_boundaries(reference):

@@ -17,7 +17,10 @@ import pytest
 from inexor import state
 from inexor.codec import T9Layout
 from inexor.device import repack as drepack
-from tests.test_migrate_device import _c_drift, _same_state, _state
+from tests.test_migrate_device import Y_BLOCKS, _c_drift, _same_state, _state
+
+# the 16-brick fixtures in quarters (4 brick rows each, above the drifts' reach)
+Y16 = ((0, 4), (4, 8), (8, 12), (12, 16))
 
 jax = pytest.importorskip("jax")
 
@@ -69,7 +72,7 @@ def _devices(w):
     return list(jax.devices()[:w])
 
 
-def _three_way(st0, c, slack, steps, devices=None):
+def _three_way(st0, c, slack, steps, devices=None, y_blocks=None):
     from inexor.device.fused import migrate_repack_device
     from inexor.device.migrate import drift_and_migrate_device
 
@@ -79,9 +82,12 @@ def _three_way(st0, c, slack, steps, devices=None):
         census = _census(st_f, c)
         m_h = state.drift_and_migrate(st_h, c)
         r_h = st_h.repack(brick_slack=slack)
-        m_d = drift_and_migrate_device(st_d, c, devices=devices)
+        m_d = drift_and_migrate_device(st_d, c, devices=devices, y_blocks=y_blocks)
         r_d = drepack.repack_device(st_d, brick_slack=slack, devices=devices)
-        m_f, r_f = migrate_repack_device(st_f, c, census, brick_slack=slack, devices=devices)
+        m_f, r_f = migrate_repack_device(st_f, c, census, brick_slack=slack, devices=devices,
+                                         y_blocks=y_blocks)
+        n_y = 1 if y_blocks is None else len(y_blocks)
+        assert m_f["migrate_device"]["units"] == int(st0.bricks_per_side) * n_y
         receipts.append((m_f["migrate_device"], r_f["repack_device"], m_h))
         where = f"step {step}"
         _same_state(st_h, st_f, f"{where}: fused vs host")
@@ -92,9 +98,10 @@ def _three_way(st0, c, slack, steps, devices=None):
     return receipts
 
 
-def test_two_fused_steps_are_bitwise_both_pairs():
+@pytest.mark.parametrize("y_blocks", Y_BLOCKS)
+def test_two_fused_steps_are_bitwise_both_pairs(y_blocks):
     st = _state()
-    rec = _three_way(st, _c_drift(st, 1.9), 0.10, 2)
+    rec = _three_way(st, _c_drift(st, 1.9), 0.10, 2, y_blocks=y_blocks)
     assert sum(m["n_arena_overflow"] for _mr, _rr, m in rec) > 0, "VACUOUS: nothing spilled"
     assert max(m["brick_reach_realized"] for _mr, _rr, m in rec) >= 2, "VACUOUS: reach < 2"
     assert all(mr["fused"] and rr["fused"] for mr, rr, _m in rec)
@@ -106,24 +113,26 @@ def test_no_ids_and_a_slack_change_are_bitwise():
     _three_way(st, _c_drift(st, 1.3), 0.05, 3)
 
 
-def test_a_growing_allocation_reads_ahead_and_stays_bitwise():
+@pytest.mark.parametrize("y_blocks", [None, Y16])
+def test_a_growing_allocation_reads_ahead_and_stays_bitwise(y_blocks):
     # built with no slack and repacked at 10%: new ranges drift right by a growing
     # prefix, past the next slab by the last of 16
     st = _state(n_part=64, nb=16, box=32.0, brick_slack=0.0)
-    rec = _three_way(st, _c_drift(st, 0.9), 0.10, 1)
+    rec = _three_way(st, _c_drift(st, 0.9), 0.10, 1, y_blocks=y_blocks)
     assert rec[0][1]["readahead_uploads"] > 0, "VACUOUS: no block overran a later slab"
 
 
-@pytest.mark.parametrize("w", [2, 3, 4])
-def test_fused_on_w_cards_is_bitwise_both_pairs(w):
+@pytest.mark.parametrize("w,y_blocks", [(2, None), (3, None), (4, None), (2, Y16), (4, Y16)])
+def test_fused_on_w_cards_is_bitwise_both_pairs(w, y_blocks):
     devs = _devices(w)
     st = _state(n_part=64, nb=16, box=32.0)
-    rec = _three_way(st, _c_drift(st, 0.9), 0.10, 2, devices=devs)
+    rec = _three_way(st, _c_drift(st, 0.9), 0.10, 2, devices=devs, y_blocks=y_blocks)
     assert all(mr["cards"] == w for mr, _rr, _m in rec)
     assert sum(mr["cross_card_segments"] for mr, _rr, _m in rec) > 0, "VACUOUS: no hand-off"
 
 
-def test_cross_card_early_uploads_happen_and_stay_bitwise():
+@pytest.mark.parametrize("y_blocks", [None, Y16])
+def test_cross_card_early_uploads_happen_and_stay_bitwise(y_blocks):
     import time
 
     from inexor.device import migrate
@@ -133,7 +142,7 @@ def test_cross_card_early_uploads_happen_and_stay_bitwise():
     devs = _devices(4)
     st = _roomy_state()
     c = _c_drift(st, 0.9)
-    rec = _three_way(st, c, 0.5, 1, devices=devs)
+    rec = _three_way(st, c, 0.5, 1, devices=devs, y_blocks=y_blocks)
     # boundary slabs are ejected before any card writes, so these are deeper ones
     assert rec[0][1]["cross_card_early_uploads"] > 0, "VACUOUS: no cross-card overrun"
 
@@ -144,14 +153,15 @@ def test_cross_card_early_uploads_happen_and_stay_bitwise():
     census = _census(st, c)
     new_start, _ = drepack.capacity_from_counts(st, census, 0.5)
     parts = partition_units(16, 4, 1)
-    early = drepack._cross_card_slabs(np.asarray(st.brick_start, dtype=np.int64), new_start,
-                                      parts, 256)
-    deep = {t for e in early for t in e} - {s for lo, hi in parts for s in (lo, hi - 1)}
-    assert deep, "VACUOUS: every overrun slab is a boundary slab"
+    early = drepack._cross_card_units(np.asarray(st.brick_start, dtype=np.int64), new_start,
+                                      parts, 16, ((0, 16),) if y_blocks is None else y_blocks)
+    deep = {t for e in early for t in e if t[0] not in {s for lo, hi in parts
+                                                         for s in (lo, hi - 1)}}
+    assert deep, "VACUOUS: every overrun unit is in a boundary slab"
     real = migrate._eject_unit
 
     def late(st_, u, *args, **kw):
-        if u[0] in deep and kw.get("pre") is None:
+        if u in deep and kw.get("pre") is None:
             time.sleep(2.0)
         return real(st_, u, *args, **kw)
 
@@ -160,7 +170,7 @@ def test_cross_card_early_uploads_happen_and_stay_bitwise():
     st_h.repack(brick_slack=0.5)
     migrate._eject_unit = late
     try:
-        migrate_repack_device(st_f, c, census, brick_slack=0.5, devices=devs)
+        migrate_repack_device(st_f, c, census, brick_slack=0.5, devices=devs, y_blocks=y_blocks)
     finally:
         migrate._eject_unit = real
     _same_state(st_h, st_f, "fused, deep ejects delayed, vs host")
