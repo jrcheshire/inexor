@@ -199,6 +199,14 @@ MIGRATE_DEVICE_B_PER_SLAB_ROW = 320
 REPACK_DEVICE_B_PER_SLAB_ROW = 70
 # `device.fused.migrate_repack_device` (measured at 1024^3, not production shape).
 FUSED_DEVICE_B_PER_SLAB_ROW = 257
+# Of that, the staged eject outputs of the slabs held while one is inserted, per held slab row:
+# dest int64 + off 3 x uint8 + w 3 x int16 + ids int32 + src int64 (from the code). PROVISIONAL
+# split of the measured 257: with y-blocks the rest scales with the unit and this does not.
+FUSED_HELD_B_PER_ROW = 29
+# Slabs held at an insert: the lookahead (reach r) and, on several cards, the top boundary
+# slab(s) ejected first (another r).
+def fused_held_slabs(reach=1, cards=1):
+    return int(reach) * (2 if int(cards) > 1 else 1)
 
 # Host bytes per card at the tile-capacity rung a production run climbs (`capacity_shape`),
 # keyed by tile size; other tile sizes take the largest. Every measured 120-step run climbed
@@ -343,7 +351,7 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
 
 
 def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=True,
-                  kernel="cards"):
+                  kernel="cards", reach=1):
     """Per-GPU bytes for the host-state / device-step design.
 
     Returns `(resident, transient, phases, worst_phase, slabs, host_mesh, after_loop)`, summed
@@ -352,7 +360,9 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
     post-tile-loop migrate/repack peaks, which do not coexist with the in-step phases.
     `paint_chunk_bricks` None = `device.paint.default_chunk_bricks`. `fused` prices the fused
     migrate + repack, whose census runs one slab's eject inside the tile loop. `kernel`: where
-    the coarse kernel parts live (`device_placement`).
+    the coarse kernel parts live (`device_placement`). Slab-sized terms follow
+    `ec.device_y_blocks`: the window holds a y-block plus its buffer bricks, the census and
+    the fused pass's work one unit (`reach` and the card count size its held slabs).
     """
     from .engine import ONCE_PER_RUN_PHASES
 
@@ -395,8 +405,10 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
     # Terms with no CPU counterpart: the streamed state window and chunks in flight.
     slabs = device_window_slabs(ec)
     nb = max(1, ec.n_fine // ec.n_brick)
-    resident["slab_window (state rows a tile plane needs)"] = int(
-        slabs * (n / nb) * row_bytes)
+    n_y = int(ec.device_y_blocks)
+    win_key = ("slab_window (state rows a tile plane needs)" if n_y == 1 else
+               f"slab_window (state rows a tile plane's y-block needs, {n_y} y-blocks)")
+    resident[win_key] = int(slabs * (n / nb) * ec.y_window_fraction * row_bytes)
     resident["stream_chunks_in_flight"] = int(
         STREAM_CHUNKS_IN_FLIGHT * STREAM_CHUNK_BYTES)
 
@@ -417,8 +429,9 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
         from .device.migrate import EJECT_B_PER_PADDED_ROW
         from .eject_jax import _padded
 
-        census_b = int(EJECT_B_PER_PADDED_ROW * _padded(int(slab_rows)))
-        transient["census_eject (fused pass, one padded slab)"] = census_b
+        census_b = int(EJECT_B_PER_PADDED_ROW * _padded(int(slab_rows * ec.y_unit_fraction)))
+        transient["census_eject (fused pass, one padded slab)" if n_y == 1 else
+                  "census_eject (fused pass, one padded unit)"] = census_b
         phases["tile_loop"] = phases.get("tile_loop", 0) + census_b
 
     in_step = sum(v for k, v in phases.items() if k not in ONCE_PER_RUN_PHASES)
@@ -426,10 +439,18 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
                default=0)
     # Migrate and repack run after the in-step transients are released, so they are priced
     # against `resident` alone, not summed into the phases; they do not coexist (max).
-    if fused:
+    if fused and n_y == 1:
         after_loop = {
             "migrate_repack_fused_pass (257 B/slab row, measured at 1024^3)": int(
                 FUSED_DEVICE_B_PER_SLAB_ROW * slab_rows),
+        }
+    elif fused:
+        held = fused_held_slabs(reach, n_gpus) * FUSED_HELD_B_PER_ROW
+        after_loop = {
+            f"migrate_repack_fused_pass ({FUSED_DEVICE_B_PER_SLAB_ROW - held} B/unit row + "
+            f"{held} B/slab row held, PROVISIONAL)": int(
+                (FUSED_DEVICE_B_PER_SLAB_ROW - held) * slab_rows * ec.y_unit_fraction
+                + held * slab_rows),
         }
     else:
         after_loop = {
@@ -480,9 +501,13 @@ def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
     # (`device.fused`), or in the separate repack
     add("migrate" if fused else "repack", "repack new_occ (a second bucket index)",
         state["bucket_index"])
-    # the windowed tile loop writes back one core slab of `w` per card at once
-    add("tile_loop", "tile_window write-back (one slab of w per card)",
-        n_gpus * int(capacity_shape(max(1, int(slab_rows)))) * 3 * np.dtype(np.int16).itemsize)
+    # the windowed tile loop writes back one staged run of `w` per card at once: a core slab,
+    # or with y-blocks the block's rows plus its buffer bricks
+    n_y = int(ec.device_y_blocks)
+    add("tile_loop", "tile_window write-back (one slab of w per card)" if n_y == 1 else
+        "tile_window write-back (one y-block run of w per card)",
+        n_gpus * int(capacity_shape(max(1, int(slab_rows * ec.y_window_fraction))))
+        * 3 * np.dtype(np.int16).itemsize)
     add("tile_loop", "tile programs recompiled at a capacity rung (MEASURED, per card)",
         n_gpus * TILE_RUNG_HOST_PER_CARD.get(int(ec.n_tile),
                                              max(TILE_RUNG_HOST_PER_CARD.values())))
@@ -582,7 +607,7 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     kernel = getattr(args, "coarse_kernel", "cards")
     resident, transient, phases, worst_phase, slabs, host_mesh, after_loop = device_budget(
         ec_dev, n=n, n_gpus=n_gpus * n_nodes, paint_chunk_bricks=args.paint_chunk_bricks,
-        fused=not getattr(args, "separate_passes", False), kernel=kernel)
+        fused=not getattr(args, "separate_passes", False), kernel=kernel, reach=args.reach)
     per_block = [k for k, w in device_placement(kernel).items() if w == "host_block"]
 
     step = ec_dev.step_bytes(n, n_rows=rows, cap=args.cap)
@@ -699,6 +724,9 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
         ra = after_peak / (args.device_gb * GB)
         print(f"    and after the tile loop:          "
               f"{'FITS' if ra < 1.0 else 'DOES NOT FIT'} ({ra:.2f}x)")
+        fit = _smallest_fitting_y_blocks(args, n, n_gpus * n_nodes, kernel)
+        print(f"  smallest --y-blocks that fits both: "
+              f"{fit if fit is not None else 'none'} (of {ec_dev.tiles_side} tile rows)")
     else:
         print("  no --device-gb given, so no per-card verdict (a GB200 detected "
               "185 GiB = 199 GB)")
@@ -714,6 +742,22 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     return 0
 
 
+def _smallest_fitting_y_blocks(args, n, n_gpus_total, kernel):
+    """The smallest `--y-blocks` whose per-GPU in-step and after-the-loop peaks both fit
+    `--device-gb`, or None."""
+    for n_y in range(1, args.n_fine // args.tile + 1):
+        a = argparse.Namespace(**vars(args))
+        a.workers, a.y_blocks = 1, n_y
+        ec, _ = build(a)
+        resident, _t, _p, worst, _s, _h, after = device_budget(
+            ec, n=n, n_gpus=n_gpus_total, paint_chunk_bricks=args.paint_chunk_bricks,
+            fused=not getattr(args, "separate_passes", False), kernel=kernel, reach=args.reach)
+        res = sum(resident.values())
+        if max(res + worst, res + max(after.values())) < args.device_gb * GB:
+            return n_y
+    return None
+
+
 def build(args):
     from .codec import T9Layout
     from .engine import EngineConfig
@@ -727,6 +771,7 @@ def build(args):
         eject_kernel=args.eject_kernel,
         migrate_eject_inflight=args.eject_inflight,
         migrate_backend="device" if getattr(args, "backend", "cpu") == "device" else "host",
+        device_y_blocks=getattr(args, "y_blocks", 1),
     )
     t9 = T9Layout(box_size=args.box, n_part=args.n_part, bucket_cells=args.bucket_cells)
     return ec, t9
@@ -762,6 +807,10 @@ def main(argv=None):
                     help="for --backend device: bricks per coarse-paint chunk on a "
                          "card. Default a quarter of an x-slab of bricks; smaller "
                          "trades card memory for more device launches.")
+    ap.add_argument("--y-blocks", type=int, default=1,
+                    help="device: y-blocks each x-slab's card work is cut into "
+                         "(EngineConfig.device_y_blocks); the per-GPU table prices this count "
+                         "and the verdict names the smallest count that fits")
     ap.add_argument("--n-part", type=int, default=None, help="particles per side")
     ap.add_argument("--box", type=float, default=None, help="box size, Mpc/h")
     ap.add_argument("--n-fine", type=int, default=None)

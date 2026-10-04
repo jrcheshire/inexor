@@ -911,3 +911,69 @@ def test_the_exchange_is_priced_in_seconds_only_given_a_rate(capsys):
     assert "s per step" not in capsys.readouterr().out
     main(_G8192 + ["--n-nodes", "8", "--net-gbs", "10"])
     assert "at --net-gbs 10.0:" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ y-blocks
+
+
+def test_y_blocks_cut_the_slab_sized_card_terms_by_the_unit_and_its_window():
+    from inexor.device.migrate import EJECT_B_PER_PADDED_ROW
+    from inexor.eject_jax import _padded
+    from inexor.layout import brick_span
+    from inexor.plan import (
+        FUSED_DEVICE_B_PER_SLAB_ROW,
+        FUSED_HELD_B_PER_ROW,
+        device_budget,
+        engine_config,
+    )
+
+    one = _ec("c-hero")
+    nb = one.n_fine // one.n_brick
+    slab_rows = one.n_total / nb
+    pad = brick_span(one.n_tile, one._b_realized, one.n_brick, nb)[0]
+    r1, t1, _p, _w, span, _h, a1 = device_budget(one, n=one.n_total, n_gpus=4)
+    for n_y in (2, 4, 8):
+        ec = engine_config("c-hero", migrate_backend="device", device_y_blocks=n_y)
+        block = max(b - a for a, b in ec.y_block_ranges)
+        r, t, _p, _w, _s, _h, a = device_budget(ec, n=ec.n_total, n_gpus=4)
+        (win,) = [v for k, v in r.items() if k.startswith("slab_window")]
+        assert win == int(span * slab_rows * (block + 2 * pad) / nb * 9)
+        assert t["census_eject (fused pass, one padded unit)"] == int(
+            EJECT_B_PER_PADDED_ROW * _padded(int(slab_rows * block / nb)))
+        held = 2 * FUSED_HELD_B_PER_ROW  # reach 1, several cards
+        assert list(a.values()) == [int((FUSED_DEVICE_B_PER_SLAB_ROW - held) * slab_rows
+                                        * block / nb + held * slab_rows)]
+        assert max(a.values()) < max(a1.values()) and win < max(r1.values())
+    assert list(a1.values()) == [int(FUSED_DEVICE_B_PER_SLAB_ROW * slab_rows)]
+
+
+def test_the_planner_names_the_smallest_fitting_y_block_count_at_8192(capsys):
+    args = ["--n-part", "8192", "--box", "4096", "--n-fine", "16384", "--n-coarse", "4096",
+            "--tile", "512", "--buf", "32", "--backend", "device", "--n-gpus", "4",
+            "--n-nodes", "8", "--host-gb", "1026", "--device-gb", "199", "--arena-frac", "0.01"]
+
+    def verdict(n_y):
+        main(args + ["--y-blocks", str(n_y)])
+        out = capsys.readouterr().out
+        fit = int(next(ln for ln in out.splitlines() if "smallest --y-blocks" in ln).split()[-5])
+        ok = [ln for ln in out.splitlines() if "per card:" in ln or "after the tile loop:" in ln]
+        return fit, all("FITS (" in ln and "DOES NOT" not in ln for ln in ok)
+
+    fit, fits_at_1 = verdict(1)
+    assert not fits_at_1, "VACUOUS: whole slabs already fit"
+    assert verdict(fit) == (fit, True)
+    assert not verdict(fit - 1)[1]
+
+
+def test_the_host_window_write_back_is_one_y_block_run(capsys):
+    from inexor.forces import capacity_shape
+    from inexor.plan import PRESETS, engine_config
+
+    main(["--preset", "c-hero", "--backend", "device", "--host-gb", "1026",
+          "--device-gb", "199", "--arena-frac", "0.01", "--n-gpus", "4", "--y-blocks", "4"])
+    out = capsys.readouterr().out
+    ec = engine_config("c-hero", migrate_backend="device", device_y_blocks=4)
+    want = 4 * int(capacity_shape(int(PRESETS["c-hero"]["n_part"] ** 3 // 256
+                                      * ec.y_window_fraction))) * 6 / 1e9
+    line = next(ln for ln in out.splitlines() if "tile_window write-back" in ln)
+    assert "y-block run" in line and abs(float(line.split()[-2]) - want) < 1e-3

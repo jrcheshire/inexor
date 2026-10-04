@@ -278,6 +278,22 @@ class EngineConfig:
         return y_blocks(self.tiles_side, self.n_tile // self.n_brick, self.device_y_blocks)
 
     @property
+    def y_unit_fraction(self):
+        """The largest y-block's share of an x-slab's bricks (1 at one y-block)."""
+        nb = self.n_fine // self.n_brick
+        return max(b - a for a, b in self.y_block_ranges) / nb
+
+    @property
+    def y_window_fraction(self):
+        """The share of an x-slab's bricks one y-block's tile window holds: the block plus the
+        buffer bricks either side (`device.window.window_runs`), at most the whole slab."""
+        from .layout import brick_span
+
+        nb = self.n_fine // self.n_brick
+        pad = brick_span(self.n_tile, self._b_realized, self.n_brick, nb)[0]
+        return min(1.0, (max(b - a for a, b in self.y_block_ranges) + 2 * pad) / nb)
+
+    @property
     def tile_window(self):
         """Whether the compiled device tile loop runs against the x-slab window:
         `device_tile_window` resolved (None = wherever the compiled device tile runs)."""
@@ -425,9 +441,10 @@ class EngineConfig:
         # drift (same function, before the loop) is never co-resident with a step's peak.
         nb = max(1, self.n_fine // self.n_brick)
         if self.migrate_backend == "device":
-            # The device passes' host scratch: two slab-sized numpy buffers at 9 B/row (from the
-            # code, not measured). Device-side terms are in `plan.device_budget`.
-            host_window = int(round(2 * 9.0 * n / nb))
+            # The device passes' host scratch: two unit-sized (a slab at one y-block) numpy
+            # buffers at 9 B/row (from the code, not measured). Device-side terms are in
+            # `plan.device_budget`.
+            host_window = int(round(2 * 9.0 * n / nb * self.y_unit_fraction))
             out = dict(kick_pending=0, repack_scratch=host_window,
                        migrate_staging=host_window)
             if cap is not None:

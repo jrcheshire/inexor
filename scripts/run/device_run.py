@@ -569,11 +569,11 @@ def under(path, root):
 
 
 def _planner(preset, cards, slack, arena, alloc_margin=0.10, n_nodes=1, host_gb=1026.0,
-             device_gb=199.0):
+             device_gb=199.0, y_blocks=1):
     cmd = [sys.executable, "-m", "inexor.plan", "--preset", preset, "--backend", "device",
            "--n-gpus", str(cards), "--host-gb", f"{host_gb:g}", "--device-gb", f"{device_gb:g}",
            "--arena-frac", str(arena), "--slack", str(slack),
-           "--alloc-margin", str(alloc_margin)]
+           "--alloc-margin", str(alloc_margin), "--y-blocks", str(y_blocks)]
     if n_nodes != 1:
         cmd += ["--n-nodes", str(n_nodes)]
     out = subprocess.run(cmd, capture_output=True, text=True,
@@ -649,7 +649,8 @@ def cmd_preflight(args):
                         f"and the run asks for {args.growth2!r}")
 
     plan = _planner(args.preset, args.cards, args.slack, args.arena_frac, args.alloc_margin,
-                    n_nodes=args.n_nodes, host_gb=args.host_gb, device_gb=args.device_gb)
+                    n_nodes=args.n_nodes, host_gb=args.host_gb, device_gb=args.device_gb,
+                    y_blocks=args.y_blocks)
     card["planner"] = plan
     _rss, _hwm, avail = host_memory()
     nm = numa_memory()
