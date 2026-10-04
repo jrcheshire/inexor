@@ -271,6 +271,13 @@ class EngineConfig:
         return applies and self.coarse_kernel_on_cards is not False
 
     @property
+    def y_block_ranges(self):
+        """The brick-y ranges `device_y_blocks` cuts each x-slab into (`decomp.y_blocks`)."""
+        from .decomp import y_blocks
+
+        return y_blocks(self.tiles_side, self.n_tile // self.n_brick, self.device_y_blocks)
+
+    @property
     def tile_window(self):
         """Whether the compiled device tile loop runs against the x-slab window:
         `device_tile_window` resolved (None = wherever the compiled device tile runs)."""
@@ -1001,7 +1008,8 @@ def _migrate_pass(st, cfg, c_drift, pool, timings=None, comm=None, devices=None)
 
         return drift_and_migrate_device(
             st, c_drift, device_budget_bytes=cfg.migrate_device_budget_bytes,
-            devices=_cards(cfg) if devices is None else devices, timings=timings, comm=comm)
+            devices=_cards(cfg) if devices is None else devices, timings=timings, comm=comm,
+            y_blocks=cfg.y_block_ranges)
     if pool is not None and cfg.migrate_pooled is not False:
         return drift_and_migrate_pooled(
             st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window,
@@ -1243,11 +1251,18 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         if cfg.tile_window:
             from .device.window import tile_loop_windowed, window_shapes
 
-            # one tile plane's x-slabs on the card at a time; one thread per card over its own
-            # tile planes (host write-backs are disjoint core slabs)
+            # one tile plane's x-slabs (one y-block of them) on the card at a time; one thread
+            # per card over its own tile planes (host write-backs are disjoint core bricks).
+            # A floor from another y-block count only holds memory, so it is dropped.
+            n_y = cfg.device_y_blocks
+            wfloor = shapes_in.get("window")
+            if wfloor and int(wfloor.get("y_blocks", 1)) != n_y:
+                wfloor = None
             wsh = allreduce_shapes(comm, window_shapes(
                 view, cfg.n_tile, b_real, cfg.n_brick, planes=range(*decomp.planes),
-                floor=shapes_in.get("window")))
+                floor=wfloor, y_blocks=n_y))
+            if n_y > 1:
+                wsh["y_blocks"] = n_y
             # the destination census the fused migrate + repack is sized from
             fused_now = bool(repack_due) and cfg.fused_pass
             tile_timings = [dict() for _ in plane_parts]
@@ -1260,7 +1275,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
                     view, one_tile, C, None, members, wshapes, planes=range(a, b),
                     coarse_shard=g_coarse[k], device=None if devs is None else devs[k],
                     census=float(c_drift) if fused_now else None,
-                    timings=None if timings is None else tile_timings[k])
+                    timings=None if timings is None else tile_timings[k], y_blocks=n_y)
 
             if devs is None:
                 loops = [run_card(0)]
@@ -1279,7 +1294,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         tile_cards = [dict(planes=int(lp.get("planes_run", cfg.tiles_side)),
                            tiles_run=int(lp["tiles_run"]),
                            **{k: lp[k] for k in ("window_live_rows_max", "residents_staged",
-                                                 "window_slabs", "wrapped")
+                                                 "window_slabs", "window_units", "wrapped")
                               if k in lp})
                       for lp in loops]
         if timings is not None and cfg.tile_window:
@@ -1344,7 +1359,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         stats, repack_stats = migrate_repack_device(
             st, c_drift, census_counts, brick_slack=cfg.brick_slack,
             device_budget_bytes=cfg.migrate_device_budget_bytes, devices=devs,
-            timings=mt, comm=comm)
+            timings=mt, comm=comm, y_blocks=cfg.y_block_ranges)
     else:
         stats = _migrate_pass(st, cfg, c_drift, pool,
                               None if timings is None else timings.setdefault("migrate", {}),
@@ -1353,6 +1368,9 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     stats["migrate_repack_fused"] = fused_now
     stats["census_slabs"] = (int(sum(lp.get("census_slabs", 0) for lp in loops))
                              if fused_now else 0)
+    stats["census_units"] = (int(sum(lp.get("census_units", 0) for lp in loops))
+                             if fused_now else 0)
+    stats["y_blocks"] = cfg.device_y_blocks
     stats["migrate_pooled_workers"] = int(stats.get("migrate_pool", {}).get("workers", 0))
     stats["migrate_backend"] = cfg.migrate_backend
     stats.setdefault("migrate_device", None)

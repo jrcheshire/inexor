@@ -53,11 +53,12 @@ def _coeffs():
     return bullfrog_float_coeffs(bullfrog_table(a_grid(0.1, 1.0, K, "log"), Cosmology()))
 
 
-def run_ranks(n_ranks, cards, ckpt_dir, resume=False, stop_at=None):
+def run_ranks(n_ranks, cards, ckpt_dir, resume=False, stop_at=None, y_blocks=1):
     """Run on `n_ranks` loopback ranks into `ckpt_dir`: from the whole state, or (`resume`)
     from the newest checkpoint there. Returns each rank's per-step stats."""
     need_devices(cards)
-    cfg = rank_cfg(cards, checkpoint_dir=str(ckpt_dir), checkpoint_every=EVERY)
+    cfg = rank_cfg(cards, checkpoint_dir=str(ckpt_dir), checkpoint_every=EVERY,
+                   device_y_blocks=y_blocks)
     co = _coeffs()
     whole = None if resume else whole_state()
 
@@ -105,6 +106,60 @@ def test_rank_checkpoints_are_the_one_rank_bytes(reference, tmp_path, n_ranks, c
         a2a = rec["comm"]["ops"]["Alltoallv"]
         assert a2a["calls"] > 0
         assert a2a["bytes"] >= rec["forward_sent_bytes"] + rec["inverse_sent_bytes"]
+
+
+def _without_window_shape(ckpt_dir, want):
+    """`hashes` with each manifest compared minus `device_shapes.window`, the one entry a
+    y-block count changes (it sizes a buffer; the numbers are cut-independent). Returns
+    (got, want) dicts to compare."""
+    import hashlib
+    import json
+
+    def strip(d, h):
+        out = dict(h)
+        for gen in ("gen0", "gen1"):
+            f = os.path.join(d, gen, "manifest.json")
+            if f"{gen}/manifest.json" in out and os.path.exists(f):
+                m = json.load(open(f))
+                m["provenance"]["device_shapes"].pop("window", None)
+                out[f"{gen}/manifest.json"] = hashlib.sha256(
+                    json.dumps(m, sort_keys=True).encode()).hexdigest()
+        return out
+
+    return strip(ckpt_dir, hashes(ckpt_dir)), strip(want[0], want[1])
+
+
+@pytest.mark.parametrize("n_ranks,cards,y_blocks", [(1, 1, 2), (1, 1, 8), (1, 2, 4), (2, 1, 4),
+                                                    (2, 2, 2), (4, 1, 2)])
+def test_y_blocked_checkpoints_are_the_one_rank_bytes(reference, tmp_path, n_ranks, cards,
+                                                      y_blocks):
+    import json
+
+    outs = run_ranks(n_ranks, cards, tmp_path, y_blocks=y_blocks)
+    got, want = _without_window_shape(tmp_path, reference)
+    assert got == want
+    last = outs[0][-1]
+    assert last["y_blocks"] == y_blocks
+    assert last["migrate_device"]["y_blocks"] == y_blocks
+    assert all(tc["window_units"] == (tc["planes"] * y_blocks) for tc in last["tile_cards"])
+    m = json.load(open(tmp_path / "gen1" / "manifest.json"))
+    w1 = json.load(open(reference[0] / "gen1" / "manifest.json"))["provenance"]["device_shapes"]
+    wy = m["provenance"]["device_shapes"]["window"]
+    assert wy["y_blocks"] == y_blocks
+    assert wy["rows"] < w1["window"]["rows"], "VACUOUS: no smaller window"
+
+
+@pytest.mark.parametrize("y_write,y_read", [(1, 4), (4, 2)])
+def test_a_checkpoint_resumes_at_another_y_block_count(reference, tmp_path, y_write, y_read):
+    first = tmp_path / "first"
+    run_ranks(2, 1, first, stop_at=EVERY, y_blocks=y_write)
+    second = tmp_path / "second"
+    second.mkdir()
+    shutil.copytree(first / "gen0", second / "gen0")
+    run_ranks(2, 1, second, resume=True, y_blocks=y_read)
+    got, want = _without_window_shape(second, reference)
+    assert {k: v for k, v in got.items() if k.startswith("gen1/")} == {
+        k: v for k, v in want.items() if k.startswith("gen1/")}
 
 
 def test_the_rank_record_carries_each_ranks_particle_flux(tmp_path):
