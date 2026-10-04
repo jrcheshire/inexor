@@ -135,6 +135,7 @@ bin's realized modes. It returns a dict and writes nothing. Card id `summary.CAR
 | `shot_noise` | `V / N`, (Mpc/h)^3, subtracted from `p` |
 | `deconvolved` | `"tsc"` (TSC window divided out) or null |
 | `oracle` | description string of the oracle |
+| `transform` | `"host"` or `"cards"`: where the spectrum was taken (see below) |
 | `n_bins` | bins kept |
 | `k_edges` | ALL requested bin edges (default 65 edges, 64 bins over `[0, k_nyquist/2]`); bins below `min_weight` are dropped from the per-bin lists, so `len(k_edges) - 1` can exceed `n_bins` |
 | `k_mean` | mode-weighted mean k per kept bin, h/Mpc |
@@ -153,7 +154,10 @@ name, with `k_min`, `k_max`, `n_bins`, `bar`, `ok` (`max_abs_z < bar`),
 
 ### Driver card options
 
-`realization.py card` writes the summary under `summary` in `realization_pk.json` (see below).
+`realization.py card` writes the summary under `summary` in `realization_pk.json` (see below);
+`device_run.py card` writes the same wrapper to `--out`. Cards record `transform`: `"host"`
+(`pk_summary_card`, the CPU driver) or `"cards"` (`pk_summary_card_cards`: paint and transform
+on the cards, across ranks; bitwise the same at any rank and card count).
 `--k-max` and `--n-bins` (default 64) pin the bins to `[0, k_max]` so runs with different
 coarse meshes share them; `--min-weight` (default 100) drops bins with fewer modes; `--ic-dir`
 cards an IC directory at step 0 instead of the newest checkpoint.
@@ -218,6 +222,29 @@ head, x, v, ids = export.load_particles("W/export", mmap=False) # full load, crc
 ```
 
 `ids` is None when absent. A missing header or an unknown `format` is refused.
+
+### One part per rank
+
+`export.write_particle_parts(st, out_dir, comm=None, dtype=np.float32, a=None, cosmo=None,
+decode="host", devices=None, ...)` is called by every rank with its own slabs
+(`device_run.py export` uses `decode="cards"`). Format id `export.FORMAT_PARTS =
+"inexor-particles-2"`. Rank `r` writes `x.r<rrrr>.npy` and `v.r<rrrr>.npy` (and
+`ids.r<rrrr>.npy`), its rows starting at row `row0` of the whole export. The parts in rank order
+are the single-file arrays row for row, at any rank count and with either decode.
+
+The header has the single-file fields, except that `files` is replaced by `parts` (one entry
+per rank: `rank`, `row0`, `rows`, `files`, `crc32`), plus `decode` (`"host"` or `"cards"`).
+Its `crc32` holds the whole array's crc32 per role, the crc of the parts concatenated, so it
+equals a single-file export's crc32 for the same particles. Rank 0 removes the header before
+any part is written and writes it once every part has closed.
+
+```python
+for row0, x, v, ids in export.iter_particle_parts("W/export"):   # either format
+    ...
+head, x, v, ids = export.load_particles("W/export", mmap=False)  # parts concatenated
+```
+
+`load_particles` with `mmap=True` refuses an export of more than one part.
 
 ### `python -m inexor.export`
 

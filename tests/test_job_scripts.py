@@ -364,3 +364,103 @@ def test_the_steps_job_refuses_inputs_it_cannot_use(tmp_path, env, says):
     r = _steps_job(tmp_path, **{k: v.format(t=tmp_path) for k, v in env.items()})
     assert r.returncode == 1 and says in r.stdout, r.stdout
     assert "=== LEG" not in r.stdout
+
+
+def _pk(path, transform="cards", p=(1.0, 2.0), z=(0.1, 0.2), edges=(0.0, 0.5, 1.0), prov=None):
+    path.write_text(json.dumps({"summary": {
+        "transform": transform, "p": list(p), "z_profile": list(z), "k_edges": list(edges),
+        "provenance": prov or {}}}))
+    return path
+
+
+@pytest.mark.parametrize("case,ok", [
+    ("same", True), ("provenance only", True), ("a field", False), ("unreadable", False)])
+def test_same_card_compares_every_field_but_the_provenance(tmp_path, case, ok):
+    a = _pk(tmp_path / "a.json")
+    b = tmp_path / "b.json"
+    if case == "unreadable":
+        b.write_text("{")
+    else:
+        _pk(b, p=(1.0, 2.5) if case == "a field" else (1.0, 2.0),
+            prov={"n_ranks": 2} if case == "provenance only" else None)
+    r = _lib(f'gate_with t same_card "{a}" "{b}"; echo "rc=$?"', tmp_path, PY=sys.executable)
+    want = ("GATE t PASS", "rc=0") if ok else ("GATE t FAIL", "rc=1")
+    assert all(w in r.stdout for w in want), r.stdout + r.stderr
+
+
+def _exp(d, crc=None, n=8, header=True):
+    d.mkdir()
+    if header:
+        (d / "export.json").write_text(json.dumps(
+            {"n_particles": n, "dtype": "float32", "crc32": crc or {"x": 1, "v": 2}}))
+    return d
+
+
+@pytest.mark.parametrize("case,ok", [
+    ("same", True), ("crc", False), ("count", False), ("no header", False)])
+def test_same_export_compares_the_count_and_every_crc(tmp_path, case, ok):
+    a = _exp(tmp_path / "a")
+    b = _exp(tmp_path / "b", crc={"x": 1, "v": 3} if case == "crc" else None,
+             n=9 if case == "count" else 8, header=case != "no header")
+    r = _lib(f'gate_with t same_export "{a}" "{b}"; echo "rc=$?"', tmp_path,
+             PY=sys.executable)
+    want = ("GATE t PASS", "rc=0") if ok else ("GATE t FAIL", "rc=1")
+    assert all(w in r.stdout for w in want), r.stdout + r.stderr
+
+
+def test_card_diff_reports_and_refuses_different_bins(tmp_path):
+    a = _pk(tmp_path / "a.json", transform="host")
+    b = _pk(tmp_path / "b.json", p=(1.0, 2.002))
+    r = _lib(f'card_diff "{a}" "{b}"; echo "rc=$?"', tmp_path, PY=sys.executable)
+    assert "host -> cards" in r.stdout and "max 1.000e-03" in r.stdout and "rc=0" in r.stdout, \
+        r.stdout + r.stderr
+    c = _pk(tmp_path / "c.json", edges=(0.0, 0.4, 1.0))
+    r = _lib(f'card_diff "{a}" "{c}"; echo "rc=$?"', tmp_path, PY=sys.executable)
+    assert "bins differ" in r.stdout and "rc=1" in r.stdout
+
+
+PRODUCTS = os.path.join(HERE, "scripts", "run", "multinode_products_vista.sbatch")
+
+
+def _products_job(tmp_path, **env):
+    """The products job script up to its first refusal (as `_steps_job`)."""
+    (tmp_path / "ckpt").mkdir(exist_ok=True)
+    stubs = tmp_path / "stubs"
+    stubs.mkdir(exist_ok=True)
+    for name in ("python", "python3", "mpiexec", "pixi"):
+        (stubs / name).write_text("#!/bin/sh\nexit 97\n")
+        (stubs / name).chmod(0o755)
+    e = {k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ}
+    e["PATH"] = f"{stubs}:{os.environ.get('PATH', '')}"
+    e.update(REHEARSAL="1", INEXOR_SRC=HERE, INEXOR_RUNS=str(tmp_path / "runs"),
+             CKPT_DIR=str(tmp_path / "ckpt"), PROD_DIR=str(tmp_path / "prod"))
+    e.update(env)
+    p = subprocess.Popen([BASH, PRODUCTS], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=e, start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, 9)
+        p.communicate()
+        pytest.fail("the products job went past its refusals")
+    return subprocess.CompletedProcess(p.args, p.returncode, out, err)
+
+
+@pytest.mark.parametrize("env,setup,says", [
+    ({"PROD_DIR": "{t}/ckpt/prod"}, None, "PROD_DIR is under CKPT_DIR"),
+    ({"CKPT_DIR": "{t}/absent"}, None, "set CKPT_DIR to an existing directory"),
+    ({}, "stray", "already holds files"),
+    ({"REF_EXPORT": "{t}/ref"}, "ref", "REF_EXPORT holds no export.json"),
+    ({"REF_CARD": "{t}/absent.json"}, None, "REF_CARD is not a file"),
+    ({"SMALL_CKPT": "{t}/absent"}, None, "SMALL_CKPT is not a directory"),
+    ({}, None, "no checkpoint in"),
+])
+def test_the_products_job_refuses_inputs_it_cannot_use(tmp_path, env, setup, says):
+    if setup == "stray":
+        (tmp_path / "prod" / "export").mkdir(parents=True)
+        (tmp_path / "prod" / "export" / "x.r0000.npy").write_text("")
+    elif setup == "ref":
+        (tmp_path / "ref").mkdir()
+    r = _products_job(tmp_path, **{k: v.format(t=tmp_path) for k, v in env.items()})
+    assert r.returncode == 1 and says in r.stdout, r.stdout + r.stderr
+    assert "=== LEG" not in r.stdout

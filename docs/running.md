@@ -111,18 +111,21 @@ python scripts/run/realization.py run --config cdev8 --workdir $W          # 20 
 ## The GPU driver: `device_run.py`
 
 `device_run.py` steps a preset on N GPUs. The particle state stays in host memory, and the
-coarse paint and solve, the tile loop and the migrate all run on the cards. It does not
-generate ICs and does not produce cards or exports:
+coarse paint and solve, the tile loop and the migrate all run on the cards. Its `card` and
+`export` subcommands also run on the cards, on one node or across nodes. It does not generate
+ICs:
 
 - **ICs**: `python scripts/run/realization.py ics --config P --workdir ICS --generator device`
   (in the `gpu` env).
-- **Card and export**: the CPU driver, run with `JAX_PLATFORMS=cpu` against the GPU run's
-  checkpoint (see below).
+- **Card and export**: `device_run.py card` / `export` (below), or the CPU driver run with
+  `JAX_PLATFORMS=cpu` against the GPU run's checkpoint (see below).
 
 | Subcommand | What it does |
 |---|---|
 | `preflight` | Checks everything before the expensive part and exits 2 on any refusal: device count and backend, the allocator's stats, the IC manifest (particle count, slab count, `growth2`), the planner's host and load peak against the CPU NUMA nodes' memory, the NUMA memory binding, and free scratch space |
 | `run` | Loads the ICs or resumes a checkpoint, then steps to `--stop-at`. Prints one line per phase boundary and a heartbeat, and rewrites a JSON card (`--card`) at every boundary. On failure, the traceback and device memory stats go into the card |
+| `card` | The P(k) card of the newest checkpoint in `--checkpoint-dir`, painted and transformed on the cards (`summary.pk_summary_card_cards`); rank 0 writes it to `--out` in the same JSON wrapper as `realization.py card` (summary under `summary`, with `transform: "cards"`). The paint is bitwise the CPU card's; the spectrum differs from the CPU card's at the FFT's rounding |
+| `export` | The particle export of that checkpoint, decoded on the cards and written as one part per rank to `--export-dir` (format `inexor-particles-2`, see [outputs](outputs.md#particle-export)); bitwise the CPU export's bytes. Refuses a non-empty `--export-dir` and, without `--allow-partial`, a checkpoint short of `--k-steps` |
 | `summarize` | Reads a run card together with the job's sampler CSVs (`--gpu-csv`, `--mem-csv`) and writes per-phase GPU memory, host memory and utilization to `--out`. Does not import jax |
 
 Key flags for `preflight` and `run`:
@@ -145,6 +148,14 @@ Key flags for `preflight` and `run`:
 | `--beat` (run) | 60 | heartbeat seconds |
 | `--comm` (run) | `serial` | `mpi`: one rank per process across nodes (see below) |
 | `--comm-timeout` (run) | 1800 | seconds a rank may wait at one exchange before it aborts the job |
+
+Flags of `card` and `export`: `--preset`, `--checkpoint-dir`, `--k-steps`, `--card` (this
+process's run card), `--cards`, layout and `--growth2` as above (they must match the run),
+`--membind-nodes`, `--beat`, `--comm`, `--comm-timeout`, and `--expect-step` (required: the
+newest checkpoint must be at this step). `card` adds `--out` (required), `--k-max` /
+`--n-bins` / `--min-weight` / `--slab` as `realization.py card`; `export` adds `--export-dir`
+(required), `--dtype` (float32), `--d-time` (native velocities instead of km/s at the
+checkpoint's epoch) and `--allow-partial`. Neither writes under the checkpoint directory.
 
 **Y-blocks.** Every card working set that would otherwise hold a whole brick x-slab (the tile
 window, the destination census, the device migrate and the fused repack) works on (x-slab,
@@ -182,6 +193,9 @@ mpiexec -n 2 python -m mpi4py scripts/run/device_run.py run --preset c-gh --work
   neighbours in the step's migrate, so its count changes by their difference.
   `emigrant_rows_sent` / `_received` count only the boundary-eject hand-off, one of the
   migrate's exchanges, and do not add up to that change.
+- `card` and `export` take `--comm mpi` the same way: each rank loads its own slabs, the card
+  is the same at any rank and card count, and the export's parts in rank order are the
+  single-node export's bytes.
 - `D7_FAIL_AT=<phase> D7_FAIL_RANK=<r>` exercises the failure path on one rank.
 - On a cluster, launch each rank through `scripts/run/rank_exec.sh [--membind NODES] [--samples
   PREFIX] -- CMD ...`. It replaces `@RANK@` in the arguments and in exported variables, so one
@@ -220,6 +234,7 @@ run) before the expensive leg and stops if they fail.
 | `gh_single_card_vista.sbatch` | gh | a whole realization on one GH200: ICs, 120 steps, card, under `$INEXOR_RUNS/d8-gh-<preset>-<job id>/` | `INEXOR_RUNS`. Optional: `PRESET` (`c-1024`), `SLACK` (0.10), `ALLOC_MARGIN` (0.10), `ARENA_FRAC` (0.01) |
 | `multinode_gate_vista.sbatch` | gh, 2 nodes | the multi-node byte gate: the single-node run on each node and the 2-rank run, compared file by file at the split step and at the end (`$INEXOR_RUNS/mn-gate-<preset>-<job id>/`); a split-step mismatch reruns segment 1 with deterministic ops and stops. The run legs' launch line is tried on every node first; every leg has a time cap, a run leg is also killed after `QUIET_S` of silent output, and a failed run leg stops the job | `INEXOR_RUNS`. Optional: `PRESET` (`c-1024`), `K` (120), `SPLIT` (20), `STOP`, `EVERY`, layout as above, `LEG_FIXED_S` (600) + `LEG_STEP_S` (100) per step (a run leg's cap), `QUIET_S` (600) |
 | `multinode_steps_vista.sbatch` | gh, 2 nodes | one realization across the nodes from ICs made elsewhere, checkpointing every `EVERY` steps into `$REAL_DIR/ckpt`; a lost job is resubmitted with `EXPECT_STEP` at its newest checkpoint (`EXPECT_STEP=0` is refused over an existing one). First a control: the older generation of `CONTROL_REF`, a run that passed the byte gate, is resumed to the newer one's step and must match it byte for byte. Ends by checking the newest checkpoint's step and particle count. Caps, silence limit and stop-on-failure as in the gate | `INEXOR_RUNS`, `IC_DIR`, `REAL_DIR`, `CONTROL_REF`, `CONTROL_ICS`. Optional: `PRESET` (`c-gh`), `K` (120), `EXPECT_STEP` (0), `STOP`, `EVERY` (20), `CONTROL_PRESET` (`c-1024`), layout as above, `LEG_FIXED_S` (600) + `LEG_STEP_S` (300) per step, `QUIET_S` (600) |
+| `multinode_products_vista.sbatch` | gh, 2 nodes | the P(k) card (`$PROD_DIR/pk.json`) and the export (`$PROD_DIR/export`, one part per rank) of a checkpoint across the nodes, on the cards. Optional checks first: `SMALL_CKPT`'s card and export on one rank and on every rank must match (stops the job otherwise). `REF_EXPORT` (an export of the same checkpoint made another way) must have the same crc32; `REF_CARD`'s per-bin difference is printed, not gated. Caps, silence limit and stop-on-failure as in the gate; `REHEARSAL=1` with `PLANT_CARD_MISMATCH`, `PLANT_EXPORT_MISMATCH` or `PLANT_LEG_FAIL` | `INEXOR_RUNS`, `CKPT_DIR`, `PROD_DIR`. Optional: `PRESET` (`c-gh`), `K` and `EXPECT_STEP` (from the newest checkpoint), `ALLOW_PARTIAL` (0), `SMALL_CKPT`, `SMALL_PRESET` (`c-1024`), `REF_EXPORT`, `REF_CARD`, layout as above, `CARD_CAP_S` (2400), `EXPORT_CAP_S` (3600), `QUIET_S` (900) |
 | `yblocks_measure_vista.sbatch` | gb | per preset (`cgh64`, `c-1024`), device ICs, then the same steps at every y-block count (1, 2, 4, ... up to the tile rows, at most 8); every count's checkpoints must equal the 1-block run's, manifests compared without their window shape, and a mismatch reruns the pair under deterministic ops; the run cards price the planner's per-unit terms. `REHEARSAL=1` runs it on a laptop CPU at cdev8-tile32 (`pixi run --frozen bash ...`), `PLANT_MISMATCH=1` flips a byte | `INEXOR_RUNS`. Optional: `PRESETS`, `K` (120), `STOP` (10), `EVERY` (5), `Y_MAX` (8) |
 
 Every script also needs `INEXOR_SRC` (the inexor checkout), or it must be submitted from the

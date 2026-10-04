@@ -231,3 +231,69 @@ gate () {
   if [ $ok -eq 0 ]; then echo "GATE $name PASS"; else echo "GATE $name FAIL"; fi
   return $ok
 }
+
+# gate_with NAME CMP FIRST OTHER...: every OTHER against FIRST by the comparison function CMP
+gate_with () {
+  local name=$1 cmp=$2 first=$3 d ok=0; shift 3
+  echo ""; echo "=== GATE $name ==="
+  for d in "$@"; do "$cmp" "$first" "$d" || ok=1; done
+  if [ $ok -eq 0 ]; then echo "GATE $name PASS"; else echo "GATE $name FAIL"; fi
+  return $ok
+}
+
+# same_card A B: two P(k) cards (`device_run.py card` / `realization.py card` JSON) equal in
+# every field of their summary except its provenance. An unreadable card fails.
+same_card () {
+  "${PY:-python3}" - "$1" "$2" <<'EOF_PY'
+import json, sys
+try:
+    s = [json.load(open(p))["summary"] for p in sys.argv[1:]]
+except (OSError, ValueError, KeyError) as e:
+    print(f"  GATE FAIL: unreadable card ({e!r})")
+    sys.exit(1)
+for x in s:
+    x.pop("provenance", None)
+bad = sorted(k for k in set(s[0]) | set(s[1]) if s[0].get(k) != s[1].get(k))
+print(f"  card fields differing: {', '.join(bad) or 'none'}: {sys.argv[1]} vs {sys.argv[2]}")
+sys.exit(1 if bad else 0)
+EOF_PY
+}
+
+# same_export A B: two complete exports (export.json present; one file per array or one part
+# per rank) holding the same particle count and the same whole-array crc32 of every array
+same_export () {
+  "${PY:-python3}" - "$1" "$2" <<'EOF_PY'
+import json, os, sys
+try:
+    h = [json.load(open(os.path.join(p, "export.json"))) for p in sys.argv[1:]]
+except (OSError, ValueError) as e:
+    print(f"  GATE FAIL: no complete export ({e!r})")
+    sys.exit(1)
+same = all(h[0].get(k) == h[1].get(k) for k in ("n_particles", "crc32", "dtype"))
+print(f"  {h[1].get('n_particles')} particles, crc32 {h[1].get('crc32')} vs "
+      f"{h[0].get('crc32')}: {'same' if same else 'DIFFERENT'}: {sys.argv[1]} vs {sys.argv[2]}")
+sys.exit(0 if same else 1)
+EOF_PY
+}
+
+# card_diff A B: per-bin |p_B / p_A - 1| and |z_B - z_A| of two cards, printed; fails only
+# when a card is unreadable or the bins differ
+card_diff () {
+  "${PY:-python3}" - "$1" "$2" <<'EOF_PY'
+import json, sys
+import numpy as np
+try:
+    a, b = (json.load(open(p))["summary"] for p in sys.argv[1:])
+except (OSError, ValueError, KeyError) as e:
+    print(f"  card_diff: unreadable card ({e!r})")
+    sys.exit(1)
+if a["k_edges"] != b["k_edges"] or len(a["p"]) != len(b["p"]):
+    print("  card_diff: the cards' bins differ")
+    sys.exit(1)
+dp = np.abs(np.asarray(b["p"]) / np.asarray(a["p"]) - 1.0)
+dz = np.abs(np.asarray(b["z_profile"]) - np.asarray(a["z_profile"]))
+print(f"  card_diff ({a.get('transform', 'host')} -> {b.get('transform', 'host')}, "
+      f"{len(dp)} bins): |dp/p| max {dp.max():.3e} median {np.median(dp):.3e}; "
+      f"|dz| max {dz.max():.3e}")
+EOF_PY
+}
