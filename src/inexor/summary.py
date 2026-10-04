@@ -229,6 +229,63 @@ def nonlinear_scale(p_of_k, k_lo=NL_SCAN_K[0], k_hi=NL_SCAN_K[1], n=4096):
     return float(np.exp(np.log(k[i - 1]) + f * (np.log(k[i]) - np.log(k[i - 1]))))
 
 
+def _card_model(cfg, cosmo, a_out):
+    """(p_lin, window, k_nyq) for a card on `cfg`'s coarse mesh at `a_out`."""
+    n = int(cfg.n_coarse)
+    box = float(cfg.box_size)
+    tab = ic_k_table(cosmo, n, box)
+    d2 = growth_factor_a(a_out, cosmo) ** 2
+
+    def p_lin(k):
+        return d2 * tab.P_of_k(k)
+
+    k_nyq = np.pi * n / box
+
+    def window(kx, ky, kz):
+        return tsc_window_slab(kx, ky, kz, k_nyq)
+
+    return p_lin, window, k_nyq
+
+
+def _card_from_result(res, cfg, cosmo, a_out, p_lin, n_part_total, shot, deconvolve_window,
+                      min_weight, edges, transform, provenance):
+    """The card dict from `combine_partials`' result; refuses a card with no bin."""
+    n = int(cfg.n_coarse)
+    if not len(res["k_mean"]):
+        n_edges = 64 if edges is None else len(np.asarray(edges)) - 1
+        raise ValueError(
+            f"no bin reached min_weight={min_weight} modes at n_coarse={n}: "
+            f"{n_edges} bins over [0, k_Nyquist/2] is sized for a full-scale coarse mesh. "
+            "Widen the bins (`edges`) or lower `min_weight` -- an empty card is not a card."
+        )
+    return dict(
+        card=CARD,
+        n_coarse=n,
+        box_size=float(cfg.box_size),
+        n_particles=int(n_part_total),
+        a_out=float(a_out),
+        growth_factor=float(growth_factor_a(a_out, cosmo)),
+        k_nyquist=float(np.pi * n / float(cfg.box_size)),
+        k_nonlinear=nonlinear_scale(p_lin),
+        k_nonlinear_scan=[float(NL_SCAN_K[0]), float(NL_SCAN_K[1])],
+        shot_noise=float(shot),
+        deconvolved="tsc" if deconvolve_window else None,
+        oracle="bin-averaged linear, D(a)^2 P_lin; NEVER a bin centre",
+        transform=transform,
+        n_bins=int(len(res["k_mean"])),
+        # edges, since the weighted `k_mean` does not reconstruct the binning
+        k_edges=[float(v) for v in res["k_edges"]],
+        k_mean=[float(v) for v in res["k_mean"]],
+        p=[float(v) for v in res["p"]],
+        p_oracle=[float(v) for v in res["p_oracle"]],
+        n_modes=[float(v) for v in res["n_modes"]],
+        z_profile=[float(v) for v in res["z"]],
+        window_correction=[float(v) for v in res["window_correction"]],
+        shot_fraction=[float(v) for v in res["shot_fraction"]],
+        provenance=provenance or {},
+    )
+
+
 def pk_summary_card(
     st,
     cfg,
@@ -249,7 +306,8 @@ def pk_summary_card(
     Oracle is `D(a_out)**2 P_lin(k, z=0)` with D(1) = 1. `delta` reuses a coarse field the
     caller already has; otherwise `coarse_delta_streamed` paints one (needs the integer coarse
     accumulator, since an f64 paint is order-dependent). The window correction is analytic TSC
-    (default band stops at half Nyquist); shot noise is V/N.
+    (default band stops at half Nyquist); shot noise is V/N. The transform runs on the host
+    (`transform: "host"`); `pk_summary_card_cards` is the multi-rank card on the GPUs.
 
     Raises if no bin reaches `min_weight` (the default 64 bins are sized for a 1024^3 coarse
     mesh): a zero-bin card would carry no measurement. `pool` (a `paint_only` `TilePool`)
@@ -271,18 +329,7 @@ def pk_summary_card(
 
     spec = ooc_fft.forward_from_slabs(lambda lo, hi: delta[lo:hi], n, slab=int(slab),
                                       progress=progress)
-
-    tab = ic_k_table(cosmo, n, box)
-    d2 = growth_factor_a(a_out, cosmo) ** 2
-
-    def p_lin(k):
-        return d2 * tab.P_of_k(k)
-
-    k_nyq = np.pi * n / box
-
-    def _window(kx, ky, kz):
-        return tsc_window_slab(kx, ky, kz, k_nyq)
-
+    p_lin, window, _k_nyq = _card_model(cfg, cosmo, a_out)
     n_part_total = int(st.n_particles)
     shot = (box**3 / n_part_total) if subtract_shot_noise else 0.0
 
@@ -291,47 +338,88 @@ def pk_summary_card(
         p_of_k=p_lin,
         edges=edges,
         slab=int(slab),
-        window=_window if deconvolve_window else None,
+        window=window if deconvolve_window else None,
         shot_noise=shot,
         min_weight=min_weight,
         progress=progress,
     )
     del spec
-    if not len(res["k_mean"]):
-        n_edges = 64 if edges is None else len(np.asarray(edges)) - 1
-        raise ValueError(
-            f"no bin reached min_weight={min_weight} modes at n_coarse={n}: "
-            f"{n_edges} bins over [0, k_Nyquist/2] is sized for a full-scale coarse mesh. "
-            "Widen the bins (`edges`) or lower `min_weight` -- an empty card is not a card."
-        )
+    return _card_from_result(res, cfg, cosmo, a_out, p_lin, n_part_total, shot,
+                             deconvolve_window, min_weight, edges, "host", provenance)
 
-    k_nl = nonlinear_scale(p_lin)
-    card = dict(
-        card=CARD,
-        n_coarse=n,
-        box_size=box,
-        n_particles=n_part_total,
-        a_out=float(a_out),
-        growth_factor=float(growth_factor_a(a_out, cosmo)),
-        k_nyquist=float(k_nyq),
-        k_nonlinear=k_nl,
-        k_nonlinear_scan=[float(NL_SCAN_K[0]), float(NL_SCAN_K[1])],
-        shot_noise=float(shot),
-        deconvolved="tsc" if deconvolve_window else None,
-        oracle="bin-averaged linear, D(a)^2 P_lin; NEVER a bin centre",
-        n_bins=int(len(res["k_mean"])),
-        # edges, since the weighted `k_mean` does not reconstruct the binning
-        k_edges=[float(v) for v in res["k_edges"]],
-        k_mean=[float(v) for v in res["k_mean"]],
-        p=[float(v) for v in res["p"]],
-        p_oracle=[float(v) for v in res["p_oracle"]],
-        n_modes=[float(v) for v in res["n_modes"]],
-        z_profile=[float(v) for v in res["z"]],
-        window_correction=[float(v) for v in res["window_correction"]],
-        shot_fraction=[float(v) for v in res["shot_fraction"]],
-        provenance=provenance or {},
+
+def pk_summary_card_cards(
+    st,
+    cfg,
+    cosmo,
+    a_out,
+    devices=None,
+    decomp=None,
+    comm=None,
+    slab=32,
+    edges=None,
+    deconvolve_window=True,
+    subtract_shot_noise=True,
+    min_weight=100.0,
+    provenance=None,
+    progress=None,
+    phase=None,
+):
+    """`pk_summary_card` with the paint and the transform on the cards, across ranks.
+
+    Every rank calls this with its node-local state (or one rank with the whole state):
+    `device.paint.coarse_delta_cards` paints the rank's coarse planes on `devices`,
+    `ooc_fft.forward_card_planes_to_pencils` returns its y-pencils of the spectrum, each rank
+    bins its own pencils (`binned_power_partials`) and the partials are allgathered and
+    combined exactly. The card is bitwise the same at any rank and card count, and every rank
+    returns it. Against `pk_summary_card` the density is bitwise; the spectrum differs at the
+    FFT's rounding (`transform: "cards"`). Shot noise uses the particle count over all ranks.
+
+    `phase(name)`, if given, is called after "card_paint", "card_transform" and "card_bin".
+    Other arguments as `pk_summary_card`.
+    """
+    from .device.paint import coarse_delta_cards
+    from .ooc_fft import forward_card_planes_to_pencils
+
+    def mark(name):
+        if phase is not None:
+            phase(name)
+
+    n = int(cfg.n_coarse)
+    box = float(cfg.box_size)
+    if decomp is None:
+        x_parts, y_parts = [(0, n)], [(0, n)]
+    else:
+        cpt = int(decomp.coarse_per_tile)
+        x_parts = [(lo * cpt, hi * cpt) for lo, hi in decomp.rank_planes]
+        y_parts = [tuple(p) for p in decomp.rank_pencils]
+    rank = 0 if comm is None else int(comm.rank)
+    shards = coarse_delta_cards(st, cfg, devices=devices, decomp=decomp, comm=comm)
+    mark("card_paint")
+    spec = forward_card_planes_to_pencils(shards, n, x_parts, y_parts, comm)
+    del shards
+    mark("card_transform")
+
+    p_lin, window, _k_nyq = _card_model(cfg, cosmo, a_out)
+    n_part_total = (int(st.n_particles) if comm is None
+                    else int(comm.allreduce(int(st.n_particles))))
+    shot = (box**3 / n_part_total) if subtract_shot_noise else 0.0
+    part = binned_power_partials(
+        spec, n, box,
+        y0=y_parts[rank][0],
+        p_of_k=p_lin,
+        edges=edges,
+        slab=int(slab),
+        window=window if deconvolve_window else None,
+        shot_noise=shot,
+        progress=progress,
     )
-    return card
+    del spec
+    parts = [part] if comm is None else comm.allgather(part)
+    res = combine_partials(parts, min_weight=min_weight)
+    mark("card_bin")
+    return _card_from_result(res, cfg, cosmo, a_out, p_lin, n_part_total, shot,
+                             deconvolve_window, min_weight, edges, "cards", provenance)
 
 
 def band_verdict(card, k_max, k_min=0.0, bar=5.0):
