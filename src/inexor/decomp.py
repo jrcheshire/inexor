@@ -140,3 +140,31 @@ class Decomp:
             if lo <= p < hi:
                 return r
         raise AssertionError("rank_planes do not tile the tile planes")
+
+
+def y_blocks(tiles_side, bricks_per_tile, n_y):
+    """The y-blocks a device unit splits an x-slab into: `n_y` brick-y ranges [lo, hi), each
+    a run of whole tile rows (`partition_units` over the tile rows), covering [0, nb).
+
+    A unit is (x-slab, y-block). Bricks are numbered x, then y, then z, so a unit is one
+    contiguous run of bricks (`unit_bricks`) and of slots. The tile window, the destination
+    census, the device migrate and the fused repack all use this cut. One block is the whole
+    slab. Execution policy: nothing here enters a checkpoint fingerprint.
+    """
+    s, bpt, n_y = int(tiles_side), int(bricks_per_tile), int(n_y)
+    if not 1 <= n_y <= s:
+        raise ValueError(f"y-blocks must be in [1, {s}] (the tile rows per side), got {n_y}")
+    return tuple((lo * bpt, hi * bpt) for lo, hi in partition_units(s, n_y, 1))
+
+
+def unit_bricks(slab, block, nb):
+    """Bricks [lo, hi) of unit (x-slab `slab`, brick-y range `block`) on an `nb`-per-side grid."""
+    s, (y_lo, y_hi), nb = int(slab), block, int(nb)
+    return s * nb * nb + int(y_lo) * nb, s * nb * nb + int(y_hi) * nb
+
+
+def block_neighbours(i, n_blocks):
+    """Blocks a row in block `i` can reach in one migrate (itself and one either side, periodic),
+    ascending. Ascending, not ring order, is what keeps a source slab's leavers brick-major."""
+    n = int(n_blocks)
+    return sorted({(int(i) + o) % n for o in (-1, 0, 1)})

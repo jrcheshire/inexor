@@ -768,7 +768,7 @@ def cmd_run(args):
                         timed_all=args.timed_all, numa_maps=args.numa_maps,
                         drop_ic_cache=args.drop_ic_cache,
                         ckpt_probe_slabs=args.ckpt_probe_slabs, trim_probe=args.trim_probe,
-                        cards=args.cards,
+                        cards=args.cards, y_blocks=args.y_blocks,
                         slack=args.slack, alloc_margin=args.alloc_margin,
                         arena_frac=args.arena_frac, checkpoint_dir=args.checkpoint_dir,
                         checkpoint_every=args.checkpoint_every)
@@ -778,7 +778,7 @@ def cmd_run(args):
             raise RuntimeError(f"{len(devs)} jax devices, {args.cards} asked")
         ec = engine_config(args.preset, coarse_backend="device", tile_backend="device",
                            migrate_backend="device", device_cards=args.cards, tile_workers=1,
-                           brick_slack=args.slack,
+                           device_y_blocks=args.y_blocks, brick_slack=args.slack,
                            checkpoint_dir=args.checkpoint_dir if args.checkpoint_every else None,
                            checkpoint_every=args.checkpoint_every)
         ec.validate()
@@ -789,7 +789,8 @@ def cmd_run(args):
         card["ranks"] = dict(rank=rank, n_ranks=decomp.n_ranks, slabs=list(decomp.slabs),
                              comm=args.comm, comm_timeout=args.comm_timeout)
         card["config"] = dict(tile_window=ec.tile_window, fused_pass=ec.fused_pass,
-                              device_cards=ec.device_cards, checkpoint_dir=ec.checkpoint_dir,
+                              device_cards=ec.device_cards, y_blocks=ec.device_y_blocks,
+                              checkpoint_dir=ec.checkpoint_dir,
                               coarse_dtype=ec.coarse_dtype, fine_dtype=ec.fine_dtype)
         src = (f"the step-{args.expect_step} checkpoint in {args.checkpoint_dir}"
                if args.expect_step else args.workdir)
@@ -1028,6 +1029,9 @@ def main(argv=None):
         p.add_argument("--workdir", required=True, help="the IC directory (read only)")
         p.add_argument("--card", required=True)
         p.add_argument("--cards", type=int, default=4)
+        p.add_argument("--y-blocks", type=int, default=1,
+                       help="split each x-slab's card work into this many y-blocks "
+                            "(EngineConfig.device_y_blocks); bitwise any count")
         p.add_argument("--slack", type=float, default=0.10)
         p.add_argument("--alloc-margin", type=float, default=0.10)
         p.add_argument("--arena-frac", type=float, default=0.01)

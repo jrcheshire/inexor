@@ -81,3 +81,69 @@ def test_refusals():
         Decomp.build(cfg, n_ranks=2, rank=2)
     # one rank is never refused on slab count: its migrate stays inside the node
     Decomp.build(cfg, n_ranks=1, reach=4)
+
+
+# ------------------------------------------------------------ y-blocks
+
+
+@pytest.mark.parametrize("name", sorted(PRESETS))
+def test_y_blocks_are_whole_tile_rows_covering_the_slab(name):
+    from inexor.decomp import y_blocks
+
+    cfg = _cfg(name)
+    s, bpt = cfg.tiles_side, cfg.n_tile // cfg.n_brick
+    nb = cfg.n_fine // cfg.n_brick
+    for n_y in range(1, s + 1):
+        blocks = y_blocks(s, bpt, n_y)
+        assert len(blocks) == n_y
+        _tiles(list(blocks), 0, nb)
+        assert all(lo % bpt == 0 and hi % bpt == 0 for lo, hi in blocks)
+    assert y_blocks(s, bpt, 1) == ((0, nb),)
+
+
+def test_y_blocks_refuse_outside_the_tile_rows():
+    from inexor.decomp import y_blocks
+
+    for bad in (0, 9):
+        with pytest.raises(ValueError, match="tile rows"):
+            y_blocks(8, 4, bad)
+
+
+def test_a_unit_is_one_contiguous_brick_run_in_its_slab():
+    from inexor.decomp import unit_bricks, y_blocks
+
+    nb, bpt = 32, 4
+    blocks = y_blocks(nb // bpt, bpt, 3)
+    for s in (0, 5, nb - 1):
+        runs = [unit_bricks(s, b, nb) for b in blocks]
+        _tiles(runs, s * nb * nb, (s + 1) * nb * nb)
+        for (lo, hi), (y_lo, y_hi) in zip(runs, blocks):
+            assert (lo // nb) % nb == y_lo and ((hi - 1) // nb) % nb == y_hi - 1
+
+
+def test_block_neighbours_are_ascending_with_wrap():
+    from inexor.decomp import block_neighbours
+
+    assert block_neighbours(0, 4) == [0, 1, 3]
+    assert block_neighbours(3, 4) == [0, 2, 3]
+    assert block_neighbours(1, 2) == [0, 1]
+    assert block_neighbours(0, 1) == [0]
+
+
+def test_y_blocks_setting_is_validated_and_not_fingerprinted():
+    import numpy as np
+
+    from inexor.engine import checkpoint_fingerprint
+
+    kw = dict(coarse_backend="device", tile_backend="device", migrate_backend="device")
+    cfg = engine_config("cdev8-tile32", **kw)
+    co = np.arange(12, dtype=np.float64)
+    want = checkpoint_fingerprint(cfg, co)
+    for n_y in (1, 2, cfg.tiles_side):
+        c = engine_config("cdev8-tile32", device_y_blocks=n_y, **kw)
+        assert checkpoint_fingerprint(c, co) == want
+    for bad in (0, cfg.tiles_side + 1):
+        with pytest.raises(ValueError, match="device_y_blocks"):
+            engine_config("cdev8-tile32", device_y_blocks=bad, **kw).validate()
+    with pytest.raises(ValueError, match="could not apply"):
+        engine_config("cdev8-tile32", device_y_blocks=2).validate()

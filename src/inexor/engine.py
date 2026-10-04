@@ -142,6 +142,7 @@ class EngineConfig:
         coarse_fold_kernel=True,
         coarse_match_order=3,
         coarse_kernel_on_cards=None,
+        device_y_blocks=1,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -240,6 +241,10 @@ class EngineConfig:
         # census); bitwise the two passes. Tri-state as `device_tile_window`; read `fused_pass`.
         self.migrate_repack_fused = (
             None if migrate_repack_fused is None else bool(migrate_repack_fused))
+        # Split every x-slab-sized card working set (tile window, destination census, device
+        # migrate, fused repack) into this many y-blocks (`decomp.y_blocks`); bitwise any count.
+        # 1 = whole slabs.
+        self.device_y_blocks = int(device_y_blocks)
 
     @property
     def np_coarse_dtype(self):
@@ -526,6 +531,15 @@ class EngineConfig:
                 "sizes it from the tile window's census, but migrate_backend="
                 f"{self.migrate_backend!r}, tile_window={self.tile_window}; the knob could "
                 "not apply.")
+        if not 1 <= self.device_y_blocks <= self.tiles_side:
+            raise ValueError(f"device_y_blocks must be in [1, {self.tiles_side}] (the tile rows "
+                             f"per side), got {self.device_y_blocks}")
+        if self.device_y_blocks > 1 and not (self.tile_window
+                                             or self.migrate_backend == "device"):
+            raise ValueError(
+                f"device_y_blocks={self.device_y_blocks} splits the tile window and the device "
+                f"migrate, but tile_window={self.tile_window}, migrate_backend="
+                f"{self.migrate_backend!r}; the knob could not apply.")
         on_device = [n for n in ("migrate_backend", "coarse_backend", "tile_backend")
                      if getattr(self, n) == "device"]
         if on_device:
@@ -1411,7 +1425,8 @@ def fused_drifts(coeffs):
 # The config fields a resume must match: those that move numbers, as physics/geometry or as a
 # buffer shape (XLA reassociates by shape). Safe to change across a resume, so excluded:
 #   execution policy (tile_workers, worker_affinity, migrate_pooled, migrate_window,
-#     eject_kernel, migrate_backend, migrate_device_budget_bytes, migrate_repack_fused) --
+#     eject_kernel, migrate_backend, migrate_device_budget_bytes, migrate_repack_fused,
+#     device_y_blocks) --
 #     every alternative is bitwise the serial host path;
 #   layout (repack_every, chunk_bricks, brick_slack) -- both paints are integer and so
 #     order-independent; checkpoints store membership, not allocation;
