@@ -1,5 +1,5 @@
 # shellcheck shell=bash disable=SC2034  # XLA_ENV and LEG_KILLED are for the sourcing script
-# Sourced by the multi-node job scripts: legs run with a time cap and a silence limit, a leg's
+# Sourced by the job scripts that run legs: legs run with a time cap and a silence limit, a leg's
 # XLA_FLAGS, and the checkpoint gate. tests/test_job_scripts.py runs each piece.
 #
 # The sourcing script sets LEG_DIR (each leg's output is also kept in LEG_DIR/NN-name.log) and
@@ -152,6 +152,47 @@ same_ckpt () {
   done < <(cd "$a" && find . -type f | sort)
   echo "  $(cd "$a" && find . -type f | wc -l | tr -d ' ') files, $bad differing: $a vs $b"
   [ $bad -eq 0 ]
+}
+
+# same_ckpt_any_cut A B: `same_ckpt`, except that manifests are compared without
+# provenance.device_shapes.window, the one entry a y-block count changes (it sizes a buffer;
+# the checkpoint's numbers do not depend on the cut)
+same_ckpt_any_cut () {
+  local a=$1 b=$2 bad=0 f d
+  for d in "$a" "$b"; do
+    if [ ! -d "$d" ] || ! compgen -G "$d/*/manifest.json" >/dev/null; then
+      echo "  GATE FAIL: no checkpoint generation in $d"
+      return 1
+    fi
+  done
+  if ! diff <(cd "$a" && find . -type f | sort) <(cd "$b" && find . -type f | sort) >/dev/null; then
+    echo "  GATE FAIL: $a and $b hold different files"
+    return 1
+  fi
+  while IFS= read -r f; do
+    if [ "${f##*/}" = manifest.json ]; then
+      "${PY:-python3}" - "$a/$f" "$b/$f" <<'EOF_PY' || { echo "  differs: $f"; bad=$((bad + 1)); }
+import json, sys
+m = [json.load(open(p)) for p in sys.argv[1:]]
+for x in m:
+    x.get("provenance", {}).get("device_shapes", {}).pop("window", None)
+sys.exit(m[0] != m[1])
+EOF_PY
+    else
+      cmp -s "$a/$f" "$b/$f" || { echo "  differs: $f"; bad=$((bad + 1)); }
+    fi
+  done < <(cd "$a" && find . -type f | sort)
+  echo "  $(cd "$a" && find . -type f | wc -l | tr -d ' ') files, $bad differing (manifests without the window shape): $a vs $b"
+  [ $bad -eq 0 ]
+}
+
+# gate_any_cut NAME DIR...: `gate` with `same_ckpt_any_cut`
+gate_any_cut () {
+  local name=$1 first=$2 d ok=0; shift 2
+  echo ""; echo "=== GATE $name ==="
+  for d in "$@"; do same_ckpt_any_cut "$first" "$d" || ok=1; done
+  if [ $ok -eq 0 ]; then echo "GATE $name PASS"; else echo "GATE $name FAIL"; fi
+  return $ok
 }
 
 # manifest_field GENDIR EXPR: EXPR of GENDIR/manifest.json, loaded as `m`

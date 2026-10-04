@@ -9,6 +9,7 @@ into bash. A stub `nvidia-smi` turns the samplers on wherever the test runs. Ski
 bash or pgrep.
 """
 
+import json
 import os
 import random
 import select
@@ -241,6 +242,38 @@ def test_gate_passes_only_identical_checkpoints(tmp_path, case):
         assert "GATE test PASS" in r.stdout and "rc=0" in r.stdout
     else:
         assert "GATE test FAIL" in r.stdout and "rc=1" in r.stdout
+
+
+def _cut_ckpt(d, window, step=3, payload=b"x"):
+    g = d / "gen0"
+    g.mkdir(parents=True)
+    (g / "t9_slab_0000.npz").write_bytes(payload)
+    m = {"n_particles": 8, "provenance": {"step": step, "device_shapes": {
+        "tile": {"arena_rect": 4}, "window": window}}}
+    (g / "manifest.json").write_text(json.dumps(m))
+    return d
+
+
+@pytest.mark.parametrize("case,ok", [
+    ("window only", True), ("same", True), ("another manifest field", False),
+    ("a slab byte", False), ("a tile shape", False)])
+def test_the_any_cut_gate_ignores_only_the_window_shape(tmp_path, case, ok):
+    w1 = {"rows": 100, "arena": 10}
+    a = _cut_ckpt(tmp_path / "a", w1)
+    b = _cut_ckpt(tmp_path / "b", {"rows": 40, "arena": 5, "y_blocks": 4}
+                  if case != "same" else w1,
+                  step=4 if case == "another manifest field" else 3,
+                  payload=b"z" if case == "a slab byte" else b"x")
+    if case == "a tile shape":
+        f = b / "gen0" / "manifest.json"
+        m = json.loads(f.read_text())
+        m["provenance"]["device_shapes"]["tile"]["arena_rect"] = 8
+        f.write_text(json.dumps(m))
+    r = _lib(f'gate_any_cut test "{a}" "{b}"; echo "rc=$?"', tmp_path)
+    want = ("GATE test PASS", "rc=0") if ok else ("GATE test FAIL", "rc=1")
+    assert all(w in r.stdout for w in want), r.stdout + r.stderr
+    plain = _lib(f'gate test "{a}" "{b}"; echo "rc=$?"', tmp_path)
+    assert ("rc=0" in plain.stdout) == (case == "same"), "CONTROL: the plain gate"
 
 
 def _gen(ckpt, g, step, n_particles=8):
