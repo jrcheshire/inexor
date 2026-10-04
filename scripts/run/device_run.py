@@ -9,6 +9,10 @@ Subcommands:
                lane (coarse, tile and migrate on the cards; window and fused pass on
                the config's auto), optionally timed per pass; then optionally a
                partial checkpoint write timed per part and a malloc_trim probe
+    card       the P(k) card of a checkpoint, painted and transformed on the cards
+               (`summary.pk_summary_card_cards`); rank 0 writes it to `--out`
+    export     the (x, v) export of a checkpoint, decoded on the cards, one part per
+               rank (`export.write_particle_parts`, format inexor-particles-2)
     summarize  after the fact, no jax: the run card against the job's sampler CSVs,
                per phase (card memory max per GPU, host MemAvailable min, utilization)
 
@@ -19,6 +23,10 @@ Usage (as the Vista job scripts call it):
     python scripts/run/device_run.py run --preset c-hero --workdir $ICS --card run.json \
         --k-steps 120 --expect-step 0 --stop-at 20 --checkpoint-dir $CKPT \
         --checkpoint-every 20 --membind-nodes 0,1
+    python scripts/run/device_run.py card --preset c-hero --checkpoint-dir $CKPT \
+        --k-steps 120 --expect-step 120 --card card-run.json --out pk.json
+    python scripts/run/device_run.py export --preset c-hero --checkpoint-dir $CKPT \
+        --k-steps 120 --expect-step 120 --card export-run.json --export-dir $EXPORT
     python scripts/run/device_run.py summarize --card run.json --gpu-csv gpu.csv \
         --mem-csv mem.csv --out summary.json
 
@@ -31,7 +39,10 @@ exchange aborts the job.
 
 Refusals in `run`: a card or checkpoint under the IC directory; a checkpoint dir that
 already holds a checkpoint unless `--expect-step` (resume) is given; a resume whose
-newest checkpoint is not at `--expect-step`; a memory binding that did not apply.
+newest checkpoint is not at `--expect-step`; a memory binding that did not apply. In `card`
+and `export`: an output under the checkpoint directory, a non-empty export directory, a
+newest checkpoint not at `--expect-step`, and (export) a checkpoint short of `--k-steps`
+unless `--allow-partial`.
 
 What survives a failure:
 - Every engine phase boundary prints one line when it is crossed (wall clock, step,
@@ -707,10 +718,11 @@ class _RankLines:
         return getattr(self._out, name)
 
 
-def cmd_run(args):
+def _comm_up(args):
+    """(comm, multi): MPI before jax; across ranks a per-rank card path and rank-prefixed
+    log lines."""
     comm = None
     if args.comm == "mpi":
-        # MPI comes up before jax does
         from inexor.comm import MPIComm
 
         comm = MPIComm(timeout=args.comm_timeout)
@@ -719,8 +731,28 @@ def cmd_run(args):
         base, ext = os.path.splitext(args.card)
         args.card = f"{base}.rank{comm.rank}{ext}"
         sys.stdout = _RankLines(sys.stdout, comm.rank)
-        if args.ckpt_probe_slabs:
-            raise SystemExit("FATAL: the checkpoint probe writes a whole state; one rank only")
+    return comm, multi
+
+
+def _check_state_on_cpu_nodes(args, card):
+    """After a load under --membind-nodes: refuse if the state sits on CPU-less (HBM) nodes.
+    State on a card's HBM only shows up later as a device OOM on a nearly empty card."""
+    nmaps, nm = numa_maps(), numa_memory()
+    off, where = pages_off_the_cpu_nodes(nmaps, nm)
+    card["load_pages_off_cpu_nodes"] = dict(bytes=off, by_node=where)
+    print(f"  after the load: {_gb(off)} GB of this process on CPU-less nodes "
+          f"{ {k: round(v / GB, 1) for k, v in where.items()} }", flush=True)
+    if off > args.off_node_gb * GB:
+        raise RuntimeError(
+            f"{off / GB:.1f} GB of the loaded state sits on CPU-less (HBM) nodes "
+            f"{sorted(where)}: those bytes are on the cards, which will OOM in the "
+            "step. The membind did not hold.")
+
+
+def cmd_run(args):
+    comm, multi = _comm_up(args)
+    if multi and args.ckpt_probe_slabs:
+        raise SystemExit("FATAL: the checkpoint probe writes a whole state; one rank only")
 
     import jax
 
@@ -827,18 +859,7 @@ def cmd_run(args):
                              rows=int(st.off.shape[0]), n_arena=int(st.n_arena))
         mon("load")
         if args.membind_nodes:
-            # the state is on the host now: check it is on the CPU nodes. State on a
-            # card's HBM only shows up later as a device OOM on a nearly empty card.
-            nmaps, nm = numa_maps(), numa_memory()
-            off, where = pages_off_the_cpu_nodes(nmaps, nm)
-            card["load_pages_off_cpu_nodes"] = dict(bytes=off, by_node=where)
-            print(f"  after the load: {_gb(off)} GB of this process on CPU-less nodes "
-                  f"{ {k: round(v / GB, 1) for k, v in where.items()} }", flush=True)
-            if off > args.off_node_gb * GB:
-                raise RuntimeError(
-                    f"{off / GB:.1f} GB of the loaded state sits on CPU-less (HBM) nodes "
-                    f"{sorted(where)}: those bytes are on the cards, which will OOM in the "
-                    "step. The membind did not hold.")
+            _check_state_on_cpu_nodes(args, card)
         timed = (tuple(range(k0, args.stop_at)) if args.timed_all
                  else (args.stop_at - 1,) if args.timed_last else ())
 
@@ -868,6 +889,138 @@ def cmd_run(args):
             card["trim_probe"] = trim_probe(mon)
             mon.save()
         _print_steps(card)
+        return 0
+    except BaseException as e:
+        mon.fail(e)
+        raise
+    finally:
+        mon.stop()
+
+
+# ---------------------------------------------------------------------- products
+
+
+def cmd_card(args):
+    return _product(args, "card")
+
+
+def cmd_export(args):
+    return _product(args, "export")
+
+
+def _product(args, kind):
+    """The P(k) card or the export of the newest checkpoint, on the cards, on every rank."""
+    comm, multi = _comm_up(args)
+
+    import jax
+    import numpy as np
+
+    from inexor import engine, export, summary
+    from inexor.decomp import Decomp
+    from inexor.plan import engine_config
+    from realization import _coeffs, _cosmo
+
+    jax.config.update("jax_enable_x64", True)
+    args.workdir = args.checkpoint_dir  # the base card's source field
+    ckpt = os.path.realpath(args.checkpoint_dir)
+    out = args.out if kind == "card" else args.export_dir
+    for what, path in (("the run card", os.path.dirname(os.path.abspath(args.card))),
+                       (f"the {kind}", out)):
+        if under(path, ckpt):
+            raise SystemExit(f"FATAL: {what} would be written under the checkpoint directory")
+    if kind == "export" and os.path.isdir(out) and os.listdir(out):
+        raise SystemExit(f"FATAL: export directory {out} is not empty")
+    if args.membind_nodes:
+        bad = membind_refusals(_node_list(args.membind_nodes))
+        if bad:
+            raise SystemExit("FATAL: " + "; ".join(bad))
+    _signals(args.card)
+    card = _base_card(kind, args)
+    rank = 0 if comm is None else comm.rank
+    fail_rank = os.environ.get("D7_FAIL_RANK")
+    fail_at = (os.environ.get("D7_FAIL_AT")
+               if fail_rank is None or int(fail_rank) == rank else None)
+    mon = Monitor(args.card, card, beat_s=args.beat, fail_at=fail_at)
+    try:
+        devs = jax.devices()
+        if len(devs) < args.cards:
+            raise RuntimeError(f"{len(devs)} jax devices, {args.cards} asked")
+        devs = devs[:args.cards]
+        ec = engine_config(args.preset, coarse_backend="device", tile_backend="device",
+                           migrate_backend="device", device_cards=args.cards, tile_workers=1,
+                           brick_slack=args.slack)
+        ec.validate()
+        decomp = Decomp.build(ec, n_ranks=1 if comm is None else comm.size, rank=rank)
+        slabs = decomp.slabs if multi else None
+        card["ranks"] = dict(rank=rank, n_ranks=decomp.n_ranks, slabs=list(decomp.slabs),
+                             comm=args.comm, comm_timeout=args.comm_timeout)
+        print(f"== device {kind} {args.preset}: {args.cards} cards, the step-"
+              f"{args.expect_step} checkpoint in {args.checkpoint_dir} -> {out}", flush=True)
+        mon.start()
+
+        cosmo = _cosmo()
+        co, a_steps = _coeffs(cosmo, args.k_steps, growth2=args.growth2)
+        t0 = time.time()
+        st, resume = engine.load_checkpoint(
+            args.checkpoint_dir, ec, co, brick_slack=args.slack,
+            alloc_margin=args.alloc_margin, arena_frac=args.arena_frac, comm=comm, slabs=slabs)
+        step = int(resume["step"])
+        if step != args.expect_step:
+            raise RuntimeError(f"the newest checkpoint under {args.checkpoint_dir} is at step "
+                               f"{step}, and this job was submitted for step {args.expect_step}")
+        load_s = time.time() - t0
+        card["state"] = dict(n_particles=st.n_particles, n_bricks=st.n_bricks,
+                             rows=int(st.off.shape[0]), n_arena=int(st.n_arena), step=step)
+        mon("load")
+        if args.membind_nodes:
+            _check_state_on_cpu_nodes(args, card)
+        a_out = float(a_steps[step])
+        prov = dict(preset=args.preset, step=step, commit=_git_commit(),
+                    checkpoint=ckpt, n_ranks=decomp.n_ranks, cards=args.cards)
+
+        t0 = time.time()
+        if kind == "card":
+            edges = None
+            if args.k_max:
+                edges = np.linspace(0.0, float(args.k_max), int(args.n_bins) + 1)
+            res = summary.pk_summary_card_cards(
+                st, ec, cosmo, a_out, devices=devs, decomp=decomp, comm=comm, slab=args.slab,
+                edges=edges, min_weight=args.min_weight, provenance=prov, phase=mon)
+            wall = time.time() - t0
+            card["product"] = dict(wall_s=wall, load_s=load_s, n_bins=res["n_bins"])
+            if rank == 0:
+                # the wrapper `realization.py card` writes, so the compare scripts read both
+                _write_json(args.out, dict(
+                    card="inexor-realization-pk-1", config=args.preset,
+                    workdir=args.checkpoint_dir, commit=_git_commit(),
+                    host=os.uname().nodename, k_steps=int(args.k_steps),
+                    growth2=args.growth2, when=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    step=step, a_out=a_out, wall_s=wall, load_s=load_s,
+                    n_ranks=decomp.n_ranks, cards=args.cards, summary=res))
+            print(f"  card: {res['n_bins']} bins, {wall / 60:.1f} min; -> {args.out}",
+                  flush=True)
+        else:
+            if step < args.k_steps and not args.allow_partial:
+                raise RuntimeError(
+                    f"the checkpoint is at step {step} of {args.k_steps}; exporting now would "
+                    "produce a mock at the wrong epoch. Pass --allow-partial if that is "
+                    "deliberate.")
+            timings = {}
+            epoch = {} if args.d_time else dict(a=a_out, cosmo=cosmo)
+            n_all = (int(st.n_particles) if comm is None
+                     else int(comm.allreduce(int(st.n_particles))))
+            head = export.write_particle_parts(
+                st, out, comm=comm, dtype=np.dtype(args.dtype), decode="cards", devices=devs,
+                expect_total=n_all, provenance=prov, timings=timings, **epoch)
+            wall = time.time() - t0
+            mon("export")
+            card["product"] = dict(wall_s=wall, load_s=load_s, timings=timings,
+                                   rows=int(st.n_live), crc32=head["crc32"])
+            print(f"  export: {int(st.n_live):,} rows on this rank of {head['n_particles']:,}, "
+                  f"{wall / 60:.1f} min ({head['units']['velocity']}); crc32 {head['crc32']}",
+                  flush=True)
+        card["finished"] = time.time()
+        mon.save()
         return 0
     except BaseException as e:
         mon.fail(e)
@@ -1083,13 +1236,49 @@ def main(argv=None):
                          "python -m mpi4py)")
     pr.add_argument("--comm-timeout", type=float, default=1800.0,
                     help="seconds a rank may wait at one exchange before aborting the job")
+    for name in ("card", "export"):
+        p = sub.add_parser(name)
+        p.add_argument("--membind-nodes", default=None,
+                       help="as `run`: refuse unless the binding applied and the loaded state "
+                            "sits on the CPU nodes")
+        p.add_argument("--off-node-gb", type=float, default=8.0)
+        p.add_argument("--preset", required=True)
+        p.add_argument("--checkpoint-dir", required=True, help="the run's checkpoint directory")
+        p.add_argument("--k-steps", type=int, required=True,
+                       help="steps in the run's schedule (the fingerprint and the epoch)")
+        p.add_argument("--expect-step", type=int, required=True,
+                       help="the step the newest checkpoint must be at")
+        p.add_argument("--card", required=True, help="this process's run card")
+        p.add_argument("--cards", type=int, default=4)
+        p.add_argument("--slack", type=float, default=0.10)
+        p.add_argument("--alloc-margin", type=float, default=0.10)
+        p.add_argument("--arena-frac", type=float, default=0.01)
+        p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"))
+        p.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
+        p.add_argument("--comm", default="serial", choices=("serial", "mpi"))
+        p.add_argument("--comm-timeout", type=float, default=1800.0)
+    pc = sub.choices["card"]
+    pc.add_argument("--out", required=True, help="the P(k) card JSON (rank 0 writes it)")
+    pc.add_argument("--slab", type=int, default=32)
+    pc.add_argument("--min-weight", type=float, default=100.0)
+    pc.add_argument("--k-max", type=float, default=None,
+                    help="pin the top of the binning (as `realization.py card`)")
+    pc.add_argument("--n-bins", type=int, default=64)
+    pe = sub.choices["export"]
+    pe.add_argument("--export-dir", required=True)
+    pe.add_argument("--dtype", default="float32", choices=("float32", "float64"))
+    pe.add_argument("--d-time", action="store_true",
+                    help="write the native dx/dD velocity instead of peculiar km/s")
+    pe.add_argument("--allow-partial", action="store_true",
+                    help="export a checkpoint short of --k-steps")
     ps = sub.add_parser("summarize")
     ps.add_argument("--card", required=True)
     ps.add_argument("--gpu-csv", default=None)
     ps.add_argument("--mem-csv", default=None)
     ps.add_argument("--out", required=True)
     args = ap.parse_args(argv)
-    return dict(preflight=cmd_preflight, run=cmd_run, summarize=cmd_summarize)[args.cmd](args)
+    return dict(preflight=cmd_preflight, run=cmd_run, card=cmd_card, export=cmd_export,
+                summarize=cmd_summarize)[args.cmd](args)
 
 
 if __name__ == "__main__":
