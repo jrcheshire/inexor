@@ -29,10 +29,11 @@ def _x64():
     jax.config.update("jax_enable_x64", prev)
 
 
-def _census(st, cfg, members, one_tile, C, g_coarse, c, devices=None):
-    shapes = _shapes(cfg, st)
+def _census(st, cfg, members, one_tile, C, g_coarse, c, devices=None, y_blocks=1):
+    shapes = _shapes(cfg, st, y_blocks)
     if devices is None:
-        out = dwin.tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, census=c)
+        out = dwin.tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, census=c,
+                                      y_blocks=y_blocks)
         return out["census_counts"], out["census_slabs"], out
     from inexor.ooc_fft import partition_units
 
@@ -40,7 +41,8 @@ def _census(st, cfg, members, one_tile, C, g_coarse, c, devices=None):
     counts, slabs = 0, 0
     for k, (a, b) in enumerate(parts):
         out = dwin.tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes,
-                                      planes=range(a, b), device=devices[k], census=c)
+                                      planes=range(a, b), device=devices[k], census=c,
+                                      y_blocks=y_blocks)
         counts = counts + out["census_counts"]
         slabs += out["census_slabs"]
     return counts, slabs, out
@@ -52,8 +54,9 @@ def _reference_counts(st, c):
     return drepack.repack_geometry(ref, 0.10)[1], stats
 
 
-@pytest.mark.parametrize("cards", [None, 2, 4])
-def test_the_census_is_the_membership_the_migrate_produces(cards):
+@pytest.mark.parametrize("cards,y_blocks", [(None, 1), (2, 1), (4, 1), (None, 2), (None, 4),
+                                            (2, 4)])
+def test_the_census_is_the_membership_the_migrate_produces(cards, y_blocks):
     devices = None
     if cards is not None:
         if len(jax.devices()) < cards:
@@ -62,10 +65,13 @@ def test_the_census_is_the_membership_the_migrate_produces(cards):
     cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
     c = _c_drift(st, 1.5)
     before = drepack.repack_geometry(st, 0.10)[1]
-    counts, slabs, out = _census(st, cfg, members, one_tile, C, g_coarse, c, devices)
+    counts, slabs, out = _census(st, cfg, members, one_tile, C, g_coarse, c, devices,
+                                 y_blocks)
     want, stats = _reference_counts(st, c)
 
     assert slabs == int(st.bricks_per_side), f"{slabs} slabs counted"
+    if devices is None:
+        assert out["census_units"] == int(st.bricks_per_side) * y_blocks
     assert counts.dtype == np.int64 and counts.shape == want.shape
     n_diff = int(np.count_nonzero(counts != want))
     assert n_diff == 0, f"{n_diff} of {len(want)} bricks differ from the migrate's membership"

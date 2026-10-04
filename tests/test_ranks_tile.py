@@ -57,7 +57,7 @@ def _g_coarse():
                  for _ in range(3))
 
 
-def tile_pass(st, cfg, decomp, comm, devs):
+def tile_pass(st, cfg, decomp, comm, devs, y_blocks=1):
     """One rank's tile phase as `engine.step` runs it; returns (cap, shapes, census)."""
     b_real = cfg._b_realized
     g = (cfg.n_tile, b_real, cfg.n_brick, cfg.n_fine)
@@ -69,7 +69,8 @@ def tile_pass(st, cfg, decomp, comm, devs):
         cap=tile_capacity(counts.reshape(-1))))["cap"], rungs=cfg.cap_rungs)
     shapes = allreduce_shapes(comm, dtile.tile_step_shapes(st))
     shapes["window"] = allreduce_shapes(comm, dwin.window_shapes(
-        view, cfg.n_tile, b_real, cfg.n_brick, planes=range(*decomp.planes)))
+        view, cfg.n_tile, b_real, cfg.n_brick, planes=range(*decomp.planes),
+        y_blocks=y_blocks))
     one_tile, geom = _tile_force(cfg.device_cards)
     C = dict(cap=int(cap), n_tile=cfg.n_tile, n_brick=cfg.n_brick, n_fine=cfg.n_fine,
              n_coarse=cfg.n_coarse, box=cfg.box_size, coarse_cell=cfg.coarse_cell,
@@ -81,7 +82,7 @@ def tile_pass(st, cfg, decomp, comm, devs):
         shard = shard_coarse_meshes(_g_coarse(), x0, nx, dev)
         lp = dwin.tile_loop_windowed(view, one_tile, C, None, members, shapes,
                                      planes=range(a, z), coarse_shard=shard, device=dev,
-                                     census=C_DRIFT)
+                                     census=C_DRIFT, y_blocks=y_blocks)
         census += lp["census_counts"]
     return cap, shapes, census
 
@@ -110,25 +111,26 @@ def reference():
     return cap, shapes, census, _owned_rows(st)
 
 
-def _run_ranks(n_ranks, cards):
+def _run_ranks(n_ranks, cards, y_blocks=1):
     cfg = rank_cfg(cards)
     whole = whole_state()
 
     def rank(c):
         d = Decomp.build(cfg, n_ranks=c.size, rank=c.rank)
         part = whole if c.size == 1 else restrict_to_slabs(whole, d.slabs)
-        cap, shapes, census = tile_pass(part, cfg, d, c, rank_devices(c.rank, cards))
+        cap, shapes, census = tile_pass(part, cfg, d, c, rank_devices(c.rank, cards),
+                                        y_blocks)
         return cap, shapes, census, _owned_rows(part)
 
     return run_loopback(n_ranks, rank, timeout=300.0)
 
 
-def _check(reference, got):
+def _check(reference, got, same_shapes=True):
     cap_w, shapes_w, census_w, rows_w = reference
     census = np.zeros_like(census_w)
     seen = {}
     for cap, shapes, c, rows in got:
-        assert cap == cap_w and shapes == shapes_w
+        assert cap == cap_w and (shapes == shapes_w or not same_shapes)
         census += c
         seen.update(rows)
     np.testing.assert_array_equal(census, census_w)
@@ -145,20 +147,35 @@ def test_rank_tile_loops_are_the_one_rank_loop(reference, n_ranks, cards):
     _check(reference, _run_ranks(n_ranks, cards))
 
 
-def test_ghost_velocities_are_never_read(reference, monkeypatch):
+@pytest.mark.parametrize("y_blocks", [2, 4])
+@pytest.mark.parametrize("n_ranks", [1, 2, 4])
+def test_y_blocked_rank_tile_loops_are_the_one_rank_loop(reference, n_ranks, y_blocks):
+    """Y-blocked windows across ranks (ghost slabs cut into brick runs) give the one-rank,
+    whole-slab loop's rows, scales and census; only the window shapes differ."""
+    got = _run_ranks(n_ranks, 1, y_blocks)
+    _check(reference, got, same_shapes=False)
+    assert all(g[1]["window"]["rows"] < reference[1]["window"]["rows"] for g in got), (
+        "vacuous: a y-blocked window is as large as a whole-slab one")
+
+
+@pytest.mark.parametrize("y_blocks", [1, 2])
+def test_ghost_velocities_are_never_read(reference, monkeypatch, y_blocks):
     """Ghost `w` staged as noise instead of zeros changes nothing: buffer rows' velocities
     are masked out of the kick."""
-    real_chunk = dghost.SlabView.slab_chunk
+    real_chunk = dghost.SlabView.range_chunk
+    calls = []
 
-    def noisy(self, name, s, L):
-        out = real_chunk(self, name, s, L)
+    def noisy(self, name, s, lo_b, hi_b, L):
+        out = real_chunk(self, name, s, lo_b, hi_b, L)
         if name == "w" and not self.owns(s):
+            calls.append(s)
             out = np.random.default_rng(s).integers(-3000, 3000, size=out.shape,
                                                     dtype=np.int64).astype(out.dtype)
         return out
 
-    monkeypatch.setattr(dghost.SlabView, "slab_chunk", noisy)
-    _check(reference, _run_ranks(2, 1))
+    monkeypatch.setattr(dghost.SlabView, "range_chunk", noisy)
+    _check(reference, _run_ranks(2, 1, y_blocks), same_shapes=y_blocks == 1)
+    assert calls, "VACUOUS: no ghost w was staged"
 
 
 def test_a_ghost_slab_without_its_occupancy_fails(reference, monkeypatch):

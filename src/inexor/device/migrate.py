@@ -191,14 +191,16 @@ def _program(key, make):
     return fn
 
 
-def _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids):
-    """One slab's eject inputs at `cap` rows, built from its window on the device."""
+def _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids, n_b=None):
+    """One unit's eject inputs at `cap` rows, built from its window on the device. `n_b` is the
+    unit's brick count (default a whole slab, `nb**2`)."""
+    nb2 = nb * nb
+    n_b = nb2 if n_b is None else int(n_b)
 
     def make():
         import jax
         import jax.numpy as jnp
 
-        nb2 = nb * nb
         lift = cap + 1  # above every prefix sum and rank (both <= cap)
 
         @jax.jit
@@ -207,14 +209,14 @@ def _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids):
             r = jnp.arange(cap, dtype=jnp.int64)
             real = r < n_rows
             bi = jnp.clip(jnp.searchsorted(row_offsets[1:], r, side="right"),
-                          0, nb2 - 1).astype(jnp.int64)
+                          0, n_b - 1).astype(jnp.int64)
             rank = r - row_offsets[bi]
             lc = live[bi]
             is_ar = rank >= lc
             # live rows: bucket = count of the brick's prefix sums <= rank, via one
             # searchsorted over per-brick-lifted prefix sums (as the device decode)
             occ_cum = jnp.cumsum(occ.astype(jnp.int64), axis=1)
-            keys = (occ_cum + (jnp.arange(nb2, dtype=jnp.int64) * lift)[:, None]).reshape(-1)
+            keys = (occ_cum + (jnp.arange(n_b, dtype=jnp.int64) * lift)[:, None]).reshape(-1)
             within = jnp.searchsorted(keys, bi * lift + rank, side="right").astype(jnp.int64)
             within = jnp.clip(within - bi * p3, 0, p3 - 1)
             bucket_live = (lo_b + bi) * p3 + within
@@ -243,7 +245,7 @@ def _rows_program(cap, w_cap, a_cap, nb, p3, per, has_ids):
 
         return rows
 
-    return _program(("rows", cap, w_cap, a_cap, nb, p3, per, has_ids), make)
+    return _program(("rows", cap, w_cap, a_cap, nb, p3, per, has_ids, n_b), make)
 
 
 def _eject_scalars_program(cap, nb, p3):
@@ -346,24 +348,29 @@ def _window_fits(n_state_rows, s0, w_cap):
 
 
 def _slab_index(st, s, ar_slots, ar_bricks):
-    """Slab s's host index for its eject rows, O(bricks + arena): the per-brick
-    occupancy, live and resident counts and prefix sums, its arena residents in
-    `pass_arena_index` order, and the padded shapes. Shared by the eject and the
-    destination census (`device.window`), so both build identical kernel inputs."""
+    """`_unit_index` of the whole x-slab `s`."""
+    return _unit_index(st, *st.slab_bricks(s), ar_slots, ar_bricks)
+
+
+def _unit_index(st, lo_b, hi_b, ar_slots, ar_bricks):
+    """The host index of bricks [lo_b, hi_b) (a slab or a unit of one) for their eject rows,
+    O(bricks + arena): the per-brick occupancy, live and resident counts and prefix sums, the
+    arena residents in `pass_arena_index` order, and the padded shapes. Shared by the eject
+    and the destination census (`device.window`), so both build identical kernel inputs."""
     from .. import eject_jax
 
-    nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
-    nb2 = nb * nb
-    lo_b, hi_b = st.slab_bricks(s)
+    p3 = int(st.buckets_per_brick)
+    lo_b, hi_b = int(lo_b), int(hi_b)
+    n_b = hi_b - lo_b
     s0, s1 = int(st.brick_start[lo_b]), int(st.brick_start[hi_b])
-    occ = st._occ(lo_b, hi_b).reshape(nb2, p3)
+    occ = st._occ(lo_b, hi_b).reshape(n_b, p3)
     live = occ.sum(axis=1, dtype=np.int64)
     a0, a1 = np.searchsorted(ar_bricks, [lo_b, hi_b])
     rows_a = ar_slots[a0:a1]
-    ar_counts = np.bincount(ar_bricks[a0:a1] - lo_b, minlength=nb2).astype(np.int64)
-    ar_offsets = np.zeros(nb2 + 1, dtype=np.int64)
+    ar_counts = np.bincount(ar_bricks[a0:a1] - lo_b, minlength=n_b).astype(np.int64)
+    ar_offsets = np.zeros(n_b + 1, dtype=np.int64)
     np.cumsum(ar_counts, out=ar_offsets[1:])
-    row_offsets = np.zeros(nb2 + 1, dtype=np.int64)
+    row_offsets = np.zeros(n_b + 1, dtype=np.int64)
     np.cumsum(live + ar_counts, out=row_offsets[1:])
     n_rows = int(row_offsets[-1])
     n_ar = int(a1 - a0)
@@ -391,7 +398,8 @@ def _eject_rows(st, ix, c_drift, off_win, w_win, ids_win, ar_rows, starts_rel, s
                  _put(ix["row_offsets"], dev), _put(ix["ar_offsets"], dev),
                  _put(ix["ar_bucket"], dev))
     clock.mark("eject: upload", index_dev, off_win, w_win, ids_win, ar_rows, scales_d)
-    rows = _rows_program(cap, w_cap, ix["a_cap"], nb, p3, per, has_ids)
+    rows = _rows_program(cap, w_cap, ix["a_cap"], nb, p3, per, has_ids,
+                         n_b=ix["hi_b"] - lo_b)
     off, bijk, w, ids, scale, brick, real = rows(
         *index_dev, off_win, w_win, ids_win, *ar_rows, scales_d,
         _put(ix["n_rows"], dev, jnp.int64), _put(lo_b, dev, jnp.int64))

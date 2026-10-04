@@ -29,9 +29,10 @@ def _x64():
     jax.config.update("jax_enable_x64", prev)
 
 
-def _shapes(cfg, st):
+def _shapes(cfg, st, y_blocks=1):
     return dict(dtile.tile_step_shapes(st),
-                window=dwin.window_shapes(st, cfg.n_tile, cfg._b_realized, cfg.n_brick))
+                window=dwin.window_shapes(st, cfg.n_tile, cfg._b_realized, cfg.n_brick,
+                                          y_blocks=y_blocks))
 
 
 @pytest.mark.parametrize("coarse_on_card", [False, True])
@@ -60,6 +61,54 @@ def test_the_windowed_loop_is_bitwise_the_whole_state_loop(coarse_on_card):
     assert out["residents_staged"] > 0, "vacuous: no arena resident reached a window"
     assert out["window_live_rows_max"] < int(st.brick_start[-1]), (
         "vacuous: a window held every live row")
+
+
+@pytest.mark.parametrize("y_blocks", [2, 4])
+def test_y_blocked_windows_are_bitwise_the_whole_state_loop(y_blocks):
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    st_whole, st_win = copy.deepcopy(st), copy.deepcopy(st)
+    ref = dtile.tile_loop_device(st_whole, one_tile, C, g_coarse, members,
+                                 dtile.tile_step_shapes(st))
+    one = dwin.tile_loop_windowed(copy.deepcopy(st), one_tile, C, g_coarse, members,
+                                  _shapes(cfg, st))
+    out = dwin.tile_loop_windowed(st_win, one_tile, C, g_coarse, members,
+                                  _shapes(cfg, st, y_blocks), y_blocks=y_blocks)
+
+    assert np.array_equal(st_win.w, st_whole.w), "velocity codes differ"
+    assert np.array_equal(st_win.vel_scale, st_whole.vel_scale), "per-brick scales differ"
+    for k in ("n_owned", "n_out", "vel_scale_kick_max", "tiles_run", "planes_run"):
+        assert out[k] == ref.get(k, one[k]), k
+    assert out["window_units"] == cfg.tiles_side * y_blocks
+    assert out["window_live_rows_max"] < one["window_live_rows_max"], (
+        "vacuous: a y-blocked window held as many rows as a whole-slab one")
+    assert out["residents_staged"] > 0
+
+
+def test_a_y_block_window_without_its_buffer_bricks_refuses():
+    """Drop the y pad from the runs: a tile's buffer brick is then outside the window."""
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    nb, pad, span, per = dwin.plane_geometry(st, cfg.n_tile, cfg._b_realized, cfg.n_brick)
+    block = dwin.tile_blocks(nb, per, 2)[1]
+    runs = dwin.window_runs(0, block, per, 0, span - 2 * pad, nb)
+    full = dwin.window_runs(0, block, per, pad, span, nb)
+    assert sum(b - a for _s, a, b in runs) < sum(b - a for _s, a, b in full)
+    win = dwin.stage_window(st, runs, _shapes(cfg, st)["window"])
+    from inexor.device.decode import tile_decode_plan
+
+    t = next(t for t in cfg.tiles if t[0] == 0 and t[1] * per == block[0])
+    with pytest.raises(ValueError, match="outside the window"):
+        dwin.rebase_plan(tile_decode_plan(st, np.asarray(members[t])), win, nb)
+
+
+def test_window_runs_cover_the_tile_reach_with_y_wrap():
+    nb, per, pad = 8, 2, 1
+    span = per + 2 * pad
+    assert dwin.window_runs(0, (0, nb), per, pad, span, nb) == [
+        (s, s * 64, (s + 1) * 64) for s in (7, 0, 1, 2)]
+    # block 0 reaches y = -1: two runs per slab, ascending
+    assert dwin.window_runs(1, (0, 2), per, pad, span, nb)[:2] == [
+        (1, 64 + 0, 64 + 24), (1, 64 + 56, 64 + 64)]
+    assert dwin.window_runs(1, (2, 4), per, pad, span, nb)[0] == (1, 64 + 8, 64 + 40)
 
 
 def test_a_windowed_step_is_one_program():
@@ -188,14 +237,19 @@ def test_staging_a_window_allocates_no_host_window(monkeypatch):
     cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
     shapes = _shapes(cfg, st)
     nb, pad, span, per = dwin.plane_geometry(st, cfg.n_tile, cfg._b_realized, cfg.n_brick)
+    from inexor.device.migrate import pass_arena_index
+
     slabs = dwin.window_slabs(0, per, pad, span, nb)
     W, A = shapes["window"]["rows"], shapes["window"]["arena"]
     window_bytes = (W + A) * (st.off.itemsize * 3 + st.w.itemsize * 3)
-    peak, win = _traced_peak(lambda: dwin.stage_window(st, slabs, shapes["window"]))
+    index = pass_arena_index(st)  # once per tile loop, as `tile_loop_windowed` builds it
+    peak, win = _traced_peak(lambda: dwin.stage_window(st, slabs, shapes["window"],
+                                                       index=index))
     assert win["copied_slabs"] == 0 and win["n_res"] > 0
     assert peak < 0.25 * window_bytes, f"staging held {peak} B against a {window_bytes} B window"
     monkeypatch.setattr(dwin, "_slab_fits", lambda *a: False)
-    ctl, win_c = _traced_peak(lambda: dwin.stage_window(st, slabs, shapes["window"]))
+    ctl, win_c = _traced_peak(lambda: dwin.stage_window(st, slabs, shapes["window"],
+                                                        index=index))
     assert win_c["copied_slabs"] == len(slabs)
     assert ctl >= 0.25 * window_bytes, f"CONTROL cannot fail: copied staging held {ctl} B"
 
@@ -216,7 +270,8 @@ def test_the_write_back_downloads_a_slab_at_a_time():
     # reference: a whole-window download
     dwin_rows = np.asarray(w_dev)
     for s in range(0, per):
-        (lo, hi), r = win["ranges"][s], int(win["slab_win"][s])
+        k = int(dwin._run_of(win, [s * nb * nb])[0])
+        (lo, hi), r = win["run_rows"][k], int(win["run_win"][k])
         st_b.w[lo:hi] = dwin_rows[r:r + hi - lo]
     b = win["res_bricks"]
     k = np.flatnonzero((b >= 0) & (b < per * nb * nb))
@@ -227,7 +282,7 @@ def test_the_write_back_downloads_a_slab_at_a_time():
     # aliases the device buffer and allocates ~nothing). Per plane: one core slab's ladder of
     # `w`, then the core residents' ladder of `w` and its int64 index; 1.5x covers the
     # reading's own copies.
-    slab = max(dwin._ladder(win["ranges"][s][1] - win["ranges"][s][0]) for s in range(per))
+    slab = max(dwin._ladder(hi - lo) for lo, hi in win["run_rows"])
     res = dwin._ladder(len(k))
     expected = slab * st.w.itemsize * 3 + res * (st.w.itemsize * 3 + 8)
     assert 1.5 * expected < 0.5 * whole, "VACUOUS: a slab is most of this window"

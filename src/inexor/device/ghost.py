@@ -136,64 +136,101 @@ class SlabView:
             raise IndexError(f"{what} is outside the owned slabs and there are no ghosts")
         return self.ghosts
 
-    # ---- per slab
-    def slab_range(self, s):
-        """Row ids [lo, hi) of slab `s`'s slot range."""
+    # ---- per brick range of one slab (a run: `(s, lo_b, hi_b)`, global brick ordinals)
+    def range_rows(self, s, lo_b, hi_b):
+        """Row ids [lo, hi) of bricks [lo_b, hi_b) of slab `s`."""
         s = int(s)
         if self.owns(s):
-            nb2 = self.bricks_per_side ** 2
             st = self.state
-            return int(st.brick_start[s * nb2]), int(st.brick_start[(s + 1) * nb2])
+            return int(st.brick_start[int(lo_b)]), int(st.brick_start[int(hi_b)])
         d = self._ghost(f"slab {s}")._slab.get(s)
         if d is None:
             raise IndexError(f"slab {s} is neither owned nor a ghost")
-        return d["lo"], d["lo"] + d["span"]
+        nb2 = self.bricks_per_side ** 2
+        i, j = int(lo_b) - s * nb2, int(hi_b) - s * nb2
+        end = d["lo"] + d["span"]
+        return (int(d["starts"][i]) if i < nb2 else end), (int(d["starts"][j]) if j < nb2 else end)
 
-    def slab_chunk(self, name, s, L):
-        """`L` rows of `off` or `w` from slab `s`'s first slot: a view where the backing
-        array holds them, else the slab's rows zero-padded. Ghost `w` is zeros."""
+    def range_chunk(self, name, s, lo_b, hi_b, L):
+        """`L` rows of `off` or `w` from the first slot of bricks [lo_b, hi_b) of slab `s`: a
+        view where the backing array holds them, else the range's rows zero-padded. Ghost
+        `w` is zeros."""
         from . import window
 
-        lo, hi = self.slab_range(s)
+        lo, hi = self.range_rows(s, lo_b, hi_b)
         if self.owns(s):
             src, at = getattr(self.state, name), lo
         elif name == "w":
             return np.zeros((L, 3), dtype=self.state.w.dtype)
         else:
-            src, at = self.ghosts._slab[int(s)]["off"], 0
+            d = self.ghosts._slab[int(s)]
+            src, at = d["off"], lo - d["lo"]
         if window._slab_fits(src.shape[0], at, L):
             return src[at:at + L]
         out = np.zeros((L,) + src.shape[1:], dtype=src.dtype)
         out[:hi - lo] = src[at:at + hi - lo]
         return out
 
-    def residents(self, slabs):
+    def range_fits(self, s, lo_b, hi_b, L):
+        """True when `range_chunk` returns a view of the owned state (no copy)."""
+        from . import window
+
+        return self.owns(s) and window._slab_fits(int(self.state.off.shape[0]),
+                                                  self.range_rows(s, lo_b, hi_b)[0], L)
+
+    def residents(self, slabs, index=None):
         """Arena residents of the bricks in `slabs`: (ids ascending, bricks, buckets)."""
+        nb2 = self.bricks_per_side ** 2
+        return self.residents_of_runs([(s, int(s) * nb2, (int(s) + 1) * nb2) for s in slabs],
+                                      index=index)
+
+    def residents_of_runs(self, runs, index=None):
+        """Arena residents of the bricks in `runs` (`(s, lo_b, hi_b)`, disjoint): (ids
+        ascending, bricks, buckets). `index` is the state's `migrate.pass_arena_index`
+        (computed here if None); pass it when calling per window, as the arena is fixed
+        for the tile loop."""
+        from .migrate import pass_arena_index
+
         st = self.state
-        nb2, p3 = self.bricks_per_side ** 2, self.buckets_per_brick
-        own = [int(s) for s in slabs if self.owns(s)]
+        nb2 = self.bricks_per_side ** 2
+        runs = [(int(s), int(a), int(b)) for s, a, b in runs]
+        own = [r for r in runs if self.owns(r[0])]
         ids, bricks, buckets = [], [], []
         if own and st.n_arena:
-            ab = np.asarray(st.arena_bucket, dtype=np.int64)
-            rows = np.flatnonzero(ab >= 0)
-            b = ab[rows] // p3
-            in_win = np.zeros(self.bricks_per_side, dtype=bool)
-            in_win[own] = True
-            keep = in_win[b // nb2]
-            rows, b = rows[keep], b[keep]
-            ids.append(int(st.arena_base) + rows)
-            bricks.append(b)
-            buckets.append(ab[rows])
-        for s in sorted(int(x) for x in slabs if not self.owns(x)):
+            slots, by_brick = pass_arena_index(st) if index is None else index
+            parts = [np.arange(*np.searchsorted(by_brick, [lo_b, hi_b])) for _s, lo_b, hi_b in own]
+            k = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+            k = k[np.argsort(slots[k], kind="stable")]
+            ids.append(slots[k])
+            bricks.append(by_brick[k])
+            buckets.append(np.asarray(st.arena_bucket, dtype=np.int64)[
+                slots[k] - int(st.arena_base)])
+        for s, lo_b, hi_b in sorted(r for r in runs if not self.owns(r[0])):
             d = self._ghost(f"slab {s}")._slab[s]
-            n = int(d["res_count"].sum())
-            ids.append(d["res_lo"] + np.arange(n, dtype=np.int64))
-            bricks.append(s * nb2 + np.repeat(np.arange(nb2, dtype=np.int64), d["res_count"]))
-            buckets.append(np.asarray(d["res_bucket"], dtype=np.int64))
+            i, j = lo_b - s * nb2, hi_b - s * nb2
+            f0, f1 = int(d["res_first"][i]), int(d["res_first"][j])
+            ids.append(d["res_lo"] + np.arange(f0, f1, dtype=np.int64))
+            bricks.append(lo_b + np.repeat(np.arange(j - i, dtype=np.int64),
+                                           d["res_count"][i:j]))
+            buckets.append(np.asarray(d["res_bucket"][f0:f1], dtype=np.int64))
         if not ids:
             e = np.zeros(0, dtype=np.int64)
             return e, e, e
         return np.concatenate(ids), np.concatenate(bricks), np.concatenate(buckets)
+
+    def brick_resident_counts(self):
+        """Arena residents per brick over owned and ghost slabs (0 elsewhere), int64."""
+        st = self.state
+        out = np.zeros(self.n_bricks, dtype=np.int64)
+        if st.n_arena:
+            ab = np.asarray(st.arena_bucket, dtype=np.int64)
+            b = ab[ab >= 0] // self.buckets_per_brick
+            out += np.bincount(b, minlength=self.n_bricks)
+        if self.ghosts is not None:
+            nb2 = self.bricks_per_side ** 2
+            for s in self.ghosts.slabs():
+                out[s * nb2:(s + 1) * nb2] = self.ghosts._slab[s]["res_count"]
+        return out
 
     def resident_rows(self, name, ids, out):
         """Rows of `off` or `w` for resident ids, written into `out` (ghost `w` is zeros).
@@ -205,10 +242,6 @@ class SlabView:
         if k < len(ids):
             out[k:len(ids)] = self.ghosts.resident_off(ids[k:]) if name == "off" else 0
         return out
-
-    def slab_residents(self, s):
-        """How many arena residents slab `s`'s bricks hold."""
-        return len(self.residents([s])[0])
 
     # ---- per brick
     def brick_occ(self, bricks):
