@@ -131,6 +131,7 @@ Key flags for `preflight` and `run`:
 |---|---|---|
 | `--preset`, `--workdir`, `--card` | required | preset, IC directory (read only), card JSON path |
 | `--cards` | 4 | GPUs to use |
+| `--y-blocks` | 1 | cut each x-slab's card work into this many y-blocks (see below); preflight prices it |
 | `--slack`, `--alloc-margin`, `--arena-frac` | 0.10, 0.10, 0.01 | allocation layout |
 | `--growth2` | `lcdm` | must match the ICs |
 | `--membind-nodes` | none | refuse unless the process runs under `numactl --membind` on these NUMA nodes |
@@ -144,6 +145,14 @@ Key flags for `preflight` and `run`:
 | `--beat` (run) | 60 | heartbeat seconds |
 | `--comm` (run) | `serial` | `mpi`: one rank per process across nodes (see below) |
 | `--comm-timeout` (run) | 1800 | seconds a rank may wait at one exchange before it aborts the job |
+
+**Y-blocks.** Every card working set that would otherwise hold a whole brick x-slab (the tile
+window, the destination census, the device migrate and the fused repack) works on (x-slab,
+y-block) units with `--y-blocks N`: a y-block is a run of whole tile rows, and a tile window
+holds its block plus the buffer bricks either side. The bytes are the same at any count, so a
+checkpoint resumes at another one. Raise it when the planner's per-GPU verdict does not fit:
+`python -m inexor.plan ... --backend device --y-blocks N` prices a count and names the
+smallest that fits. More units mean more, smaller kernel launches per step.
 
 `run` also refuses to write a card or checkpoint anywhere under the IC directory. The GPU
 driver always starts at a = 0.1 (it has no `--a-init`), and it checks the ICs' `growth2` but

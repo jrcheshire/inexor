@@ -262,3 +262,8 @@ Notes on the run card:
   `run_peak`, ...), and `peak_rss_bytes` is then `run_peak`.
 - `a_steps` is the full scale-factor grid (`k_steps + 1` points).
 - `per_step_stats` is the list of per-step stats dicts returned by `engine.run`.
+- In a step's stats on the device lane, `y_blocks` is the y-block count it ran at;
+  `census_units` counts the units the destination census ran (with `census_slabs` the slabs);
+  each `tile_cards` entry's `window_units` counts the windows staged; and
+  `migrate_device` carries `y_blocks` and `units`, with `window_direct_slabs` /
+  `window_copied_slabs` counting units.

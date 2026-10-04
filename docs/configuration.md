@@ -199,6 +199,7 @@ These move phases to accelerators (`src/inexor/device/`). Each device backend re
 | `device_tile_window` | `None` | run the compiled device tile loop on an x-slab window; `None` auto |
 | `migrate_repack_fused` | `None` | fuse device migrate and repack on repack steps; `None` auto |
 | `device_paint_chunk_bricks` | `None` | bricks per device coarse-paint chunk; `None` a quarter x-slab |
+| `device_y_blocks` | 1 | y-blocks each x-slab's card work is cut into (tile window, destination census, device migrate, fused repack); whole tile rows, at most the tile rows per side; bitwise any count, not in the checkpoint fingerprint |
 
 ### Comparison and reference fields
 
