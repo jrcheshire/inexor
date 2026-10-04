@@ -150,6 +150,19 @@ KERNEL_ON_CARDS = {
 }
 
 
+# Per-GPU terms live through some phases only; every other resident term is live for the whole
+# run. MEASURED on the cards: memory in use between phases is the coarse kernel parts, plus the
+# coarse force from the solve through the migrate (c-1024 on 4 GB200: 0.13 / 0.55 GB a card,
+# job 1048248), and the allocator reuses a phase's memory in the next.
+AFTER_LOOP = "after_loop"
+DEVICE_HELD = {
+    "coarse_force_resident": ("coarse_solve", "tile_loop", AFTER_LOOP),
+    "tile_kernels": ("tile_loop",),
+    "slab_window": ("tile_loop",),
+}
+CARD0_TILE_KERNELS = "tile_kernels, card 0's default-device copy (MEASURED)"
+
+
 def device_placement(kernel="cards"):
     """`DEVICE_PLACEMENT` for the coarse kernel on the `"cards"` or the `"host"`."""
     if kernel not in ("cards", "host"):
@@ -172,12 +185,6 @@ def shard_halo_planes():
     return {"coarse_accumulator": ACC_GHOST_LO + ACC_GHOST_HI,
             "coarse_force_resident": 2 * COARSE_HALO}
 
-# Streaming pinned host memory in 2 GiB chunks holds a device high-water of exactly two
-# chunks, independent of the total streamed; the per-chunk `block_until_ready` is what bounds
-# it (without it XLA keeps every staged copy alive).
-STREAM_CHUNK_BYTES = 2.0 * 2**30
-STREAM_CHUNKS_IN_FLIGHT = 2
-
 # One coarse-paint chunk on a card (`device.paint`): measured device peak bytes per padded
 # row, `off` window upload included. Jitted (default): 62-72 B, charged at the largest.
 PAINT_CHUNK_B_PER_ROW = 72
@@ -197,16 +204,32 @@ PAINT_PAD_BOUND = 1.26
 MIGRATE_DEVICE_B_PER_SLAB_ROW = 320
 # `device` repack, windows and program included (measured at a production-shape slab).
 REPACK_DEVICE_B_PER_SLAB_ROW = 70
-# `device.fused.migrate_repack_device` (measured at 1024^3, not production shape).
-FUSED_DEVICE_B_PER_SLAB_ROW = 257
-# Of that, the staged eject outputs of the slabs held while one is inserted, per held slab row:
-# dest int64 + off 3 x uint8 + w 3 x int16 + ids int32 + src int64 (from the code). PROVISIONAL
-# split of the measured 257: with y-blocks the rest scales with the unit and this does not.
-FUSED_HELD_B_PER_ROW = 29
-# Slabs held at an insert: the lookahead (reach r) and, on several cards, the top boundary
-# slab(s) ejected first (another r).
-def fused_held_slabs(reach=1, cards=1):
-    return int(reach) * (2 if int(cards) > 1 else 1)
+# `device.fused.migrate_repack_device`: device peak bytes per slab row (particles per x-slab)
+# by unit fraction (a y-block's share of the slab), keyed 1/y. MEASURED as the first drift's
+# card peak above the bytes in use before it, smallest card and run taken: y 1 at c-hero on
+# 4 GB200 (1024783; c-gh on gh 1045958, c-1024 on 1 gh 1043437 and cgh64 / c-1024 on 4 GB200
+# 1048248 read 211.8-224.9); y 2 and 4 at cgh64 and y 8 at c-1024, on 4 GB200 (1048248; the
+# other preset reads within 2%). The same at 1 and 4 cards and from 512^3 to 4096^3. Rounded
+# down, so each stays under its measurement.
+FUSED_DEVICE_B_PER_SLAB_ROW_BY_UNIT = {1.0: 206.8, 0.5: 166.2, 0.25: 129.7, 0.125: 102.3}
+
+
+def fused_device_rate(u):
+    """Fused-pass device bytes per slab row at unit fraction `u` (`ec.y_unit_fraction`):
+    linear in u between the measured points, and below the smallest measured fraction along
+    the last segment's slope. Returns `(rate, how)`, `how` "measured", "interpolated" or
+    "extrapolated"."""
+    pts = sorted(FUSED_DEVICE_B_PER_SLAB_ROW_BY_UNIT.items())
+    u = float(u)
+    if not 0.0 < u <= 1.0:
+        raise ValueError(f"unit fraction must be in (0, 1], got {u}")
+    for k, v in pts:
+        if u == k:
+            return v, "measured"
+    seg = next(((a, b) for a, b in zip(pts, pts[1:]) if a[0] < u < b[0]), pts[:2])
+    (u0, v0), (u1, v1) = seg
+    how = "interpolated" if u0 < u < u1 else "extrapolated"
+    return v0 + (v1 - v0) * (u - u0) / (u1 - u0), how
 
 # Host bytes per card at the tile-capacity rung a production run climbs (`capacity_shape`),
 # keyed by tile size; other tile sizes take the largest. Every measured 120-step run climbed
@@ -350,22 +373,30 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
     return host, card, disk
 
 
+def device_held_phases(term):
+    """The phases a held per-GPU term is live in (`DEVICE_HELD`), or None when it is live for
+    the whole run."""
+    return next((v for k, v in DEVICE_HELD.items() if term == k or term.startswith(k + " ")),
+                None)
+
+
 def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=True,
-                  kernel="cards", reach=1):
-    """Per-GPU bytes for the host-state / device-step design.
+                  kernel="cards"):
+    """Per-GPU bytes for the host-state / device-step design, for the busiest card.
 
-    Returns `(resident, transient, phases, worst_phase, slabs, host_mesh, after_loop)`, summed
-    within a phase and maxed across as in the CPU column (XLA does not return buffers between
-    phases). `host_mesh` holds "host"-placed terms for the host table; `after_loop` the
-    post-tile-loop migrate/repack peaks, which do not coexist with the in-step phases.
-    `paint_chunk_bricks` None = `device.paint.default_chunk_bricks`. `fused` prices the fused
-    migrate + repack, whose census runs one slab's eject inside the tile loop. `kernel`: where
-    the coarse kernel parts live (`device_placement`). Slab-sized terms follow
-    `ec.device_y_blocks`: the window holds a y-block plus its buffer bricks, the census and
-    the fused pass's work one unit (`reach` and the card count size its held slabs).
+    Returns `(resident, transient, phases, worst_phase, slabs, host_mesh, after_loop)`.
+    `resident` and `transient` are the term inventories. `phases` maps each phase, and
+    `AFTER_LOOP`, to its live set beyond the whole-run terms: its transients plus the
+    `DEVICE_HELD` terms live in it. The card's allocator returns memory between phases
+    (memory in use falls back to the whole-run terms, measured), so `worst_phase` is the
+    largest in-step or once-per-run phase, not their sum. `after_loop` holds the
+    migrate/repack pass terms (they do not coexist: max). `host_mesh` holds "host"-placed
+    terms for the host table. `paint_chunk_bricks` None = `device.paint.default_chunk_bricks`.
+    `fused` prices the fused migrate + repack, whose census runs one unit's eject inside the
+    tile loop. `kernel`: where the coarse kernel parts live (`device_placement`). Slab-sized
+    terms follow `ec.device_y_blocks`: the window holds a y-block plus its buffer bricks, the
+    census and the fused pass's work one unit.
     """
-    from .engine import ONCE_PER_RUN_PHASES
-
     placement = device_placement(kernel)
 
     mesh = ec.mesh_bytes()
@@ -402,15 +433,19 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
             if one != "resident":
                 phases[one] = phases.get(one, 0) + b
 
-    # Terms with no CPU counterpart: the streamed state window and chunks in flight.
+    # Card 0 also holds the tile kernels `forces.make_tile_force_fn` builds on jax's default
+    # device, for the whole run (in use on card 0 only, between phases: 0.79 GB at tile 256,
+    # 4.60 at 512, = `tile_kernels`; jobs 1048248, 1045958, 1024783).
+    if "tile_kernels" in resident:
+        resident[CARD0_TILE_KERNELS] = resident["tile_kernels"]
+
+    # The state window a tile plane's y-block needs: no CPU counterpart.
     slabs = device_window_slabs(ec)
     nb = max(1, ec.n_fine // ec.n_brick)
     n_y = int(ec.device_y_blocks)
     win_key = ("slab_window (state rows a tile plane needs)" if n_y == 1 else
                f"slab_window (state rows a tile plane's y-block needs, {n_y} y-blocks)")
     resident[win_key] = int(slabs * (n / nb) * ec.y_window_fraction * row_bytes)
-    resident["stream_chunks_in_flight"] = int(
-        STREAM_CHUNKS_IN_FLIGHT * STREAM_CHUNK_BYTES)
 
     # The device coarse paint's working set (replaces the "gone" host decode).
     from .device.paint import default_chunk_bricks
@@ -434,23 +469,13 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
                   "census_eject (fused pass, one padded unit)"] = census_b
         phases["tile_loop"] = phases.get("tile_loop", 0) + census_b
 
-    in_step = sum(v for k, v in phases.items() if k not in ONCE_PER_RUN_PHASES)
-    once = max((v for k, v in phases.items() if k in ONCE_PER_RUN_PHASES),
-               default=0)
-    # Migrate and repack run after the in-step transients are released, so they are priced
-    # against `resident` alone, not summed into the phases; they do not coexist (max).
-    if fused and n_y == 1:
+    # Migrate and repack run after the tile loop; they do not coexist (max).
+    if fused:
+        rate, how = fused_device_rate(ec.y_unit_fraction)
+        unit = "whole slabs" if n_y == 1 else f"{n_y} y-blocks"
         after_loop = {
-            "migrate_repack_fused_pass (257 B/slab row, measured at 1024^3)": int(
-                FUSED_DEVICE_B_PER_SLAB_ROW * slab_rows),
-        }
-    elif fused:
-        held = fused_held_slabs(reach, n_gpus) * FUSED_HELD_B_PER_ROW
-        after_loop = {
-            f"migrate_repack_fused_pass ({FUSED_DEVICE_B_PER_SLAB_ROW - held} B/unit row + "
-            f"{held} B/slab row held, PROVISIONAL)": int(
-                (FUSED_DEVICE_B_PER_SLAB_ROW - held) * slab_rows * ec.y_unit_fraction
-                + held * slab_rows),
+            f"migrate_repack_fused_pass ({rate:.1f} B/slab row at {unit}, MEASURED"
+            f"{'' if how == 'measured' else ', ' + how})": int(rate * slab_rows),
         }
     else:
         after_loop = {
@@ -459,7 +484,19 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
             "repack_device_pass (70 B/slab row)": int(
                 REPACK_DEVICE_B_PER_SLAB_ROW * slab_rows),
         }
-    return resident, transient, phases, max(in_step, once), slabs, host_mesh, after_loop
+    phases[AFTER_LOOP] = max(after_loop.values())
+    for k, v in resident.items():
+        for p in device_held_phases(k) or ():
+            phases[p] = phases.get(p, 0) + v
+    worst = max(v for k, v in phases.items() if k != AFTER_LOOP)
+    return resident, transient, phases, worst, slabs, host_mesh, after_loop
+
+
+def device_peaks(resident, phases, worst_phase):
+    """`(in_step, after_loop)` per-GPU peaks from `device_budget`'s outputs: the whole-run
+    terms plus the worst phase, and plus the after-the-loop live set."""
+    whole_run = sum(v for k, v in resident.items() if device_held_phases(k) is None)
+    return whole_run + worst_phase, whole_run + phases[AFTER_LOOP]
 
 
 def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
@@ -607,7 +644,7 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     kernel = getattr(args, "coarse_kernel", "cards")
     resident, transient, phases, worst_phase, slabs, host_mesh, after_loop = device_budget(
         ec_dev, n=n, n_gpus=n_gpus * n_nodes, paint_chunk_bricks=args.paint_chunk_bricks,
-        fused=not getattr(args, "separate_passes", False), kernel=kernel, reach=args.reach)
+        fused=not getattr(args, "separate_passes", False), kernel=kernel)
     per_block = [k for k, w in device_placement(kernel).items() if w == "host_block"]
 
     step = ec_dev.step_bytes(n, n_rows=rows, cap=args.cap)
@@ -663,19 +700,22 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
           "migrate\n  and repack build per slab (from the code); MEASURED lines are the "
           "host side of\n  card transfers, which the CPU backend does not allocate.")
 
-    _table(f"PER GPU (of {n_gpus}), resident through the tile loop", resident)
+    whole_run = {k: v for k, v in resident.items() if device_held_phases(k) is None}
+    held = {f"{k} [{', '.join(device_held_phases(k))}]": v for k, v in resident.items()
+            if device_held_phases(k) is not None}
+    _table(f"PER GPU (of {n_gpus}), resident for the whole run (busiest card)", whole_run)
+    _table(f"PER GPU (of {n_gpus}), held through the phases in brackets", held)
     if transient:
         _table(f"PER GPU (of {n_gpus}), transient (peak while that phase runs)",
                transient)
-    _table(f"PER GPU (of {n_gpus}), BY PHASE", phases,
-           total_label="sum of ALL phases listed")
-    _table(f"PER GPU (of {n_gpus}), AFTER THE TILE LOOP (migrate, then repack; "
-           "not co-resident with the phases above)", after_loop,
+    _table(f"PER GPU (of {n_gpus}), AFTER THE TILE LOOP (migrate, then repack)", after_loop,
            total_label="max (the two do not coexist)", reduce=max)
-    print(f"  the verdict below charges {_fmt(worst_phase).strip()}, which is "
-          "max(the in-step\n  phases summed, the largest once-per-run phase) -- "
-          "`kernel_build` runs before\n  the loop and is never co-resident with "
-          "it, so adding it would overcharge.")
+    _table(f"PER GPU (of {n_gpus}), BY PHASE (transients + held terms live in it)", phases,
+           total_label="max (phases do not coexist on a card)", reduce=max)
+    print(f"  the in-step verdict charges {_fmt(worst_phase).strip()}, the largest phase but "
+          f"{AFTER_LOOP}:\n  a card's memory in use falls back to the whole-run terms "
+          "between phases (measured),\n  so phases are maxed here, where the host column "
+          "sums them.")
     print(f"  the slab window is {slabs} x-slabs, DERIVED from "
           f"`layout.brick_span`:\n  a tile draws from that many bricks per side, "
           "so walking tiles in x-order\n  needs that many consecutive slabs live. "
@@ -701,7 +741,7 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
 
     print("\nBINDING TERMS")
     host_peak = sum(host_res.values()) + host_phase_sums[worst_host]
-    dev_peak = sum(resident.values()) + worst_phase
+    dev_peak, after_peak = device_peaks(resident, phases, worst_phase)
     print(f"  host, a lower bound on the run's peak: {_fmt(host_peak)}")
     print(f"  the LOAD stage peaks at:               {_fmt(load_peak)}"
           f"   {'<- BINDING' if load_peak > host_peak else ''}")
@@ -715,7 +755,6 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
               f"{'FITS' if rl < 1.0 else 'DOES NOT FIT'} ({rl:.2f}x)")
     else:
         print("  no --host-gb given, so no host verdict (a Vista gb node is 1026)")
-    after_peak = sum(resident.values()) + max(after_loop.values())
     print(f"  per GPU, resident + after-the-loop:    {_fmt(after_peak)}")
     if args.device_gb is not None:
         r = dev_peak / (args.device_gb * GB)
@@ -749,11 +788,10 @@ def _smallest_fitting_y_blocks(args, n, n_gpus_total, kernel):
         a = argparse.Namespace(**vars(args))
         a.workers, a.y_blocks = 1, n_y
         ec, _ = build(a)
-        resident, _t, _p, worst, _s, _h, after = device_budget(
+        resident, _t, phases, worst, _s, _h, _a = device_budget(
             ec, n=n, n_gpus=n_gpus_total, paint_chunk_bricks=args.paint_chunk_bricks,
-            fused=not getattr(args, "separate_passes", False), kernel=kernel, reach=args.reach)
-        res = sum(resident.values())
-        if max(res + worst, res + max(after.values())) < args.device_gb * GB:
+            fused=not getattr(args, "separate_passes", False), kernel=kernel)
+        if max(device_peaks(resident, phases, worst)) < args.device_gb * GB:
             return n_y
     return None
 

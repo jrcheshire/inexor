@@ -646,9 +646,9 @@ def test_the_fused_pass_charges_its_census_in_the_tile_loop_and_one_pass_after()
     from inexor.device.migrate import EJECT_B_PER_PADDED_ROW
     from inexor.eject_jax import _padded
     from inexor.plan import (
-        FUSED_DEVICE_B_PER_SLAB_ROW,
         MIGRATE_DEVICE_B_PER_SLAB_ROW,
         device_budget,
+        fused_device_rate,
     )
 
     ec = _ec("c-hero")
@@ -660,7 +660,7 @@ def test_the_fused_pass_charges_its_census_in_the_tile_loop_and_one_pass_after()
     assert t_f["census_eject (fused pass, one padded slab)"] == census
     assert p_f["tile_loop"] - p_s["tile_loop"] == census
     assert not any("census" in k for k in t_s)
-    assert list(a_f.values()) == [int(FUSED_DEVICE_B_PER_SLAB_ROW * slab_rows)]
+    assert list(a_f.values()) == [int(fused_device_rate(1.0)[0] * slab_rows)]
     assert max(a_s.values()) == int(MIGRATE_DEVICE_B_PER_SLAB_ROW * slab_rows)
 
 
@@ -823,7 +823,7 @@ def test_the_host_kernel_arrays_are_charged_to_the_host_not_the_cards(capsys):
     main(["--preset", "c-hero", "--backend", "device", "--coarse-kernel", "host"])
     out = capsys.readouterr().out
     res_block = out.split("HOST, resident for the whole run")[1].split("\n\n")[0]
-    card_block = out.split("PER GPU (of 4), resident through the tile loop")[1].split("\n\n")[0]
+    card_block = out.split("PER GPU (of 4), resident for the whole run")[1].split("\n\n")[0]
     for k in ("coarse_kernel_pref", "coarse_match_factor"):
         assert k in res_block and k not in card_block, k
 
@@ -839,7 +839,7 @@ def test_card_kernel_arrays_move_a_quarter_each_onto_the_cards(capsys):
     assert abs((host_res - card_res) - 2 * half / 1e9) < 0.01, (host_res, card_res)
     main(["--preset", "c-hero", "--backend", "device"])
     out = capsys.readouterr().out
-    card_block = out.split("PER GPU (of 4), resident through the tile loop")[1].split("\n\n")[0]
+    card_block = out.split("PER GPU (of 4), resident for the whole run")[1].split("\n\n")[0]
     for k in ("coarse_kernel_pref", "coarse_match_factor"):
         ln = next(x for x in card_block.splitlines() if x.strip().startswith(k))
         assert abs(float(ln.split()[-2]) - half / 4 / 1e9) < 1e-3, ln
@@ -920,12 +920,7 @@ def test_y_blocks_cut_the_slab_sized_card_terms_by_the_unit_and_its_window():
     from inexor.device.migrate import EJECT_B_PER_PADDED_ROW
     from inexor.eject_jax import _padded
     from inexor.layout import brick_span
-    from inexor.plan import (
-        FUSED_DEVICE_B_PER_SLAB_ROW,
-        FUSED_HELD_B_PER_ROW,
-        device_budget,
-        engine_config,
-    )
+    from inexor.plan import device_budget, engine_config, fused_device_rate
 
     one = _ec("c-hero")
     nb = one.n_fine // one.n_brick
@@ -940,11 +935,9 @@ def test_y_blocks_cut_the_slab_sized_card_terms_by_the_unit_and_its_window():
         assert win == int(span * slab_rows * (block + 2 * pad) / nb * 9)
         assert t["census_eject (fused pass, one padded unit)"] == int(
             EJECT_B_PER_PADDED_ROW * _padded(int(slab_rows * block / nb)))
-        held = 2 * FUSED_HELD_B_PER_ROW  # reach 1, several cards
-        assert list(a.values()) == [int((FUSED_DEVICE_B_PER_SLAB_ROW - held) * slab_rows
-                                        * block / nb + held * slab_rows)]
+        assert list(a.values()) == [int(fused_device_rate(block / nb)[0] * slab_rows)]
         assert max(a.values()) < max(a1.values()) and win < max(r1.values())
-    assert list(a1.values()) == [int(FUSED_DEVICE_B_PER_SLAB_ROW * slab_rows)]
+    assert list(a1.values()) == [int(fused_device_rate(1.0)[0] * slab_rows)]
 
 
 def test_the_planner_names_the_smallest_fitting_y_block_count_at_8192(capsys):
@@ -977,3 +970,120 @@ def test_the_host_window_write_back_is_one_y_block_run(capsys):
                                       * ec.y_window_fraction))) * 6 / 1e9
     line = next(ln for ln in out.splitlines() if "tile_window write-back" in ln)
     assert "y-block run" in line and abs(float(line.split()[-2]) - want) < 1e-3
+
+
+# ------------------------------------------- the per-GPU column, against measured card peaks
+
+_CARD_ARGS = ["--backend", "device", "--slack", "0.10", "--alloc-margin", "0.10",
+              "--arena-frac", "0.01"]
+
+# (planner args, the busiest card's peak over the whole record in GB: jax `peak_bytes_in_use`,
+# cuda_async, rounded down). 1048248: 10 steps on one gb node; 1024783/1024784/1027664: the
+# 120-step 4096^3 run (coarse kernel on the host); 1045958: 120 steps of c-gh on 2 gh;
+# 1043437: c-1024 steps 0-20 and 100-120 on 1 gh and per rank on 2 gh.
+_CARD_RECORDS = {
+    "cgh64 y1 (1048248)": (["--preset", "cgh64", "--n-gpus", "4", "--y-blocks", "1"], 4.265),
+    "cgh64 y2 (1048248)": (["--preset", "cgh64", "--n-gpus", "4", "--y-blocks", "2"], 4.289),
+    "cgh64 y4 (1048248)": (["--preset", "cgh64", "--n-gpus", "4", "--y-blocks", "4"], 4.037),
+    "c-1024 y1 (1048248)": (["--preset", "c-1024", "--n-gpus", "4", "--y-blocks", "1"], 7.464),
+    "c-1024 y2 (1048248)": (["--preset", "c-1024", "--n-gpus", "4", "--y-blocks", "2"], 5.867),
+    "c-1024 y4 (1048248)": (["--preset", "c-1024", "--n-gpus", "4", "--y-blocks", "4"], 5.275),
+    "c-1024 y8 (1048248)": (["--preset", "c-1024", "--n-gpus", "4", "--y-blocks", "8"], 4.772),
+    "c-hero (1024783-1027664)": (["--preset", "c-hero", "--n-gpus", "4",
+                                  "--coarse-kernel", "host"], 130.431),
+    "c-gh on 2 gh (1045958)": (["--preset", "c-gh", "--n-gpus", "1", "--n-nodes", "2"], 26.339),
+    "c-1024 on 1 gh (1043437)": (["--preset", "c-1024", "--n-gpus", "1"], 10.24),
+    "c-1024 on 2 gh (1043437)": (["--preset", "c-1024", "--n-gpus", "1", "--n-nodes", "2"],
+                                 9.165),
+}
+
+
+def _card_in_step(capsys, args):
+    main(args + _CARD_ARGS)
+    out = capsys.readouterr().out
+    return float(out.split("per GPU, resident + worst phase:")[1].split("GB")[0])
+
+
+@pytest.mark.parametrize("record", sorted(_CARD_RECORDS))
+def test_the_card_column_stays_under_every_measured_card_peak_and_close_to_it(capsys, record):
+    """The busiest card's in-step charge is a lower bound on every recorded whole-run card
+    peak, and no lower than 0.80 of it (0.83-0.98 when set)."""
+    args, measured = _CARD_RECORDS[record]
+    priced = _card_in_step(capsys, args)
+    assert priced <= measured, f"{record}: priced {priced:.3f} GB over the measured {measured}"
+    assert priced >= 0.80 * measured, (
+        f"{record}: priced {priced:.3f} GB is {priced / measured:.2f} of the measured {measured}")
+
+
+# The first drift's card peak above the bytes in use before it, smallest card, in bytes.
+_FIRST_DRIFT = [
+    ("c-hero", 4, 1, 55_535_217_195),   # 1024783
+    ("c-gh", 1, 1, 14_318_757_899),     # 1045958, per rank
+    ("c-1024", 1, 1, 3_577_807_210),    # 1043437
+    ("cgh64", 4, 1, 898_344_997),       # 1048248, and below
+    ("cgh64", 4, 2, 697_444_128),
+    ("cgh64", 4, 4, 544_322_729),
+    ("c-1024", 4, 1, 3_552_588_050),
+    ("c-1024", 4, 2, 2_842_615_194),
+    ("c-1024", 4, 4, 2_184_663_233),
+    ("c-1024", 4, 8, 1_716_477_218),
+]
+
+
+@pytest.mark.parametrize("preset,cards,n_y,measured", _FIRST_DRIFT)
+def test_the_fused_pass_is_priced_under_its_measured_first_drift(preset, cards, n_y, measured):
+    from inexor.plan import device_budget, engine_config
+
+    ec = engine_config(preset, migrate_backend="device", device_y_blocks=n_y)
+    *_, after = device_budget(ec, n=ec.n_total, n_gpus=cards)
+    priced = max(after.values())
+    assert priced <= measured, f"priced {priced} B over the measured {measured}"
+
+
+def test_the_fused_rate_is_the_table_between_its_points_and_extrapolated_below():
+    from inexor.plan import FUSED_DEVICE_B_PER_SLAB_ROW_BY_UNIT as TAB
+    from inexor.plan import fused_device_rate
+
+    for u, v in TAB.items():
+        assert fused_device_rate(u) == (v, "measured")
+    rate, how = fused_device_rate(0.375)
+    assert how == "interpolated" and rate == pytest.approx((TAB[0.25] + TAB[0.5]) / 2)
+    rate, how = fused_device_rate(1 / 16)
+    slope = (TAB[0.25] - TAB[0.125]) / 0.125
+    assert how == "extrapolated" and rate == pytest.approx(TAB[0.125] - slope / 16)
+    us = np.linspace(1 / 32, 1.0, 64)
+    rates = [fused_device_rate(u)[0] for u in us]
+    assert all(r > 0 for r in rates) and np.all(np.diff(rates) > 0)
+    with pytest.raises(ValueError):
+        fused_device_rate(0.0)
+
+
+def test_card_phases_are_maxed_not_summed():
+    """On a card the worst phase is the largest phase: at c-gh the sum of the in-step phases
+    is more than 10 GB above it."""
+    from inexor.plan import AFTER_LOOP, device_budget, engine_config
+
+    ec = engine_config("c-gh", migrate_backend="device")
+    _r, _t, phases, worst, *_ = device_budget(ec, n=ec.n_total, n_gpus=2)
+    in_step = {k: v for k, v in phases.items() if k != AFTER_LOOP}
+    assert worst == max(in_step.values())
+    assert sum(in_step.values()) - worst > 10e9, "VACUOUS: the phases are too small to tell"
+
+
+@pytest.mark.parametrize("preset,gb", [("c-1024", 0.791), ("c-hero", 4.602)])
+def test_card_0_is_charged_its_default_device_copy_of_the_tile_kernels(preset, gb):
+    """In use on card 0 only, between phases: 0.79 GB at tile 256 (1048248, 1045958), 4.60
+    at tile 512 (1024783), each = `tile_kernels`. Charged once, for the whole run."""
+    from inexor.plan import (
+        CARD0_TILE_KERNELS,
+        device_budget,
+        device_held_phases,
+        engine_config,
+    )
+
+    ec = engine_config(preset, migrate_backend="device")
+    resident, *_ = device_budget(ec, n=ec.n_total, n_gpus=4)
+    assert resident[CARD0_TILE_KERNELS] == resident["tile_kernels"]
+    assert resident[CARD0_TILE_KERNELS] / 1e9 == pytest.approx(gb, abs=1e-3)
+    assert device_held_phases(CARD0_TILE_KERNELS) is None
+    assert device_held_phases("tile_kernels") == ("tile_loop",)

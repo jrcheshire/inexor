@@ -268,8 +268,12 @@ pixi run --frozen python -m inexor.plan --n-part 2048 --box 1024 --n-fine 4096 \
 Reading the verdict: each budget line reads `FITS` or `DOES NOT FIT` with the ratio of the
 estimate to the budget. The host estimate is state + resident mesh + the worst phase + worker
 startup; the load stage is reported beside it and marked `<- BINDING` when it is larger.
-Within a step, phases are summed rather than maxed, because freed allocator arenas are not
-returned between phases. The shared-memory table is a separate budget from host RAM.
+Within a step, host phases are summed rather than maxed, because freed allocator arenas are not
+returned between phases. The per-GPU column (`--backend device`) takes the largest phase
+instead: a card's memory in use falls back to the whole-run terms between phases, so each
+phase is charged its own transients plus the terms held through it (the coarse force, and in
+the tile loop the slab window and tile kernels), and the migrate after the loop likewise. The
+shared-memory table is a separate budget from host RAM.
 
 The planner is arithmetic over the config, not a measurement: it is a lower bound. It cannot
 see XLA's intra-jit scratch, and `tile_buffers` is omitted unless `--cap` is given. Budgets
