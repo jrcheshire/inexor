@@ -286,13 +286,14 @@ def _row_bytes(key, dtype):
     return 4 if key == "ids" else 3 * np.dtype(dtype).itemsize
 
 
-def _host_chunks(st, chunk_bricks):
-    """(slots, x, v) per group of `chunk_bricks` of the state's own bricks, host decode."""
+def _host_chunks(st, chunk_bricks, vfac=None):
+    """(slots, x, v) per group of `chunk_bricks` of the state's own bricks, host decode;
+    `v` times `vfac` when given."""
     lo, hi = st.owned_bricks
     for b0 in range(lo, hi, chunk_bricks):
         slots, x, v = st.decode_bricks(list(range(b0, min(b0 + chunk_bricks, hi))))
         if len(slots):
-            yield slots, x, v
+            yield slots, x, (v if vfac is None else v * vfac)
 
 
 def write_particle_parts(
@@ -302,9 +303,10 @@ def write_particle_parts(
     dtype=np.float32,
     a=None,
     cosmo=None,
-    chunk_bricks=1024,
-    chunks=None,
     decode="host",
+    devices=None,
+    chunk_bricks=None,
+    chunks=None,
     expect_total=None,
     provenance=None,
     timings=None,
@@ -317,11 +319,12 @@ def write_particle_parts(
     contiguous (x-major slabs), so the parts concatenated in rank order are
     `write_particles`'s arrays byte for byte, and the header's whole-array crc32 is theirs.
 
-    `chunks` is an iterable of `(slots, x, v)` in brick order over the state's own bricks,
-    x and v f64 with v the native D-time velocity (default: host `decode_bricks` over groups
-    of `chunk_bricks`); `decode` names it in the header. `a`, `cosmo`, `dtype`, `timings` and
-    `progress` as `write_particles`. `expect_total` (e.g. the checkpoint's count) is checked
-    against the ranks' sum on rank 0.
+    `decode` is "host" (`decode_bricks` over groups of `chunk_bricks`, default 1024) or
+    "cards" (`device.export.export_chunks` on `devices`, chunks of `chunk_bricks`, default
+    the coarse paint's); the two write the same bytes. `chunks` overrides both: an iterable
+    of `(slots, x, v)` in brick order over the state's own bricks, already in output units.
+    `a`, `cosmo`, `dtype`, `timings` and `progress` as `write_particles`. `expect_total`
+    (e.g. the checkpoint's count) is checked against the ranks' sum on rank 0.
 
     Rank 0 removes the header before any part is written and writes it after every part has
     closed, so its presence marks a complete export. Returns the header on every rank.
@@ -337,8 +340,9 @@ def write_particle_parts(
 
         comm = SerialComm()
     rank = int(comm.rank)
-    chunk_bricks = int(chunk_bricks)
-    if chunk_bricks < 1:
+    if decode not in ("host", "cards"):
+        raise ValueError(f"decode must be 'host' or 'cards', got {decode!r}")
+    if chunk_bricks is not None and int(chunk_bricks) < 1:
         raise ValueError(f"chunk_bricks must be >= 1, got {chunk_bricks}")
     os.makedirs(workdir, exist_ok=True)
     hpath = os.path.join(workdir, HEADER)
@@ -387,7 +391,16 @@ def write_particle_parts(
         if timings is not None:
             timings["write thread"] = timings.get("write thread", 0.0) + dt
 
-    source = _host_chunks(st, chunk_bricks) if chunks is None else iter(chunks)
+    vf = vfac if kms else None
+    if chunks is not None:
+        source = iter(chunks)
+    elif decode == "host":
+        source = _host_chunks(st, 1024 if chunk_bricks is None else int(chunk_bricks), vf)
+    else:
+        from .device.export import export_chunks
+
+        source = export_chunks(st, devices=devices, chunk_bricks=chunk_bricks, dtype=dtype,
+                               vfac=vf, with_slots=with_ids, timings=timings)
     try:
         while True:
             t0 = clock()
@@ -395,8 +408,6 @@ def write_particle_parts(
             if item is None:
                 break
             slots, x, v = item
-            if kms:
-                v = v * vfac
             ids_block = st.ids[slots] if with_ids else None
             _add("decode", t0)
             _join()
@@ -407,6 +418,8 @@ def write_particle_parts(
         _join()
     finally:
         pool.shutdown(wait=True)
+        if hasattr(source, "close"):
+            source.close()  # a card source's threads stop with it
     if timings is not None:
         timings["chunks"] = n_chunks
     for s_ in streams.values():

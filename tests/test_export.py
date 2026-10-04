@@ -596,3 +596,51 @@ def test_a_failing_rank_leaves_no_header(tmp_path):
     with pytest.raises(Exception):
         run_loopback(2, rank, timeout=60.0)
     assert not os.path.exists(os.path.join(d, export.HEADER))
+
+
+# --- the export decoded on the cards ---
+
+
+@pytest.mark.parametrize("kms,dtype,with_ids,chunk", [
+    (True, np.float32, False, None),
+    (False, np.float32, True, 16),
+    (False, np.float64, False, 4),
+    (True, np.float64, True, 64),
+])
+def test_the_cards_decode_writes_the_host_bytes(tmp_path, kms, dtype, with_ids, chunk):
+    """Positions, velocities (D-time and km/s), ids and arena residents decoded on a card are
+    the host export byte for byte."""
+    import jax
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        st = _evolved_state(with_ids=with_ids)
+        assert st.arena_used > 0, "vacuous: no arena residents"
+        epoch = dict(a=0.5, cosmo=PLANCK) if kms else {}
+        one = str(tmp_path / "one")
+        want = export.write_particles(st, one, dtype=dtype, **epoch)
+        d = str(tmp_path / "cards")
+        timings = {}
+        head = export.write_particle_parts(st, d, dtype=dtype, decode="cards",
+                                           chunk_bricks=chunk, timings=timings, **epoch)
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+    assert head["decode"] == "cards" and timings["card s"] > 0.0
+    assert head["crc32"] == want["crc32"]
+    for key, f in want["files"].items():
+        assert _array_bytes(os.path.join(d, head["parts"][0]["files"][key])) == \
+            _array_bytes(os.path.join(one, f))
+
+
+def test_the_cards_decode_refuses_a_chunk_that_splits_the_range(tmp_path):
+    import jax
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        with pytest.raises(ValueError, match="does not tile"):
+            export.write_particle_parts(_evolved_state(), str(tmp_path / "e"),
+                                        decode="cards", chunk_bricks=3)
+    finally:
+        jax.config.update("jax_enable_x64", prev)

@@ -111,14 +111,15 @@ def slab_window(st, bricks):
     return plan_w, off, arena_bucket, span
 
 
-def slab_window_fixed(st, bricks, shapes):
+def slab_window_fixed(st, bricks, shapes, with_w=False):
     """`slab_window` at the fixed shapes of `step_shapes`, for the jitted chunk.
 
     The live slice is padded to `live_w` rows and arena residents follow at row
     `live_w`, so `arena_base` is the same for every chunk of the step. The
     arena rectangle is padded to `arena_rect` columns and the arena rows to
     `arena_n`. Padding is never read for a live row. Refuses (never truncates) a
-    chunk that exceeds the step's shapes.
+    chunk that exceeds the step's shapes. `with_w` also stages the velocity codes
+    `w` at the same rows (the export's decode).
     """
     from .decode import tile_decode_plan
 
@@ -142,10 +143,16 @@ def slab_window_fixed(st, bricks, shapes):
 
     off = np.zeros((W + A, 3), dtype=st.off.dtype)
     off[:span] = st.off[s0:s1]
+    w = None
+    if with_w:
+        w = np.zeros((W + A, 3), dtype=st.w.dtype)
+        w[:span] = st.w[s0:s1]
     arena_bucket = np.zeros(A, dtype=np.int64)
     rect = np.full((L, R), -1, dtype=np.int64)
     if n_ar:
         off[W:W + n_ar] = st.off[flat]
+        if with_w:
+            w[W:W + n_ar] = st.w[flat]
         arena_bucket[:n_ar] = st.arena_bucket[flat - int(st.arena_base)]
         sub = np.full(a.shape, -1, dtype=np.int64)
         sub[valid] = W + np.arange(n_ar, dtype=np.int64)
@@ -156,8 +163,11 @@ def slab_window_fixed(st, bricks, shapes):
         # the uint32 index view, not the plan's int64 copy; widened on the device
         occ=st._occ(b0, b0 + L).reshape(-1, p3),
         live_counts=plan["live_counts"], arena_slots=rect,
-        row_offsets=plan["row_offsets"], bricks=bricks, off=off,
+        row_offsets=plan["row_offsets"], bricks=bricks, off=off, w=w,
         arena_bucket=arena_bucket, n_rows=int(plan["n_rows"]),
+        # window row -> state slot: live rows `slot0 + r` (r < live_w), arena rows
+        # `arena_rows[r - live_w]`
+        slot0=s0, arena_rows=flat,
     )
 
 

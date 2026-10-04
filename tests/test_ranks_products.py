@@ -1,19 +1,22 @@
-"""The products across ranks: the P(k) card on the cards.
+"""The products across ranks: the P(k) card on the cards and the export decoded on them.
 
 Each loopback rank holds its brick slabs (`restrict_to_slabs`) of a `cdev8-tile32` state with
-arena residents. The card painted and transformed on the cards must be the one-rank,
-one-card card in every field, at 1-4 ranks x 1-2 cards.
+arena residents. At 1-4 ranks x 1-2 cards, the card painted and transformed on the cards must
+be the one-rank, one-card card in every field, and the export's parts in rank order must be
+the single-file host export (`write_particles`) byte for byte, with its crc32.
 """
 
 import json
+import os
 
 import numpy as np
 import pytest
 
 pytest.importorskip("jax")
 
+from inexor import export  # noqa: E402
 from inexor.comm import run_loopback  # noqa: E402
-from inexor.config import Cosmology  # noqa: E402
+from inexor.config import PLANCK, Cosmology  # noqa: E402
 from inexor.decomp import Decomp  # noqa: E402
 from inexor.summary import pk_summary_card_cards  # noqa: E402
 from tests.ranks_common import RANKS_MARKS, rank_cfg, rank_devices, whole_state  # noqa: E402
@@ -89,3 +92,39 @@ def test_an_empty_card_is_refused_on_every_rank(whole):
         return True
 
     assert all(run_loopback(2, rank, timeout=120.0))
+
+
+@pytest.fixture(scope="module")
+def host_export(whole, tmp_path_factory):
+    d = str(tmp_path_factory.mktemp("host") / "e")
+    head = export.write_particles(whole, d, dtype=np.float32, a=A_OUT, cosmo=PLANCK)
+    assert whole.arena_used > 0, "vacuous: no arena residents"
+    return d, head
+
+
+def _bytes(path):
+    return np.ascontiguousarray(np.load(path)).tobytes()
+
+
+@pytest.mark.parametrize("cards", [1, 2])
+@pytest.mark.parametrize("n_ranks", [1, 2, 3, 4])
+def test_rank_exports_decoded_on_the_cards_are_the_host_export(whole, host_export, tmp_path,
+                                                               n_ranks, cards):
+    one, want = host_export
+    cfg = rank_cfg(cards)
+    d = str(tmp_path / "parts")
+
+    def rank(c):
+        dc = Decomp.build(cfg, n_ranks=c.size, rank=c.rank)
+        part = whole if c.size == 1 else restrict_to_slabs(whole, dc.slabs)
+        return export.write_particle_parts(part, d, comm=c, decode="cards",
+                                           devices=rank_devices(c.rank, cards),
+                                           dtype=np.float32, a=A_OUT, cosmo=PLANCK,
+                                           expect_total=whole.n_live)
+
+    heads = run_loopback(n_ranks, rank, timeout=120.0)
+    head = heads[0]
+    assert len(head["parts"]) == n_ranks and head["crc32"] == want["crc32"]
+    for key in ("x", "v"):
+        got = b"".join(_bytes(os.path.join(d, p["files"][key])) for p in head["parts"])
+        assert got == _bytes(os.path.join(one, want["files"][key]))
