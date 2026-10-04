@@ -454,3 +454,145 @@ def test_append_does_not_copy_the_block_to_write_it(tmp_path):
     assert _peak(fixed) < 1.5 * payload
     assert _peak(control) > 1.9 * payload
     assert (tmp_path / "a.npy").read_bytes() == (tmp_path / "b.npy").read_bytes()
+
+
+# --- multi-part exports (format inexor-particles-2) ---
+
+
+@pytest.mark.parametrize("cut", [1, 7, 4096])
+def test_crc32_combine_is_the_crc_of_the_concatenation(cut):
+    rng = np.random.default_rng(cut)
+    a = rng.integers(0, 256, size=5000, dtype=np.uint8).tobytes()
+    b = rng.integers(0, 256, size=cut, dtype=np.uint8).tobytes()
+    assert export._crc32_combine(zlib.crc32(a), zlib.crc32(b), len(b)) == zlib.crc32(a + b)
+    assert export._crc32_combine(zlib.crc32(a), zlib.crc32(b""), 0) == zlib.crc32(a)
+    assert export._crc32_combine(0, zlib.crc32(b), len(b)) == zlib.crc32(b)
+
+
+def test_crc32_combine_past_four_gibibytes():
+    """A part's byte length passes 2**32 at production scale (0.8 TB per node and array)."""
+    head = b"inexor"
+    n = 2**32 + 13
+    block = bytes(64 << 20)
+    crc_z = 0
+    left = n
+    while left:
+        k = min(left, len(block))
+        crc_z = zlib.crc32(block[:k] if k < len(block) else block, crc_z)
+        left -= k
+    want = crc_z_with_head = zlib.crc32(head)
+    left = n
+    while left:
+        k = min(left, len(block))
+        want = zlib.crc32(block[:k] if k < len(block) else block, want)
+        left -= k
+    assert export._crc32_combine(crc_z_with_head, crc_z, n) == want
+
+
+def _parts_by_rank(st, n_ranks, workdir, **kw):
+    from inexor.comm import run_loopback
+    from tests.test_partial_state import rank_slabs, restrict_to_slabs
+
+    cuts = list(rank_slabs(NB, n_ranks))
+
+    def rank(c):
+        part = st if c.size == 1 else restrict_to_slabs(st, cuts[c.rank])
+        return export.write_particle_parts(part, workdir, comm=c, **kw)
+
+    return run_loopback(n_ranks, rank, timeout=60.0)
+
+
+def _array_bytes(path):
+    a = np.load(path)
+    return np.ascontiguousarray(a).tobytes()
+
+
+@pytest.mark.parametrize("n_ranks", [1, 2, 4])
+def test_parts_in_rank_order_are_the_single_file_bytes(tmp_path, n_ranks):
+    """The gate: concatenated parts == `write_particles`' arrays, and the header's whole-array
+    crc32 == the single-file crc32, at f32 km/s (the production output)."""
+    st = _evolved_state()
+    assert st.arena_used > 0, "vacuous: no arena residents"
+    one = str(tmp_path / "one")
+    want = export.write_particles(st, one, dtype=np.float32, a=0.5, cosmo=PLANCK,
+                                  chunk_bricks=3)
+    d = str(tmp_path / "parts")
+    heads = _parts_by_rank(st, n_ranks, d, dtype=np.float32, a=0.5, cosmo=PLANCK,
+                           chunk_bricks=5, expect_total=st.n_live)
+    head = heads[0]
+    assert all(h == head for h in heads)
+    assert head["format"] == export.FORMAT_PARTS and len(head["parts"]) == n_ranks
+    assert head["crc32"] == want["crc32"]
+    assert head["n_particles"] == want["n_particles"] == st.n_live
+    assert head["peculiar_velocity_factor"] == want["peculiar_velocity_factor"]
+    for key in ("x", "v"):
+        got = b"".join(_array_bytes(os.path.join(d, p["files"][key])) for p in head["parts"])
+        assert got == _array_bytes(os.path.join(one, want["files"][key]))
+    rows = [(p["row0"], p["rows"]) for p in head["parts"]]
+    assert [r0 for r0, _ in rows] == list(np.cumsum([0] + [n for _, n in rows])[:-1])
+    _, x, v, ids = export.load_particles(d, mmap=False)
+    _, xw, vw, _ = export.load_particles(one, mmap=False)
+    assert x.tobytes() == xw.tobytes() and v.tobytes() == vw.tobytes() and ids is None
+    assert [r0 for r0, *_ in export.iter_particle_parts(d)] == [r0 for r0, _ in rows]
+
+
+def test_one_part_carries_ids_and_loads_as_a_memmap(tmp_path):
+    st = _evolved_state(with_ids=True)
+    one = str(tmp_path / "one")
+    want = export.write_particles(st, one, dtype=np.float64)
+    d = str(tmp_path / "parts")
+    head = export.write_particle_parts(st, d, dtype=np.float64, chunk_bricks=7)
+    assert head["has_ids"] and head["crc32"] == want["crc32"]
+    _, x, v, ids = export.load_particles(d, mmap=True)
+    assert isinstance(x, np.memmap)
+    _, xw, vw, idw = export.load_particles(one, mmap=False)
+    np.testing.assert_array_equal(ids, idw)
+    np.testing.assert_array_equal(x, xw)
+
+
+def test_a_multi_part_export_refuses_one_memmap(tmp_path):
+    d = str(tmp_path / "parts")
+    _parts_by_rank(_evolved_state(), 2, d)
+    with pytest.raises(ValueError, match="iter_particle_parts"):
+        export.load_particles(d, mmap=True)
+
+
+def test_a_short_part_refuses_at_close_and_writes_no_header(tmp_path):
+    st = _evolved_state()
+    lo, hi = st.owned_bricks
+    chunks = [st.decode_bricks([b]) for b in range(lo, hi) if st.brick_member_count(b)]
+    d = str(tmp_path / "short")
+    with pytest.raises(RuntimeError, match="Rows were lost"):
+        export.write_particle_parts(st, d, chunks=chunks[:-1])
+    assert not os.path.exists(os.path.join(d, export.HEADER))
+
+
+def test_an_unexpected_total_writes_no_header(tmp_path):
+    st = _evolved_state()
+    d = str(tmp_path / "e")
+    with pytest.raises(RuntimeError, match="lost or doubled"):
+        export.write_particle_parts(st, d, expect_total=st.n_live + 1)
+    assert not os.path.exists(os.path.join(d, export.HEADER))
+
+
+def test_a_failing_rank_leaves_no_header(tmp_path):
+    from inexor.comm import run_loopback
+    from tests.test_partial_state import rank_slabs, restrict_to_slabs
+
+    st = _evolved_state()
+    d = str(tmp_path / "e")
+    export.write_particle_parts(st, d)  # a stale complete export: its header must go
+    cuts = list(rank_slabs(NB, 2))
+
+    def boom():
+        raise OSError("disk full, on purpose")
+        yield
+
+    def rank(c):
+        part = restrict_to_slabs(st, cuts[c.rank])
+        return export.write_particle_parts(part, d, comm=c,
+                                           chunks=boom() if c.rank == 1 else None)
+
+    with pytest.raises(Exception):
+        run_loopback(2, rank, timeout=60.0)
+    assert not os.path.exists(os.path.join(d, export.HEADER))
