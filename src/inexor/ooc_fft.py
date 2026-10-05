@@ -1260,8 +1260,9 @@ def kspace_pass_device(sources, n_mesh, box_size=1.0, kernel=None, out=None, inv
 # ---------------------------------------------------------------------------
 
 
-def zeros_card_shards(n_mesh, devices, dtype=np.float32):
-    """Card shards of zeros tiling x-planes [0, N): `[{lo, hi, device, delta}]`.
+def zeros_card_shards(n_mesh, devices, dtype=np.float32, planes=None):
+    """Card shards of zeros tiling x-planes [0, N) (or `planes` = [lo, hi), one rank's):
+    `[{lo, hi, device, delta}]`.
 
     The format `forward_from_card_planes` consumes; one contiguous run per device.
     """
@@ -1269,10 +1270,12 @@ def zeros_card_shards(n_mesh, devices, dtype=np.float32):
     import jax.numpy as jnp
 
     n = int(n_mesh)
+    p0, p1 = (0, n) if planes is None else (int(planes[0]), int(planes[1]))
     dt = np.dtype(dtype)
     _require_x64_for(dt)
     shards = []
-    for (lo, hi), dev in zip(partition_units(n, len(devices), 1), devices):
+    for (lo, hi), dev in zip(((p0 + a, p0 + z) for a, z in
+                              partition_units(p1 - p0, len(devices), 1)), devices):
         shape = (hi - lo, n, n)
         zeros = _card_program(("zeros", shape, dt.str), lambda shape=shape: jax.jit(
             lambda z: jnp.broadcast_to(z, shape)))

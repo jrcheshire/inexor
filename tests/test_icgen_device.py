@@ -147,32 +147,48 @@ def test_refusals(tmp_path):
 
 
 def test_host_allocation_is_what_the_planner_charges():
-    """numpy's peak over a WARMED generation vs `plan.ic_device_stages`' host column.
+    """numpy's peak in each stage of a WARMED generation vs `plan.ic_device_stages`' host
+    column for that stage.
 
-    Measured on four forced host devices: 1.06x at 128^3, 1.02x at 256^3 (tracemalloc
-    sees numpy, not jax arrays, which is the planner's host column); bar [0.9, 1.2]. RSS
-    is not the quantity: on CPU devices it also holds the "cards".
+    tracemalloc sees numpy, not jax arrays, which is the planner's host column; RSS is not
+    the quantity (on CPU devices it also holds the "cards"). Stages 2-5 must be within
+    [0.9, 1.2] of the planner (measured on four forced host devices at 128^3: 1.07-1.11).
+    The emission stage is checked as measured <= planner only: its per-card copies of each
+    slab's codes back to the host are host allocations on a GPU, but on the CPU backend
+    `np.asarray` aliases the jax buffer and tracemalloc cannot see them.
     """
     import tempfile
     import tracemalloc
 
     n, nb = 128, 8
     devs = _devices(4)
+    peaks = {}
 
-    def once():
+    def log(line):
+        _cur, peak = tracemalloc.get_traced_memory()
+        peaks[line.split(":")[0].split()[-1]] = peak
+        tracemalloc.reset_peak()
+
+    def once(lg=None):
         icgen.generate_t9_slabs_device(tempfile.mkdtemp(), jax.random.PRNGKey(0), n, n / 2,
-                                       Cosmology(), A_INIT, nb, slab=32, devices=devs)
+                                       Cosmology(), A_INIT, nb, slab=32, devices=devs, log=lg)
 
     once()  # compile every program at these shapes before counting
     tracemalloc.start()
     try:
-        once()
-        _cur, peak = tracemalloc.get_traced_memory()
+        once(log)
     finally:
         tracemalloc.stop()
     host, _card, _disk = plan.ic_device_stages(n, n_gpus=4, nb=nb, slab=32)
-    ratio = peak / max(host.values())
-    assert 0.9 <= ratio <= 1.2, f"numpy peak is {ratio:.2f}x the planner's host column"
+    stage = {"source": "2 ", "source_forward": "3 ", "velocities": "4 ", "displacements": "5 ",
+             "emission": "6 "}
+    priced = {k: next(v for key, v in host.items() if key.startswith(p))
+              for k, p in stage.items()}
+    for k in ("source", "source_forward", "velocities", "displacements"):
+        ratio = peaks[k] / priced[k]
+        assert 0.9 <= ratio <= 1.2, f"stage {k}: numpy peak is {ratio:.2f}x the planner's"
+    assert peaks["emission"] <= priced["emission"], (
+        f"emission: numpy peak {peaks['emission']} > the planner's {priced['emission']}")
 
 
 def test_the_planner_stage_table_prices_4096_on_a_gb_node():

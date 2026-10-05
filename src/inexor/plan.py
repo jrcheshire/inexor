@@ -322,7 +322,7 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
     field = n**3 * w
     spec = n * n * m * 2 * w
     pencil_host = 2 * W * n * m * 2 * w  # a block and its result, per card thread
-    slab_real = int(slab) * n * n * w
+    plane_host = W * n * n * w  # one real plane per card thread on its way to the host
     nb = int(nb) if nb else max(1, n // 16)
     rows_slab = n**3 // nb
     chunk_rows = min(int(slab), n // nb) * n * n
@@ -333,10 +333,10 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
         "1 noise -> delta spectrum": (spec + field if png else spec) + pencil_host,
         "2 2LPT source (accumulated on the cards)": 2 * spec + pencil_host,
         "3 source forward": 3 * spec + pencil_host,
-        "4 velocities (to disk)": 3 * spec + pencil_host + slab_real,
+        "4 velocities (to disk)": 3 * spec + pencil_host + plane_host,
         "5 displacements (x on the cards, y/z host)": (max(3 * spec, 2 * spec + field,
                                                            spec + 2 * field)
-                                                       + pencil_host + slab_real),
+                                                       + pencil_host + plane_host),
         "6 emission": 2 * field + emission_b,
     }
     quarter = -(-n // W) * n * n * w
@@ -357,7 +357,7 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
         cap = int(rows_src * 1.06)  # the capacity ladder's padding, ~one rung
         per3 = (n // 2 // nb) ** 3  # bucket_cells 2: n / 2 buckets per side
         host["6 emission"] = (2 * field
-                              + W * c * n * n * 5 * w                  # u_y, u_z, v uploads
+                              + W * c * n * n * 3 * w                  # v reads (u_y, u_z: views)
                               + W * (cap * 9 + nb * nb * per3 * 8))  # D2H off/w + occupancy
         halo5 = 2 * window * p * n * n * w
         card["5 displacements (x on the cards, y/z host)"] = quarter + halo5 + work

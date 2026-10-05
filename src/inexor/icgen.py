@@ -438,6 +438,8 @@ def generate_t9_slabs_device(
     noise="device",
     log=None,
     emission="cards",
+    comm=None,
+    batch_planes=ooc_fft.DEFAULT_BATCH_PLANES,
 ):
     """`generate_t9_slabs` with the IC stage on the devices. Same arguments and output format.
 
@@ -445,6 +447,18 @@ def generate_t9_slabs_device(
     stream `ic.IC_STREAM_DEVICE`; "host": the CPU stream `ic.IC_STREAM`), `log` (callable
     taking one line, called per stage), and `emission` ("cards": `device.emit`; "host":
     `_emit_t9_slabs`; bitwise-identical slabs on the CPU backend).
+
+    Across ranks (`comm`; every rank calls this with its own `devices` and the same shared
+    `workdir`): rank r owns destination brick slabs `partition_units(nb, n_ranks, 1)[r]`,
+    their particle x-planes, and y-pencils `partition_units(n, n_ranks, pencil_batch)[r]`
+    of every spectrum. Plane <-> pencil exchanges go in batches of `batch_planes`
+    (`ooc_fft.forward_planes_to_pencils` / `inverse_pencils_to_planes`); V is staged in
+    shared files, so a rank reads its neighbours' halo planes from disk; U_x is held on
+    the cards and U_y / U_z on the host with `window` brick slabs of halo. Rank 0 writes
+    the manifest once every rank has emitted. The files are byte for byte the one-rank
+    files at any rank and card count (the manifest adds `n_ranks`); one rank runs the
+    same code with no exchange. Across ranks only `noise="device"` and
+    `emission="cards"` are supported.
     Differences from the host path: kernels are applied on the device inside the axis-0 pass;
     the phi round trip is skipped at f_NL = 0; the 2LPT source is
     1/2 (delta^2 - sum phi_ii^2) - sum_{i<j} phi_ij^2 (using sum phi_ii = -delta); U and V are
@@ -463,6 +477,16 @@ def generate_t9_slabs_device(
         raise ValueError(f"noise must be 'device' or 'host', got {noise!r}")
     if emission not in ("cards", "host"):
         raise ValueError(f"emission must be 'cards' or 'host', got {emission!r}")
+    if comm is None:
+        from .comm import SerialComm
+
+        comm = SerialComm()
+    n_ranks, rank = int(comm.size), int(comm.rank)
+    if n_ranks > 1 and (noise != "device" or emission != "cards"):
+        raise ValueError(
+            f"across ranks the generator runs noise='device' and emission='cards' only (got "
+            f"noise={noise!r}, emission={emission!r}); the host lanes are single-node parity "
+            "references")
     t9 = T9Layout(box_size, n_part, bucket_cells)
     n, box = int(n_part), float(box_size)
     nb = int(bricks_per_side)
@@ -491,53 +515,118 @@ def generate_t9_slabs_device(
         if log is not None:
             log(f"  ic stage {name}: {timings[name]:.1f} s")
 
+    _check_shared_workdir(workdir, comm)
+    import jax.numpy as jnp
+
+    p = n // nb
+    slab_parts = ooc_fft.partition_units(nb, n_ranks, 1)
+    x_parts = [(a * p, z * p) for a, z in slab_parts]
+    y_parts = ooc_fft.partition_units(n, n_ranks, pencil_batch)
+    x_lo, x_hi = x_parts[rank]
+    y_lo, y_hi = y_parts[rank]
+    # this rank's cards over its x-planes, by the one-rank rule
+    cards = [(x_lo + a, x_lo + z, d) for (a, z), d in
+             zip(ooc_fft.partition_units(x_hi - x_lo, len(devs), 1), devs)]
+    own = [(a, z - a, d) for a, z, d in cards]
+    pkw = dict(devices=devs, pencil_batch=pencil_batch, pencils=(y_lo, y_hi))
+    xkw = dict(comm=comm, batch_planes=batch_planes)
+
+    def put(x, dev):
+        x = np.asarray(x)
+        return jax.device_put(x, dev)
+
+    def irfft2_plane(sp):
+        return jnp.fft.irfft2(sp, s=(n, n), axes=(-2, -1))
+
+    def axis0_inverse(spec):
+        def part(a, z, dev):
+            ooc_fft.fft_axis0_device_inplace(spec[:, a:z, :], inverse=True,
+                                             pencil_batch=pencil_batch, device=dev)
+        ooc_fft._run_parts(part, ooc_fft.partition_units(y_hi - y_lo, len(devs), pencil_batch),
+                           devs)
+
     tab = ic_k_table(cosmo, n, box, backend=backend, table=table)
     colour = K.colour(tab, n, box)
 
-    # white noise -> delta's spectrum
+    # white noise -> delta's spectrum (this rank's pencils)
     t0 = time.perf_counter()
     first = colour if f_NL == 0.0 else colour * K.poisson(cosmo, tab, n, box, inverse=True)
     if noise == "device":
-        spec = ooc_fft.noise_forward_cards(key, n, devs, dt, kernel=first, box_size=box,
-                                           pencil_batch=pencil_batch)
+        draw = ooc_fft.noise_plane_program(n, dt)
+        key_on = {}
+
+        def noise_plane(g, dev):
+            if dev not in key_on:
+                key_on[dev] = put(key, dev)
+            return draw(key_on[dev], put(np.uint32(g), dev))
+
+        spec = ooc_fft.forward_planes_to_pencils(noise_plane, n, cards, x_parts, y_parts,
+                                                 dtype=dt, kernel=first, box_size=box,
+                                                 pencil_batch=pencil_batch, **xkw)
     else:
         spec = ooc_fft.forward_from_slabs_device(
             lambda lo, hi: ic.white_slab(key, lo, hi, n, dt), n, slab=slab, kernel=first,
             box_size=box, **kw)
     mean_phi2 = None
     if f_NL != 0.0:
-        phi = np.empty((n, n, n), dtype=dt)
-        tot = 0.0
-        for lo, s in ooc_fft.inverse_to_slabs_device(spec, n, slab=slab, **kw):
-            phi[lo:lo + s.shape[0]] = s
-            tot = ic.sq_sum_by_plane(s, tot)
+        axis0_inverse(spec)
+        phi = np.empty((x_hi - x_lo, n, n), dtype=dt)
+        sums = np.zeros(x_hi - x_lo)
+
+        def to_phi(k, i, g, sp):
+            pl = np.asarray(irfft2_plane(sp))[0]
+            phi[g - x_lo] = pl
+            sums[g - x_lo] = ic.sq_sum_by_plane(pl[None], 0.0)
+
+        ooc_fft.inverse_pencils_to_planes(spec, n, own, y_parts, to_phi, **xkw)
         del spec
+        # `ic.sq_sum_by_plane`'s fold over every plane in global order
+        tot = 0.0
+        for part_sums in comm.allgather(sums):
+            for v in part_sums:
+                tot += float(v)
         mean_phi2 = tot / n**3
 
-        def _png_slab(lo, hi):
-            p = phi[lo:hi]
-            return p + np.asarray(f_NL, dtype=p.dtype) * (p * p - np.asarray(mean_phi2, p.dtype))
+        def png_plane(g, dev):
+            q = phi[g - x_lo:g - x_lo + 1]
+            q = q + np.asarray(f_NL, dtype=q.dtype) * (q * q - np.asarray(mean_phi2, q.dtype))
+            return jnp.fft.rfft2(ooc_fft._to_device(q, dev), axes=(-2, -1))
 
-        spec = ooc_fft.forward_from_slabs_device(
-            _png_slab, n, slab=slab, kernel=K.poisson(cosmo, tab, n, box), box_size=box, **kw)
+        spec = ooc_fft.forward_planes_to_pencils(
+            png_plane, n, cards, x_parts, y_parts, dtype=dt,
+            kernel=K.poisson(cosmo, tab, n, box), box_size=box, pencil_batch=pencil_batch,
+            **xkw)
         del phi
     _lap("delta", t0)
 
-    # 2LPT source, accumulated on the devices
+    # 2LPT source, accumulated on this rank's cards
     t0 = time.perf_counter()
-    acc = ooc_fft.zeros_card_shards(n, devs, dt)
+    acc = ooc_fft.zeros_card_shards(n, devs, dt, planes=(x_lo, x_hi))
+    add = ooc_fft.acc_sq_program(n, dt)
     work = None
     terms = ([(None, 0.5)] + [(K.deriv2(i, j), -0.5) for i, j in _DIAG]
              + [(K.deriv2(i, j), -1.0) for i, j in _OFFDIAG])
     for kern, weight in terms:
-        acc, work = ooc_fft.inverse_accumulate_cards([(1.0, spec)], n, acc, weight, kernel=kern,
-                                                     box_size=box, work=work,
-                                                     pencil_batch=pencil_batch)
+        work = ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=kern, out=work,
+                                          inverse=True, **pkw)
+        w_on = [put(np.asarray(weight, dtype=dt), d) for d in devs]
+
+        def accumulate(k, i, g, sp, w_on=w_on):
+            acc[k]["delta"] = add(acc[k]["delta"], put(np.int64(i), devs[k]), sp, w_on[k])
+
+        ooc_fft.inverse_pencils_to_planes(work, n, own, y_parts, accumulate, **xkw)
     _lap("source", t0)
 
     t0 = time.perf_counter()
-    spec2 = ooc_fft.forward_from_card_planes(acc, n, pencil_batch=pencil_batch)
-    del acc
+
+    def source_plane(g, dev):
+        sh = next(a for a in acc if int(a["lo"]) <= g < int(a["hi"]))
+        i = g - int(sh["lo"])
+        return jnp.fft.rfft2(sh["delta"][i:i + 1], axes=(-2, -1))
+
+    spec2 = ooc_fft.forward_planes_to_pencils(source_plane, n, cards, x_parts, y_parts,
+                                              dtype=dt, pencil_batch=pencil_batch, **xkw)
+    acc = None  # released before the velocities
     _lap("source_forward", t0)
 
     D1 = growth_factor_a(a_init, cosmo)
@@ -546,35 +635,53 @@ def generate_t9_slabs_device(
     f2 = growth_rate_2(a_init, cosmo, growth2)
     v_coef2 = -(D2 * f2) / (D1 * f1)
 
-    # V, staged to disk
+    # V, staged to shared files: rank 0 creates them, every rank writes its own planes
     t0 = time.perf_counter()
-    vmax = 0.0
+    v_paths = [os.path.join(stage, f"v_{ax}.npy") for ax in range(3)]
+    if rank == 0:
+        for path in v_paths:
+            ooc_fft.StagedArray.create(path, dt, (n, n, n))
+    comm.barrier()
+    v_sa = [ooc_fft.StagedArray.open(path, dt, (n, n, n)) for path in v_paths]
+    vmax_card = [0.0] * len(devs)
     for ax in range(3):
-        ooc_fft.kspace_pass_device([(1.0, spec), (v_coef2, spec2)], n, box,
-                                   kernel=K.grad_invk2(ax), out=work, inverse=True, **kw)
-        v_sa = ooc_fft.StagedArray.create(os.path.join(stage, f"v_{ax}.npy"), dt, (n, n, n))
-        for lo, s in ooc_fft.inverse_to_slabs_device(work, n, slab=slab, pass2=False, **kw):
-            v_sa.write_slab(lo, s)
-            vmax = max(vmax, float(np.max(np.abs(np.asarray(s, np.float64)))))
+        work = ooc_fft.kspace_pass_device([(1.0, spec), (v_coef2, spec2)], n, box,
+                                          kernel=K.grad_invk2(ax), out=work, inverse=True,
+                                          **pkw)
+
+        def to_v(k, i, g, sp, sa=v_sa[ax]):
+            pl = np.asarray(irfft2_plane(sp))
+            sa.write_slab(g, pl)
+            vmax_card[k] = max(vmax_card[k], float(np.max(np.abs(np.asarray(pl, np.float64)))))
+
+        ooc_fft.inverse_pencils_to_planes(work, n, own, y_parts, to_v, **xkw)
+    vmax = comm.allreduce(max(vmax_card), "max")
     _lap("velocities", t0)
 
-    # U = D1 psi1 - D2 psi2: x on the devices, y and z on the host
+    # U = D1 psi1 - D2 psi2: x on the devices, y and z on the host (with halo)
     t0 = time.perf_counter()
     ooc_fft.kspace_pass_device([(D1, spec), (-D2, spec2)], n, box, out=spec, transform=False,
-                               **kw)
+                               **pkw)
     del spec2
-    ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(0), out=work,
-                               inverse=True, **kw)
+    work = ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(0), out=work,
+                                      inverse=True, **pkw)
     if emission == "cards":
-        # each device's destination slabs plus `window` brick slabs of halo either side
+        # each card's destination slabs plus `window` brick slabs of halo either side
         from .device import emit as demit
 
-        ux = demit.card_slab_ranges(n, nb, devs, window)
-        arrays = ooc_fft.inverse_to_card_shards(
-            work, n, [(r["x0"], r["nx"], r["device"]) for r in ux],
-            pencil_batch=pencil_batch, pass2=False)
-        for r, a in zip(ux, arrays):
-            r["delta"] = a
+        ux = demit.card_slab_ranges(n, nb, devs, window, slabs=slab_parts[rank])
+        set_plane = ooc_fft._card_program(("plane_set",), lambda: jax.jit(
+            lambda m, i, q: m.at[i].set(q), donate_argnums=0))
+        for r in ux:
+            r["delta"] = jax.jit(lambda z, shape=(int(r["nx"]), n, n): jnp.broadcast_to(z, shape))(
+                put(np.zeros((), dtype=dt), r["device"]))
+
+        def to_ux(k, i, g, sp):
+            ux[k]["delta"] = set_plane(ux[k]["delta"], put(np.int64(i), ux[k]["device"]),
+                                       irfft2_plane(sp)[0])
+
+        ooc_fft.inverse_pencils_to_planes(work, n, [(r["x0"], r["nx"], r["device"])
+                                                    for r in ux], y_parts, to_ux, **xkw)
     else:
         ranges = ooc_fft.partition_units(n, len(devs), 1)
         arrays = ooc_fft.inverse_to_card_shards(
@@ -582,26 +689,44 @@ def generate_t9_slabs_device(
             pencil_batch=pencil_batch, pass2=False)
         ux = [dict(lo=lo, hi=hi, device=d, delta=a)
               for ((lo, hi), d), a in zip(zip(ranges, devs), arrays)]
-    del arrays
+        del arrays
     umax = max(float(np.asarray(jax.numpy.max(jax.numpy.abs(s["delta"])))) for s in ux)
 
-    uy = np.empty((n, n, n), dtype=dt)
-    ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(1), out=work,
-                               inverse=True, **kw)
-    for lo, s in ooc_fft.inverse_to_slabs_device(work, n, slab=slab, pass2=False, **kw):
-        uy[lo:lo + s.shape[0]] = s
-        umax = max(umax, float(np.max(np.abs(s))))
+    # U_y, U_z: this rank's planes plus `window` brick slabs either side (all planes when
+    # that covers the box), read by global plane
+    h = window * p
+    w_lo, w_n = (0, n) if x_hi - x_lo + 2 * h >= n else ((x_lo - h) % n, x_hi - x_lo + 2 * h)
+    w_cards = [(w_lo + a, z - a, d) for (a, z), d in
+               zip(ooc_fft.partition_units(w_n, len(devs), 1), devs)]
+    umax_card = [0.0] * len(devs)
 
-    # U_z reuses `work`'s bytes (n^2 (n/2+1) x 2w >= n^3 x w): a device array uploaded from
-    # a slice of `work` can keep the buffer alive, so a fresh allocation could hold a 4th field
-    uz = work.reshape(-1).view(np.uint8)[:n**3 * dt.itemsize].view(dt).reshape(n, n, n)
-    del work
+    def host_window(field, buf=None):
+        def to_host(k, i, g, sp):
+            pl = np.asarray(irfft2_plane(sp))[0]
+            field.arr[(g - field.lo) % n] = pl
+            if x_lo <= g < x_hi:
+                umax_card[k] = max(umax_card[k], float(np.max(np.abs(pl))))
+        return to_host
+
+    uy = _PlaneWindow(np.empty((w_n, n, n), dtype=dt), w_lo, n)
+    work = ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(1), out=work,
+                                      inverse=True, **pkw)
+    ooc_fft.inverse_pencils_to_planes(work, n, w_cards, y_parts, host_window(uy), **xkw)
+
+    # U_z reuses `work`'s bytes when they hold it (n^2 (n/2+1) x 2w >= n^3 x w at one rank):
+    # a device array uploaded from a slice of `work` can keep the buffer alive, so a fresh
+    # allocation could hold a 4th field
+    need = w_n * n * n * dt.itemsize
+    flat = work.reshape(-1).view(np.uint8)
+    uz_arr = (flat[:need].view(dt).reshape(w_n, n, n) if flat.size >= need
+              else np.empty((w_n, n, n), dtype=dt))
+    uz = _PlaneWindow(uz_arr, w_lo, n)
+    del work, flat
     ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(2), out=spec,
-                               inverse=True, **kw)
-    for lo, s in ooc_fft.inverse_to_slabs_device(spec, n, slab=slab, pass2=False, **kw):
-        uz[lo:lo + s.shape[0]] = s
-        umax = max(umax, float(np.max(np.abs(s))))
+                               inverse=True, **pkw)
+    ooc_fft.inverse_pencils_to_planes(spec, n, w_cards, y_parts, host_window(uz), **xkw)
     del spec
+    umax = comm.allreduce(max([umax] + umax_card), "max")
     _lap("displacements", t0)
 
     scale = vmax / INT16_MAX
@@ -616,50 +741,102 @@ def generate_t9_slabs_device(
             "Raise `window` (and re-derive the staging cost) rather than widening silently."
         )
 
+    # every rank's V planes are on disk before any rank reads its halo
+    comm.barrier()
     t0 = time.perf_counter()
-    v_ro = [ooc_fft.StagedArray.open(os.path.join(stage, f"v_{ax}.npy"), dt, (n, n, n))
-            for ax in range(3)]
+    v_ro = [ooc_fft.StagedArray.open(path, dt, (n, n, n)) for path in v_paths]
     emission_s = {}
     if emission == "cards":
-        written, n_total = demit.emit_t9_slabs_cards(
-            workdir, ux, uy, uz, v_ro, t9, n, box, nb, dt, window, timings=emission_s)
+        written, n_local = demit.emit_t9_slabs_cards(
+            workdir, ux, uy, uz, v_ro, t9, n, box, nb, dt, window, timings=emission_s,
+            complete=n_ranks == 1)
     else:
-        written, n_total = _emit_t9_slabs(
-            workdir, [_CardField(ux), _HostField(uy), _HostField(uz)], v_ro, t9, n, box, nb,
-            dt, slab, window)
-    del ux, uy, uz
+        written, n_local = _emit_t9_slabs(
+            workdir, [_CardField(ux), uy, uz], v_ro, t9, n, box, nb, dt, slab, window)
+    ux = uy = uz = None
+    n_total = int(comm.allreduce(int(n_local)))
+    # each rank's files in its emitter's order, ranks in order (one rank: the emitter's list)
+    written = [f for part in comm.allgather(list(written)) for f in part]
+    if len(written) != nb or n_total != n**3:
+        raise RuntimeError(f"the ranks wrote {len(written)} of {nb} slabs holding {n_total} of "
+                           f"{n**3} particles")
     _lap("emission", t0)
 
-    manifest = dict(
-        schema=SCHEMA,
-        files=written,
-        n_particles=n_total,
-        vel_scale=float(scale),
-        max_displacement=float(umax),
-        window=window,
-        box_size=box,
-        n_part=n,
-        bucket_cells=int(bucket_cells),
-        bricks_per_side=nb,
-        a_init=float(a_init),
-        order=order,
-        growth2=growth2,
-        f_NL=float(f_NL),
-        fdtype=dt.name,
-        slab=int(slab),
-        ic_stream=ic.IC_STREAM_DEVICE if noise == "device" else ic.IC_STREAM,
-        backend=backend,
-        table_n_points=int(len(tab.k)),
-        mean_phi2=None if mean_phi2 is None else float(mean_phi2),
-        generator="device",
-        emission=emission,
-        emission_s=emission_s,
-        n_devices=len(devs),
-        pencil_batch=int(pencil_batch),
-        stage_s=timings,
-        provenance=provenance or {},
-    )
-    return _write_manifest(workdir, manifest, keep_stage)
+    manifest = None
+    # no rank still reads the staged V when rank 0 removes it
+    comm.barrier()
+    if rank == 0:
+        manifest = dict(
+            schema=SCHEMA,
+            files=written,
+            n_particles=n_total,
+            vel_scale=float(scale),
+            max_displacement=float(umax),
+            window=window,
+            box_size=box,
+            n_part=n,
+            bucket_cells=int(bucket_cells),
+            bricks_per_side=nb,
+            a_init=float(a_init),
+            order=order,
+            growth2=growth2,
+            f_NL=float(f_NL),
+            fdtype=dt.name,
+            slab=int(slab),
+            ic_stream=ic.IC_STREAM_DEVICE if noise == "device" else ic.IC_STREAM,
+            backend=backend,
+            table_n_points=int(len(tab.k)),
+            mean_phi2=None if mean_phi2 is None else float(mean_phi2),
+            generator="device",
+            emission=emission,
+            emission_s=emission_s,
+            n_devices=len(devs),
+            pencil_batch=int(pencil_batch),
+            stage_s=timings,
+            provenance=provenance or {},
+        )
+        if n_ranks > 1:
+            manifest["n_ranks"] = n_ranks
+        manifest = _write_manifest(workdir, manifest, keep_stage)
+    return comm.bcast(manifest)
+
+
+class _PlaneWindow:
+    """Host planes `lo .. lo + len(arr) - 1` (mod n) of a field, sliced by global plane
+    (`[g0:g1]`, a run inside the window), as the emission reads U_y and U_z."""
+
+    def __init__(self, arr, lo, n):
+        self.arr, self.lo, self.n = arr, int(lo), int(n)
+
+    def __getitem__(self, sl):
+        i0 = (int(sl.start) - self.lo) % self.n
+        i1 = i0 + int(sl.stop) - int(sl.start)
+        if i1 > len(self.arr):
+            raise IndexError(f"planes [{sl.start}, {sl.stop}) are outside this window of "
+                             f"{len(self.arr)} planes from {self.lo}")
+        return self.arr[i0:i1]
+
+    def read_slab(self, lo, hi):
+        return self[lo:hi]
+
+
+def _check_shared_workdir(workdir, comm):
+    """Refuse unless every rank sees the same `workdir` (rank 0 writes a marker the others
+    must find): the ranks write one generation together."""
+    if int(comm.size) == 1:
+        return
+    tag = comm.bcast(f".ranks-{os.getpid()}-{time.time_ns()}" if comm.rank == 0 else None)
+    path = os.path.join(workdir, tag)
+    if comm.rank == 0:
+        open(path, "w").close()
+    comm.barrier()
+    seen = comm.allgather(os.path.exists(path))
+    comm.barrier()
+    if comm.rank == 0:
+        os.remove(path)
+    if not all(seen):
+        raise RuntimeError(f"ranks {[r for r, ok in enumerate(seen) if not ok]} do not see "
+                           f"{workdir}: the ranks must share the IC directory")
 
 
 def _shared_like(arr, alloc, tag):

@@ -206,3 +206,98 @@ def test_inverse_planes_are_the_single_process_planes(n_ranks, cards, batch):
             assert got.tobytes() == want_shards[(r, k)].tobytes(), f"rank {r} card {k}"
         assert planes.tobytes() == want_planes[lo:hi].tobytes(), f"rank {r} planes"
         assert acc.tobytes() == want_acc[lo:hi].tobytes(), f"rank {r} accumulated source"
+
+
+# --- the generator across ranks ---
+
+GEN_N, GEN_NB, GEN_BOX = 64, 8, 32.0
+# its largest velocity sits at plane 41, on a rank other than 0 at 2, 3 and 4 ranks, so a
+# rank-local maximum (the manifest's vel_scale comes from rank 0) changes the bytes
+GEN_SEED = 10
+IGNORED = ("provenance", "stage_s", "emission_s", "n_devices", "n_ranks", "stage_cleanup")
+
+
+def _generate(workdir, comm, devs, f_NL=0.0, window=1, batch=3, log=None):
+    from inexor import icgen
+    from inexor.config import Cosmology
+
+    import jax
+
+    return icgen.generate_t9_slabs_device(
+        str(workdir), jax.random.PRNGKey(GEN_SEED), GEN_N, GEN_BOX, Cosmology(), 0.1, GEN_NB,
+        f_NL=f_NL, window=window, devices=devs, comm=comm, batch_planes=batch, log=log)
+
+
+def _ic_dir(d):
+    """{file: bytes} of the slab files, and the manifest without its run-specific fields."""
+    import json
+    import os
+
+    man = json.load(open(os.path.join(d, "manifest.json")))
+    files = {f: open(os.path.join(d, f), "rb").read() for f in man["files"]}
+    return files, {k: v for k, v in man.items() if k not in IGNORED}
+
+
+@pytest.fixture(scope="module")
+def one_rank_ics(tmp_path_factory):
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    out = {}
+    for f_NL, window in ((0.0, 1), (0.5, 1), (0.0, 2)):
+        d = tmp_path_factory.mktemp(f"one-{f_NL}-{window}")
+        _generate(d, None, [jax.devices()[0]], f_NL=f_NL, window=window)
+        out[(f_NL, window)] = _ic_dir(d)
+    return out
+
+
+@pytest.mark.parametrize("n_ranks,cards,batch,f_NL,window", [
+    (1, 2, 3, 0.0, 1), (2, 1, 1, 0.0, 1), (2, 2, 3, 0.5, 1), (3, 1, 64, 0.5, 1),
+    (4, 2, 5, 0.0, 1), (4, 1, 3, 0.5, 1), (2, 2, 3, 0.0, 2), (4, 2, 2, 0.0, 2)])
+def test_rank_ics_are_the_one_rank_ics(one_rank_ics, tmp_path, n_ranks, cards, batch, f_NL,
+                                       window):
+    files, man = one_rank_ics[(f_NL, window)]
+    assert len(files) == GEN_NB and man["n_particles"] == GEN_N**3
+
+    def rank(c):
+        return _generate(tmp_path, c, _devs(c.rank, cards), f_NL=f_NL, window=window,
+                         batch=batch)
+
+    mans = run_loopback(n_ranks, rank, timeout=300.0)
+    assert all(m == mans[0] for m in mans)
+    got_files, got_man = _ic_dir(tmp_path)
+    assert got_man == man
+    assert sorted(got_files) == sorted(files)
+    for f in files:
+        assert got_files[f] == files[f], f
+    assert mans[0].get("n_ranks", 1) == n_ranks
+
+
+def test_a_failing_rank_leaves_no_manifest(tmp_path):
+    import os
+
+    def rank(c):
+        def log(line):
+            if c.rank == 1 and "source" in line:
+                raise RuntimeError("rank 1 fails after the 2LPT source, on purpose")
+        return _generate(tmp_path, c, _devs(c.rank, 1), log=log)
+
+    with pytest.raises(Exception):
+        run_loopback(2, rank, timeout=300.0)
+    assert not os.path.exists(os.path.join(tmp_path, "manifest.json"))
+
+
+def test_the_host_lanes_are_refused_across_ranks(tmp_path):
+    from inexor import icgen
+    from inexor.config import Cosmology
+
+    import jax
+
+    def rank(c):
+        with pytest.raises(ValueError, match="across ranks"):
+            icgen.generate_t9_slabs_device(str(tmp_path), jax.random.PRNGKey(4), GEN_N, GEN_BOX,
+                                           Cosmology(), 0.1, GEN_NB, devices=_devs(c.rank, 1),
+                                           comm=c, noise="host")
+        return True
+
+    assert all(run_loopback(2, rank, timeout=60.0))

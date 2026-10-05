@@ -44,17 +44,19 @@ def _padded(n):
     return int(capacity_shape(max(1, int(n)) + 1, rungs=12))
 
 
-def card_slab_ranges(n, nb, devices, window):
+def card_slab_ranges(n, nb, devices, window, slabs=None):
     """Per card: destination slabs [lo, hi) and the u_x plane range it must hold.
 
     Returns `[{lo, hi, x0, nx, device}]`; planes `x0 .. x0 + nx - 1` (mod n) cover the
     card's slabs plus `window` brick slabs either side, the sources its slabs draw on.
+    `slabs` = [lo, hi) splits one rank's destination slabs (default all of them).
     """
     n, nb, window = int(n), int(nb), int(window)
+    s0, s1 = (0, nb) if slabs is None else (int(slabs[0]), int(slabs[1]))
     p = n // nb
     h = window * p
-    return [dict(lo=a, hi=b, x0=a * p - h, nx=(b - a) * p + 2 * h, device=dev)
-            for (a, b), dev in zip(ooc_fft.partition_units(nb, len(devices), 1), devices)]
+    return [dict(lo=s0 + a, hi=s0 + b, x0=(s0 + a) * p - h, nx=(b - a) * p + 2 * h, device=dev)
+            for (a, b), dev in zip(ooc_fft.partition_units(s1 - s0, len(devices), 1), devices)]
 
 
 def shards_from_host(field, ranges):
