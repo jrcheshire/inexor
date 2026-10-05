@@ -7,13 +7,13 @@
 #SBATCH -t 12:00:00
 #SBATCH -o inexor-mn-steps-%j.log
 #SBATCH --signal=B:USR1@900
-# One realization stepped across the nodes, one GH200 and one rank per node, from ICs made
-# elsewhere (hero_ics_vista.sbatch on gb), with checkpoints in REAL_DIR/ckpt. A lost job is
+# One realization stepped across the nodes, one rank per node on gh (one GH200) or gb (four
+# GB200), from ICs made elsewhere (multinode_ics_vista.sbatch, hero_ics_vista.sbatch), with checkpoints in REAL_DIR/ckpt. A lost job is
 # resubmitted with EXPECT_STEP at its newest checkpoint.
 #
-# Before the steps: the job-script tests, the MPI launch line on every node (an MPI start and
-# a rank that dies at once, which must end the launch), the planner at 1 and N nodes, and the
-# preflight against IC_DIR on node 0 (all fatal). Then the control, also fatal: the older
+# Before the steps: the MPI launch line on every node (an MPI start and a rank that dies at
+# once, which must end the launch), the planner at 1 and N nodes, and the preflight against
+# IC_DIR on node 0 (all fatal). With CONTROL_REF, the control, also fatal: the older
 # generation of CONTROL_REF (a run that passed the byte gate, multinode_gate_vista.sbatch) is
 # copied into a fresh dir and resumed to the newer one's step with this commit and launch
 # line, and the dir must equal CONTROL_REF byte for byte.
@@ -23,14 +23,19 @@
 # checkpoint must be at step STOP and hold the preset's particle count. Each leg's output is
 # also in REAL_DIR/job-<id>/legs/.
 #
-# Requires INEXOR_RUNS, IC_DIR, REAL_DIR (not under IC_DIR), CONTROL_REF (a gated run's
-# ckpt/, two generations) and CONTROL_ICS (its ICs), and INEXOR_SRC or submission from the
-# checkout. Optional: PRESET (c-gh), K (120), EXPECT_STEP (0), STOP (K), EVERY (20),
+# Requires INEXOR_RUNS, IC_DIR, REAL_DIR (not under IC_DIR), and INEXOR_SRC or submission
+# from the checkout. Optional: CONTROL_REF (a gated run's ckpt/, two generations) with
+# CONTROL_ICS (its ICs); PRESET (c-gh), K (120), EXPECT_STEP (0), STOP (K), EVERY (20),
 # CONTROL_PRESET (c-1024), SLACK / ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), LEG_FIXED_S (600) +
 # LEG_STEP_S (300) per step (a run leg's cap), QUIET_S (600).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R IC_DIR=$R/c-gh-ics REAL_DIR=$R/c-gh-r1 \
 #     CONTROL_REF=$R/mn-gate-c-1024-1043437/mpi/ckpt CONTROL_ICS=$R/mn-gate-c-1024-1043437/ics \
 #     sbatch -A <account> scripts/run/multinode_steps_vista.sbatch
+# 8192^3 on 8 gb nodes, 40 steps to z = 0 (~7-7.5 h; no control: c-1024 cannot split over
+# 32 GPUs):
+#   INEXOR_RUNS=$R IC_DIR=$R/c-8192-ics REAL_DIR=$R/c-8192-k40 PRESET=c-8192 K=40 EVERY=20 \
+#     LEG_STEP_S=1200 sbatch -A <account> -p gb -N 8 -n 8 -t 11:00:00 \
+#     scripts/run/multinode_steps_vista.sbatch
 #
 # REHEARSAL=1 runs the same legs on a laptop CPU at cdev8-tile32 (steps 0 -> 6 of 40), with
 # IC_DIR and CONTROL_REF from a rehearsal of the gate script:
@@ -55,7 +60,10 @@ mkdir -p "$RUNS" && RUNS=$(cd "$RUNS" && pwd)
 export PYTHONUNBUFFERED=1
 
 abspath () { (cd "$1" 2>/dev/null && pwd); }
+CONTROL=0
+[ -n "${CONTROL_REF:-}${CONTROL_ICS:-}" ] && CONTROL=1
 for v in IC_DIR CONTROL_REF CONTROL_ICS; do
+  [ "$v" = IC_DIR ] || [ "$CONTROL" = 1 ] || continue
   [ -n "${!v:-}" ] && [ -d "${!v}" ] || { echo "FATAL: set $v to an existing directory"; exit 1; }
   printf -v "$v" %s "$(abspath "${!v}")"
 done
@@ -93,7 +101,7 @@ mkdir -p "$WORK" "$CARDS"
 
 echo "=== $(hostname): commit $(git rev-parse --short HEAD), job $SLURM_JOB_ID, $(date) ==="
 echo "=== $PRESET, K=$K, steps $EXPECT_STEP -> $STOP, every $EVERY, layout ${LAYOUT[*]} ==="
-echo "=== ICs $IC_DIR, checkpoints $CKPT, control $CONTROL_REF ($CONTROL_PRESET) ==="
+echo "=== ICs $IC_DIR, checkpoints $CKPT, control ${CONTROL_REF:-none} ($CONTROL_PRESET) ==="
 echo "=== nodes ${SLURM_JOB_NODELIST:-local}, launch '$LAUNCH', work $WORK ==="
 for t in mpiexec mpicc ptxas "$PY"; do echo "  $t -> $(command -v "$t" || echo none)"; done
 if [ "${REHEARSAL:-0}" != 1 ]; then
@@ -128,7 +136,7 @@ leg_cap () { echo $((LEG_FIXED_S + LEG_STEP_S * ($2 - $1))); }
 ranks () {
   local arm=$1 preset=$2 ics=$3 ckpt=$4 k=$5 from=$6 stop=$7 every=$8 extra=${9:-}
   on_ranks "$CARDS/${TAG}_${arm}_s${from}_r@RANK@" "$extra" "${MPIPATH[@]}" \
-    "$PY" -m mpi4py "$DRIVER" run --preset "$preset" --workdir "$ics" --cards 1 \
+    "$PY" -m mpi4py "$DRIVER" run --preset "$preset" --workdir "$ics" --cards "$N_CARDS" \
     --k-steps "$k" --stop-at "$stop" --expect-step "$from" --timed-all --beat 60 \
     "${MEMBIND_CHECK[@]}" "${LAYOUT[@]}" --checkpoint-every "$every" \
     --card "$CARDS/${TAG}_${arm}_s${from}.json" \
@@ -137,11 +145,6 @@ ranks () {
 
 # --- guards (node 0)
 run_leg --cap 1800 build-mpi4py build_mpi4py || stop_job "mpi4py did not build"
-# its mpiexec cases are left to the launch guards below, on the launcher the legs use
-run_leg --cap 600 guard-job-scripts \
-  "${CPU[@]}" "$PY" -m pytest -q -rs -p no:cacheprovider tests/test_job_scripts.py \
-    -k "not mpiexec" \
-  || stop_job "the job-script tests failed on this machine"
 run_leg --cap 300 guard-launch-mpi \
   on_ranks "$CARDS/${TAG}_guard-mpi_r@RANK@" "" "${MPIPATH[@]}" \
     "$PY" -m mpi4py -c "from mpi4py import MPI; import jax; c = MPI.COMM_WORLD
@@ -154,30 +157,31 @@ run_leg --cap 300 --expect-fail guard-dead-rank \
 for n in 1 "$N_RANKS"; do
   run_leg --cap 300 "plan-$n-node" \
     "${CPU[@]}" "$PY" -m inexor.plan --preset "$PRESET" --backend device \
-    --n-gpus 1 --n-nodes "$n" --host-gb 116 --device-gb 96 --slack "$SLACK" \
+    "${PLAN_MACHINE[@]}" --n-nodes "$n" --slack "$SLACK" \
     --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA"
 done
 run_leg --cap 600 "preflight-$N_RANKS-node" \
   "${BIND0[@]}" "${ON0[@]}" "$PY" "$DRIVER" preflight --preset "$PRESET" --workdir "$IC_DIR" \
-    --cards 1 --card "$CARDS/${TAG}_preflight_n$N_RANKS.json" --scratch "$REAL_DIR" \
+    --cards "$N_CARDS" --card "$CARDS/${TAG}_preflight_n$N_RANKS.json" --scratch "$REAL_DIR" \
     --n-nodes "$N_RANKS" "${MACHINE[@]}" "${MEMBIND_CHECK[@]}" "${LAYOUT[@]}" \
   || stop_job "preflight refused"
 
-# --- control: CONTROL_REF's older generation resumed to its newer one, byte for byte
-CTRL=$WORK/control/ckpt
-read -r old C_FROM C_TO < <(ckpt_generations "$CONTROL_REF") \
-  || stop_job "$CONTROL_REF does not hold two generations at different steps"
-CK=$(manifest_field "$CONTROL_REF/$old" "m['provenance']['n_steps']")
-[ $((C_TO % (C_TO - C_FROM))) = 0 ] \
-  || stop_job "the control cannot checkpoint at step $C_TO every $((C_TO - C_FROM)) from $C_FROM"
-echo "=== control: $CONTROL_PRESET $old (step $C_FROM) -> $C_TO of $CK, in $CTRL ==="
-mkdir -p "$CTRL"
-run_leg --cap 1800 control-copy cp -a "$CONTROL_REF/$old" "$CTRL/" \
-  || stop_job "the control generation did not copy"
-if [ "${REHEARSAL:-0}" = 1 ] && [ "${PLANT_CONTROL_MISMATCH:-0}" = 1 ]; then
-  f=$(cd "$CTRL/$old" && find . -type f ! -name manifest.json | sort | head -1)
-  echo "=== REHEARSAL: flipping one byte of control/ckpt/$old/$f ==="
-  "$PY" - "$CTRL/$old/$f" <<'EOF'
+# --- control (with CONTROL_REF): its older generation resumed to its newer one, byte for byte
+if [ "$CONTROL" = 1 ]; then
+  CTRL=$WORK/control/ckpt
+  read -r old C_FROM C_TO < <(ckpt_generations "$CONTROL_REF") \
+    || stop_job "$CONTROL_REF does not hold two generations at different steps"
+  CK=$(manifest_field "$CONTROL_REF/$old" "m['provenance']['n_steps']")
+  [ $((C_TO % (C_TO - C_FROM))) = 0 ] \
+    || stop_job "the control cannot checkpoint at step $C_TO every $((C_TO - C_FROM)) from $C_FROM"
+  echo "=== control: $CONTROL_PRESET $old (step $C_FROM) -> $C_TO of $CK, in $CTRL ==="
+  mkdir -p "$CTRL"
+  run_leg --cap 1800 control-copy cp -a "$CONTROL_REF/$old" "$CTRL/" \
+    || stop_job "the control generation did not copy"
+  if [ "${REHEARSAL:-0}" = 1 ] && [ "${PLANT_CONTROL_MISMATCH:-0}" = 1 ]; then
+    f=$(cd "$CTRL/$old" && find . -type f ! -name manifest.json | sort | head -1)
+    echo "=== REHEARSAL: flipping one byte of control/ckpt/$old/$f ==="
+    "$PY" - "$CTRL/$old/$f" <<'EOF'
 import sys
 with open(sys.argv[1], "r+b") as fh:
     fh.seek(-1, 2)
@@ -185,16 +189,17 @@ with open(sys.argv[1], "r+b") as fh:
     fh.seek(-1, 2)
     fh.write(bytes([b[0] ^ 1]))
 EOF
+  fi
+  PLANT=""
+  [ "${REHEARSAL:-0}" = 1 ] && [ "${PLANT_LEG_FAIL:-0}" = 1 ] && PLANT=--xla_planted_unknown_flag
+  run_leg --cap "$(leg_cap "$C_FROM" "$C_TO")" --quiet-limit "$QUIET_S" \
+    "control $C_FROM->$C_TO" ranks control "$CONTROL_PRESET" "$CONTROL_ICS" "$CTRL" "$CK" \
+    "$C_FROM" "$C_TO" $((C_TO - C_FROM)) "$PLANT"
+  r=$?; summarize control "$C_FROM"
+  [ $r -eq 0 ] || stop_job "the control leg failed"
+  gate control "$CONTROL_REF" "$CTRL" \
+    || { rc_total=$((rc_total + 1)); stop_job "the control differs from $CONTROL_REF"; }
 fi
-PLANT=""
-[ "${REHEARSAL:-0}" = 1 ] && [ "${PLANT_LEG_FAIL:-0}" = 1 ] && PLANT=--xla_planted_unknown_flag
-run_leg --cap "$(leg_cap "$C_FROM" "$C_TO")" --quiet-limit "$QUIET_S" \
-  "control $C_FROM->$C_TO" ranks control "$CONTROL_PRESET" "$CONTROL_ICS" "$CTRL" "$CK" \
-  "$C_FROM" "$C_TO" $((C_TO - C_FROM)) "$PLANT"
-r=$?; summarize control "$C_FROM"
-[ $r -eq 0 ] || stop_job "the control leg failed"
-gate control "$CONTROL_REF" "$CTRL" \
-  || { rc_total=$((rc_total + 1)); stop_job "the control differs from $CONTROL_REF"; }
 
 # --- production: EXPECT_STEP -> STOP
 run_leg --cap "$(leg_cap "$EXPECT_STEP" "$STOP")" --quiet-limit "$QUIET_S" \

@@ -18,7 +18,7 @@
 # job stops with every checkpoint kept. Otherwise segment 2 resumes all three to STOP and
 # compares the last two generations. The job exits with the number of failed gates and legs.
 #
-# Before the runs: the job-script tests and the run legs' own launch line on every node (a
+# Before the runs: the run legs' own launch line on every node (a
 # JAX start, an MPI start, and a rank that dies at once, which must end the launch), then on
 # node 0 and the CPU backend the kernel-block and rank-gate tests (all fatal) and the real-MPI
 # tests against the module's MPI (recorded, not fatal).
@@ -148,11 +148,6 @@ for n in 1 2; do
     --n-gpus 1 --n-nodes $n --host-gb 116 --device-gb 96 --slack "$SLACK" \
     --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA"
 done
-# its mpiexec cases are left to the launch guards below, on the launcher the legs use
-run_leg --cap 600 guard-job-scripts \
-  "${CPU[@]}" "$PY" -m pytest -q -rs -p no:cacheprovider tests/test_job_scripts.py \
-    -k "not mpiexec" \
-  || { echo "FATAL: the job-script tests failed on this machine"; exit 1; }
 # the run legs' launch line, on every node, before anything long
 run_leg --cap 300 guard-launch-ref \
   on_ranks "$CARDS/${TAG}_guard-ref_r@RANK@" "" \

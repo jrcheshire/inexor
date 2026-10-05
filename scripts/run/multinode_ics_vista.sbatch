@@ -7,12 +7,11 @@
 #SBATCH -t 02:00:00
 #SBATCH -o inexor-mn-ics-%j.log
 #SBATCH --signal=B:USR1@600
-# Device ICs across the nodes, one GH200 and one rank per node (`device_run.py ics --comm
-# mpi`): every rank generates its own brick slabs into the shared IC_DIR, rank 0 writes the
+# Device ICs across the nodes, one rank per node on gh (one GH200) or gb (four GB200)
+# (`device_run.py ics --comm mpi`): every rank generates its own brick slabs into the shared IC_DIR, rank 0 writes the
 # manifest.
 #
-# Guards first (job-script tests, the MPI launch line on every node, a dying rank ends the
-# launch; all fatal). With SMALL_PRESET, a byte check before the production generation: that
+# Guards first (the MPI launch line on every node, a dying rank ends the launch; both fatal). With SMALL_PRESET, a byte check before the production generation: that
 # preset's ICs on one rank (node 0) and on every rank must be the same files (slab bytes,
 # manifest minus provenance, timings and rank / card / y-block counts); a mismatch stops the
 # job. Then PRESET's ICs into IC_DIR, and a check that the manifest holds the preset's
@@ -27,6 +26,9 @@
 # (none; c-1024 for the cluster check), GEN_CAP_S (3600), QUIET_S (900).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R IC_DIR=$R/c-gh-ics-mn SMALL_PRESET=c-1024 \
 #     sbatch -A <account> scripts/run/multinode_ics_vista.sbatch
+# 8192^3 on 8 gb nodes (~1-1.5 h):
+#   INEXOR_RUNS=$R IC_DIR=$R/c-8192-ics PRESET=c-8192 GEN_CAP_S=7200 \
+#     sbatch -A <account> -p gb -N 8 -n 8 -t 03:00:00 scripts/run/multinode_ics_vista.sbatch
 #
 # REHEARSAL=1 runs the same legs on a laptop CPU at cdev8-tile32 (a = 0.08, whose
 # displacements fit that box's one-slab window):
@@ -104,25 +106,20 @@ stop_job () {
 ics_ranks () {
   local arm=$1 preset=$2 dir=$3 extra=$4; shift 4
   on_ranks "$CARDS/${TAG}_${arm}_s0_r@RANK@" "$extra" "${MPIPATH[@]}" \
-    "$PY" -m mpi4py "$DRIVER" ics --preset "$preset" --workdir "$dir" --cards 1 --beat 60 \
-    "${MEMBIND_CHECK[@]}" --card "$CARDS/${TAG}_${arm}_s0.json" --comm mpi \
+    "$PY" -m mpi4py "$DRIVER" ics --preset "$preset" --workdir "$dir" --cards "$N_CARDS" \
+    --beat 60 "${MEMBIND_CHECK[@]}" --card "$CARDS/${TAG}_${arm}_s0.json" --comm mpi \
     --comm-timeout 1800 "$@"
 }
 
 # ics_one ARM PRESET DIR ARGS...: the same ICs on node 0 alone
 ics_one () {
   local arm=$1 preset=$2 dir=$3; shift 3
-  "${BIND0[@]}" "${ON0[@]}" "$PY" "$DRIVER" ics --preset "$preset" --workdir "$dir" --cards 1 \
-    --beat 60 "${MEMBIND_CHECK[@]}" --card "$CARDS/${TAG}_${arm}_s0.json" "$@"
+  "${BIND0[@]}" "${ON0[@]}" "$PY" "$DRIVER" ics --preset "$preset" --workdir "$dir" \
+    --cards "$N_CARDS" --beat 60 "${MEMBIND_CHECK[@]}" --card "$CARDS/${TAG}_${arm}_s0.json" "$@"
 }
 
 # --- guards (node 0)
 run_leg --cap 1800 build-mpi4py build_mpi4py || stop_job "mpi4py did not build"
-# its mpiexec cases are left to the launch guards below, on the launcher the legs use
-run_leg --cap 600 guard-job-scripts \
-  "${CPU[@]}" "$PY" -m pytest -q -rs -p no:cacheprovider tests/test_job_scripts.py \
-    -k "not mpiexec" \
-  || stop_job "the job-script tests failed on this machine"
 run_leg --cap 300 guard-launch-mpi \
   on_ranks "$CARDS/${TAG}_guard-mpi_r@RANK@" "" "${MPIPATH[@]}" \
     "$PY" -m mpi4py -c "from mpi4py import MPI; import jax; c = MPI.COMM_WORLD

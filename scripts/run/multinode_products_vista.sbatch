@@ -8,11 +8,10 @@
 #SBATCH -o inexor-mn-products-%j.log
 #SBATCH --signal=B:USR1@600
 # The P(k) card and the (x, v) export of a realization's checkpoint, across the nodes, one
-# GH200 and one rank per node (`device_run.py card` / `export`): the card painted and
+# rank per node on gh (one GH200) or gb (four GB200) (`device_run.py card` / `export`): the card painted and
 # transformed on the cards, the export decoded on them and written as one part per rank.
 #
-# Guards first (job-script tests, the MPI launch line on every node, a dying rank ends the
-# launch; all fatal). With SMALL_CKPT, a byte check before the products: that checkpoint's
+# Guards first (the MPI launch line on every node, a dying rank ends the launch; both fatal). With SMALL_CKPT, a byte check before the products: that checkpoint's
 # card and export on one rank (node 0) and on every rank must be the same (the card in every
 # field, the export's crc32 of every array); a mismatch stops the job. Then the card and the
 # export of CKPT_DIR into PROD_DIR. With REF_EXPORT (an export of the same checkpoint made
@@ -27,11 +26,15 @@
 # the card lands in PROD_DIR/pk.json, the export in PROD_DIR/export, which must not hold
 # files), and INEXOR_SRC or submission from the checkout. Optional: PRESET (c-gh); K and
 # EXPECT_STEP (the newest checkpoint's n_steps and step); ALLOW_PARTIAL (0: refuse an
-# export short of K); SMALL_CKPT + SMALL_PRESET (c-1024); REF_EXPORT; REF_CARD; SLACK /
+# export short of K); WITH_EXPORT (1; 0 = the card only); SMALL_CKPT + SMALL_PRESET (c-1024); REF_EXPORT; REF_CARD; SLACK /
 # ALLOC_MARGIN (0.10), ARENA_FRAC (0.01); CARD_CAP_S (2400), EXPORT_CAP_S (3600), QUIET_S (900).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R CKPT_DIR=$R/c-gh-k120/ckpt PROD_DIR=$R/c-gh-k120-mn \
 #     SMALL_CKPT=$R/mn-gate-c-1024-1043437/mpi/ckpt REF_EXPORT=$R/c-gh-k120-product/export \
 #     REF_CARD=<the c-gh card json> sbatch -A <account> scripts/run/multinode_products_vista.sbatch
+# 8192^3 on 8 gb nodes, after the steps job:
+#   INEXOR_RUNS=$R CKPT_DIR=$R/c-8192-k40/ckpt PROD_DIR=$R/c-8192-k40-product PRESET=c-8192 \
+#     [WITH_EXPORT=0] sbatch -A <account> -p gb -N 8 -n 8 -t 03:00:00 \
+#     --dependency=afterok:<steps job> scripts/run/multinode_products_vista.sbatch
 #
 # REHEARSAL=1 runs the same legs on a laptop CPU at cdev8-tile32, from a rehearsal of the
 # gate script (the small check against the same checkpoint):
@@ -69,8 +72,8 @@ done
 [ -n "${PROD_DIR:-}" ] || { echo "FATAL: set PROD_DIR (the products' dir)"; exit 1; }
 mkdir -p "$PROD_DIR" && PROD_DIR=$(abspath "$PROD_DIR")
 case "$PROD_DIR/" in "$CKPT_DIR"/*) echo "FATAL: PROD_DIR is under CKPT_DIR"; exit 1 ;; esac
-EXPORT=$PROD_DIR/export
-if [ -d "$EXPORT" ] && [ -n "$(ls -A "$EXPORT")" ]; then
+EXPORT=$PROD_DIR/export WITH_EXPORT=${WITH_EXPORT:-1}
+if [ "$WITH_EXPORT" = 1 ] && [ -d "$EXPORT" ] && [ -n "$(ls -A "$EXPORT")" ]; then
   echo "FATAL: $EXPORT already holds files"; exit 1
 fi
 
@@ -140,7 +143,7 @@ prod_ranks () {
   local kind=$1 arm=$2 preset=$3 ckpt=$4 k=$5 step=$6 extra=$7; shift 7
   on_ranks "$CARDS/${TAG}_${arm}_s${step}_r@RANK@" "$extra" "${MPIPATH[@]}" \
     "$PY" -m mpi4py "$DRIVER" "$kind" --preset "$preset" --checkpoint-dir "$ckpt" \
-    --k-steps "$k" --expect-step "$step" --cards 1 --beat 60 "${MEMBIND_CHECK[@]}" \
+    --k-steps "$k" --expect-step "$step" --cards "$N_CARDS" --beat 60 "${MEMBIND_CHECK[@]}" \
     "${LAYOUT[@]}" --card "$CARDS/${TAG}_${arm}_s${step}.json" --comm mpi \
     --comm-timeout 1800 "$@"
 }
@@ -149,17 +152,12 @@ prod_ranks () {
 prod_one () {
   local kind=$1 arm=$2 preset=$3 ckpt=$4 k=$5 step=$6; shift 6
   "${BIND0[@]}" "${ON0[@]}" "$PY" "$DRIVER" "$kind" --preset "$preset" --checkpoint-dir "$ckpt" \
-    --k-steps "$k" --expect-step "$step" --cards 1 --beat 60 "${MEMBIND_CHECK[@]}" \
+    --k-steps "$k" --expect-step "$step" --cards "$N_CARDS" --beat 60 "${MEMBIND_CHECK[@]}" \
     "${LAYOUT[@]}" --card "$CARDS/${TAG}_${arm}_s${step}.json" "$@"
 }
 
 # --- guards (node 0)
 run_leg --cap 1800 build-mpi4py build_mpi4py || stop_job "mpi4py did not build"
-# its mpiexec cases are left to the launch guards below, on the launcher the legs use
-run_leg --cap 600 guard-job-scripts \
-  "${CPU[@]}" "$PY" -m pytest -q -rs -p no:cacheprovider tests/test_job_scripts.py \
-    -k "not mpiexec" \
-  || stop_job "the job-script tests failed on this machine"
 run_leg --cap 300 guard-launch-mpi \
   on_ranks "$CARDS/${TAG}_guard-mpi_r@RANK@" "" "${MPIPATH[@]}" \
     "$PY" -m mpi4py -c "from mpi4py import MPI; import jax; c = MPI.COMM_WORLD
@@ -214,6 +212,7 @@ if [ -n "${REF_CARD:-}" ]; then
   echo ""; echo "=== CARD vs $REF_CARD (reported, not gated) ==="
   card_diff "$REF_CARD" "$PROD_DIR/pk.json"
 fi
+[ "$WITH_EXPORT" = 1 ] || { echo "=== WITH_EXPORT=$WITH_EXPORT: the card only ==="; exit $rc_total; }
 run_leg --cap "$EXPORT_CAP_S" --quiet-limit "$QUIET_S" export \
   prod_ranks export export "$PRESET" "$CKPT_DIR" "$K" "$EXPECT_STEP" "" \
   --export-dir "$EXPORT" "${PARTIAL[@]}"

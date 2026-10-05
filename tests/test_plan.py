@@ -925,8 +925,9 @@ def test_the_automatic_y_block_count_keeps_every_unit_within_a_4096_cubed_slab(c
     from inexor.ooc_fft import partition_units
     from inexor.plan import engine_config
 
-    for preset in PRESETS:
-        assert engine_config(preset, migrate_backend="device").device_y_blocks == 1, preset
+    for preset, g in PRESETS.items():
+        want = 1 if g["n_part"] <= 4096 else 4
+        assert engine_config(preset, migrate_backend="device").device_y_blocks == want, preset
     assert engine_config("c-hero", migrate_backend="device", device_y_blocks=3).device_y_blocks == 3
     ec = EngineConfig(box_size=4096.0, n_part=8192, n_fine=16384, n_coarse=4096, n_tile=512,
                       b_fine=32, migrate_backend="device")

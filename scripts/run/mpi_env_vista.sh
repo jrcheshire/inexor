@@ -1,7 +1,7 @@
 # shellcheck shell=bash disable=SC2034  # sourced: the variables are for the sourcing script
 # Sourced by the multi-node job scripts, from the inexor checkout: the machine and MPI launch
-# environment on Vista gh (one GH200 per node), one rank per node under ibrun, host MPI from
-# the MVAPICH-Plus module.
+# environment on Vista gh (one GH200 per node) or gb (four GB200 per node, two CPU memory
+# nodes), one rank per node under ibrun, host MPI from the MVAPICH-Plus module.
 #
 # Requires SRC (the checkout) and RUNS (the run root); reads N_RANKS (2) and REHEARSAL. Sets:
 #   PY             the gpu env's python (the laptop's in a rehearsal)
@@ -11,6 +11,8 @@
 #   BIND0          the numactl prefix of a node-0 process (ICs, preflight)
 #   MEMBIND_RANK   rank_exec.sh's binding of each rank; MEMBIND_CHECK the driver's check of it
 #   MACHINE        the preflight's host and card sizes
+#   N_CARDS        GPUs per rank: 1 on gh, 4 on gb (a rehearsal: 1)
+#   PLAN_MACHINE   the planner's per-node GPU count and host / card sizes (a rehearsal: gh's)
 #   ON0, CPU       `env` prefixes: node 0's compile cache; the CPU backend
 #   DRIVER, RANK_EXEC  scripts/run/device_run.py and scripts/run/rank_exec.sh
 # exports the XLA / JAX variables of a GPU leg and a per-rank JAX_COMPILATION_CACHE_DIR
@@ -46,18 +48,26 @@ STUB
   export PATH="$STUBS:$PATH"
   # MEMBIND_CHECK stays off: the driver's binding check reads Linux /proc
   BIND0=(numactl --membind=0) MEMBIND_RANK=(--membind 0) MEMBIND_CHECK=() MACHINE=(--allow-cpu)
+  N_CARDS=1 PLAN_MACHINE=(--n-gpus 1 --host-gb 116 --device-gb 96)
 
   LAUNCH="mpiexec -n $N_RANKS"
   MPI4PY_DIR=""
   build_mpi4py () { echo "rehearsal: mpi4py from the env"; }
 else
-  [ "$SLURM_JOB_PARTITION" = gh ] || { echo "FATAL: gh only (one GH200 per node)"; exit 1; }
+  case "$SLURM_JOB_PARTITION" in
+    gh|gb) ;;
+    *) echo "FATAL: partition $SLURM_JOB_PARTITION is not gh or gb"; exit 1 ;;
+  esac
   command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
   export XLA_PYTHON_CLIENT_PREALLOCATE=false
   export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
   export XLA_CLIENT_MEM_FRACTION=0.95
   # JAX's default host-memory cap is 64 GB, below what host streaming needs here
-  export XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=160
+  if [ "$SLURM_JOB_PARTITION" = gb ]; then
+    export XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=900
+  else
+    export XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=160
+  fi
   export INEXOR_LOAD_TRACE=1
   export JAX_LOG_COMPILES=1
   unset JAX_PLATFORMS CUDA_VISIBLE_DEVICES XLA_FLAGS
@@ -65,8 +75,16 @@ else
   PY=$ENV/bin/python3.14  # the versioned launcher: a scratch purge can take `python`
   [ -x "$PY" ] || { echo "FATAL: no $PY (install the gpu env first)"; exit 1; }
   export CONDA_PREFIX=$ENV
-  BIND0=(numactl --membind=0) MEMBIND_RANK=(--membind 0) MEMBIND_CHECK=(--membind-nodes 0)
-  MACHINE=(--host-gb 116 --device-gb 96)
+  # host memory on the CPU nodes only (gb: 0 and 1; the GPUs' HBM nodes stay free)
+  # shellcheck disable=SC2054  # "0,1" is one numactl node list
+  if [ "$SLURM_JOB_PARTITION" = gb ]; then
+    BIND0=(numactl --membind=0,1) MEMBIND_RANK=(--membind 0,1)
+    MEMBIND_CHECK=(--membind-nodes 0,1) MACHINE=(--host-gb 1026 --device-gb 199) N_CARDS=4
+    PLAN_MACHINE=(--n-gpus 4 "${MACHINE[@]}")
+  else
+    BIND0=(numactl --membind=0) MEMBIND_RANK=(--membind 0) MEMBIND_CHECK=(--membind-nodes 0)
+    MACHINE=(--host-gb 116 --device-gb 96) N_CARDS=1 PLAN_MACHINE=(--n-gpus 1 "${MACHINE[@]}")
+  fi
 
   type module >/dev/null 2>&1 || . /etc/profile  # a non-interactive submission shell
   MPI_MODULE=${MPI_MODULE:-mvapich-plus/5.1.0}

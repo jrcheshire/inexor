@@ -51,7 +51,8 @@ def test_tile_brick_ids_are_the_triple_loop(name):
         np.testing.assert_array_equal(got, _loop_bricks(t, *g, nb))
 
 
-@pytest.mark.parametrize("name", sorted(PRESETS))
+# a whole brick grid of int64 counts: 1 GB at 8192^3, so presets up to 4096^3
+@pytest.mark.parametrize("name", sorted(n for n, g in PRESETS.items() if g["n_part"] <= 4096))
 def test_window_counts_are_the_per_brick_sums(name):
     cfg, g, nb = _geom(name)
     rng = np.random.default_rng(1)

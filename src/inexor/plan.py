@@ -28,6 +28,7 @@ PRESETS = {
     "c-1024": dict(n_part=1024, box=512.0, n_fine=2048, n_coarse=512, tile=256, buf=32),
     "c-gh": dict(n_part=2048, box=1024.0, n_fine=4096, n_coarse=1024, tile=256, buf=32),
     "c-hero": dict(n_part=4096, box=2048.0, n_fine=8192, n_coarse=2048, tile=512, buf=32),
+    "c-8192": dict(n_part=8192, box=4096.0, n_fine=16384, n_coarse=4096, tile=512, buf=32),
 }
 
 GB = 1e9
