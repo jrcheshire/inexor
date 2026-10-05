@@ -214,10 +214,11 @@ GEN_N, GEN_NB, GEN_BOX = 64, 8, 32.0
 # its largest velocity sits at plane 41, on a rank other than 0 at 2, 3 and 4 ranks, so a
 # rank-local maximum (the manifest's vel_scale comes from rank 0) changes the bytes
 GEN_SEED = 10
-IGNORED = ("provenance", "stage_s", "emission_s", "n_devices", "n_ranks", "stage_cleanup")
+IGNORED = ("provenance", "stage_s", "emission_s", "n_devices", "n_ranks", "stage_cleanup",
+           "emission_y_blocks")
 
 
-def _generate(workdir, comm, devs, f_NL=0.0, window=1, batch=3, log=None):
+def _generate(workdir, comm, devs, f_NL=0.0, window=1, batch=3, log=None, y_blocks=1):
     from inexor import icgen
     from inexor.config import Cosmology
 
@@ -225,7 +226,8 @@ def _generate(workdir, comm, devs, f_NL=0.0, window=1, batch=3, log=None):
 
     return icgen.generate_t9_slabs_device(
         str(workdir), jax.random.PRNGKey(GEN_SEED), GEN_N, GEN_BOX, Cosmology(), 0.1, GEN_NB,
-        f_NL=f_NL, window=window, devices=devs, comm=comm, batch_planes=batch, log=log)
+        f_NL=f_NL, window=window, devices=devs, comm=comm, batch_planes=batch, log=log,
+        emit_y_blocks=y_blocks)
 
 
 def _ic_dir(d):
@@ -251,17 +253,18 @@ def one_rank_ics(tmp_path_factory):
     return out
 
 
-@pytest.mark.parametrize("n_ranks,cards,batch,f_NL,window", [
-    (1, 2, 3, 0.0, 1), (2, 1, 1, 0.0, 1), (2, 2, 3, 0.5, 1), (3, 1, 64, 0.5, 1),
-    (4, 2, 5, 0.0, 1), (4, 1, 3, 0.5, 1), (2, 2, 3, 0.0, 2), (4, 2, 2, 0.0, 2)])
+@pytest.mark.parametrize("n_ranks,cards,batch,f_NL,window,y_blocks", [
+    (1, 2, 3, 0.0, 1, 1), (2, 1, 1, 0.0, 1, 1), (2, 2, 3, 0.5, 1, 1), (3, 1, 64, 0.5, 1, 1),
+    (4, 2, 5, 0.0, 1, 1), (4, 1, 3, 0.5, 1, 1), (2, 2, 3, 0.0, 2, 1), (4, 2, 2, 0.0, 2, 1),
+    (1, 1, 3, 0.0, 1, 4), (2, 2, 3, 0.5, 1, 3), (3, 1, 5, 0.0, 2, 8)])
 def test_rank_ics_are_the_one_rank_ics(one_rank_ics, tmp_path, n_ranks, cards, batch, f_NL,
-                                       window):
+                                       window, y_blocks):
     files, man = one_rank_ics[(f_NL, window)]
     assert len(files) == GEN_NB and man["n_particles"] == GEN_N**3
 
     def rank(c):
         return _generate(tmp_path, c, _devs(c.rank, cards), f_NL=f_NL, window=window,
-                         batch=batch)
+                         batch=batch, y_blocks=y_blocks)
 
     mans = run_loopback(n_ranks, rank, timeout=300.0)
     assert all(m == mans[0] for m in mans)

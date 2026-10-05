@@ -1610,10 +1610,14 @@ class StagedArray:
 
     def read_slab(self, lo, hi):
         lo, hi = int(lo), int(hi)
+        out = np.empty((hi - lo,) + self.shape[1:], dtype=self.dtype)
         with open(self.path, "rb") as fh:
             fh.seek(self._data0 + self._row * lo)
-            buf = fh.read(self._row * (hi - lo))
-        return np.frombuffer(buf, dtype=self.dtype).reshape((hi - lo,) + self.shape[1:]).copy()
+            # straight into the result: one allocation, not a bytes buffer plus its copy
+            got = fh.readinto(memoryview(out).cast("B"))
+        if got != out.nbytes:
+            raise EOFError(f"{self.path}: read {got} of {out.nbytes} bytes at plane {lo}")
+        return out
 
 
 # ---------------------------------------------------------------------------

@@ -288,10 +288,12 @@ def _write_t9_slab(workdir, d, occ, off, w, scale_d, lo_bucket, lo_brick):
         bucket_lo=int(lo_bucket),
         brick_lo=int(lo_brick),
         crc32=dict(
-            occupancy=zlib.crc32(occ.tobytes()),
-            off=zlib.crc32(off.tobytes()),
-            w=zlib.crc32(w.tobytes()),
-            scale=zlib.crc32(scale_d.tobytes()),
+            # the arrays' own buffers, not `tobytes()` copies (a slab's codes are ~10 GB at
+            # 8192^3); the same crc
+            occupancy=zlib.crc32(np.ascontiguousarray(occ)),
+            off=zlib.crc32(np.ascontiguousarray(off)),
+            w=zlib.crc32(np.ascontiguousarray(w)),
+            scale=zlib.crc32(np.ascontiguousarray(scale_d)),
         ),
     )
     path = os.path.join(workdir, f"t9_slab_{int(d):04d}.npz")
@@ -398,22 +400,6 @@ class _HostField:
         return self.arr[lo:hi]
 
 
-class _CardField:
-    """`read_slab` over card shards tiling x-planes [0, N) (`{lo, hi, delta}` dicts)."""
-
-    def __init__(self, shards):
-        self.shards = sorted(shards, key=lambda s: int(s["lo"]))
-
-    def read_slab(self, lo, hi):
-        parts = []
-        for s in self.shards:
-            s_lo, s_hi = int(s["lo"]), int(s["hi"])
-            a, b = max(lo, s_lo), min(hi, s_hi)
-            if a < b:
-                parts.append(np.asarray(s["delta"][a - s_lo:b - s_lo]))
-        return parts[0] if len(parts) == 1 else np.concatenate(parts)
-
-
 def generate_t9_slabs_device(
     workdir,
     key,
@@ -440,6 +426,7 @@ def generate_t9_slabs_device(
     emission="cards",
     comm=None,
     batch_planes=ooc_fft.DEFAULT_BATCH_PLANES,
+    emit_y_blocks=1,
 ):
     """`generate_t9_slabs` with the IC stage on the devices. Same arguments and output format.
 
@@ -459,6 +446,11 @@ def generate_t9_slabs_device(
     files at any rank and card count (the manifest adds `n_ranks`); one rank runs the
     same code with no exchange. Across ranks only `noise="device"` and
     `emission="cards"` are supported.
+
+    U_y and U_z (and U_x, moved off the cards before the emission) keep their own planes in
+    a spent spectrum's bytes. `emit_y_blocks` encodes each destination slab in that many
+    y-blocks on the cards (`device.emit`; same bytes at any count, recorded in the manifest
+    when > 1), which bounds a card's emission memory by a slab's y-block, not the slab.
     Differences from the host path: kernels are applied on the device inside the axis-0 pass;
     the phi round trip is skipped at f_NL = 0; the 2LPT source is
     1/2 (delta^2 - sum phi_ii^2) - sum_{i<j} phi_ij^2 (using sum phi_ii = -delta); U and V are
@@ -658,74 +650,76 @@ def generate_t9_slabs_device(
     vmax = comm.allreduce(max(vmax_card), "max")
     _lap("velocities", t0)
 
-    # U = D1 psi1 - D2 psi2: x on the devices, y and z on the host (with halo)
+    # U = D1 psi1 - D2 psi2: x on the devices for now, y and z on the host (with halo)
     t0 = time.perf_counter()
     ooc_fft.kspace_pass_device([(D1, spec), (-D2, spec2)], n, box, out=spec, transform=False,
                                **pkw)
-    del spec2
+    spare, spec2 = spec2, None  # its bytes take U_y
     work = ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(0), out=work,
                                       inverse=True, **pkw)
-    if emission == "cards":
-        # each card's destination slabs plus `window` brick slabs of halo either side
-        from .device import emit as demit
+    # each card's destination slabs plus `window` brick slabs of halo either side
+    from .device import emit as demit
 
-        ux = demit.card_slab_ranges(n, nb, devs, window, slabs=slab_parts[rank])
-        set_plane = ooc_fft._card_program(("plane_set",), lambda: jax.jit(
-            lambda m, i, q: m.at[i].set(q), donate_argnums=0))
-        for r in ux:
-            r["delta"] = jax.jit(lambda z, shape=(int(r["nx"]), n, n): jnp.broadcast_to(z, shape))(
-                put(np.zeros((), dtype=dt), r["device"]))
+    ux_cards = demit.card_slab_ranges(n, nb, devs, window, slabs=slab_parts[rank])
+    set_plane = ooc_fft._card_program(("plane_set",), lambda: jax.jit(
+        lambda m, i, q: m.at[i].set(q), donate_argnums=0))
+    for r in ux_cards:
+        r["delta"] = jax.jit(lambda z, shape=(int(r["nx"]), n, n): jnp.broadcast_to(z, shape))(
+            put(np.zeros((), dtype=dt), r["device"]))
 
-        def to_ux(k, i, g, sp):
-            ux[k]["delta"] = set_plane(ux[k]["delta"], put(np.int64(i), ux[k]["device"]),
-                                       irfft2_plane(sp)[0])
+    def to_ux(k, i, g, sp):
+        ux_cards[k]["delta"] = set_plane(ux_cards[k]["delta"],
+                                         put(np.int64(i), ux_cards[k]["device"]),
+                                         irfft2_plane(sp)[0])
 
-        ooc_fft.inverse_pencils_to_planes(work, n, [(r["x0"], r["nx"], r["device"])
-                                                    for r in ux], y_parts, to_ux, **xkw)
-    else:
-        ranges = ooc_fft.partition_units(n, len(devs), 1)
-        arrays = ooc_fft.inverse_to_card_shards(
-            work, n, [(lo, hi - lo, d) for (lo, hi), d in zip(ranges, devs)],
-            pencil_batch=pencil_batch, pass2=False)
-        ux = [dict(lo=lo, hi=hi, device=d, delta=a)
-              for ((lo, hi), d), a in zip(zip(ranges, devs), arrays)]
-        del arrays
-    umax = max(float(np.asarray(jax.numpy.max(jax.numpy.abs(s["delta"])))) for s in ux)
+    ooc_fft.inverse_pencils_to_planes(work, n, [(r["x0"], r["nx"], r["device"])
+                                                for r in ux_cards], y_parts, to_ux, **xkw)
+    umax = max(float(np.asarray(jax.numpy.max(jax.numpy.abs(r["delta"])))) for r in ux_cards)
 
-    # U_y, U_z: this rank's planes plus `window` brick slabs either side (all planes when
-    # that covers the box), read by global plane
+    # the host windows: this rank's planes plus `window` brick slabs either side (all planes
+    # when that covers the box), read by global plane
     h = window * p
     w_lo, w_n = (0, n) if x_hi - x_lo + 2 * h >= n else ((x_lo - h) % n, x_hi - x_lo + 2 * h)
     w_cards = [(w_lo + a, z - a, d) for (a, z), d in
                zip(ooc_fft.partition_units(w_n, len(devs), 1), devs)]
     umax_card = [0.0] * len(devs)
 
-    def host_window(field, buf=None):
+    def host_window(field):
         def to_host(k, i, g, sp):
             pl = np.asarray(irfft2_plane(sp))[0]
-            field.arr[(g - field.lo) % n] = pl
+            field.set_plane(g, pl)
             if x_lo <= g < x_hi:
                 umax_card[k] = max(umax_card[k], float(np.max(np.abs(pl))))
         return to_host
 
-    uy = _PlaneWindow(np.empty((w_n, n, n), dtype=dt), w_lo, n)
+    uy = _PlaneWindow(n, x_lo, x_hi, h, dt, core_bytes=spare)
+    del spare
     work = ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(1), out=work,
                                       inverse=True, **pkw)
     ooc_fft.inverse_pencils_to_planes(work, n, w_cards, y_parts, host_window(uy), **xkw)
 
-    # U_z reuses `work`'s bytes when they hold it (n^2 (n/2+1) x 2w >= n^3 x w at one rank):
-    # a device array uploaded from a slice of `work` can keep the buffer alive, so a fresh
-    # allocation could hold a 4th field
-    need = w_n * n * n * dt.itemsize
-    flat = work.reshape(-1).view(np.uint8)
-    uz_arr = (flat[:need].view(dt).reshape(w_n, n, n) if flat.size >= need
-              else np.empty((w_n, n, n), dtype=dt))
-    uz = _PlaneWindow(uz_arr, w_lo, n)
-    del work, flat
+    # U_z takes `work`'s bytes: a device array uploaded from a slice of `work` can keep the
+    # buffer alive, so a fresh allocation could hold a 4th field
+    uz = _PlaneWindow(n, x_lo, x_hi, h, dt, core_bytes=work)
+    del work
     ooc_fft.kspace_pass_device([(1.0, spec)], n, box, kernel=K.grad_invk2(2), out=spec,
                                inverse=True, **pkw)
     ooc_fft.inverse_pencils_to_planes(spec, n, w_cards, y_parts, host_window(uz), **xkw)
+
+    # U_x off the cards into the last spectrum's bytes, so the emission's cards hold only
+    # its own programs
+    ux = _PlaneWindow(n, x_lo, x_hi, h, dt, core_bytes=spec)
     del spec
+    for g in ux.planes():
+        for r in ux_cards:
+            i = (g - int(r["x0"])) % n
+            if i < int(r["nx"]):
+                ux.set_plane(g, np.asarray(r["delta"][i]))
+                break
+        else:
+            raise RuntimeError(f"no card holds U_x plane {g}")
+    for r in ux_cards:
+        del r["delta"]
     umax = comm.allreduce(max([umax] + umax_card), "max")
     _lap("displacements", t0)
 
@@ -748,11 +742,11 @@ def generate_t9_slabs_device(
     emission_s = {}
     if emission == "cards":
         written, n_local = demit.emit_t9_slabs_cards(
-            workdir, ux, uy, uz, v_ro, t9, n, box, nb, dt, window, timings=emission_s,
-            complete=n_ranks == 1)
+            workdir, ux_cards, ux, uy, uz, v_ro, t9, n, box, nb, dt, window,
+            timings=emission_s, complete=n_ranks == 1, y_blocks=emit_y_blocks)
     else:
         written, n_local = _emit_t9_slabs(
-            workdir, [_CardField(ux), uy, uz], v_ro, t9, n, box, nb, dt, slab, window)
+            workdir, [ux, uy, uz], v_ro, t9, n, box, nb, dt, slab, window)
     ux = uy = uz = None
     n_total = int(comm.allreduce(int(n_local)))
     # each rank's files in its emitter's order, ranks in order (one rank: the emitter's list)
@@ -797,27 +791,62 @@ def generate_t9_slabs_device(
         )
         if n_ranks > 1:
             manifest["n_ranks"] = n_ranks
+        if int(emit_y_blocks) > 1:
+            manifest["emission_y_blocks"] = int(emit_y_blocks)
         manifest = _write_manifest(workdir, manifest, keep_stage)
     return comm.bcast(manifest)
 
 
 class _PlaneWindow:
-    """Host planes `lo .. lo + len(arr) - 1` (mod n) of a field, sliced by global plane
-    (`[g0:g1]`, a run inside the window), as the emission reads U_y and U_z."""
+    """Host planes of a field around one rank's planes [lo, hi), read by global plane.
 
-    def __init__(self, arr, lo, n):
-        self.arr, self.lo, self.n = arr, int(lo), int(n)
+    The rank's planes sit in one array, a view of `core_bytes` (a spent spectrum) when it is
+    large enough, and `halo` planes either side in arrays of their own; when that reaches
+    every plane, all `n` planes sit in one array. `w[g0:g1]` returns a run inside one piece
+    (the emission reads runs inside one source slab, and the pieces are whole slabs).
+    """
+
+    def __init__(self, n, lo, hi, halo, dtype, core_bytes=None):
+        self.n = n = int(n)
+        lo, hi, halo, dt = int(lo), int(hi), int(halo), np.dtype(dtype)
+        if hi - lo + 2 * halo >= n:
+            spans = [(0, n, True)]
+        else:
+            spans = [((lo - halo) % n, halo, False), (lo, hi - lo, True), (hi % n, halo, False)]
+        self.pieces = []
+        for start, count, core in spans:
+            if count == 0:
+                continue
+            need = count * n * n * dt.itemsize
+            if core and core_bytes is not None:
+                flat = core_bytes.reshape(-1).view(np.uint8)
+                if flat.size >= need:
+                    self.pieces.append((start, flat[:need].view(dt).reshape(count, n, n)))
+                    continue
+            self.pieces.append((start, np.empty((count, n, n), dtype=dt)))
+
+    def _find(self, g, m):
+        for start, arr in self.pieces:
+            i = (int(g) - start) % self.n
+            if i + m <= len(arr):
+                return arr, i
+        raise IndexError(f"planes [{g}, {g + m}) are not inside one piece of this window")
 
     def __getitem__(self, sl):
-        i0 = (int(sl.start) - self.lo) % self.n
-        i1 = i0 + int(sl.stop) - int(sl.start)
-        if i1 > len(self.arr):
-            raise IndexError(f"planes [{sl.start}, {sl.stop}) are outside this window of "
-                             f"{len(self.arr)} planes from {self.lo}")
-        return self.arr[i0:i1]
+        m = int(sl.stop) - int(sl.start)
+        arr, i = self._find(sl.start, m)
+        return arr[i:i + m]
 
     def read_slab(self, lo, hi):
         return self[lo:hi]
+
+    def set_plane(self, g, plane):
+        arr, i = self._find(g, 1)
+        arr[i] = plane
+
+    def planes(self):
+        """Every global plane the window holds, in window order."""
+        return [(start + i) % self.n for start, arr in self.pieces for i in range(len(arr))]
 
 
 def _check_shared_workdir(workdir, comm):

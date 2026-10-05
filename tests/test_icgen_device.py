@@ -151,11 +151,9 @@ def test_host_allocation_is_what_the_planner_charges():
     column for that stage.
 
     tracemalloc sees numpy, not jax arrays, which is the planner's host column; RSS is not
-    the quantity (on CPU devices it also holds the "cards"). Stages 2-5 must be within
-    [0.9, 1.2] of the planner (measured on four forced host devices at 128^3: 1.07-1.11).
-    The emission stage is checked as measured <= planner only: its per-card copies of each
-    slab's codes back to the host are host allocations on a GPU, but on the CPU backend
-    `np.asarray` aliases the jax buffer and tracemalloc cannot see them.
+    the quantity (on CPU devices it also holds the "cards"). Stages 2-6 must be within
+    [0.9, 1.2] of the planner (four forced host devices at 128^3). The emission's per-card
+    slab codes land in preallocated numpy arrays, so tracemalloc sees them on any backend.
     """
     import tempfile
     import tracemalloc
@@ -184,23 +182,25 @@ def test_host_allocation_is_what_the_planner_charges():
              "emission": "6 "}
     priced = {k: next(v for key, v in host.items() if key.startswith(p))
               for k, p in stage.items()}
-    for k in ("source", "source_forward", "velocities", "displacements"):
-        ratio = peaks[k] / priced[k]
-        assert 0.9 <= ratio <= 1.2, f"stage {k}: numpy peak is {ratio:.2f}x the planner's"
-    assert peaks["emission"] <= priced["emission"], (
-        f"emission: numpy peak {peaks['emission']} > the planner's {priced['emission']}")
+    ratios = {k: peaks[k] / priced[k] for k in stage}
+    for k, ratio in ratios.items():
+        assert 0.9 <= ratio <= 1.2, f"stage {k}: numpy peak is {ratio:.2f}x the planner's " \
+                                    f"({ratios})"
 
 
 def test_the_planner_stage_table_prices_4096_on_a_gb_node():
     host, card, disk = plan.ic_device_stages(4096, n_gpus=4, nb=256)
     field = 4096**3 * 4
     # the design: at most three full-size arrays on the host; on a card, a quarter field
-    # through the transforms and, in card emission, the u_x halo shard plus the source
-    # window and the larger emission program (charged, not measured: the gb emit-shape
-    # leg reads it)
+    # through the transforms and, in card emission, the kept rows of a destination's source
+    # window plus the larger of a chunk's program and one unit's destination program (u_x
+    # stays on the host; charged, not measured: the gb emit-shape leg reads it)
     assert 3 * field <= max(host.values()) < 3.3 * field
-    halo = (256 // 4 + 2) * 16 * 4096**2 * 4
-    assert card["6 emission"] >= halo + 3 * 16 * 4096**2 * plan.EMIT_KEPT_B_PER_ROW
+    rows = 16 * 4096**2
+    kept = 3 * rows * plan.EMIT_KEPT_B_PER_ROW
+    assert card["6 emission"] >= kept + rows * plan.EMIT_DEST_B_PER_ROW
+    _h4, card4, _d4 = plan.ic_device_stages(4096, n_gpus=4, nb=256, emit_y_blocks=4)
+    assert kept < card4["6 emission"] < card["6 emission"]
     assert max(card[k] for k in card if not k.startswith("6")) < 0.27 * field
     assert disk["velocity staging (3 fields)"] == 3 * field
     assert max(host.values()) < 1026e9 and max(card.values()) < 0.9 * 199e9

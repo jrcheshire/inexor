@@ -214,12 +214,12 @@ class _Window:
 def cmd_emit_shape(args):
     """One destination slab of the card emission at production shapes, on ONE card.
 
-    Synthetic fields over its three source slabs only (u within the window, v ~ N(0,1)).
-    Reports the card's peak (`memory_stats`, never reset -- hence its own process), the
-    per-source and per-destination seconds, and projects the whole emission on four
-    cards: the peak with this process's 3-slab u_x shard swapped for the real halo shard,
-    and nb destinations over the cards. rc 3 if the projected card peak exceeds
-    STOP_CARD_FRAC x GB_CARD.
+    Synthetic fields over its three source slabs only (u within the window, v ~ N(0,1)),
+    all on the host as the generator leaves them. Reports the card's peak (`memory_stats`,
+    never reset -- hence its own process), the per-source and per-destination seconds, and
+    projects the whole emission on four cards: the card holds the same programs for every
+    destination, so the peak carries over; nb destinations go over the cards. rc 3 if the
+    projected card peak exceeds STOP_CARD_FRAC x GB_CARD.
     """
     import jax
 
@@ -242,20 +242,19 @@ def cmd_emit_shape(args):
     v = [rng.standard_normal(shape, dtype=np.float32) for _ in range(3)]
     print(f"fields for {g1 - g0} planes of {n}^2: {time.perf_counter() - t0:.0f} s", flush=True)
     dev = jax.devices()[0]
-    shard = dict(lo=d, hi=d + 1, x0=g0, nx=g1 - g0, device=dev,
-                 delta=jax.device_put(u[0], dev))
+    card_range = dict(lo=d, hi=d + 1, device=dev)
     t = {}
     out = tempfile.mkdtemp(dir=args.tmp)
     t0 = time.perf_counter()
-    names, rows = emit.emit_t9_slabs_cards(out, [shard], _Window(u[1], g0), _Window(u[2], g0),
+    names, rows = emit.emit_t9_slabs_cards(out, [card_range], _Window(u[0], g0),
+                                           _Window(u[1], g0), _Window(u[2], g0),
                                            [_Window(a, g0) for a in v], t9, n, box, nb, dt,
-                                           window, timings=t, complete=False)
+                                           window, timings=t, complete=False,
+                                           y_blocks=args.y_blocks)
     wall = time.perf_counter() - t0
     peak = (dev.memory_stats() or {}).get("peak_bytes_in_use")
-    shard_b = (g1 - g0) * n * n * dt.itemsize
-    halo_b = (nb // W + 2 * window) * p * n * n * dt.itemsize
-    proj_peak = None if peak is None else peak - shard_b + halo_b
-    _h, card, _d = ic_device_stages(n, n_gpus=W, nb=nb)
+    proj_peak = peak
+    _h, card, _d = ic_device_stages(n, n_gpus=W, nb=nb, emit_y_blocks=args.y_blocks)
     # per card: nb/W destinations and nb/W + 2*window sources; the first call compiled
     dest_each = t["dest_s"] + t["write_s"]
     src_each = (t["source_s"] + t["upload_s"]) / (2 * window + 1)
@@ -426,6 +425,8 @@ def main():
     p = sub.add_parser("emit-shape")
     p.add_argument("--n", type=int, default=4096)
     p.add_argument("--nb", type=int, default=256)
+    p.add_argument("--y-blocks", type=int, default=1,
+                   help="y-block units per destination slab (bitwise any count)")
     p.add_argument("--out", required=True)
     p.add_argument("--tmp", default=None)
     p = sub.add_parser("project")

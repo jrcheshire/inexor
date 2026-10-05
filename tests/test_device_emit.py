@@ -53,15 +53,16 @@ def _host(tmp, u, v, t9, n, box, nb, dt):
     return d, written, total
 
 
-def _cards(tmp, u, v, t9, n, box, nb, dt, w, name="cards", planes=emit.PLANES_PER_CALL):
+def _cards(tmp, u, v, t9, n, box, nb, dt, w, name="cards", planes=emit.PLANES_PER_CALL,
+           y_blocks=1):
     d = str(tmp / name)
     os.makedirs(d)
-    shards = emit.shards_from_host(u[0], emit.card_slab_ranges(n, nb, _devices(w), 1))
     t = {}
-    written, total = emit.emit_t9_slabs_cards(d, shards, u[1], u[2],
+    written, total = emit.emit_t9_slabs_cards(d, emit.card_slab_ranges(n, nb, _devices(w), 1),
+                                              u[0], u[1], u[2],
                                               [icgen._HostField(a) for a in v], t9, n, box,
                                               nb, np.dtype(dt), 1, planes_per_call=planes,
-                                              timings=t)
+                                              timings=t, y_blocks=y_blocks)
     return d, written, total, t
 
 
@@ -114,6 +115,21 @@ def test_card_counts_and_plane_chunks_are_bitwise_on_any_backend(tmp_path):
     ref = _payload(d1, names)
     _same(ref, _payload(d4, names))
     _same(ref, _payload(d2, names))
+
+
+@pytest.mark.parametrize("y_blocks", [2, 3, 8])
+def test_any_y_block_count_writes_the_one_block_bytes(tmp_path, y_blocks):
+    """A unit is a contiguous key range of the slab (whole brick rows), so the joined units
+    are the whole-slab arrays: 2, an uneven 3 and one brick row per unit (8 of 8)."""
+    n, nb, dt = 64, 8, np.float32
+    box = float(n)
+    t9 = T9Layout(box, n, 2)
+    u, v = _fields(n, box, nb, dt, seed=2)
+    d1, names, t1, _ = _cards(tmp_path, u, v, t9, n, box, nb, dt, 2, "one-block")
+    dy, names_y, ty, _ = _cards(tmp_path, u, v, t9, n, box, nb, dt, 2, "units",
+                                y_blocks=y_blocks)
+    assert names_y == names and ty == t1 == n**3
+    _same(_payload(d1, names), _payload(dy, names))
 
 
 def test_the_seam_and_slab_crossers_are_exercised(tmp_path):

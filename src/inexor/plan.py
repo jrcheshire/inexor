@@ -309,7 +309,7 @@ EMIT_KEPT_B_PER_ROW = 23  # key int64 + off uint8 x 3 + v float32 x 3, per live 
 
 def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1, png=False,
                      emission="cards", planes_per_call=4, n_nodes=1, batch_planes=16,
-                     pencil_batch=1):
+                     pencil_batch=1, emit_y_blocks=1):
     """Host, per-card and disk bytes at each stage of `icgen.generate_t9_slabs_device`.
 
     Returns `(host, card, disk)` dicts of stage -> bytes: summed within a stage, peak = max
@@ -321,6 +321,8 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
     y-pencils of each spectrum, its x-planes, U_y / U_z with `window` brick slabs of halo
     either side, and one batch of `batch_planes` planes in flight in a plane <-> pencil
     exchange (sent and received). Host bytes are per node; the disk table is the shared total.
+    U_x, U_y and U_z keep a rank's own planes in spent spectra's bytes (halo planes apart);
+    `emit_y_blocks` prices the card emission's destination program per y-block unit.
     """
     from .ooc_fft import partition_units
 
@@ -344,16 +346,14 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
         win = min(n, nx_r + 2 * int(window) * p)
         xfer = 2 * int(batch_planes) * n * m * 2 * w
     field_r = nx_r * n * n * w
-    win_field = win * n * n * w
+    # a window's own planes in a spectrum's bytes when they fit, its halo planes apart
+    core_extra = 0 if field_r <= spec_r or win == n else field_r
+    halo_b = (win - nx_r) * n * n * w if win < n else 0
     emission_b = ((2 * window + 1) * rows_slab * 35  # staged keys, offsets, float64 velocities
                   + rows_slab * 80                   # a destination slab's finalize copies
                   + chunk_rows * 80)                 # one chunk's float64 positions/velocities
-    if R == 1:
-        displacements = max(3 * spec, 2 * spec + field, spec + 2 * field)
-    else:
-        # U_z takes `work`'s bytes only when they hold its window
-        displacements = max(3 * spec_r, 2 * spec_r + win_field
-                            + (0 if spec_r >= win_field else win_field))
+    # spec, U_y in the spare spectrum, U_z in `work`, plus their halo planes
+    displacements = 3 * spec_r + 2 * (halo_b + core_extra)
     host = {
         "1 noise -> delta spectrum": (spec_r + field_r if png else spec_r) + pencil_host + xfer,
         "2 2LPT source (accumulated on the cards)": 2 * spec_r + pencil_host + xfer,
@@ -361,7 +361,7 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
         "4 velocities (to disk)": 3 * spec_r + pencil_host + plane_host + xfer,
         "5 displacements (x on the cards, y/z host)": (displacements + pencil_host + plane_host
                                                        + xfer),
-        "6 emission": 2 * field + emission_b,
+        "6 emission": 3 * (spec_r + halo_b + core_extra) + emission_b,  # U windows + host
     }
     quarter = -(-nx_r // W) * n * n * w
     work = 6 * n * m * 2 * w + 4 * n * n * 2 * w  # a pencil block's program + a plane's, rough
@@ -375,21 +375,20 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
     }
     if emission == "cards":
         c = max(1, min(int(planes_per_call), p))
-        slabs_card = -(-(nx_r // p) // W)
-        halo = (slabs_card + 2 * window) * p * n * n * w
+        Y = max(1, int(emit_y_blocks))
         rows_src = p * n * n
         cap = int(rows_src * 1.06)  # the capacity ladder's padding, ~one rung
         per3 = (n // 2 // nb) ** 3  # bucket_cells 2: n / 2 buckets per side
-        host["6 emission"] = (2 * win_field
-                              + W * c * n * n * 3 * w                  # v reads (u_y, u_z: views)
-                              + W * (cap * 9 + nb * nb * per3 * 8))  # D2H off/w + occupancy
+        host["6 emission"] = (3 * (spec_r + halo_b + core_extra)  # U_x, U_y, U_z windows
+                              + W * c * n * n * 3 * w            # v reads (u: views)
+                              # a slab's D2H off/w (units land in place) + occupancy
+                              + W * (cap * 9 + nb * nb * per3 * 8))
         halo5 = 2 * window * p * n * n * w
         card["5 displacements (x on the cards, y/z host)"] = quarter + halo5 + work
-        card["6 emission"] = (halo
-                              + (2 * window + 1) * rows_src * EMIT_KEPT_B_PER_ROW
+        card["6 emission"] = ((2 * window + 1) * rows_src * EMIT_KEPT_B_PER_ROW
                               + max(c * n * n * EMIT_SOURCE_B_PER_ROW
                                     + rows_src * EMIT_KEPT_B_PER_ROW,  # chunk concat
-                                    cap * EMIT_DEST_B_PER_ROW))
+                                    -(-cap // Y) * EMIT_DEST_B_PER_ROW))
     elif emission != "host":
         raise ValueError(f"emission must be 'cards' or 'host', got {emission!r}")
     elif R > 1:
@@ -747,7 +746,7 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     ic_nodes = max(1, int(getattr(args, "n_nodes", 1)))
     ic_host, ic_card, ic_disk = ic_device_stages(
         args.n_part, n_gpus=n_gpus, fdtype=np.float32, nb=max(1, ec.n_fine // ec.n_brick),
-        n_nodes=ic_nodes)
+        n_nodes=ic_nodes, emit_y_blocks=max(1, int(getattr(args, "y_blocks", 1) or 1)))
     per_node = f", per node (busiest of {ic_nodes})" if ic_nodes > 1 else ""
     _table(f"IC GENERATION ON THE CARDS (its own job), HOST{per_node} by stage", ic_host,
            total_label="PEAK (max, not sum)", reduce=max)
@@ -870,7 +869,8 @@ def main(argv=None):
     ap.add_argument("--y-blocks", type=int, default=1,
                     help="device: y-blocks each x-slab's card work is cut into "
                          "(EngineConfig.device_y_blocks); the per-GPU table prices this count "
-                         "and the verdict names the smallest count that fits")
+                         "and the verdict names the smallest count that fits. The IC tables "
+                         "price the emission at the same count")
     ap.add_argument("--n-part", type=int, default=None, help="particles per side")
     ap.add_argument("--box", type=float, default=None, help="box size, Mpc/h")
     ap.add_argument("--n-fine", type=int, default=None)
