@@ -112,11 +112,10 @@ python scripts/run/realization.py run --config cdev8 --workdir $W          # 20 
 
 `device_run.py` steps a preset on N GPUs. The particle state stays in host memory, and the
 coarse paint and solve, the tile loop and the migrate all run on the cards. Its `card` and
-`export` subcommands also run on the cards, on one node or across nodes. It does not generate
-ICs:
+`export` subcommands also run on the cards, on one node or across nodes, and so do its ICs:
 
-- **ICs**: `python scripts/run/realization.py ics --config P --workdir ICS --generator device`
-  (in the `gpu` env).
+- **ICs**: `device_run.py ics` (below; across nodes too), or `python scripts/run/realization.py
+  ics --config P --workdir ICS --generator device` (in the `gpu` env); one node, the same files.
 - **Card and export**: `device_run.py card` / `export` (below), or the CPU driver run with
   `JAX_PLATFORMS=cpu` against the GPU run's checkpoint (see below).
 
@@ -124,6 +123,7 @@ ICs:
 |---|---|
 | `preflight` | Checks everything before the expensive part and exits 2 on any refusal: device count and backend, the allocator's stats, the IC manifest (particle count, slab count, `growth2`), the planner's host and load peak against the CPU NUMA nodes' memory, the NUMA memory binding, and free scratch space |
 | `run` | Loads the ICs or resumes a checkpoint, then steps to `--stop-at`. Prints one line per phase boundary and a heartbeat, and rewrites a JSON card (`--card`) at every boundary. On failure, the traceback and device memory stats go into the card |
+| `ics` | Device ICs into `--workdir` (`icgen.generate_t9_slabs_device`), with one boundary per generator stage. Under `--comm mpi` every rank generates its own brick slabs and rank 0 writes the manifest; the files are the same at any rank, card and `--y-blocks` count. Refuses a directory that already holds a manifest |
 | `card` | The P(k) card of the newest checkpoint in `--checkpoint-dir`, painted and transformed on the cards (`summary.pk_summary_card_cards`); rank 0 writes it to `--out` in the same JSON wrapper as `realization.py card` (summary under `summary`, with `transform: "cards"`). The paint is bitwise the CPU card's; the spectrum differs from the CPU card's at the FFT's rounding |
 | `export` | The particle export of that checkpoint, decoded on the cards and written as one part per rank to `--export-dir` (format `inexor-particles-2`, see [outputs](outputs.md#particle-export)); bitwise the CPU export's bytes. Refuses a non-empty `--export-dir` and, without `--allow-partial`, a checkpoint short of `--k-steps` |
 | `summarize` | Reads a run card together with the job's sampler CSVs (`--gpu-csv`, `--mem-csv`) and writes per-phase GPU memory, host memory and utilization to `--out`. Does not import jax |
@@ -148,6 +148,13 @@ Key flags for `preflight` and `run`:
 | `--beat` (run) | 60 | heartbeat seconds |
 | `--comm` (run) | `serial` | `mpi`: one rank per process across nodes (see below) |
 | `--comm-timeout` (run) | 1800 | seconds a rank may wait at one exchange before it aborts the job |
+
+Flags of `ics`: `--preset`, `--workdir`, `--card`, `--cards`, `--seed` (0), `--a-init` (0.1),
+`--growth2`, `--f-nl` (0), `--window` (1, emission window in brick slabs), `--bucket-cells`
+(2), `--slab`, `--pencil-batch`, `--batch-planes` (16, planes per rank in each plane <-> pencil
+exchange; the transient host memory of an exchange), `--y-blocks` (1, emission units per
+destination slab: what bounds a card's emission memory at 8192^3; the planner prices it with
+the same flag), `--membind-nodes`, `--beat`, `--comm`, `--comm-timeout`.
 
 Flags of `card` and `export`: `--preset`, `--checkpoint-dir`, `--k-steps`, `--card` (this
 process's run card), `--cards`, layout and `--growth2` as above (they must match the run),

@@ -9,6 +9,9 @@ Subcommands:
                lane (coarse, tile and migrate on the cards; window and fused pass on
                the config's auto), optionally timed per pass; then optionally a
                partial checkpoint write timed per part and a malloc_trim probe
+    ics        device ICs into --workdir (`icgen.generate_t9_slabs_device`), on one node or,
+               under --comm mpi, across nodes (every rank writes its own slabs; rank 0 the
+               manifest); one boundary per generator stage
     card       the P(k) card of a checkpoint, painted and transformed on the cards
                (`summary.pk_summary_card_cards`); rank 0 writes it to `--out`
     export     the (x, v) export of a checkpoint, decoded on the cards, one part per
@@ -23,6 +26,7 @@ Usage (as the Vista job scripts call it):
     python scripts/run/device_run.py run --preset c-hero --workdir $ICS --card run.json \
         --k-steps 120 --expect-step 0 --stop-at 20 --checkpoint-dir $CKPT \
         --checkpoint-every 20 --membind-nodes 0,1
+    python scripts/run/device_run.py ics --preset c-hero --workdir $ICS --card ics.json
     python scripts/run/device_run.py card --preset c-hero --checkpoint-dir $CKPT \
         --k-steps 120 --expect-step 120 --card card-run.json --out pk.json
     python scripts/run/device_run.py export --preset c-hero --checkpoint-dir $CKPT \
@@ -897,6 +901,84 @@ def cmd_run(args):
         mon.stop()
 
 
+# ---------------------------------------------------------------------- ICs
+
+
+def cmd_ics(args):
+    """Device ICs into --workdir, one rank per node under --comm mpi."""
+    comm, _multi = _comm_up(args)
+
+    import jax
+
+    from inexor import icgen
+    from inexor.plan import engine_config
+    from realization import GEN_FDTYPE, _cosmo, _geom, _ic_provenance
+
+    jax.config.update("jax_enable_x64", True)
+    if os.path.exists(os.path.join(args.workdir, icgen.MANIFEST)):
+        raise SystemExit(f"FATAL: {args.workdir} already holds an IC manifest")
+    if under(os.path.dirname(os.path.abspath(args.card)), os.path.realpath(args.workdir)):
+        raise SystemExit("FATAL: the run card would be written under the IC directory")
+    if args.membind_nodes:
+        bad = membind_refusals(_node_list(args.membind_nodes))
+        if bad:
+            raise SystemExit("FATAL: " + "; ".join(bad))
+    _signals(args.card)
+    card = _base_card("ics", args)
+    rank = 0 if comm is None else comm.rank
+    fail_rank = os.environ.get("D7_FAIL_RANK")
+    fail_at = (os.environ.get("D7_FAIL_AT")
+               if fail_rank is None or int(fail_rank) == rank else None)
+    mon = Monitor(args.card, card, beat_s=args.beat, fail_at=fail_at)
+    try:
+        devs = jax.devices()
+        if len(devs) < args.cards:
+            raise RuntimeError(f"{len(devs)} jax devices, {args.cards} asked")
+        devs = devs[:args.cards]
+        g = _geom(args.preset)
+        nb = g["n_fine"] // engine_config(args.preset).n_brick
+        n_ranks = 1 if comm is None else comm.size
+        card["ranks"] = dict(rank=rank, n_ranks=n_ranks, comm=args.comm,
+                             comm_timeout=args.comm_timeout)
+        card["plan"] = dict(seed=args.seed, a_init=args.a_init, growth2=args.growth2,
+                            f_NL=args.f_nl, window=args.window, cards=args.cards,
+                            batch_planes=args.batch_planes, y_blocks=args.y_blocks,
+                            pencil_batch=args.pencil_batch, slab=args.slab)
+        print(f"== device ICs {args.preset}: n_part={g['n_part']} L={g['L']} "
+              f"bricks_per_side={nb}, {args.cards} card(s) x {n_ranks} rank(s) -> "
+              f"{args.workdir}", flush=True)
+        mon.start()
+        prov = _ic_provenance("device")
+        prov.update(n_ranks=n_ranks, comm=args.comm)
+
+        def log(line):
+            print(line, flush=True)
+            if line.strip().startswith("ic stage "):
+                mon("ic_" + line.split(":")[0].split()[-1])
+
+        t0 = time.time()
+        man = icgen.generate_t9_slabs_device(
+            args.workdir, jax.random.PRNGKey(args.seed), g["n_part"], g["L"], _cosmo(),
+            args.a_init, nb, bucket_cells=args.bucket_cells, f_NL=args.f_nl,
+            fdtype=GEN_FDTYPE, slab=args.slab, window=args.window, provenance=prov,
+            growth2=args.growth2, devices=devs, pencil_batch=args.pencil_batch, log=log,
+            comm=comm, batch_planes=args.batch_planes, emit_y_blocks=args.y_blocks)
+        card["product"] = dict(wall_s=time.time() - t0, run_host_peak=mon.run_peak,
+                               manifest={k: man.get(k) for k in (
+                                   "n_particles", "bricks_per_side", "max_displacement",
+                                   "vel_scale", "stage_s", "emission_s")})
+        print(f"  ICs: {man['n_particles']:,} particles in {len(man['files'])} slab files, "
+              f"{(time.time() - t0) / 60:.1f} min", flush=True)
+        card["finished"] = time.time()
+        mon.save()
+        return 0
+    except BaseException as e:
+        mon.fail(e)
+        raise
+    finally:
+        mon.stop()
+
+
 # ---------------------------------------------------------------------- products
 
 
@@ -1236,6 +1318,28 @@ def main(argv=None):
                          "python -m mpi4py)")
     pr.add_argument("--comm-timeout", type=float, default=1800.0,
                     help="seconds a rank may wait at one exchange before aborting the job")
+    pi = sub.add_parser("ics")
+    pi.add_argument("--preset", required=True)
+    pi.add_argument("--workdir", required=True, help="the IC directory (shared by the ranks)")
+    pi.add_argument("--card", required=True, help="this process's run card")
+    pi.add_argument("--cards", type=int, default=4)
+    pi.add_argument("--seed", type=int, default=0)
+    pi.add_argument("--a-init", type=float, default=0.1)
+    pi.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"))
+    pi.add_argument("--f-nl", type=float, default=0.0, help="local f_NL of the ICs")
+    pi.add_argument("--window", type=int, default=1,
+                    help="emission window in brick slabs (refused if a displacement reaches it)")
+    pi.add_argument("--bucket-cells", type=int, default=2)
+    pi.add_argument("--slab", type=int, default=32)
+    pi.add_argument("--pencil-batch", type=int, default=1)
+    pi.add_argument("--batch-planes", type=int, default=16,
+                    help="planes per rank in each plane <-> pencil exchange")
+    pi.add_argument("--y-blocks", type=int, default=1,
+                    help="y-block units per destination slab in the emission (bitwise any)")
+    pi.add_argument("--membind-nodes", default=None)
+    pi.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
+    pi.add_argument("--comm", default="serial", choices=("serial", "mpi"))
+    pi.add_argument("--comm-timeout", type=float, default=1800.0)
     for name in ("card", "export"):
         p = sub.add_parser(name)
         p.add_argument("--membind-nodes", default=None,
@@ -1277,7 +1381,8 @@ def main(argv=None):
     ps.add_argument("--mem-csv", default=None)
     ps.add_argument("--out", required=True)
     args = ap.parse_args(argv)
-    return dict(preflight=cmd_preflight, run=cmd_run, card=cmd_card, export=cmd_export,
+    return dict(preflight=cmd_preflight, run=cmd_run, ics=cmd_ics, card=cmd_card,
+                export=cmd_export,
                 summarize=cmd_summarize)[args.cmd](args)
 
 

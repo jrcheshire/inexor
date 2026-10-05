@@ -165,3 +165,57 @@ def test_the_export_refuses_a_non_empty_directory(one_rank_run, tmp_path):
     p = _product("export", 1, one_rank_run / "ckpt", tmp_path,
                  ["--export-dir", str(tmp_path / "export"), "--allow-partial"])
     assert p.returncode != 0 and "is not empty" in p.stdout + p.stderr
+
+
+IC_IGNORED = ("provenance", "stage_s", "emission_s", "n_devices", "n_ranks", "stage_cleanup",
+              "emission_y_blocks")
+
+
+def _ic_dir(d):
+    man = json.load(open(os.path.join(d, "manifest.json")))
+    files = {f: open(os.path.join(d, f), "rb").read() for f in man["files"]}
+    return files, {k: v for k, v in man.items() if k not in IC_IGNORED}, man
+
+
+def _device_ics(n, out, extra=()):
+    cmd = [MPIEXEC, "-n", str(n), sys.executable, "-m", "mpi4py", DRIVER, "ics",
+           "--preset", PRESET, "--workdir", str(out / "ics"), "--card", str(out / "ics.json"),
+           "--cards", "1", "--a-init", "0.08", "--batch-planes", "5", "--comm", "mpi",
+           "--comm-timeout", "300", "--beat", "600", *extra]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=1200, env=ENV)
+
+
+@pytest.fixture(scope="module")
+def one_rank_device_ics(tmp_path_factory):
+    out = tmp_path_factory.mktemp("dics1")
+    p = _device_ics(1, out)
+    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
+    return out / "ics"
+
+
+def test_driver_ics_at_two_ranks_are_the_one_rank_ics(one_rank_device_ics, tmp_path):
+    p = _device_ics(2, tmp_path, ["--y-blocks", "2"])
+    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
+    f1, m1, _ = _ic_dir(one_rank_device_ics)
+    f2, m2, raw2 = _ic_dir(tmp_path / "ics")
+    assert raw2["n_ranks"] == 2 and raw2["emission_y_blocks"] == 2
+    assert m2 == m1 and f2 == f1
+    assert all((tmp_path / f"ics.rank{r}.json").exists() for r in range(2))
+    assert "[rank 1] " in p.stdout and "ic_emission" in p.stdout
+
+
+def test_driver_ics_are_the_realization_device_ics(one_rank_device_ics, tmp_path):
+    p = subprocess.run([sys.executable, REALIZATION, "ics", "--config", PRESET, "--workdir",
+                        str(tmp_path / "ics"), "--generator", "device", "--a-init", "0.08"],
+                       capture_output=True, text=True, env=ENV, timeout=900)
+    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
+    f1, m1, _ = _ic_dir(one_rank_device_ics)
+    f2, m2, _ = _ic_dir(tmp_path / "ics")
+    assert m2 == m1 and f2 == f1
+
+
+def test_driver_ics_refuse_an_existing_generation(one_rank_device_ics, tmp_path):
+    out = tmp_path
+    (out / "ics").symlink_to(one_rank_device_ics)
+    p = _device_ics(1, out)
+    assert p.returncode != 0 and "already holds an IC manifest" in p.stdout + p.stderr

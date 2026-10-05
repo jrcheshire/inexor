@@ -82,7 +82,7 @@ The IC generators add these fields:
 | `a_init` | scale factor of the ICs |
 | `order` | LPT order (2) |
 | `growth2` | `"lcdm"` or `"eds"` second-order growth |
-| `f_NL` | local primordial non-Gaussianity amplitude (the driver uses 0) |
+| `f_NL` | local primordial non-Gaussianity amplitude (`realization.py` uses 0; `device_run.py ics --f-nl`) |
 | `fdtype` | generator float dtype (`float32` in the driver) |
 | `slab` | planes per out-of-core FFT slab |
 | `ic_stream` | noise stream identifier |
@@ -93,7 +93,10 @@ The IC generators add these fields:
 | `provenance` | from the driver: `generator`, `commit`, `host`, `machine`, `numpy`, `when`, `jax`, `x64`, `devices`, `n_devices`, `allocator`, and the XLA variables listed in [configuration](configuration.md#environment-variables) |
 
 The device generator also records `generator: "device"`, `emission`, `emission_s`,
-`n_devices`, `pencil_batch` and `stage_s` (per-stage seconds).
+`n_devices` (per rank), `pencil_batch` and `stage_s` (per-stage seconds), and, only when
+they are above 1, `n_ranks` (generated across nodes) and `emission_y_blocks`. Neither moves a
+byte of the slab files: the same seed gives the same files at any rank, card and y-block
+count.
 
 ### Checkpoints
 
