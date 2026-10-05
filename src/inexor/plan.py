@@ -308,38 +308,62 @@ EMIT_KEPT_B_PER_ROW = 23  # key int64 + off uint8 x 3 + v float32 x 3, per live 
 
 
 def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1, png=False,
-                     emission="cards", planes_per_call=4):
+                     emission="cards", planes_per_call=4, n_nodes=1, batch_planes=16,
+                     pencil_batch=1):
     """Host, per-card and disk bytes at each stage of `icgen.generate_t9_slabs_device`.
 
     Returns `(host, card, disk)` dicts of stage -> bytes: summed within a stage, peak = max
     over stages, following the generator's allocation order. A lower bound (small temporaries
     charged roughly, page cache not at all). `png` charges the f_NL != 0 phi round trip;
     `emission` prices stage 6 for `device.emit` ("cards") or `icgen._emit_t9_slabs` ("host").
+
+    `n_nodes` > 1 prices the busiest rank of a run across nodes (`n_gpus` cards each): its
+    y-pencils of each spectrum, its x-planes, U_y / U_z with `window` brick slabs of halo
+    either side, and one batch of `batch_planes` planes in flight in a plane <-> pencil
+    exchange (sent and received). Host bytes are per node; the disk table is the shared total.
     """
-    n, W = int(n), max(1, int(n_gpus))
+    from .ooc_fft import partition_units
+
+    n, W, R = int(n), max(1, int(n_gpus)), max(1, int(n_nodes))
     w = np.dtype(fdtype).itemsize
     m = n // 2 + 1
+    nb = int(nb) if nb else max(1, n // 16)
+    p = n // nb
     field = n**3 * w
     spec = n * n * m * 2 * w
     pencil_host = 2 * W * n * m * 2 * w  # a block and its result, per card thread
     plane_host = W * n * n * w  # one real plane per card thread on its way to the host
-    nb = int(nb) if nb else max(1, n // 16)
     rows_slab = n**3 // nb
     chunk_rows = min(int(slab), n // nb) * n * n
+    if R == 1:
+        spec_r, nx_r, win, xfer = spec, n, n, 0
+    else:
+        ny_r = max(z - a for a, z in partition_units(n, R, pencil_batch))
+        nx_r = max(z - a for a, z in partition_units(nb, R, 1)) * p
+        spec_r = n * ny_r * m * 2 * w
+        win = min(n, nx_r + 2 * int(window) * p)
+        xfer = 2 * int(batch_planes) * n * m * 2 * w
+    field_r = nx_r * n * n * w
+    win_field = win * n * n * w
     emission_b = ((2 * window + 1) * rows_slab * 35  # staged keys, offsets, float64 velocities
                   + rows_slab * 80                   # a destination slab's finalize copies
                   + chunk_rows * 80)                 # one chunk's float64 positions/velocities
+    if R == 1:
+        displacements = max(3 * spec, 2 * spec + field, spec + 2 * field)
+    else:
+        # U_z takes `work`'s bytes only when they hold its window
+        displacements = max(3 * spec_r, 2 * spec_r + win_field
+                            + (0 if spec_r >= win_field else win_field))
     host = {
-        "1 noise -> delta spectrum": (spec + field if png else spec) + pencil_host,
-        "2 2LPT source (accumulated on the cards)": 2 * spec + pencil_host,
-        "3 source forward": 3 * spec + pencil_host,
-        "4 velocities (to disk)": 3 * spec + pencil_host + plane_host,
-        "5 displacements (x on the cards, y/z host)": (max(3 * spec, 2 * spec + field,
-                                                           spec + 2 * field)
-                                                       + pencil_host + plane_host),
+        "1 noise -> delta spectrum": (spec_r + field_r if png else spec_r) + pencil_host + xfer,
+        "2 2LPT source (accumulated on the cards)": 2 * spec_r + pencil_host + xfer,
+        "3 source forward": 3 * spec_r + pencil_host + xfer,
+        "4 velocities (to disk)": 3 * spec_r + pencil_host + plane_host + xfer,
+        "5 displacements (x on the cards, y/z host)": (displacements + pencil_host + plane_host
+                                                       + xfer),
         "6 emission": 2 * field + emission_b,
     }
-    quarter = -(-n // W) * n * n * w
+    quarter = -(-nx_r // W) * n * n * w
     work = 6 * n * m * 2 * w + 4 * n * n * 2 * w  # a pencil block's program + a plane's, rough
     card = {
         "1 noise -> delta spectrum": work,
@@ -350,13 +374,13 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
         "6 emission": quarter,
     }
     if emission == "cards":
-        p = n // nb
         c = max(1, min(int(planes_per_call), p))
-        halo = (-(-nb // W) + 2 * window) * p * n * n * w
+        slabs_card = -(-(nx_r // p) // W)
+        halo = (slabs_card + 2 * window) * p * n * n * w
         rows_src = p * n * n
         cap = int(rows_src * 1.06)  # the capacity ladder's padding, ~one rung
         per3 = (n // 2 // nb) ** 3  # bucket_cells 2: n / 2 buckets per side
-        host["6 emission"] = (2 * field
+        host["6 emission"] = (2 * win_field
                               + W * c * n * n * 3 * w                  # v reads (u_y, u_z: views)
                               + W * (cap * 9 + nb * nb * per3 * 8))  # D2H off/w + occupancy
         halo5 = 2 * window * p * n * n * w
@@ -368,6 +392,8 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
                                     cap * EMIT_DEST_B_PER_ROW))
     elif emission != "host":
         raise ValueError(f"emission must be 'cards' or 'host', got {emission!r}")
+    elif R > 1:
+        raise ValueError("across nodes the generator emits on the cards only")
     disk = {"velocity staging (3 fields)": 3 * field, "T9 slabs written": 9 * n**3}
     return host, card, disk
 
@@ -718,12 +744,15 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
                                    int(arena * share), shared=True, share=share)
 
     # the generator runs float32 fields whatever the mesh dtypes; it wants particles per side
+    ic_nodes = max(1, int(getattr(args, "n_nodes", 1)))
     ic_host, ic_card, ic_disk = ic_device_stages(
-        args.n_part, n_gpus=n_gpus, fdtype=np.float32, nb=max(1, ec.n_fine // ec.n_brick))
-    _table("IC GENERATION ON THE CARDS (its own job), HOST by stage", ic_host,
+        args.n_part, n_gpus=n_gpus, fdtype=np.float32, nb=max(1, ec.n_fine // ec.n_brick),
+        n_nodes=ic_nodes)
+    per_node = f", per node (busiest of {ic_nodes})" if ic_nodes > 1 else ""
+    _table(f"IC GENERATION ON THE CARDS (its own job), HOST{per_node} by stage", ic_host,
            total_label="PEAK (max, not sum)", reduce=max)
-    _table(f"IC GENERATION ON THE CARDS, PER GPU (of {n_gpus}) by stage", ic_card,
-           total_label="PEAK (max, not sum)", reduce=max)
+    _table(f"IC GENERATION ON THE CARDS, PER GPU (of {n_gpus}{' per node' if per_node else ''})"
+           " by stage", ic_card, total_label="PEAK (max, not sum)", reduce=max)
     _table("IC GENERATION, DISK", ic_disk)
     for label, peak, budget in (("host", max(ic_host.values()), args.host_gb),
                                 ("per GPU", max(ic_card.values()), args.device_gb)):

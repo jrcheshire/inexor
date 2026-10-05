@@ -6,7 +6,7 @@ Per-term arithmetic (`mesh_bytes`, `step_bytes`, ...) is tested where it lives.
 import numpy as np
 import pytest
 
-from inexor import engine
+from inexor import engine, plan
 from inexor.engine import EngineConfig
 from inexor.forces import padded_size
 from inexor.plan import GB as GB_
@@ -1070,3 +1070,36 @@ def test_card_phases_are_maxed_not_summed():
     in_step = {k: v for k, v in phases.items() if k != AFTER_LOOP}
     assert worst == max(in_step.values())
     assert sum(in_step.values()) - worst > 10e9, "VACUOUS: the phases are too small to tell"
+
+
+def test_ic_stages_one_node_price_under_the_measured_c_gh_ics():
+    """c-gh ICs on one gb node (job 1045956, four GB200s) measured a 108.1 GB host peak; the
+    stage table is a lower bound on it."""
+    host, _card, _disk = plan.ic_device_stages(2048, n_gpus=4, nb=128)
+    assert max(host.values()) <= 108.1e9
+
+
+def test_ic_stages_across_nodes_price_the_busiest_ranks_share():
+    n, nb, W, R, B = 2048, 128, 1, 2, 16
+    one, card1, disk1 = plan.ic_device_stages(n, n_gpus=W, nb=nb)
+    host, card, disk = plan.ic_device_stages(n, n_gpus=W, nb=nb, n_nodes=R, batch_planes=B)
+    m = n // 2 + 1
+    spec_r = n * (n // R) * m * 8
+    pencil = 2 * W * n * m * 8
+    xfer = 2 * B * n * m * 8
+    assert host["3 source forward"] == 3 * spec_r + pencil + xfer
+    assert host["2 2LPT source (accumulated on the cards)"] == 2 * spec_r + pencil + xfer
+    assert disk == disk1  # one shared generation
+    assert max(host.values()) < max(one.values())
+    assert card["2 2LPT source (accumulated on the cards)"] < card1[
+        "2 2LPT source (accumulated on the cards)"]
+    with pytest.raises(ValueError, match="on the cards only"):
+        plan.ic_device_stages(n, n_gpus=W, nb=nb, n_nodes=R, emission="host")
+
+
+def test_the_planner_prints_the_ic_tables_per_node(capsys):
+    plan.main(["--preset", "c-gh", "--backend", "device", "--n-gpus", "1", "--n-nodes", "2",
+               "--host-gb", "116", "--device-gb", "96", "--arena-frac", "0.01"])
+    out = capsys.readouterr().out
+    assert "HOST, per node (busiest of 2) by stage" in out
+    assert "PER GPU (of 1 per node) by stage" in out
