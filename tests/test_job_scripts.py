@@ -464,3 +464,69 @@ def test_the_products_job_refuses_inputs_it_cannot_use(tmp_path, env, setup, say
     r = _products_job(tmp_path, **{k: v.format(t=tmp_path) for k, v in env.items()})
     assert r.returncode == 1 and says in r.stdout, r.stdout + r.stderr
     assert "=== LEG" not in r.stdout
+
+
+def _ics(d, payload=b"x", man=None, files=("t9_slab_0000.npz",)):
+    d.mkdir()
+    for f in files:
+        (d / f).write_bytes(payload)
+    m = {"files": list(files), "n_particles": 8, "vel_scale": 1.0, "n_devices": 1,
+         "provenance": {"host": str(d)}, "stage_s": {"x": 1.0}}
+    m.update(man or {})
+    (d / "manifest.json").write_text(json.dumps(m))
+    return d
+
+
+@pytest.mark.parametrize("case,ok", [
+    ("same", True), ("run fields only", True), ("a slab byte", False),
+    ("a manifest field", False), ("another file list", False), ("no manifest", False)])
+def test_same_ics_compares_the_slabs_and_the_manifest_but_the_run_fields(tmp_path, case, ok):
+    a = _ics(tmp_path / "a")
+    if case == "no manifest":
+        b = tmp_path / "b"
+        b.mkdir()
+    else:
+        b = _ics(tmp_path / "b",
+                 payload=b"z" if case == "a slab byte" else b"x",
+                 man={"run fields only": {"n_devices": 4, "n_ranks": 2, "emission_y_blocks": 4,
+                                          "stage_s": {"x": 9.0}},
+                      "a manifest field": {"vel_scale": 2.0}}.get(case),
+                 files=("t9_slab_0000.npz", "t9_slab_0001.npz") if case == "another file list"
+                 else ("t9_slab_0000.npz",))
+    r = _lib(f'gate_with t same_ics "{a}" "{b}"; echo "rc=$?"', tmp_path, PY=sys.executable)
+    want = ("GATE t PASS", "rc=0") if ok else ("GATE t FAIL", "rc=1")
+    assert all(w in r.stdout for w in want), r.stdout + r.stderr
+
+
+ICS_JOB = os.path.join(HERE, "scripts", "run", "multinode_ics_vista.sbatch")
+
+
+def _ics_job(tmp_path, **env):
+    """The IC job script up to its first refusal (as `_steps_job`)."""
+    stubs = tmp_path / "stubs"
+    stubs.mkdir(exist_ok=True)
+    for name in ("python", "python3", "mpiexec", "pixi"):
+        (stubs / name).write_text("#!/bin/sh\nexit 97\n")
+        (stubs / name).chmod(0o755)
+    e = {k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ}
+    e["PATH"] = f"{stubs}:{os.environ.get('PATH', '')}"
+    e.update(REHEARSAL="1", INEXOR_SRC=HERE, INEXOR_RUNS=str(tmp_path / "runs"))
+    e.update(env)
+    p = subprocess.Popen([BASH, ICS_JOB], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=e, start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, 9)
+        p.communicate()
+        pytest.fail("the IC job went past its refusals")
+    return subprocess.CompletedProcess(p.args, p.returncode, out, err)
+
+
+def test_the_ics_job_refuses_an_existing_generation_and_a_missing_dir(tmp_path):
+    _ics(tmp_path / "old")
+    r = _ics_job(tmp_path, IC_DIR=str(tmp_path / "old"))
+    assert r.returncode == 1 and "already holds an IC manifest" in r.stdout, r.stdout
+    assert "=== LEG" not in r.stdout
+    r = _ics_job(tmp_path)
+    assert r.returncode == 1 and "set IC_DIR" in r.stdout, r.stdout

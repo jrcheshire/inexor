@@ -297,3 +297,27 @@ print(f"  card_diff ({a.get('transform', 'host')} -> {b.get('transform', 'host')
       f"|dz| max {dz.max():.3e}")
 EOF_PY
 }
+
+# same_ics A B: two IC generations (manifest present) with the same slab files byte for byte
+# and the same manifest except what a rank, card or y-block count and the run record
+# (provenance, timings, n_devices, n_ranks, emission_y_blocks, stage_cleanup)
+same_ics () {
+  "${PY:-python3}" - "$1" "$2" <<'EOF_PY'
+import json, os, sys
+skip = ("provenance", "stage_s", "emission_s", "n_devices", "n_ranks", "emission_y_blocks",
+        "stage_cleanup")
+try:
+    m = [json.load(open(os.path.join(d, "manifest.json"))) for d in sys.argv[1:]]
+except (OSError, ValueError) as e:
+    print(f"  GATE FAIL: no complete IC generation ({e!r})")
+    sys.exit(1)
+bad = [f for f in m[0]["files"] if f not in m[1]["files"] or
+       open(os.path.join(sys.argv[1], f), "rb").read() != open(os.path.join(sys.argv[2], f), "rb").read()]
+if sorted(m[0]["files"]) != sorted(m[1]["files"]):
+    bad.append("the file lists")
+fields = sorted(k for k in set(m[0]) | set(m[1]) if k not in skip and m[0].get(k) != m[1].get(k))
+print(f"  {len(m[0]['files'])} slab files, differing: {', '.join(bad) or 'none'}; manifest "
+      f"fields differing: {', '.join(fields) or 'none'}: {sys.argv[1]} vs {sys.argv[2]}")
+sys.exit(1 if bad or fields else 0)
+EOF_PY
+}
