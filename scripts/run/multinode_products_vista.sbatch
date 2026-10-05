@@ -116,7 +116,6 @@ if [ "${REHEARSAL:-0}" != 1 ]; then
   echo "  modules $(module -t list 2>&1 | tr '\n' ' ')"
   nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null
   free -g | head -2
-  lfs getstripe -d "$PROD_DIR" 2>/dev/null | head -3
 fi
 df -h "$PROD_DIR" | tail -1
 env | grep -E '^(XLA_|JAX_|INEXOR_|MV2_|MVP_|HYDRA_)' | sort
