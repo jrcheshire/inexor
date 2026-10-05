@@ -39,7 +39,7 @@
 #     CKPT_DIR=$G/mpi/ckpt SMALL_CKPT=$G/mpi/ckpt PROD_DIR=runs/rehearsal/products-r1 \
 #     scripts/run/mpi_lane.sh --run bash scripts/run/multinode_products_vista.sbatch
 # PLANT_CARD_MISMATCH=1 / PLANT_EXPORT_MISMATCH=1 run the small check's every-rank card with
-# another --min-weight / export with D-time velocities, so its gate must stop the job;
+# bins pinned by --k-max / export with D-time velocities, so its gate must stop the job;
 # PLANT_LEG_FAIL=1 gives the first rank leg an unknown XLA flag, which aborts every rank.
 #
 # Wall (c-gh on 2 gh): per node the load is ~4.3e9 particles (~55 GB), the card paints and
@@ -180,7 +180,7 @@ if [ -n "${SMALL_CKPT:-}" ]; then
   mkdir -p "$S"
   PLANT_CARD=() PLANT_EXPORT=()
   if [ "${REHEARSAL:-0}" = 1 ]; then
-    [ "${PLANT_CARD_MISMATCH:-0}" = 1 ] && PLANT_CARD=(--min-weight 1e9)
+    [ "${PLANT_CARD_MISMATCH:-0}" = 1 ] && PLANT_CARD=(--k-max 1.0)
     [ "${PLANT_EXPORT_MISMATCH:-0}" = 1 ] && PLANT_EXPORT=(--d-time)
   fi
   run_leg --cap "$CARD_CAP_S" --quiet-limit "$QUIET_S" small-card-1 \
