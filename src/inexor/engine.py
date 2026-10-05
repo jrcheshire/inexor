@@ -142,7 +142,7 @@ class EngineConfig:
         coarse_fold_kernel=True,
         coarse_match_order=3,
         coarse_kernel_on_cards=None,
-        device_y_blocks=1,
+        device_y_blocks=None,
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -243,8 +243,20 @@ class EngineConfig:
             None if migrate_repack_fused is None else bool(migrate_repack_fused))
         # Split every x-slab-sized card working set (tile window, destination census, device
         # migrate, fused repack) into this many y-blocks (`decomp.y_blocks`); bitwise any count.
-        # 1 = whole slabs.
-        self.device_y_blocks = int(device_y_blocks)
+        # 1 = whole slabs; None = automatic. Read `device_y_blocks`.
+        self._device_y_blocks = None if device_y_blocks is None else int(device_y_blocks)
+
+    @property
+    def device_y_blocks(self):
+        """The y-block count: the constructor's, or for None `decomp.auto_y_blocks` (units no
+        larger than a 4096^3 x-slab) wherever the tile window or the device migrate runs, else 1."""
+        if self._device_y_blocks is not None:
+            return self._device_y_blocks
+        if not (self.tile_window or self.migrate_backend == "device"):
+            return 1
+        from .decomp import auto_y_blocks
+
+        return auto_y_blocks(self.n_part**3 / (self.n_fine // self.n_brick), self.tiles_side)
 
     @property
     def np_coarse_dtype(self):
@@ -555,13 +567,14 @@ class EngineConfig:
                 "sizes it from the tile window's census, but migrate_backend="
                 f"{self.migrate_backend!r}, tile_window={self.tile_window}; the knob could "
                 "not apply.")
-        if not 1 <= self.device_y_blocks <= self.tiles_side:
+        n_y = self._device_y_blocks  # an automatic count is in range and applies by construction
+        if n_y is not None and not 1 <= n_y <= self.tiles_side:
             raise ValueError(f"device_y_blocks must be in [1, {self.tiles_side}] (the tile rows "
-                             f"per side), got {self.device_y_blocks}")
-        if self.device_y_blocks > 1 and not (self.tile_window
-                                             or self.migrate_backend == "device"):
+                             f"per side), got {n_y}")
+        if n_y is not None and n_y > 1 and not (self.tile_window
+                                                or self.migrate_backend == "device"):
             raise ValueError(
-                f"device_y_blocks={self.device_y_blocks} splits the tile window and the device "
+                f"device_y_blocks={n_y} splits the tile window and the device "
                 f"migrate, but tile_window={self.tile_window}, migrate_backend="
                 f"{self.migrate_backend!r}; the knob could not apply.")
         on_device = [n for n in ("migrate_backend", "coarse_backend", "tile_backend")

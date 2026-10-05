@@ -803,11 +803,13 @@ def test_the_host_peak_stays_under_every_measured_whole_run_peak(capsys, args, m
 
 def test_the_pre_step_phases_are_credited_the_untouched_slack(capsys):
     """The kernel build and the lead drift run before any insert has touched the slack rows,
-    so both are charged against the resident minus the slack; the credit is printed."""
+    so whichever carries a host term is charged against the resident minus the slack; the
+    credit is printed."""
     main(["--preset", "c-hero", "--backend", "device", "--arena-frac", "0.01"])
     out = capsys.readouterr().out
     credits = [ln for ln in out.splitlines() if "slack rows not yet touched" in ln]
-    assert sorted(ln.split(":")[0].strip() for ln in credits) == ["kernel_build", "lead_drift"]
+    names = {ln.split(":")[0].strip() for ln in credits}
+    assert "kernel_build" in names and names <= {"kernel_build", "lead_drift"}
     slack = float(next(ln for ln in out.splitlines()
                        if ln.strip().startswith("slack + alloc_margin")).split()[-2])
     assert all(abs(float(ln.split()[-2]) + slack) < 1e-3 for ln in credits)
@@ -914,6 +916,34 @@ def test_the_exchange_is_priced_in_seconds_only_given_a_rate(capsys):
 
 
 # ------------------------------------------------------------------ y-blocks
+
+
+def test_the_automatic_y_block_count_keeps_every_unit_within_a_4096_cubed_slab(capsys):
+    """None = `decomp.auto_y_blocks`: one block for every preset (each runs as before), 4 at
+    8192^3, 16 at 16384^3, each the fewest blocks whose largest unit holds at most the cap."""
+    from inexor.decomp import UNIT_ROWS_MAX, auto_y_blocks
+    from inexor.ooc_fft import partition_units
+    from inexor.plan import engine_config
+
+    for preset in PRESETS:
+        assert engine_config(preset, migrate_backend="device").device_y_blocks == 1, preset
+    assert engine_config("c-hero", migrate_backend="device", device_y_blocks=3).device_y_blocks == 3
+    ec = EngineConfig(box_size=4096.0, n_part=8192, n_fine=16384, n_coarse=4096, n_tile=512,
+                      b_fine=32, migrate_backend="device")
+    assert ec.device_y_blocks == 4
+    assert EngineConfig(box_size=4096.0, n_part=8192, n_fine=16384, n_coarse=4096, n_tile=512,
+                        b_fine=32).device_y_blocks == 1  # no slab-cutting lane: no cut
+
+    def unit_rows(slab_rows, side, n_y):
+        return slab_rows * max(hi - lo for lo, hi in partition_units(side, n_y, 1)) / side
+
+    for n, nb, side, want in ((8192, 512, 32, 4), (8192, 512, 512, 4), (16384, 1024, 64, 16)):
+        got = auto_y_blocks(n**3 / nb, side)
+        assert got == want, (n, side)
+        assert unit_rows(n**3 / nb, side, got) <= UNIT_ROWS_MAX
+        assert unit_rows(n**3 / nb, side, got - 1) > UNIT_ROWS_MAX
+    main(_G8192 + ["--n-nodes", "8", "--host-gb", "1026", "--device-gb", "199"])
+    assert "y-blocks priced:                       4 (auto)" in capsys.readouterr().out
 
 
 def test_y_blocks_cut_the_slab_sized_card_terms_by_the_unit_and_its_window():

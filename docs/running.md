@@ -134,7 +134,7 @@ Key flags for `preflight` and `run`:
 |---|---|---|
 | `--preset`, `--workdir`, `--card` | required | preset, IC directory (read only), card JSON path |
 | `--cards` | 4 | GPUs to use |
-| `--y-blocks` | 1 | cut each x-slab's card work into this many y-blocks (see below); preflight prices it |
+| `--y-blocks` | auto | cut each x-slab's card work into this many y-blocks (see below); preflight prices it |
 | `--slack`, `--alloc-margin`, `--arena-frac` | 0.10, 0.10, 0.01 | allocation layout |
 | `--growth2` | `lcdm` | must match the ICs |
 | `--membind-nodes` | none | refuse unless the process runs under `numactl --membind` on these NUMA nodes |
@@ -152,7 +152,7 @@ Key flags for `preflight` and `run`:
 Flags of `ics`: `--preset`, `--workdir`, `--card`, `--cards`, `--seed` (0), `--a-init` (0.1),
 `--growth2`, `--f-nl` (0), `--window` (1, emission window in brick slabs), `--bucket-cells`
 (2), `--slab`, `--pencil-batch`, `--batch-planes` (16, planes per rank in each plane <-> pencil
-exchange; the transient host memory of an exchange), `--y-blocks` (1, emission units per
+exchange; the transient host memory of an exchange), `--y-blocks` (auto, emission units per
 destination slab: what bounds a card's emission memory at 8192^3; the planner prices it with
 the same flag), `--membind-nodes`, `--beat`, `--comm`, `--comm-timeout`.
 
@@ -166,11 +166,13 @@ checkpoint's epoch) and `--allow-partial`. Neither writes under the checkpoint d
 
 **Y-blocks.** Every card working set that would otherwise hold a whole brick x-slab (the tile
 window, the destination census, the device migrate and the fused repack) works on (x-slab,
-y-block) units with `--y-blocks N`: a y-block is a run of whole tile rows, and a tile window
-holds its block plus the buffer bricks either side. The bytes are the same at any count, so a
-checkpoint resumes at another one. Raise it when the planner's per-GPU verdict does not fit:
-`python -m inexor.plan ... --backend device --y-blocks N` prices a count and names the
-smallest that fits. More units mean more, smaller kernel launches per step.
+y-block) units: a y-block is a run of whole tile rows, and a tile window holds its block plus
+the buffer bricks either side. By default the count is automatic: the fewest blocks that keep
+a unit within the rows of a 4096^3 x-slab (`decomp.auto_y_blocks`), so 1 up to 4096^3, 4 at
+8192^3 and 16 at 16384^3; the IC emission applies the same rule to its destination slabs.
+`--y-blocks N` sets a count. The bytes are the same at any count, so a checkpoint resumes at
+another one. `python -m inexor.plan ... --backend device` prints the count it priced and
+the smallest that fits. More units mean more, smaller kernel launches per step.
 
 `run` also refuses to write a card or checkpoint anywhere under the IC directory. The GPU
 driver always starts at a = 0.1 (it has no `--a-init`), and it checks the ICs' `growth2` but

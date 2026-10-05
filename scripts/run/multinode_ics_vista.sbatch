@@ -23,7 +23,7 @@
 #
 # Requires INEXOR_RUNS, IC_DIR (a new directory: one holding a manifest is refused), and
 # INEXOR_SRC or submission from the checkout. Optional: PRESET (c-gh), SEED (0), A_INIT
-# (0.1), F_NL (0), WINDOW (1), Y_BLOCKS (1, emission units), BATCH_PLANES (16), SMALL_PRESET
+# (0.1), F_NL (0), WINDOW (1), Y_BLOCKS (auto, emission units), BATCH_PLANES (16), SMALL_PRESET
 # (none; c-1024 for the cluster check), GEN_CAP_S (3600), QUIET_S (900).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R IC_DIR=$R/c-gh-ics-mn SMALL_PRESET=c-1024 \
 #     sbatch -A <account> scripts/run/multinode_ics_vista.sbatch
@@ -57,7 +57,7 @@ if [ "${REHEARSAL:-0}" = 1 ]; then
   PRESET=${PRESET:-cdev8-tile32} A_INIT=${A_INIT:-0.08}
 fi
 PRESET=${PRESET:-c-gh} SEED=${SEED:-0} A_INIT=${A_INIT:-0.1} F_NL=${F_NL:-0} WINDOW=${WINDOW:-1}
-Y_BLOCKS=${Y_BLOCKS:-1} BATCH_PLANES=${BATCH_PLANES:-16}
+Y_BLOCKS=${Y_BLOCKS:-auto} BATCH_PLANES=${BATCH_PLANES:-16}
 GEN_CAP_S=${GEN_CAP_S:-3600} QUIET_S=${QUIET_S:-900}
 N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 

@@ -157,6 +157,28 @@ def y_blocks(tiles_side, bricks_per_tile, n_y):
     return tuple((lo * bpt, hi * bpt) for lo, hi in partition_units(s, n_y, 1))
 
 
+# The most particle rows one y-block unit holds when the count is automatic: one x-slab of the
+# 4096^3 run (256 brick slabs), the size the planner's per-unit terms are measured at.
+UNIT_ROWS_MAX = 4096**3 // 256
+
+
+def auto_y_blocks(slab_rows, rows_per_side):
+    """The fewest y-blocks that keep every unit of an x-slab at or below `UNIT_ROWS_MAX` rows.
+
+    `slab_rows`: particle rows in one x-slab (n_part^3 / brick slabs). `rows_per_side`: the
+    y rows the slab is cut along, split by `partition_units(rows_per_side, n_y, 1)` (tile rows
+    for the step's `y_blocks`, brick rows for the IC emission). Capped at `rows_per_side`.
+    Consumers: `EngineConfig.device_y_blocks` and `icgen.generate_t9_slabs_device` when their
+    count is None.
+    """
+    side = int(rows_per_side)
+    for n_y in range(1, side + 1):
+        largest = max(hi - lo for lo, hi in partition_units(side, n_y, 1))
+        if slab_rows * largest <= UNIT_ROWS_MAX * side:
+            return n_y
+    return side
+
+
 def unit_bricks(slab, block, nb):
     """Bricks [lo, hi) of unit (x-slab `slab`, brick-y range `block`) on an `nb`-per-side grid."""
     s, (y_lo, y_hi), nb = int(slab), block, int(nb)

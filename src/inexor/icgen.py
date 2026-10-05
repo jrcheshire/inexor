@@ -426,7 +426,7 @@ def generate_t9_slabs_device(
     emission="cards",
     comm=None,
     batch_planes=ooc_fft.DEFAULT_BATCH_PLANES,
-    emit_y_blocks=1,
+    emit_y_blocks=None,
 ):
     """`generate_t9_slabs` with the IC stage on the devices. Same arguments and output format.
 
@@ -450,7 +450,8 @@ def generate_t9_slabs_device(
     U_y and U_z (and U_x, moved off the cards before the emission) keep their own planes in
     a spent spectrum's bytes. `emit_y_blocks` encodes each destination slab in that many
     y-blocks on the cards (`device.emit`; same bytes at any count, recorded in the manifest
-    when > 1), which bounds a card's emission memory by a slab's y-block, not the slab.
+    when > 1), which bounds a card's emission memory by a slab's y-block, not the slab; None
+    takes `decomp.auto_y_blocks` over the brick rows.
     Differences from the host path: kernels are applied on the device inside the axis-0 pass;
     the phi round trip is skipped at f_NL = 0; the 2LPT source is
     1/2 (delta^2 - sum phi_ii^2) - sum_{i<j} phi_ij^2 (using sum phi_ii = -delta); U and V are
@@ -486,6 +487,10 @@ def generate_t9_slabs_device(
         raise ValueError(f"bricks_per_side {nb} must divide the bucket grid {t9.n_buckets_side}")
     if n % nb:
         raise ValueError(f"bricks_per_side {nb} must divide n_part {n}")
+    if emit_y_blocks is None:
+        from .decomp import auto_y_blocks
+
+        emit_y_blocks = auto_y_blocks(n**3 / nb, nb)
     if order != 2:
         raise ValueError(f"the streamed generator is order=2 only, got {order}")
     dt = np.dtype(fdtype)

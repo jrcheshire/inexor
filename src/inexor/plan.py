@@ -252,12 +252,6 @@ TILE_RUNG_KEPT_HOST_PER_CARD = {256: 1.67 * GB, 512: 0.51 * GB}
 # (the 32^3 smoke's host peak, job 1027664). Other card counts take the larger.
 PROCESS_BASELINE_BY_CARDS = {1: 4.26 * GB, 4: 3.2 * GB}
 
-# The lead drift's host transient above its closing RSS, per card per slab row, on several
-# cards. MEASURED at c-hero on 4 GB200 only (68 GB, job 1003657); ~0 at cgh64 on 4 GB200
-# (1034340, nothing traced) and on one GH200 at cgh64 and c-1024 (1029876). Unattributed; the
-# slab-row scaling is an assumption. The single-card lane is charged nothing.
-LEAD_DRIFT_HOST_B_PER_SLAB_ROW_PER_CARD = 63
-
 
 def device_window_slabs(ec):
     """x-slabs of bricks that must be resident to serve one plane of tiles.
@@ -566,9 +560,9 @@ def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
     add("tile_loop", "tile programs recompiled at a capacity rung (MEASURED, per card)",
         n_gpus * TILE_RUNG_HOST_PER_CARD.get(int(ec.n_tile),
                                              max(TILE_RUNG_HOST_PER_CARD.values())))
-    if n_gpus > 1:
-        add("lead_drift", "lead drift card transfers (MEASURED at c-hero, per card)",
-            n_gpus * LEAD_DRIFT_HOST_B_PER_SLAB_ROW_PER_CARD * slab_rows)
+    # The lead drift's own host transient is not charged: above its closing RSS it measured
+    # 0-12 GB at c-hero (1024783, 1024784, 1027664), 0.6 GB at c-gh on 2 nodes (1045958) and
+    # 0 at c-1024 for y-blocks 1-8 (1048248).
     # Before the first step the loader has written the n particle rows only; the slack rows
     # are first touched by migrate inserts, the lead drift's included (so crediting it the
     # whole slack keeps it a lower bound).
@@ -746,7 +740,7 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     ic_nodes = max(1, int(getattr(args, "n_nodes", 1)))
     ic_host, ic_card, ic_disk = ic_device_stages(
         args.n_part, n_gpus=n_gpus, fdtype=np.float32, nb=max(1, ec.n_fine // ec.n_brick),
-        n_nodes=ic_nodes, emit_y_blocks=max(1, int(getattr(args, "y_blocks", 1) or 1)))
+        n_nodes=ic_nodes, emit_y_blocks=_emit_y_blocks(args, ec))
     per_node = f", per node (busiest of {ic_nodes})" if ic_nodes > 1 else ""
     _table(f"IC GENERATION ON THE CARDS (its own job), HOST{per_node} by stage", ic_host,
            total_label="PEAK (max, not sum)", reduce=max)
@@ -767,6 +761,8 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     print(f"  the LOAD stage peaks at:               {_fmt(load_peak)}"
           f"   {'<- BINDING' if load_peak > host_peak else ''}")
     print(f"  per GPU, resident + worst phase:       {_fmt(dev_peak)}")
+    print(f"  y-blocks priced:                       {ec_dev.device_y_blocks}"
+          f"{' (auto)' if getattr(args, 'y_blocks', None) is None else ''}")
     if args.host_gb is not None:
         r = host_peak / (args.host_gb * GB)
         print(f"  against --host-gb {args.host_gb}: "
@@ -802,6 +798,22 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     return 0
 
 
+def _y_blocks_arg(value):
+    """`--y-blocks`: a count, or "auto" (None)."""
+    return None if value == "auto" else int(value)
+
+
+def _emit_y_blocks(args, ec):
+    """The IC emission's y-block count: `--y-blocks`, or for auto `decomp.auto_y_blocks` over
+    the brick rows (the generator's own default)."""
+    if getattr(args, "y_blocks", None) is not None:
+        return int(args.y_blocks)
+    from .decomp import auto_y_blocks
+
+    nb = max(1, ec.n_fine // ec.n_brick)
+    return auto_y_blocks(int(args.n_part) ** 3 / nb, nb)
+
+
 def _smallest_fitting_y_blocks(args, n, n_gpus_total, kernel):
     """The smallest `--y-blocks` whose per-GPU in-step and after-the-loop peaks both fit
     `--device-gb`, or None."""
@@ -830,7 +842,7 @@ def build(args):
         eject_kernel=args.eject_kernel,
         migrate_eject_inflight=args.eject_inflight,
         migrate_backend="device" if getattr(args, "backend", "cpu") == "device" else "host",
-        device_y_blocks=getattr(args, "y_blocks", 1),
+        device_y_blocks=getattr(args, "y_blocks", None),
     )
     t9 = T9Layout(box_size=args.box, n_part=args.n_part, bucket_cells=args.bucket_cells)
     return ec, t9
@@ -866,11 +878,12 @@ def main(argv=None):
                     help="for --backend device: bricks per coarse-paint chunk on a "
                          "card. Default a quarter of an x-slab of bricks; smaller "
                          "trades card memory for more device launches.")
-    ap.add_argument("--y-blocks", type=int, default=1,
+    ap.add_argument("--y-blocks", type=_y_blocks_arg, default=None,
                     help="device: y-blocks each x-slab's card work is cut into "
                          "(EngineConfig.device_y_blocks); the per-GPU table prices this count "
                          "and the verdict names the smallest count that fits. The IC tables "
-                         "price the emission at the same count")
+                         "price the emission at the same count. Default auto "
+                         "(`decomp.auto_y_blocks`): units no larger than a 4096^3 x-slab")
     ap.add_argument("--n-part", type=int, default=None, help="particles per side")
     ap.add_argument("--box", type=float, default=None, help="box size, Mpc/h")
     ap.add_argument("--n-fine", type=int, default=None)

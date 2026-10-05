@@ -583,12 +583,17 @@ def under(path, root):
     return a == b or a.startswith(b + os.sep)
 
 
+def _y_blocks(value):
+    """`--y-blocks`: a count, or "auto" (None: `decomp.auto_y_blocks`)."""
+    return None if value == "auto" else int(value)
+
+
 def _planner(preset, cards, slack, arena, alloc_margin=0.10, n_nodes=1, host_gb=1026.0,
-             device_gb=199.0, y_blocks=1):
+             device_gb=199.0, y_blocks=None):
     cmd = [sys.executable, "-m", "inexor.plan", "--preset", preset, "--backend", "device",
            "--n-gpus", str(cards), "--host-gb", f"{host_gb:g}", "--device-gb", f"{device_gb:g}",
            "--arena-frac", str(arena), "--slack", str(slack),
-           "--alloc-margin", str(alloc_margin), "--y-blocks", str(y_blocks)]
+           "--alloc-margin", str(alloc_margin), "--y-blocks", str(y_blocks or "auto")]
     if n_nodes != 1:
         cmd += ["--n-nodes", str(n_nodes)]
     out = subprocess.run(cmd, capture_output=True, text=True,
@@ -805,7 +810,7 @@ def cmd_run(args):
                         timed_all=args.timed_all, numa_maps=args.numa_maps,
                         drop_ic_cache=args.drop_ic_cache,
                         ckpt_probe_slabs=args.ckpt_probe_slabs, trim_probe=args.trim_probe,
-                        cards=args.cards, y_blocks=args.y_blocks,
+                        cards=args.cards, y_blocks=args.y_blocks or "auto",
                         slack=args.slack, alloc_margin=args.alloc_margin,
                         arena_frac=args.arena_frac, checkpoint_dir=args.checkpoint_dir,
                         checkpoint_every=args.checkpoint_every)
@@ -942,7 +947,7 @@ def cmd_ics(args):
                              comm_timeout=args.comm_timeout)
         card["plan"] = dict(seed=args.seed, a_init=args.a_init, growth2=args.growth2,
                             f_NL=args.f_nl, window=args.window, cards=args.cards,
-                            batch_planes=args.batch_planes, y_blocks=args.y_blocks,
+                            batch_planes=args.batch_planes, y_blocks=args.y_blocks or "auto",
                             pencil_batch=args.pencil_batch, slab=args.slab)
         print(f"== device ICs {args.preset}: n_part={g['n_part']} L={g['L']} "
               f"bricks_per_side={nb}, {args.cards} card(s) x {n_ranks} rank(s) -> "
@@ -1265,9 +1270,10 @@ def main(argv=None):
         p.add_argument("--workdir", required=True, help="the IC directory (read only)")
         p.add_argument("--card", required=True)
         p.add_argument("--cards", type=int, default=4)
-        p.add_argument("--y-blocks", type=int, default=1,
+        p.add_argument("--y-blocks", type=_y_blocks, default=None,
                        help="split each x-slab's card work into this many y-blocks "
-                            "(EngineConfig.device_y_blocks); bitwise any count")
+                            "(EngineConfig.device_y_blocks); bitwise any count. Default "
+                            "auto: units no larger than a 4096^3 x-slab")
         p.add_argument("--slack", type=float, default=0.10)
         p.add_argument("--alloc-margin", type=float, default=0.10)
         p.add_argument("--arena-frac", type=float, default=0.01)
@@ -1334,8 +1340,9 @@ def main(argv=None):
     pi.add_argument("--pencil-batch", type=int, default=1)
     pi.add_argument("--batch-planes", type=int, default=16,
                     help="planes per rank in each plane <-> pencil exchange")
-    pi.add_argument("--y-blocks", type=int, default=1,
-                    help="y-block units per destination slab in the emission (bitwise any)")
+    pi.add_argument("--y-blocks", type=_y_blocks, default=None,
+                    help="y-block units per destination slab in the emission (bitwise any). "
+                         "Default auto: units no larger than a 4096^3 x-slab")
     pi.add_argument("--membind-nodes", default=None)
     pi.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
     pi.add_argument("--comm", default="serial", choices=("serial", "mpi"))
