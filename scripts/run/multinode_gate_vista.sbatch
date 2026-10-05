@@ -160,7 +160,7 @@ assert c.Get_size() == $N_RANKS, c.Get_size()
 print('rank', c.Get_rank(), 'of', c.Get_size(), jax.devices())" \
   || { echo "FATAL: the MPI launch line does not start every rank"; exit 1; }
 run_leg --cap 300 --expect-fail guard-dead-rank \
-  on_ranks "$CARDS/${TAG}_guard-dead_r@RANK@" "" "$PY" -c "import os; os.abort()" \
+  on_ranks "$CARDS/${TAG}_guard-dead_r@RANK@" "" "$PY" -c "import os, signal; os.kill(os.getpid(), signal.SIGKILL)" \
   || { echo "FATAL: a rank that dies does not end the launch"; exit 1; }
 run_leg --cap 600 guard-kernel-block \
   "${CPU[@]}" XLA_FLAGS=--xla_force_host_platform_device_count=4 \
