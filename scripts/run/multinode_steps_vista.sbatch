@@ -18,23 +18,22 @@
 # copied into a fresh dir and resumed to the newer one's step with this commit and launch
 # line, and the dir must equal CONTROL_REF byte for byte.
 #
-# Every leg has a time cap; a run leg is also killed once its output (the driver's 60 s
-# heartbeat) has been silent for QUIET_S. A failed leg stops the job. At the end the newest
+# A leg is killed once its output (a run leg's: the driver's 60 s heartbeat) has been silent;
+# nothing else bounds a leg but the wall. A failed leg stops the job. At the end the newest
 # checkpoint must be at step STOP and hold the preset's particle count. Each leg's output is
 # also in REAL_DIR/job-<id>/legs/.
 #
 # Requires INEXOR_RUNS, IC_DIR, REAL_DIR (not under IC_DIR), and INEXOR_SRC or submission
 # from the checkout. Optional: CONTROL_REF (a gated run's ckpt/, two generations) with
 # CONTROL_ICS (its ICs); PRESET (c-gh), K (120), EXPECT_STEP (0), STOP (K), EVERY (20),
-# CONTROL_PRESET (c-1024), SLACK / ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), LEG_FIXED_S (600) +
-# LEG_STEP_S (300) per step (a run leg's cap), QUIET_S (600).
+# CONTROL_PRESET (c-1024), SLACK / ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), QUIET_S (600).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R IC_DIR=$R/c-gh-ics REAL_DIR=$R/c-gh-r1 \
 #     CONTROL_REF=$R/mn-gate-c-1024-1043437/mpi/ckpt CONTROL_ICS=$R/mn-gate-c-1024-1043437/ics \
 #     sbatch -A <account> scripts/run/multinode_steps_vista.sbatch
 # 8192^3 on 8 gb nodes, 40 steps to z = 0 (~7-7.5 h; no control: c-1024 cannot split over
 # 32 GPUs):
 #   INEXOR_RUNS=$R IC_DIR=$R/c-8192-ics REAL_DIR=$R/c-8192-k40 PRESET=c-8192 K=40 EVERY=20 \
-#     LEG_STEP_S=1200 sbatch -A <account> -p gb -N 8 -n 8 -t 11:00:00 \
+#     sbatch -A <account> -p gb -N 8 -n 8 -t 11:00:00 \
 #     scripts/run/multinode_steps_vista.sbatch
 #
 # REHEARSAL=1 runs the same legs on a laptop CPU at cdev8-tile32 (steps 0 -> 6 of 40), with
@@ -79,7 +78,7 @@ fi
 PRESET=${PRESET:-c-gh} K=${K:-120} EXPECT_STEP=${EXPECT_STEP:-0} STOP=${STOP:-$K}
 EVERY=${EVERY:-20} CONTROL_PRESET=${CONTROL_PRESET:-c-1024}
 SLACK=${SLACK:-0.10} ALLOC_MARGIN=${ALLOC_MARGIN:-0.10} ARENA=${ARENA:-${ARENA_FRAC:-0.01}}
-LEG_FIXED_S=${LEG_FIXED_S:-600} LEG_STEP_S=${LEG_STEP_S:-300} QUIET_S=${QUIET_S:-600}
+QUIET_S=${QUIET_S:-600}
 N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 
 CKPT=$REAL_DIR/ckpt
@@ -128,9 +127,6 @@ stop_job () {
   exit $((rc_total > 0 ? rc_total : 1))
 }
 
-# leg_cap FROM STOP: a run leg's time cap
-leg_cap () { echo $((LEG_FIXED_S + LEG_STEP_S * ($2 - $1))); }
-
 # ranks ARM PRESET ICS CKPT K FROM STOP EVERY [XLA_FLAGS]: one run across the nodes, one rank
 # each, from the ICs or (FROM > 0) the step-FROM checkpoint in CKPT
 ranks () {
@@ -144,23 +140,23 @@ ranks () {
 }
 
 # --- guards (node 0)
-run_leg --cap 1800 build-mpi4py build_mpi4py || stop_job "mpi4py did not build"
-run_leg --cap 300 guard-launch-mpi \
+run_leg --quiet-limit 1800 build-mpi4py build_mpi4py || stop_job "mpi4py did not build"
+run_leg --quiet-limit 300 guard-launch-mpi \
   on_ranks "$CARDS/${TAG}_guard-mpi_r@RANK@" "" "${MPIPATH[@]}" \
     "$PY" -m mpi4py -c "from mpi4py import MPI; import jax; c = MPI.COMM_WORLD
 assert c.Get_size() == $N_RANKS, c.Get_size()
 print('rank', c.Get_rank(), 'of', c.Get_size(), jax.devices())" \
   || stop_job "the MPI launch line does not start every rank"
-run_leg --cap 300 --expect-fail guard-dead-rank \
+run_leg --quiet-limit 300 --expect-fail guard-dead-rank \
   on_ranks "$CARDS/${TAG}_guard-dead_r@RANK@" "" "$PY" -c "import os, signal; os.kill(os.getpid(), signal.SIGKILL)" \
   || stop_job "a rank that dies does not end the launch"
 for n in 1 "$N_RANKS"; do
-  run_leg --cap 300 "plan-$n-node" \
+  run_leg --quiet-limit 300 "plan-$n-node" \
     "${CPU[@]}" "$PY" -m inexor.plan --preset "$PRESET" --backend device \
     "${PLAN_MACHINE[@]}" --n-nodes "$n" --slack "$SLACK" \
     --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA"
 done
-run_leg --cap 600 "preflight-$N_RANKS-node" \
+run_leg --quiet-limit 600 "preflight-$N_RANKS-node" \
   "${BIND0[@]}" "${ON0[@]}" "$PY" "$DRIVER" preflight --preset "$PRESET" --workdir "$IC_DIR" \
     --cards "$N_CARDS" --card "$CARDS/${TAG}_preflight_n$N_RANKS.json" --scratch "$REAL_DIR" \
     --n-nodes "$N_RANKS" "${MACHINE[@]}" "${MEMBIND_CHECK[@]}" "${LAYOUT[@]}" \
@@ -176,7 +172,7 @@ if [ "$CONTROL" = 1 ]; then
     || stop_job "the control cannot checkpoint at step $C_TO every $((C_TO - C_FROM)) from $C_FROM"
   echo "=== control: $CONTROL_PRESET $old (step $C_FROM) -> $C_TO of $CK, in $CTRL ==="
   mkdir -p "$CTRL"
-  run_leg --cap 1800 control-copy cp -a "$CONTROL_REF/$old" "$CTRL/" \
+  run_leg control-copy cp -a "$CONTROL_REF/$old" "$CTRL/" \
     || stop_job "the control generation did not copy"
   if [ "${REHEARSAL:-0}" = 1 ] && [ "${PLANT_CONTROL_MISMATCH:-0}" = 1 ]; then
     f=$(cd "$CTRL/$old" && find . -type f ! -name manifest.json | sort | head -1)
@@ -192,7 +188,7 @@ EOF
   fi
   PLANT=""
   [ "${REHEARSAL:-0}" = 1 ] && [ "${PLANT_LEG_FAIL:-0}" = 1 ] && PLANT=--xla_planted_unknown_flag
-  run_leg --cap "$(leg_cap "$C_FROM" "$C_TO")" --quiet-limit "$QUIET_S" \
+  run_leg --quiet-limit "$QUIET_S" \
     "control $C_FROM->$C_TO" ranks control "$CONTROL_PRESET" "$CONTROL_ICS" "$CTRL" "$CK" \
     "$C_FROM" "$C_TO" $((C_TO - C_FROM)) "$PLANT"
   r=$?; summarize control "$C_FROM"
@@ -202,7 +198,7 @@ EOF
 fi
 
 # --- production: EXPECT_STEP -> STOP
-run_leg --cap "$(leg_cap "$EXPECT_STEP" "$STOP")" --quiet-limit "$QUIET_S" \
+run_leg --quiet-limit "$QUIET_S" \
   "steps $EXPECT_STEP->$STOP" ranks steps "$PRESET" "$IC_DIR" "$CKPT" "$K" "$EXPECT_STEP" \
   "$STOP" "$EVERY"
 r=$?; summarize steps "$EXPECT_STEP"

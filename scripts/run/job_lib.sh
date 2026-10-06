@@ -1,5 +1,5 @@
 # shellcheck shell=bash disable=SC2034  # XLA_ENV and LEG_KILLED are for the sourcing script
-# Sourced by the job scripts that run legs: legs run with a time cap and a silence limit, a leg's
+# Sourced by the job scripts that run legs: legs run with a silence limit, a leg's
 # XLA_FLAGS, and the checkpoint gate. tests/test_job_scripts.py runs each piece.
 #
 # The sourcing script sets LEG_DIR (each leg's output is also kept in LEG_DIR/NN-name.log) and
@@ -77,20 +77,20 @@ leg_kill () {
   return 0
 }
 
-# run_leg [--cap S] [--quiet-limit S] [--expect-fail] NAME CMD...
+# run_leg [--quiet-limit S] [--expect-fail] NAME CMD...
 #   Runs CMD (a command or a shell function) in the background and polls it, so the batch
 #   shell's traps (the pre-wall USR1) run during the leg. Its output goes to stdout and to
-#   LEG_DIR/NN-NAME.log. --cap kills the leg S seconds after it starts; --quiet-limit kills it
-#   once its output has been silent for S seconds. A killed leg sets LEG_KILLED=1 and
-#   returns 124. --expect-fail inverts the leg: it passes (0) only when CMD fails by itself.
-#   A failed leg adds one to rc_total.
+#   LEG_DIR/NN-NAME.log. --quiet-limit kills it once its output has been silent for S
+#   seconds; nothing else bounds a leg but the job's wall. A killed leg sets LEG_KILLED=1
+#   and returns 124; an unknown option is refused (2). --expect-fail inverts the leg: it
+#   passes (0) only when CMD fails by itself. A failed leg adds one to rc_total.
 run_leg () {
-  local cap="" quiet="" expect_fail=0
+  local quiet="" expect_fail=0
   while :; do
     case "$1" in
-      --cap) cap=$2; shift 2 ;;
       --quiet-limit) quiet=$2; shift 2 ;;
       --expect-fail) expect_fail=1; shift ;;
+      --*) echo "run_leg: unknown option $1" >&2; return 2 ;;
       *) break ;;
     esac
   done
@@ -102,19 +102,13 @@ run_leg () {
   : > "$out"; rm -f "$out.rc"
   echo ""; echo "=== LEG $name ($(date +%H:%M:%S)) ==="
   ( "$@" > >(tee -a "$out") 2>&1; echo $? > "$out.rc" ) &
-  local pid=$! t0=$SECONDS last=$SECONDS size=0 now why
+  local pid=$! last=$SECONDS size=0 now
   while kill -0 "$pid" 2>/dev/null; do
     sleep "${LEG_POLL_S:-10}" & wait $!
     now=$(wc -c < "$out" | tr -d ' ')
     if [ "$now" != "$size" ]; then size=$now; last=$SECONDS; fi
-    why=""
-    if [ -n "$cap" ] && [ $((SECONDS - t0)) -ge "$cap" ]; then
-      why="ran past its $cap s cap"
-    elif [ -n "$quiet" ] && [ $((SECONDS - last)) -ge "$quiet" ]; then
-      why="printed nothing for $quiet s"
-    fi
-    if [ -n "$why" ]; then
-      echo "=== LEG $name KILLED ($(date +%H:%M:%S)): it $why ==="
+    if [ -n "$quiet" ] && [ $((SECONDS - last)) -ge "$quiet" ]; then
+      echo "=== LEG $name KILLED ($(date +%H:%M:%S)): it printed nothing for $quiet s ==="
       LEG_KILLED=1
       leg_kill "$pid"
       break

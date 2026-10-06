@@ -19,15 +19,15 @@
 # with REF_CARD (a card of the same checkpoint, e.g. hero_card_vista.sbatch's) the per-bin
 # difference is printed, never gated (the transforms differ).
 #
-# Every leg has a time cap and a silence limit; a failed leg stops the job. Each leg's
-# output is also in PROD_DIR/job-<id>/legs/.
+# Every leg has a silence limit and no time limit but the wall; a failed leg stops the job.
+# Each leg's output is also in PROD_DIR/job-<id>/legs/.
 #
 # Requires INEXOR_RUNS, CKPT_DIR (the run's checkpoint dir), PROD_DIR (not under CKPT_DIR;
 # the card lands in PROD_DIR/pk.json, the export in PROD_DIR/export, which must not hold
 # files), and INEXOR_SRC or submission from the checkout. Optional: PRESET (c-gh); K and
 # EXPECT_STEP (the newest checkpoint's n_steps and step); ALLOW_PARTIAL (0: refuse an
 # export short of K); WITH_EXPORT (1; 0 = the card only); SMALL_CKPT + SMALL_PRESET (c-1024); REF_EXPORT; REF_CARD; SLACK /
-# ALLOC_MARGIN (0.10), ARENA_FRAC (0.01); CARD_CAP_S (2400), EXPORT_CAP_S (3600), QUIET_S (900).
+# ALLOC_MARGIN (0.10), ARENA_FRAC (0.01); QUIET_S (900).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R CKPT_DIR=$R/c-gh-k120/ckpt PROD_DIR=$R/c-gh-k120-mn \
 #     SMALL_CKPT=$R/mn-gate-c-1024-1043437/mpi/ckpt REF_EXPORT=$R/c-gh-k120-product/export \
 #     REF_CARD=<the c-gh card json> sbatch -A <account> scripts/run/multinode_products_vista.sbatch
@@ -83,7 +83,7 @@ if [ "${REHEARSAL:-0}" = 1 ]; then
 fi
 PRESET=${PRESET:-c-gh} SMALL_PRESET=${SMALL_PRESET:-c-1024} ALLOW_PARTIAL=${ALLOW_PARTIAL:-0}
 SLACK=${SLACK:-0.10} ALLOC_MARGIN=${ALLOC_MARGIN:-0.10} ARENA=${ARENA:-${ARENA_FRAC:-0.01}}
-CARD_CAP_S=${CARD_CAP_S:-2400} EXPORT_CAP_S=${EXPORT_CAP_S:-3600} QUIET_S=${QUIET_S:-900}
+QUIET_S=${QUIET_S:-900}
 N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 
 . "$SRC/scripts/run/mpi_env_vista.sh"
@@ -157,14 +157,14 @@ prod_one () {
 }
 
 # --- guards (node 0)
-run_leg --cap 1800 build-mpi4py build_mpi4py || stop_job "mpi4py did not build"
-run_leg --cap 300 guard-launch-mpi \
+run_leg --quiet-limit 1800 build-mpi4py build_mpi4py || stop_job "mpi4py did not build"
+run_leg --quiet-limit 300 guard-launch-mpi \
   on_ranks "$CARDS/${TAG}_guard-mpi_r@RANK@" "" "${MPIPATH[@]}" \
     "$PY" -m mpi4py -c "from mpi4py import MPI; import jax; c = MPI.COMM_WORLD
 assert c.Get_size() == $N_RANKS, c.Get_size()
 print('rank', c.Get_rank(), 'of', c.Get_size(), jax.devices())" \
   || stop_job "the MPI launch line does not start every rank"
-run_leg --cap 300 --expect-fail guard-dead-rank \
+run_leg --quiet-limit 300 --expect-fail guard-dead-rank \
   on_ranks "$CARDS/${TAG}_guard-dead_r@RANK@" "" "$PY" -c "import os, signal; os.kill(os.getpid(), signal.SIGKILL)" \
   || stop_job "a rank that dies does not end the launch"
 
@@ -180,20 +180,20 @@ if [ -n "${SMALL_CKPT:-}" ]; then
     [ "${PLANT_CARD_MISMATCH:-0}" = 1 ] && PLANT_CARD=(--k-max 1.0)
     [ "${PLANT_EXPORT_MISMATCH:-0}" = 1 ] && PLANT_EXPORT=(--d-time)
   fi
-  run_leg --cap "$CARD_CAP_S" --quiet-limit "$QUIET_S" small-card-1 \
+  run_leg --quiet-limit "$QUIET_S" small-card-1 \
     prod_one card small-card-1 "$SMALL_PRESET" "$SMALL_CKPT" "$SMALL_K" "$SMALL_STEP" \
     --out "$S/pk-1.json" || stop_job "the small one-rank card failed"
-  run_leg --cap "$CARD_CAP_S" --quiet-limit "$QUIET_S" "small-card-$N_RANKS" \
+  run_leg --quiet-limit "$QUIET_S" "small-card-$N_RANKS" \
     prod_ranks card small-card "$SMALL_PRESET" "$SMALL_CKPT" "$SMALL_K" "$SMALL_STEP" \
     "$PLANT" --out "$S/pk-$N_RANKS.json" "${PLANT_CARD[@]}"
   r=$?; summarize small-card "$SMALL_STEP"
   [ $r -eq 0 ] || stop_job "the small every-rank card failed"
   gate_with small-card same_card "$S/pk-1.json" "$S/pk-$N_RANKS.json" \
     || { rc_total=$((rc_total + 1)); stop_job "the small card differs across rank counts"; }
-  run_leg --cap "$EXPORT_CAP_S" --quiet-limit "$QUIET_S" small-export-1 \
+  run_leg --quiet-limit "$QUIET_S" small-export-1 \
     prod_one export small-export-1 "$SMALL_PRESET" "$SMALL_CKPT" "$SMALL_K" "$SMALL_STEP" \
     --export-dir "$S/export-1" --allow-partial || stop_job "the small one-rank export failed"
-  run_leg --cap "$EXPORT_CAP_S" --quiet-limit "$QUIET_S" "small-export-$N_RANKS" \
+  run_leg --quiet-limit "$QUIET_S" "small-export-$N_RANKS" \
     prod_ranks export small-export "$SMALL_PRESET" "$SMALL_CKPT" "$SMALL_K" "$SMALL_STEP" \
     "" --export-dir "$S/export-$N_RANKS" --allow-partial "${PLANT_EXPORT[@]}"
   r=$?; summarize small-export "$SMALL_STEP"
@@ -204,7 +204,7 @@ if [ -n "${SMALL_CKPT:-}" ]; then
 fi
 
 # --- the products
-run_leg --cap "$CARD_CAP_S" --quiet-limit "$QUIET_S" card \
+run_leg --quiet-limit "$QUIET_S" card \
   prod_ranks card card "$PRESET" "$CKPT_DIR" "$K" "$EXPECT_STEP" "$PLANT" --out "$PROD_DIR/pk.json"
 r=$?; summarize card "$EXPECT_STEP"
 [ $r -eq 0 ] || stop_job "the card failed"
@@ -213,7 +213,7 @@ if [ -n "${REF_CARD:-}" ]; then
   card_diff "$REF_CARD" "$PROD_DIR/pk.json"
 fi
 [ "$WITH_EXPORT" = 1 ] || { echo "=== WITH_EXPORT=$WITH_EXPORT: the card only ==="; exit $rc_total; }
-run_leg --cap "$EXPORT_CAP_S" --quiet-limit "$QUIET_S" export \
+run_leg --quiet-limit "$QUIET_S" export \
   prod_ranks export export "$PRESET" "$CKPT_DIR" "$K" "$EXPECT_STEP" "" \
   --export-dir "$EXPORT" "${PARTIAL[@]}"
 r=$?; summarize export "$EXPECT_STEP"

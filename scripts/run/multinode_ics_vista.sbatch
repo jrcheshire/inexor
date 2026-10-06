@@ -17,17 +17,17 @@
 # job. Then PRESET's ICs into IC_DIR, and a check that the manifest holds the preset's
 # particle count in its slab count.
 #
-# Every leg has a time cap and a silence limit; a failed leg stops the job. Each leg's
-# output is also in IC_DIR/../<name>-job-<id>/legs/.
+# Every leg has a silence limit and no time limit but the wall; a failed leg stops the job.
+# Each leg's output is also in IC_DIR/../<name>-job-<id>/legs/.
 #
 # Requires INEXOR_RUNS, IC_DIR (a new directory: one holding a manifest is refused), and
 # INEXOR_SRC or submission from the checkout. Optional: PRESET (c-gh), SEED (0), A_INIT
 # (0.1), F_NL (0), WINDOW (1), Y_BLOCKS (auto, emission units), BATCH_PLANES (16), SMALL_PRESET
-# (none; c-1024 for the cluster check), GEN_CAP_S (3600), QUIET_S (900).
+# (none; c-1024 for the cluster check), QUIET_S (900).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R IC_DIR=$R/c-gh-ics-mn SMALL_PRESET=c-1024 \
 #     sbatch -A <account> scripts/run/multinode_ics_vista.sbatch
 # 8192^3 on 8 gb nodes (~1-1.5 h):
-#   INEXOR_RUNS=$R IC_DIR=$R/c-8192-ics PRESET=c-8192 GEN_CAP_S=7200 \
+#   INEXOR_RUNS=$R IC_DIR=$R/c-8192-ics PRESET=c-8192 \
 #     sbatch -A <account> -p gb -N 8 -n 8 -t 03:00:00 scripts/run/multinode_ics_vista.sbatch
 #
 # REHEARSAL=1 runs the same legs on a laptop CPU at cdev8-tile32 (a = 0.08, whose
@@ -60,7 +60,7 @@ if [ "${REHEARSAL:-0}" = 1 ]; then
 fi
 PRESET=${PRESET:-c-gh} SEED=${SEED:-0} A_INIT=${A_INIT:-0.1} F_NL=${F_NL:-0} WINDOW=${WINDOW:-1}
 Y_BLOCKS=${Y_BLOCKS:-auto} BATCH_PLANES=${BATCH_PLANES:-16}
-GEN_CAP_S=${GEN_CAP_S:-3600} QUIET_S=${QUIET_S:-900}
+QUIET_S=${QUIET_S:-900}
 N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 
 . "$SRC/scripts/run/mpi_env_vista.sh"
@@ -119,14 +119,14 @@ ics_one () {
 }
 
 # --- guards (node 0)
-run_leg --cap 1800 build-mpi4py build_mpi4py || stop_job "mpi4py did not build"
-run_leg --cap 300 guard-launch-mpi \
+run_leg --quiet-limit 1800 build-mpi4py build_mpi4py || stop_job "mpi4py did not build"
+run_leg --quiet-limit 300 guard-launch-mpi \
   on_ranks "$CARDS/${TAG}_guard-mpi_r@RANK@" "" "${MPIPATH[@]}" \
     "$PY" -m mpi4py -c "from mpi4py import MPI; import jax; c = MPI.COMM_WORLD
 assert c.Get_size() == $N_RANKS, c.Get_size()
 print('rank', c.Get_rank(), 'of', c.Get_size(), jax.devices())" \
   || stop_job "the MPI launch line does not start every rank"
-run_leg --cap 300 --expect-fail guard-dead-rank \
+run_leg --quiet-limit 300 --expect-fail guard-dead-rank \
   on_ranks "$CARDS/${TAG}_guard-dead_r@RANK@" "" "$PY" -c "import os, signal; os.kill(os.getpid(), signal.SIGKILL)" \
   || stop_job "a rank that dies does not end the launch"
 
@@ -139,10 +139,10 @@ if [ -n "${SMALL_PRESET:-}" ]; then
   mkdir -p "$S"
   SMALL_SEED=$SEED
   [ "${REHEARSAL:-0}" = 1 ] && [ "${PLANT_MISMATCH:-0}" = 1 ] && SMALL_SEED=$((SEED + 1))
-  run_leg --cap "$GEN_CAP_S" --quiet-limit "$QUIET_S" small-ics-1 \
+  run_leg --quiet-limit "$QUIET_S" small-ics-1 \
     ics_one small-ics-1 "$SMALL_PRESET" "$S/ics-1" "${GEN[@]}" \
     || stop_job "the small one-rank ICs failed"
-  run_leg --cap "$GEN_CAP_S" --quiet-limit "$QUIET_S" "small-ics-$N_RANKS" \
+  run_leg --quiet-limit "$QUIET_S" "small-ics-$N_RANKS" \
     ics_ranks small-ics "$SMALL_PRESET" "$S/ics-$N_RANKS" "$PLANT" "${GEN[@]}" \
     --seed "$SMALL_SEED"
   r=$?; summarize small-ics 0
@@ -153,7 +153,7 @@ if [ -n "${SMALL_PRESET:-}" ]; then
 fi
 
 # --- the ICs
-run_leg --cap "$GEN_CAP_S" --quiet-limit "$QUIET_S" ics \
+run_leg --quiet-limit "$QUIET_S" ics \
   ics_ranks ics "$PRESET" "$IC_DIR" "$PLANT" "${GEN[@]}"
 r=$?; summarize ics 0
 [ $r -eq 0 ] || stop_job "the ICs failed"

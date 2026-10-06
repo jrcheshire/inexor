@@ -23,15 +23,13 @@
 # node 0 and the CPU backend the kernel-block and rank-gate tests (all fatal) and the real-MPI
 # tests against the module's MPI (recorded, not fatal).
 #
-# Every leg has a time cap; a run leg is also killed once its output (the driver's 60 s
-# heartbeat) has been silent for QUIET_S. A failed run leg stops the job, and the gate fails
+# A leg is killed once its output (a run leg's: the driver's 60 s heartbeat) has been silent;
+# nothing else bounds a leg but the wall. A failed run leg stops the job, and the gate fails
 # on a missing or empty checkpoint dir. Each leg's output is also in $WORK/legs/.
 #
 # Requires INEXOR_RUNS (outputs under $INEXOR_RUNS/mn-gate-<preset>-<job>) and INEXOR_SRC or
 # submission from the checkout. Optional: PRESET (c-1024), K (120), SPLIT (20), STOP (K),
-# EVERY (SPLIT), SLACK (0.10), ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), DET_TIMEOUT (5400 s, a
-# deterministic-ops leg's cap), LEG_FIXED_S (600) + LEG_STEP_S (100) per step (a run leg's
-# cap), QUIET_S (600).
+# EVERY (SPLIT), SLACK (0.10), ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), QUIET_S (600).
 #   INEXOR_RUNS=$SCRATCH/inexor_runs sbatch -A <account> scripts/run/multinode_gate_vista.sbatch
 #
 # REHEARSAL=1 runs the same legs on a laptop CPU at cdev8-tile32 (first 6 of 40 steps, split
@@ -66,8 +64,7 @@ else
 fi
 PRESET=${PRESET:-c-1024} K=${K:-120} SPLIT=${SPLIT:-20} STOP=${STOP:-$K} EVERY=${EVERY:-$SPLIT}
 SLACK=${SLACK:-0.10} ALLOC_MARGIN=${ALLOC_MARGIN:-0.10} ARENA=${ARENA:-${ARENA_FRAC:-0.01}}
-DET_TIMEOUT=${DET_TIMEOUT:-5400}
-LEG_FIXED_S=${LEG_FIXED_S:-600} LEG_STEP_S=${LEG_STEP_S:-100} QUIET_S=${QUIET_S:-600}
+QUIET_S=${QUIET_S:-600}
 N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 . "$SRC/scripts/run/mpi_env_vista.sh"
 . "$SRC/scripts/run/job_lib.sh"
@@ -102,9 +99,6 @@ finish () {
 }
 trap finish EXIT
 trap forward_usr1 USR1
-
-# leg_cap FROM STOP: a run leg's time cap
-leg_cap () { echo $((LEG_FIXED_S + LEG_STEP_S * ($2 - $1))); }
 
 # run_args ARM FROM STOP: the driver's run arguments for one arm and segment
 run_args () {
@@ -141,49 +135,50 @@ stop_job () {
 }
 
 # --- guards and inputs (node 0)
-run_leg --cap 1800 build-mpi4py build_mpi4py || { echo "FATAL: mpi4py did not build"; exit 1; }
+run_leg --quiet-limit 1800 build-mpi4py build_mpi4py \
+  || { echo "FATAL: mpi4py did not build"; exit 1; }
 for n in 1 2; do
-  run_leg --cap 300 "plan-$n-node" \
+  run_leg --quiet-limit 300 "plan-$n-node" \
     "${CPU[@]}" "$PY" -m inexor.plan --preset "$PRESET" --backend device \
     --n-gpus 1 --n-nodes $n --host-gb 116 --device-gb 96 --slack "$SLACK" \
     --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA"
 done
 # the run legs' launch line, on every node, before anything long
-run_leg --cap 300 guard-launch-ref \
+run_leg --quiet-limit 300 guard-launch-ref \
   on_ranks "$CARDS/${TAG}_guard-ref_r@RANK@" "" \
     "$PY" -c "import jax; print('devices', jax.devices())" \
   || { echo "FATAL: the one-node launch line does not start JAX on every node"; exit 1; }
-run_leg --cap 300 guard-launch-mpi \
+run_leg --quiet-limit 300 guard-launch-mpi \
   on_ranks "$CARDS/${TAG}_guard-mpi_r@RANK@" "" "${MPIPATH[@]}" \
     "$PY" -m mpi4py -c "from mpi4py import MPI; import jax; c = MPI.COMM_WORLD
 assert c.Get_size() == $N_RANKS, c.Get_size()
 print('rank', c.Get_rank(), 'of', c.Get_size(), jax.devices())" \
   || { echo "FATAL: the MPI launch line does not start every rank"; exit 1; }
-run_leg --cap 300 --expect-fail guard-dead-rank \
+run_leg --quiet-limit 300 --expect-fail guard-dead-rank \
   on_ranks "$CARDS/${TAG}_guard-dead_r@RANK@" "" "$PY" -c "import os, signal; os.kill(os.getpid(), signal.SIGKILL)" \
   || { echo "FATAL: a rank that dies does not end the launch"; exit 1; }
-run_leg --cap 600 guard-kernel-block \
+run_leg --quiet-limit 600 guard-kernel-block \
   "${CPU[@]}" XLA_FLAGS=--xla_force_host_platform_device_count=4 \
     "$PY" -m pytest -q -rs -p no:cacheprovider tests/test_coarse_kernel_cards.py \
   || { echo "FATAL: the kernel block build is not bitwise on this machine"; exit 1; }
-run_leg --cap 1200 guard-rank-gates \
+run_leg --quiet-limit 1200 guard-rank-gates \
   "${CPU[@]}" OMP_NUM_THREADS=1 \
     XLA_FLAGS="--xla_cpu_multi_thread_eigen=false --xla_force_host_platform_device_count=8" \
     "$PY" -m pytest -q -rs -p no:cacheprovider -n auto tests/test_ranks_coarse.py \
     tests/test_ranks_tile.py tests/test_ranks_migrate.py tests/test_ranks_run.py \
   || { echo "FATAL: the rank gates failed on this machine"; exit 1; }
 # not fatal: the tests launch their own mpiexec, whose placement quirks are not the code's
-run_leg --cap 1200 guard-mpi-lane \
+run_leg --quiet-limit 1200 guard-mpi-lane \
   "${CPU[@]}" OMP_NUM_THREADS=1 "${MPIPATH[@]}" \
     "$PY" -m pytest -q -rs -p no:cacheprovider --basetemp "$WORK/pytest-mpi" \
     tests/test_comm_mpi.py tests/test_driver_mpi.py
 
-run_leg --cap 1800 ics \
+run_leg --quiet-limit 1800 ics \
   "${BIND0[@]}" "${ON0[@]}" "$PY" scripts/run/realization.py ics --config "$PRESET" \
     --workdir "$ICS" "${ICS_ARGS[@]}" \
   || { echo "FATAL: the IC generation failed"; exit 1; }
 for n in 1 2; do
-  run_leg --cap 600 "preflight-$n-node" \
+  run_leg --quiet-limit 600 "preflight-$n-node" \
     "${BIND0[@]}" "${ON0[@]}" "$PY" "$DRIVER" preflight --preset "$PRESET" --workdir "$ICS" --cards 1 \
       --card "$CARDS/${TAG}_preflight_n$n.json" --scratch "$RUNS" --n-nodes $n \
       "${MACHINE[@]}" "${MEMBIND_CHECK[@]}" "${LAYOUT[@]}" \
@@ -191,12 +186,11 @@ for n in 1 2; do
 done
 
 # --- segment 1: steps 0 -> SPLIT
-RUN=(--cap "$(leg_cap 0 "$SPLIT")" --quiet-limit "$QUIET_S")
 PLANT=""
 [ "${REHEARSAL:-0}" = 1 ] && [ "${PLANT_LEG_FAIL:-0}" = 1 ] && PLANT=--xla_planted_unknown_flag
-run_leg "${RUN[@]}" "ref 0->$SPLIT" refs ref 0 "$SPLIT" "$PLANT"; r=$?; summarize ref 0
+run_leg --quiet-limit "$QUIET_S" "ref 0->$SPLIT" refs ref 0 "$SPLIT" "$PLANT"; r=$?; summarize ref 0
 [ $r -eq 0 ] || stop_job "ref 0->$SPLIT"
-run_leg "${RUN[@]}" "mpi 0->$SPLIT" ranks mpi 0 "$SPLIT"; r=$?; summarize mpi 0
+run_leg --quiet-limit "$QUIET_S" "mpi 0->$SPLIT" ranks mpi 0 "$SPLIT"; r=$?; summarize mpi 0
 [ $r -eq 0 ] || stop_job "mpi 0->$SPLIT"
 if [ "${REHEARSAL:-0}" = 1 ] && [ "${PLANT_MISMATCH:-0}" = 1 ]; then
   f=$(cd "$WORK/ref1/ckpt" && find . -type f ! -name manifest.json | sort | head -1)
@@ -214,11 +208,10 @@ if ! gate "step-$SPLIT" "$WORK/ref0/ckpt" "$WORK/ref1/ckpt" "$WORK/mpi/ckpt"; th
   rc_total=$((rc_total + 1))
   echo "=== the step-$SPLIT checkpoints differ: 0 -> $SPLIT again with deterministic ops ==="
   DET=--xla_gpu_deterministic_ops=true
-  RUN=(--cap "$DET_TIMEOUT" --quiet-limit "$QUIET_S")
-  run_leg "${RUN[@]}" "det-ref 0->$SPLIT" refs det-ref 0 "$SPLIT" "$DET"; r=$?
+  run_leg --quiet-limit "$QUIET_S" "det-ref 0->$SPLIT" refs det-ref 0 "$SPLIT" "$DET"; r=$?
   summarize det-ref 0
   [ $r -eq 0 ] || stop_job "det-ref 0->$SPLIT"
-  run_leg "${RUN[@]}" "det-mpi 0->$SPLIT" ranks det-mpi 0 "$SPLIT" "$DET"; r=$?
+  run_leg --quiet-limit "$QUIET_S" "det-mpi 0->$SPLIT" ranks det-mpi 0 "$SPLIT" "$DET"; r=$?
   summarize det-mpi 0
   [ $r -eq 0 ] || stop_job "det-mpi 0->$SPLIT"
   gate "step-$SPLIT-deterministic" "$WORK/det-ref0/ckpt" "$WORK/det-ref1/ckpt" \
@@ -229,10 +222,10 @@ fi
 
 # --- segment 2: SPLIT -> STOP, resumed from the step-SPLIT checkpoints
 if [ "$STOP" -gt "$SPLIT" ]; then
-  RUN=(--cap "$(leg_cap "$SPLIT" "$STOP")" --quiet-limit "$QUIET_S")
-  run_leg "${RUN[@]}" "ref $SPLIT->$STOP" refs ref "$SPLIT" "$STOP"; r=$?; summarize ref "$SPLIT"
+  run_leg --quiet-limit "$QUIET_S" "ref $SPLIT->$STOP" refs ref "$SPLIT" "$STOP"; r=$?
+  summarize ref "$SPLIT"
   [ $r -eq 0 ] || stop_job "ref $SPLIT->$STOP"
-  run_leg "${RUN[@]}" "mpi $SPLIT->$STOP" ranks mpi "$SPLIT" "$STOP"; r=$?
+  run_leg --quiet-limit "$QUIET_S" "mpi $SPLIT->$STOP" ranks mpi "$SPLIT" "$STOP"; r=$?
   summarize mpi "$SPLIT"
   [ $r -eq 0 ] || stop_job "mpi $SPLIT->$STOP"
   gate "step-$STOP" "$WORK/ref0/ckpt" "$WORK/ref1/ckpt" "$WORK/mpi/ckpt" \

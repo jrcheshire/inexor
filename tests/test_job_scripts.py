@@ -1,6 +1,6 @@
-"""The multi-node job's shell pieces: a rank's end releases its launcher, every run leg has a
-time cap and a silence limit, the gate refuses a missing or empty checkpoint, and a leg's
-XLA_FLAGS is never a bare separator.
+"""The multi-node job's shell pieces: a rank's end releases its launcher, a silent leg is
+killed and a printing one never is, the gate refuses a missing or empty checkpoint, and a
+leg's XLA_FLAGS is never a bare separator.
 
 `scripts/run/rank_exec.sh` runs under a launcher that hands the rank one of its own pipes
 and waits for it to close before reaping the rank, as hydra's proxy does, and under a real
@@ -165,18 +165,21 @@ def test_a_silent_leg_is_killed_with_its_children(tmp_path, nap):
     assert not _survivors(f"sleep {nap}")
 
 
-def test_a_leg_past_its_cap_is_killed_even_while_printing(tmp_path):
-    t0 = time.monotonic()
-    r = _lib('run_leg --cap 3 --quiet-limit 100 busy '
-             'bash -c "while :; do echo x; sleep 0.2; done"\n'
+def test_a_printing_leg_is_never_killed(tmp_path):
+    r = _lib('run_leg --quiet-limit 2 busy '
+             'bash -c "for i in {1..30}; do echo x; sleep 0.2; done"\n'
              'echo "rc=$? killed=$LEG_KILLED"', tmp_path)
-    assert time.monotonic() - t0 < 15
-    assert "rc=124 killed=1" in r.stdout and "ran past its 3 s cap" in r.stdout
+    assert "rc=0 killed=0" in r.stdout and "KILLED" not in r.stdout
+
+
+def test_run_leg_refuses_an_unknown_option(tmp_path):
+    r = _lib('run_leg --cap 3 old true; echo "rc=$? legs=$LEG_N"', tmp_path)
+    assert "rc=2 legs=0" in r.stdout and "unknown option --cap" in r.stderr
 
 
 def test_a_leg_that_ignores_term_is_killed(tmp_path, nap):
     t0 = time.monotonic()
-    r = _lib(f'run_leg --cap 2 stubborn bash -c "trap \\"\\" TERM; sleep {nap}; :"\n'
+    r = _lib(f'run_leg --quiet-limit 2 stubborn bash -c "trap \\"\\" TERM; sleep {nap}; :"\n'
              'echo "rc=$? killed=$LEG_KILLED"', tmp_path)
     assert time.monotonic() - t0 < 20
     assert "rc=124 killed=1" in r.stdout
@@ -186,7 +189,7 @@ def test_a_leg_that_ignores_term_is_killed(tmp_path, nap):
 def test_expect_fail_passes_only_a_failure_of_its_own(tmp_path, nap):
     r = _lib('run_leg --expect-fail a bash -c "exit 1"; echo "a=$?"\n'
              'run_leg --expect-fail b true; echo "b=$?"\n'
-             f'run_leg --cap 2 --expect-fail c sleep {nap}; echo "c=$? total=$rc_total"',
+             f'run_leg --quiet-limit 2 --expect-fail c sleep {nap}; echo "c=$? total=$rc_total"',
              tmp_path)
     assert "a=0" in r.stdout and "b=1" in r.stdout and "c=1 total=2" in r.stdout
 

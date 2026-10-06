@@ -16,8 +16,7 @@
 #
 # Requires INEXOR_RUNS and INEXOR_SRC (or submission from the checkout). Optional: PRESETS
 # ("cgh64 c-1024"), K (120), STOP (10), EVERY (5), Y_MAX (8; counts are 1, 2, 4, ... up to the
-# preset's tile rows), LEG_FIXED_S (900) + LEG_STEP_S (120) per step (a run leg's cap),
-# QUIET_S (600).
+# preset's tile rows), QUIET_S (600).
 #   INEXOR_RUNS=$SCRATCH/inexor_runs sbatch -A <account> scripts/run/yblocks_measure_vista.sbatch
 #
 # REHEARSAL=1 runs the same legs on a laptop CPU at cdev8-tile32 (steps 0 -> 6 of 40, 4
@@ -76,8 +75,7 @@ else
   MEMBIND_CHECK=(--membind-nodes 0,1) MACHINE=(--host-gb 1026 --device-gb 199)
 fi
 PRESETS=${PRESETS:-cgh64 c-1024} K=${K:-120} STOP=${STOP:-10} EVERY=${EVERY:-5}
-Y_MAX=${Y_MAX:-8} LEG_FIXED_S=${LEG_FIXED_S:-900} LEG_STEP_S=${LEG_STEP_S:-120}
-QUIET_S=${QUIET_S:-600}
+Y_MAX=${Y_MAX:-8} QUIET_S=${QUIET_S:-600}
 # shellcheck disable=SC2054
 BIND=(numactl --membind=0,1)  # host allocations on the CPU sockets only
 CPU=(env JAX_PLATFORMS=cpu)
@@ -153,20 +151,22 @@ for preset in $PRESETS; do
   D=$WORK/$preset
   echo ""; echo "=== $preset: $rows tile rows, y-blocks ${YS[*]}, in $D ==="
   for y in "${YS[@]}"; do
-    run_leg --cap 300 "plan-$preset-y$y" "${CPU[@]}" "$PY" -m inexor.plan --preset "$preset" \
-      --backend device --n-gpus 4 --host-gb 1026 --device-gb 199 --y-blocks "$y" "${LAYOUT[@]}"
+    run_leg --quiet-limit 300 "plan-$preset-y$y" \
+      "${CPU[@]}" "$PY" -m inexor.plan --preset "$preset" --backend device --n-gpus 4 \
+      --host-gb 1026 --device-gb 199 --y-blocks "$y" "${LAYOUT[@]}"
   done
-  run_leg --cap 1800 "ics-$preset" "${BIND[@]}" "$PY" "$SRC/scripts/run/realization.py" ics \
-    --config "$preset" --workdir "$D/ics" "${ICS_ARGS[@]}" \
+  run_leg --quiet-limit 1800 "ics-$preset" \
+    "${BIND[@]}" "$PY" "$SRC/scripts/run/realization.py" ics --config "$preset" \
+    --workdir "$D/ics" "${ICS_ARGS[@]}" \
     || stop_job "the $preset ICs failed"
-  run_leg --cap 600 "preflight-$preset" "${BIND[@]}" "$PY" "$DRIVER" preflight \
+  run_leg --quiet-limit 600 "preflight-$preset" "${BIND[@]}" "$PY" "$DRIVER" preflight \
     --preset "$preset" --workdir "$D/ics" --cards 4 --y-blocks "${YS[${#YS[@]} - 1]}" \
     --card "$CARDS/${TAG}_${preset}_preflight.json" --scratch "$WORK" "${MACHINE[@]}" \
     "${MEMBIND_CHECK[@]}" "${LAYOUT[@]}" \
     || stop_job "preflight refused $preset"
   for y in "${YS[@]}"; do
     card=$CARDS/${TAG}_${preset}_y$y.json
-    run_leg --cap $((LEG_FIXED_S + LEG_STEP_S * STOP)) --quiet-limit "$QUIET_S" \
+    run_leg --quiet-limit "$QUIET_S" \
       "run-$preset-y$y" arm "$preset" "$D/ics" "$D/y$y/ckpt" "$y" "$card" \
       || stop_job "the $preset run at $y y-blocks failed"
     "${CPU[@]}" "$PY" "$DRIVER" summarize --card "$card" --gpu-csv "$GPU_CSV" \
@@ -196,7 +196,7 @@ EOF
     same_ckpt_any_cut "$D/y1/ckpt" "$D/y$y/ckpt" >/dev/null && continue
     for z in 1 "$y"; do
       [ -d "$D/det-y$z/ckpt" ] && continue
-      run_leg --cap $((LEG_FIXED_S + LEG_STEP_S * STOP)) --quiet-limit "$QUIET_S" \
+      run_leg --quiet-limit "$QUIET_S" \
         "det-$preset-y$z" arm "$preset" "$D/ics" "$D/det-y$z/ckpt" "$z" \
         "$CARDS/${TAG}_${preset}_det-y$z.json" --xla_gpu_deterministic_ops=true
     done
