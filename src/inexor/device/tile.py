@@ -169,7 +169,13 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
 
     fn = jax.jit(body_write, donate_argnums=(7, 8)) if write else jax.jit(body)
     with _KERNEL_LOCK:
-        return _KERNELS.setdefault(key, fn)
+        fn = _KERNELS.setdefault(key, fn)
+        # `cap` only rises within a run (`capacity_shape`'s floor), so a smaller-cap program
+        # of this family is never called again; dropping it releases its executable
+        family = key[:1] + key[2:]
+        for k in [k for k in _KERNELS if k[1] < cap and k[:1] + k[2:] == family]:
+            del _KERNELS[k]
+        return fn
 
 
 def tile_task_device(st, one_tile, C, g_coarse, t, bricks, jit=False, shapes=None,

@@ -232,6 +232,27 @@ def test_a_jitted_step_is_one_program_within_the_floor():
     assert dtile._TRACES[0] - t0 == 1, "new kick coefficients retraced the program"
 
 
+def test_a_larger_capacity_replaces_the_smaller_program():
+    """A program built at a larger `cap` drops the smaller-cap ones of its family (the
+    capacity only rises within a run); other families and the cache hit are kept."""
+    t9 = T9Layout(box_size=L_BOX, n_part=N_PART, bucket_cells=2)
+    kw = dict(n_b=8, p3=8, per=1, nb=8, n_tile=N_TILE, n_brick=8, n_coarse=N_COARSE,
+              coarse_cell=L_BOX / N_COARSE, box=L_BOX, t9=t9)
+
+    def one_tile(u, live, owned):
+        raise AssertionError("never traced here")
+
+    dtile._KERNELS.clear()
+    small = dtile._tile_kernel(one_tile, cap=100, write=True, **kw)
+    other = dtile._tile_kernel(one_tile, cap=100, write=False, **kw)
+    big = dtile._tile_kernel(one_tile, cap=126, write=True, **kw)
+    held = [id(f) for f in dtile._KERNELS.values()]
+    assert id(small) not in held, "the superseded program is still cached"
+    assert id(big) in held and id(other) in held
+    assert len(held) == 2
+    assert dtile._tile_kernel(one_tile, cap=126, write=True, **kw) is big
+
+
 def test_a_staged_state_and_timings_change_no_bit():
     """The state placed on the device once, and the timed (synced) call, return
     exactly what the plain jitted call returns; every phase is timed."""
