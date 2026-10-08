@@ -6,20 +6,26 @@
 #SBATCH -t 04:00:00
 #SBATCH -o d8-gh-1card-%j.log
 #SBATCH --signal=B:USR1@900
-# A whole realization on ONE GH200: device-generated LCDM ICs, the 120-step schedule on
-# the single-card device lane, and its P(k) card. PRESET defaults to c-1024 (1024^3 in
-# 512 Mpc/h, the same resolution as every other preset); c-gh is 2048^3.
+# Realizations on ONE GH200: device-generated LCDM ICs, then one run per step count in KS
+# from those ICs on the single-card device lane (each checkpointed once, at its end), and
+# each run's P(k) card. PRESET defaults to c-1024 (1024^3 in 512 Mpc/h, the same resolution
+# as every other preset). A run that fails gets no card and the next step count still runs.
 #
-# Requires INEXOR_RUNS (run root; outputs under $INEXOR_RUNS/d8-gh-<preset>-<job>) and
-# INEXOR_SRC or submission from the inexor checkout. Optional: PRESET, SLACK,
-# ALLOC_MARGIN, ARENA_FRAC. The account is passed with `sbatch -A`:
+# Requires INEXOR_RUNS (run root; outputs under $INEXOR_RUNS/d8-gh-<preset>-<job>/k<K>) and
+# INEXOR_SRC or submission from the inexor checkout. Optional: PRESET, KS (120; step counts,
+# space-separated), SLACK, ALLOC_MARGIN, ARENA_FRAC. The account is passed with `sbatch -A`:
 #   INEXOR_RUNS=$SCRATCH/inexor_runs sbatch -A <account> scripts/run/gh_single_card_vista.sbatch
 #   sbatch -A <account> -t <wall> --export=ALL,PRESET=c-gh,SLACK=0.05,ALLOC_MARGIN=0.05 ...
+# The step-count ladder at 512^3 in 256 Mpc/h (one IC set, five schedules):
+#   INEXOR_RUNS=$SCRATCH/inexor_runs PRESET=cgh64 KS="40 60 80 120 160" \
+#     sbatch -A <account> scripts/run/gh_single_card_vista.sbatch
 #
 # A GH200 host is ~116 GB of LPDDR with a hard cliff; MemAvailable also counts the card's
 # HBM, so the preflight compares against the CPU NUMA node alone and the process is bound
 # to it (--membind 0).
 #
+# Wall (cgh64 ladder), estimated: ~8 s/step on one GH200 (gh 1029876's 512^3 run), 460
+# steps ~1 h, plus five cards (~1-2 min each) and the ICs: ~1.5-2 h central, 4 h requested.
 # Wall (c-1024), estimated: ~35-45 s/step (4096^3 on four GB200s scaled by volume, one
 # card for four, and GH200 vs GB200 tile force), 120 steps ~70-90 min; ICs ~5 min, pytest
 # ~2, checkpoints ~1, card ~5. ~1.5-2 h central; 4 h requested since small-N fixed costs
@@ -46,12 +52,13 @@ PRESET=${PRESET:-c-1024}
 SLACK=${SLACK:-0.10}
 ALLOC_MARGIN=${ALLOC_MARGIN:-0.10}
 ARENA=${ARENA_FRAC:-0.01}
-K=120
+KS=${KS:-120}
+for K in $KS; do
+  [[ "$K" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: KS holds '$K', not a step count"; exit 1; }
+done
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 WORK=$RUNS/d8-gh-$PRESET-$SLURM_JOB_ID
 ICS=$WORK/ics
-CKPT=$WORK/ckpt
-PROD=$WORK/prod
 CARDS=runs/v2
 mkdir -p "$CARDS"
 TAG=d8gh_${PRESET}_$SLURM_JOB_ID
@@ -62,10 +69,10 @@ BIND="numactl --membind=0"
 MEMBIND="--membind-nodes 0"
 CPU="env JAX_PLATFORMS=cpu"
 LAYOUT="--slack $SLACK --alloc-margin $ALLOC_MARGIN --arena-frac $ARENA"
-mkdir -p "$WORK" "$PROD"
+mkdir -p "$WORK"
 
 echo "=== $(hostname): commit $(git rev-parse --short HEAD), job $SLURM_JOB_ID, $(date) ==="
-echo "=== $PRESET, K=$K, slack $SLACK, alloc_margin $ALLOC_MARGIN, arena_frac $ARENA ==="
+echo "=== $PRESET, K in $KS, slack $SLACK, alloc_margin $ALLOC_MARGIN, arena_frac $ARENA ==="
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || echo "no nvidia-smi"
 free -g | head -2
 numactl --hardware | head -6
@@ -137,22 +144,27 @@ run_leg preflight \
     --slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA" \
   || { echo "FATAL: preflight refused"; exit 1; }
 
-run_leg run \
-  $BIND pixi run -e gpu python $DRIVER run --preset "$PRESET" --workdir "$ICS" --cards 1 \
-    --card $CARDS/${TAG}_run.json --k-steps $K --stop-at $K --timed-all --numa-maps \
-    $MEMBIND --beat 60 --slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA" \
-    --checkpoint-dir "$CKPT" --checkpoint-every 40
-rc_run=$?
-run_leg summarize \
-  pixi run -e gpu python $DRIVER summarize --card $CARDS/${TAG}_run.json --gpu-csv "$GPU_CSV" \
-    --mem-csv "$MEM_CSV" --out $CARDS/${TAG}_run_summary.json
-[ $rc_run -ne 0 ] && { echo "FATAL: the run failed"; exit 1; }
+for K in $KS; do
+  CKPT=$WORK/k$K/ckpt
+  PROD=$WORK/k$K/prod
+  mkdir -p "$PROD"
+  run_leg "run-k$K" \
+    $BIND pixi run -e gpu python $DRIVER run --preset "$PRESET" --workdir "$ICS" --cards 1 \
+      --card $CARDS/${TAG}_k${K}_run.json --k-steps $K --stop-at $K --timed-all --numa-maps \
+      $MEMBIND --beat 60 --slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA" \
+      --checkpoint-dir "$CKPT" --checkpoint-every $K
+  rc_run=$?
+  run_leg "summarize-k$K" \
+    pixi run -e gpu python $DRIVER summarize --card $CARDS/${TAG}_k${K}_run.json \
+      --gpu-csv "$GPU_CSV" --mem-csv "$MEM_CSV" --out $CARDS/${TAG}_k${K}_run_summary.json
+  [ $rc_run -ne 0 ] && { echo "=== the $K-step run failed: no card ==="; continue; }
 
-# the product subcommands read <workdir>/ckpt and refuse a checkpoint under the ICs
-ln -sfn "$CKPT" "$PROD/ckpt"
-run_leg card \
-  $CPU $BIND pixi run -e gpu python scripts/run/realization.py card --config "$PRESET" \
-    --workdir "$PROD" --k-steps $K $LAYOUT --heartbeat 60 --tile-workers 8 --card-pool
-[ -f "$PROD/realization_pk.json" ] && cp "$PROD/realization_pk.json" $CARDS/${TAG}_pk.json
+  # the product subcommands read <workdir>/ckpt and refuse a checkpoint under the ICs
+  ln -sfn "$CKPT" "$PROD/ckpt"
+  run_leg "card-k$K" \
+    $CPU $BIND pixi run -e gpu python scripts/run/realization.py card --config "$PRESET" \
+      --workdir "$PROD" --k-steps $K $LAYOUT --heartbeat 60 --tile-workers 8 --card-pool
+  [ -f "$PROD/realization_pk.json" ] && cp "$PROD/realization_pk.json" $CARDS/${TAG}_k${K}_pk.json
+done
 
 exit $rc_total
