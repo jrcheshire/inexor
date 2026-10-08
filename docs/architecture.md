@@ -221,8 +221,10 @@ and device coarse paints bitwise one monolithic paint. The float twins (`paint_f
 ## 4. Initial conditions (`icgen.py`, `ic.py`, `lpt.py`, `cosmology.py`, `ooc_fft.py`)
 
 - **Linear power** (`cosmology.linear_power`, `ic_k_table`): EH98 (Eisenstein & Hu 1998)
-  normalized to `sigma8`, or a tabulated z = 0 `(k, P)` (`backend="table"`). The transfer
-  function in the potential is always EH98.
+  normalized to `sigma8`, or a tabulated z = 0 `(k, P)` (`backend="table"`, a checked
+  `LinearPkTable` that the IC manifest embeds and the checkpoints carry). The transfer
+  function in the potential is EH98's, or with a table derived from it (sqrt(P / k^n_s),
+  unity at k = 1e-4 h/Mpc).
 - **Noise** (`ic.white_plane`): one unit-normal `(N, N)` plane per axis-0 index, keyed
   `jax.random.fold_in(key, i)` and drawn on the CPU backend, so any slab decomposition gives
   the same field. The stream is named `ic.IC_STREAM` and needs `jax_threefry_partitionable`.

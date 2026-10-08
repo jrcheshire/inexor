@@ -23,7 +23,8 @@
 # Requires INEXOR_RUNS, IC_DIR (a new directory: one holding a manifest is refused), and
 # INEXOR_SRC or submission from the checkout. Optional: PRESET (c-gh), SEED (0), A_INIT
 # (0.1), F_NL (0), WINDOW (1), Y_BLOCKS (auto, emission units), BATCH_PLANES (16), SMALL_PRESET
-# (none; c-1024 for the cluster check), QUIET_S (900).
+# (none; c-1024 for the cluster check), QUIET_S (900), PK_TABLE (a tabulated linear P(k) from
+# scripts/run/camb_linear_pk.py instead of EH98, for every IC leg).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R IC_DIR=$R/c-gh-ics-mn SMALL_PRESET=c-1024 \
 #     sbatch -A <account> scripts/run/multinode_ics_vista.sbatch
 # 8192^3 on 8 gb nodes (~1-1.5 h):
@@ -61,6 +62,10 @@ fi
 PRESET=${PRESET:-c-gh} SEED=${SEED:-0} A_INIT=${A_INIT:-0.1} F_NL=${F_NL:-0} WINDOW=${WINDOW:-1}
 Y_BLOCKS=${Y_BLOCKS:-auto} BATCH_PLANES=${BATCH_PLANES:-16}
 QUIET_S=${QUIET_S:-900}
+if [ -n "${PK_TABLE:-}" ]; then
+  [ -f "$PK_TABLE" ] || { echo "FATAL: PK_TABLE is not a file: $PK_TABLE"; exit 1; }
+  PK_TABLE=$(abspath "$(dirname "$PK_TABLE")")/$(basename "$PK_TABLE")
+fi
 N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 
 . "$SRC/scripts/run/mpi_env_vista.sh"
@@ -73,10 +78,12 @@ CARDS=$SRC/runs/v2
 TAG=mnics_${PRESET}_$SLURM_JOB_ID
 GEN=(--seed "$SEED" --a-init "$A_INIT" --f-nl "$F_NL" --window "$WINDOW"
      --y-blocks "$Y_BLOCKS" --batch-planes "$BATCH_PLANES")
+[ -n "${PK_TABLE:-}" ] && GEN+=(--pk-table "$PK_TABLE")
 mkdir -p "$WORK" "$CARDS"
 
 echo "=== $(hostname): commit $(git rev-parse --short HEAD), job $SLURM_JOB_ID, $(date) ==="
 echo "=== $PRESET ICs -> $IC_DIR: seed $SEED, a_init $A_INIT, f_NL $F_NL, window $WINDOW, y-blocks $Y_BLOCKS, batch $BATCH_PLANES ==="
+echo "=== linear P(k) ${PK_TABLE:-EH98} ==="
 echo "=== small check ${SMALL_PRESET:-none}; nodes ${SLURM_JOB_NODELIST:-local}, launch '$LAUNCH', work $WORK ==="
 for t in mpiexec mpicc "$PY"; do echo "  $t -> $(command -v "$t" || echo none)"; done
 if [ "${REHEARSAL:-0}" != 1 ]; then

@@ -1543,14 +1543,16 @@ def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=No
 def epoch_record(epoch, step):
     """The `{a, cosmology}` a checkpoint carries so its units can be chosen later.
 
-    `epoch` is `(a_steps, cosmo)` (the full `integrate.a_grid` output, n_steps + 1 entries,
-    and its cosmology) or None (writes nothing). `step` is the number of completed steps, so
-    the checkpoint sits at `a_steps[step]`. Provenance only: not needed to resume, and not
-    in the fingerprint (which already covers it via `coeffs`).
+    `epoch` is `(a_steps, cosmo)` or `(a_steps, cosmo, linear_pk)` (the full `integrate.a_grid`
+    output, n_steps + 1 entries, its cosmology, and the `LinearPkTable.record()` of a
+    tabulated IC spectrum, recorded as `linear_pk` so a card can use it) or None (writes
+    nothing). `step` is the number of completed steps, so the checkpoint sits at
+    `a_steps[step]`. Provenance only: not needed to resume, and not in the fingerprint (which
+    covers the epoch via `coeffs`; the spectrum only seeded the ICs).
     """
     if epoch is None:
         return {}
-    a_steps, cosmo = epoch
+    a_steps, cosmo, *rest = epoch
     step = int(step)
     if not 0 <= step < len(a_steps):
         raise IndexError(
@@ -1558,7 +1560,10 @@ def epoch_record(epoch, step):
             f"({len(a_steps) - 1} steps): the schedule and the epoch grid disagree, and "
             "recording the wrong epoch would silently mis-scale every exported velocity"
         )
-    return dict(a=float(a_steps[step]), cosmology=dataclasses.asdict(cosmo))
+    out = dict(a=float(a_steps[step]), cosmology=dataclasses.asdict(cosmo))
+    if rest and rest[0] is not None:
+        out["linear_pk"] = rest[0]
+    return out
 
 
 def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=0.10,
@@ -1643,8 +1648,9 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     full `coeffs` (a run over `coeffs[:n]` is a different trajectory, since drifts are fused
     across steps). With checkpointing on, `stop_at` must be a checkpoint boundary.
 
-    `epoch = (a_steps, cosmo)` is read only by checkpoints (`epoch_record`), so an export can
-    convert velocities to km/s from the directory alone. `timed_steps` names absolute steps
+    `epoch = (a_steps, cosmo[, linear_pk])` is read only by checkpoints (`epoch_record`), so an
+    export can convert velocities to km/s, and a card take the ICs' tabulated P(k), from the
+    directory alone. `timed_steps` names absolute steps
     whose device passes, separate repack and checkpoint are timed into `stats["timings"]`.
 
     Across ranks (`comm`; `decomp` defaults from its rank and size), every rank runs this
@@ -1673,7 +1679,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         )
     if epoch is not None:
         # checked up front; `coeffs` is the full schedule even for a `stop_at` segment
-        a_steps, _ = epoch
+        a_steps = epoch[0]
         if len(a_steps) != len(coeffs) + 1:
             raise ValueError(
                 f"epoch grid has {len(a_steps)} points for a {len(coeffs)}-step schedule; "

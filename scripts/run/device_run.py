@@ -768,7 +768,7 @@ def cmd_run(args):
     from inexor import engine, icgen
     from inexor.decomp import Decomp
     from inexor.plan import engine_config
-    from realization import _coeffs, _cosmo, _require_ic_growth2
+    from realization import _coeffs, _cosmo, _ic_linear_pk, _linear_pk, _require_ic_growth2
 
     jax.config.update("jax_enable_x64", True)
     ics = os.path.realpath(args.workdir)
@@ -856,8 +856,10 @@ def cmd_run(args):
                     f"the newest checkpoint under {args.checkpoint_dir} is at step "
                     f"{resume['step']}, and this job was submitted to resume from step "
                     f"{args.expect_step}")
+            linear_pk = _linear_pk(resume, cosmo)
         else:
             _require_ic_growth2(args.workdir, args.growth2)
+            linear_pk = _ic_linear_pk(args.workdir, cosmo)
             st = icgen.load_slot_state(args.workdir, brick_slack=args.slack,
                                        alloc_margin=args.alloc_margin,
                                        arena_frac=args.arena_frac,
@@ -878,8 +880,10 @@ def cmd_run(args):
             with mon.lock:
                 card["steps"].append(s)
 
+        # the ICs' linear P(k), if tabulated, rides along into every checkpoint
+        epoch = (a_steps, cosmo, None if linear_pk is None else linear_pk.record())
         out = engine.run(st, ec, co, phase=mon, resume=resume, stop_at=args.stop_at,
-                         collect=collect, timed_steps=timed, epoch=(a_steps, cosmo),
+                         collect=collect, timed_steps=timed, epoch=epoch,
                          comm=comm, decomp=decomp)
         card["finished"] = time.time()
         # a checkpoint is written after the last boundary and has none of its own
@@ -917,7 +921,7 @@ def cmd_ics(args):
 
     from inexor import icgen
     from inexor.plan import engine_config
-    from realization import GEN_FDTYPE, _cosmo, _geom, _ic_provenance
+    from realization import GEN_FDTYPE, _cosmo, _geom, _ic_provenance, _pk_table_arg
 
     jax.config.update("jax_enable_x64", True)
     if os.path.exists(os.path.join(args.workdir, icgen.MANIFEST)):
@@ -948,7 +952,8 @@ def cmd_ics(args):
         card["plan"] = dict(seed=args.seed, a_init=args.a_init, growth2=args.growth2,
                             f_NL=args.f_nl, window=args.window, cards=args.cards,
                             batch_planes=args.batch_planes, y_blocks=args.y_blocks or "auto",
-                            pencil_batch=args.pencil_batch, slab=args.slab)
+                            pencil_batch=args.pencil_batch, slab=args.slab,
+                            pk_table=args.pk_table)
         print(f"== device ICs {args.preset}: n_part={g['n_part']} L={g['L']} "
               f"bricks_per_side={nb}, {args.cards} card(s) x {n_ranks} rank(s) -> "
               f"{args.workdir}", flush=True)
@@ -961,13 +966,16 @@ def cmd_ics(args):
             if line.strip().startswith("ic stage "):
                 mon("ic_" + line.split(":")[0].split()[-1])
 
+        cosmo = _cosmo()
+        backend, table = _pk_table_arg(args, cosmo)
         t0 = time.time()
         man = icgen.generate_t9_slabs_device(
-            args.workdir, jax.random.PRNGKey(args.seed), g["n_part"], g["L"], _cosmo(),
+            args.workdir, jax.random.PRNGKey(args.seed), g["n_part"], g["L"], cosmo,
             args.a_init, nb, bucket_cells=args.bucket_cells, f_NL=args.f_nl,
             fdtype=GEN_FDTYPE, slab=args.slab, window=args.window, provenance=prov,
             growth2=args.growth2, devices=devs, pencil_batch=args.pencil_batch, log=log,
-            comm=comm, batch_planes=args.batch_planes, emit_y_blocks=args.y_blocks)
+            comm=comm, batch_planes=args.batch_planes, emit_y_blocks=args.y_blocks,
+            backend=backend, table=table)
         card["product"] = dict(wall_s=time.time() - t0, run_host_peak=mon.run_peak,
                                manifest={k: man.get(k) for k in (
                                    "n_particles", "bricks_per_side", "max_displacement",
@@ -1005,7 +1013,7 @@ def _product(args, kind):
     from inexor import engine, export, summary
     from inexor.decomp import Decomp
     from inexor.plan import engine_config
-    from realization import _coeffs, _cosmo
+    from realization import _coeffs, _cosmo, _linear_pk
 
     jax.config.update("jax_enable_x64", True)
     args.workdir = args.checkpoint_dir  # the base card's source field
@@ -1062,8 +1070,11 @@ def _product(args, kind):
         if args.membind_nodes:
             _check_state_on_cpu_nodes(args, card)
         a_out = float(a_steps[step])
+        linear_pk = _linear_pk(resume, cosmo)
         prov = dict(preset=args.preset, step=step, commit=_git_commit(),
                     checkpoint=ckpt, n_ranks=decomp.n_ranks, cards=args.cards)
+        if linear_pk is not None:
+            prov["linear_pk"] = linear_pk.stamp()
 
         t0 = time.time()
         if kind == "card":
@@ -1072,7 +1083,8 @@ def _product(args, kind):
                 edges = np.linspace(0.0, float(args.k_max), int(args.n_bins) + 1)
             res = summary.pk_summary_card_cards(
                 st, ec, cosmo, a_out, devices=devs, decomp=decomp, comm=comm, slab=args.slab,
-                edges=edges, min_weight=args.min_weight, provenance=prov, phase=mon)
+                edges=edges, min_weight=args.min_weight, provenance=prov, phase=mon,
+                linear_pk=linear_pk)
             wall = time.time() - t0
             card["product"] = dict(wall_s=wall, load_s=load_s, n_bins=res["n_bins"])
             if rank == 0:
@@ -1332,6 +1344,9 @@ def main(argv=None):
     pi.add_argument("--seed", type=int, default=0)
     pi.add_argument("--a-init", type=float, default=0.1)
     pi.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"))
+    pi.add_argument("--pk-table", default=None,
+                    help="tabulated z = 0 linear P(k) (scripts/run/camb_linear_pk.py) instead "
+                         "of EH98; embedded in the IC manifest, carried into the checkpoints")
     pi.add_argument("--f-nl", type=float, default=0.0, help="local f_NL of the ICs")
     pi.add_argument("--window", type=int, default=1,
                     help="emission window in brick slabs (refused if a displacement reaches it)")

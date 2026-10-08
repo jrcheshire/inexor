@@ -87,6 +87,7 @@ The IC generators add these fields:
 | `slab` | planes per out-of-core FFT slab |
 | `ic_stream` | noise stream identifier |
 | `backend` | linear power backend (`eh98` or `table`) |
+| `linear_pk` | with `backend: "table"` only: the whole table (`format`, `source`, `sha256`, `z`, `cosmology`, `generator`, `k`, `P`; see [configuration](configuration.md#linear-power-spectrum)) |
 | `table_n_points` | nodes of the k table |
 | `mean_phi2` | mean of phi^2 (null on the device generator at f_NL = 0) |
 | `stage_cleanup` | report of removing `stage/`, or `{kept: true, ...}` |
@@ -114,6 +115,7 @@ complete. A resumed run first writes the generation it did not load. The manifes
 | `n_arena` | arena rows at write time (default `arena_frac` on resume) |
 | `fingerprint` | `engine.checkpoint_fingerprint` of config + coefficients |
 | `a`, `cosmology` | epoch of the checkpoint and its `Cosmology` fields, when `run` was given `epoch=(a_steps, cosmo)` (the driver always does) |
+| `linear_pk` | the ICs' tabulated linear P(k), when they were made from one (the drivers pass it on from the IC manifest or the checkpoint they resume) |
 
 `engine.load_checkpoint(dir, cfg, coeffs)` picks the generation with the highest `step` and
 refuses one whose fingerprint differs from the current config and schedule. It also refuses
@@ -144,6 +146,7 @@ bin's realized modes. It returns a dict and writes nothing. Card id `summary.CAR
 | `k_mean` | mode-weighted mean k per kept bin, h/Mpc |
 | `p` | measured power, window-deconvolved and shot-subtracted, (Mpc/h)^3 |
 | `p_oracle` | bin-averaged linear power at `a_out`, (Mpc/h)^3 |
+| `linear_pk` | the linear spectrum of the oracle: `{"source": "eh98"}`, or the ICs' table's `source` and `sha256` |
 | `n_modes` | full-grid mode count per bin |
 | `z_profile` | `(p / p_oracle - 1) / sqrt(2 / n_modes)` |
 | `window_correction` | mode-mean `W^2` per bin |
@@ -200,7 +203,8 @@ decode (float64, cast to `dtype`), arena residents included.
 Header fields: `format`, `n_particles`, `box_size`, `n_part`, `dtype`, `files` (role -> file
 name), `crc32` (role -> crc32), `units` (`position`, `velocity` strings), `velocity_is_dtime`,
 `peculiar_velocity_factor`, `a`, `cosmology`, `row_order`, `has_ids`, `source`
-(`"write_particles"`), `provenance`.
+(`"write_particles"`), `provenance` (from the drivers; it holds `linear_pk`, the table's
+`source` and `sha256`, when the ICs were made from a tabulated P(k)).
 
 ### Velocity convention
 

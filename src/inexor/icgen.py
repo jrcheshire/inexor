@@ -26,7 +26,14 @@ import numpy as np
 
 from . import ic, ooc_fft
 from .codec import INT16_MAX, T9Layout
-from .cosmology import growth_factor_2, growth_factor_a, growth_rate_2, growth_rate_a, ic_k_table
+from .cosmology import (
+    LinearPkTable,
+    growth_factor_2,
+    growth_factor_a,
+    growth_rate_2,
+    growth_rate_a,
+    ic_k_table,
+)
 from .layout import DEFAULT_INDEX_DTYPE, _stable_sort_index, _to_index
 from .lpt import _DIAG, _OFFDIAG, lpt2_source_from_spec
 from .state import (
@@ -128,8 +135,10 @@ def generate_t9_slabs(
     `provenance` is stored verbatim in it. order=2 only. On success the staging
     intermediates are removed (unless `keep_stage`) and the cleanup report is recorded under
     `stage_cleanup`; an interrupted run keeps them. `window` is the emission window depth in
-    brick slabs; generation refuses if the max displacement reaches it.
+    brick slabs; generation refuses if the max displacement reaches it. backend="table" takes
+    a `LinearPkTable` as `table`, embedded whole in the manifest as `linear_pk`.
     """
+    _require_pk_table(backend, table)
     t9 = T9Layout(box_size, n_part, bucket_cells)
     n, box = int(n_part), float(box_size)
     nb = int(bricks_per_side)
@@ -251,7 +260,17 @@ def generate_t9_slabs(
         mean_phi2=float(mean_phi2),
         provenance=provenance or {},
     )
+    if backend == "table":
+        manifest["linear_pk"] = table.record()
     return _write_manifest(workdir, manifest, keep_stage)
+
+
+def _require_pk_table(backend, table):
+    """A generator's table is a checked `LinearPkTable`, so the ICs can carry it."""
+    if backend == "table" and not isinstance(table, LinearPkTable):
+        raise TypeError("backend='table' generates ICs from a LinearPkTable "
+                        "(cosmology.load_linear_pk), which the manifest embeds; got "
+                        f"{type(table).__name__}")
 
 
 def _write_manifest(workdir, manifest, keep_stage):
@@ -461,6 +480,7 @@ def generate_t9_slabs_device(
     """
     import jax
 
+    _require_pk_table(backend, table)
     if not jax.config.jax_enable_x64:
         raise RuntimeError(
             "generate_t9_slabs_device needs jax_enable_x64: its k-space kernels are built "
@@ -794,6 +814,8 @@ def generate_t9_slabs_device(
             stage_s=timings,
             provenance=provenance or {},
         )
+        if backend == "table":
+            manifest["linear_pk"] = table.record()
         if n_ranks > 1:
             manifest["n_ranks"] = n_ranks
         if int(emit_y_blocks) > 1:

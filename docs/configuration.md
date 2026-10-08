@@ -107,7 +107,26 @@ fingerprint hashes, so runs differing in any of them cannot resume from each oth
 | `sigma8` | 0.81 | |
 | `T_cmb_K` | 2.7255 | |
 
-The linear power spectrum is EH98 (`cosmology.ic_k_table(backend="eh98")`).
+### Linear power spectrum
+
+The ICs are coloured with EH98 (Eisenstein & Hu 1998, with baryon oscillations, normalized to
+`sigma8`) unless `ics` is given `--pk-table FILE`, a tabulated z = 0 linear P(k) in the
+`inexor-linear-pk-1` JSON format. `scripts/run/camb_linear_pk.py` makes one from CAMB at the
+engine's cosmology (flat LCDM, massless neutrinos, A_s solved for `sigma8`), in a throwaway
+env so CAMB never enters the project's:
+
+```bash
+pixi exec --spec python=3.12 --spec camb --spec numpy -- \
+    python scripts/run/camb_linear_pk.py -o data/linear_pk_camb.json
+```
+
+The table (`cosmology.LinearPkTable`) is refused unless its cosmology equals the run's, it is
+at z = 0, its sigma8 is within 1e-3 (relative) of the cosmology's, and it covers k = 1e-4 to
+1e2 h/Mpc. With a table, the transfer function in the f_NL potential is derived from it,
+T = sqrt(P / k^n_s) scaled to 1 at k = 1e-4 h/Mpc, so the potential matches the spectrum.
+The whole table is embedded in the IC manifest and carried into every checkpoint, where the
+P(k) card takes its linear oracle from it; cards and export headers record its `source` and
+`sha256`. EH98 runs record nothing, so their manifests are unchanged.
 
 ## Layout and memory knobs
 

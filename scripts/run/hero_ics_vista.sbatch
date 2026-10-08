@@ -15,7 +15,8 @@
 #
 # Requires: INEXOR_RUNS (run root), IC_DIR (IC output directory; HERO_IC_DIR is read when it
 # is unset), and INEXOR_SRC or submission from the inexor checkout. Optional: PRESET
-# (c-hero), NEED_GB (1500, the free scratch the preflight requires). The account is passed
+# (c-hero), NEED_GB (1500, the free scratch the preflight requires), PK_TABLE (a tabulated
+# linear P(k) from scripts/run/camb_linear_pk.py instead of EH98). The account is passed
 # with `sbatch -A`:
 #   INEXOR_RUNS=$SCRATCH/inexor_runs IC_DIR=$SCRATCH/inexor_runs/c-hero-lcdm \
 #     sbatch -A <account> scripts/run/hero_ics_vista.sbatch
@@ -77,7 +78,7 @@ nvidia-smi --query-gpu=index,memory.used --format=csv,noheader -l 10 > "$GPU_LOG
 SAMPLER=$!
 run_leg "ics-$PRESET" \
   pixi run -e gpu python scripts/run/realization.py ics --config "$PRESET" --workdir "$HERO" \
-    --generator device
+    --generator device ${PK_TABLE:+--pk-table "$PK_TABLE"}
 kill $SAMPLER 2>/dev/null
 [ -f "$HERO/realization_ics.json" ] && cp "$HERO/realization_ics.json" "$CARDS/${TAG}_$PRESET.json"
 

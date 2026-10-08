@@ -380,6 +380,43 @@ def _require_ic_growth2(ic_dir, growth2):
             f"asks for {growth2!r}. Regenerate them, or pass the matching --growth2.")
 
 
+def _linear_pk(record_holder, cosmo):
+    """The checked `LinearPkTable` an IC or checkpoint manifest (or a checkpoint's provenance)
+    embeds as `linear_pk`, or None for EH98 (nothing recorded)."""
+    from inexor.cosmology import LinearPkTable
+
+    rec = record_holder.get("linear_pk")
+    return None if rec is None else LinearPkTable.from_record(rec, cosmo)
+
+
+def _ic_linear_pk(ic_dir, cosmo):
+    """`_linear_pk` of the IC manifest in `ic_dir`."""
+    from inexor import icgen
+
+    with open(os.path.join(ic_dir, icgen.MANIFEST)) as fh:
+        return _linear_pk(json.load(fh), cosmo)
+
+
+def _pk_table_arg(args, cosmo):
+    """(backend, table) for the IC generators from `--pk-table`: EH98 when not given."""
+    if not args.pk_table:
+        return "eh98", None
+    from inexor.cosmology import load_linear_pk
+
+    tab = load_linear_pk(args.pk_table, cosmo)
+    print(f"  linear P(k): {args.pk_table} ({tab.source}, {tab.k.size} points, "
+          f"sha256 {tab.sha256[:12]})", flush=True)
+    return "table", tab
+
+
+def _without_table(man):
+    """A manifest for a run card: the embedded table's stamp in place of its arrays."""
+    rec = man.get("linear_pk")
+    if rec is None:
+        return man
+    return {**man, "linear_pk": dict(source=rec.get("source"), sha256=rec.get("sha256"))}
+
+
 def _card(kind, args, body, tag=""):
     card = dict(card=f"inexor-realization-{kind}-1", config=args.config,
                 workdir=args.workdir, commit=_git_commit(), host=platform.node(),
@@ -442,20 +479,23 @@ def cmd_ics(args):
     prov = _ic_provenance(args.generator)
     print(f"  provenance: allocator={prov['allocator']} "
           f"fraction={prov['XLA_CLIENT_MEM_FRACTION']} jax={prov.get('jax')}", flush=True)
+    cosmo = _cosmo()
+    backend, table = _pk_table_arg(args, cosmo)
     t0 = time.perf_counter()
     if args.generator == "device":
         man = icgen.generate_t9_slabs_device(
-            args.workdir, key, g["n_part"], g["L"], _cosmo(), args.a_init, nb,
+            args.workdir, key, g["n_part"], g["L"], cosmo, args.a_init, nb,
             fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
             pencil_batch=args.pencil_batch, noise=args.noise, provenance=prov,
             bucket_cells=args.bucket_cells, log=lambda line: print(line, flush=True),
-            growth2=args.growth2,
+            growth2=args.growth2, backend=backend, table=table,
         )
     else:
         man = icgen.generate_t9_slabs(
-            args.workdir, key, g["n_part"], g["L"], _cosmo(), args.a_init, nb,
+            args.workdir, key, g["n_part"], g["L"], cosmo, args.a_init, nb,
             fdtype=GEN_FDTYPE, slab=args.slab, keep_stage=args.keep_stage,
             provenance=prov, bucket_cells=args.bucket_cells, growth2=args.growth2,
+            backend=backend, table=table,
         )
     wall = time.perf_counter() - t0
     peak = _maxrss_bytes()
@@ -471,7 +511,7 @@ def cmd_ics(args):
     return _card("ics", args, dict(
         wall_s=wall, peak_rss_bytes=peak,
         bytes_per_particle=peak / g["n_part"] ** 3,
-        bricks_per_side=int(nb), manifest=man, seed=args.seed, slab=args.slab,
+        bricks_per_side=int(nb), manifest=_without_table(man), seed=args.seed, slab=args.slab,
         generator=args.generator, n_part=g["n_part"],
     )) and 0
 
@@ -500,6 +540,7 @@ def cmd_run(args):
     if have is not None:
         st, resume = engine.load_checkpoint(d, ec, co, arena_frac=args.arena_frac,
                                             alloc_margin=args.alloc_margin, alloc=allocator)
+        linear_pk = _linear_pk(resume, cosmo)
         src = f"checkpoint at step {int(resume['step'])}"
         if int(resume["step"]) >= args.k_steps:
             print(f"  NOTHING TO DO: the checkpoint is already at step "
@@ -508,6 +549,7 @@ def cmd_run(args):
     else:
         _require_ic_epoch(args.workdir, args.a_init)
         _require_ic_growth2(args.workdir, args.growth2)
+        linear_pk = _ic_linear_pk(args.workdir, cosmo)
         st = icgen.load_slot_state(
             args.workdir, brick_slack=args.slack, alloc_margin=args.alloc_margin,
             arena_frac=args.arena_frac, alloc=allocator,
@@ -548,10 +590,11 @@ def cmd_run(args):
     stats = []
     t0 = time.perf_counter()
     # `epoch` is stored with the checkpoints so `python -m inexor.export` can
-    # write km/s from a bare checkpoint directory without this driver's a-grid
+    # write km/s from a bare checkpoint directory without this driver's a-grid, and
+    # a card can take the ICs' linear P(k) from them
     out = engine.run(st, ec, co, phase=ph, resume=resume, stop_at=stop,
                      collect=stats.append, allocator=allocator,
-                     epoch=(a_steps, cosmo))
+                     epoch=(a_steps, cosmo, None if linear_pk is None else linear_pk.record()))
     wall = time.perf_counter() - t0
     # `clear_refs` resets ru_maxrss along with VmHWM (both read `mm->hiwater_rss`),
     # so under tracing the run's peak is only available as `PhaseTracer.run_peak`
@@ -619,7 +662,7 @@ def _state_at_head(args, ec, co, alloc=None):
         raise SystemExit("no checkpoint to read; run `run` first")
     st, resume = engine.load_checkpoint(_ckpt_dir(args), ec, co, arena_frac=args.arena_frac,
                                         alloc_margin=args.alloc_margin, alloc=alloc)
-    return st, int(resume["step"])
+    return st, int(resume["step"]), resume
 
 
 def _ic_state(args, alloc=None):
@@ -664,7 +707,8 @@ def cmd_export(args):
     cosmo = _cosmo()
     co, a_steps = _coeffs(cosmo, args.k_steps, args.a_init, args.growth2)
     ec = _engine_config(g, args, _ckpt_dir(args))
-    st, step = _state_at_head(args, ec, co)
+    st, step, resume = _state_at_head(args, ec, co)
+    linear_pk = _linear_pk(resume, cosmo)
     if step < args.k_steps and not args.allow_partial:
         raise SystemExit(
             f"the checkpoint is at step {step} of {args.k_steps}; exporting now would "
@@ -680,7 +724,8 @@ def cmd_export(args):
         st, out_dir, dtype=np.float32, a=a_out, cosmo=cosmo,
         chunk_bricks=args.chunk_bricks,
         provenance=dict(config=args.config, step=step, commit=_git_commit(),
-                        workdir=args.workdir),
+                        workdir=args.workdir,
+                        **({} if linear_pk is None else dict(linear_pk=linear_pk.stamp()))),
         progress=_heartbeat(args),
     )
     wall = time.perf_counter() - t0
@@ -759,8 +804,10 @@ def cmd_card(args):
     t_load = time.perf_counter()
     if args.ic_dir:
         st, step = _ic_state(args, alloc=allocator), 0
+        linear_pk = _ic_linear_pk(args.ic_dir, cosmo)
     else:
-        st, step = _state_at_head(args, ec, co, alloc=allocator)
+        st, step, resume = _state_at_head(args, ec, co, alloc=allocator)
+        linear_pk = _linear_pk(resume, cosmo)
     t_load = time.perf_counter() - t_load
     # see `cmd_run`: without the trim the loader's transients and the pool stack
     trimmed = malloc_trim() if pooled else None
@@ -795,7 +842,8 @@ def cmd_card(args):
                   f"{0.5 * np.pi * ec.n_coarse / ec.box_size:.4f})")
         card = summary.pk_summary_card(st, ec, cosmo, a_out, slab=args.slab,
                                        min_weight=args.min_weight, edges=edges,
-                                       progress=_heartbeat(args), pool=pool)
+                                       progress=_heartbeat(args), pool=pool,
+                                       linear_pk=linear_pk)
     finally:
         if pool is not None:
             pool.close()
@@ -875,6 +923,11 @@ def build_parser():
                          "-(3/7) D^2, which converges to an EdS-coupled solution. "
                          "Recorded in the IC manifest; run and card refuse ICs made "
                          "with the other")
+    ap.add_argument("--pk-table", default=None,
+                    help="ics: make the ICs from this tabulated z = 0 linear P(k) "
+                         "(scripts/run/camb_linear_pk.py) instead of EH98. The table "
+                         "travels in the IC manifest into every checkpoint, and the "
+                         "card's linear oracle reads it there")
     ap.add_argument("--buf", type=int, default=None,
                     help="override the buffer in FINE CELLS. Changes beta and the "
                          "split's truncation error, both of which get printed")
@@ -944,6 +997,9 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    if args.pk_table and args.phase != "ics":
+        raise SystemExit("--pk-table is an `ics` option: a run, card or export takes the "
+                         "linear P(k) the ICs and checkpoints carry")
     return {"ics": cmd_ics, "run": cmd_run, "export": cmd_export,
             "card": cmd_card}[args.phase](args)
 

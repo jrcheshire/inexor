@@ -13,7 +13,8 @@
 #
 # Requires INEXOR_RUNS (run root; outputs under $INEXOR_RUNS/d8-gh-<preset>-<job>/k<K>) and
 # INEXOR_SRC or submission from the inexor checkout. Optional: PRESET, KS (120; step counts,
-# space-separated), SLACK, ALLOC_MARGIN, ARENA_FRAC. The account is passed with `sbatch -A`:
+# space-separated), SLACK, ALLOC_MARGIN, ARENA_FRAC, PK_TABLE (a tabulated linear P(k) from
+# scripts/run/camb_linear_pk.py instead of EH98). The account is passed with `sbatch -A`:
 #   INEXOR_RUNS=$SCRATCH/inexor_runs sbatch -A <account> scripts/run/gh_single_card_vista.sbatch
 #   sbatch -A <account> -t <wall> --export=ALL,PRESET=c-gh,SLACK=0.05,ALLOC_MARGIN=0.05 ...
 # The step-count ladder at 512^3 in 256 Mpc/h (one IC set, five schedules):
@@ -135,7 +136,7 @@ run_leg pytest-gpu \
 
 run_leg ics \
   $BIND pixi run -e gpu python scripts/run/realization.py ics --config "$PRESET" \
-    --workdir "$ICS" --generator device \
+    --workdir "$ICS" --generator device ${PK_TABLE:+--pk-table "$PK_TABLE"} \
   || { echo "FATAL: the IC generation failed"; exit 1; }
 
 run_leg preflight \

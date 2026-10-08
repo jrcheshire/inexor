@@ -4,9 +4,13 @@ numpy/scipy only (no JAX), so it can be imported before JAX is configured. Every
 constant of the run consumed by the integrator tables and IC generators. The second-order growth
 D2 solves the LCDM ODE, which the BullFrog weights need (Rampf, List & Hahn 2024,
 arXiv:2409.19049, Sec. 4.4); EdS -(3/7) D^2 is an explicit option. `linear_power` backends: "eh98"
-(analytic, Eisenstein & Hu 1998) or "table" (tabulated z=0 (k, P), e.g. from CAMB).
+(analytic, Eisenstein & Hu 1998) or "table" (tabulated z=0 (k, P), e.g. from CAMB; a
+`LinearPkTable` is the checked form the IC generators and their manifests carry).
 """
 
+import dataclasses
+import hashlib
+import json
 import math
 from functools import lru_cache
 
@@ -276,8 +280,8 @@ def linear_power(k_hmpc, cosmo, z=0.0, backend="eh98", table=None):
     """Linear matter P(k, z) in (Mpc/h)^3, k in h/Mpc.
 
     backend="eh98": analytic EH98, sigma8-normalized (self-contained default).
-    backend="table": tabulated z=0 spectrum, table = (k_table, P_table) arrays
-    (e.g. a CAMB dump); log-log interpolated, refuses k
+    backend="table": tabulated z=0 spectrum, table = (k_table, P_table) arrays or a
+    `LinearPkTable` (e.g. a CAMB dump); log-log interpolated, refuses k
     outside the table range (loud, never extrapolates). Both backends scale to
     z with growth_factor_a**2.
     """
@@ -287,6 +291,8 @@ def linear_power(k_hmpc, cosmo, z=0.0, backend="eh98", table=None):
     elif backend == "table":
         if table is None:
             raise ValueError("backend='table' requires table=(k_table, P_table)")
+        if isinstance(table, LinearPkTable):
+            table = (table.k, table.P)
         k_t = np.asarray(table[0], dtype=np.float64)
         P_t = np.asarray(table[1], dtype=np.float64)
         # relative slack so exact-endpoint queries do not trip the guard
@@ -384,10 +390,12 @@ def ic_k_table(cosmo, n_mesh, box_size, n_points=32768, backend="eh98", table=No
     """Build the ICKTable on n_points universal log nodes over [K_TABLE_MIN, K_TABLE_MAX].
 
     (n_mesh, box_size) are used only to refuse at build time a grid whose |k| range
-    [2 pi/L, sqrt(3) pi n/L] the universal range does not cover. backend="eh98": P from
-    `linear_power`; backend="table": P resampled from a (k, P) dump that must cover the range.
-    T is always EH98 (a P dump carries no transfer function). The default n_points keeps the
-    interpolation error (quadratic in node spacing) at the few x 1e-7 level.
+    [2 pi/L, sqrt(3) pi n/L] the universal range does not cover. backend="eh98": P and T
+    from EH98. backend="table": P resampled from a (k, P) dump that must cover the range, and
+    T derived from it, T = sqrt(P / k^n_s) scaled to 1 at K_TABLE_MIN, so the potential of an
+    f_NL transform matches the spectrum it colours (T(1e-4 h/Mpc) is 1 to ~1e-4 in LCDM). The
+    default n_points keeps the interpolation error (quadratic in node spacing) at the few x
+    1e-7 level.
     """
     n_mesh = int(n_mesh)
     if n_mesh < 2:
@@ -401,5 +409,99 @@ def ic_k_table(cosmo, n_mesh, box_size, n_points=32768, backend="eh98", table=No
         )
     k = np.exp(np.linspace(np.log(K_TABLE_MIN), np.log(K_TABLE_MAX), int(n_points)))
     P = linear_power(k, cosmo, z=0.0, backend=backend, table=table)
-    T = transfer_eh98(k, cosmo)
+    if backend == "table":
+        T = np.sqrt(P / k**cosmo.n_s)
+        T = T / T[0]
+    else:
+        T = transfer_eh98(k, cosmo)
     return ICKTable(k, P, T)
+
+
+# Tabulated linear spectrum, carried with the data it seeds
+
+LINEAR_PK_FORMAT = "inexor-linear-pk-1"
+# a table whose sigma8 differs from the cosmology's by more than this (relative) is refused
+LINEAR_PK_SIGMA8_RTOL = 1e-3
+
+
+class LinearPkTable:
+    """A tabulated z = 0 linear P(k) (k in h/Mpc, P in (Mpc/h)^3) for one cosmology.
+
+    Made by `load_linear_pk` (a file from `scripts/run/camb_linear_pk.py`) or `from_record`
+    (the copy an IC or checkpoint manifest embeds). Both refuse a table that would silently
+    seed another run: another format, z != 0, any cosmological parameter other than the
+    run's, sigma8 off the cosmology's by more than LINEAR_PK_SIGMA8_RTOL, or k not covering
+    [K_TABLE_MIN, K_TABLE_MAX]. `sha256` hashes the float64 (k, P) bytes, so the file and
+    every embedded copy share it. Pass it as `table` with backend="table".
+    """
+
+    __slots__ = ("k", "P", "source", "meta")
+
+    def __init__(self, k, P, source, meta=None):
+        self.k = np.ascontiguousarray(k, dtype=np.float64)
+        self.P = np.ascontiguousarray(P, dtype=np.float64)
+        self.source = str(source)
+        self.meta = dict(meta or {})
+
+    @property
+    def sha256(self):
+        return hashlib.sha256(self.k.tobytes() + self.P.tobytes()).hexdigest()
+
+    def stamp(self):
+        """{source, sha256}: what a card or an export header records."""
+        return dict(source=self.source, sha256=self.sha256)
+
+    def record(self):
+        """The whole table as a JSON-able dict (the file format, and what manifests embed)."""
+        return dict(format=LINEAR_PK_FORMAT, source=self.source, sha256=self.sha256,
+                    **self.meta, k=self.k.tolist(), P=self.P.tolist())
+
+    @classmethod
+    def from_record(cls, rec, cosmo):
+        """A checked table from `record()`'s dict; refuses as the class docstring says."""
+        fmt = rec.get("format")
+        if fmt != LINEAR_PK_FORMAT:
+            raise ValueError(f"linear P(k) table format {fmt!r}, expected {LINEAR_PK_FORMAT!r}")
+        if float(rec.get("z", math.nan)) != 0.0:
+            raise ValueError(f"the linear P(k) table is at z = {rec.get('z')!r}; it must be "
+                             "the z = 0 spectrum (the generators scale it with D(a)^2)")
+        want = dataclasses.asdict(cosmo)
+        have = rec.get("cosmology") or {}
+        bad = sorted(n for n in set(want) | set(have)
+                     if n not in have or n not in want
+                     or not math.isclose(float(have[n]), float(want[n]), rel_tol=1e-12))
+        if bad:
+            raise ValueError(
+                "the linear P(k) table's cosmology differs from the run's in "
+                + ", ".join(f"{n} ({have.get(n)!r} vs {want.get(n)!r})" for n in bad))
+        k = np.asarray(rec.get("k"), dtype=np.float64)
+        P = np.asarray(rec.get("P"), dtype=np.float64)
+        if not (k.ndim == 1 and k.shape == P.shape and k.size >= 2):
+            raise ValueError("the linear P(k) table needs 1D k and P of equal length >= 2")
+        if not (np.all(np.isfinite(k)) and np.all(np.isfinite(P)) and np.all(k > 0)
+                and np.all(P > 0) and np.all(np.diff(k) > 0)):
+            raise ValueError("the linear P(k) table needs finite, positive P and positive, "
+                             "strictly increasing k")
+        if k[0] > K_TABLE_MIN * (1 + 1e-12) or k[-1] < K_TABLE_MAX * (1 - 1e-12):
+            raise ValueError(
+                f"the linear P(k) table spans k = [{k[0]:.3e}, {k[-1]:.3e}] h/Mpc and must "
+                f"cover [{K_TABLE_MIN:.0e}, {K_TABLE_MAX:.0e}]")
+        meta = {n: v for n, v in rec.items()
+                if n not in ("format", "source", "sha256", "k", "P")}
+        tab = cls(k, P, rec.get("source", "unknown"), meta)
+        if "sha256" in rec and rec["sha256"] != tab.sha256:
+            raise ValueError("the linear P(k) table's sha256 does not match its (k, P): "
+                             "the embedded copy was altered")
+        s8 = sigma_R(8.0, cosmo, backend="table", table=tab)
+        if abs(s8 / cosmo.sigma8 - 1.0) > LINEAR_PK_SIGMA8_RTOL:
+            raise ValueError(
+                f"the linear P(k) table has sigma8 = {s8:.6f} and the cosmology {cosmo.sigma8}"
+                f" (relative {s8 / cosmo.sigma8 - 1.0:+.2e}, refused beyond "
+                f"{LINEAR_PK_SIGMA8_RTOL:g}); make the table at the run's sigma8")
+        return tab
+
+
+def load_linear_pk(path, cosmo):
+    """The checked `LinearPkTable` in the JSON file at `path` (see `LinearPkTable`)."""
+    with open(path) as fh:
+        return LinearPkTable.from_record(json.load(fh), cosmo)
