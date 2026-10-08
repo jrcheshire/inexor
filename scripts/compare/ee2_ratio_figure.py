@@ -11,14 +11,16 @@ euclidemu2 is pip-only, and its wheel needs `gsl` in the env to load.
 
 Plots B_inexor / B_EE2 for up to three cards, B = P / P_lin with each side against its
 own linear theory (see `pk_boost_reference.py` for why the boost, not P, is compared).
-All cards must share k bins and redshift. Two bands around unity:
+EE2 is evaluated at each card's own k and redshift, so cards from different boxes may be
+overlaid; all must share the `--cosmology`. Two kinds of band around unity:
   - +-1 sigma Gaussian sample variance of ONE realization, sqrt(2 / n_modes) per bin,
-    from the first card's mode counts. A floor: non-Gaussian covariance raises it at
-    high k.
+    one band per distinct k grid (from its first card's mode counts), in that card's
+    color. A floor: non-Gaussian covariance raises it at high k.
   - EE2's quoted accuracy, 1% for 0.01 <= k <= 10 h/Mpc at z <= 3
     (Knabenhans et al. 2021, arXiv:2010.11288, abstract).
 EE2 (trained on paired-and-fixed sims) carries almost no realization scatter; cards on
-the same ICs share theirs, so their difference is read without it.
+the same ICs share theirs, so their difference is read without it. Cards on different
+ICs differ by both bands' scatter.
 """
 
 import argparse
@@ -55,39 +57,46 @@ def main():
     with open(args.cosmology) as fh:
         cos = json.load(fh)["cosmology"]
 
-    series = []
-    for i, path in enumerate(args.cards):
+    cards = []
+    for path in args.cards:
         with open(path) as fh:
-            card = json.load(fh)
+            cards.append(json.load(fh))
+    # EE2 takes A_s; the engine is sigma8-normalized, so tie them with a CAMB solve
+    # (A_s is fixed by sigma8 at z = 0, so one solve serves every card)
+    k_top = max(max(c["summary"]["k_mean"]) for c in cards)
+    *_, A_s = camb_boost(cos, 1.0 / float(cards[0]["a_out"]) - 1.0, k_top * 1.2, "mead2020")
+
+    series = []
+    grids = []  # [(k, sigma, color, [series index, ...])], one per distinct k grid
+    for i, (path, card) in enumerate(zip(args.cards, cards)):
         s = card["summary"]
         k = np.asarray(s["k_mean"], float)
         boost = np.asarray(s["p"], float) / np.asarray(s["p_oracle"], float)
         z = 1.0 / float(card["a_out"]) - 1.0
-        if i == 0:
-            k0, z0 = k, z
-            n_modes = np.asarray(s["n_modes"], float)
-            # EE2 takes A_s; the engine is sigma8-normalized, so tie them with a CAMB solve
-            *_, A_s = camb_boost(cos, z, float(k.max()) * 1.2, "mead2020")
-            b_ee2 = ee2_boost(cos, z, k, A_s)
-        elif not (np.array_equal(k, k0) and z == z0):
-            raise SystemExit(f"{path} has different k bins or redshift from {args.cards[0]}")
         n = round(s["n_particles"] ** (1.0 / 3.0))
         label = (args.labels[i] if args.labels else
                  f"inexor {n}$^3$, {s['box_size']:g} $h^{{-1}}$Mpc, {card.get('k_steps', '?')} steps")
-        series.append((path, label, boost / b_ee2))
-    k = k0
-    sigma = np.sqrt(2.0 / n_modes)
+        series.append((path, label, k, boost / ee2_boost(cos, z, k, A_s)))
+        for grid in grids:
+            if np.array_equal(grid[0], k):
+                grid[3].append(i)
+                break
+        else:
+            sigma = np.sqrt(2.0 / np.asarray(s["n_modes"], float))
+            grids.append((k, sigma, COLORS[i], [i]))
 
     fig, ax = plt.subplots(figsize=(6.0, 3.9))
-    ax.fill_between(k, 1.0 - sigma, 1.0 + sigma, color="#2a78d6", alpha=0.15, lw=0,
-                    label=r"sample variance, $\pm1\sigma$ (Gaussian)")
+    for j, (k, sigma, color, _) in enumerate(grids):
+        ax.fill_between(k, 1.0 - sigma, 1.0 + sigma, color=color, alpha=0.15, lw=0,
+                        label=r"sample variance, $\pm1\sigma$ (Gaussian)" if j == 0 else None)
     ax.axhspan(1.0 - EE2_ACCURACY, 1.0 + EE2_ACCURACY, color="0.35", alpha=0.18, lw=0,
                label="EE2 quoted accuracy (1%)")
     ax.axhline(1.0, color="0.45", lw=1.0)
-    for i, (_, label, ratio) in enumerate(series):
+    for i, (_, label, k, ratio) in enumerate(series):
         ax.plot(k, ratio, color=COLORS[i], marker=MARKERS[i], ms=3, lw=1.4, label=label)
     ax.set_xscale("log")
-    ax.set_xlim(k.min() * 0.95, k.max() * 1.05)
+    k_lo = min(k.min() for k, *_ in grids)
+    ax.set_xlim(k_lo * 0.95, k_top * 1.05)
     ax.set_xlabel(r"$k\ \ [h\,{\rm Mpc}^{-1}]$")
     ax.set_ylabel(r"$B_{\rm inexor}\,/\,B_{\rm EE2}$")
     ax.legend(frameon=False, fontsize=8.5, loc="lower left")
@@ -96,13 +105,15 @@ def main():
     fig.savefig(args.out, dpi=args.dpi, bbox_inches="tight")
     print(f"-> {args.out}")
 
-    heads = " ".join(f"{'card ' + str(i):>8}" for i in range(len(series)))
-    print(f"\n  {'k':>7} {'sigma':>7} {heads}")
-    for i in range(k.size):
-        if i % 4 and k[i] > 0.15 and i != k.size - 1:
-            continue
-        print(f"  {k[i]:7.3f} {sigma[i]:7.4f} " + " ".join(f"{r[i]:8.4f}" for _, _, r in series))
-    for i, (path, _, _) in enumerate(series):
+    for k, sigma, _, members in grids:
+        heads = " ".join(f"{'card ' + str(i):>8}" for i in members)
+        print(f"\n  {'k':>7} {'sigma':>7} {heads}")
+        for b in range(k.size):
+            if b % 4 and k[b] > 0.15 and b != k.size - 1:
+                continue
+            print(f"  {k[b]:7.3f} {sigma[b]:7.4f} "
+                  + " ".join(f"{series[i][3][b]:8.4f}" for i in members))
+    for i, (path, *_) in enumerate(series):
         print(f"  card {i}: {path}")
 
 
