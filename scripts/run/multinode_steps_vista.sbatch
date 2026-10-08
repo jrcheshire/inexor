@@ -20,13 +20,17 @@
 #
 # A leg is killed once its output (a run leg's: the driver's 60 s heartbeat) has been silent;
 # nothing else bounds a leg but the wall. A failed leg stops the job. At the end the newest
-# checkpoint must be at step STOP and hold the preset's particle count. Each leg's output is
-# also in REAL_DIR/job-<id>/legs/.
+# checkpoint must be at step STOP and hold the preset's particle count. With PROD_DIR, a
+# passing check is followed in the same allocation by multinode_products_vista.sbatch on the
+# newest checkpoint (the card, and the export unless WITH_EXPORT=0), with this job's layout.
+# Each leg's output is also in REAL_DIR/job-<id>/legs/.
 #
 # Requires INEXOR_RUNS, IC_DIR, REAL_DIR (not under IC_DIR), and INEXOR_SRC or submission
 # from the checkout. Optional: CONTROL_REF (a gated run's ckpt/, two generations) with
 # CONTROL_ICS (its ICs); PRESET (c-gh), K (120), EXPECT_STEP (0), STOP (K), EVERY (20),
-# CONTROL_PRESET (c-1024), SLACK / ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), QUIET_S (600).
+# Y_BLOCKS (auto; the production run, preflight and planner, not the control),
+# CONTROL_PRESET (c-1024), SLACK / ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), QUIET_S (600),
+# PROD_DIR (not under REAL_DIR/ckpt) with WITH_EXPORT (1).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R IC_DIR=$R/c-gh-ics REAL_DIR=$R/c-gh-r1 \
 #     CONTROL_REF=$R/mn-gate-c-1024-1043437/mpi/ckpt CONTROL_ICS=$R/mn-gate-c-1024-1043437/ics \
 #     sbatch -A <account> scripts/run/multinode_steps_vista.sbatch
@@ -35,6 +39,11 @@
 #   INEXOR_RUNS=$R IC_DIR=$R/c-8192-ics REAL_DIR=$R/c-8192-k40 PRESET=c-8192 K=40 EVERY=20 \
 #     sbatch -A <account> -p gb -N 8 -n 8 -t 11:00:00 \
 #     scripts/run/multinode_steps_vista.sbatch
+# 4096^3 on 16 gh nodes, 40 steps from the 4096^3 ICs, then card and export (2 y-blocks: at
+# auto's 1 the planner puts a card at 1.02x of 96 GB):
+#   INEXOR_RUNS=$R IC_DIR=$R/c-hero-lcdm-r1 REAL_DIR=$R/c-hero-gh16-k40 PRESET=c-hero K=40 \
+#     EVERY=20 Y_BLOCKS=2 PROD_DIR=$R/c-hero-gh16-k40-product \
+#     sbatch -A <account> -N 16 -n 16 -t 10:00:00 scripts/run/multinode_steps_vista.sbatch
 #
 # REHEARSAL=1 runs the same legs on a laptop CPU at cdev8-tile32 (steps 0 -> 6 of 40), with
 # IC_DIR and CONTROL_REF from a rehearsal of the gate script:
@@ -78,13 +87,21 @@ fi
 PRESET=${PRESET:-c-gh} K=${K:-120} EXPECT_STEP=${EXPECT_STEP:-0} STOP=${STOP:-$K}
 EVERY=${EVERY:-20} CONTROL_PRESET=${CONTROL_PRESET:-c-1024}
 SLACK=${SLACK:-0.10} ALLOC_MARGIN=${ALLOC_MARGIN:-0.10} ARENA=${ARENA:-${ARENA_FRAC:-0.01}}
-QUIET_S=${QUIET_S:-600}
+QUIET_S=${QUIET_S:-600} Y_BLOCKS=${Y_BLOCKS:-auto} WITH_EXPORT=${WITH_EXPORT:-1}
 N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 
 CKPT=$REAL_DIR/ckpt
 # here, before any guard: the driver refuses the same, but only after the guards' ~30 min
 if [ "$EXPECT_STEP" = 0 ] && compgen -G "$CKPT/gen*/manifest.json" >/dev/null; then
   echo "FATAL: $CKPT already holds a checkpoint; set EXPECT_STEP to resume it"; exit 1
+fi
+# the products job's own refusals, here rather than after the steps
+if [ -n "${PROD_DIR:-}" ]; then
+  mkdir -p "$PROD_DIR" && PROD_DIR=$(abspath "$PROD_DIR")
+  case "$PROD_DIR/" in "$CKPT"/*) echo "FATAL: PROD_DIR is under REAL_DIR/ckpt"; exit 1 ;; esac
+  if [ "$WITH_EXPORT" = 1 ] && [ -d "$PROD_DIR/export" ] && [ -n "$(ls -A "$PROD_DIR/export")" ]; then
+    echo "FATAL: $PROD_DIR/export already holds files"; exit 1
+  fi
 fi
 
 . "$SRC/scripts/run/mpi_env_vista.sh"
@@ -99,8 +116,9 @@ LAYOUT=(--slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA")
 mkdir -p "$WORK" "$CARDS"
 
 echo "=== $(hostname): commit $(git rev-parse --short HEAD), job $SLURM_JOB_ID, $(date) ==="
-echo "=== $PRESET, K=$K, steps $EXPECT_STEP -> $STOP, every $EVERY, layout ${LAYOUT[*]} ==="
+echo "=== $PRESET, K=$K, steps $EXPECT_STEP -> $STOP, every $EVERY, y-blocks $Y_BLOCKS, layout ${LAYOUT[*]} ==="
 echo "=== ICs $IC_DIR, checkpoints $CKPT, control ${CONTROL_REF:-none} ($CONTROL_PRESET) ==="
+echo "=== products ${PROD_DIR:-none}${PROD_DIR:+ (export $WITH_EXPORT)} ==="
 echo "=== nodes ${SLURM_JOB_NODELIST:-local}, launch '$LAUNCH', work $WORK ==="
 for t in mpiexec mpicc ptxas "$PY"; do echo "  $t -> $(command -v "$t" || echo none)"; done
 if [ "${REHEARSAL:-0}" != 1 ]; then
@@ -127,16 +145,18 @@ stop_job () {
   exit $((rc_total > 0 ? rc_total : 1))
 }
 
-# ranks ARM PRESET ICS CKPT K FROM STOP EVERY [XLA_FLAGS]: one run across the nodes, one rank
-# each, from the ICs or (FROM > 0) the step-FROM checkpoint in CKPT
+# ranks ARM PRESET ICS CKPT K FROM STOP EVERY [XLA_FLAGS [ARGS...]]: one run across the
+# nodes, one rank each, from the ICs or (FROM > 0) the step-FROM checkpoint in CKPT; ARGS go
+# to the driver
 ranks () {
   local arm=$1 preset=$2 ics=$3 ckpt=$4 k=$5 from=$6 stop=$7 every=$8 extra=${9:-}
+  shift $(($# < 9 ? $# : 9))
   on_ranks "$CARDS/${TAG}_${arm}_s${from}_r@RANK@" "$extra" "${MPIPATH[@]}" \
     "$PY" -m mpi4py "$DRIVER" run --preset "$preset" --workdir "$ics" --cards "$N_CARDS" \
     --k-steps "$k" --stop-at "$stop" --expect-step "$from" --timed-all --beat 60 \
     "${MEMBIND_CHECK[@]}" "${LAYOUT[@]}" --checkpoint-every "$every" \
     --card "$CARDS/${TAG}_${arm}_s${from}.json" \
-    --checkpoint-dir "$ckpt" --comm mpi --comm-timeout 1800
+    --checkpoint-dir "$ckpt" --comm mpi --comm-timeout 1800 "$@"
 }
 
 # --- guards (node 0)
@@ -153,13 +173,14 @@ run_leg --quiet-limit 300 --expect-fail guard-dead-rank \
 for n in 1 "$N_RANKS"; do
   run_leg --quiet-limit 300 "plan-$n-node" \
     "${CPU[@]}" "$PY" -m inexor.plan --preset "$PRESET" --backend device \
-    "${PLAN_MACHINE[@]}" --n-nodes "$n" --slack "$SLACK" \
+    "${PLAN_MACHINE[@]}" --n-nodes "$n" --y-blocks "$Y_BLOCKS" --slack "$SLACK" \
     --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA"
 done
 run_leg --quiet-limit 600 "preflight-$N_RANKS-node" \
   "${BIND0[@]}" "${ON0[@]}" "$PY" "$DRIVER" preflight --preset "$PRESET" --workdir "$IC_DIR" \
     --cards "$N_CARDS" --card "$CARDS/${TAG}_preflight_n$N_RANKS.json" --scratch "$REAL_DIR" \
-    --n-nodes "$N_RANKS" "${MACHINE[@]}" "${MEMBIND_CHECK[@]}" "${LAYOUT[@]}" \
+    --n-nodes "$N_RANKS" --y-blocks "$Y_BLOCKS" "${MACHINE[@]}" "${MEMBIND_CHECK[@]}" \
+    "${LAYOUT[@]}" \
   || stop_job "preflight refused"
 
 # --- control (with CONTROL_REF): its older generation resumed to its newer one, byte for byte
@@ -200,7 +221,7 @@ fi
 # --- production: EXPECT_STEP -> STOP
 run_leg --quiet-limit "$QUIET_S" \
   "steps $EXPECT_STEP->$STOP" ranks steps "$PRESET" "$IC_DIR" "$CKPT" "$K" "$EXPECT_STEP" \
-  "$STOP" "$EVERY"
+  "$STOP" "$EVERY" "" --y-blocks "$Y_BLOCKS"
 r=$?; summarize steps "$EXPECT_STEP"
 [ $r -eq 0 ] || stop_job "the steps leg failed"
 
@@ -214,5 +235,15 @@ if [ "$best" = "$STOP" ] && [ "$got" = "$want" ]; then
   echo "CHECK PASS"
 else
   echo "CHECK FAIL"; rc_total=$((rc_total + 1))
+  [ -n "${PROD_DIR:-}" ] && echo "=== no products: the check failed ==="
+  exit $rc_total
+fi
+
+# --- products (with PROD_DIR): the products job in this allocation, on the checkpoint just made
+if [ -n "${PROD_DIR:-}" ]; then
+  run_leg products env INEXOR_SRC="$SRC" INEXOR_RUNS="$RUNS" N_RANKS="$N_RANKS" \
+    CKPT_DIR="$CKPT" PROD_DIR="$PROD_DIR" PRESET="$PRESET" K="$K" EXPECT_STEP="$STOP" \
+    WITH_EXPORT="$WITH_EXPORT" SLACK="$SLACK" ALLOC_MARGIN="$ALLOC_MARGIN" ARENA_FRAC="$ARENA" \
+    bash "$SRC/scripts/run/multinode_products_vista.sbatch"
 fi
 exit $rc_total

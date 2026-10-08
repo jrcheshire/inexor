@@ -369,6 +369,83 @@ def test_the_steps_job_refuses_inputs_it_cannot_use(tmp_path, env, says):
     assert "=== LEG" not in r.stdout
 
 
+@pytest.mark.parametrize("prod,export_file,says", [
+    ("real/ckpt/prod", False, "PROD_DIR is under REAL_DIR/ckpt"),
+    ("prod", True, "prod/export already holds files"),
+])
+def test_the_steps_job_refuses_products_it_could_not_write(tmp_path, prod, export_file, says):
+    if export_file:
+        (tmp_path / prod / "export").mkdir(parents=True)
+        (tmp_path / prod / "export" / "x.r0000.npy").write_text("")
+    r = _steps_job(tmp_path, PROD_DIR=str(tmp_path / prod))
+    assert r.returncode == 1 and says in r.stdout, r.stdout
+    assert "=== LEG" not in r.stdout  # before any guard, not after the steps
+
+
+SCALING = os.path.join(HERE, "scripts", "run", "multinode_scaling_vista.sbatch")
+
+
+def _scaling_job(tmp_path, stub_python=True, **env):
+    """The scaling job script up to its first refusal, as `_steps_job`: REF_CKPT holds two
+    generations unless overridden, and the stubs fail any leg at once. With stub_python
+    False, python is real (the generations can be read) and the first guard's `mpiexec`
+    stops the job."""
+    if not (tmp_path / "ref").exists():
+        _gen(tmp_path / "ref", "gen0", 100)
+        _gen(tmp_path / "ref", "gen1", 120)
+    (tmp_path / "ref_ics").mkdir(exist_ok=True)
+    stubs = tmp_path / "stubs"
+    stubs.mkdir(exist_ok=True)
+    for name in ("python", "python3", "mpiexec", "pixi")[0 if stub_python else 2:]:
+        (stubs / name).write_text("#!/bin/sh\nexit 97\n")
+        (stubs / name).chmod(0o755)
+    e = {k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ}
+    path = os.environ.get("PATH", "")
+    if not stub_python:  # the python running this test, ahead of any other
+        path = f"{os.path.dirname(sys.executable)}:{path}"
+    e["PATH"] = f"{stubs}:{path}"
+    e.update(REHEARSAL="1", INEXOR_SRC=HERE, INEXOR_RUNS=str(tmp_path / "runs"),
+             REF_CKPT=str(tmp_path / "ref"), REF_ICS=str(tmp_path / "ref_ics"),
+             OUT_DIR=str(tmp_path / "out"))
+    e.update(env)
+    p = subprocess.Popen([BASH, SCALING], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=e, start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, 9)
+        p.communicate()
+        pytest.fail("the scaling job went past its refusals")
+    return subprocess.CompletedProcess(p.args, p.returncode, out, err)
+
+
+@pytest.mark.parametrize("env,says", [
+    ({"REF_CKPT": "{t}/absent"}, "set REF_CKPT to an existing directory"),
+    ({"REF_ICS": ""}, "set REF_ICS to an existing directory"),
+    ({"OUT_DIR": ""}, "set OUT_DIR"),
+    ({"OUT_DIR": "{t}/ref/out"}, "OUT_DIR is under REF_CKPT or REF_ICS"),
+    ({"RANK_COUNTS": "1 4"}, "rank count '4' is not between 1 and the allocation's 2 tasks"),
+    ({"RANK_COUNTS": "1 two"}, "rank count 'two' is not between"),
+    ({"RANK_COUNTS": "0 2"}, "rank count '0' is not between"),
+])
+def test_the_scaling_job_refuses_inputs_it_cannot_use(tmp_path, env, says):
+    r = _scaling_job(tmp_path, **{k: v.format(t=tmp_path) for k, v in env.items()})
+    assert r.returncode == 1 and says in r.stdout, r.stdout
+    assert "=== LEG" not in r.stdout
+
+
+@pytest.mark.parametrize("steps,refused", [((100, 120), False), ((120, None), True),
+                                            ((120, 120), True)])
+def test_the_scaling_job_needs_two_generations_at_different_steps(tmp_path, steps, refused):
+    for g, step in zip(("gen0", "gen1"), steps):
+        if step is not None:
+            _gen(tmp_path / "ref", g, step)
+    r = _scaling_job(tmp_path, stub_python=False)
+    assert r.returncode == 1  # refused, or stopped at the first guard by the stub mpiexec
+    assert ("does not hold two generations at different steps" in r.stdout) == refused, r.stdout
+    assert ("=== LEG guard-launch-mpi-1" in r.stdout) != refused, r.stdout
+
+
 def _pk(path, transform="cards", p=(1.0, 2.0), z=(0.1, 0.2), edges=(0.0, 0.5, 1.0), prov=None):
     path.write_text(json.dumps({"summary": {
         "transform": transform, "p": list(p), "z_profile": list(z), "k_edges": list(edges),
