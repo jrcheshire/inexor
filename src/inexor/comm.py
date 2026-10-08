@@ -176,7 +176,8 @@ class Comm:
 
         Sizes are allgathered and checked on every rank first, so a mismatch raises on all
         ranks instead of hanging one. Pairwise exchange: at shift k, send to rank + k and
-        receive from rank - k, each message in `chunk_bytes` pieces.
+        receive from rank - k, each message in `chunk_bytes` pieces; a shift at which no
+        rank sends is skipped.
         """
         n = self.size
         if len(sendbufs) != n or len(recvbufs) != n:
@@ -198,6 +199,8 @@ class Comm:
                 f"Alltoallv: rank {i} sends {sizes[i][0][j]} B to rank {j}, which expects "
                 f"{sizes[j][1][i]} B ({len(bad)} mismatched pair(s))")
         for k in range(n):
+            if all(sizes[i][0][(i + k) % n] == 0 for i in range(n)):
+                continue  # no rank sends at this shift; the sizes are shared, so all skip it
             dest, source = (self.rank + k) % n, (self.rank - k) % n
             sc = _chunk_bounds(sv[dest].size, self.chunk_bytes)
             rc = _chunk_bounds(rv[source].size, self.chunk_bytes)
@@ -380,10 +383,12 @@ def exchange_neighbours(comm, to_left, to_right):
     right rank sent left, as fresh arrays.
 
     `to_left` / `to_right` map names to numpy arrays (sent C-contiguous; a name may be absent
-    on some ranks). Every rank must call this, in the same order. The names, dtypes and
-    shapes are allgathered first, then each name moves in two `Alltoallv` calls, one per
-    direction, so at two ranks (each rank both neighbours of the other) the directions never
-    mix. On one rank everything is sent to itself as a copy; the step's callers skip it there.
+    on some ranks, or different on every rank). Every rank must call this, in the same order.
+    The names, dtypes and shapes are allgathered first; then the i-th name (sorted) of each
+    side moves in two `Alltoallv` calls, one per direction, so the call count is the largest
+    per-rank name count, not the union over ranks, and at two ranks (each rank both
+    neighbours of the other) the directions never mix. On one rank everything is sent to
+    itself as a copy; the step's callers skip it there.
     """
     n, r = comm.size, comm.rank
     left, right = (r - 1) % n, (r + 1) % n
@@ -392,25 +397,27 @@ def exchange_neighbours(comm, to_left, to_right):
         return {k: (np.asarray(v).dtype.str, tuple(np.shape(v))) for k, v in d.items()}
 
     heads = comm.allgather((head(to_left), head(to_right)))
-    names = sorted(set().union(*(set(a) | set(b) for a, b in heads)))
+    n_slots = max(max(len(a), len(b)) for a, b in heads)
     empty = np.empty(0, dtype=np.uint8)
     out = dict(left={}, right={})
-    for k in names:
-        # leftward: send to `left`, receive what `right` sent left; rightward the mirror
-        for src, dest, source, h, into in (
-                (to_left, left, right, heads[right][0], out["right"]),
-                (to_right, right, left, heads[left][1], out["left"])):
+    # leftward: send to `left`, receive what `right` sent left; rightward the mirror
+    sides = [(to_left, sorted(to_left), left, right, heads[right][0], sorted(heads[right][0]),
+              out["right"]),
+             (to_right, sorted(to_right), right, left, heads[left][1], sorted(heads[left][1]),
+              out["left"])]
+    for i in range(n_slots):
+        for src, mine, dest, source, h, theirs, into in sides:
             sendbufs = [empty] * n
-            if k in src:
-                sendbufs[dest] = np.ascontiguousarray(src[k])
+            if i < len(mine):
+                sendbufs[dest] = np.ascontiguousarray(src[mine[i]])
             recvbufs = [empty] * n
             got = None
-            if k in h:
-                got = np.empty(h[k][1], dtype=np.dtype(h[k][0]))
+            if i < len(theirs):
+                got = np.empty(h[theirs[i]][1], dtype=np.dtype(h[theirs[i]][0]))
                 recvbufs[source] = got
             comm.Alltoallv(sendbufs, recvbufs)
             if got is not None:
-                into[k] = got
+                into[theirs[i]] = got
     return out["left"], out["right"]
 
 

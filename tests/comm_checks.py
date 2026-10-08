@@ -84,6 +84,29 @@ def neighbour_arrays(c):
     _same(from_right, _to_left(right))
 
 
+def _named(r, n_names, side):
+    return {f"{r}:{side}{i}": np.arange(5 + i + r, dtype=np.int64) + 100 * r + 10 * i
+            for i in range(n_names)}
+
+
+def neighbour_rank_named_arrays(c):
+    """Names different on every rank (the slab-numbered ghost parcels): each arrives under
+    its sender's name, and the `Alltoallv` count is twice the largest per-rank name count,
+    whatever the rank count."""
+    def counts(r):
+        return r % 3 + 1, 2
+
+    left, right = (c.rank - 1) % c.size, (c.rank + 1) % c.size
+    nl, nr = counts(c.rank)
+    c.take_ledger()
+    from_left, from_right = exchange_neighbours(c, _named(c.rank, nl, "l"),
+                                                _named(c.rank, nr, "r"))
+    calls = c.take_ledger()["ops"]["Alltoallv"]["calls"]
+    _same(from_left, _named(left, counts(left)[1], "r"))
+    _same(from_right, _named(right, counts(right)[0], "l"))
+    assert calls == 2 * max(max(counts(r)) for r in range(c.size)), calls
+
+
 def ledger(c):
     """The ledger counts each public call once (not the calls nested inside it) with the bytes
     this rank sent to other ranks, and `take_ledger` resets it."""
@@ -114,4 +137,4 @@ def ledger(c):
 
 
 CHECKS = [ring_sendrecv, ragged_alltoallv, collectives, object_sendrecv, neighbour_arrays,
-          ledger]
+          neighbour_rank_named_arrays, ledger]

@@ -174,6 +174,31 @@ def test_shared_checks(kind, n, check):
         _run(kind, n, check, chunk_bytes=chunk)
 
 
+def test_an_alltoallv_skips_the_shifts_no_rank_sends_at(monkeypatch):
+    """A neighbour-only `Alltoallv` on 4 ranks moves in the two shifts that carry data, not
+    one per rank; every buffer still lands."""
+    calls = []
+    real = cm.LoopbackComm._sendrecv_bytes
+
+    def counted(self, *a):
+        calls.append(self.rank)
+        return real(self, *a)
+
+    monkeypatch.setattr(cm.LoopbackComm, "_sendrecv_bytes", counted)
+
+    def fn(c):
+        n, r = c.size, c.rank
+        sizes = lambda i, j: 3 if (j - i) % n in (1, n - 1) else 0  # noqa: E731
+        send = [_payload(r, j, sizes(r, j)) for j in range(n)]
+        recv = [np.full(sizes(i, r), -1, np.int64) for i in range(n)]
+        c.Alltoallv(send, recv)
+        for i in range(n):
+            np.testing.assert_array_equal(recv[i], _payload(i, r, sizes(i, r)))
+
+    _run("loopback", 4, fn)
+    assert sorted(calls) == [0, 0, 1, 1, 2, 2, 3, 3], calls
+
+
 def test_mixed_neighbour_directions_fail_the_check(monkeypatch):
     """At two ranks each rank is both neighbours of the other: an exchange that sends the
     leftward arrays rightward must fail the neighbour check."""
