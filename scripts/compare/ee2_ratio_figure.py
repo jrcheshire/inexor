@@ -1,4 +1,4 @@
-"""One realization's nonlinear boost against EuclidEmulator2, with its sample variance.
+"""One realization's P(k) against EuclidEmulator2's, with its sample variance.
 
     pixi exec --spec python=3.12 --spec camb --spec matplotlib --spec numpy --spec scipy \
         --spec gsl --spec pip -- bash -c "pip install -q euclidemu2; \
@@ -9,8 +9,9 @@
 
 euclidemu2 is pip-only, and its wheel needs `gsl` in the env to load.
 
-Plots B_inexor / B_EE2 for up to three cards, B = P / P_lin with each side against its
-own linear theory (see `pk_boost_reference.py` for why the boost, not P, is compared).
+Plots P_inexor / P_EE2 for up to three cards, each side relative to its own linear theory,
+(P / P_lin)_inexor / (P / P_lin)_EE2: the card's P_lin is EH98, EE2's a Boltzmann solve, and
+they differ by a few percent (see `pk_boost_reference.py`).
 EE2 is evaluated at each card's own k and redshift, so cards from different boxes may be
 overlaid; all must share the `--cosmology`. Two kinds of band around unity:
   - +-1 sigma Gaussian sample variance of ONE realization, sqrt(2 / n_modes) per bin,
@@ -98,7 +99,7 @@ def main():
     k_lo = min(k.min() for k, *_ in grids)
     ax.set_xlim(k_lo * 0.95, k_top * 1.05)
     ax.set_xlabel(r"$k\ \ [h\,{\rm Mpc}^{-1}]$")
-    ax.set_ylabel(r"$B_{\rm inexor}\,/\,B_{\rm EE2}$")
+    ax.set_ylabel(r"$P_{\rm inexor}\,/\,P_{\rm EE2}$, each over its own $P_{\rm lin}$")
     ax.legend(frameon=False, fontsize=8.5, loc="lower left")
     ax.grid(alpha=0.25, lw=0.6)
     fig.tight_layout()
