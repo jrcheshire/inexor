@@ -28,6 +28,7 @@ pytestmark = pytest.mark.skipif(BASH is None or shutil.which("pgrep") is None,
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RANK_EXEC = os.path.join(HERE, "scripts", "run", "rank_exec.sh")
 JOB_LIB = os.path.join(HERE, "scripts", "run", "job_lib.sh")
+GPU_ENV = os.path.join(HERE, "scripts", "run", "gpu_env.sh")
 
 
 def _survivors(tag):
@@ -610,3 +611,45 @@ def test_the_ics_job_refuses_an_existing_generation_and_a_missing_dir(tmp_path):
     assert "=== LEG" not in r.stdout
     r = _ics_job(tmp_path)
     assert r.returncode == 1 and "set IC_DIR" in r.stdout, r.stdout
+
+
+def _gpu_env(tmp_path, healthy, install_ok=True, rebuild=None):
+    """`ensure_gpu_env` on a fake checkout: its env's python passes the check while a marker
+    file exists; the stub `pixi` logs its calls, `clean` removes the marker and `install` makes
+    it (or fails, with install_ok=False)."""
+    src = tmp_path / "src"
+    (src / ".pixi" / "envs" / "gpu" / "bin").mkdir(parents=True)
+    ok = tmp_path / "env_ok"
+    if healthy:
+        ok.write_text("")
+    py = src / ".pixi" / "envs" / "gpu" / "bin" / "python3.14"
+    py.write_text(f'#!/bin/sh\n[ -e "{ok}" ]\n')
+    py.chmod(0o755)
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    log = tmp_path / "pixi.log"
+    (stubs / "pixi").write_text(
+        f'#!/bin/sh\necho "$*" >> "{log}"\n'
+        f'case "$1" in clean) rm -f "{ok}";; install) {"touch " + str(ok) if install_ok else "exit 3"};; esac\n')
+    (stubs / "pixi").chmod(0o755)
+    e = dict(os.environ, PATH=f"{stubs}{os.pathsep}{os.environ['PATH']}")
+    e.pop("REBUILD_ENV", None)
+    if rebuild is not None:
+        e["REBUILD_ENV"] = rebuild
+    r = subprocess.run([BASH, "-c", f'. "{GPU_ENV}"; ensure_gpu_env "{src}"'],
+                       capture_output=True, text=True, env=e, timeout=60)
+    calls = log.read_text().splitlines() if log.exists() else []
+    return r, calls
+
+
+@pytest.mark.parametrize("healthy,rebuild,install_ok,rc,calls", [
+    (True, None, True, 0, []),
+    (False, None, True, 0, ["clean -e gpu", "install -e gpu --locked"]),
+    (True, "1", True, 0, ["clean -e gpu", "install -e gpu --locked"]),
+    (False, None, False, 1, ["clean -e gpu", "install -e gpu --locked"]),
+])
+def test_a_broken_or_flagged_gpu_env_is_rebuilt_from_the_lock(tmp_path, healthy, rebuild,
+                                                              install_ok, rc, calls):
+    r, seen = _gpu_env(tmp_path, healthy, install_ok, rebuild)
+    assert r.returncode == rc, r.stdout + r.stderr
+    assert seen == calls

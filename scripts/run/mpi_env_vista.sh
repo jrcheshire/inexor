@@ -3,7 +3,8 @@
 # environment on Vista gh (one GH200 per node) or gb (four GB200 per node, two CPU memory
 # nodes), one rank per node under ibrun, host MPI from the MVAPICH-Plus module.
 #
-# Requires SRC (the checkout) and RUNS (the run root); reads N_RANKS (2) and REHEARSAL. Sets:
+# Requires SRC (the checkout) and RUNS (the run root); reads N_RANKS (2), REHEARSAL and
+# REBUILD_ENV (1: reinstall the gpu env from the lock; `gpu_env.sh`). Sets:
 #   PY             the gpu env's python (the laptop's in a rehearsal)
 #   LAUNCH         the launcher, `ibrun` (rehearsal: `mpiexec -n N_RANKS`)
 #   MPI4PY_DIR     mpi4py built against the module, for `python -m mpi4py` legs; MPIPATH is the
@@ -71,6 +72,8 @@ else
   export INEXOR_LOAD_TRACE=1
   export JAX_LOG_COMPILES=1
   unset JAX_PLATFORMS CUDA_VISIBLE_DEVICES XLA_FLAGS
+  . "$SRC/scripts/run/gpu_env.sh"
+  ensure_gpu_env "$SRC" || { echo "FATAL: no working gpu env"; exit 1; }
   ENV=$SRC/.pixi/envs/gpu
   PY=$ENV/bin/python3.14  # the versioned launcher: a scratch purge can take `python`
   [ -x "$PY" ] || { echo "FATAL: no $PY (install the gpu env first)"; exit 1; }

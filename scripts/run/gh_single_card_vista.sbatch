@@ -14,7 +14,9 @@
 # Requires INEXOR_RUNS (run root; outputs under $INEXOR_RUNS/d8-gh-<preset>-<job>/k<K>) and
 # INEXOR_SRC or submission from the inexor checkout. Optional: PRESET, KS (120; step counts,
 # space-separated), SLACK, ALLOC_MARGIN, ARENA_FRAC, PK_TABLE (a tabulated linear P(k) from
-# scripts/run/camb_linear_pk.py instead of EH98). The account is passed with `sbatch -A`:
+# scripts/run/camb_linear_pk.py instead of EH98), REBUILD_ENV=1 (reinstall the gpu env from the
+# lock first; it is also reinstalled when it fails to import, as after a scratch purge). The
+# account is passed with `sbatch -A`:
 #   INEXOR_RUNS=$SCRATCH/inexor_runs sbatch -A <account> scripts/run/gh_single_card_vista.sbatch
 #   sbatch -A <account> -t <wall> --export=ALL,PRESET=c-gh,SLACK=0.05,ALLOC_MARGIN=0.05 ...
 # The step-count ladder at 512^3 in 256 Mpc/h (one IC set, five schedules):
@@ -48,6 +50,8 @@ export INEXOR_LOAD_TRACE=1
 export JAX_LOG_COMPILES=1
 unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
+. scripts/run/gpu_env.sh
+ensure_gpu_env "$PWD" || { echo "FATAL: no working gpu env"; exit 1; }
 
 PRESET=${PRESET:-c-1024}
 SLACK=${SLACK:-0.10}
