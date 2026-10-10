@@ -32,8 +32,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 
-def camb_boost(cos, z, kmax, version):
-    """B(k) = P_nl/P_lin from CAMB at `cos`, normalized to its sigma8."""
+def camb_boost(cos, z, kmax, version, npoints=400):
+    """B(k) = P_nl/P_lin from CAMB at `cos`, normalized to its sigma8, on `npoints` log-spaced
+    k in [1e-3, kmax]. Returns (kh, P_lin, P_nl, sigma8, A_s)."""
     import camb
 
     h = cos["h"]
@@ -54,11 +55,11 @@ def camb_boost(cos, z, kmax, version):
     s8 = camb.get_results(pars).get_sigma8_0()
     pars.InitPower.As = pars.InitPower.As * (cos["sigma8"] / s8) ** 2
     lin = camb.get_results(pars)
-    kh, _, plin = lin.get_matter_power_spectrum(minkh=1e-3, maxkh=kmax, npoints=400)
+    kh, _, plin = lin.get_matter_power_spectrum(minkh=1e-3, maxkh=kmax, npoints=npoints)
 
     pars.NonLinear = camb.model.NonLinear_both
     nl = camb.get_results(pars)
-    kh2, _, pnl = nl.get_matter_power_spectrum(minkh=1e-3, maxkh=kmax, npoints=400)
+    kh2, _, pnl = nl.get_matter_power_spectrum(minkh=1e-3, maxkh=kmax, npoints=npoints)
     assert np.allclose(kh, kh2)
     return kh, plin[0], pnl[0], float(nl.get_sigma8_0()), float(pars.InitPower.As)
 
