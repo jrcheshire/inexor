@@ -103,16 +103,28 @@ else
   export PATH="$PATH:$ENV/bin"
 
   # built into a job-private dir, then moved into place, so two jobs building at once
-  # cannot interleave
+  # cannot interleave. A build missing any file its RECORD lists (a scratch purge) is moved
+  # aside to MPI4PY_DIR.damaged.<job> and rebuilt; the result must be complete and import.
+  mpi4py_ok () {
+    pip_target_complete "$MPI4PY_DIR" \
+      && PYTHONPATH="$MPI4PY_DIR" "$PY" -c "import mpi4py, sys; sys.exit(not mpi4py.__file__.startswith('$MPI4PY_DIR'))" 2>/dev/null
+  }
   build_mpi4py () {
-    if PYTHONPATH="$MPI4PY_DIR" "$PY" -c "import mpi4py, sys; sys.exit(not mpi4py.__file__.startswith('$MPI4PY_DIR'))" 2>/dev/null; then
-      echo "mpi4py already built in $MPI4PY_DIR"; return 0
+    if mpi4py_ok; then
+      echo "mpi4py already built in $MPI4PY_DIR (complete)"; return 0
+    fi
+    if [ -e "$MPI4PY_DIR" ]; then
+      echo "mpi4py in $MPI4PY_DIR is incomplete: moving it to $MPI4PY_DIR.damaged.$SLURM_JOB_ID"
+      mv -T "$MPI4PY_DIR" "$MPI4PY_DIR.damaged.$SLURM_JOB_ID" || return 1
     fi
     local tmp=$MPI4PY_DIR.tmp.$SLURM_JOB_ID
     mkdir -p "$(dirname "$MPI4PY_DIR")"
     MPICC=$(command -v mpicc) pixi exec --spec python=3.14 --spec pip -- \
       pip install --no-cache-dir --no-binary mpi4py --target "$tmp" "mpi4py==$MPI4PY_VERSION" \
-      && { mv -T "$tmp" "$MPI4PY_DIR" 2>/dev/null || [ -d "$MPI4PY_DIR" ]; }
+      || return 1
+    # another job may have moved its build into place first; either way it must check out
+    mv -T "$tmp" "$MPI4PY_DIR" 2>/dev/null || echo "mpi4py: $MPI4PY_DIR appeared during the build; keeping it"
+    mpi4py_ok || { echo "mpi4py: the build in $MPI4PY_DIR is incomplete or does not import"; return 1; }
   }
 fi
 

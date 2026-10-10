@@ -613,43 +613,98 @@ def test_the_ics_job_refuses_an_existing_generation_and_a_missing_dir(tmp_path):
     assert r.returncode == 1 and "set IC_DIR" in r.stdout, r.stdout
 
 
-def _gpu_env(tmp_path, healthy, install_ok=True, rebuild=None):
-    """`ensure_gpu_env` on a fake checkout: its env's python passes the check while a marker
-    file exists; the stub `pixi` logs its calls, `clean` removes the marker and `install` makes
-    it (or fails, with install_ok=False)."""
+def _gpu_env(tmp_path, healthy, install_ok=True, rebuild=None, purged=False,
+             restore_lib=True):
+    """`ensure_gpu_env` on a fake checkout: its env's python passes the import check while a
+    marker file exists, and its conda-meta lists `lib/libfoo.so` (`purged` deletes it). The stub
+    `pixi` logs its calls with the PIXI_CACHE_DIR it saw; `clean` removes the marker and the
+    library, `install` restores both (the marker only with restore_lib=False; or fails, with
+    install_ok=False)."""
     src = tmp_path / "src"
-    (src / ".pixi" / "envs" / "gpu" / "bin").mkdir(parents=True)
+    env = src / ".pixi" / "envs" / "gpu"
+    (env / "bin").mkdir(parents=True)
+    (env / "lib").mkdir()
+    (env / "conda-meta").mkdir()
+    (env / "conda-meta" / "foo-1.0-0.json").write_text(
+        json.dumps({"files": ["bin/python3.14", "lib/libfoo.so"]}))
+    lib = env / "lib" / "libfoo.so"
+    if not purged:
+        lib.write_text("")
     ok = tmp_path / "env_ok"
     if healthy:
         ok.write_text("")
-    py = src / ".pixi" / "envs" / "gpu" / "bin" / "python3.14"
+    py = env / "bin" / "python3.14"
     py.write_text(f'#!/bin/sh\n[ -e "{ok}" ]\n')
     py.chmod(0o755)
     stubs = tmp_path / "stubs"
     stubs.mkdir()
     log = tmp_path / "pixi.log"
+    restore = (f'touch "{ok}"' + (f' "{lib}"' if restore_lib else "")) if install_ok else "exit 3"
     (stubs / "pixi").write_text(
-        f'#!/bin/sh\necho "$*" >> "{log}"\n'
-        f'case "$1" in clean) rm -f "{ok}";; install) {"touch " + str(ok) if install_ok else "exit 3"};; esac\n')
+        f'#!/bin/sh\necho "$* cache=$PIXI_CACHE_DIR" >> "{log}"\n'
+        f'case "$1" in clean) rm -f "{ok}" "{lib}";; install) {restore};; esac\n')
     (stubs / "pixi").chmod(0o755)
-    e = dict(os.environ, PATH=f"{stubs}{os.pathsep}{os.environ['PATH']}")
+    caches = tmp_path / "caches"
+    e = dict(os.environ, PATH=f"{stubs}{os.pathsep}{os.environ['PATH']}",
+             GPU_ENV_CACHE_ROOT=str(caches))
     e.pop("REBUILD_ENV", None)
+    e.pop("PIXI_CACHE_DIR", None)
     if rebuild is not None:
         e["REBUILD_ENV"] = rebuild
     r = subprocess.run([BASH, "-c", f'. "{GPU_ENV}"; ensure_gpu_env "{src}"'],
                        capture_output=True, text=True, env=e, timeout=60)
     calls = log.read_text().splitlines() if log.exists() else []
-    return r, calls
+    return r, calls, caches
 
 
-@pytest.mark.parametrize("healthy,rebuild,install_ok,rc,calls", [
-    (True, None, True, 0, []),
-    (False, None, True, 0, ["clean -e gpu", "install -e gpu --locked"]),
-    (True, "1", True, 0, ["clean -e gpu", "install -e gpu --locked"]),
-    (False, None, False, 1, ["clean -e gpu", "install -e gpu --locked"]),
+@pytest.mark.parametrize("healthy,rebuild,install_ok,purged,rc,rebuilt", [
+    (True, None, True, False, 0, False),
+    (False, None, True, False, 0, True),
+    (True, "1", True, False, 0, True),
+    (False, None, False, False, 1, True),
+    # imports fine but a listed file is gone: the census alone triggers the rebuild
+    (True, None, True, True, 0, True),
 ])
-def test_a_broken_or_flagged_gpu_env_is_rebuilt_from_the_lock(tmp_path, healthy, rebuild,
-                                                              install_ok, rc, calls):
-    r, seen = _gpu_env(tmp_path, healthy, install_ok, rebuild)
+def test_a_broken_purged_or_flagged_gpu_env_is_rebuilt_through_an_empty_cache(
+        tmp_path, healthy, rebuild, install_ok, purged, rc, rebuilt):
+    r, seen, caches = _gpu_env(tmp_path, healthy, install_ok, rebuild, purged)
     assert r.returncode == rc, r.stdout + r.stderr
-    assert seen == calls
+    if not rebuilt:
+        assert seen == [] and not caches.exists()
+        return
+    [made] = list(caches.iterdir())
+    assert seen[0] == "clean -e gpu cache="
+    assert seen[1:] == [f"install -e gpu --locked cache={made}"]
+    if rc == 0:
+        assert "gpu env: rebuilt" in r.stdout
+
+
+def test_a_rebuild_that_leaves_a_listed_file_missing_fails(tmp_path):
+    """pixi reports success but the purged library never comes back: the census after the
+    rebuild fails the guard."""
+    r, seen, _ = _gpu_env(tmp_path, healthy=True, purged=True, restore_lib=False)
+    assert r.returncode == 1 and "still fails after the rebuild" in r.stdout, r.stdout
+    assert [c.split(" cache=")[0] for c in seen] == ["clean -e gpu", "install -e gpu --locked"]
+
+
+def test_pip_target_complete_reads_every_record(tmp_path):
+    d = tmp_path / "mpi4py-build"
+    (d / "mpi4py").mkdir(parents=True)
+    (d / "pkg-1.0.dist-info").mkdir()
+    for f in ("mpi4py/__init__.py", "mpi4py/MPI.so"):
+        (d / f).write_text("")
+    (d / "pkg-1.0.dist-info" / "RECORD").write_text(
+        "mpi4py/__init__.py,sha256=x,0\nmpi4py/MPI.so,sha256=y,0\npkg-1.0.dist-info/RECORD,,\n")
+
+    def check():
+        return subprocess.run([BASH, "-c", f'. "{GPU_ENV}"; pip_target_complete "{d}"'],
+                              capture_output=True, text=True, timeout=60)
+
+    assert check().returncode == 0
+    (d / "mpi4py" / "MPI.so").unlink()
+    r = check()
+    assert r.returncode == 1 and "missing: mpi4py/MPI.so" in r.stdout, r.stdout
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    d = empty
+    assert check().returncode == 1
