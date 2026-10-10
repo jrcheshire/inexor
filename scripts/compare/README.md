@@ -82,37 +82,40 @@ The inexor legs run in inexor's `gpu` env with `JAX_PLATFORMS=cpu`; the GPU evol
 
 ## pk_boost_reference.py and ee2_ratio_figure.py
 
-Both compare a realization's P(k) card (`realization_pk.json`, written by `realization.py
-card`) against references. `pk_boost_reference.py` compares nonlinear boosts
-`B(k) = P(k) / P_lin(k)`, each side against its own linear theory: the card's
-`p / p_oracle` (the oracle is the linear spectrum the ICs were made from) against CAMB's
-`P_nl / P_lin` or EuclidEmulator2's emulated boost. `ee2_ratio_figure.py` compares P itself,
-both sides averaged over the card's modes (below).
+Both compare P(k) cards (`realization_pk.json`, written by `realization.py card`, or a
+DISCO-DJ cross-check card) against references, as `P_card / P_reference` with every
+reference averaged over each card bin's own lattice modes, the average the card takes of its
+own P. Evaluating a reference at a bin's mean k instead leaves the BAO as a +-1-2% zigzag
+(a bin spans ~40% of a period). The bins are rebuilt from the card's mesh and edges
+(`pk_boost_reference.card_bin_modes`; cards that predate `k_edges` use the binner's default
+edges), and a card whose mode counts are not reproduced is refused. References are run at
+the A_s that matches the cosmology's `sigma8`; a card made from EH98 ICs shows EH98's
+difference from CAMB's linear spectrum at low k.
 
 Run them with `pixi exec` and the specs given in each docstring, not in the project env:
 camb and euclidemu2 are not engine dependencies, and adding them would move `pixi.lock`.
 
-- **`pk_boost_reference.py CARD`**: the card's boost against CAMB HMcode2020 and halofit
-  (Takahashi), plus EuclidEmulator2 if `euclidemu2` imports (`--no-ee2` skips it); a
-  two-panel figure (`-o`) and a table on stdout. CAMB is run massless-neutrino and
-  rescaled to the card's `sigma8`. The cosmology comes from the card, or else from
-  `--cosmology FILE` (any JSON with a `cosmology` block; an export header written with
-  km/s velocities has one); there is no default.
+- **`pk_boost_reference.py CARD [CARD ...]`**: left panel, the boost `B = P / P_lin` of
+  each card (over its own linear oracle) and of CAMB HMcode2020, halofit (Takahashi) and
+  EuclidEmulator2 if `euclidemu2` imports (`--no-ee2` skips it), for scale; right panel,
+  `P / P_reference`: one card against all three references, several cards (one redshift,
+  any boxes) each against EE2 (HMcode without it), with the reference's quoted accuracy as
+  the band. A table on stdout. CAMB is run massless-neutrino. `--labels` and `--linestyles`
+  take one entry per card, `--legend-loc` places the ratio panel's legend. The cosmology
+  comes from the card, or else from `--cosmology FILE` (any JSON with a `cosmology` block;
+  an export header written with km/s velocities has one); there is no default.
 
   ```bash
-  pixi exec --spec camb --spec matplotlib --spec numpy -- \
+  pixi exec --spec python=3.12 --spec camb --spec matplotlib --spec numpy --spec scipy -- \
       python scripts/compare/pk_boost_reference.py RUN/realization_pk.json \
       --cosmology RUN/export/export.json -o figures/pk_boost.png
   ```
 
 - **`ee2_ratio_figure.py CARD [CARD ...]`**: `P_inexor / P_EE2` for up to three cards, with
-  `P_EE2 = P_lin,CAMB x B_EE2` averaged over each card bin's own lattice modes (the bins are
-  rebuilt from the card's mesh and edges; a card whose mode counts are not reproduced is
-  refused). Unlike the boost ratio above, this compares P directly, so a card made from EH98
-  ICs shows EH98's difference from CAMB at low k. Cards may come from different boxes and
-  redshifts; one +-1 sigma Gaussian sample-variance band per distinct k grid, and EE2's
-  quoted 1% accuracy band. `--cosmology` and `-o` are required; `--labels` takes one label
-  per card. euclidemu2 is pip-only and its wheel needs `gsl` in the env:
+  `P_EE2 = P_lin,CAMB x B_EE2`. Cards may come from different boxes and redshifts; one +-1
+  sigma Gaussian sample-variance band per distinct k grid, and EE2's quoted 1% accuracy
+  band. `--cosmology` and `-o` are required; `--labels` takes one label per card.
+  euclidemu2 is pip-only and its wheel needs `gsl` in the env:
 
   ```bash
   pixi exec --spec python=3.12 --spec camb --spec matplotlib --spec numpy --spec scipy \
