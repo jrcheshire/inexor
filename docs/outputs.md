@@ -113,13 +113,23 @@ complete. A resumed run first writes the generation it did not load. The manifes
 | `n_steps` | steps in the full schedule |
 | `cap_shape`, `pad_shape`, `device_shapes` | buffer shapes restored on resume, so the same programs compile |
 | `n_arena` | arena rows at write time (default `arena_frac` on resume) |
-| `fingerprint` | `engine.checkpoint_fingerprint` of config + coefficients |
+| `fingerprint` | `engine.checkpoint_fingerprint` of config + coefficients (+ snapshot steps, when the run has them) |
 | `a`, `cosmology` | epoch of the checkpoint and its `Cosmology` fields, when `run` was given `epoch=(a_steps, cosmo)` (the driver always does) |
 | `linear_pk` | the ICs' tabulated linear P(k), when they were made from one (the drivers pass it on from the IC manifest or the checkpoint they resume) |
+| `source` | when `run` was given one (the GPU driver always is): the IC directory and the IC manifest's `generator`, `commit`, `host`, `when`. The byte gates in `job_lib.sh` compare manifests without it |
+| `snapshot_steps` | the run's snapshot steps, when it has any |
+| `snapshot` | `true` on a snapshot |
+
+A run with `snapshot_steps` also writes, at the end of each such step, a **snapshot**:
+`<snapshot_dir>/step<NNNN>/gen0/`, the same format, where positions and velocities both sit
+at `a_steps[step]` (that step drifted only its trailing half; `engine.drift_plan`). In a
+regular checkpoint before the last step the fused drift has already taken positions half a
+step past it; `engine.synchronized(provenance)` says which, and the drivers' `card` and
+`export` refuse the unsynchronized ones without `--allow-partial`.
 
 `engine.load_checkpoint(dir, cfg, coeffs)` picks the generation with the highest `step` and
-refuses one whose fingerprint differs from the current config and schedule. It also refuses
-when no generation has a manifest. A state carrying particle ids cannot be checkpointed (the
+refuses one whose fingerprint differs from the current config and schedule (and the snapshot
+steps it records). It also refuses when no generation has a manifest. A state carrying particle ids cannot be checkpointed (the
 schema has no ids).
 
 ## P(k) summary card

@@ -48,7 +48,7 @@ limit costs one phase rather than the whole run. Checkpoints always go to `<work
 | `--migrate-pooled` / `--serial-migrate` | auto | run | run the migrate on the pool, or serially |
 | `--eject-kernel` | `jax` | run | `jax` or `numpy` |
 | `--phase-instrument` | `time` | run | `time` (seconds per phase) or `peak` (per-phase host high-water mark, Linux only) |
-| `--allow-partial` | off | export | export a checkpoint from before the last step |
+| `--allow-partial` | off | card, export | a checkpoint that is neither the last step nor a snapshot (its positions are half a step past its epoch) |
 | `--export-dir` | `<workdir>/export` | export | output directory |
 | `--chunk-bricks` | 1024 | export | bricks decoded per chunk |
 | `--min-weight` | 100 | card | drop bins with this many modes or fewer |
@@ -73,8 +73,10 @@ limit costs one phase rather than the whole run. Checkpoints always go to `<work
   `--checkpoint-every`. With no `--stop-at`, the stop step is `--k-steps`, so `--k-steps`
   must be a multiple of it as well. A stop at or before the step you are resuming from is
   also refused.
-- **Export before the last step.** `export` refuses a checkpoint short of `--k-steps` unless
-  you pass `--allow-partial`.
+- **Products from a mid-run checkpoint.** `card` and `export` refuse a checkpoint that is
+  neither the last step nor a snapshot unless you pass `--allow-partial`: the drift is fused
+  across steps, so its positions are half a step past its epoch. A card of the ICs
+  (`--ic-dir`) is not refused.
 - **Resume onto a different configuration.** Loading a checkpoint fails on a fingerprint
   mismatch (see below).
 - **Empty card.** `card` fails if no bin has more than `--min-weight` modes. Widen the bins
@@ -130,7 +132,7 @@ coarse paint and solve, the tile loop and the migrate all run on the cards. Its 
 | `run` | Loads the ICs or resumes a checkpoint, then steps to `--stop-at`. Prints one line per phase boundary and a heartbeat, and rewrites a JSON card (`--card`) at every boundary. On failure, the traceback and device memory stats go into the card |
 | `ics` | Device ICs into `--workdir` (`icgen.generate_t9_slabs_device`), with one boundary per generator stage. Under `--comm mpi` every rank generates its own brick slabs and rank 0 writes the manifest; the files are the same at any rank, card and `--y-blocks` count. Refuses a directory that already holds a manifest |
 | `card` | The P(k) card of the newest checkpoint in `--checkpoint-dir`, painted and transformed on the cards (`summary.pk_summary_card_cards`); rank 0 writes it to `--out` in the same JSON wrapper as `realization.py card` (summary under `summary`, with `transform: "cards"`). The paint is bitwise the CPU card's; the spectrum differs from the CPU card's at the FFT's rounding |
-| `export` | The particle export of that checkpoint, decoded on the cards and written as one part per rank to `--export-dir` (format `inexor-particles-2`, see [outputs](outputs.md#particle-export)); bitwise the CPU export's bytes. Refuses a non-empty `--export-dir` and, without `--allow-partial`, a checkpoint short of `--k-steps` |
+| `export` | The particle export of that checkpoint, decoded on the cards and written as one part per rank to `--export-dir` (format `inexor-particles-2`, see [outputs](outputs.md#particle-export)); bitwise the CPU export's bytes. Refuses a non-empty `--export-dir` and, without `--allow-partial`, a checkpoint that is neither the last step nor a snapshot |
 | `summarize` | Reads a run card together with the job's sampler CSVs (`--gpu-csv`, `--mem-csv`) and writes per-phase GPU memory, host memory and utilization to `--out`. Does not import jax |
 
 Key flags for `preflight` and `run`:
@@ -148,7 +150,9 @@ Key flags for `preflight` and `run`:
 | `--k-steps` (run) | 40 | length of the whole schedule |
 | `--checkpoint-dir`, `--checkpoint-every` (run) | none, 0 | 0 = no checkpoints. Otherwise `--stop-at` must be a multiple of `--checkpoint-every` |
 | `--expect-step` (run) | 0 | 0 = start from the ICs, refused if `--checkpoint-dir` already holds a checkpoint. N = resume from the newest checkpoint, refused unless it is at step N |
-| `--timed-last`, `--timed-all` (run) | off | synced per-pass timing breakdown on the last step or on every step |
+| `--timed-last`, `--timed-all`, `--timed-every N` (run) | off | synced per-pass timing breakdown on the last step, every step, or every N-th (absolute step k with (k + 1) % N == 0). Untimed steps run without the syncs, so their wall is the step's cost |
+| `--snapshot-z`, `--snapshot-dir` (run) | none | synchronized snapshots at the step boundaries nearest these redshifts (comma list), written as `<snapshot-dir>/step<NNNN>/gen0` in checkpoint format; the step before each drifts only its trailing half, so the run differs from one without snapshots by one position rounding per snapshot. Recorded in the checkpoints and their fingerprint, so a resume must give the same `--snapshot-z`. Not under the ICs or `--checkpoint-dir` |
+| `--card-sample-ms` (run) | 10 | sample every card's allocator bytes in use this often (0 = off); each boundary record carries `card_phase_peak`, the largest since the previous boundary |
 | `--drop-ic-cache` (run) | off | drop each IC slab's page cache as it is read |
 | `--beat` (run) | 60 | heartbeat seconds |
 | `--comm` (run) | `serial` | `mpi`: one rank per process across nodes (see below) |
@@ -167,8 +171,11 @@ process's run card), `--cards`, layout and `--growth2` as above (they must match
 `--membind-nodes`, `--beat`, `--comm`, `--comm-timeout`, and `--expect-step` (required: the
 newest checkpoint must be at this step). `card` adds `--out` (required), `--k-max` /
 `--n-bins` / `--min-weight` / `--slab` as `realization.py card`; `export` adds `--export-dir`
-(required), `--dtype` (float32), `--d-time` (native velocities instead of km/s at the
-checkpoint's epoch) and `--allow-partial`. Neither writes under the checkpoint directory.
+(required), `--dtype` (float32) and `--d-time` (native velocities instead of km/s at the
+checkpoint's epoch). Both refuse a checkpoint that is neither the last step nor a snapshot
+(read from its manifest before the load) unless `--allow-partial`; a snapshot directory
+(`<snapshot-dir>/step<NNNN>`) is a `--checkpoint-dir` like any other. Neither writes under
+the checkpoint directory.
 
 **Y-blocks.** Every card working set that would otherwise hold a whole brick x-slab (the tile
 window, the destination census, the device migrate and the fused repack) works on (x-slab,
@@ -248,7 +255,7 @@ run) before the expensive leg and stops if they fail.
 | `hero_export_vista.sbatch` | gb | export of the same checkpoint to `$PROD_DIR/export` | `INEXOR_RUNS`, `CKPT_DIR` (or `SRC_RUN`), `K_STEPS`, `PROD_DIR`. Optional: `PRESET` (`c-hero`) |
 | `gh_single_card_vista.sbatch` | gh | realizations on one GH200: one set of ICs, then a run and a card per step count in `KS` (each checkpointed once, at its end), under `$INEXOR_RUNS/d8-gh-<preset>-<job id>/k<K>/`; a run that fails gets no card and the next step count still runs | `INEXOR_RUNS`. Optional: `PRESET` (`c-1024`), `KS` (120; e.g. `"40 60 80 120 160"` for a step-count ladder), `PK_TABLE`, `SLACK` (0.10), `ALLOC_MARGIN` (0.10), `ARENA_FRAC` (0.01) |
 | `multinode_gate_vista.sbatch` | gh, 2 nodes | the multi-node byte gate: the single-node run on each node and the 2-rank run, compared file by file at the split step and at the end (`$INEXOR_RUNS/mn-gate-<preset>-<job id>/`); a split-step mismatch reruns segment 1 with deterministic ops and stops. The run legs' launch line is tried on every node first; a leg is killed after `QUIET_S` of silent output and has no time limit but the wall, and a failed run leg stops the job | `INEXOR_RUNS`. Optional: `PRESET` (`c-1024`), `K` (120), `SPLIT` (20), `STOP`, `EVERY`, layout as above, `QUIET_S` (600) |
-| `multinode_steps_vista.sbatch` | gh or gb, `-p` / `-N` at submission (default gh, 2 nodes) | one realization across the nodes from ICs made elsewhere, checkpointing every `EVERY` steps into `$REAL_DIR/ckpt`; a lost job is resubmitted with `EXPECT_STEP` at its newest checkpoint (`EXPECT_STEP=0` is refused over an existing one). With `CONTROL_REF`, first a control: its older generation (a run that passed the byte gate) is resumed to the newer one's step and must match it byte for byte. Ends by checking the newest checkpoint's step and particle count; with `PROD_DIR`, a passing check is followed in the same allocation by `multinode_products_vista.sbatch` on that checkpoint (card, and export unless `WITH_EXPORT=0`). Silence limit and stop-on-failure as in the gate | `INEXOR_RUNS`, `IC_DIR`, `REAL_DIR`. Optional: `CONTROL_REF` with `CONTROL_ICS`, `PRESET` (`c-gh`), `K` (120), `EXPECT_STEP` (0), `STOP`, `EVERY` (20), `Y_BLOCKS` (auto; production run, preflight and planner), `CONTROL_PRESET` (`c-1024`), layout as above, `QUIET_S` (600), `PROD_DIR` with `WITH_EXPORT` (1) |
+| `multinode_steps_vista.sbatch` | gh or gb, `-p` / `-N` at submission (default gh, 2 nodes) | one realization across the nodes from ICs made elsewhere, checkpointing every `EVERY` steps into `$REAL_DIR/ckpt`; a lost job is resubmitted with `EXPECT_STEP` at its newest checkpoint (`EXPECT_STEP=0` is refused over an existing one). With `CONTROL_REF`, first a control: its older generation (a run that passed the byte gate) is resumed to the newer one's step and must match it byte for byte. Ends by checking the newest checkpoint's step and particle count; with `PROD_DIR`, a passing check is followed in the same allocation by `multinode_products_vista.sbatch` on that checkpoint (card, and export unless `WITH_EXPORT=0`). Silence limit and stop-on-failure as in the gate | `INEXOR_RUNS`, `IC_DIR`, `REAL_DIR`. Optional: `CONTROL_REF` with `CONTROL_ICS`, `PRESET` (`c-gh`), `K` (120), `EXPECT_STEP` (0), `STOP`, `EVERY` (20), `Y_BLOCKS` (auto; production run, preflight and planner), `CONTROL_PRESET` (`c-1024`), layout as above, `QUIET_S` (600), `PROD_DIR` with `WITH_EXPORT` (1), `TIMED` (`--timed-all`), `SNAPSHOT_Z` (none; e.g. `2,1,0.5`: snapshots in `$REAL_DIR/snapshots`, and with `PROD_DIR` the products job on each into `$PROD_DIR/step<NNNN>`) |
 | `multinode_scaling_vista.sbatch` | gh or gb, `-N` at submission (default gh, 16 nodes) | strong scaling inside one allocation: `REF_CKPT`'s older generation resumed to its newer one's step at each rank count in `RANK_COUNTS`, every leg on the allocation's first nodes (`ibrun -n N -o 0`), each leg's checkpoints compared byte for byte with `REF_CKPT`. Launch line, planner and preflight checked at every count before any leg; a failed or differing leg is counted and the next one still runs. `REHEARSAL=1` with `PLANT_MISMATCH` | `INEXOR_RUNS`, `REF_CKPT` (two generations), `REF_ICS`, `OUT_DIR`. Optional: `PRESET` (`c-gh`), `RANK_COUNTS` (`"2 4 8 16"`), `Y_BLOCKS` (auto), layout (`REF_CKPT`'s own), `QUIET_S` (600) |
 | `multinode_ics_vista.sbatch` | gh or gb, `-p` / `-N` at submission (default gh, 2 nodes) | device ICs across the nodes into `$IC_DIR` (`device_run.py ics --comm mpi`), then a check of the manifest's particle and slab counts against the preset. Optional check first: `SMALL_PRESET`'s ICs on one rank and on every rank must be the same files (stops the job otherwise). Silence limit and stop-on-failure as in the gate; `REHEARSAL=1` with `PLANT_MISMATCH` or `PLANT_LEG_FAIL` | `INEXOR_RUNS`, `IC_DIR` (new). Optional: `PRESET` (`c-gh`), `SEED` (0), `A_INIT` (0.1), `F_NL` (0), `WINDOW` (1), `Y_BLOCKS` (auto), `BATCH_PLANES` (16), `SMALL_PRESET`, `QUIET_S` (900), `PK_TABLE` (every IC leg) |
 | `multinode_products_vista.sbatch` | gh or gb, `-p` / `-N` at submission (default gh, 2 nodes) | the P(k) card (`$PROD_DIR/pk.json`) and the export (`$PROD_DIR/export`, one part per rank) of a checkpoint across the nodes, on the cards. Optional checks first: `SMALL_CKPT`'s card and export on one rank and on every rank must match (stops the job otherwise). `REF_EXPORT` (an export of the same checkpoint made another way) must have the same crc32; `REF_CARD`'s per-bin difference is printed, not gated. Silence limit and stop-on-failure as in the gate; `REHEARSAL=1` with `PLANT_CARD_MISMATCH`, `PLANT_EXPORT_MISMATCH` or `PLANT_LEG_FAIL` | `INEXOR_RUNS`, `CKPT_DIR`, `PROD_DIR`. Optional: `PRESET` (`c-gh`), `K` and `EXPECT_STEP` (from the newest checkpoint), `ALLOW_PARTIAL` (0), `WITH_EXPORT` (1; 0 = the card only), `SMALL_CKPT`, `SMALL_PRESET` (`c-1024`), `REF_EXPORT`, `REF_CARD`, layout as above, `QUIET_S` (900) |
