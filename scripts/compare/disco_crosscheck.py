@@ -17,7 +17,7 @@ Four phases, each in the env it needs; they exchange one npz each.
 
 `evolve` runs DISCO-DJ with CIC (worder 2), ik gradient and Laplacian, no
 deconvolution, no antialiasing, BullFrog on the explicit a-grid, momentum
-= v_d * Fplus(a). Particle order is irrelevant to the PM: DISCO-DJ stores X - q
+= v_d * Fplus(a); `--chunk-size` sets DISCO-DJ's particle chunking, its memory knob. Particle order is irrelevant to the PM: DISCO-DJ stores X - q
 periodically wrapped and adds q back before every paint (its `nbody/acc.py`).
 
 `card` takes everything after `--` as realization-script arguments, so the bins,
@@ -118,9 +118,12 @@ def cmd_evolve(args):
     n_part, L = int(meta["n_part"]), float(meta["box_size"])
     a_steps = d["a_steps"]
     a_i, a_f = float(a_steps[0]), float(a_steps[-1])
+    if args.chunk_size is not None and (args.chunk_size <= 0 or n_part**3 % args.chunk_size):
+        raise SystemExit(f"--chunk-size {args.chunk_size} must divide {n_part}^3 particles")
     print(f"== evolve DISCO-DJ: {n_part}^3 particles, L={L}, PM mesh {args.n_mesh}^3, "
           f"{len(a_steps) - 1} BullFrog steps a={a_i:.4f}->{a_f:.4f}, "
-          f"precision {args.precision}, backend {jax.devices()[0].platform}", flush=True)
+          f"precision {args.precision}, chunk_size {args.chunk_size}, "
+          f"backend {jax.devices()[0].platform}", flush=True)
 
     dj = DiscoDJ(dim=3, res=n_part, boxsize=L, cosmo=meta["disco_cosmo"],
                  precision=args.precision)
@@ -134,7 +137,8 @@ def cmd_evolve(args):
     X, P, _ = dj.run_nbody(
         a_i, a_f, len(a_steps) - 1, time_var=a_steps, stepper="bullfrog", method="pm",
         res_pm=args.n_mesh, worder=2, antialias=0, grad_kernel_order=0,
-        laplace_kernel_order=0, deconvolve=False, convert_to_numpy=True,
+        laplace_kernel_order=0, deconvolve=False, chunk_size=args.chunk_size,
+        convert_to_numpy=True,
     )
     wall = time.perf_counter() - t0
     X = np.mod(np.asarray(X, np.float64).reshape(-1, 3), L)
@@ -147,7 +151,7 @@ def cmd_evolve(args):
     print(f"  evolve wall {wall:.1f} s (compile included), device peak "
           f"{'n/a' if peak is None else f'{peak / 1e9:.1f} GB'}", flush=True)
     meta.update(n_mesh=args.n_mesh, precision=args.precision, evolve_wall_s=wall,
-                device_peak_bytes=peak,
+                device_peak_bytes=peak, chunk_size=args.chunk_size,
                 code="discodj", settings="DISCO-DJ: worder=2, ik grad/laplace, "
                 "no deconvolution, no antialias, bullfrog")
     _save(args.out, x=X, v_d=V, a_steps=a_steps, meta=meta)
@@ -268,6 +272,9 @@ def main():
     v.add_argument("--n-mesh", type=int, required=True)
     v.add_argument("--precision", default="double", choices=("double", "single"),
                    help="double is the cross-check setting")
+    v.add_argument("--chunk-size", type=int, default=None,
+                   help="particles DISCO-DJ paints and interpolates at once (its run_nbody "
+                        "chunk_size; must divide the particle count). Default: all at once")
     v.add_argument("--out", required=True)
     m = sub.add_parser("evolve-mono")
     m.add_argument("--in", dest="inp", required=True)
