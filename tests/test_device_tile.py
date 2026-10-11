@@ -303,6 +303,25 @@ def test_a_device_step_writes_the_state_the_host_apply_path_writes():
     assert np.array_equal(st_d.vel_scale, st_h.vel_scale), "per-brick scales differ"
 
 
+def test_each_compiled_tile_program_records_its_xla_memory_breakdown():
+    """The loop's write program records `memory_analysis()` at its first call on the device:
+    argument, output and temp bytes, no error. Recording does not change what it writes."""
+    cfg, st, members, one_tile, C, g_coarse = _setup("float64", "float32")
+    shapes = dtile.tile_step_shapes(st)
+    dtile.PROGRAM_MEMORY.clear()
+    st_a, st_b = copy.deepcopy(st), copy.deepcopy(st)
+    dtile.tile_loop_device(st_a, one_tile, C, g_coarse, members, shapes)
+    recs = {k: v for k, v in dtile.PROGRAM_MEMORY.items() if "write=True" in k}
+    assert len(recs) == 1, dtile.PROGRAM_MEMORY
+    (rec,) = recs.values()
+    assert "error" not in rec, rec
+    assert rec["argument_size_in_bytes"] > 0 and rec["temp_size_in_bytes"] >= 0
+    # the second loop reuses the program: no new record, and the same bytes written
+    dtile.tile_loop_device(st_b, one_tile, C, g_coarse, members, shapes)
+    assert len([k for k in dtile.PROGRAM_MEMORY if "write=True" in k]) == 1
+    assert np.array_equal(st_a.w, st_b.w) and np.array_equal(st_a.vel_scale, st_b.vel_scale)
+
+
 def test_a_skipped_tile_leaves_its_rows_and_the_host_untouched():
     """Control on the write: a tile left out keeps its stored codes and scales, and the donated
     device buffers never alias the host state."""

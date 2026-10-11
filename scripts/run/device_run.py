@@ -362,7 +362,8 @@ def _gb(x):
 class Monitor:
     """`engine.run(phase=)` hook plus heartbeat, both streaming, and the card."""
 
-    def __init__(self, card_path, card, beat_s=60.0, fail_at=None, with_numa_maps=False):
+    def __init__(self, card_path, card, beat_s=60.0, fail_at=None, with_numa_maps=False,
+                 card_sample_s=0.0):
         self.card_path = card_path
         self.with_numa_maps = bool(with_numa_maps)
         self.card = card
@@ -382,10 +383,44 @@ class Monitor:
         self._stop = threading.Event()
         self._beat_s = float(beat_s)
         self._thread = threading.Thread(target=self._beat_loop, daemon=True, name="d7-beat")
+        # every card's allocator bytes in use, sampled between boundaries: the boundary
+        # records' `peak` is the process's running maximum, so it cannot say which phase
+        # set it; `card_phase_peak` is the largest sample since the previous boundary
+        self._card_sample_s = float(card_sample_s)
+        self._card_max = None
+        self.card_sample_errors = 0
+        self._card_thread = (threading.Thread(target=self._card_loop, daemon=True,
+                                              name="d7-cards")
+                             if self._card_sample_s > 0 else None)
 
     def start(self):
         self.save()
         self._thread.start()
+        if self._card_thread is not None:
+            self._card_thread.start()
+
+    def _card_loop(self):
+        while not self._stop.wait(self._card_sample_s):
+            try:
+                now = [c["in_use"] or 0 for c in card_memory()]
+            except Exception as e:  # an instrument must never be the failure
+                self.card_sample_errors += 1
+                if self.card_sample_errors == 1:
+                    print(f"[cards] {_stamp()} sampler error {e!r}", flush=True)
+                continue
+            with self.lock:
+                self._card_max = (now if self._card_max is None
+                                  else [max(a, b) for a, b in zip(self._card_max, now)])
+
+    def _take_card_max(self, cards):
+        """The largest in-use bytes per card since the previous boundary (the samples and
+        `cards`, read at this one), restarting from `cards`; None without a sampler."""
+        if self._card_thread is None:
+            return None
+        now = [c["in_use"] or 0 for c in cards]
+        with self.lock:
+            got, self._card_max = self._card_max, list(now)
+        return now if got is None else [max(a, b) for a, b in zip(got, now)]
 
     def stop(self):
         self._stop.set()
@@ -407,6 +442,7 @@ class Monitor:
         rss, hwm, avail = host_memory()
         self.run_peak = max(self.run_peak, hwm or 0)
         cards = card_memory()
+        phase_peak = self._take_card_max(cards)
         nm = numa_memory()
         snap = self.snapshot()
         nmaps, nmaps_s = None, None
@@ -417,13 +453,14 @@ class Monitor:
         if name == "coarse_paint":
             self.step += 1
         rec = dict(t=now, name=name, step=self.step, dt=now - self.t_last, rss=rss,
-                   hwm=hwm, avail=avail, cards=cards, numa=nm, numa_maps=nmaps,
-                   numa_maps_s=nmaps_s, **snap)
+                   hwm=hwm, avail=avail, cards=cards, card_phase_peak=phase_peak, numa=nm,
+                   numa_maps=nmaps, numa_maps_s=nmaps_s, **snap)
         print(f"[phase] {_stamp(now)} step {self.step:2d} {name:<16} {rec['dt']:9.1f} s | host "
               f"rss {_gb(rss)} peak {_gb(hwm)} | {_numa_text(nm)} | cards in_use "
               f"{[round((c['in_use'] or 0) / GB, 1) for c in cards]} peak "
-              f"{[None if c['peak'] is None else round(c['peak'] / GB, 1) for c in cards]} GB",
-              flush=True)
+              f"{[None if c['peak'] is None else round(c['peak'] / GB, 1) for c in cards]} GB"
+              + ("" if phase_peak is None else
+                 f" | phase peak {[round(x / GB, 1) for x in phase_peak]} GB"), flush=True)
         print(f"[mem]   {_mem_text(snap['mem'], snap['faults'], snap['vmstat'], nm)}"
               + ("" if nmaps is None else
                  f" | process pages by node {_nodes_text(nmaps)} ({nmaps_s:.1f} s)"), flush=True)
@@ -844,8 +881,9 @@ def cmd_run(args):
     fail_at = (os.environ.get("D7_FAIL_AT")
                if fail_rank is None or int(fail_rank) == rank else None)
     mon = Monitor(args.card, card, beat_s=args.beat, fail_at=fail_at,
-                  with_numa_maps=args.numa_maps)
+                  with_numa_maps=args.numa_maps, card_sample_s=args.card_sample_ms / 1000.0)
     card["plan"] = dict(stop_at=args.stop_at, k_steps=args.k_steps,
+                        card_sample_ms=args.card_sample_ms,
                         expect_step=args.expect_step, timed_last=args.timed_last,
                         timed_all=args.timed_all, timed_every=args.timed_every,
                         numa_maps=args.numa_maps,
@@ -927,11 +965,15 @@ def cmd_run(args):
         timed = timed_steps(k0, args.stop_at, timed_all=args.timed_all,
                             every=args.timed_every, last=args.timed_last)
 
+        from inexor.device import tile as dtile
+
         def collect(stats):
             s = {k: v for k, v in stats.items() if k not in ("pool", "busy", "loop_wall")}
             print("STEP_JSON " + json.dumps(s, default=str), flush=True)
             with mon.lock:
                 card["steps"].append(s)
+                # XLA's memory breakdown of every tile program compiled so far
+                card["program_memory"] = dict(dtile.PROGRAM_MEMORY)
 
         # the ICs' linear P(k), if tabulated, rides along into every checkpoint
         epoch = (a_steps, cosmo, None if linear_pk is None else linear_pk.record())
@@ -1378,6 +1420,9 @@ def main(argv=None):
                     help="synced per-phase breakdown of the device passes on the last step")
     pr.add_argument("--timed-all", action="store_true",
                     help="the same breakdown on every step")
+    pr.add_argument("--card-sample-ms", type=float, default=10.0,
+                    help="sample every card's allocator bytes in use this often (0: off); "
+                         "each boundary records the largest since the previous one")
     pr.add_argument("--snapshot-z", default=[], metavar="Z,Z,...",
                     type=lambda t: [float(x) for x in t.split(",") if x.strip()],
                     help="write a synchronized snapshot at the step boundary nearest each "

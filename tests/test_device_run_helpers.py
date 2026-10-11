@@ -61,3 +61,17 @@ def test_snapshot_redshifts_outside_the_schedule_or_on_one_step_are_refused():
             snap(zs, a_steps)
     with pytest.raises(ValueError, match="two on one step"):
         snap([1.0, 1.001], a_steps)
+
+
+def test_the_card_sampler_keeps_each_phases_own_peak(tmp_path):
+    """`card_phase_peak` is the largest in-use sample since the previous boundary (or the
+    boundary's own reading), and the next phase starts from the in-use at this boundary,
+    not from the earlier peak."""
+    mon = _driver().Monitor(str(tmp_path / "card.json"), {}, card_sample_s=1000.0)
+    mon._card_max = [5, 7]
+    assert mon._take_card_max([{"in_use": 6}, {"in_use": 1}]) == [6, 7]
+    assert mon._take_card_max([{"in_use": 2}, {"in_use": 3}]) == [6, 3]
+    mon._card_max = [9, 0]
+    assert mon._take_card_max([{"in_use": None}, {"in_use": 4}]) == [9, 4]
+    off = _driver().Monitor(str(tmp_path / "off.json"), {})
+    assert off._take_card_max([{"in_use": 1}]) is None

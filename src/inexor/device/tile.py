@@ -39,6 +39,10 @@ import numpy as np
 _KERNELS = {}
 _TRACES = [0]
 _KERNEL_LOCK = threading.Lock()
+# XLA's own memory breakdown of each compiled tile program ("tile cap=.. n_b=.. write=..
+# forces=.. on <device>" -> its `*_in_bytes` fields), taken at the program's first call on a
+# device by `_recorded`; read by the drivers into their run cards
+PROGRAM_MEMORY = {}
 
 #: Count of `tile_loop_device` calls (see `migrate.CALLS`).
 CALLS = 0
@@ -170,6 +174,7 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
         return w_new, vs_new, sc
 
     fn = jax.jit(body_write, donate_argnums=(7, 8)) if write else jax.jit(body)
+    fn = _recorded(fn, f"tile cap={cap} n_b={n_b} write={bool(write)} forces={bool(with_forces)}")
     with _KERNEL_LOCK:
         fn = _KERNELS.setdefault(key, fn)
         # `cap` only rises within a run (`capacity_shape`'s floor), so a smaller-cap program
@@ -178,6 +183,31 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
         for k in [k for k in _KERNELS if k[1] < cap and k[:1] + k[2:] == family]:
             del _KERNELS[k]
         return fn
+
+
+def _recorded(fn, label):
+    """`fn`, a jitted program, recording `compile().memory_analysis()` into `PROGRAM_MEMORY`
+    at its first call on each device (the device of its first argument). The ahead-of-time
+    compile is the one the call then uses (jax shares the compilation cache), so nothing is
+    compiled twice; an error is recorded in place of the numbers and the call still runs."""
+    seen = set()
+
+    def call(*args):
+        dev = next(iter(args[0].devices()), None) if hasattr(args[0], "devices") else None
+        with _KERNEL_LOCK:
+            first = dev not in seen
+            seen.add(dev)
+        if first:
+            try:
+                m = fn.lower(*args).compile().memory_analysis()
+                rec = {k: int(getattr(m, k)) for k in dir(m) if k.endswith("_in_bytes")}
+            except Exception as e:  # an instrument must never be the failure
+                rec = {"error": repr(e)}
+            with _KERNEL_LOCK:
+                PROGRAM_MEMORY[f"{label} on {dev}"] = rec
+        return fn(*args)
+
+    return call
 
 
 def tile_task_device(st, one_tile, C, g_coarse, t, bricks, jit=False, shapes=None,
