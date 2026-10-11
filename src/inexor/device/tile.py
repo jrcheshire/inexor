@@ -112,7 +112,7 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
 
     def tile(starts, occ, live_counts, arena_slots, row_offsets, bricks, off, w,
              vel_scale, arena_bucket, arena_base, n_rows, origin, tijk, o_cells,
-             sub_x, sub_y, sub_z, alpha_k, bcoef, scale_div, *shard_x0):
+             sub_x, sub_y, sub_z, alpha_k, bcoef, scale_div, kernels, *shard_x0):
         # with `coarse_extent`, sub_x/y/z are the card's coarse shard meshes and the
         # tile gathers its own blocks; otherwise they are host-staged blocks
         _TRACES[0] += 1  # trace time only
@@ -127,7 +127,9 @@ def _tile_kernel(one_tile, *, cap, n_b, p3, per, nb, n_tile, n_brick, n_coarse,
         cyc = jnp.arange(cap, dtype=jnp.int64) % n_rows
         u = jnp.mod(x[cyc] - origin, box)
         own = owned_rows_device(bor, tijk, n_tile, n_brick, nb) & live
-        g_short, owned, n_out = one_tile(u, live, own)
+        # the kernels are an argument, not constants: a program per capacity rung and per
+        # card would otherwise each carry a copy, held in host memory for the run
+        g_short, owned, n_out = one_tile.with_kernels(u, live, own, kernels)
         guard = []
         g_long = gather_coarse_subblock(
             sub_x, sub_y, sub_z, x, o_cells, coarse_cell, n_coarse, assign="tsc",
@@ -312,16 +314,25 @@ def _clock(timings, accumulate=False):
     return mark
 
 
+def tile_kernels_on(one_tile, device=None):
+    """`one_tile`'s short-force kernels on `device` (None: jax's default), for the tile
+    programs of one loop; a loop places them once and drops them when it ends."""
+    from .paint import _on
+
+    return tuple(_on(k, device) for k in one_tile.kernels)
+
+
 def _jit_inputs(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells, extent,
                 shapes, with_forces, write, mark, coarse_shard=None, device=None,
-                arena_base=None):
+                arena_base=None, kernels=None):
     """(program, leading args, trailing args) for one tile; the state arrays go
     between them. Host work and the per-tile upload, marked `stage` and
     `h2d_tile`. With `coarse_shard` (`device.coarse`), the shard meshes go in
     place of host-staged blocks and the program gathers them; they must already
     be on `device`, where every other input is placed (None: jax's default).
     `arena_base` is where the state arrays' arena rows start (None: the whole
-    state's `st.arena_base`; a `device.window` passes its own)."""
+    state's `st.arena_base`; a `device.window` passes its own). `kernels` are
+    `tile_kernels_on(one_tile, device)` (None: placed for this tile alone)."""
     from ..forces import stage_coarse_subblock
     from .coarse import check_covers
     from .paint import _on
@@ -365,7 +376,8 @@ def _jit_inputs(st, one_tile, C, g_coarse, t, bricks, plan, origin, o_cells, ext
             *sub,
             _on(C["alpha_k"], d, np.float64),
             _on(C["bcoef"], d, np.float64),
-            _on(np.full((n_b,), 32767.0), d, np.float64), *extra]
+            _on(np.full((n_b,), 32767.0), d, np.float64),
+            tile_kernels_on(one_tile, d) if kernels is None else kernels, *extra]
     mark("h2d_tile", *head, *tail)
     return fn, head, tail
 
@@ -456,7 +468,8 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
     mark = _clock(timings, accumulate=True)
     cap = int(C["cap"])
     los, his, extents, owns, outs, smax = [], [], [], [], [], []
-    mark("h2d_state_once", *ds.values())
+    kernels = tile_kernels_on(one_tile, device)
+    mark("h2d_state_once", *ds.values(), *kernels)
     for t in tiles:
         bricks = np.asarray(members[t], dtype=np.int64)
         plan = tile_decode_plan(st, bricks)
@@ -471,7 +484,7 @@ def tile_loop_device(st, one_tile, C, g_coarse, members, shapes, tiles=None,
         mark("plan")
         fn, head, tail = _jit_inputs(st, one_tile, C, g_coarse, t, bricks, plan, origin,
                                      o_cells, extent, shapes, False, True, mark,
-                                     coarse_shard, device)
+                                     coarse_shard, device, kernels=kernels)
         w_new, vs_new, sc = fn(*head, ds["off"], ds["w"], ds["vel_scale"],
                                ds["arena_bucket"], *tail)
         ds["w"], ds["vel_scale"] = w_new, vs_new

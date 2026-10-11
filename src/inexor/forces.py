@@ -1099,11 +1099,11 @@ def make_tile_force_fn(
                      paint=paint, frac_bits=frac_bits, fdtype=fdtype)
     cell, mean = geom["cell"], geom["mean"]
     P = geom["P"]
-    # numpy, not jax arrays: the traced program embeds them as constants either way, and a jax
-    # array would also stay resident on jax's default device for the life of `one_tile`
+    # numpy, not jax arrays: a jax array would stay resident on jax's default device for the
+    # life of `one_tile`
     kers = split_kernels((P,) * 3, cell, "short", r_s=r_s, fdtype=fdtype)
 
-    def one_tile(u, live, owned):
+    def short_force(u, live, owned, kernels):
         # `owned` is supplied by the caller (exact integer ownership; see `owning_tile`)
         if paint == "int":
             mesh_i, n_out_p = tile_paint_int(u, live, (P,) * 3, cell, frac_bits)
@@ -1111,11 +1111,30 @@ def make_tile_force_fn(
         else:
             delta, n_out_p = tile_paint_f64(u, live, (P,) * 3, cell, mean, fdtype=fdtype)
         dk = jnp.fft.rfftn(delta)
-        g = [jnp.fft.irfftn(dk * k, s=(P,) * 3) for k in kers]
+        g = [jnp.fft.irfftn(dk * k, s=(P,) * 3) for k in kernels]
         out, n_out_g = tile_gather_vector(g[0], g[1], g[2], u, live, (P,) * 3, cell)
         return out, live & owned, n_out_p + n_out_g
 
-    return jax.jit(one_tile), geom
+    return TileForce(short_force, kers), geom
+
+
+class TileForce:
+    """The per-tile short force from `make_tile_force_fn`.
+
+    `one_tile(u, live, owned) -> (g, live & owned, n_out)` runs a jitted program with the
+    kernels compiled in as constants. `one_tile.with_kernels(u, live, owned, kernels)` is the
+    unjitted function taking them as an argument, for compiled programs that would otherwise
+    embed a copy each (`device.tile` places `one_tile.kernels`, the numpy kernels, on each card
+    once per tile loop instead).
+    """
+
+    def __init__(self, short_force, kernels):
+        self.with_kernels = short_force
+        self.kernels = tuple(kernels)
+        self._jit = jax.jit(lambda u, live, owned: short_force(u, live, owned, self.kernels))
+
+    def __call__(self, u, live, owned):
+        return self._jit(u, live, owned)
 
 
 def tile_geom(n_fine, box_size, n_particles_total, n_tile, b_fine,

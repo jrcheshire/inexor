@@ -441,6 +441,8 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
     n_owned = n_out = tiles_run = units = 0
     smax_all, wrapped, live_max, residents = [], False, 0, 0
 
+    # the short-force kernels, on the card for this call's planes (not compiled in)
+    kernels = dtile.tile_kernels_on(one_tile, device)
     for i, block in ((i, b) for i in planes for b in blocks):
         rows_t = range(block[0] // per, block[1] // per)
         win = stage_window(view, window_runs(i, block, per, pad, span, nb), shapes["window"],
@@ -466,7 +468,7 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
             fn, head, tail = dtile._jit_inputs(
                 st, one_tile, C, g_coarse, t, bricks, rebase_plan(plan, win, nb), origin,
                 o_cells, extent, shapes, False, True, no_mark, coarse_shard, device,
-                arena_base=win["W"])
+                arena_base=win["W"], kernels=kernels)
             w_new, vs, sc = fn(*head, wd["off"], wd["w"], vs, wd["arena_bucket"], *tail)
             wd["w"] = w_new
             los.append(sc["lo"])
