@@ -38,7 +38,8 @@ PHASES = (
     # per-tile pipeline has four; both lanes appear here
     "tile_loop",
     "tile_decode", "tile_short", "tile_long", "tile_reduce",
-    "tile_loop_end", "reconcile", "migrate", "repack", "checkpoint",
+    "tile_loop_end", "reconcile", "migrate", "repack", "snapshot", "snapshot_drift",
+    "checkpoint",
 )
 
 
@@ -226,7 +227,8 @@ class PhaseTracer:
 TIMER_PHASES = (
     "kernel_build", "lead_drift", "coarse_paint", "coarse_solve", "membership",
     "tile_loop", "tile_decode", "tile_short", "tile_long", "tile_reduce",
-    "tile_loop_end", "reconcile", "migrate", "repack", "checkpoint",
+    "tile_loop_end", "reconcile", "migrate", "repack", "snapshot", "snapshot_drift",
+    "checkpoint",
 )
 
 

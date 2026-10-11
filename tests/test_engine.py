@@ -682,6 +682,99 @@ def test_resumed_run_is_bitwise_the_uninterrupted_one(tmp_path):
     np.testing.assert_array_equal(_rows(ref), _rows(st_r))
 
 
+def _slab_bytes(gen_dir):
+    """{file: bytes} of a checkpoint generation's slab files (the manifest set aside)."""
+    return {f: open(os.path.join(gen_dir, f), "rb").read() for f in sorted(os.listdir(gen_dir))
+            if f != "manifest.json"}
+
+
+def test_a_snapshot_is_bitwise_the_end_of_the_truncated_schedule(tmp_path):
+    """A snapshot at step 3 of 6 drifts only step 3's trailing half, so its state is the end of
+    a run over `coeffs[:3]` byte for byte; its manifest marks it and records its epoch."""
+    import json
+
+    co = _coeffs(6)
+    a_steps, cosmo = _epoch(6)
+    snap = str(tmp_path / "snap")
+    cfg_a = _cfg()
+    out = engine.run(_ck_state(cfg_a), cfg_a, co, snapshot_steps=[3], snapshot_dir=snap,
+                     epoch=(a_steps, cosmo))
+    assert [o["snapshot"] is not None for o in out] == [False, False, True, False, False, False]
+
+    d = str(tmp_path / "ck")
+    cfg_b = _cfg(checkpoint_dir=d, checkpoint_every=3)
+    engine.run(_ck_state(cfg_b), cfg_b, co[:3])
+    got = _slab_bytes(os.path.join(snap, "step0003", "gen0"))
+    assert got and got == _slab_bytes(os.path.join(d, "gen0"))
+
+    prov = json.load(open(os.path.join(snap, "step0003", "gen0", "manifest.json")))["provenance"]
+    assert prov["snapshot"] is True and prov["step"] == 3 and prov["snapshot_steps"] == [3]
+    assert prov["a"] == float(a_steps[3])
+    assert engine.synchronized(prov)
+
+
+def test_snapshots_compose_across_resumed_segments(tmp_path):
+    """Snapshots at steps 2 and 4 with checkpoints every 2: run straight through, or as three
+    resumed segments, the snapshots and the final checkpoint are the same bytes (each snapshot
+    is written, and its leading half-drift run, before the checkpoint a segment resumes from)."""
+    co = _coeffs(6)
+    arms = {}
+    for arm in ("straight", "segments"):
+        d, snap = str(tmp_path / arm / "ck"), str(tmp_path / arm / "snap")
+        cfg = _cfg(checkpoint_dir=d, checkpoint_every=2)
+        kw = dict(snapshot_steps=[2, 4], snapshot_dir=snap)
+        if arm == "straight":
+            engine.run(_ck_state(cfg), cfg, co, **kw)
+        else:
+            engine.run(_ck_state(cfg), cfg, co, stop_at=2, **kw)
+            for stop in (4, 6):
+                st, res = engine.load_checkpoint(d, cfg, co, arena_frac=0.05)
+                engine.run(st, cfg, co, resume=res, stop_at=stop, **kw)
+        arms[arm] = (d, snap)
+    (d0, s0), (d1, s1) = arms["straight"], arms["segments"]
+    for step in ("step0002", "step0004"):
+        assert _slab_bytes(os.path.join(s0, step, "gen0")) == \
+            _slab_bytes(os.path.join(s1, step, "gen0")), step
+    final = [max((os.path.join(d, g) for g in ("gen0", "gen1")),
+                 key=lambda x: json.load(open(os.path.join(x, "manifest.json")))
+                 ["provenance"]["step"]) for d in (d0, d1)]
+    assert _slab_bytes(final[0]) == _slab_bytes(final[1])
+
+
+def test_a_resume_must_name_the_runs_snapshots(tmp_path):
+    """The snapshot steps split drifts, so a resume that names other ones (or none) is
+    refused; the checkpoint itself still loads (its fingerprint uses its recorded steps)."""
+    co = _coeffs(4)
+    d, snap = str(tmp_path / "ck"), str(tmp_path / "snap")
+    cfg = _cfg(checkpoint_dir=d, checkpoint_every=2)
+    engine.run(_ck_state(cfg), cfg, co, stop_at=2, snapshot_steps=[2], snapshot_dir=snap)
+    st, res = engine.load_checkpoint(d, cfg, co, arena_frac=0.05)
+    assert res["snapshot_steps"] == [2] and not engine.synchronized(res)
+    for steps in ((), (3,)):
+        with pytest.raises(ValueError, match="snapshots"):
+            engine.run(st, cfg, co, resume=res, snapshot_steps=steps, snapshot_dir=snap)
+
+
+def test_snapshot_steps_must_lie_inside_the_schedule():
+    co = _coeffs(4)
+    for bad in ([0], [4], [5]):
+        with pytest.raises(ValueError, match="outside"):
+            engine.drift_plan(co, bad)
+    with pytest.raises(ValueError, match="snapshot_dir"):
+        engine.run(_ck_state(_cfg()), _cfg(), co, snapshot_steps=[2])
+    lead, drifts, after = engine.drift_plan(co, [2])
+    h = np.asarray(co)[:, 0]
+    assert drifts[1] == h[1] and after == {1: float(h[2])}
+    np.testing.assert_array_equal(np.delete(drifts, 1),
+                                  np.delete(engine.fused_drifts(co)[1], 1))
+
+
+def test_synchronized_is_the_last_step_or_a_snapshot():
+    assert engine.synchronized({"step": 6, "n_steps": 6})
+    assert not engine.synchronized({"step": 3, "n_steps": 6})
+    assert engine.synchronized({"step": 3, "n_steps": 6, "snapshot": True})
+
+
 def test_load_checkpoint_refuses_a_foreign_run(tmp_path):
     """Resume refuses a different geometry or schedule (the fingerprint hashes `coeffs`, so
     cosmology, a-grid and K are covered) but accepts different execution policy."""

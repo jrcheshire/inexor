@@ -1467,6 +1467,38 @@ def fused_drifts(coeffs):
     return float(h[0]), np.concatenate([h[:-1] + h[1:], h[-1:]])
 
 
+def drift_plan(coeffs, snapshot_steps=()):
+    """`fused_drifts` with synchronized outputs -> `(lead, drifts, after)`.
+
+    A step whose end `s` is in `snapshot_steps` drifts only its own trailing half `h_k`, so
+    positions and velocities both sit at `a_s` (bitwise the end of a run over `coeffs[:s]`);
+    `after[k]` is then the next step's leading half `h_{k+1}`, run as its own pass once the
+    snapshot is written. Every other step drifts as in `fused_drifts`. Steps must lie in
+    `1 .. K-1`: the last step's end is synchronized already.
+    """
+    lead, drifts = fused_drifts(coeffs)
+    h = np.asarray(coeffs)[:, 0]
+    steps = sorted({int(x) for x in snapshot_steps})
+    bad = [x for x in steps if not 0 < x < len(h)]
+    if bad:
+        raise ValueError(f"snapshot steps {bad} outside 1..{len(h) - 1} of a {len(h)}-step "
+                         "schedule (step 0 is the ICs, the last step's end the final state)")
+    after = {}
+    for x in steps:
+        drifts[x - 1] = h[x - 1]
+        after[x - 1] = float(h[x])
+    return lead, drifts, after
+
+
+def synchronized(prov, n_steps=None):
+    """Whether a checkpoint's positions and velocities share its epoch `a_steps[step]`: the
+    final step, or a snapshot (`drift_plan`). Elsewhere the fused drift has taken positions
+    half a step past it, so a card or export would carry the wrong epoch. `prov` is its
+    provenance (`load_checkpoint`'s resume dict); `n_steps` defaults to the recorded one."""
+    n = int(prov["n_steps"] if n_steps is None else n_steps)
+    return int(prov["step"]) >= n or bool(prov.get("snapshot"))
+
+
 
 # ------------------------------------------------------------- checkpoints
 
@@ -1486,9 +1518,10 @@ _FINGERPRINTED = (
 )
 
 
-def checkpoint_fingerprint(cfg, coeffs):
+def checkpoint_fingerprint(cfg, coeffs, snapshot_steps=()):
     """Hash of what a resume must match: `_FINGERPRINTED` config fields plus `coeffs` as bytes
-    (so the cosmology, a-grid and K are covered)."""
+    (so the cosmology, a-grid and K are covered), and the snapshot steps, which split drifts
+    (`drift_plan`)."""
     h = hashlib.sha256()
     fp = {k: getattr(cfg, k) for k in _FINGERPRINTED}
     # only when != 2, so order-2 fingerprints are unchanged
@@ -1496,17 +1529,24 @@ def checkpoint_fingerprint(cfg, coeffs):
         fp["coarse_match_order"] = cfg.coarse_match_order
     h.update(json.dumps(fp, sort_keys=True).encode())
     h.update(np.ascontiguousarray(coeffs, dtype=np.float64).tobytes())
+    if snapshot_steps:
+        # only when there are any, so fingerprints without snapshots are unchanged
+        h.update(json.dumps(sorted(int(x) for x in snapshot_steps)).encode())
     return h.hexdigest()
 
 
 def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=None,
-                      device_shapes=None, timings=None, comm=None, source=None):
+                      device_shapes=None, timings=None, comm=None, source=None,
+                      snapshot_steps=(), snapshot_dir=None):
     """Write generation `gen` of the rolling pair; returns its directory (the step's receipt).
 
     `epoch` is the optional `(a_steps, cosmo)` from `run` (see `epoch_record`);
     `device_shapes` are restored on resume; `source`, if given, is recorded as the
-    provenance's `source` (the run's ICs). `comm`: every rank calls this with its node-local
-    state (`icgen.write_t9_slabs`); the provenance is the same at any rank count."""
+    provenance's `source` (the run's ICs). A run with `snapshot_steps` records them (they
+    enter the fingerprint). With `snapshot_dir` this writes a snapshot instead: the
+    synchronized state at `step`, as generation 0 under `snapshot_dir`, marked `snapshot`.
+    `comm`: every rank calls this with its node-local state (`icgen.write_t9_slabs`); the
+    provenance is the same at any rank count."""
     import math
 
     from . import icgen
@@ -1533,12 +1573,16 @@ def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=No
         device_shapes={name: {k: int(v) for k, v in s.items()}
                        for name, s in (device_shapes or {}).items()},
         n_arena=n_arena,
-        fingerprint=checkpoint_fingerprint(cfg, coeffs),
+        fingerprint=checkpoint_fingerprint(cfg, coeffs, snapshot_steps),
     )
     prov.update(epoch_record(epoch, step))
     if source:
         prov["source"] = dict(source)
-    d = os.path.join(cfg.checkpoint_dir, f"gen{gen}")
+    if snapshot_steps:
+        prov["snapshot_steps"] = sorted(int(x) for x in snapshot_steps)
+    if snapshot_dir is not None:
+        prov["snapshot"] = True
+    d = os.path.join(cfg.checkpoint_dir if snapshot_dir is None else snapshot_dir, f"gen{gen}")
     icgen.write_t9_slabs(st, d, provenance=prov, timings=timings, comm=comm)
     return d
 
@@ -1613,7 +1657,7 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
             "written last, so a torn generation is deliberately unloadable)"
         )
     d, prov, man = best
-    want = checkpoint_fingerprint(cfg, coeffs)
+    want = checkpoint_fingerprint(cfg, coeffs, prov.get("snapshot_steps", ()))
     if prov.get("fingerprint") != want:
         raise ValueError(
             f"{d} was written under a different configuration or schedule "
@@ -1640,7 +1684,7 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
 
 def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         stop_at=None, allocator=None, epoch=None, timed_steps=(), comm=None, decomp=None,
-        devices=None, source=None):
+        devices=None, source=None, snapshot_steps=(), snapshot_dir=None):
     """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`.
 
     Returns the list of per-step stats. `phase` is forwarded to `step`; `run` adds the
@@ -1656,6 +1700,12 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     directory alone. `source`, a JSON-able dict naming the run's ICs, is recorded in every
     checkpoint's provenance. `timed_steps` names absolute steps
     whose device passes, separate repack and checkpoint are timed into `stats["timings"]`.
+
+    `snapshot_steps` (absolute steps in 1..K-1, with `snapshot_dir`) write a snapshot at the
+    end of each: that step drifts only its trailing half, the synchronized state is written
+    as `snapshot_dir/step<NNNN>/gen0` (checkpoint format, marked `snapshot`), and the next
+    step's leading half runs as its own pass before any regular checkpoint (`drift_plan`).
+    They are recorded in the run's checkpoints and fingerprint, so a resume must name them.
 
     Across ranks (`comm`; `decomp` defaults from its rank and size), every rank runs this
     with its node-local state (`load_checkpoint(comm=, slabs=)` or `icgen.load_slot_state(
@@ -1674,6 +1724,14 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     _require_rank_slabs(st, comm, decomp, "engine.run")
     cfg.validate()
     timed_steps = {int(k) for k in timed_steps}
+    snapshot_steps = sorted({int(x) for x in snapshot_steps})
+    if snapshot_steps and not snapshot_dir:
+        raise ValueError("snapshot_steps need a snapshot_dir to write into")
+    if resume is not None and sorted(resume.get("snapshot_steps", [])) != snapshot_steps:
+        raise ValueError(
+            f"the checkpoint was written by a run with snapshots at "
+            f"{sorted(resume.get('snapshot_steps', []))}, this one asks for {snapshot_steps}: "
+            "snapshots split drifts, so the segments would not compose into one trajectory")
     ph = phase if phase is not None else _no_phase
     ckpt_on = bool(cfg.checkpoint_dir) and cfg.checkpoint_every > 0
     if ckpt_on and st.ids is not None:
@@ -1727,7 +1785,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     )
     ph("kernel_build")
     try:
-        lead, fused = fused_drifts(coeffs)
+        lead, fused, after = drift_plan(coeffs, snapshot_steps)
         # Lead half-drift onto the first midpoint; skipped on resume (the checkpoint is past
         # it). The boundary fires either way.
         if resume is None:
@@ -1784,6 +1842,20 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                     stats["repack"] = _repack_pass(
                         st, cfg, None if timings is None else timings.setdefault("repack", {}))
                 ph("repack")
+            # a snapshot of the synchronized state, then the next step's leading half-drift,
+            # both before a regular checkpoint (which a resume continues from directly)
+            stats["snapshot"] = None
+            if k in after:
+                stats["snapshot"] = _write_checkpoint(
+                    st, cfg, coeffs, k + 1, cap_shape, pad_shape, 0, epoch=epoch,
+                    device_shapes=device_shapes,
+                    timings=None if timings is None else timings.setdefault("snapshot", {}),
+                    comm=comm, source=source, snapshot_steps=snapshot_steps,
+                    snapshot_dir=os.path.join(snapshot_dir, f"step{k + 1:04d}"),
+                )
+                ph("snapshot")
+                _migrate_pass(st, cfg, after[k], pool, comm=comm, devices=devs)
+                ph("snapshot_drift")
             # after the repack (the step's settled state); None when not written
             stats["checkpoint"] = None
             if ckpt_on and (k + 1) % cfg.checkpoint_every == 0:
@@ -1791,7 +1863,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                     st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2, epoch=epoch,
                     device_shapes=device_shapes,
                     timings=None if timings is None else timings.setdefault("checkpoint", {}),
-                    comm=comm, source=source,
+                    comm=comm, source=source, snapshot_steps=snapshot_steps,
                 )
                 n_ckpt += 1
                 ph("checkpoint")
