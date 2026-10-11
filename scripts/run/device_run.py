@@ -583,6 +583,16 @@ def under(path, root):
     return a == b or a.startswith(b + os.sep)
 
 
+def timed_steps(k0, stop, *, timed_all=False, every=0, last=False):
+    """The absolute steps of [k0, stop) that `engine.run` times: all of them, every `every`-th
+    (step k with (k + 1) % every == 0, so resumed segments keep the cadence), or the last."""
+    if timed_all:
+        return tuple(range(k0, stop))
+    if every:
+        return tuple(k for k in range(k0, stop) if (k + 1) % every == 0)
+    return (stop - 1,) if last else ()
+
+
 def _y_blocks(value):
     """`--y-blocks`: a count, or "auto" (None: `decomp.auto_y_blocks`)."""
     return None if value == "auto" else int(value)
@@ -807,7 +817,8 @@ def cmd_run(args):
                   with_numa_maps=args.numa_maps)
     card["plan"] = dict(stop_at=args.stop_at, k_steps=args.k_steps,
                         expect_step=args.expect_step, timed_last=args.timed_last,
-                        timed_all=args.timed_all, numa_maps=args.numa_maps,
+                        timed_all=args.timed_all, timed_every=args.timed_every,
+                        numa_maps=args.numa_maps,
                         drop_ic_cache=args.drop_ic_cache,
                         ckpt_probe_slabs=args.ckpt_probe_slabs, trim_probe=args.trim_probe,
                         cards=args.cards, y_blocks=args.y_blocks or "auto",
@@ -871,8 +882,8 @@ def cmd_run(args):
         mon("load")
         if args.membind_nodes:
             _check_state_on_cpu_nodes(args, card)
-        timed = (tuple(range(k0, args.stop_at)) if args.timed_all
-                 else (args.stop_at - 1,) if args.timed_last else ())
+        timed = timed_steps(k0, args.stop_at, timed_all=args.timed_all,
+                            every=args.timed_every, last=args.timed_last)
 
         def collect(stats):
             s = {k: v for k, v in stats.items() if k not in ("pool", "busy", "loop_wall")}
@@ -1315,6 +1326,10 @@ def main(argv=None):
                     help="synced per-phase breakdown of the device passes on the last step")
     pr.add_argument("--timed-all", action="store_true",
                     help="the same breakdown on every step")
+    pr.add_argument("--timed-every", type=int, default=0, metavar="N",
+                    help="the same breakdown on every N-th step (absolute step k with "
+                         "(k + 1) %% N == 0); the steps between are untimed, so their wall "
+                         "is the step's cost without the syncs")
     pr.add_argument("--numa-maps", action="store_true",
                     help="the process's pages per NUMA node at every boundary (slow walk)")
     pr.add_argument("--ckpt-probe-slabs", type=int, default=0,

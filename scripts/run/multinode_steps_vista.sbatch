@@ -30,7 +30,8 @@
 # CONTROL_ICS (its ICs); PRESET (c-gh), K (120), EXPECT_STEP (0), STOP (K), EVERY (20),
 # Y_BLOCKS (auto; the production run, preflight and planner, not the control),
 # CONTROL_PRESET (c-1024), SLACK / ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), QUIET_S (600),
-# PROD_DIR (not under REAL_DIR/ckpt) with WITH_EXPORT (1).
+# PROD_DIR (not under REAL_DIR/ckpt) with WITH_EXPORT (1), TIMED (--timed-all; e.g.
+# "--timed-every 5" leaves the steps between untimed).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R IC_DIR=$R/c-gh-ics REAL_DIR=$R/c-gh-r1 \
 #     CONTROL_REF=$R/mn-gate-c-1024-1043437/mpi/ckpt CONTROL_ICS=$R/mn-gate-c-1024-1043437/ics \
 #     sbatch -A <account> scripts/run/multinode_steps_vista.sbatch
@@ -88,6 +89,7 @@ PRESET=${PRESET:-c-gh} K=${K:-120} EXPECT_STEP=${EXPECT_STEP:-0} STOP=${STOP:-$K
 EVERY=${EVERY:-20} CONTROL_PRESET=${CONTROL_PRESET:-c-1024}
 SLACK=${SLACK:-0.10} ALLOC_MARGIN=${ALLOC_MARGIN:-0.10} ARENA=${ARENA:-${ARENA_FRAC:-0.01}}
 QUIET_S=${QUIET_S:-600} Y_BLOCKS=${Y_BLOCKS:-auto} WITH_EXPORT=${WITH_EXPORT:-1}
+TIMED=${TIMED:---timed-all}
 N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 
 CKPT=$REAL_DIR/ckpt
@@ -153,7 +155,7 @@ ranks () {
   shift $(($# < 9 ? $# : 9))
   on_ranks "$CARDS/${TAG}_${arm}_s${from}_r@RANK@" "$extra" "${MPIPATH[@]}" \
     "$PY" -m mpi4py "$DRIVER" run --preset "$preset" --workdir "$ics" --cards "$N_CARDS" \
-    --k-steps "$k" --stop-at "$stop" --expect-step "$from" --timed-all --beat 60 \
+    --k-steps "$k" --stop-at "$stop" --expect-step "$from" $TIMED --beat 60 \
     "${MEMBIND_CHECK[@]}" "${LAYOUT[@]}" --checkpoint-every "$every" \
     --card "$CARDS/${TAG}_${arm}_s${from}.json" \
     --checkpoint-dir "$ckpt" --comm mpi --comm-timeout 1800 "$@"
