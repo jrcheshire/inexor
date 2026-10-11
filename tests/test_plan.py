@@ -742,46 +742,70 @@ def test_the_process_baseline_closes_the_single_gh200_floor(capsys):
         assert 0.95 * floor <= resident <= floor, (preset, resident, floor)
 
 
-def _rung_lines(out):
-    """(tile-loop rung jump GB, held-from-the-rung GB) as printed."""
-    jump = float(next(ln for ln in out.splitlines()
-                      if "recompiled at a capacity rung" in ln).split()[-2])
-    held = float(out.split("but the tile loop:")[1].split()[0])
-    return jump, held
+def _compiled_lines(out):
+    """(held from the first step, tile-loop compile transient, held from the rung) GB as
+    printed."""
+    held_first = float(out.split("charged to every in-step phase:")[1].split()[0])
+    spike = float(next(ln for ln in out.splitlines()
+                       if "tile programs compiled, first step or a capacity rung" in ln)
+                  .split()[-2])
+    held_rung = float(out.split("but the tile loop:")[1].split()[0])
+    return held_first, spike, held_rung
 
 
-@pytest.mark.parametrize("preset,cards,jump,kept", [
-    # per card, the smallest measured: c-1024 on 1 and 2 gh (job 1043437, rungs 74 and 116),
-    # c-hero on 4 GB200 (1024784, rung 61); the kept rise is every phase's, 5 steps on
-    ("c-1024", 1, (5.28, 5.41), (1.67, 2.26)),
-    ("c-hero", 4, (16.3, 16.3), (0.51, 0.89)),
+@pytest.mark.parametrize("args,want", [
+    # per node, the smallest measured (plan.py's MEASURED comment): c-gh on 2-16 gh,
+    # c-hero on 16 gh, c-8192 on 8 gb
+    (["--preset", "c-gh", "--n-gpus", "1"], (0.63, 3.59, 1.72)),
+    (["--preset", "c-hero", "--n-gpus", "1"], (13.35, 21.32, 9.22)),
+    (["--preset", "c-8192", "--n-gpus", "4", "--n-nodes", "8"], (27.2, 24.5, 2.04)),
+    # unmeasured pairs: the largest per-card value at the tile size, times the cards
+    (["--preset", "c-hero", "--n-gpus", "2"], (2 * 13.35, 2 * 21.32, 2 * 9.22)),
+    (["--preset", "c-gh", "--n-gpus", "4"], (4 * 0.63, 4 * 3.59, 4 * 1.72)),
+    # an unmeasured tile size: the largest measured one's
+    (["--preset", "c-gh", "--tile", "128", "--n-gpus", "1"], (13.35, 21.32, 9.22)),
 ])
-def test_the_rung_terms_are_the_measured_ones_per_card(capsys, preset, cards, jump, kept):
-    main(["--preset", preset, "--backend", "device", "--n-gpus", str(cards)])
-    got_jump, got_held = _rung_lines(capsys.readouterr().out)
-    assert jump[0] - 0.01 <= got_jump / cards <= jump[1] + 0.01
-    assert kept[0] - 0.01 <= got_held / cards <= kept[1] + 0.01
+def test_the_compiled_program_terms_are_the_measured_ones(capsys, args, want):
+    main(args + ["--backend", "device"])
+    got = _compiled_lines(capsys.readouterr().out)
+    assert all(abs(g - w) < 0.01 for g, w in zip(got, want)), (got, want)
 
 
-def test_what_the_rung_keeps_is_charged_to_every_in_step_phase_but_the_tile_loop(capsys):
-    """The tile loop's rung jump is measured above the step before, so it already sits on
-    the kept bytes; the kernel build runs once, before any rung. At c-gh on 2 gh the coarse
-    solve binds with them in it."""
+def test_held_compiled_memory_is_charged_to_the_in_step_phases_only(capsys):
+    """The first step's compiled programs are held by every in-step phase; one rung's are
+    held by every in-step phase but the tile loop, whose compile transient is measured from
+    the RSS before the rung. The kernel build and the lead drift run before step 1 and carry
+    neither. Each phase's printed peak is the resident plus that, and the host verdict is
+    the largest."""
     main(["--preset", "c-gh", "--backend", "device", "--n-gpus", "1", "--n-nodes", "2"])
     out = capsys.readouterr().out
     resident = float(next(ln for ln in out.split("HOST, resident for the whole run")[1]
                           .split("\n\n")[0].splitlines()
                           if ln.strip().startswith("total")).split()[-2])
     sums = {}
-    for ln in out.split("HOST, by phase")[1].split("\n\n")[0].splitlines():
+    table = out.split("HOST, by phase")[1].split("\n\n")[0].split("\n  ---")[0]
+    for ln in table.splitlines():
         if ":" in ln and ln.rstrip().endswith("GB"):
             p = ln.split(":")[0].strip()
             sums[p] = sums.get(p, 0.0) + float(ln.split()[-2])
-    _, held = _rung_lines(out)
-    want = resident + max(s + (0 if p in ("tile_loop", "kernel_build") else held)
-                          for p, s in sums.items())
+    held_first, _, held_rung = _compiled_lines(out)
+
+    def held(p):
+        if p in ("kernel_build", "lead_drift"):
+            return 0.0
+        return held_first + (0.0 if p == "tile_loop" else held_rung)
+
+    want = {p: resident + s + held(p) for p, s in sums.items()}
+    want.setdefault("membership", resident + held("membership"))
+    printed = {}
+    for ln in out.split("HOST, peak by phase")[1].split("\n\n")[0].splitlines()[1:]:
+        f = ln.split()
+        if len(f) == 3 and f[2] == "GB" and f[0] != "max":
+            printed[f[0]] = float(f[1])
+    for p, w in want.items():
+        assert abs(printed[p] - w) < 0.01, (p, printed[p], w)
     peak = float(out.split("host, a lower bound on the run's peak:")[1].split()[0])
-    assert abs(peak - want) < 0.01, (peak, want)
+    assert abs(peak - max(printed.values())) < 0.01, (peak, printed)
 
 
 @pytest.mark.parametrize("args,measured", [

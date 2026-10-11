@@ -292,7 +292,11 @@ returned between phases. The per-GPU column (`--backend device`) takes the large
 instead: a card's memory in use falls back to the whole-run terms between phases, so each
 phase is charged its own transients plus the terms held through it (the coarse force, and in
 the tile loop the slab window and tile kernels), and the migrate after the loop likewise. The
-shared-memory table is a separate budget from host RAM.
+device lane's host column also charges what compiling the step's programs keeps in host memory:
+held by every in-step phase from the first step on, one capacity rung's more, and the tile
+loop's compile transient. These are measured per tile size and cards per node; an unmeasured
+pair takes the largest per-card value. It prints each phase's own peak (`HOST, peak by phase`).
+The shared-memory table is a separate budget from host RAM.
 
 The planner is arithmetic over the config, not a measurement: it is a lower bound. It cannot
 see XLA's intra-jit scratch, and `tile_buffers` is omitted unless `--cap` is given. Budgets

@@ -231,21 +231,42 @@ def fused_device_rate(u):
     how = "interpolated" if u0 < u < u1 else "extrapolated"
     return v0 + (v1 - v0) * (u - u0) / (u1 - u0), how
 
-# Host bytes per card at the tile-capacity rung a production run climbs (`capacity_shape`),
-# keyed by tile size; other tile sizes take the largest. Every measured 120-step run climbed
-# at least one rung (c-1024 two), so one is priced. Both are per card and do not depend on
-# the slab (a 2-rank rank and the one-node run measure the same). MEASURED, smallest taken:
-# - the tile loop's jump at the rung step above the step before, beyond the window write-back
-#   (compiling the new tile programs and writing them to the persistent compilation cache).
-#   256: 5.28-5.41 GB (job 1043437, c-1024 on 1 and 2 gh, rungs at steps 74 and 116). 512:
-#   16.3 GB (c-hero on 4 GB200, 1024784, step 61). The first step's compile is smaller
-#   (2.4-3.0 and 10.5 GB). It assumes the cache, which the job scripts set; without it the
-#   jump is 3.6 GB at 256 (1029876).
-# - the rise every in-step phase keeps after it, steps r+3..r+7 against r-5..r-1.
-#   256: 1.67-2.26 GB (1043437, 1029876 at c-1024 and cgh64). 512: 0.51-0.89 GB (1024784;
-#   the two steps after the rung carry up to 6.5 GB, the coarse solve 1.4 GB).
-TILE_RUNG_HOST_PER_CARD = {256: 5.28 * GB, 512: 16.3 * GB}
-TILE_RUNG_KEPT_HOST_PER_CARD = {256: 1.67 * GB, 512: 0.51 * GB}
+# Host bytes of the compiled device programs, per node, keyed by (tile size, cards per node);
+# `_per_node` prices an unmeasured pair. Compiling the step's programs leaves host memory in use
+# for the rest of the run (live, not freed-but-cached: `malloc_trim` at the end of a 4096^3 run
+# returned 0.3 of 820 GB, job 1003657), and a capacity rung (`capacity_shape`) compiles and
+# keeps more. One rung is priced: every measured 120-step run climbed at least one. MEASURED
+# from run cards' `boundaries[]` (rss at a phase's end, hwm its peak), smallest taken, with the
+# persistent compilation cache the job scripts set (without it a 256 rung measured 3.6 GB,
+# 1029876); every rung measurement predates the superseded-program drop (`_tile_kernel`,
+# 00a193e):
+# - held from the first step: rss at step 2's first phase minus the planner's resident.
+#   (256, 1): 0.63-1.66 GB (c-gh on 2-16 gh, jobs 1063862, 1063389, 1045958). (512, 1):
+#   13.35-13.49 (c-hero on 16 gh, 1057032). (512, 4): 27.2-38.0 (c-8192 on 8 gb, 1054104).
+# - the tile loop's compile transient: its peak at a compiling step above the RSS it started
+#   from, less a non-compiling step's. (256, 1): 4.91-5.00 at a rung (1045958 step 75),
+#   3.59-6.01 at a first step. (512, 1): 21.32-21.49 at the rung, 21.57-21.67 at the first
+#   step (1057032). (512, 4): 24.5-51.2 at a first step (1054104).
+# - held from a rung on: step r+1's first-phase rss minus step r-1's. (256, 1): 1.72 (1045958).
+#   (512, 1): 9.22-9.44 (1057032). (512, 4): 0.51-0.89 per card on an earlier code version
+#   (c-hero on 4 GB200, 1024784), the only measurement.
+HELD_COMPILED_HOST = {(256, 1): 0.63 * GB, (512, 1): 13.35 * GB, (512, 4): 27.2 * GB}
+TILE_COMPILE_SPIKE_HOST = {(256, 1): 3.59 * GB, (512, 1): 21.32 * GB, (512, 4): 24.5 * GB}
+HELD_RUNG_HOST = {(256, 1): 1.72 * GB, (512, 1): 9.22 * GB, (512, 4): 4 * 0.51 * GB}
+
+
+def _per_node(table, tile, cards):
+    """A MEASURED per-node host term for `tile` and `cards` per node. An unmeasured pair takes
+    the largest per-card value measured at that tile size (or, for an unmeasured tile size, at
+    the largest one) times `cards`."""
+    key = (int(tile), int(cards))
+    if key in table:
+        return table[key]
+    tiles = {t for t, _ in table}
+    t = key[0] if key[0] in tiles else max(tiles)
+    return key[1] * max(v / c for (tt, c), v in table.items() if tt == t)
+
+
 # The device-lane process's host floor beyond the priced state (CUDA context, jaxlib, XLA's
 # host pools), keyed by cards per node. MEASURED: 4.265 / 4.281 GB on one GH200 at cgh64 /
 # c-1024 (job 1029876, RSS after step 1 minus the priced resident; the smaller is taken, so
@@ -519,6 +540,8 @@ def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
     `phases` maps phase -> {term: bytes}, summed within a phase. The host peak is
     `sum(resident) + max(phase sums)`: the large numpy buffers are returned to the OS when
     freed, so phases do not accumulate (measured: RSS at phase starts differs by tens of GB).
+    The compiled programs' host memory does stay; `_device_main` charges it to every in-step
+    phase (`HELD_COMPILED_HOST`, `HELD_RUNG_HOST`).
     `state` and `step` are the planner's state table and `ec.step_bytes`; `host_mesh` the
     host-placed mesh terms from `device_budget`.
     """
@@ -558,9 +581,8 @@ def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
         "tile_window write-back (one y-block run of w per card)",
         n_gpus * int(capacity_shape(max(1, int(slab_rows * ec.y_window_fraction))))
         * 3 * np.dtype(np.int16).itemsize)
-    add("tile_loop", "tile programs recompiled at a capacity rung (MEASURED, per card)",
-        n_gpus * TILE_RUNG_HOST_PER_CARD.get(int(ec.n_tile),
-                                             max(TILE_RUNG_HOST_PER_CARD.values())))
+    add("tile_loop", "tile programs compiled, first step or a capacity rung (MEASURED)",
+        _per_node(TILE_COMPILE_SPIKE_HOST, ec.n_tile, n_gpus))
     # The lead drift's own host transient is not charged: above its closing RSS it measured
     # 0-12 GB at c-hero (1024783, 1024784, 1027664), 0.6 GB at c-gh on 2 nodes (1045958) and
     # 0 at c-1024 for y-blocks 1-8 (1048248).
@@ -682,15 +704,27 @@ def _device_main(args, ec, t9, n, rows, arena, state, share=1.0):
     _table("HOST, by phase (summed within a phase; phases do not coexist)",
            {f"{p}: {k}": v for p, terms in host_ph.items() for k, v in terms.items()},
            total_label="sum of ALL phases listed")
-    # Held from the rung on by every in-step phase; the tile loop's rung jump is measured above
-    # the step before, so it does not carry it, and the once-per-run phases run before it.
-    rung_kept = n_gpus * TILE_RUNG_KEPT_HOST_PER_CARD.get(
-        int(ec.n_tile), max(TILE_RUNG_KEPT_HOST_PER_CARD.values()))
+    # The compiled programs' host memory, held by every in-step phase from the first step on;
+    # the phases before step 1 run without it. A rung adds more, held from the rung on; the
+    # tile loop's compile transient is measured from the RSS before the rung, so at the rung
+    # step it sits on the first step's held bytes only (and exceeds the rung's).
+    pre_step = ONCE_PER_RUN_PHASES | {"lead_drift"}
+    held_first = _per_node(HELD_COMPILED_HOST, ec.n_tile, n_gpus)
+    held_rung = _per_node(HELD_RUNG_HOST, ec.n_tile, n_gpus)
     host_phase_sums = {p: sum(t.values()) + (
-        0 if p == "tile_loop" or p in ONCE_PER_RUN_PHASES else rung_kept)
+        0 if p in pre_step else held_first + (0 if p == "tile_loop" else held_rung))
         for p, t in host_ph.items()}
-    print(f"  held from the capacity rung on (MEASURED, per card), charged to every in-step "
-          f"phase\n  but the tile loop: {_fmt(rung_kept).strip()}")
+    print(f"  held from the first step on (compiled programs, MEASURED), charged to every "
+          f"in-step phase: {_fmt(held_first).strip()}")
+    print(f"  held from the capacity rung on (MEASURED), charged to every in-step phase\n"
+          f"  but the tile loop: {_fmt(held_rung).strip()}")
+    # each phase's own peak; an in-step phase with no host term still carries the held bytes
+    whole_host = sum(host_res.values())
+    phase_peaks = {p: whole_host + s for p, s in host_phase_sums.items()}
+    for p in ("coarse_paint", "coarse_solve", "membership", "tile_loop", "migrate"):
+        phase_peaks.setdefault(p, whole_host + held_first + held_rung)
+    _table("HOST, peak by phase (resident + the phase's terms + held)", phase_peaks,
+           total_label="max", reduce=max)
     worst_host = max(host_phase_sums, key=host_phase_sums.get)
     print(f"  worst phase: {worst_host} at {_fmt(host_phase_sums[worst_host]).strip()} "
           "above the resident")
