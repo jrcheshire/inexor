@@ -123,8 +123,9 @@ def _tile_members(order, starts, nb, tijk, n_tile, b_fine, n_brick):
     return np.concatenate(idx)
 
 
-def two_level_force(g, ec):
-    """The engine's split, in float64 with integer paints: coarse TSC long arm + tiled CIC."""
+def two_level_force(g, ec, long_paint="int"):
+    """The engine's split in float64: coarse TSC long arm (`long_paint` "int", as the engine,
+    or "f64") + tiled CIC short arm (integer paint)."""
     import jax.numpy as jnp
 
     from inexor import forces as F
@@ -134,7 +135,7 @@ def two_level_force(g, ec):
     def force(x):
         x = np.asarray(x, np.float64)
         g_long, _ = F.force_global(x, g["n_coarse"], g["L"], n, "long", r_s=ec.r_s,
-                                   match=ec.coarse_match, assign="tsc", paint="int")
+                                   match=ec.coarse_match, assign="tsc", paint=long_paint)
         order, starts, nb = _brick_index(x, g["n_fine"], ec.n_brick, cell)
 
         def members(t):
@@ -161,7 +162,7 @@ def run_engine(g, ec, co, x, v):
     return np.concatenate([st.decode_brick(b)[1] for b in range(st.n_bricks)]), {}
 
 
-def run_float(g, ec, co, x, v, quant):
+def run_float(g, ec, co, x, v, quant, long_paint="int"):
     """`engine.float_run_bullfrog_sync`'s shape, with the codecs named in `quant` emulated."""
     import jax.numpy as jnp
 
@@ -189,7 +190,7 @@ def run_float(g, ec, co, x, v, quant):
         s = scales(xx, vv)
         return np.rint(vv / s) * s
 
-    force = two_level_force(g, ec)
+    force = two_level_force(g, ec, long_paint)
     if "x" in quant:
         x = lattice(x)
     if "v" in quant:
@@ -222,6 +223,8 @@ def main():
     ap.add_argument("--a-init", type=float, default=0.1)
     ap.add_argument("--k", type=int, required=True)
     ap.add_argument("--arm", required=True, choices=("engine", "ref", "refx", "refv", "refxv"))
+    ap.add_argument("--long-paint", default="int", choices=("int", "f64"),
+                    help="float arms: the coarse arm's paint (the engine paints integers)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -238,11 +241,12 @@ def main():
     if args.arm == "engine":
         xf, stats = run_engine(g, ec, co, x, v)
     else:
-        xf, stats = run_float(g, ec, co, x, v, args.arm[3:])
+        xf, stats = run_float(g, ec, co, x, v, args.arm[3:], args.long_paint)
     wall = time.perf_counter() - t0
     k, p = power_spectrum(xf, g["n_fine"], g["L"], g["n_part"] ** 3)
     rec = dict(config=args.config, geometry=g, a_init=args.a_init, k_steps=args.k,
-               arm=args.arm, coarse_match_order=MATCH_ORDER, seed=SEED, wall_s=wall,
+               arm=args.arm, long_paint=args.long_paint, coarse_match_order=MATCH_ORDER,
+               seed=SEED, wall_s=wall,
                k_centres=np.asarray(k).tolist(), p=np.asarray(p).tolist(), **stats)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as fh:

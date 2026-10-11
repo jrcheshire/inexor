@@ -58,20 +58,24 @@ def camb_boost(cos, z, kmax, version, npoints=400):
         mnu=0.0, num_massive_neutrinos=0, omk=0.0,
         halofit_version=version,
     )
-    pars.set_matter_power(redshifts=[z], kmax=max(kmax * 2.0, 10.0))
+    # z = 0 is always solved: sigma8 normalizes the spectrum today
+    pars.set_matter_power(redshifts=sorted({float(z), 0.0}, reverse=True),
+                          kmax=max(kmax * 2.0, 10.0))
 
     # sigma8 is an output of the solve: rescale As to hit it (sigma8 ~ sqrt(As))
     pars.NonLinear = camb.model.NonLinear_none
     s8 = camb.get_results(pars).get_sigma8_0()
     pars.InitPower.As = pars.InitPower.As * (cos["sigma8"] / s8) ** 2
     lin = camb.get_results(pars)
-    kh, _, plin = lin.get_matter_power_spectrum(minkh=1e-3, maxkh=kmax, npoints=npoints)
+    kh, zs, plin = lin.get_matter_power_spectrum(minkh=1e-3, maxkh=kmax, npoints=npoints)
+    iz = int(np.argmin(np.abs(np.asarray(zs) - z)))
+    assert abs(zs[iz] - z) < 1e-6, (zs, z)
 
     pars.NonLinear = camb.model.NonLinear_both
     nl = camb.get_results(pars)
-    kh2, _, pnl = nl.get_matter_power_spectrum(minkh=1e-3, maxkh=kmax, npoints=npoints)
-    assert np.allclose(kh, kh2)
-    return kh, plin[0], pnl[0], float(nl.get_sigma8_0()), float(pars.InitPower.As)
+    kh2, zs2, pnl = nl.get_matter_power_spectrum(minkh=1e-3, maxkh=kmax, npoints=npoints)
+    assert np.allclose(kh, kh2) and np.allclose(zs, zs2)
+    return kh, plin[iz], pnl[iz], float(nl.get_sigma8_0()), float(pars.InitPower.As)
 
 
 def ee2_boost(cos, z, k, A_s):
