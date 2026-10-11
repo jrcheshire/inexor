@@ -384,12 +384,15 @@ class EngineConfig:
             coarse_force_resident=3 * cells * cw,
             # one component: `coarse_force_meshes` solves one at a time into the caller's buffers
             coarse_force_copy_transient=cells * cw,
-            # --- fine, resident through the tile loop
-            tile_kernels=w * 3 * phalf * 2 * fw,
-            # the build: `split_kernels` holds k2_true, k2_safe, fac (f64) and pref (fine dtype)
-            # while materializing the complex kernels; the `ik_j` are low-rank broadcasts
-            tile_kernel_build_f64=w * 3 * phalf * 8,
-            tile_kernel_pref=w * phalf * fw,
+            # --- fine, resident through the tile loop: `split_prefactor`'s real half-grid and
+            # three low-rank ik_j; the program forms each complex kernel as it multiplies
+            tile_kernels=w * (phalf + 2 * (2 * p + p // 2 + 1)) * fw,
+            # the build beside the kept pref: k2_true, k2_safe and S or fac (f64) at f64; at
+            # f32 also the f64 quotient before narrowing. Measured (tracemalloc, cdev8 and cdev):
+            # peaks of 32.0 and 36.0 B per half-grid cell at f64 and f32
+            tile_kernel_build_f64=w * phalf * 8 * (3 if fw == 8 else 4),
+            # retired: the kept prefactor IS `tile_kernels`; kept at zero so it stays visible
+            tile_kernel_pref=0,
             # --- fine, transient per tile
             tile_workspace=w * (pcells * (fw + 4 + 3 * fw) + phalf * 2 * fw),
         )

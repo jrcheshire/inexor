@@ -243,14 +243,15 @@ def _match_orders(match):
     return dict(order_solve=int(match[2]), order_target=int(match[3]))
 
 
-def split_kernels(shape, cell, which, r_s=None, fdtype=np.float64):
-    """The (Kx, Ky, Kz) half-grid kernels of the Gaussian split: (split_factor / k2_safe) * ik_j.
+def split_prefactor(shape, cell, which, r_s=None, fdtype=np.float64):
+    """The Gaussian split's real prefactor and low-rank gradients -> (pref, (ikx, iky, ikz)).
 
-    The build (k2, S, fac / k2_safe) is always f64; `fdtype` narrows only the real prefactor before
-    the complex multiply. Narrowing `ik` instead would be f64 * complex64 -> complex128 (numpy
-    promotion), silently not an f32 arm. The prefactor form is within 2 f32 ulp of narrowing the
-    finished product and avoids a full complex128 half-grid per component. At the f64 default the
-    casts are no-ops, so the result is bitwise the reference kernel.
+    `pref = split_factor / k2_safe` on the rfftn half-grid at `fdtype`; the `ik_j` broadcast
+    (shapes (nx,1,1)/(1,ny,1)/(1,1,nz//2+1)) at the matching complex dtype. The kernels are the
+    products `pref * ik_j` (`split_kernels`); a caller that forms them inside its own program
+    keeps one real half-grid instead of three complex ones. The build (k2, S, fac / k2_safe) is
+    always f64; `fdtype` narrows only the real prefactor. Narrowing `ik` instead would be
+    f64 * complex64 -> complex128 (numpy promotion), silently not an f32 arm.
     """
     fdtype = np.dtype(fdtype)
     if fdtype not in (np.dtype(np.float32), np.dtype(np.float64)):
@@ -259,7 +260,19 @@ def split_kernels(shape, cell, which, r_s=None, fdtype=np.float64):
     fac = split_factor(k2_true, 0.0 if r_s is None else r_s, which)
     pref = (fac / k2_safe).astype(fdtype, copy=False)
     cdtype = np.complex128 if fdtype == np.dtype(np.float64) else np.complex64
-    return tuple(pref * ik.astype(cdtype, copy=False) for ik in (ikx, iky, ikz))
+    return pref, tuple(ik.astype(cdtype, copy=False) for ik in (ikx, iky, ikz))
+
+
+def split_kernels(shape, cell, which, r_s=None, fdtype=np.float64):
+    """The (Kx, Ky, Kz) half-grid kernels of the Gaussian split: `pref * ik_j` from
+    `split_prefactor`.
+
+    The prefactor form is within 2 f32 ulp of narrowing the finished product and avoids a full
+    complex128 half-grid per component. At the f64 default the casts are no-ops, so the result
+    is bitwise the reference kernel.
+    """
+    pref, iks = split_prefactor(shape, cell, which, r_s=r_s, fdtype=fdtype)
+    return tuple(pref * ik for ik in iks)
 
 
 # ===========================================================================
@@ -1097,8 +1110,10 @@ def make_tile_force_fn(
     cell, mean = geom["cell"], geom["mean"]
     P = geom["P"]
     # numpy, not jax arrays: a jax array would stay resident on jax's default device for the
-    # life of `one_tile`
-    kers = split_kernels((P,) * 3, cell, "short", r_s=r_s, fdtype=fdtype)
+    # life of `one_tile`. One real half-grid and three low-rank ik_j; the program forms each
+    # complex kernel `pref * ik_j` as it multiplies, as `split_kernels` would.
+    pref, iks = split_prefactor((P,) * 3, cell, "short", r_s=r_s, fdtype=fdtype)
+    kers = (pref, *iks)
 
     def short_force(u, live, owned, kernels):
         # `owned` is supplied by the caller (exact integer ownership; see `owning_tile`)
@@ -1108,7 +1123,8 @@ def make_tile_force_fn(
         else:
             delta, n_out_p = tile_paint_f64(u, live, (P,) * 3, cell, mean, fdtype=fdtype)
         dk = jnp.fft.rfftn(delta)
-        g = [jnp.fft.irfftn(dk * k, s=(P,) * 3) for k in kernels]
+        pref = kernels[0]
+        g = [jnp.fft.irfftn(dk * (pref * ik), s=(P,) * 3) for ik in kernels[1:]]
         out, n_out_g = tile_gather_vector(g[0], g[1], g[2], u, live, (P,) * 3, cell)
         return out, live & owned, n_out_p + n_out_g
 
@@ -1122,7 +1138,7 @@ class TileForce:
     kernels compiled in as constants. `one_tile.with_kernels(u, live, owned, kernels)` is the
     unjitted function taking them as an argument, for compiled programs that would otherwise
     embed a copy each (`device.tile` places `one_tile.kernels`, the numpy kernels, on each card
-    once per tile loop instead).
+    once per tile loop instead). `kernels` is `(pref, ikx, iky, ikz)` from `split_prefactor`.
     """
 
     def __init__(self, short_force, kernels):
