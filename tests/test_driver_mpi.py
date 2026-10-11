@@ -102,9 +102,10 @@ def _product(kind, n, ckpt, out, extra):
 
 
 def _card_args(out):
-    # 8 bins up to half Nyquist of the 64^3 coarse mesh in a 64 Mpc/h box
+    # 8 bins up to half Nyquist of the 64^3 coarse mesh in a 64 Mpc/h box; step 6 of 40 is not
+    # synchronized, which a rank-count comparison does not care about
     return ["--out", str(out / "pk.json"), "--k-max", "1.5707963267948966", "--n-bins", "8",
-            "--min-weight", "1"]
+            "--min-weight", "1", "--allow-partial"]
 
 
 def _export_bytes(d):
