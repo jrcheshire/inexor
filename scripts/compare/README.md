@@ -127,3 +127,16 @@ camb and euclidemu2 are not engine dependencies, and adding them would move `pix
 
 EE2 is parameterized by `A_s`, so both tools take `A_s` from the CAMB solve that matches
 the card's `sigma8`, and `ee2_boost` refuses a cosmology outside EE2's training range.
+
+## quant_grid.py, quant_grid_gg_vista.sbatch
+
+The codec's effect on the power spectrum: the engine against float runs of the same
+drift-synchronized BullFrog shape and two-level force, on the same 2LPT ICs. Arms `engine`,
+`ref` (nothing quantized), `refx` / `refv` (positions or velocities quantized as the engine
+does), `refxv` (both; reproduces `engine`, which checks the emulation). One arm per process,
+one JSON card each (fine-mesh P(k), drift per step in quanta, kick per step in velocity
+codes). CPU backend. The gg job runs the grid of start epochs (z = 9, 19, 49) x step counts
+(40, 120, 240) at the production spacing and three points at twice it, every leg pinned to
+its own 4 cores, through the checkout's gpu env python (never `pixi run`, so it cannot
+reinstall an env other jobs share).
+
