@@ -69,14 +69,20 @@ def cmd_export(args):
     R._require_ic_epoch(args.ic_dir, args.a_init)
     R._require_ic_growth2(args.ic_dir, args.growth2)
     st = icgen.load_slot_state(args.ic_dir)
-    xs, vs = [], []
+    # filled in place: a list + concatenate would hold two copies (~100 GB at 1024^3)
+    n = g["n_part"] ** 3
+    x, v = np.empty((n, 3), np.float64), np.empty((n, 3), np.float64)
+    i = 0
     for b in range(st.n_bricks):
         _, xb, vb = st.decode_brick(b)
-        xs.append(np.asarray(xb, np.float64))
-        vs.append(np.asarray(vb, np.float64))
-    x, v = np.concatenate(xs), np.concatenate(vs)
-    if x.shape[0] != g["n_part"] ** 3:
-        raise SystemExit(f"decoded {x.shape[0]:,} particles, expected {g['n_part'] ** 3:,}")
+        m = xb.shape[0]
+        if i + m > n:
+            raise SystemExit(f"decoded more than the expected {n:,} particles")
+        x[i:i + m], v[i:i + m] = np.asarray(xb), np.asarray(vb)
+        i += m
+    if i != n:
+        raise SystemExit(f"decoded {i:,} particles, expected {n:,}")
+    del st
     print(f"== export {args.config}: {x.shape[0]:,} particles from {args.ic_dir}, "
           f"{args.k_steps} steps a={a_steps[0]:.4f}->{a_steps[-1]:.4f}, "
           f"rms|v_d| {np.sqrt(np.mean(np.sum(v**2, 1))):.3f}", flush=True)
@@ -92,7 +98,8 @@ def cmd_export(args):
     _save(args.out, x=x, v_d=v, a_steps=np.asarray(a_steps, np.float64),
           meta=dict(config=args.config, n_part=g["n_part"], box_size=g["L"],
                     ic_dir=args.ic_dir, k_steps=args.k_steps, a_init=float(a_steps[0]),
-                    growth2=args.growth2, pk_file=pk_path))
+                    growth2=args.growth2, pk_file=pk_path,
+                    disco_cosmo=_disco_cosmo(cosmo)))
     return 0
 
 
@@ -103,10 +110,11 @@ def cmd_evolve(args):
     jax.config.update("jax_enable_x64", True)
     from discodj import DiscoDJ
 
-    from inexor.config import Cosmology
-
+    # the disco-mocks env has no inexor: the cosmology comes from the export
     d = _load(args.inp)
     meta = d["meta"]
+    if "disco_cosmo" not in meta:
+        raise SystemExit(f"{args.inp} carries no disco_cosmo; re-run export")
     n_part, L = int(meta["n_part"]), float(meta["box_size"])
     a_steps = d["a_steps"]
     a_i, a_f = float(a_steps[0]), float(a_steps[-1])
@@ -114,7 +122,7 @@ def cmd_evolve(args):
           f"{len(a_steps) - 1} BullFrog steps a={a_i:.4f}->{a_f:.4f}, "
           f"precision {args.precision}, backend {jax.devices()[0].platform}", flush=True)
 
-    dj = DiscoDJ(dim=3, res=n_part, boxsize=L, cosmo=_disco_cosmo(Cosmology()),
+    dj = DiscoDJ(dim=3, res=n_part, boxsize=L, cosmo=meta["disco_cosmo"],
                  precision=args.precision)
     dj = dj.with_timetables()
     dj = dj.with_linear_ps(transfer_function="from_file", filename=meta["pk_file"],
