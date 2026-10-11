@@ -1500,11 +1500,12 @@ def checkpoint_fingerprint(cfg, coeffs):
 
 
 def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=None,
-                      device_shapes=None, timings=None, comm=None):
+                      device_shapes=None, timings=None, comm=None, source=None):
     """Write generation `gen` of the rolling pair; returns its directory (the step's receipt).
 
     `epoch` is the optional `(a_steps, cosmo)` from `run` (see `epoch_record`);
-    `device_shapes` are restored on resume. `comm`: every rank calls this with its node-local
+    `device_shapes` are restored on resume; `source`, if given, is recorded as the
+    provenance's `source` (the run's ICs). `comm`: every rank calls this with its node-local
     state (`icgen.write_t9_slabs`); the provenance is the same at any rank count."""
     import math
 
@@ -1535,6 +1536,8 @@ def _write_checkpoint(st, cfg, coeffs, step, cap_shape, pad_shape, gen, epoch=No
         fingerprint=checkpoint_fingerprint(cfg, coeffs),
     )
     prov.update(epoch_record(epoch, step))
+    if source:
+        prov["source"] = dict(source)
     d = os.path.join(cfg.checkpoint_dir, f"gen{gen}")
     icgen.write_t9_slabs(st, d, provenance=prov, timings=timings, comm=comm)
     return d
@@ -1637,7 +1640,7 @@ def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=
 
 def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         stop_at=None, allocator=None, epoch=None, timed_steps=(), comm=None, decomp=None,
-        devices=None):
+        devices=None, source=None):
     """Advance `st` over a whole schedule. `coeffs` from `bullfrog_float_coeffs`.
 
     Returns the list of per-step stats. `phase` is forwarded to `step`; `run` adds the
@@ -1650,7 +1653,8 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
 
     `epoch = (a_steps, cosmo[, linear_pk])` is read only by checkpoints (`epoch_record`), so an
     export can convert velocities to km/s, and a card take the ICs' tabulated P(k), from the
-    directory alone. `timed_steps` names absolute steps
+    directory alone. `source`, a JSON-able dict naming the run's ICs, is recorded in every
+    checkpoint's provenance. `timed_steps` names absolute steps
     whose device passes, separate repack and checkpoint are timed into `stats["timings"]`.
 
     Across ranks (`comm`; `decomp` defaults from its rank and size), every rank runs this
@@ -1787,7 +1791,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                     st, cfg, coeffs, k + 1, cap_shape, pad_shape, n_ckpt % 2, epoch=epoch,
                     device_shapes=device_shapes,
                     timings=None if timings is None else timings.setdefault("checkpoint", {}),
-                    comm=comm,
+                    comm=comm, source=source,
                 )
                 n_ckpt += 1
                 ph("checkpoint")

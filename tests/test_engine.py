@@ -868,6 +868,28 @@ def test_epoch_is_optional_and_absent_by_default(tmp_path):
     assert "a" not in man["provenance"] and "cosmology" not in man["provenance"]
 
 
+def test_source_is_recorded_when_given_and_moves_nothing(tmp_path):
+    """`run(source=)` names the run's ICs in every checkpoint's provenance; without it the key
+    is absent, and with it neither the slabs nor any other manifest field moves."""
+    import json
+
+    src = {"ics": "/somewhere/ics", "ics_provenance": {"commit": "abc"}}
+    dirs = [str(tmp_path / "a"), str(tmp_path / "b")]
+    for d, source in zip(dirs, (None, src)):
+        cfg_c = _cfg(checkpoint_dir=d, checkpoint_every=1)
+        engine.run(_ck_state(cfg_c), cfg_c, _coeffs(2), source=source)
+    man = [json.load(open(os.path.join(d, "gen1", "manifest.json"))) for d in dirs]
+    assert "source" not in man[0]["provenance"]
+    assert man[1]["provenance"].pop("source") == src
+    assert man[0] == man[1]
+    files = sorted(f for f in os.listdir(os.path.join(dirs[0], "gen1")) if f != "manifest.json")
+    assert files == sorted(f for f in os.listdir(os.path.join(dirs[1], "gen1"))
+                           if f != "manifest.json")
+    for f in files:
+        a, b = (open(os.path.join(d, "gen1", f), "rb").read() for d in dirs)
+        assert a == b, f
+
+
 def test_epoch_does_not_move_the_fingerprint_or_the_trajectory(tmp_path):
     """Recording the epoch moves neither the trajectory nor the fingerprint (which already
     hashes `coeffs`), and a checkpoint with an epoch resumes under a config without one."""

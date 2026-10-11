@@ -90,6 +90,9 @@ def test_the_device_lane_carries_the_table_everywhere(table, device_run):
         prov = json.load(open(d / "ckpt" / g / "manifest.json"))["provenance"]
         steps.add(prov["step"])
         assert _sha(prov.get("linear_pk")) == sha, g
+        # both segments name the ICs they ran from
+        assert prov["source"]["ics"] == os.path.realpath(d / "ics"), g
+        assert prov["source"]["ics_provenance"]["generator"], g
     assert steps == {1, 2}, "one generation from before the resume, one from after"
     card = json.load(open(d / "pk.json"))["summary"]
     assert card["linear_pk"] == dict(source="test-wiggle", sha256=sha)

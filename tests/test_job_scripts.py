@@ -280,6 +280,26 @@ def test_the_any_cut_gate_ignores_only_the_window_shape(tmp_path, case, ok):
     assert ("rc=0" in plain.stdout) == (case == "same"), "CONTROL: the plain gate"
 
 
+@pytest.mark.parametrize("gate", ["gate", "gate_any_cut"])
+def test_both_gates_set_aside_only_the_recorded_source(tmp_path, gate):
+    """A control leg names its ICs differently from its reference, and a reference may predate
+    the field: provenance.source is metadata, so neither gate compares it. A slab byte still
+    fails both."""
+    w = {"rows": 100, "arena": 10}
+    a = _cut_ckpt(tmp_path / "a", w)
+    b = _cut_ckpt(tmp_path / "b", w)
+    c = _cut_ckpt(tmp_path / "c", w, payload=b"z")
+    for d in (b, c):
+        f = d / "gen0" / "manifest.json"
+        m = json.loads(f.read_text())
+        m["provenance"]["source"] = {"ics": f"/ics/{d.name}"}
+        f.write_text(json.dumps(m))
+    ok = _lib(f'{gate} test "{a}" "{b}"; echo "rc=$?"', tmp_path)
+    assert "GATE test PASS" in ok.stdout and "rc=0" in ok.stdout, ok.stdout + ok.stderr
+    bad = _lib(f'{gate} test "{b}" "{c}"; echo "rc=$?"', tmp_path)
+    assert "GATE test FAIL" in bad.stdout and "rc=1" in bad.stdout, bad.stdout
+
+
 def _gen(ckpt, g, step, n_particles=8):
     d = ckpt / g
     d.mkdir(parents=True)

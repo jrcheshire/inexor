@@ -893,9 +893,12 @@ def cmd_run(args):
 
         # the ICs' linear P(k), if tabulated, rides along into every checkpoint
         epoch = (a_steps, cosmo, None if linear_pk is None else linear_pk.record())
+        ic_prov = icgen.read_manifest(args.workdir).get("provenance") or {}
+        source = dict(ics=ics, ics_provenance={k: ic_prov[k] for k in (
+            "generator", "commit", "host", "when") if k in ic_prov})
         out = engine.run(st, ec, co, phase=mon, resume=resume, stop_at=args.stop_at,
                          collect=collect, timed_steps=timed, epoch=epoch,
-                         comm=comm, decomp=decomp)
+                         comm=comm, decomp=decomp, source=source)
         card["finished"] = time.time()
         # a checkpoint is written after the last boundary and has none of its own
         card["after_last_boundary_s"] = card["finished"] - mon.t_last

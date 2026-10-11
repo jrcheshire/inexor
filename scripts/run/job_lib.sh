@@ -126,8 +126,25 @@ run_leg () {
   return "$ok"
 }
 
-# same_ckpt A B: the same files under two checkpoint dirs, byte for byte. A dir that is
-# missing or holds no generation (no */manifest.json) fails.
+# same_manifest A B [window]: two manifest.json files equal once provenance.source (the run's
+# ICs, which a control leg names differently from its reference) is set aside, and with
+# `window` also provenance.device_shapes.window
+same_manifest () {
+  "${PY:-python3}" - "$1" "$2" "${3:-}" <<'EOF_PY'
+import json, sys
+m = [json.load(open(p)) for p in sys.argv[1:3]]
+for x in m:
+    prov = x.get("provenance", {})
+    prov.pop("source", None)
+    if sys.argv[3] == "window":
+        prov.get("device_shapes", {}).pop("window", None)
+sys.exit(m[0] != m[1])
+EOF_PY
+}
+
+# same_ckpt A B: the same files under two checkpoint dirs, byte for byte, except that
+# manifests are compared without provenance.source (`same_manifest`). A dir that is missing
+# or holds no generation (no */manifest.json) fails.
 same_ckpt () {
   local a=$1 b=$2 bad=0 f d
   for d in "$a" "$b"; do
@@ -142,13 +159,17 @@ same_ckpt () {
     return 1
   fi
   while IFS= read -r f; do
-    cmp -s "$a/$f" "$b/$f" || { echo "  differs: $f"; bad=$((bad + 1)); }
+    if [ "${f##*/}" = manifest.json ]; then
+      same_manifest "$a/$f" "$b/$f" || { echo "  differs: $f"; bad=$((bad + 1)); }
+    else
+      cmp -s "$a/$f" "$b/$f" || { echo "  differs: $f"; bad=$((bad + 1)); }
+    fi
   done < <(cd "$a" && find . -type f | sort)
   echo "  $(cd "$a" && find . -type f | wc -l | tr -d ' ') files, $bad differing: $a vs $b"
   [ $bad -eq 0 ]
 }
 
-# same_ckpt_any_cut A B: `same_ckpt`, except that manifests are compared without
+# same_ckpt_any_cut A B: `same_ckpt`, except that manifests are also compared without
 # provenance.device_shapes.window, the one entry a y-block count changes (it sizes a buffer;
 # the checkpoint's numbers do not depend on the cut)
 same_ckpt_any_cut () {
@@ -165,13 +186,7 @@ same_ckpt_any_cut () {
   fi
   while IFS= read -r f; do
     if [ "${f##*/}" = manifest.json ]; then
-      "${PY:-python3}" - "$a/$f" "$b/$f" <<'EOF_PY' || { echo "  differs: $f"; bad=$((bad + 1)); }
-import json, sys
-m = [json.load(open(p)) for p in sys.argv[1:]]
-for x in m:
-    x.get("provenance", {}).get("device_shapes", {}).pop("window", None)
-sys.exit(m[0] != m[1])
-EOF_PY
+      same_manifest "$a/$f" "$b/$f" window || { echo "  differs: $f"; bad=$((bad + 1)); }
     else
       cmp -s "$a/$f" "$b/$f" || { echo "  differs: $f"; bad=$((bad + 1)); }
     fi
