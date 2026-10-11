@@ -138,6 +138,16 @@ def host_memory():
     return (status.get("VmRSS"), status.get("VmHWM", maxrss), meminfo.get("MemAvailable"))
 
 
+def rss_now():
+    """This process's resident bytes from /proc/self/statm (cheap enough to sample every few
+    ms); None off Linux."""
+    try:
+        with open("/proc/self/statm") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 PROC_MEM_KEYS = ("VmRSS", "VmHWM", "RssAnon", "RssFile", "RssShmem", "VmLck", "VmPin", "VmSwap")
 
 
@@ -385,9 +395,12 @@ class Monitor:
         self._thread = threading.Thread(target=self._beat_loop, daemon=True, name="d7-beat")
         # every card's allocator bytes in use, sampled between boundaries: the boundary
         # records' `peak` is the process's running maximum, so it cannot say which phase
-        # set it; `card_phase_peak` is the largest sample since the previous boundary
+        # set it; `card_phase_peak` is the largest sample since the previous boundary.
+        # The same loop samples host RSS (`rss_phase_peak`): the kernel's VmHWM has read
+        # 0.3-0.4 GB below a 20 ms RSS sampler during a tile-program recompile.
         self._card_sample_s = float(card_sample_s)
         self._card_max = None
+        self._rss_max = None
         self.card_sample_errors = 0
         self._card_thread = (threading.Thread(target=self._card_loop, daemon=True,
                                               name="d7-cards")
@@ -401,16 +414,20 @@ class Monitor:
 
     def _card_loop(self):
         while not self._stop.wait(self._card_sample_s):
+            rss = rss_now()
             try:
                 now = [c["in_use"] or 0 for c in card_memory()]
             except Exception as e:  # an instrument must never be the failure
                 self.card_sample_errors += 1
                 if self.card_sample_errors == 1:
                     print(f"[cards] {_stamp()} sampler error {e!r}", flush=True)
-                continue
+                now = None
             with self.lock:
-                self._card_max = (now if self._card_max is None
-                                  else [max(a, b) for a, b in zip(self._card_max, now)])
+                if now is not None:
+                    self._card_max = (now if self._card_max is None
+                                      else [max(a, b) for a, b in zip(self._card_max, now)])
+                if rss is not None:
+                    self._rss_max = rss if self._rss_max is None else max(self._rss_max, rss)
 
     def _take_card_max(self, cards):
         """The largest in-use bytes per card since the previous boundary (the samples and
@@ -421,6 +438,15 @@ class Monitor:
         with self.lock:
             got, self._card_max = self._card_max, list(now)
         return now if got is None else [max(a, b) for a, b in zip(got, now)]
+
+    def _take_rss_max(self, rss):
+        """The largest sampled host RSS since the previous boundary (and `rss`, read at this
+        one), restarting from `rss`; None without a sampler or off Linux."""
+        if self._card_thread is None or rss is None:
+            return None
+        with self.lock:
+            got, self._rss_max = self._rss_max, rss
+        return rss if got is None else max(got, rss)
 
     def stop(self):
         self._stop.set()
@@ -443,6 +469,7 @@ class Monitor:
         self.run_peak = max(self.run_peak, hwm or 0)
         cards = card_memory()
         phase_peak = self._take_card_max(cards)
+        rss_peak = self._take_rss_max(rss)
         nm = numa_memory()
         snap = self.snapshot()
         nmaps, nmaps_s = None, None
@@ -453,7 +480,8 @@ class Monitor:
         if name == "coarse_paint":
             self.step += 1
         rec = dict(t=now, name=name, step=self.step, dt=now - self.t_last, rss=rss,
-                   hwm=hwm, avail=avail, cards=cards, card_phase_peak=phase_peak, numa=nm,
+                   hwm=hwm, rss_phase_peak=rss_peak, avail=avail, cards=cards,
+                   card_phase_peak=phase_peak, numa=nm,
                    numa_maps=nmaps, numa_maps_s=nmaps_s, **snap)
         print(f"[phase] {_stamp(now)} step {self.step:2d} {name:<16} {rec['dt']:9.1f} s | host "
               f"rss {_gb(rss)} peak {_gb(hwm)} | {_numa_text(nm)} | cards in_use "
@@ -1339,6 +1367,7 @@ def cmd_summarize(args):
             if lo <= t <= hi:
                 gn[node] = max(gn.get(node, 0.0), used)
         rows.append(dict(step=b["step"], name=b["name"], dt=b["dt"], host_phase_peak=b["hwm"],
+                         host_phase_peak_sampled=b.get("rss_phase_peak"),
                          host_avail_min=min(m) if m else None,
                          gpu_node_used_max_gb={k: v / GB for k, v in sorted(gn.items())},
                          card_max_gib={k: v["mib"] / 1024 for k, v in sorted(per.items())},

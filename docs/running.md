@@ -152,7 +152,7 @@ Key flags for `preflight` and `run`:
 | `--expect-step` (run) | 0 | 0 = start from the ICs, refused if `--checkpoint-dir` already holds a checkpoint. N = resume from the newest checkpoint, refused unless it is at step N |
 | `--timed-last`, `--timed-all`, `--timed-every N` (run) | off | synced per-pass timing breakdown on the last step, every step, or every N-th (absolute step k with (k + 1) % N == 0). Untimed steps run without the syncs, so their wall is the step's cost |
 | `--snapshot-z`, `--snapshot-dir` (run) | none | synchronized snapshots at the step boundaries nearest these redshifts (comma list), written as `<snapshot-dir>/step<NNNN>/gen0` in checkpoint format; the step before each drifts only its trailing half, so the run differs from one without snapshots by one position rounding per snapshot. Recorded in the checkpoints and their fingerprint, so a resume must give the same `--snapshot-z`. Not under the ICs or `--checkpoint-dir` |
-| `--card-sample-ms` (run) | 10 | sample every card's allocator bytes in use this often (0 = off); each boundary record carries `card_phase_peak`, the largest since the previous boundary |
+| `--card-sample-ms` (run) | 10 | sample every card's allocator bytes in use, and the process's resident memory, this often (0 = off); each boundary record carries `card_phase_peak` and `rss_phase_peak`, the largest since the previous boundary (`rss_phase_peak` is None off Linux) |
 | `--drop-ic-cache` (run) | off | drop each IC slab's page cache as it is read |
 | `--beat` (run) | 60 | heartbeat seconds |
 | `--comm` (run) | `serial` | `mpi`: one rank per process across nodes (see below) |
