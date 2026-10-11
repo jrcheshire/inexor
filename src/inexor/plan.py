@@ -187,8 +187,9 @@ def shard_halo_planes():
             "coarse_force_resident": 2 * COARSE_HALO}
 
 # One coarse-paint chunk on a card (`device.paint`): measured device peak bytes per padded
-# row, `off` window upload included. Jitted (default): 62-72 B, charged at the largest.
-PAINT_CHUNK_B_PER_ROW = 72
+# row, `off` window upload included. Jitted (default): 62-72 B, charged at the largest, plus
+# the exact-mass remainder (one int32 per row, `painting._add_exact_mass`).
+PAINT_CHUNK_B_PER_ROW = 76
 # Eager (`jit=False`): 266-293 B.
 PAINT_CHUNK_EAGER_B_PER_ROW = 266
 # Folded into the rate above; kept at 0 because readers add the two.
@@ -196,7 +197,7 @@ PAINT_WINDOW_B_PER_ROW = 0
 # Bytes alive at once in the traced (unfused) program; not a floor for the compiled one.
 # `tests/test_device_paint.py` fails if a re-trace exceeds it, catching program growth
 # without a card.
-PAINT_CHUNK_TRACED_B_PER_ROW = 125
+PAINT_CHUNK_TRACED_B_PER_ROW = 129
 # `forces.capacity_shape`'s padding is <= 26.0%.
 PAINT_PAD_BOUND = 1.26
 

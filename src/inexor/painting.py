@@ -2,7 +2,8 @@
 
 Each stencil has two paints behind one interface:
 - integer paint (`paint_int`, `paint_tsc_int`): corner weights quantized to `frac_bits` fixed
-  point and scatter-added into an int32 mesh. Integer addition is associative, so the result is
+  point and scatter-added into an int32 mesh, each particle's weights summing to exactly
+  2^frac_bits (`_add_exact_mass`). Integer addition is associative, so the result is
   bit-identical regardless of atomic or particle order. Primal-only.
 - float twin (`paint_f32`, `paint_tsc_f64`): differentiable, but order-dependent under float
   atomics on GPU, so never used on the deterministic primal force path.
@@ -55,6 +56,57 @@ def _corner_flat_weight(base, frac, corner, n_mesh):
     return flat, wx * wy * wz
 
 
+def _cic_is_nearest(frac, corner):
+    """Bool row mask: `corner` (offsets in {0, 1} from the base cell) is the CIC corner nearest
+    the particle, the largest of its 8 weights (>= 1/8). Per axis the nearer cell is base + 1
+    where frac >= 1/2, so exactly one corner is nearest for every row."""
+    up = frac >= 0.5
+    m = [up[:, a] if d else ~up[:, a] for a, d in enumerate(corner)]
+    return m[0] & m[1] & m[2]
+
+
+def _add_exact_mass(mesh, corners, piece, nearest, frac_bits, live=None):
+    """Scatter-add each particle's corner weights in `frac_bits` fixed point, exactly
+    2^frac_bits per particle.
+
+    `piece(corner)` -> (flat index, weight); `nearest(corner)` -> True / False when that corner
+    is / is not the nearest for every particle (TSC's centre), else a bool row mask (CIC).
+    Every other corner adds its weight rounded through f32; the nearest adds 2^frac_bits minus
+    their sum. The nearest weight is >= 1/8 for CIC and TSC and the remainder's rounding is at
+    most half a unit per other corner, so it is never negative. Rows with `live` False must
+    carry zero weights and add 0 everywhere. Each corner is traced twice, for the remainder and
+    for its scatter, so only the remainder outlives a corner's own arrays.
+    """
+    scale = np.float32(2.0**frac_bits)  # np scalars: no device array at trace-build time
+
+    def code(w):
+        return rint_i(w.astype(jnp.float32) * scale)
+
+    rest = None
+    for c in corners:
+        near = nearest(c)
+        if near is True:
+            continue
+        q = code(piece(c)[1])
+        if near is not False:
+            q = jnp.where(near, 0, q)
+        rest = q if rest is None else rest + q
+    rem = np.int32(1 << frac_bits) - rest
+    if live is not None:
+        rem = jnp.where(live, rem, 0)
+    for c in corners:
+        near = nearest(c)
+        flat, w = piece(c)
+        if near is True:
+            q = rem
+        elif near is False:
+            q = code(w)
+        else:
+            q = jnp.where(near, rem, code(w))
+        mesh = mesh.at[flat].add(q, mode="promise_in_bounds")
+    return mesh
+
+
 def paint_f32(positions, n_mesh, box_size, fdtype=jnp.float32):
     """Differentiable CIC paint of counts; order-dependent on GPU (use paint_int on the primal)."""
     mesh = jnp.zeros((n_mesh**3,), dtype=fdtype)
@@ -68,15 +120,13 @@ def paint_f32(positions, n_mesh, box_size, fdtype=jnp.float32):
 def paint_int(positions, n_mesh, box_size, frac_bits=12):
     """Deterministic integer CIC paint; returns the raw int32 mesh (decode: counts_from_int).
 
-    Bit-identical under any scatter order. Each particle's 8 rounded weights need not sum to
-    exactly 2^frac_bits, a mass error of order 8 x 2^-frac_bits per particle.
+    Bit-identical under any scatter order; each particle paints exactly 2^frac_bits
+    (`_add_exact_mass`).
     """
-    scale = np.float32(2.0**frac_bits)  # np scalar: no device array at trace-build time
     mesh = jnp.zeros((n_mesh**3,), dtype=jnp.int32)
     base, frac = _cic_pieces(positions, n_mesh, box_size)
-    for corner in _CORNERS:
-        flat, w = _corner_flat_weight(base, frac, corner, n_mesh)
-        mesh = mesh.at[flat].add(rint_i(w.astype(jnp.float32) * scale), mode="promise_in_bounds")
+    mesh = _add_exact_mass(mesh, _CORNERS, lambda c: _corner_flat_weight(base, frac, c, n_mesh),
+                           lambda c: _cic_is_nearest(frac, c), frac_bits)
     return mesh.reshape(n_mesh, n_mesh, n_mesh)
 
 
@@ -132,6 +182,11 @@ _TSC_OFFSETS = (-1, 0, 1)
 _TSC_CORNERS = [(dx, dy, dz) for dx in _TSC_OFFSETS for dy in _TSC_OFFSETS for dz in _TSC_OFFSETS]
 
 
+def _tsc_is_nearest(corner):
+    """The TSC centre is every particle's nearest corner, its largest weight (>= 1/8)."""
+    return corner == (0, 0, 0)
+
+
 def _tsc_pieces(positions, cell):
     """TSC base cell (int32, stop_gradient) and per-axis weights for offsets (-1, 0, +1).
 
@@ -172,16 +227,20 @@ def paint_tsc_f64(positions, n_mesh, box_size, n_particles_total):
 # Worst-case TSC cell-weight sum per unit occupancy: over the 27 neighbours (max per-axis weight
 # 0.75 at offset 0, 0.5 at +-1), 0.75^3 + 6(0.5)(0.75^2) + 12(0.5^2)(0.75) + 8(0.5^3).
 TSC_CELL_WEIGHT_BOUND = 5.359375
+# Fixed-point rounding on top of it, in units of 2^-frac_bits per unit occupancy: a particle in
+# the cell adds its centre, at most 13 over its weight (26 corners' half-unit roundings); one in
+# each of the 26 neighbours adds a rounded corner, at most half a unit over.
+TSC_ROUNDING_UNITS = 26.0
 
 
 def check_tsc_paint_headroom(n_particles_total, frac_bits, max_cell_particles=1.0e4):
-    """`check_int_paint_headroom` with the strict TSC bound `TSC_CELL_WEIGHT_BOUND`.
+    """`check_int_paint_headroom` with the strict TSC bound `TSC_CELL_WEIGHT_BOUND`, plus the
+    fixed-point rounding `TSC_ROUNDING_UNITS`.
 
     At frac_bits=12 and 1e4 particles/cell the worst case is ~2.2e8 (~9.8x below 2^31).
     """
-    worst_cell_sum = (
-        TSC_CELL_WEIGHT_BOUND * min(float(n_particles_total), max_cell_particles)
-        * 2.0**frac_bits
+    worst_cell_sum = min(float(n_particles_total), max_cell_particles) * (
+        TSC_CELL_WEIGHT_BOUND * 2.0**frac_bits + TSC_ROUNDING_UNITS
     )
     if worst_cell_sum >= 2.0**31:
         raise ValueError(
@@ -197,23 +256,21 @@ def paint_tsc_int(positions, n_mesh, box_size, frac_bits=12, live=None):
     """Deterministic integer TSC paint; returns the raw int32 mesh. Primal-only.
 
     Bit-identical under any scatter or particle order, which the brick-sorted layout (reordered
-    every step) requires. Per-corner rounding gives a mass error of order 27 x 2^-frac_bits
-    per particle. `live` (bool mask) lets streamed callers pad chunks to one compiled shape:
-    masked rows add exactly zero, so the mesh is bitwise the unpadded one.
+    every step) requires; each particle paints exactly 2^frac_bits (`_add_exact_mass`). `live`
+    (bool mask) lets streamed callers pad chunks to one compiled shape: masked rows add exactly
+    zero, so the mesh is bitwise the unpadded one.
     """
-    scale = np.float32(2.0**frac_bits)  # np scalar: no device array at trace-build time
     N = int(n_mesh)
     cell = float(box_size) / N
     base, w = _tsc_pieces(positions, cell)
     mesh = jnp.zeros((N**3,), dtype=jnp.int32)
     m = None if live is None else jnp.asarray(live)
-    for corner in _TSC_CORNERS:
+
+    def piece(corner):
         flat, ww = _tsc_corner_flat_weight(base, w, corner, N)
-        if m is not None:
-            ww = jnp.where(m, ww, 0.0)
-        mesh = mesh.at[flat].add(
-            rint_i(ww.astype(jnp.float32) * scale), mode="promise_in_bounds"
-        )
+        return flat, (ww if m is None else jnp.where(m, ww, 0.0))
+
+    mesh = _add_exact_mass(mesh, _TSC_CORNERS, piece, _tsc_is_nearest, frac_bits, live=m)
     return mesh.reshape(N, N, N)
 
 
@@ -229,7 +286,6 @@ def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
     `dead_rows`: where masked rows add their zero, "spread" (row i -> cell i mod block size) or
     "cell0"; bitwise identical, but "cell0" is a heavily duplicated index, slow on some GPUs.
     """
-    scale = np.float32(2.0**frac_bits)
     N = int(n_mesh)
     cell = float(box_size) / N
     ex, ey, ez = (int(e) for e in extent)
@@ -244,7 +300,8 @@ def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
         dead = jnp.arange(positions.shape[0], dtype=jnp.int32) % (ex * ey * ez)
     else:
         raise ValueError(f"dead_rows must be 'cell0' or 'spread', got {dead_rows!r}")
-    for corner in _TSC_CORNERS:
+
+    def piece(corner):
         dx, dy, dz = corner
         lx = (base[:, 0] + dx - ox) % N
         ly = (base[:, 1] + dy - oy) % N
@@ -254,9 +311,9 @@ def paint_tsc_int_subblock(positions, origin_cells, extent, n_mesh, box_size,
         if m is not None:
             ww = jnp.where(m, ww, 0.0)
             flat = jnp.where(m, flat, dead)
-        mesh = mesh.at[flat].add(
-            rint_i(ww.astype(jnp.float32) * scale), mode="promise_in_bounds"
-        )
+        return flat, ww
+
+    mesh = _add_exact_mass(mesh, _TSC_CORNERS, piece, _tsc_is_nearest, frac_bits, live=m)
     return mesh.reshape(ex, ey, ez)
 
 

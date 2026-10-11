@@ -735,14 +735,14 @@ def test_tile_paint_int_matches_the_f64_twin_within_the_quantization_bound():
     assert err > 0.0, "the two paints agree exactly, so the int path is not quantizing"
 
 
-def test_tile_paint_int_conserves_mass_within_the_fixed_point_rounding():
-    """Integer counterpart of the tile mass test: after per-corner rounding the 8 weights
-    sum to 1 +- 8 * 2^-(frac_bits+1), so mass is conserved to that bound."""
+def test_tile_paint_int_conserves_mass_exactly():
+    """Integer counterpart of the tile mass test: each in-box particle's 8 weights sum to
+    exactly 2^frac_bits, so the painted mass is the in-box count exactly."""
     u, live, shape, cell, _ = _clustered_tile_fixture(seed=55)
     mesh, n_out = forces.tile_paint_int(u, live, shape, cell)
     n_in = int(np.asarray(live).sum()) - int(n_out)
-    total = float(np.asarray(mesh).sum()) / 2.0**12
-    assert total == pytest.approx(n_in, rel=8 * 2.0**-13)
+    assert n_in > 0
+    assert int(np.asarray(mesh, dtype=np.int64).sum()) == n_in * 2**12
 
 
 def test_tile_paint_headroom_uses_the_strict_cic_bound_and_refuses_an_overflow():

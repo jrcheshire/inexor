@@ -211,9 +211,11 @@ Production (`plan.RATIFIED`) uses `alpha = 1`, a float32 coarse mesh, float64 fi
 
 ### Why integer paints
 
-Both arms paint fixed-point weights (`frac_bits`, default 12) into int32 meshes. Integer
-addition is associative, so the density is bit-identical under any particle, atomic or
-chunk order. The layout reorders particles every step, so a float paint would not be
+Both arms paint fixed-point weights (`frac_bits`, default 12) into int32 meshes. Every
+corner but the one nearest the particle adds its weight rounded to `frac_bits`; the nearest
+adds the remainder, so each particle paints exactly 2^frac_bits and the mean density is the
+particle count exactly. Integer addition is associative, so the density is bit-identical
+under any particle, atomic or chunk order. The layout reorders particles every step, so a float paint would not be
 reproducible even on one machine; the integer paint is also what makes the chunked, pooled
 and device coarse paints bitwise one monolithic paint. The float twins (`paint_f32`,
 `paint_tsc_f64`, `tile_paint_f64`) remain for reference arms.

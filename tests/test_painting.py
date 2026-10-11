@@ -7,7 +7,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from inexor.codec import rint_i
 from inexor.painting import (
     _CORNERS,
     _cic_pieces,
@@ -43,18 +42,64 @@ def test_f32_mass_conservation_exact_class():
     assert total == pytest.approx(4096.0, abs=5e-2)  # f32 summation round-off only
 
 
-def test_int_paint_per_particle_weight_sum():
-    # the 8 quantized corner weights of one particle sum to 2^F up to 8 half-ulp
-    # roundings (measured 7.3e-4 relative at F=12)
-    pos = _positions(5, n=8192)
-    F = 12
-    base, frac = _cic_pieces(pos, N, L)
-    wsum = jnp.zeros((8192,), jnp.int32)
-    for corner in _CORNERS:
-        _, w = _corner_flat_weight(base, frac, corner, N)
-        wsum = wsum + rint_i(w * np.float32(2.0**F))
-    rel = jnp.max(jnp.abs(wsum - 2**F)) / 2.0**F
-    assert float(rel) <= 8 * 2.0 ** -(F + 1) / 1.0
+def _sub_cell_positions(cell, n_cells, seed=5, n=6000):
+    """Random positions plus offsets where the rounding and the nearest corner are decided at a
+    boundary: on cell edges, at half a cell (CIC's tie), at +-1/2 of the TSC centre, 1 ulp
+    either side of each, and mixed per axis."""
+    rng = np.random.default_rng(seed)
+    ties = np.array([0.0, 0.5, 1.0 - 2.0**-20, 0.5 - 2.0**-20, 0.5 + 2.0**-20, 0.25, 2.0**-20])
+    grid = np.stack(np.meshgrid(ties, ties, ties, indexing="ij"), -1).reshape(-1, 3)
+    frac = np.concatenate([grid, rng.uniform(size=(n, 3))])
+    cells = rng.integers(0, n_cells, size=frac.shape)
+    return (cells + frac) * cell
+
+
+def test_every_integer_paint_puts_exactly_one_unit_of_mass_per_particle():
+    """Each particle's corner weights sum to exactly 2^F in all four integer paints (the
+    nearest corner takes the remainder of the others' rounding), no corner is negative,
+    and rows masked off (`live`, dead sub-block rows, tile rows outside the box) add 0.
+    Positions in float32 (the coarse arm's) and float64 (the fine tiles'), x64 on as in runs."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        _exact_mass_checks()
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+def _exact_mass_checks():
+    from inexor import forces
+    from inexor.painting import paint_tsc_int, paint_tsc_int_subblock
+
+    F, n, box = 12, 16, 32.0
+    x = jnp.asarray(_sub_cell_positions(box / n, n))
+    one = jnp.array([True])
+    o = jnp.zeros(3, jnp.int32)
+    paints = {
+        "cic": lambda p: paint_int(p[None], n, box, F),
+        "tsc": lambda p: paint_tsc_int(p[None], n, box, F),
+        "tsc_subblock": lambda p: paint_tsc_int_subblock(p[None], o, (n,) * 3, n, box, F),
+        "tile_cic": lambda p: forces.tile_paint_int(p[None], one, (n,) * 3, box / n, F)[0],
+    }
+    for dt in (jnp.float32, jnp.float64):
+        for name, paint in paints.items():
+            meshes = np.asarray(jax.vmap(paint)(x.astype(dt)))
+            sums = meshes.reshape(len(x), -1).sum(axis=1)
+            assert (sums == 2**F).all(), (name, dt, np.unique(sums))
+            assert meshes.min() >= 0, (name, dt, meshes.min())
+
+    # masked rows: exactly the live rows' mass, in every masked form
+    lv = jnp.asarray(np.random.default_rng(6).uniform(size=len(x)) < 0.5)
+    n_live = int(lv.sum())
+    assert 0 < n_live < len(x)
+    assert int(paint_tsc_int(x, n, box, F, live=lv).sum()) == n_live * 2**F
+    for dead in ("spread", "cell0"):
+        sub = paint_tsc_int_subblock(x, o, (n,) * 3, n, box, F, live=lv, dead_rows=dead)
+        assert int(sub.sum()) == n_live * 2**F, dead
+    mesh, n_out = forces.tile_paint_int(x, lv, (n // 2,) * 3, box / n, F)
+    in_box = np.asarray(lv) & np.all(np.asarray(x) < box / 2, axis=1)
+    assert int(n_out) == n_live - int(in_box.sum()) > 0
+    assert int(mesh.sum()) == int(in_box.sum()) * 2**F
 
 
 def test_periodic_edge_deposit():

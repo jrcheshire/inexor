@@ -36,10 +36,11 @@ import numpy as np
 from .painting import (
     _CORNERS as _CIC_CORNERS,
 )
-from .codec import rint_i
 from .painting import (
     _TSC_CORNERS,
     CIC_CELL_WEIGHT_BOUND,
+    _add_exact_mass,
+    _cic_is_nearest,
     check_int_paint_headroom,
     cic_read_vector,
     counts_from_int,
@@ -863,22 +864,18 @@ def tile_paint_int(u, live, shape, cell, frac_bits=TILE_FRAC_BITS):
 
     Integer addition is associative, so the result is bit-identical under any member order or
     atomic order (required because the brick-sorted layout reorders particles). Weights are
-    quantized to `frac_bits` through f32, so accuracy differs slightly from `tile_paint_f64`.
-    Decode with `tile_delta_from_int`. No saturating op: overflow is refused up front by
-    `check_tile_paint_headroom` at the strict 8x CIC stencil bound.
+    quantized to `frac_bits` through f32, each in-box particle's summing to exactly
+    2^frac_bits (`painting._add_exact_mass`), so accuracy differs slightly from
+    `tile_paint_f64`. Decode with `tile_delta_from_int`. No saturating op: overflow is refused
+    up front by `check_tile_paint_headroom` at the strict 8x CIC stencil bound.
     """
     nx, ny, nz = (int(s) for s in shape)
-    scale = np.float32(2.0**frac_bits)  # np scalar: no device array at trace-build time
     base, frac, ok, n_out = _tile_cic_pieces(u, live, (nx, ny, nz), cell)
     mesh = jnp.zeros((nx * ny * nz,), dtype=jnp.int32)
     wlo = 1.0 - frac
-    for dx in (0, 1):
-        for dy in (0, 1):
-            for dz in (0, 1):
-                flat, w = _tile_corner(base, frac, wlo, (dx, dy, dz), (nx, ny, nz), ok)
-                mesh = mesh.at[flat].add(
-                    rint_i(w.astype(jnp.float32) * scale), mode="promise_in_bounds"
-                )
+    mesh = _add_exact_mass(mesh, _CIC_CORNERS,
+                           lambda c: _tile_corner(base, frac, wlo, c, (nx, ny, nz), ok),
+                           lambda c: _cic_is_nearest(frac, c), frac_bits, live=ok)
     return mesh.reshape(nx, ny, nz), n_out
 
 
