@@ -1234,6 +1234,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     ghosts, ghost_rec = exchange_ghosts(st, decomp, comm, decomp.pad)
     rank_rec.update(ghost_rec)
     view = SlabView(st, ghosts)
+    del ghosts  # `view` is their only holder, released after the tile loop
 
     # --- membership, and the capacity one jitted program needs
     b_real = cfg._b_realized
@@ -1365,6 +1366,8 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
 
     # kept so the phase trace has a stable shape (nothing accumulates across the loop)
     ph("tile_loop_end")
+    # the neighbours' slabs serve the tile windows only; the migrate does not read them
+    view = None
 
     if n_owned != st.n_particles:
         raise AssertionError(
