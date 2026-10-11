@@ -469,8 +469,9 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
                 st, one_tile, C, g_coarse, t, bricks, rebase_plan(plan, win, nb), origin,
                 o_cells, extent, shapes, False, True, no_mark, coarse_shard, device,
                 arena_base=win["W"], kernels=kernels)
-            w_new, vs, sc = fn(*head, wd["off"], wd["w"], vs, wd["arena_bucket"], *tail)
-            wd["w"] = w_new
+            # no local alias of the new `w`: `del win, wd` must free the window's last one
+            # before the next window is staged, or two windows' `w` share the card
+            wd["w"], vs, sc = fn(*head, wd["off"], wd["w"], vs, wd["arena_bucket"], *tail)
             los.append(sc["lo"])
             his.append(sc["hi"])
             extents.append(int(extent))
