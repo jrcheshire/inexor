@@ -112,6 +112,32 @@ def test_a_snapshot_makes_products_and_a_mid_run_checkpoint_does_not(snapshot_ru
     assert not os.path.exists(d / "mid-pk.json")
 
 
+def test_fine_dtype_reaches_the_run_and_its_products_must_name_it(device_run):
+    """`--fine-dtype float32` runs the fine tiles in single precision; it is fingerprinted, so a
+    card that omits it is refused and one that passes it loads, in both lanes."""
+    d = device_run
+    common = ["--preset", PRESET, "--cards", "1", "--beat", "600"]
+    _run([DRIVER, "run", *common, "--workdir", str(d / "ics"), "--k-steps", "40", *LAYOUT,
+          "--fine-dtype", "float32", "--checkpoint-dir", str(d / "f32" / "ckpt"),
+          "--checkpoint-every", "1", "--card", str(d / "f32-run.json"), "--stop-at", "1"])
+    assert json.load(open(d / "f32-run.json"))["config"]["fine_dtype"] == "float32"
+    prod = [*common, "--checkpoint-dir", str(d / "f32" / "ckpt"), "--k-steps", "40",
+            "--expect-step", "1", *LAYOUT, "--min-weight", "1", "--allow-partial"]
+    p = _run([DRIVER, "card", *prod, "--card", str(d / "f32-card-f64.json"),
+              "--out", str(d / "f32-pk-f64.json")], ok=False)
+    assert p.returncode != 0 and "different configuration" in p.stdout + p.stderr
+    _run([DRIVER, "card", *prod, "--fine-dtype", "float32", "--card", str(d / "f32-card.json"),
+          "--out", str(d / "f32-pk.json")])
+    assert json.load(open(d / "f32-pk.json"))["step"] == 1
+    # no --a-init: the device driver's schedule starts at the default a = 0.1
+    cpu = [REALIZATION, "card", "--config", PRESET, "--tile-workers", "1",
+           "--workdir", str(d / "f32"), "--k-steps", "40", *LAYOUT, "--min-weight", "1",
+           "--allow-partial"]
+    p = _run(cpu, ok=False)
+    assert p.returncode != 0 and "different configuration" in p.stdout + p.stderr
+    _run(cpu + ["--fine-dtype", "float32"])
+
+
 def _sha(rec):
     return None if rec is None else rec.get("sha256")
 

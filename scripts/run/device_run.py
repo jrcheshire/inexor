@@ -660,11 +660,12 @@ def _y_blocks(value):
 
 
 def _planner(preset, cards, slack, arena, alloc_margin=0.10, n_nodes=1, host_gb=1026.0,
-             device_gb=199.0, y_blocks=None):
+             device_gb=199.0, y_blocks=None, fine_dtype="float64"):
     cmd = [sys.executable, "-m", "inexor.plan", "--preset", preset, "--backend", "device",
            "--n-gpus", str(cards), "--host-gb", f"{host_gb:g}", "--device-gb", f"{device_gb:g}",
            "--arena-frac", str(arena), "--slack", str(slack),
-           "--alloc-margin", str(alloc_margin), "--y-blocks", str(y_blocks or "auto")]
+           "--alloc-margin", str(alloc_margin), "--y-blocks", str(y_blocks or "auto"),
+           "--fine-dtype", fine_dtype]
     if n_nodes != 1:
         cmd += ["--n-nodes", str(n_nodes)]
     out = subprocess.run(cmd, capture_output=True, text=True,
@@ -741,7 +742,7 @@ def cmd_preflight(args):
 
     plan = _planner(args.preset, args.cards, args.slack, args.arena_frac, args.alloc_margin,
                     n_nodes=args.n_nodes, host_gb=args.host_gb, device_gb=args.device_gb,
-                    y_blocks=args.y_blocks)
+                    y_blocks=args.y_blocks, fine_dtype=args.fine_dtype)
     card["planner"] = plan
     _rss, _hwm, avail = host_memory()
     nm = numa_memory()
@@ -900,6 +901,7 @@ def cmd_run(args):
         ec = engine_config(args.preset, coarse_backend="device", tile_backend="device",
                            migrate_backend="device", device_cards=args.cards, tile_workers=1,
                            device_y_blocks=args.y_blocks, brick_slack=args.slack,
+                           fine_dtype=args.fine_dtype,
                            checkpoint_dir=args.checkpoint_dir if args.checkpoint_every else None,
                            checkpoint_every=args.checkpoint_every)
         ec.validate()
@@ -1143,7 +1145,7 @@ def _product(args, kind):
         devs = devs[:args.cards]
         ec = engine_config(args.preset, coarse_backend="device", tile_backend="device",
                            migrate_backend="device", device_cards=args.cards, tile_workers=1,
-                           brick_slack=args.slack)
+                           brick_slack=args.slack, fine_dtype=args.fine_dtype)
         ec.validate()
         decomp = Decomp.build(ec, n_ranks=1 if comm is None else comm.size, rank=rank)
         slabs = decomp.slabs if multi else None
@@ -1394,6 +1396,9 @@ def main(argv=None):
         p.add_argument("--slack", type=float, default=0.10)
         p.add_argument("--alloc-margin", type=float, default=0.10)
         p.add_argument("--arena-frac", type=float, default=0.01)
+        p.add_argument("--fine-dtype", default="float64", choices=("float64", "float32"),
+                       help="precision of the fine tiles, their FFTs and the kick (production: "
+                            "float64); fingerprinted, so products of a run must pass the same")
         p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"),
                        help="the second-order growth the ICs must have been generated with")
     pf = sub.choices["preflight"]
@@ -1498,6 +1503,9 @@ def main(argv=None):
         p.add_argument("--slack", type=float, default=0.10)
         p.add_argument("--alloc-margin", type=float, default=0.10)
         p.add_argument("--arena-frac", type=float, default=0.01)
+        p.add_argument("--fine-dtype", default="float64", choices=("float64", "float32"),
+                       help="precision of the fine tiles, their FFTs and the kick (production: "
+                            "float64); fingerprinted, so products of a run must pass the same")
         p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"))
         p.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
         p.add_argument("--comm", default="serial", choices=("serial", "mpi"))

@@ -52,7 +52,8 @@ def engine_config(preset, **overrides):
     """The `EngineConfig` the production driver builds: preset geometry + `RATIFIED` knobs.
 
     Shared by the planner and `scripts/run/realization.py`. `overrides` are for per-invocation
-    knobs (workers, slack, checkpointing), not for undoing `RATIFIED`.
+    knobs (workers, slack, checkpointing), not for undoing `RATIFIED`; the drivers'
+    `--fine-dtype` is the one exception, for precision comparisons.
     """
     from .engine import EngineConfig
 

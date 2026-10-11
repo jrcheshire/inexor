@@ -316,6 +316,7 @@ def _engine_config(g, args, checkpoint_dir):
         # getattr: tests build a bare Namespace, and an absent flag must mean
         # the library default
         coarse_match_order=getattr(args, "coarse_match_order", 3),
+        fine_dtype=getattr(args, "fine_dtype", "float64"),
     )
     ec.validate()
     return ec
@@ -948,6 +949,9 @@ def build_parser():
     ap.add_argument("--pencil-batch", type=int, default=1,
                     help="ics --generator device: y-pencil planes per card program")
     ap.add_argument("--slack", type=float, default=0.20)
+    ap.add_argument("--fine-dtype", default="float64", choices=("float64", "float32"),
+                    help="precision of the fine tiles, their FFTs and the kick (production: "
+                         "float64); fingerprinted, so card/export must match the run's")
     ap.add_argument("--arena-frac", type=float, default=0.20)
     ap.add_argument("--alloc-margin", type=float, default=0.10)
     ap.add_argument("--tile-workers", type=int, default=16)
