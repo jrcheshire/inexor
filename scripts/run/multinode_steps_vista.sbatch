@@ -31,7 +31,9 @@
 # Y_BLOCKS (auto; the production run, preflight and planner, not the control),
 # CONTROL_PRESET (c-1024), SLACK / ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), QUIET_S (600),
 # PROD_DIR (not under REAL_DIR/ckpt) with WITH_EXPORT (1), TIMED (--timed-all; e.g.
-# "--timed-every 5" leaves the steps between untimed).
+# "--timed-every 5" leaves the steps between untimed), SNAPSHOT_Z (e.g. "2,1,0.5":
+# synchronized snapshots at the nearest steps, in REAL_DIR/snapshots/step<NNNN>; with
+# PROD_DIR each gets the products job too, into PROD_DIR/step<NNNN>).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R IC_DIR=$R/c-gh-ics REAL_DIR=$R/c-gh-r1 \
 #     CONTROL_REF=$R/mn-gate-c-1024-1043437/mpi/ckpt CONTROL_ICS=$R/mn-gate-c-1024-1043437/ics \
 #     sbatch -A <account> scripts/run/multinode_steps_vista.sbatch
@@ -90,6 +92,10 @@ EVERY=${EVERY:-20} CONTROL_PRESET=${CONTROL_PRESET:-c-1024}
 SLACK=${SLACK:-0.10} ALLOC_MARGIN=${ALLOC_MARGIN:-0.10} ARENA=${ARENA:-${ARENA_FRAC:-0.01}}
 QUIET_S=${QUIET_S:-600} Y_BLOCKS=${Y_BLOCKS:-auto} WITH_EXPORT=${WITH_EXPORT:-1}
 TIMED=${TIMED:---timed-all}
+SNAPSHOT_Z=${SNAPSHOT_Z:-}
+SNAPS=$REAL_DIR/snapshots
+SNAP_ARGS=()
+[ -n "$SNAPSHOT_Z" ] && SNAP_ARGS=(--snapshot-z "$SNAPSHOT_Z" --snapshot-dir "$SNAPS")
 N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 
 CKPT=$REAL_DIR/ckpt
@@ -223,7 +229,7 @@ fi
 # --- production: EXPECT_STEP -> STOP
 run_leg --quiet-limit "$QUIET_S" \
   "steps $EXPECT_STEP->$STOP" ranks steps "$PRESET" "$IC_DIR" "$CKPT" "$K" "$EXPECT_STEP" \
-  "$STOP" "$EVERY" "" --y-blocks "$Y_BLOCKS"
+  "$STOP" "$EVERY" "" --y-blocks "$Y_BLOCKS" "${SNAP_ARGS[@]}"
 r=$?; summarize steps "$EXPECT_STEP"
 [ $r -eq 0 ] || stop_job "the steps leg failed"
 
@@ -247,5 +253,16 @@ if [ -n "${PROD_DIR:-}" ]; then
     CKPT_DIR="$CKPT" PROD_DIR="$PROD_DIR" PRESET="$PRESET" K="$K" EXPECT_STEP="$STOP" \
     WITH_EXPORT="$WITH_EXPORT" SLACK="$SLACK" ALLOC_MARGIN="$ALLOC_MARGIN" ARENA_FRAC="$ARENA" \
     bash "$SRC/scripts/run/multinode_products_vista.sbatch"
+  # each snapshot the run has written (this segment's or an earlier one's), into its own dir
+  if [ -n "$SNAPSHOT_Z" ]; then
+    for g in "$SNAPS"/step*/gen0/manifest.json; do
+      [ -f "$g" ] || continue
+      sd=$(dirname "$(dirname "$g")"); n=$(basename "$sd"); step=$((10#${n#step}))
+      run_leg "products $n" env INEXOR_SRC="$SRC" INEXOR_RUNS="$RUNS" N_RANKS="$N_RANKS" \
+        CKPT_DIR="$sd" PROD_DIR="$PROD_DIR/$n" PRESET="$PRESET" K="$K" EXPECT_STEP="$step" \
+        WITH_EXPORT="$WITH_EXPORT" SLACK="$SLACK" ALLOC_MARGIN="$ALLOC_MARGIN" \
+        ARENA_FRAC="$ARENA" bash "$SRC/scripts/run/multinode_products_vista.sbatch"
+    done
+  fi
 fi
 exit $rc_total
