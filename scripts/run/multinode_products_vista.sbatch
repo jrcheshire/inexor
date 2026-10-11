@@ -25,8 +25,8 @@
 # Requires INEXOR_RUNS, CKPT_DIR (the run's checkpoint dir), PROD_DIR (not under CKPT_DIR;
 # the card lands in PROD_DIR/pk.json, the export in PROD_DIR/export, which must not hold
 # files), and INEXOR_SRC or submission from the checkout. Optional: PRESET (c-gh); K and
-# EXPECT_STEP (the newest checkpoint's n_steps and step); ALLOW_PARTIAL (0: refuse an
-# export short of K); WITH_EXPORT (1; 0 = the card only); SMALL_CKPT + SMALL_PRESET (c-1024); REF_EXPORT; REF_CARD; SLACK /
+# EXPECT_STEP (the newest checkpoint's n_steps and step); ALLOW_PARTIAL (0: refuse a
+# checkpoint that is neither the last step nor a snapshot, for the card and the export); WITH_EXPORT (1; 0 = the card only); SMALL_CKPT + SMALL_PRESET (c-1024); REF_EXPORT; REF_CARD; SLACK /
 # ALLOC_MARGIN (0.10), ARENA_FRAC (0.01); QUIET_S (900).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R CKPT_DIR=$R/c-gh-k120/ckpt PROD_DIR=$R/c-gh-k120-mn \
 #     SMALL_CKPT=$R/mn-gate-c-1024-1043437/mpi/ckpt REF_EXPORT=$R/c-gh-k120-product/export \
@@ -182,10 +182,10 @@ if [ -n "${SMALL_CKPT:-}" ]; then
   fi
   run_leg --quiet-limit "$QUIET_S" small-card-1 \
     prod_one card small-card-1 "$SMALL_PRESET" "$SMALL_CKPT" "$SMALL_K" "$SMALL_STEP" \
-    --out "$S/pk-1.json" || stop_job "the small one-rank card failed"
+    --out "$S/pk-1.json" --allow-partial || stop_job "the small one-rank card failed"
   run_leg --quiet-limit "$QUIET_S" "small-card-$N_RANKS" \
     prod_ranks card small-card "$SMALL_PRESET" "$SMALL_CKPT" "$SMALL_K" "$SMALL_STEP" \
-    "$PLANT" --out "$S/pk-$N_RANKS.json" "${PLANT_CARD[@]}"
+    "$PLANT" --out "$S/pk-$N_RANKS.json" --allow-partial "${PLANT_CARD[@]}"
   r=$?; summarize small-card "$SMALL_STEP"
   [ $r -eq 0 ] || stop_job "the small every-rank card failed"
   gate_with small-card same_card "$S/pk-1.json" "$S/pk-$N_RANKS.json" \
@@ -205,7 +205,8 @@ fi
 
 # --- the products
 run_leg --quiet-limit "$QUIET_S" card \
-  prod_ranks card card "$PRESET" "$CKPT_DIR" "$K" "$EXPECT_STEP" "$PLANT" --out "$PROD_DIR/pk.json"
+  prod_ranks card card "$PRESET" "$CKPT_DIR" "$K" "$EXPECT_STEP" "$PLANT" --out "$PROD_DIR/pk.json" \
+  "${PARTIAL[@]}"
 r=$?; summarize card "$EXPECT_STEP"
 [ $r -eq 0 ] || stop_job "the card failed"
 if [ -n "${REF_CARD:-}" ]; then
