@@ -1613,6 +1613,22 @@ def epoch_record(epoch, step):
     return out
 
 
+def newest_checkpoint_provenance(checkpoint_dir):
+    """The provenance `load_checkpoint` would pick (the highest step among generations whose
+    manifest is an inexor checkpoint), read without loading the state; None if there is none."""
+    best = None
+    for gen in (0, 1):
+        mpath = os.path.join(checkpoint_dir, f"gen{gen}", "manifest.json")
+        if not os.path.exists(mpath):
+            continue
+        with open(mpath) as fh:
+            prov = json.load(fh).get("provenance", {})
+        if prov.get("kind") == "inexor-checkpoint" and (
+                best is None or int(prov["step"]) > int(best["step"])):
+            best = dict(prov, gen=gen)
+    return best
+
+
 def load_checkpoint(checkpoint_dir, cfg, coeffs, brick_slack=None, alloc_margin=0.10,
                     arena_frac=None, alloc=None, comm=None, slabs=None):
     """Newest complete checkpoint under `checkpoint_dir` -> `(st, resume)`.

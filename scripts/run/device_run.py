@@ -45,8 +45,10 @@ Refusals in `run`: a card or checkpoint under the IC directory; a checkpoint dir
 already holds a checkpoint unless `--expect-step` (resume) is given; a resume whose
 newest checkpoint is not at `--expect-step`; a memory binding that did not apply. In `card`
 and `export`: an output under the checkpoint directory, a non-empty export directory, a
-newest checkpoint not at `--expect-step`, and (export) a checkpoint short of `--k-steps`
-unless `--allow-partial`.
+newest checkpoint not at `--expect-step`, and a checkpoint that is neither the last step nor
+a snapshot (`run --snapshot-z`), whose positions are half a step past its epoch, unless
+`--allow-partial`. In `run`, also snapshots under the ICs or the checkpoint directory, and
+on a run from the ICs a snapshot directory that already holds one of its steps.
 
 What survives a failure:
 - Every engine phase boundary prints one line when it is crossed (wall clock, step,
@@ -593,6 +595,28 @@ def timed_steps(k0, stop, *, timed_all=False, every=0, last=False):
     return (stop - 1,) if last else ()
 
 
+def snapshot_steps_for(zs, a_steps):
+    """[(z asked, step, z of that step)] for each redshift in `zs`: the step boundary in
+    1..K-1 whose a is nearest 1 / (1 + z). Refuses a z outside the schedule's interior and two
+    that land on one step."""
+    import numpy as np
+
+    a_steps = np.asarray(a_steps, dtype=np.float64)
+    out = []
+    for z in zs:
+        a = 1.0 / (1.0 + float(z))
+        if not a_steps[0] < a < a_steps[-1]:
+            raise ValueError(f"snapshot z={z} (a={a:.4f}) is outside the schedule's interior "
+                             f"a in ({a_steps[0]:.4f}, {a_steps[-1]:.4f}); the ICs and the "
+                             "final state are written anyway")
+        s = 1 + int(np.argmin(np.abs(a_steps[1:-1] - a)))
+        out.append((float(z), s, float(1.0 / a_steps[s] - 1.0)))
+    steps = [s for _, s, _ in out]
+    if len(set(steps)) != len(steps):
+        raise ValueError(f"snapshot redshifts {list(zs)} land on steps {steps}: two on one step")
+    return out
+
+
 def _y_blocks(value):
     """`--y-blocks`: a count, or "auto" (None: `decomp.auto_y_blocks`)."""
     return None if value == "auto" else int(value)
@@ -788,6 +812,12 @@ def cmd_run(args):
             raise SystemExit(f"FATAL: {what} would be written under the IC directory")
     if args.checkpoint_every and not args.checkpoint_dir:
         raise SystemExit("FATAL: --checkpoint-every needs --checkpoint-dir")
+    if args.snapshot_z and not args.snapshot_dir:
+        raise SystemExit("FATAL: --snapshot-z needs --snapshot-dir")
+    for what, root in (("the IC directory", ics), ("the checkpoint directory",
+                                                   args.checkpoint_dir)):
+        if args.snapshot_dir and root and under(args.snapshot_dir, os.path.realpath(root)):
+            raise SystemExit(f"FATAL: snapshots would be written under {what}")
     if args.expect_step and not args.checkpoint_dir:
         raise SystemExit("FATAL: --expect-step needs --checkpoint-dir to resume from")
     if not args.expect_step and args.checkpoint_dir and any(
@@ -854,6 +884,18 @@ def cmd_run(args):
 
         cosmo = _cosmo()
         co, a_steps = _coeffs(cosmo, args.k_steps, growth2=args.growth2)
+        snaps = snapshot_steps_for(args.snapshot_z, a_steps) if args.snapshot_z else []
+        snap_steps = [x for _, x, _ in snaps]
+        card["snapshots"] = [dict(z=z, step=x, z_step=zx) for z, x, zx in snaps]
+        if snaps:
+            print("  snapshots: " + ", ".join(f"z={z:g} -> step {x} (z={zx:.4f})"
+                                              for z, x, zx in snaps), flush=True)
+        if not args.expect_step:
+            old = [x for x in snap_steps if os.path.exists(os.path.join(
+                args.snapshot_dir, f"step{x:04d}", "gen0", "manifest.json"))]
+            if old:
+                raise RuntimeError(f"{args.snapshot_dir} already holds snapshots at steps {old}; "
+                                   "a run from the ICs would overwrite them")
         resume = None
         if args.expect_step:
             # a resume job that silently restarted from the ICs would burn its whole
@@ -898,12 +940,14 @@ def cmd_run(args):
             "generator", "commit", "host", "when") if k in ic_prov})
         out = engine.run(st, ec, co, phase=mon, resume=resume, stop_at=args.stop_at,
                          collect=collect, timed_steps=timed, epoch=epoch,
-                         comm=comm, decomp=decomp, source=source)
+                         comm=comm, decomp=decomp, source=source,
+                         snapshot_steps=snap_steps, snapshot_dir=args.snapshot_dir)
         card["finished"] = time.time()
         # a checkpoint is written after the last boundary and has none of its own
         card["after_last_boundary_s"] = card["finished"] - mon.t_last
         # the receipt lands on the step's stats after `collect` has seen them
         card["checkpoints"] = [o.get("checkpoint") for o in out]
+        card["snapshot_dirs"] = [o["snapshot"] for o in out if o.get("snapshot")]
         card["run_host_peak"] = mon.run_peak
         print(f"  {card['after_last_boundary_s']:.1f} s after the last boundary; checkpoints "
               f"{card['checkpoints']}", flush=True)
@@ -1069,6 +1113,16 @@ def _product(args, kind):
 
         cosmo = _cosmo()
         co, a_steps = _coeffs(cosmo, args.k_steps, growth2=args.growth2)
+        # before the (long) load: products need positions and velocities at one epoch
+        head = engine.newest_checkpoint_provenance(args.checkpoint_dir)
+        if (head is not None and not engine.synchronized(head, args.k_steps)
+                and not args.allow_partial):
+            raise RuntimeError(
+                f"the step-{head['step']} checkpoint in {args.checkpoint_dir} is neither the "
+                f"last of {args.k_steps} steps nor a snapshot: its positions are half a step "
+                "past its epoch (the drift is fused across steps), so a card or export would "
+                "carry the wrong one. Use a snapshot (run --snapshot-z) or the final "
+                "checkpoint, or pass --allow-partial if that is deliberate.")
         t0 = time.time()
         st, resume = engine.load_checkpoint(
             args.checkpoint_dir, ec, co, brick_slack=args.slack,
@@ -1113,11 +1167,6 @@ def _product(args, kind):
             print(f"  card: {res['n_bins']} bins, {wall / 60:.1f} min; -> {args.out}",
                   flush=True)
         else:
-            if step < args.k_steps and not args.allow_partial:
-                raise RuntimeError(
-                    f"the checkpoint is at step {step} of {args.k_steps}; exporting now would "
-                    "produce a mock at the wrong epoch. Pass --allow-partial if that is "
-                    "deliberate.")
             timings = {}
             epoch = {} if args.d_time else dict(a=a_out, cosmo=cosmo)
             n_all = (int(st.n_particles) if comm is None
@@ -1329,6 +1378,13 @@ def main(argv=None):
                     help="synced per-phase breakdown of the device passes on the last step")
     pr.add_argument("--timed-all", action="store_true",
                     help="the same breakdown on every step")
+    pr.add_argument("--snapshot-z", default=[], metavar="Z,Z,...",
+                    type=lambda t: [float(x) for x in t.split(",") if x.strip()],
+                    help="write a synchronized snapshot at the step boundary nearest each "
+                         "redshift (engine.run snapshot_steps); a resume must give the same")
+    pr.add_argument("--snapshot-dir", default=None,
+                    help="where snapshots go (step<NNNN>/gen0), not under the ICs or "
+                         "--checkpoint-dir")
     pr.add_argument("--timed-every", type=int, default=0, metavar="N",
                     help="the same breakdown on every N-th step (absolute step k with "
                          "(k + 1) %% N == 0); the steps between are untimed, so their wall "
@@ -1401,6 +1457,9 @@ def main(argv=None):
         p.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
         p.add_argument("--comm", default="serial", choices=("serial", "mpi"))
         p.add_argument("--comm-timeout", type=float, default=1800.0)
+        p.add_argument("--allow-partial", action="store_true",
+                       help="a checkpoint that is neither the last step nor a snapshot "
+                            "(positions half a step past its epoch)")
     pc = sub.choices["card"]
     pc.add_argument("--out", required=True, help="the P(k) card JSON (rank 0 writes it)")
     pc.add_argument("--slab", type=int, default=32)
@@ -1413,8 +1472,6 @@ def main(argv=None):
     pe.add_argument("--dtype", default="float32", choices=("float32", "float64"))
     pe.add_argument("--d-time", action="store_true",
                     help="write the native dx/dD velocity instead of peculiar km/s")
-    pe.add_argument("--allow-partial", action="store_true",
-                    help="export a checkpoint short of --k-steps")
     ps = sub.add_parser("summarize")
     ps.add_argument("--card", required=True)
     ps.add_argument("--gpu-csv", default=None)

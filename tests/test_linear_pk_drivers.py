@@ -70,11 +70,46 @@ def device_run(table, tmp_path_factory):
     _run(run + ["--card", str(d / "run1.json"), "--stop-at", "2", "--expect-step", "1"])
     prod = [*common, "--checkpoint-dir", str(d / "ckpt"), "--k-steps", "40",
             "--expect-step", "2", *LAYOUT]
+    # step 2 of 40 is not synchronized; the table is what this checks, so it is allowed
     _run([DRIVER, "card", *prod, "--card", str(d / "card-run.json"),
-          "--out", str(d / "pk.json"), "--min-weight", "1"])
+          "--out", str(d / "pk.json"), "--min-weight", "1", "--allow-partial"])
     _run([DRIVER, "export", *prod, "--card", str(d / "export-run.json"),
           "--export-dir", str(d / "export"), "--allow-partial"])
     return d
+
+
+@pytest.fixture(scope="module")
+def snapshot_run(device_run):
+    """Three steps of 40 from the same ICs with a snapshot at z = 7.9 (step 2 of this
+    schedule, a = 0.1 x 10^(2/40)) and a checkpoint at step 3."""
+    d = device_run
+    common = ["--preset", PRESET, "--cards", "1", "--beat", "600"]
+    _run([DRIVER, "run", *common, "--workdir", str(d / "ics"), "--k-steps", "40", *LAYOUT,
+          "--checkpoint-dir", str(d / "snap-ckpt"), "--checkpoint-every", "3",
+          "--snapshot-z", "7.9", "--snapshot-dir", str(d / "snaps"),
+          "--card", str(d / "snap-run.json"), "--stop-at", "3"])
+    return d
+
+
+def test_a_snapshot_makes_products_and_a_mid_run_checkpoint_does_not(snapshot_run):
+    d = snapshot_run
+    run = json.load(open(d / "snap-run.json"))
+    assert [s["step"] for s in run["snapshots"]] == [2]
+    assert run["snapshot_dirs"] == [str(d / "snaps" / "step0002" / "gen0")]
+    prov = json.load(open(d / "snaps" / "step0002" / "gen0" / "manifest.json"))["provenance"]
+    assert prov["snapshot"] is True and prov["snapshot_steps"] == [2]
+    common = ["--preset", PRESET, "--cards", "1", "--beat", "600", "--k-steps", "40", *LAYOUT]
+    # the snapshot is synchronized: no override needed
+    _run([DRIVER, "card", *common, "--checkpoint-dir", str(d / "snaps" / "step0002"),
+          "--expect-step", "2", "--card", str(d / "snap-card-run.json"),
+          "--out", str(d / "snap-pk.json"), "--min-weight", "1"])
+    assert json.load(open(d / "snap-pk.json"))["step"] == 2
+    # the step-3 checkpoint is not, and is refused before its state is loaded
+    p = _run([DRIVER, "card", *common, "--checkpoint-dir", str(d / "snap-ckpt"),
+              "--expect-step", "3", "--card", str(d / "mid-card-run.json"),
+              "--out", str(d / "mid-pk.json"), "--min-weight", "1"], ok=False)
+    assert p.returncode != 0 and "neither the last" in p.stdout + p.stderr
+    assert not os.path.exists(d / "mid-pk.json")
 
 
 def _sha(rec):

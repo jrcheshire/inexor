@@ -25,7 +25,8 @@ Conventions and refusals:
 - The preset geometry must equal `_instruments.CONFIGS` for any config both define.
 - `run` resumes from a checkpoint whenever one exists and prints which source it
   used; starting from ICs, it refuses ICs made at another `--a-init`/`--growth2`.
-- `export` refuses a checkpoint short of `--k-steps` unless `--allow-partial`.
+- `card` and `export` refuse a checkpoint that is neither the last step nor a snapshot
+  (positions half a step past its epoch) unless `--allow-partial`.
 - In the library: `write_particles` refuses a short file, `pk_summary_card` an
   empty card, and `stop_at` a stop off a checkpoint boundary.
 - Walls, peaks, the phase card and the z profile go to
@@ -660,6 +661,14 @@ def _state_at_head(args, ec, co, alloc=None):
     have = _newest_checkpoint_step(args)
     if have is None:
         raise SystemExit("no checkpoint to read; run `run` first")
+    head = engine.newest_checkpoint_provenance(_ckpt_dir(args))
+    if (head is not None and not engine.synchronized(head, args.k_steps)
+            and not args.allow_partial):
+        raise SystemExit(
+            f"the step-{head['step']} checkpoint is neither the last of {args.k_steps} steps "
+            "nor a snapshot: its positions are half a step past its epoch (the drift is fused "
+            "across steps), so a card or export would carry the wrong one. Pass "
+            "--allow-partial if that is deliberate.")
     st, resume = engine.load_checkpoint(_ckpt_dir(args), ec, co, arena_frac=args.arena_frac,
                                         alloc_margin=args.alloc_margin, alloc=alloc)
     return st, int(resume["step"]), resume
@@ -709,12 +718,6 @@ def cmd_export(args):
     ec = _engine_config(g, args, _ckpt_dir(args))
     st, step, resume = _state_at_head(args, ec, co)
     linear_pk = _linear_pk(resume, cosmo)
-    if step < args.k_steps and not args.allow_partial:
-        raise SystemExit(
-            f"the checkpoint is at step {step} of {args.k_steps}; exporting now would "
-            "produce a mock at the wrong epoch. Pass --allow-partial if that is "
-            "deliberate."
-        )
     out_dir = args.export_dir or os.path.join(args.workdir, "export")
     a_out = float(a_steps[-1]) if step >= args.k_steps else float(a_steps[step])
     print(f"== EXPORT {args.config} at step {step}, a={a_out:.4f} -> {out_dir}")
