@@ -14,7 +14,8 @@ such later slab is uploaded first (read-ahead); writes go in ascending slab orde
 be overrun because the allocation refusal bounds the new allocation by the old `arena_base`.
 With several cards (`devices=`), card k sweeps its own contiguous slabs; the new ranges are
 disjoint, and every slab whose old range intersects another card's new range is uploaded by its
-owner before any card writes.
+owner before any card writes. A node-local state (one rank's slabs) repacks its own slabs only,
+as the host repack does; nothing crosses ranks.
 """
 
 from __future__ import annotations
@@ -96,7 +97,10 @@ def repack_geometry(st, brick_slack):
     Duplicated rather than shared so the host repack stays an independent reference;
     `tests/test_repack_device.py` pins the two equal."""
     p3 = st.buckets_per_brick
-    run_counts = st.occupancy.reshape(st.n_bricks, p3).sum(axis=1, dtype=np.int64)
+    blo, bhi = st.owned_bricks
+    # bricks this state does not own count 0
+    run_counts = np.zeros(st.n_bricks, dtype=np.int64)
+    run_counts[blo:bhi] = st.occupancy.reshape(bhi - blo, p3).sum(axis=1, dtype=np.int64)
     arena_live = np.nonzero(st.arena_bucket >= 0)[0]
     counts = run_counts.copy()
     if len(arena_live):
@@ -169,27 +173,28 @@ def repack_device(st, brick_slack=0.10, timings=None, devices=None):
     this driver holds), plus a `repack_device` stats dict. Needs `jax_enable_x64`.
 
     `devices` is a sequence of jax devices, one per card (None: jax's default device).
+    A node-local `st` repacks its owned slabs.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     from ..eject_jax import require_x64
     from ..ooc_fft import partition_units
-    from ..state import require_whole
 
     global CALLS
-    # across ranks the repack runs fused with the migrate (`device.fused`)
-    require_whole(st, "device.repack.repack_device")
     require_x64()
     CALLS += 1
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
     nb2 = nb * nb
+    lo_s, hi_s = st.owned_slabs
+    k0 = int(st.bucket_lo)
     has_ids = st.ids is not None
     run_counts, counts, new_start, n_alloc = repack_geometry(st, brick_slack)
     devs = [None] if devices is None else list(devices)
     if not devs:
         raise ValueError("devices= was an empty sequence; pass None for one card")
     W = len(devs)
-    parts = [(0, nb)] if W == 1 else partition_units(nb, W, 1)
+    parts = [(lo_s, hi_s)] if W == 1 else [
+        (lo_s + int(a), lo_s + int(b)) for a, b in partition_units(hi_s - lo_s, W, 1)]
     clock = _Clock(timings if W == 1 else None)
 
     # the residents' payload, lifted once and grouped by brick
@@ -246,7 +251,7 @@ def repack_device(st, brick_slack=0.10, timings=None, devices=None):
             e = windows[s]
             lo_b, hi_b = e["lo_b"], e["hi_b"]
             n_lo, n_hi = int(new_start[lo_b]), int(new_start[hi_b])
-            occ = np.asarray(st.occupancy)[lo_b * p3: hi_b * p3].reshape(nb2, p3)
+            occ = np.asarray(st.occupancy)[lo_b * p3 - k0: hi_b * p3 - k0].reshape(nb2, p3)
             live = run_counts[lo_b:hi_b]
             ar_counts = k_per_brick[lo_b:hi_b]
             ar_offsets = np.zeros(nb2 + 1, dtype=np.int64)
@@ -293,7 +298,7 @@ def repack_device(st, brick_slack=0.10, timings=None, devices=None):
             st.w[n_lo:n_hi] = np.asarray(out_w)[:m]
             if has_ids:
                 st.ids[n_lo:n_hi] = np.asarray(out_ids)[:m]
-            new_occ[lo_b * p3: hi_b * p3] = np.asarray(occ_s)
+            new_occ[lo_b * p3 - k0: hi_b * p3 - k0] = np.asarray(occ_s)
             acc["scratch"] = max(acc["scratch"], lifted + m * (
                 st.off.itemsize * 3 + st.w.itemsize * 3 + (st.ids.itemsize if has_ids else 0)))
             out_off = out_w = out_ids = occ_s = None
@@ -328,7 +333,7 @@ def repack_device(st, brick_slack=0.10, timings=None, devices=None):
     st.arena_bucket[:] = -1
     st._invalidate_arena_index()
     clock.mark("pass: tail")
-    receipt = dict(slabs=nb, programs=len(_repack_programs()) - programs0,
+    receipt = dict(slabs=hi_s - lo_s, programs=len(_repack_programs()) - programs0,
                    windows_peak=int(max(a["peak_windows"] for a in accs)),
                    readahead_uploads=int(sum(a["readahead"] for a in accs)),
                    empty_slabs=int(sum(a["empty"] for a in accs)),

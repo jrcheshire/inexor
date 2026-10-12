@@ -1051,12 +1051,13 @@ def _migrate_pass(st, cfg, c_drift, pool, timings=None, comm=None, devices=None)
     return drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel)
 
 
-def _repack_pass(st, cfg, timings=None):
+def _repack_pass(st, cfg, timings=None, devices=None):
     """Route the repack like the migrate; the device pass adds a `repack_device` receipt."""
     if cfg.migrate_backend == "device":
         from .device.repack import repack_device
 
-        return repack_device(st, brick_slack=cfg.brick_slack, devices=_cards(cfg),
+        return repack_device(st, brick_slack=cfg.brick_slack,
+                             devices=_cards(cfg) if devices is None else devices,
                              timings=timings)
     return st.repack(brick_slack=cfg.brick_slack)
 
@@ -1877,6 +1878,10 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                 )
                 ph("snapshot")
                 _migrate_pass(st, cfg, after[k], pool, comm=comm, devices=devs)
+                # repacked as after any step: bricks sized for the pre-drift state would
+                # overflow the next step's migrate into the arena and grow its shapes
+                if cfg.repack_every:
+                    _repack_pass(st, cfg, devices=devs)
                 ph("snapshot_drift")
             # after the repack (the step's settled state); None when not written
             stats["checkpoint"] = None

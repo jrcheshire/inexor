@@ -2,8 +2,8 @@
 
 `restrict_to_slabs` cuts a whole state into the node-local state a rank would hold. Every
 per-brick read of the cut must equal the whole state's on the owned bricks, and refuse
-outside them; the repack must produce the whole repack's owned block byte for byte; passes
-with no cross-rank path refuse a node-local state.
+outside them; the repack must produce the whole repack's owned block byte for byte, and the
+device repack the host repack's; passes with no cross-rank path refuse a node-local state.
 """
 
 import math
@@ -141,6 +141,38 @@ def test_a_cuts_repack_is_the_whole_repacks_owned_block(whole, n_ranks, which):
         np.testing.assert_array_equal(part.off[:n_alloc], ref.off[r0:r1])
         np.testing.assert_array_equal(part.w[:n_alloc], ref.w[r0:r1])
         assert part.arena_used == 0 and not part.off[n_alloc:].any()
+
+
+@pytest.mark.parametrize("n_ranks", [2, 4])
+@pytest.mark.parametrize("cards", [1, 2])
+def test_a_cuts_device_repack_is_its_host_repack(whole, n_ranks, cards):
+    """The device repack of each rank's cut, on that rank's cards, is bitwise the host repack
+    of the same cut: every state array, the arena base and the returned counts."""
+    jax = pytest.importorskip("jax")
+    from inexor.device.repack import repack_device
+
+    if len(jax.devices()) < cards:
+        pytest.skip(f"needs {cards} jax devices")
+    devices = None if cards == 1 else list(jax.devices()[:cards])
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        merged = 0
+        for slabs in rank_slabs(NB, n_ranks):
+            host, dev = restrict_to_slabs(whole, slabs), restrict_to_slabs(whole, slabs)
+            r_h = host.repack(brick_slack=0.10)
+            r_d = repack_device(dev, brick_slack=0.10, devices=devices)
+            assert r_d.pop("repack_device")["slabs"] == slabs[1] - slabs[0]
+            for f in ("brick_start", "occupancy", "off", "w", "vel_scale", "arena_bucket"):
+                np.testing.assert_array_equal(getattr(dev, f), getattr(host, f), err_msg=f)
+            assert dev.arena_base == host.arena_base
+            for k in ("slots_used", "bricks_fast", "bricks_merged"):
+                assert r_d[k] == r_h[k], k
+            dev.check()
+            merged += r_h["bricks_merged"]
+        assert merged > 0, "vacuous: no cut had arena residents to fold in"
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def test_check_refuses_a_malformed_cut(whole):

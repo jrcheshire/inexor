@@ -53,9 +53,10 @@ def _coeffs():
     return bullfrog_float_coeffs(bullfrog_table(a_grid(0.1, 1.0, K, "log"), Cosmology()))
 
 
-def run_ranks(n_ranks, cards, ckpt_dir, resume=False, stop_at=None, y_blocks=1):
+def run_ranks(n_ranks, cards, ckpt_dir, resume=False, stop_at=None, y_blocks=1, **run_kw):
     """Run on `n_ranks` loopback ranks into `ckpt_dir`: from the whole state, or (`resume`)
-    from the newest checkpoint there. Returns each rank's per-step stats."""
+    from the newest checkpoint there; `run_kw` go to `engine.run`. Returns each rank's
+    per-step stats."""
     need_devices(cards)
     cfg = rank_cfg(cards, checkpoint_dir=str(ckpt_dir), checkpoint_every=EVERY,
                    device_y_blocks=y_blocks)
@@ -71,9 +72,32 @@ def run_ranks(n_ranks, cards, ckpt_dir, resume=False, stop_at=None, y_blocks=1):
         else:
             st = whole if c.size == 1 else restrict_to_slabs(whole, d.slabs)
         return engine.run(st, cfg, co, resume=res, stop_at=stop_at, comm=c, decomp=d,
-                          devices=rank_devices(c.rank, cards))
+                          devices=rank_devices(c.rank, cards), **run_kw)
 
     return run_loopback(n_ranks, rank, timeout=600.0)
+
+
+@pytest.fixture(scope="module")
+def snapshot_reference(tmp_path_factory):
+    """The one-rank run with a snapshot at step 2: (checkpoint hashes, snapshot hashes)."""
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    d = tmp_path_factory.mktemp("snapref")
+    run_ranks(1, 1, d / "ck", snapshot_steps=[2], snapshot_dir=str(d / "snap"))
+    return hashes(d / "ck"), hashes(d / "snap" / "step0002")
+
+
+@pytest.mark.parametrize("n_ranks,cards", [(1, 2), (2, 1), (2, 2), (3, 1)])
+def test_a_snapshot_run_is_the_one_rank_bytes(snapshot_reference, tmp_path, n_ranks, cards):
+    """With a snapshot at step 2 (its leading half-drift and repack on every rank), the
+    snapshot and both checkpoint generations are the one-rank run's bytes."""
+    want_ck, want_snap = snapshot_reference
+    assert want_snap and sorted({k.split("/")[0] for k in want_ck}) == ["gen0", "gen1"]
+    run_ranks(n_ranks, cards, tmp_path / "ck", snapshot_steps=[2],
+              snapshot_dir=str(tmp_path / "snap"))
+    assert hashes(tmp_path / "snap" / "step0002") == want_snap
+    assert hashes(tmp_path / "ck") == want_ck
 
 
 @pytest.fixture(scope="module")

@@ -741,6 +741,23 @@ def test_snapshots_compose_across_resumed_segments(tmp_path):
     assert _slab_bytes(final[0]) == _slab_bytes(final[1])
 
 
+def test_the_state_after_a_snapshot_is_repacked(tmp_path):
+    """A snapshot's leading half-drift runs as its own pass, and leaves the state repacked like
+    any step's: bricks still sized for the pre-drift state would overflow the next step's
+    migrate into the arena. Stopping on the snapshot step exposes that state: no arena
+    residents, and a further repack moves nothing."""
+    co = _coeffs(6)
+    cfg = _cfg()
+    st = _ck_state(cfg)
+    engine.run(st, cfg, co, snapshot_steps=[3], snapshot_dir=str(tmp_path / "snap"), stop_at=3)
+    assert st.arena_used == 0
+    fields = ("brick_start", "occupancy", "off", "w")
+    before = {f: np.array(getattr(st, f), copy=True) for f in fields}
+    st.repack(brick_slack=cfg.brick_slack)
+    for f in fields:
+        np.testing.assert_array_equal(getattr(st, f), before[f], err_msg=f)
+
+
 def test_a_resume_must_name_the_runs_snapshots(tmp_path):
     """The snapshot steps split drifts, so a resume that names other ones (or none) is
     refused; the checkpoint itself still loads (its fingerprint uses its recorded steps)."""
