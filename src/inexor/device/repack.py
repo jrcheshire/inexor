@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .migrate import _Clock, _ladder, _program, _put, pass_arena_index
+from .migrate import _Clock, _ladder, _program, _put, _small_ladder, pass_arena_index
 
 #: Call count of device repack passes.
 CALLS = 0
@@ -219,7 +219,7 @@ def repack_device(st, brick_slack=0.10, timings=None, devices=None):
         span = s1 - s0
         a0, a1 = int(a_edge[lo_b]), int(a_edge[hi_b])
         n_ar = a1 - a0
-        a_cap = _ladder(n_ar)
+        a_cap = _small_ladder(n_ar)
         w_cap = _ladder(span + a_cap)
 
         def window(src, src_a):

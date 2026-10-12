@@ -16,8 +16,8 @@ input is the slab's keepers, then its sources' emigrants in `sorted({(d + o) % n
 
 A staged slab keeps its eject output until its own insert, then its emigrants alone.
 `device_budget_bytes` refuses a slab whose estimated footprint (held arrays plus the
-kernels' per-padded-row bytes) exceeds it. Row buffers use each kernel's `_padded`; other
-shapes use `forces.capacity_shape`. The window is `w_cap` rows uploaded as a view of the
+kernels' per-padded-row bytes) exceeds it. Row buffers use each kernel's `_padded`, emigrant
+and spill rows `_small_ladder`, other shapes `forces.capacity_shape`. The window is `w_cap` rows uploaded as a view of the
 host state (copied only where it would run off the end); rows past the slab are never read.
 Every device-to-host read goes through `_host`, counted in `READS`.
 
@@ -115,6 +115,20 @@ def _ladder(n):
     from ..forces import capacity_shape
 
     return int(capacity_shape(max(1, int(n))))
+
+
+#: Smallest padded length of a unit's emigrant, spill or arena-resident rows (`_small_ladder`).
+SMALL_ROWS_FLOOR = 4096
+
+
+def _small_ladder(n):
+    """Padded length of a unit's emigrant, spill or arena-resident rows: `n` up to a power of
+    two, at least `SMALL_ROWS_FLOOR`. These sets are small next to the unit and vary across
+    units and steps by orders of magnitude; every length keys its own programs (and each
+    compile holds host memory for the run), so their ladder is coarse."""
+    from ..forces import capacity_shape
+
+    return int(capacity_shape(max(SMALL_ROWS_FLOOR, int(n)), rungs=1))
 
 
 def _put(a, dev, dtype=None):
@@ -629,7 +643,7 @@ def _spills(st, out, nw, ns, cap_i, dev):
     if not ns:
         return spills, None
     # gather onto the ladder: a slice sized by the spill count would compile per slab
-    cap_s = _ladder(ns)
+    cap_s = _small_ladder(ns)
     sbufs = (_zeros(cap_s, jnp.int64, dev), _zeros((cap_s, 3), jnp.uint8, dev),
              _zeros((cap_s, 3), jnp.int16, dev),
              _zeros(cap_s, jnp.int32, dev) if has_ids else None,
@@ -693,7 +707,7 @@ def _emigrants_only(e, has_ids, dev=None):
     if n_emig <= 0:
         return dict(dest=None, off=None, w=None, ids=None, src=None, cap=0, n_keep=0,
                     n_rows=0, rr=e["rr"], to=e["to"])
-    cap_e = _ladder(n_emig)
+    cap_e = _small_ladder(n_emig)
     bufs = (_zeros(cap_e, jnp.int64, dev), _zeros((cap_e, 3), jnp.uint8, dev),
             _zeros((cap_e, 3), jnp.int16, dev),
             _zeros(cap_e, jnp.int32, dev) if has_ids else None, _zeros(cap_e, jnp.int64, dev))
@@ -823,7 +837,7 @@ def _unpack_emigrants(parcel, dev):
         e = dict(cap=0, n_keep=0, n_rows=n, rr=rr, to=parcel[f"{s}:{j}:to"],
                  **{k: None for k in _EMIGRANT_FIELDS})
         if n:
-            e["cap"] = cap = _ladder(n)
+            e["cap"] = cap = _small_ladder(n)
             for k in _EMIGRANT_FIELDS:
                 a = parcel.get(f"{s}:{j}:{k}")
                 if a is not None:

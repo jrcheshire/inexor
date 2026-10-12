@@ -198,7 +198,7 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
             st.vel_scale[lo_b:hi_b] = scales_h
             return dict(consumed=consumed, spills=spills, n_over=ns)
 
-        a_cap = _m._ladder(ns)
+        a_cap = _m._small_ladder(ns)
         w_cap = _m._ladder(span + a_cap)
         if rows is None:
             rows = (_m._zeros(a_cap, jnp.int64, dev), _m._zeros((a_cap, 3), jnp.uint8, dev),
