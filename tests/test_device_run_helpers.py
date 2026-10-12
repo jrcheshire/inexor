@@ -1,5 +1,6 @@
 """The GPU driver's pure helpers: `timed_steps` (which steps `--timed-all`, `--timed-every N`
-and `--timed-last` time) and `snapshot_steps_for` (`--snapshot-z` to step boundaries)."""
+and `--timed-last` time), `snapshot_steps_for` (`--snapshot-z` to step boundaries), the
+monitor's samplers, `smaps_summary` (`--smaps`) and `cache_probe` (`--cache-probe`)."""
 
 import importlib.util
 import os
@@ -91,3 +92,92 @@ def test_the_sampler_keeps_each_phases_host_rss_peak(tmp_path):
     assert off._take_rss_max(5) is None
     rss = drv.rss_now()
     assert rss is None or rss > 0
+
+
+_SMAPS = """\
+00400000-00452000 r-xp 00000000 08:02 173521      /usr/bin/python3.14
+Rss:                 100 kB
+Anonymous:             0 kB
+Shared_Clean:        100 kB
+VmFlags: rd ex mr mw me dw
+7f0000000000-7f0000100000 rw-p 00000000 00:00 0
+Rss:                4000 kB
+Anonymous:          4000 kB
+Private_Dirty:      4000 kB
+7f0000100000-7f0000200000 rw-p 00000000 00:00 0                          [anon:jemalloc]
+Rss:                1000 kB
+Anonymous:          1000 kB
+Private_Dirty:      1000 kB
+01000000-02000000 rw-p 00000000 00:00 0                                  [heap]
+Rss:                2000 kB
+Anonymous:          2000 kB
+7f1000000000-7f1000400000 rw-s 00000000 00:1a 99        /dev/shm/mvp-shmem-1234 (deleted)
+Rss:                3000 kB
+Shared_Dirty:       3000 kB
+7f2000000000-7f2000010000 rw-s 00000000 00:06 12        /dev/nvidiactl
+Rss:                  64 kB
+Locked:               64 kB
+7f3000000000-7f3000100000 r-xp 00000000 08:02 777       /opt/lib/libcudart.so.12.9.37
+Rss:                 500 kB
+Shared_Clean:        500 kB
+7f4000000000-7f4000100000 rw-s 00000000 00:01 5         /memfd:xla (deleted)
+Rss:                 200 kB
+Shared_Dirty:        200 kB
+7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]
+Rss:                  12 kB
+Anonymous:            12 kB
+"""
+
+
+def test_smaps_sums_resident_memory_by_mapping_kind(tmp_path, monkeypatch):
+    """Every mapping lands in one kind by its pathname, its fields sum there (kB to bytes),
+    and the largest mappings are listed with their names."""
+    drv = _driver()
+    (tmp_path / "smaps").write_text(_SMAPS)
+    monkeypatch.setenv("D7_PROC_SELF", str(tmp_path))
+    sm = drv.smaps_summary(top=3)
+    kb = 1024
+    k = sm["kinds"]
+    assert sm["n_maps"] == 9
+    assert set(k) == {"file", "anon", "heap", "shm", "nvidia", "lib", "stack"}
+    assert k["anon"]["rss"] == 5000 * kb and k["anon"]["maps"] == 2
+    assert k["anon"]["private_dirty"] == 5000 * kb
+    assert k["shm"]["rss"] == 3200 * kb and k["shm"]["shared_dirty"] == 3200 * kb
+    assert k["nvidia"]["locked"] == 64 * kb
+    assert k["lib"]["shared_clean"] == 500 * kb and k["file"]["rss"] == 100 * kb
+    assert sum(e["rss"] for e in k.values()) == 10876 * kb
+    assert [m["name"] for m in sm["top"]] == ["", "/dev/shm/mvp-shmem-1234 (deleted)", "[heap]"]
+    assert sm["top"][1]["shared"] == 3000 * kb and sm["top"][1]["kind"] == "shm"
+    (tmp_path / "smaps").unlink()
+    assert drv.smaps_summary() is None
+
+
+def test_every_program_cache_the_probe_clears_exists():
+    """`PROGRAM_CACHES` names live module dicts: a renamed cache would otherwise be skipped
+    silently and its memory read as the state's."""
+    import importlib
+
+    from inexor import forces
+
+    for mod, attr in _driver().PROGRAM_CACHES:
+        assert isinstance(getattr(importlib.import_module(mod), attr), dict), (mod, attr)
+    assert callable(forces._cached_force_fn.cache_clear)
+
+
+def test_the_cache_probe_empties_the_program_caches_and_records_each_stage(tmp_path,
+                                                                         monkeypatch):
+    import importlib
+
+    drv = _driver()
+    (tmp_path / "smaps").write_text(_SMAPS)
+    monkeypatch.setenv("D7_PROC_SELF", str(tmp_path))
+    mig = importlib.import_module("inexor.device.migrate")
+    mig._PROGRAMS[("probe-test",)] = object()
+    mon = drv.Monitor(str(tmp_path / "card.json"), {}, with_smaps=True)
+    out = drv.cache_probe(mon)
+    assert [r["name"] for r in out["records"]] == ["cache_before", "after_jax_clear_caches",
+                                                   "after_program_caches"]
+    assert all(r["smaps"]["n_maps"] == 9 for r in out["records"])
+    assert set(out["entries"]) == {f"{m}.{a}" for m, a in drv.PROGRAM_CACHES}
+    assert out["entries"]["inexor.device.migrate._PROGRAMS"] >= 1
+    assert not mig._PROGRAMS

@@ -373,9 +373,10 @@ class Monitor:
     """`engine.run(phase=)` hook plus heartbeat, both streaming, and the card."""
 
     def __init__(self, card_path, card, beat_s=60.0, fail_at=None, with_numa_maps=False,
-                 card_sample_s=0.0):
+                 card_sample_s=0.0, with_smaps=False):
         self.card_path = card_path
         self.with_numa_maps = bool(with_numa_maps)
+        self.with_smaps = bool(with_smaps)
         self.card = card
         self.lock = threading.Lock()
         self.t_start = time.time()
@@ -477,12 +478,17 @@ class Monitor:
             t0 = time.time()
             nmaps = numa_maps()
             nmaps_s = time.time() - t0
+        smaps, smaps_s = None, None
+        if self.with_smaps:
+            t0 = time.time()
+            smaps = smaps_summary()
+            smaps_s = time.time() - t0
         if name == "coarse_paint":
             self.step += 1
         rec = dict(t=now, name=name, step=self.step, dt=now - self.t_last, rss=rss,
                    hwm=hwm, rss_phase_peak=rss_peak, avail=avail, cards=cards,
                    card_phase_peak=phase_peak, numa=nm,
-                   numa_maps=nmaps, numa_maps_s=nmaps_s, **snap)
+                   numa_maps=nmaps, numa_maps_s=nmaps_s, smaps=smaps, smaps_s=smaps_s, **snap)
         print(f"[phase] {_stamp(now)} step {self.step:2d} {name:<16} {rec['dt']:9.1f} s | host "
               f"rss {_gb(rss)} peak {_gb(hwm)} | {_numa_text(nm)} | cards in_use "
               f"{[round((c['in_use'] or 0) / GB, 1) for c in cards]} peak "
@@ -492,6 +498,8 @@ class Monitor:
         print(f"[mem]   {_mem_text(snap['mem'], snap['faults'], snap['vmstat'], nm)}"
               + ("" if nmaps is None else
                  f" | process pages by node {_nodes_text(nmaps)} ({nmaps_s:.1f} s)"), flush=True)
+        if smaps is not None:
+            print(f"[smaps] {_smaps_text(smaps)} GB ({smaps_s:.1f} s)", flush=True)
         with self.lock:
             self.card["boundaries"].append(rec)
             self.last = name
@@ -557,6 +565,79 @@ def _node_list(text):
     return out
 
 
+SMAPS_KEYS = (("rss", "Rss"), ("anon", "Anonymous"), ("shared_clean", "Shared_Clean"),
+              ("shared_dirty", "Shared_Dirty"), ("private_clean", "Private_Clean"),
+              ("private_dirty", "Private_Dirty"), ("locked", "Locked"), ("swap", "Swap"))
+
+
+def smaps_kind(name):
+    """A /proc/self/smaps mapping's kind from its pathname: anon, heap, stack, kernel, shm
+    (/dev/shm, SysV, memfd), nvidia, rdma (/dev/infiniband), device, anon_inode, lib, file."""
+    if not name or name.startswith("[anon:"):
+        return "anon"
+    if name == "[heap]":
+        return "heap"
+    if name.startswith("[stack"):
+        return "stack"
+    if name.startswith("["):
+        return "kernel"
+    if name.startswith(("/dev/shm/", "/SYSV", "/memfd:")):
+        return "shm"
+    if name.startswith("/dev/nvidia"):
+        return "nvidia"
+    if name.startswith("/dev/infiniband"):
+        return "rdma"
+    if name.startswith("/dev/"):
+        return "device"
+    if name.startswith("anon_inode:"):
+        return "anon_inode"
+    if ".so" in os.path.basename(name.split(" (deleted)")[0]):
+        return "lib"
+    return "file"
+
+
+def smaps_summary(top=8):
+    """This process's resident memory by mapping kind (`smaps_kind`), bytes, from
+    /proc/self/smaps: per kind the `SMAPS_KEYS` sums and the mapping count, plus the `top`
+    mappings by Rss with their names. A page-table walk like numa_maps: boundaries only, the
+    caller records its seconds. None where unreadable."""
+    maps = []
+    try:
+        with open(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "smaps")) as fh:
+            fields = dict((v, k) for k, v in SMAPS_KEYS)
+            cur = None
+            for line in fh:
+                tok = line.split(None, 5)
+                if not tok:
+                    continue
+                if tok[0].endswith(":"):
+                    key = fields.get(tok[0][:-1])
+                    if cur is not None and key is not None:
+                        cur[key] += int(tok[1]) * 1024
+                    continue
+                cur = dict.fromkeys(fields.values(), 0)
+                cur["name"] = tok[5].strip() if len(tok) > 5 else ""
+                maps.append(cur)
+    except OSError:
+        return None
+    kinds = {}
+    for m in maps:
+        e = kinds.setdefault(smaps_kind(m["name"]), dict.fromkeys(fields.values(), 0))
+        for k in fields.values():
+            e[k] += m[k]
+        e["maps"] = e.get("maps", 0) + 1
+    big = sorted(maps, key=lambda m: -m["rss"])[:top]
+    return dict(kinds=kinds, n_maps=len(maps),
+                top=[dict(name=m["name"], kind=smaps_kind(m["name"]), rss=m["rss"],
+                          anon=m["anon"], shared=m["shared_clean"] + m["shared_dirty"])
+                     for m in big])
+
+
+def _smaps_text(sm):
+    ks = sorted(sm["kinds"].items(), key=lambda kv: -kv[1]["rss"])
+    return ", ".join(f"{k} {e['rss'] / GB:.2f}" for k, e in ks if e["rss"] >= 0.01 * GB)
+
+
 def _nodes_text(nmaps):
     return {n: {k: round(v / GB, 1) for k, v in e.items() if v} for n, e in sorted(nmaps.items())}
 
@@ -565,7 +646,7 @@ def _probe_record(mon, name):
     """A boundary-shaped record outside the engine's phases, for the post-run probes."""
     rss, hwm, avail = host_memory()
     return dict(t=time.time(), name=name, rss=rss, hwm=hwm, numa=numa_memory(),
-                **mon.snapshot())
+                smaps=smaps_summary() if mon.with_smaps else None, **mon.snapshot())
 
 
 def checkpoint_probe(st, out_dir, n_slabs, mon):
@@ -630,6 +711,47 @@ def trim_probe(mon):
           f"{_gb(before['rss'])} -> {_gb(after['rss'])} GB, anon "
           f"{_gb(before['mem'].get('RssAnon'))} -> {_gb(after['mem'].get('RssAnon'))} GB",
           flush=True)
+    return out
+
+
+#: inexor's module-level program caches, (module, attribute): compiled programs and what
+#: they close over, kept for the whole run
+PROGRAM_CACHES = (("inexor.eject_jax", "_CACHE"), ("inexor.insert_jax", "_CACHE"),
+                  ("inexor.ooc_fft", "_CARD_PROGRAMS"), ("inexor.device.migrate", "_PROGRAMS"),
+                  ("inexor.device.paint", "_KERNELS"), ("inexor.device.paint", "_CARD_KERNELS"),
+                  ("inexor.device.tile", "_KERNELS"), ("inexor.device.export", "_EXPORT_KERNELS"))
+
+
+def cache_probe(mon):
+    """After the run: host memory as jax's compilation caches are cleared, then inexor's
+    `PROGRAM_CACHES` and the force closures' lru_cache, each followed by gc. The fall is what
+    the compiled programs held; freed memory the C allocator keeps stays resident (the trim
+    probe, run after this one, returns it)."""
+    import gc
+    import importlib
+
+    import jax
+
+    from inexor import forces
+
+    gc.collect()
+    recs = [_probe_record(mon, "cache_before")]
+    t0 = time.time()
+    jax.clear_caches()
+    gc.collect()
+    recs.append(_probe_record(mon, "after_jax_clear_caches"))
+    entries = {}
+    for mod, attr in PROGRAM_CACHES:
+        cache = getattr(importlib.import_module(mod), attr)
+        entries[f"{mod}.{attr}"] = len(cache)
+        cache.clear()
+    forces._cached_force_fn.cache_clear()
+    gc.collect()
+    recs.append(_probe_record(mon, "after_program_caches"))
+    out = dict(seconds=time.time() - t0, entries=entries, records=recs)
+    print("== cache probe: RSS / anon GB " + " -> ".join(
+        f"{r['name']} {_gb(r['rss']).strip()} / {_gb(r['mem'].get('RssAnon')).strip()}"
+        for r in recs) + f"; {sum(entries.values())} inexor cache entries", flush=True)
     return out
 
 
@@ -910,7 +1032,8 @@ def cmd_run(args):
     fail_at = (os.environ.get("D7_FAIL_AT")
                if fail_rank is None or int(fail_rank) == rank else None)
     mon = Monitor(args.card, card, beat_s=args.beat, fail_at=fail_at,
-                  with_numa_maps=args.numa_maps, card_sample_s=args.card_sample_ms / 1000.0)
+                  with_numa_maps=args.numa_maps, card_sample_s=args.card_sample_ms / 1000.0,
+                  with_smaps=args.smaps)
     card["plan"] = dict(stop_at=args.stop_at, k_steps=args.k_steps,
                         card_sample_ms=args.card_sample_ms,
                         expect_step=args.expect_step, timed_last=args.timed_last,
@@ -1027,6 +1150,9 @@ def cmd_run(args):
         if args.ckpt_probe_slabs:
             card["ckpt_probe"] = checkpoint_probe(st, args.ckpt_probe_dir,
                                                   args.ckpt_probe_slabs, mon)
+            mon.save()
+        if args.cache_probe:
+            card["cache_probe"] = cache_probe(mon)
             mon.save()
         if args.trim_probe:
             card["trim_probe"] = trim_probe(mon)
@@ -1470,6 +1596,10 @@ def main(argv=None):
                          "is the step's cost without the syncs")
     pr.add_argument("--numa-maps", action="store_true",
                     help="the process's pages per NUMA node at every boundary (slow walk)")
+    pr.add_argument("--smaps", action="store_true",
+                    help="resident memory by mapping kind (anon, heap, shm, nvidia, libraries, "
+                         "...) and the largest mappings at every boundary, from "
+                         "/proc/self/smaps (a page-table walk, slow on a large state)")
     pr.add_argument("--ckpt-probe-slabs", type=int, default=0,
                     help="after the run, write this many slabs of the state, timed per part")
     pr.add_argument("--ckpt-probe-dir", default=None)
@@ -1478,8 +1608,11 @@ def main(argv=None):
                          "not run while the kernel drains it")
     pr.add_argument("--off-node-gb", type=float, default=8.0,
                     help="with --membind-nodes: GB of this process allowed on CPU-less nodes")
+    pr.add_argument("--cache-probe", action="store_true",
+                    help="after the run, host memory as jax's compilation caches and then "
+                         "inexor's program caches are cleared")
     pr.add_argument("--trim-probe", action="store_true",
-                    help="after the run (and the probe), gc + malloc_trim(0), RSS either side")
+                    help="after the run (and the probes), gc + malloc_trim(0), RSS either side")
     pr.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
     pr.add_argument("--checkpoint-dir", default=None)
     pr.add_argument("--checkpoint-every", type=int, default=0,

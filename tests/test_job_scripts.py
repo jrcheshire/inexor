@@ -406,11 +406,11 @@ def test_the_steps_job_refuses_products_it_could_not_write(tmp_path, prod, expor
 SCALING = os.path.join(HERE, "scripts", "run", "multinode_scaling_vista.sbatch")
 
 
-def _scaling_job(tmp_path, stub_python=True, **env):
-    """The scaling job script up to its first refusal, as `_steps_job`: REF_CKPT holds two
-    generations unless overridden, and the stubs fail any leg at once. With stub_python
-    False, python is real (the generations can be read) and the first guard's `mpiexec`
-    stops the job."""
+def _scaling_job(tmp_path, stub_python=True, script=SCALING, **env):
+    """The scaling job script (or `script`) up to its first refusal, as `_steps_job`:
+    REF_CKPT holds two generations unless overridden, and the stubs fail any leg at once.
+    With stub_python False, python is real (the generations can be read) and the first
+    guard's `mpiexec` stops the job."""
     if not (tmp_path / "ref").exists():
         _gen(tmp_path / "ref", "gen0", 100)
         _gen(tmp_path / "ref", "gen1", 120)
@@ -429,7 +429,7 @@ def _scaling_job(tmp_path, stub_python=True, **env):
              REF_CKPT=str(tmp_path / "ref"), REF_ICS=str(tmp_path / "ref_ics"),
              OUT_DIR=str(tmp_path / "out"))
     e.update(env)
-    p = subprocess.Popen([BASH, SCALING], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    p = subprocess.Popen([BASH, script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, env=e, start_new_session=True)
     try:
         out, err = p.communicate(timeout=30)
@@ -465,6 +465,50 @@ def test_the_scaling_job_needs_two_generations_at_different_steps(tmp_path, step
     assert r.returncode == 1  # refused, or stopped at the first guard by the stub mpiexec
     assert ("does not hold two generations at different steps" in r.stdout) == refused, r.stdout
     assert ("=== LEG guard-launch-mpi-1" in r.stdout) != refused, r.stdout
+
+
+MEMDIAG = os.path.join(HERE, "scripts", "run", "memory_diag_vista.sbatch")
+
+
+def _memdiag_job(tmp_path, stub_python=True, **env):
+    """The memory diagnostics job up to its first refusal (`_scaling_job`), with ONE_ICS and
+    MPI_OFF set unless overridden."""
+    (tmp_path / "one_ics").mkdir(exist_ok=True)
+    e = dict(ONE_ICS=str(tmp_path / "one_ics"), MPI_OFF="FI_MR_CACHE_MAX_COUNT=0 MVP_NOLOCAL=1")
+    e.update(env)
+    return _scaling_job(tmp_path, stub_python=stub_python, script=MEMDIAG, **e)
+
+
+@pytest.mark.parametrize("env,says", [
+    ({"ONE_ICS": "{t}/absent"}, "set ONE_ICS to an existing directory"),
+    ({"REF_CKPT": "{t}/absent"}, "set REF_CKPT to an existing directory"),
+    ({"REF_ICS": ""}, "set REF_ICS to an existing directory"),
+    ({"ONE_CKPT": "{t}/absent"}, "ONE_CKPT {t}/absent is not a directory"),
+    ({"OUT_DIR": ""}, "set OUT_DIR"),
+    ({"OUT_DIR": "{t}/ref/out"}, "OUT_DIR is under {t}/ref"),
+    ({"OUT_DIR": "{t}/one_ics/out"}, "OUT_DIR is under {t}/one_ics"),
+    ({"MPI_OFF": ""}, "set MPI_OFF"),
+    ({"MPI_OFF": "FI_MR_CACHE_MAX_COUNT=0 nocache"}, "MPI_OFF item 'nocache' is not VAR=value"),
+    ({"ONE_STOP": "50"}, "ONE_STOP 50 is not a step of the 40-step schedule"),
+    ({"ONE_STOP": "0"}, "ONE_STOP 0 is not a step"),
+])
+def test_the_memory_diag_job_refuses_inputs_it_cannot_use(tmp_path, env, says):
+    r = _memdiag_job(tmp_path, **{k: v.format(t=tmp_path) for k, v in env.items()})
+    assert r.returncode == 1 and says.format(t=tmp_path) in r.stdout, r.stdout
+    assert "=== LEG" not in r.stdout
+
+
+@pytest.mark.parametrize("steps,refused", [("", False), ("10", False), ("20", False),
+                                            ("7", True), ("30", True), ("0", True)])
+def test_the_memory_diag_segment_must_end_on_a_checkpoint(tmp_path, steps, refused):
+    """From the reference's step-100 generation of a 120-step run: 10 steps by default; a
+    count whose end is not a multiple of it, or past the run, is refused before any leg."""
+    r = _memdiag_job(tmp_path, stub_python=False, **({"STEPS": steps} if steps else {}))
+    assert r.returncode == 1  # refused, or stopped at the first guard by the stub mpiexec
+    assert ("cannot end on a checkpoint" in r.stdout) == refused, r.stdout
+    assert ("=== LEG" in r.stdout) != refused, r.stdout
+    if not refused:
+        assert f"-> {100 + int(steps or 10)} of 120" in r.stdout, r.stdout
 
 
 def _pk(path, transform="cards", p=(1.0, 2.0), z=(0.1, 0.2), edges=(0.0, 0.5, 1.0), prov=None):
