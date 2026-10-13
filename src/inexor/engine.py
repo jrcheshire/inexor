@@ -1756,6 +1756,11 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             f"the checkpoint was written by a run with snapshots at "
             f"{sorted(resume.get('snapshot_steps', []))}, this one asks for {snapshot_steps}: "
             "snapshots split drifts, so the segments would not compose into one trajectory")
+    if resume is not None and resume.get("snapshot"):
+        raise ValueError(
+            f"the checkpoint at step {resume['step']} is a snapshot: its positions sit on the "
+            "step boundary, not at the midpoint a resume continues from, and the run would "
+            "write over it; resume from the run's own checkpoint_dir")
     ph = phase if phase is not None else _no_phase
     ckpt_on = bool(cfg.checkpoint_dir) and cfg.checkpoint_every > 0
     if ckpt_on and st.ids is not None:

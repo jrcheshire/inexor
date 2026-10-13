@@ -772,6 +772,23 @@ def test_a_resume_must_name_the_runs_snapshots(tmp_path):
             engine.run(st, cfg, co, resume=res, snapshot_steps=steps, snapshot_dir=snap)
 
 
+def test_a_snapshot_is_not_a_resume_point(tmp_path):
+    """A snapshot's positions sit on a step boundary, a checkpoint's at the midpoint a resume
+    continues from: resuming from a snapshot is refused (it would skip a half-drift and write
+    over the snapshot). The run's own checkpoint at that step resumes."""
+    co = _coeffs(4)
+    d, snap = str(tmp_path / "ck"), str(tmp_path / "snap")
+    cfg = _cfg(checkpoint_dir=d, checkpoint_every=2)
+    kw = dict(snapshot_steps=[2], snapshot_dir=snap)
+    engine.run(_ck_state(cfg), cfg, co, stop_at=2, **kw)
+    st, res = engine.load_checkpoint(os.path.join(snap, "step0002"), cfg, co, arena_frac=0.05)
+    assert res["snapshot"] is True and res["step"] == 2
+    with pytest.raises(ValueError, match="snapshot"):
+        engine.run(st, cfg, co, resume=res, **kw)
+    st, res = engine.load_checkpoint(d, cfg, co, arena_frac=0.05)
+    engine.run(st, cfg, co, resume=res, **kw)
+
+
 def test_snapshot_steps_must_lie_inside_the_schedule():
     co = _coeffs(4)
     for bad in ([0], [4], [5]):
