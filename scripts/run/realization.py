@@ -594,9 +594,11 @@ def cmd_run(args):
     # `epoch` is stored with the checkpoints so `python -m inexor.export` can
     # write km/s from a bare checkpoint directory without this driver's a-grid, and
     # a card can take the ICs' linear P(k) from them
+    # `source.a_init` lets the GPU driver's products and resumes read the schedule's start
     out = engine.run(st, ec, co, phase=ph, resume=resume, stop_at=stop,
                      collect=stats.append, allocator=allocator,
-                     epoch=(a_steps, cosmo, None if linear_pk is None else linear_pk.record()))
+                     epoch=(a_steps, cosmo, None if linear_pk is None else linear_pk.record()),
+                     source=dict(ics=os.path.realpath(args.workdir), a_init=float(args.a_init)))
     wall = time.perf_counter() - t0
     # `clear_refs` resets ru_maxrss along with VmHWM (both read `mm->hiwater_rss`),
     # so under tracing the run's peak is only available as `PhaseTracer.run_peak`

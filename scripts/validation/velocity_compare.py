@@ -1,4 +1,4 @@
-"""inexor against DISCO-DJ in velocity, from the same initial particles (paper Sec. 5).
+"""inexor against DISCO-DJ in velocity, from the same initial particles.
 
 Field level, since an export carries no particle identity: density, momentum
 p = sum_i v_i W(x - x_i) and its divergence theta = i k . p, each code painted with CIC on one

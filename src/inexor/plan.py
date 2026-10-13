@@ -9,7 +9,7 @@ Examples:
   python -m inexor.plan --preset cdev
   python -m inexor.plan --preset c-gh --host-gb 116
   python -m inexor.plan --n-part 2048 --box 1024 --n-fine 4096 --n-coarse 1024 \
-      --tile 256 --buf 32 --host-gb 237 --disk-gb 2000
+      --tile 256 --buf 32 --host-gb 237
 """
 
 import argparse
@@ -46,6 +46,17 @@ RATIFIED = dict(
     alpha=1.0,                # r_s / coarse_cell
 )
 BUCKET_CELLS = 2
+
+
+def preset_geometry(preset, n_fine=None):
+    """`PRESETS[preset]` with `n_fine` replacing the fine mesh and the tile buffer (in fine cells)
+    scaled with it, so the buffer keeps its physical width and the split its truncation error:
+    the drivers' --n-fine."""
+    g = dict(PRESETS[preset])
+    if n_fine is not None and int(n_fine) != int(g["n_fine"]):
+        g["buf"] = int(round(g["buf"] * int(n_fine) / g["n_fine"]))
+        g["n_fine"] = int(n_fine)
+    return g
 
 
 def engine_config(preset, **overrides):
@@ -309,7 +320,8 @@ def _print_load_and_ic(args, ec, t9, n, rows, arena, shared, share=1.0):
     try:
         from .ooc_fft import plan_bytes
 
-        ic = plan_bytes(args.n_part, np.dtype(args.coarse_dtype), "derivative")
+        # the host IC generator runs in single precision whatever the coarse mesh's dtype
+        ic = plan_bytes(args.n_part, np.dtype(np.float32), "derivative")
         print(f"\nIC STAGE (out-of-core, 'derivative' policy): peak "
               f"{_fmt(ic['peak'])}")
     except Exception as exc:  # pragma: no cover - informational only
@@ -965,11 +977,12 @@ def main(argv=None):
                          "keeps its worker count")
     ap.add_argument("--slabs", type=int, default=128,
                     help="T9 slab files the ICs were written as (c-gh: 128)")
-    ap.add_argument("--disk-gb", type=float, default=None, help="scratch budget for IC staging")
     args = ap.parse_args(argv)
 
     if args.preset:
-        for k, v in PRESETS[args.preset].items():
+        # --n-fine without --buf scales the buffer with it, as the drivers do
+        geom = preset_geometry(args.preset, n_fine=args.n_fine if args.buf is None else None)
+        for k, v in geom.items():
             if getattr(args, k.replace("-", "_")) is None:
                 setattr(args, k.replace("-", "_"), v)
     if args.buf is None:

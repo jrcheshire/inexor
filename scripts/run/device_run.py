@@ -844,7 +844,7 @@ def _y_blocks(value):
 
 
 def _planner(preset, cards, slack, arena, alloc_margin=0.10, n_nodes=1, host_gb=1026.0,
-             device_gb=199.0, y_blocks=None, fine_dtype="float64"):
+             device_gb=199.0, y_blocks=None, fine_dtype="float64", n_fine=None):
     cmd = [sys.executable, "-m", "inexor.plan", "--preset", preset, "--backend", "device",
            "--n-gpus", str(cards), "--host-gb", f"{host_gb:g}", "--device-gb", f"{device_gb:g}",
            "--arena-frac", str(arena), "--slack", str(slack),
@@ -852,6 +852,8 @@ def _planner(preset, cards, slack, arena, alloc_margin=0.10, n_nodes=1, host_gb=
            "--fine-dtype", fine_dtype]
     if n_nodes != 1:
         cmd += ["--n-nodes", str(n_nodes)]
+    if n_fine:
+        cmd += ["--n-fine", str(n_fine)]
     out = subprocess.run(cmd, capture_output=True, text=True,
                          env=dict(os.environ, PYTHONPATH=os.path.join(REPO, "src"))).stdout
 
@@ -918,6 +920,11 @@ def cmd_preflight(args):
         refusals.append(f"manifest holds {man['n_particles']} particles")
     if len(man["files"]) != int(man["bricks_per_side"]):
         refusals.append(f"{len(man['files'])} slab files for {man['bricks_per_side']} slabs")
+    # the epoch the run would start at, refused against a conflicting --a-init
+    try:
+        card["manifest"]["a_init"] = _start_epoch(args)
+    except SystemExit as e:
+        refusals.append(str(e))
     # a manifest without the field predates it and was generated with EdS D2
     card["manifest"]["growth2"] = man.get("growth2", "eds")
     if card["manifest"]["growth2"] != args.growth2:
@@ -926,7 +933,7 @@ def cmd_preflight(args):
 
     plan = _planner(args.preset, args.cards, args.slack, args.arena_frac, args.alloc_margin,
                     n_nodes=args.n_nodes, host_gb=args.host_gb, device_gb=args.device_gb,
-                    y_blocks=args.y_blocks, fine_dtype=args.fine_dtype)
+                    y_blocks=args.y_blocks, fine_dtype=args.fine_dtype, n_fine=args.n_fine)
     card["planner"] = plan
     _rss, _hwm, avail = host_memory()
     nm = numa_memory()

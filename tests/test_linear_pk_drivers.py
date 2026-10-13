@@ -180,3 +180,20 @@ def test_pk_table_is_refused_outside_ics(table, tmp_path):
     p = _run([REALIZATION, "run", "--config", PRESET, "--workdir", str(tmp_path),
               "--pk-table", path], ok=False)
     assert p.returncode != 0 and "--pk-table is an `ics` option" in p.stderr
+
+
+def test_a_cpu_lane_checkpoint_carries_its_epoch_to_the_device_products(tmp_path):
+    """The CPU driver records its schedule's a_init with its checkpoints, so the GPU driver's
+    products of a run started at a = 0.08 use that schedule rather than refusing the
+    fingerprint; an explicit conflicting --a-init is refused."""
+    common = ["--config", PRESET, "--tile-workers", "1", "--a-init", A_INIT, *LAYOUT]
+    _run([REALIZATION, "ics", *common, "--workdir", str(tmp_path)])
+    _run([REALIZATION, "run", *common, "--workdir", str(tmp_path), "--k-steps", "40",
+          "--stop-at", "1", "--checkpoint-every", "1"])
+    prod = [DRIVER, "card", "--preset", PRESET, "--cards", "1", "--beat", "600",
+            "--checkpoint-dir", str(tmp_path / "ckpt"), "--k-steps", "40", "--expect-step", "1",
+            *LAYOUT, "--min-weight", "1", "--allow-partial", "--out", str(tmp_path / "pk.json")]
+    _run(prod + ["--card", str(tmp_path / "c0.json")])
+    assert json.load(open(tmp_path / "pk.json"))["step"] == 1
+    p = _run(prod + ["--card", str(tmp_path / "c1.json"), "--a-init", "0.1"], ok=False)
+    assert p.returncode != 0 and "another epoch" in p.stdout + p.stderr

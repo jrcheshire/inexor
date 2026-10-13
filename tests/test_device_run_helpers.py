@@ -275,3 +275,9 @@ def test_n_fine_gives_the_cpu_drivers_geometry():
     base = engine_config("cgh64")
     assert (got.n_fine, got.b_fine) == (want.n_fine, want.b_fine) == (2048, 2 * base.b_fine)
     assert got.r_s == base.r_s and got.n_coarse == base.n_coarse
+    # the planner's --n-fine prices the same buffer
+    from inexor.plan import preset_geometry
+
+    for preset, nf in (("cgh64", 2048), ("cdev8", 512), ("c-hero", 16384)):
+        assert preset_geometry(preset, nf)["buf"] == real._geom(preset, n_fine=nf)["buf"]
+    assert preset_geometry("cgh64") == preset_geometry("cgh64", 1024)

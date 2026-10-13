@@ -134,7 +134,7 @@ run_leg () {
 run_leg plan \
   pixi run -e gpu python -m inexor.plan --preset "$PRESET" --backend device --n-gpus 1 \
     --host-gb 116 --device-gb 96 --slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" \
-    --arena-frac "$ARENA"
+    --arena-frac "$ARENA" $NF
 
 run_leg pytest-gpu \
   pixi run -e gpu python -m pytest -q -rs \
