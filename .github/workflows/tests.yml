@@ -1,7 +1,10 @@
 # Lint and tests on pull requests into main: on open, on every push to the PR, on reopen, and
 # when a draft is marked ready for review. Draft PRs are skipped, and nothing runs on pushes to
-# main: a merge lands commits a PR run already tested (require branches to be up to date before
-# merging, in the branch protection rule, so that holds).
+# main: a merge lands commits a PR run already tested (the ruleset requires branches to be up to
+# date before merging, so that holds).
+#
+# The suite runs as parallel shards (tests/conftest.py, INEXOR_TEST_SHARD=i/n); the `test` and
+# `test-ranks` jobs pass only if every shard of theirs passed, and are the required checks.
 name: tests
 
 on:
@@ -15,6 +18,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  PIXI_VERSION: v0.81.0
+
 jobs:
   lint:
     if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
@@ -24,36 +30,63 @@ jobs:
       - uses: actions/checkout@v7
       - uses: prefix-dev/setup-pixi@v0.11.0
         with:
-          pixi-version: v0.81.0
+          pixi-version: ${{ env.PIXI_VERSION }}
           locked: true
           cache: true
           environments: default
       - run: pixi run lint
 
-  test:
+  # the suite without the across-ranks files, which test-ranks-shard runs
+  test-shard:
     if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      INEXOR_TEST_SHARD: ${{ matrix.shard }}/3
     steps:
       - uses: actions/checkout@v7
       - uses: prefix-dev/setup-pixi@v0.11.0
         with:
-          pixi-version: v0.81.0
+          pixi-version: ${{ env.PIXI_VERSION }}
           locked: true
           cache: true
           environments: default
-      - run: pixi run test
+      - run: pixi run test --dist worksteal --ignore-glob='tests/test_ranks_*.py' --durations=15
+
+  test-ranks-shard:
+    if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      INEXOR_TEST_SHARD: ${{ matrix.shard }}/4
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.0
+        with:
+          pixi-version: ${{ env.PIXI_VERSION }}
+          locked: true
+          cache: true
+          environments: default
+      - run: pixi run test-ranks --dist worksteal --durations=15
+
+  test:
+    if: always() && (github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft)
+    needs: test-shard
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.test-shard.result }}" = success
 
   test-ranks:
-    if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
+    if: always() && (github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft)
+    needs: test-ranks-shard
     runs-on: ubuntu-latest
-    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
-      - uses: prefix-dev/setup-pixi@v0.11.0
-        with:
-          pixi-version: v0.81.0
-          locked: true
-          cache: true
-          environments: default
-      - run: pixi run test-ranks
+      - run: test "${{ needs.test-ranks-shard.result }}" = success
