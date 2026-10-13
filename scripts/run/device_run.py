@@ -110,8 +110,9 @@ def _git_commit():
 
 def _write_json(path, obj):
     tmp = f"{path}.tmp"
+    # one-shot dumps with no indent is the C encoder; the card is rewritten at every boundary
     with open(tmp, "w") as fh:
-        json.dump(obj, fh, indent=1, default=str)
+        fh.write(json.dumps(obj, default=str))
     os.replace(tmp, path)
 
 

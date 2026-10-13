@@ -181,3 +181,28 @@ def test_the_cache_probe_empties_the_program_caches_and_records_each_stage(tmp_p
     assert set(out["entries"]) == {f"{m}.{a}" for m, a in drv.PROGRAM_CACHES}
     assert out["entries"]["inexor.device.migrate._PROGRAMS"] >= 1
     assert not mig._PROGRAMS
+
+
+def test_the_run_card_is_written_by_the_c_encoder(tmp_path, monkeypatch):
+    """The card is rewritten whole at every boundary and heartbeat, so it goes through the C
+    encoder (json's pure-Python one costs ~0.15 s per write at a 120-step card); the file
+    reads back as the object, non-JSON values as their str."""
+    import json
+    import json.encoder
+
+    from pathlib import Path
+
+    real, calls = json.encoder.c_make_encoder, []
+    assert real is not None, "this python's json has no C encoder"
+
+    def spy(*a):
+        calls.append(1)
+        return real(*a)
+
+    monkeypatch.setattr(json.encoder, "c_make_encoder", spy)
+    card = dict(steps=[dict(step=k, hwm=1.5 * k) for k in range(3)], path=Path("/x"))
+    out = tmp_path / "card.json"
+    _driver()._write_json(str(out), card)
+    assert calls, "the card went through the pure-Python encoder"
+    assert json.loads(out.read_text()) == dict(card, path="/x")
+    assert not os.path.exists(f"{out}.tmp")
