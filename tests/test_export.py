@@ -644,3 +644,18 @@ def test_the_cards_decode_refuses_a_chunk_that_splits_the_range(tmp_path):
                                         decode="cards", chunk_bricks=3)
     finally:
         jax.config.update("jax_enable_x64", prev)
+
+
+def test_cli_refuses_a_checkpoint_whose_positions_are_past_its_epoch(tmp_path):
+    """A regular checkpoint mid-schedule has positions half a step past its velocities (the
+    drift is fused across steps): exported only with --allow-partial. The final step and a
+    snapshot are synchronized and export."""
+    mid = _checkpoint(tmp_path, "mid", kind="inexor-checkpoint", step=3, n_steps=6)
+    with pytest.raises(SystemExit, match="allow-partial"):
+        export._main([mid, str(tmp_path / "o0")])
+    assert export._main([mid, str(tmp_path / "o1"), "--allow-partial"]) == 0
+    end = _checkpoint(tmp_path, "end", kind="inexor-checkpoint", step=6, n_steps=6)
+    assert export._main([end, str(tmp_path / "o2")]) == 0
+    snap = _checkpoint(tmp_path, "snap", kind="inexor-checkpoint", step=3, n_steps=6,
+                       snapshot=True)
+    assert export._main([snap, str(tmp_path / "o3")]) == 0

@@ -625,9 +625,24 @@ def _main(argv=None):
         "--d-time", action="store_true",
         help="write the engine's native dx/dD velocity instead of peculiar km/s",
     )
+    ap.add_argument(
+        "--allow-partial", action="store_true",
+        help="export a run checkpoint that is neither its last step nor a snapshot "
+             "(positions half a step past its velocities)",
+    )
     args = ap.parse_args(argv)
 
     man = read_manifest(args.checkpoint_dir)
+    prov = man.get("provenance") or {}
+    if prov.get("kind") == "inexor-checkpoint" and "n_steps" in prov and not args.allow_partial:
+        from .engine import synchronized
+
+        if not synchronized(prov):
+            raise SystemExit(
+                f"{args.checkpoint_dir} is step {prov['step']} of {prov['n_steps']} and not a "
+                "snapshot: the drift is fused across steps, so its positions are half a step "
+                "past its velocities. Export the final step or a snapshot, or pass "
+                "--allow-partial if that is deliberate.")
     a, cosmo, why = _resolve_epoch(man, args)
     st = load_slot_state(args.checkpoint_dir)
     head = write_particles(

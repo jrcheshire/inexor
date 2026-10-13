@@ -321,12 +321,14 @@ count if a node does not have four GPUs.
 
 ```bash
 python -m inexor.export CHECKPOINT_DIR OUT_DIR [--dtype float32|float64] [--chunk-bricks 1024] \
-    [--a A [--omega-m OM] [--h H] | --d-time]
+    [--a A [--omega-m OM] [--h H] | --d-time] [--allow-partial]
 ```
 
-`CHECKPOINT_DIR` is any directory with a T9 `manifest.json`: `ckpt/gen0`, `ckpt/gen1`, or an
-IC directory. Unlike `realization.py export`, this does not need the run's configuration and
-does not check a fingerprint or the step. By default, velocities are written in peculiar km/s
+`CHECKPOINT_DIR` is any directory with a T9 `manifest.json`: `ckpt/gen0`, `ckpt/gen1`, a
+snapshot, or an IC directory. Unlike `realization.py export`, this does not need the run's
+configuration and does not check a fingerprint. A run checkpoint that is neither its last step
+nor a snapshot is refused (its positions are half a step past its velocities) unless
+`--allow-partial` is given. By default, velocities are written in peculiar km/s
 at the epoch the checkpoint records:
 
 - `--a` overrides the recorded epoch, and `--omega-m` / `--h` override single cosmology

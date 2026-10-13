@@ -267,8 +267,11 @@ head, x, v, ids = export.load_particles("W/export", mmap=False)  # parts concate
 
 ```
 python -m inexor.export CHECKPOINT_DIR OUT_DIR [--dtype float32|float64] [--chunk-bricks 1024]
-                        [--a A] [--omega-m OM] [--h H] [--d-time]
+                        [--a A] [--omega-m OM] [--h H] [--d-time] [--allow-partial]
 ```
+
+A run checkpoint that is neither its last step nor a snapshot is refused without
+`--allow-partial`.
 
 `CHECKPOINT_DIR` is any T9 slab directory (for example `W/ckpt/gen1`). The output epoch is
 resolved in this order:
