@@ -37,8 +37,8 @@ ENV = dict(os.environ, OMP_NUM_THREADS="1", JAX_PLATFORMS="cpu",
 def ics(tmp_path_factory):
     d = tmp_path_factory.mktemp("ics")
     # a slightly early start: at this box's 2 Mpc/h brick slabs the a = 0.1 displacements
-    # exceed the streamed generator's one-slab window (the driver's schedule still starts at
-    # 0.1; the epoch does not matter to a byte comparison between rank counts)
+    # exceed the streamed generator's one-slab window (the driver's schedule starts at the
+    # ICs' recorded epoch)
     p = subprocess.run([sys.executable, REALIZATION, "ics", "--config", PRESET, "--workdir",
                         str(d), "--tile-workers", "1", "--a-init", "0.08"],
                        capture_output=True, text=True, env=ENV, timeout=900)

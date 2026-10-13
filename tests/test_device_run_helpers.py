@@ -206,3 +206,46 @@ def test_the_run_card_is_written_by_the_c_encoder(tmp_path, monkeypatch):
     assert calls, "the card went through the pure-Python encoder"
     assert json.loads(out.read_text()) == dict(card, path="/x")
     assert not os.path.exists(f"{out}.tmp")
+
+
+def test_the_schedule_starts_at_the_ics_or_checkpoints_epoch(tmp_path):
+    """`run` from ICs starts the schedule at the ICs' recorded a_init, a resume or a product
+    at the checkpoint's (`source.a_init`); records without the field mean a = 0.1. An explicit
+    --a-init that disagrees is refused: the ICs carry their epoch in D and f."""
+    import argparse
+    import json
+
+    import pytest
+
+    start = _driver()._start_epoch
+
+    def ics(name, **man):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "manifest.json").write_text(json.dumps(man))
+        return argparse.Namespace(workdir=str(d), a_init=None)
+
+    early, old = ics("early", a_init=0.08), ics("old")
+    assert start(early) == 0.08
+    assert start(old) == 0.1
+    early.a_init = 0.1
+    with pytest.raises(SystemExit, match="another epoch"):
+        start(early)
+    early.a_init = 0.08
+    assert start(early) == 0.08
+
+    def ckpt(name, step, **source):
+        d = tmp_path / name / "gen0"
+        d.mkdir(parents=True)
+        prov = dict(kind="inexor-checkpoint", step=step)
+        if source:
+            prov["source"] = source
+        (d / "manifest.json").write_text(json.dumps(dict(provenance=prov)))
+        return str(d.parent)
+
+    args = argparse.Namespace(workdir=None, a_init=None)
+    assert start(args, ckpt("ck", 3, a_init=0.08)) == 0.08
+    assert start(args, ckpt("ck_old", 3)) == 0.1
+    args.a_init = 0.1
+    with pytest.raises(SystemExit, match="another epoch"):
+        start(args, str(tmp_path / "ck"))

@@ -108,6 +108,27 @@ def _git_commit():
                           capture_output=True, text=True).stdout.strip()
 
 
+def _start_epoch(args, checkpoint_dir=None):
+    """The schedule's a_init: the ICs' recorded epoch for a run from `args.workdir`, else the
+    checkpoint's (`source.a_init`). A record that predates the field means A_INIT. An explicit
+    `--a-init` must agree: the ICs carry their epoch in the displacements and velocities."""
+    from _instruments import A_INIT
+    from inexor import engine, icgen
+
+    if checkpoint_dir is None:
+        with open(os.path.join(args.workdir, icgen.MANIFEST)) as fh:
+            have, where = json.load(fh).get("a_init"), f"the ICs in {args.workdir}"
+    else:
+        prov = engine.newest_checkpoint_provenance(checkpoint_dir) or {}
+        have, where = (prov.get("source") or {}).get("a_init"), \
+            f"the checkpoints in {checkpoint_dir}"
+    have = A_INIT if have is None else float(have)
+    if args.a_init is not None and abs(float(args.a_init) - have) > 1e-12 * have:
+        raise SystemExit(f"{where} start at a = {have!r}; --a-init {args.a_init!r} would evolve "
+                         "them from another epoch")
+    return have
+
+
 def _write_json(path, obj):
     tmp = f"{path}.tmp"
     # one-shot dumps with no indent is the C encoder; the card is rewritten at every boundary
@@ -1075,7 +1096,9 @@ def cmd_run(args):
         mon.start()
 
         cosmo = _cosmo()
-        co, a_steps = _coeffs(cosmo, args.k_steps, growth2=args.growth2)
+        a_init = _start_epoch(args, args.checkpoint_dir if args.expect_step else None)
+        card["a_init"] = a_init
+        co, a_steps = _coeffs(cosmo, args.k_steps, a_init=a_init, growth2=args.growth2)
         snaps = snapshot_steps_for(args.snapshot_z, a_steps) if args.snapshot_z else []
         snap_steps = [x for _, x, _ in snaps]
         card["snapshots"] = [dict(z=z, step=x, z_step=zx) for z, x, zx in snaps]
@@ -1132,7 +1155,7 @@ def cmd_run(args):
         # the ICs' linear P(k), if tabulated, rides along into every checkpoint
         epoch = (a_steps, cosmo, None if linear_pk is None else linear_pk.record())
         ic_prov = icgen.read_manifest(args.workdir).get("provenance") or {}
-        source = dict(ics=ics, ics_provenance={k: ic_prov[k] for k in (
+        source = dict(ics=ics, a_init=a_init, ics_provenance={k: ic_prov[k] for k in (
             "generator", "commit", "host", "when") if k in ic_prov})
         out = engine.run(st, ec, co, phase=mon, resume=resume, stop_at=args.stop_at,
                          collect=collect, timed_steps=timed, epoch=epoch,
@@ -1311,7 +1334,9 @@ def _product(args, kind):
         mon.start()
 
         cosmo = _cosmo()
-        co, a_steps = _coeffs(cosmo, args.k_steps, growth2=args.growth2)
+        a_init = _start_epoch(args, args.checkpoint_dir)
+        card["a_init"] = a_init
+        co, a_steps = _coeffs(cosmo, args.k_steps, a_init=a_init, growth2=args.growth2)
         # before the (long) load: products need positions and velocities at one epoch
         head = engine.newest_checkpoint_provenance(args.checkpoint_dir)
         if (head is not None and not engine.synchronized(head, args.k_steps)
@@ -1557,6 +1582,10 @@ def main(argv=None):
                             "float64); fingerprinted, so products of a run must pass the same")
         p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"),
                        help="the second-order growth the ICs must have been generated with")
+        p.add_argument("--a-init", type=float, default=None,
+                       help="the schedule's starting scale factor. Default: the ICs' recorded "
+                            "epoch (from ICs) or the checkpoint's (resume); refused if given "
+                            "and different")
     pf = sub.choices["preflight"]
     pf.add_argument("--scratch", default=os.environ.get("SCRATCH", "/tmp"))
     pf.add_argument("--host-margin", type=float, default=0.95,
@@ -1670,6 +1699,9 @@ def main(argv=None):
                        help="precision of the fine tiles, their FFTs and the kick (production: "
                             "float64); fingerprinted, so products of a run must pass the same")
         p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"))
+        p.add_argument("--a-init", type=float, default=None,
+                       help="the run's starting scale factor (fingerprinted). Default: the "
+                            "checkpoint's; refused if given and different")
         p.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
         p.add_argument("--comm", default="serial", choices=("serial", "mpi"))
         p.add_argument("--comm-timeout", type=float, default=1800.0)
