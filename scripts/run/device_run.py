@@ -123,7 +123,7 @@ def _geometry(args):
 
 def _start_epoch(args, checkpoint_dir=None):
     """The schedule's a_init: the ICs' recorded epoch for a run from `args.workdir`, else the
-    checkpoint's (`source.a_init`). A record that predates the field means A_INIT. An explicit
+    checkpoint's (`source.a_init`). A record without the field means A_INIT. An explicit
     `--a-init` must agree: the ICs carry their epoch in the displacements and velocities."""
     from _instruments import A_INIT
     from inexor import engine, icgen
@@ -429,11 +429,10 @@ class Monitor:
         self._stop = threading.Event()
         self._beat_s = float(beat_s)
         self._thread = threading.Thread(target=self._beat_loop, daemon=True, name="d7-beat")
-        # every card's allocator bytes in use, sampled between boundaries: the boundary
-        # records' `peak` is the process's running maximum, so it cannot say which phase
-        # set it; `card_phase_peak` is the largest sample since the previous boundary.
-        # The same loop samples host RSS (`rss_phase_peak`): the kernel's VmHWM has read
-        # 0.3-0.4 GB below a 20 ms RSS sampler during a tile-program recompile.
+        # every card's allocator bytes and host RSS, sampled between boundaries: a boundary's
+        # `peak` is the process's running maximum and cannot say which phase set it, so
+        # `card_phase_peak` / `rss_phase_peak` are the largest samples since the previous
+        # boundary (the kernel's VmHWM can read below a fast RSS sampler)
         self._card_sample_s = float(card_sample_s)
         self._card_max = None
         self._rss_max = None
@@ -1586,8 +1585,8 @@ def main(argv=None):
         p.add_argument("--cards", type=int, default=4)
         p.add_argument("--y-blocks", type=_y_blocks, default=None,
                        help="split each x-slab's card work into this many y-blocks "
-                            "(EngineConfig.device_y_blocks); bitwise any count. Default "
-                            "auto: units no larger than a 4096^3 x-slab")
+                            "(EngineConfig.device_y_blocks); bitwise the same at any count. "
+                            "Default auto: units no larger than a 4096^3 x-slab")
         p.add_argument("--slack", type=float, default=0.10)
         p.add_argument("--alloc-margin", type=float, default=0.10)
         p.add_argument("--arena-frac", type=float, default=0.01)
@@ -1690,8 +1689,8 @@ def main(argv=None):
     pi.add_argument("--batch-planes", type=int, default=16,
                     help="planes per rank in each plane <-> pencil exchange")
     pi.add_argument("--y-blocks", type=_y_blocks, default=None,
-                    help="y-block units per destination slab in the emission (bitwise any). "
-                         "Default auto: units no larger than a 4096^3 x-slab")
+                    help="y-block units per destination slab in the emission (bitwise the "
+                         "same at any count). Default auto: units no larger than a 4096^3 x-slab")
     pi.add_argument("--membind-nodes", default=None)
     pi.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
     pi.add_argument("--comm", default="serial", choices=("serial", "mpi"))
@@ -1728,7 +1727,7 @@ def main(argv=None):
         p.add_argument("--comm", default="serial", choices=("serial", "mpi"))
         p.add_argument("--comm-timeout", type=float, default=1800.0)
         p.add_argument("--allow-partial", action="store_true",
-                       help="a checkpoint that is neither the last step nor a snapshot "
+                       help="accept a checkpoint that is neither the last step nor a snapshot "
                             "(positions half a step past its epoch)")
     pc = sub.choices["card"]
     pc.add_argument("--out", required=True, help="the P(k) card JSON (rank 0 writes it)")

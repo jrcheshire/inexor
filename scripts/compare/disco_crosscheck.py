@@ -17,8 +17,9 @@ Four phases, each in the env it needs; they exchange one npz each.
 
 `evolve` runs DISCO-DJ with CIC (worder 2), ik gradient and Laplacian, no
 deconvolution, no antialiasing, BullFrog on the explicit a-grid, momentum
-= v_d * Fplus(a); `--chunk-size` sets DISCO-DJ's particle chunking, its memory knob. Particle order is irrelevant to the PM: DISCO-DJ stores X - q
-periodically wrapped and adds q back before every paint (its `nbody/acc.py`).
+= v_d * Fplus(a); `--chunk-size` sets DISCO-DJ's particle chunking, its memory knob.
+Particle order is irrelevant to the PM: DISCO-DJ stores X - q periodically wrapped and adds
+q back before every paint (its `nbody/acc.py`).
 
 `card` takes everything after `--` as realization-script arguments, so the bins,
 paint, deconvolution and layout are the ones the engine's cards use; it writes

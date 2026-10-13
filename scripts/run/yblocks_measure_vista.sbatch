@@ -6,7 +6,7 @@
 #SBATCH -t 02:30:00
 #SBATCH -o inexor-yblocks-%j.log
 #SBATCH --signal=B:USR1@600
-# The y-block cut on one gb node (4 B200): per preset, device ICs once, then the same steps
+# The y-block cut on one gb node (four GB200): per preset, device ICs once, then the same steps
 # at every y-block count, each from the ICs into its own checkpoint dir. Every count's
 # checkpoints must equal the 1-block run's byte for byte, manifests compared without their
 # window shape (gate_any_cut); a mismatch reruns 1 and that count under

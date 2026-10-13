@@ -9,7 +9,8 @@
 # cache would be linked straight back in), then checked again. Returns 1 if it still fails.
 # Jobs starting together from one checkout take turns on a lock (where `flock` exists), so a
 # second job finds the env the first rebuilt; a job already running from the checkout loses
-# its env during a rebuild. The cache goes under $GPU_ENV_CACHE_ROOT (default $SCRATCH).
+# its env during a rebuild. The cache goes under $GPU_ENV_CACHE_ROOT (default $SCRATCH, else
+# SRC/.pixi).
 ensure_gpu_env () {
   mkdir -p "$1/.pixi" || return 1
   if command -v flock >/dev/null 2>&1; then

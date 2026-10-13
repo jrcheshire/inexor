@@ -38,8 +38,8 @@
 # PLANT_MISMATCH=1 flips one byte of the first leg's copy before its resume, so its gate must
 # fail and the next leg still run.
 #
-# Wall (c-gh, 20 steps late in the run): 1045958 ran its last 20 steps at ~126 s/step on 2 gh
-# nodes, so the 2-rank leg is ~42 min; at 4 / 8 / 16 ranks ~20-30 / 12-20 / 7-14 min if the
+# Wall (c-gh, 20 steps late in the run): the last 20 steps run at ~126 s/step on 2 gh nodes,
+# so the 2-rank leg is ~42 min; at 4 / 8 / 16 ranks ~20-30 / 12-20 / 7-14 min if the
 # exchange and the per-step fixed costs keep pace (unmeasured). Each leg also copies a
 # generation (~80 GB) and loads it; with ~20 min of guards, ~2-2.5 h central, 5 h requested.
 # Every node is charged for every leg. USR1 900 s before the wall reaches every rank through

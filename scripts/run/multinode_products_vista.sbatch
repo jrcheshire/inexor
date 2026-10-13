@@ -8,16 +8,18 @@
 #SBATCH -o inexor-mn-products-%j.log
 #SBATCH --signal=B:USR1@600
 # The P(k) card and the (x, v) export of a realization's checkpoint, across the nodes, one
-# rank per node on gh (one GH200) or gb (four GB200) (`device_run.py card` / `export`): the card painted and
-# transformed on the cards, the export decoded on them and written as one part per rank.
+# rank per node on gh (one GH200) or gb (four GB200) (`device_run.py card` / `export`): the
+# card painted and transformed on the GPUs, the export decoded on them and written as one
+# part per rank.
 #
-# Guards first (the MPI launch line on every node, a dying rank ends the launch; both fatal). With SMALL_CKPT, a byte check before the products: that checkpoint's
-# card and export on one rank (node 0) and on every rank must be the same (the card in every
-# field, the export's crc32 of every array); a mismatch stops the job. Then the card and the
-# export of CKPT_DIR into PROD_DIR. With REF_EXPORT (an export of the same checkpoint made
-# another way, e.g. hero_export_vista.sbatch's host decode) the export's crc32 must equal it;
-# with REF_CARD (a card of the same checkpoint, e.g. hero_card_vista.sbatch's) the per-bin
-# difference is printed, never gated (the transforms differ).
+# Guards first (the MPI launch line on every node, a dying rank ends the launch; both fatal).
+# With SMALL_CKPT, a byte check before the products: that checkpoint's card and export on one
+# rank (node 0) and on every rank must be the same (the card in every field, the export's
+# crc32 of every array); a mismatch stops the job. Then the card and the export of CKPT_DIR
+# into PROD_DIR. With REF_EXPORT (an export of the same checkpoint made another way, e.g.
+# hero_export_vista.sbatch's host decode) the export's crc32 must equal it; with REF_CARD (a
+# card of the same checkpoint, e.g. hero_card_vista.sbatch's) the per-bin difference is
+# printed, never gated (the transforms differ).
 #
 # Every leg has a silence limit and no time limit but the wall; a failed leg stops the job.
 # Each leg's output is also in PROD_DIR/job-<id>/legs/.
@@ -26,10 +28,11 @@
 # the card lands in PROD_DIR/pk.json, the export in PROD_DIR/export, which must not hold
 # files), and INEXOR_SRC or submission from the checkout. Optional: PRESET (c-gh); K and
 # EXPECT_STEP (the newest checkpoint's n_steps and step); ALLOW_PARTIAL (0: refuse a
-# checkpoint that is neither the last step nor a snapshot, for the card and the export); WITH_EXPORT (1; 0 = the card only); SMALL_CKPT + SMALL_PRESET (c-1024); REF_EXPORT; REF_CARD; SLACK /
-# ALLOC_MARGIN (0.10), ARENA_FRAC (0.01); QUIET_S (900).
+# checkpoint that is neither the last step nor a snapshot); WITH_EXPORT (1; 0 = the card
+# only); SMALL_CKPT + SMALL_PRESET (c-1024); REF_EXPORT; REF_CARD; SLACK / ALLOC_MARGIN
+# (0.10), ARENA_FRAC (0.01); QUIET_S (900).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R CKPT_DIR=$R/c-gh-k120/ckpt PROD_DIR=$R/c-gh-k120-mn \
-#     SMALL_CKPT=$R/mn-gate-c-1024-1043437/mpi/ckpt REF_EXPORT=$R/c-gh-k120-product/export \
+#     SMALL_CKPT=$R/mn-gate-c-1024-<job>/mpi/ckpt REF_EXPORT=$R/c-gh-k120-product/export \
 #     REF_CARD=<the c-gh card json> sbatch -A <account> scripts/run/multinode_products_vista.sbatch
 # 8192^3 on 8 gb nodes, after the steps job:
 #   INEXOR_RUNS=$R CKPT_DIR=$R/c-8192-k40/ckpt PROD_DIR=$R/c-8192-k40-product PRESET=c-8192 \

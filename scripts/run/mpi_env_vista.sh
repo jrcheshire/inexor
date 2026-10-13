@@ -3,12 +3,14 @@
 # environment on Vista gh (one GH200 per node) or gb (four GB200 per node, two CPU memory
 # nodes), one rank per node under ibrun, host MPI from the MVAPICH-Plus module.
 #
-# Requires SRC (the checkout) and RUNS (the run root); reads N_RANKS (2), REHEARSAL and
-# REBUILD_ENV (1: reinstall the gpu env from the lock; `gpu_env.sh`). Sets:
+# Requires SRC (the checkout) and RUNS (the run root); reads N_RANKS (2), REHEARSAL,
+# REBUILD_ENV (1: reinstall the gpu env from the lock; `gpu_env.sh`), MPI_MODULE
+# (mvapich-plus/5.1.0), MPI4PY_DIR (under $SCRATCH/inexor-mpi4py) and XLA_CACHE_ROOT
+# ($SCRATCH/inexor-xla-cache). Sets:
 #   PY             the gpu env's python (the laptop's in a rehearsal)
 #   LAUNCH         the launcher, `ibrun` (rehearsal: `mpiexec -n N_RANKS`)
-#   MPI4PY_DIR     mpi4py built against the module, for `python -m mpi4py` legs; MPIPATH is the
-#                  `env PYTHONPATH=...` prefix that imports it (empty in a rehearsal)
+#   MPI4PY_DIR     mpi4py built against the module, for `python -m mpi4py` legs; MPIPATH is
+#                  the `env PYTHONPATH=...` prefix that imports it (empty in a rehearsal)
 #   BIND0          the numactl prefix of a node-0 process (ICs, preflight)
 #   MEMBIND_RANK   rank_exec.sh's binding of each rank; MEMBIND_CHECK the driver's check of it
 #   MACHINE        the preflight's host and card sizes

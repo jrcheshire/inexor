@@ -22,9 +22,9 @@
 # Requires INEXOR_RUNS, ONE_ICS, REF_CKPT (two generations at different steps), REF_ICS (its
 # ICs), OUT_DIR, MPI_OFF (space-separated VAR=value), and INEXOR_SRC or submission from the
 # checkout. Optional: ONE_CKPT, ONE_PRESET (cgh64), ONE_K (120), ONE_STOP (ONE_K), ONE_FINE
-# (float64), PRESET (c-gh), STEPS (10), SLACK / ALLOC_MARGIN (0.10), ARENA_FRAC (0.01),
-# QUIET_S (600).
-#   R=$SCRATCH/inexor_runs; S=$R/gh-same-ics-1065471/cgh64; INEXOR_RUNS=$R ONE_ICS=$S/ics \
+# (float64), PRESET (c-gh), STEPS (10, or the generations' gap if smaller), SLACK /
+# ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), QUIET_S (600).
+#   R=$SCRATCH/inexor_runs; S=$R/gh-same-ics-<job>/cgh64; INEXOR_RUNS=$R ONE_ICS=$S/ics \
 #     ONE_CKPT=$S/inexor-float64/ckpt REF_CKPT=$R/c-gh-k120/ckpt REF_ICS=$R/c-gh-lcdm-r1 \
 #     OUT_DIR=$R/mem-diag MPI_OFF="..." sbatch -A <account> scripts/run/memory_diag_vista.sbatch
 #
@@ -32,9 +32,10 @@
 # gate script:
 #   G=runs/rehearsal/mn-gate-cdev8-tile32-<tag>; REHEARSAL=1 INEXOR_RUNS=runs/rehearsal \
 #     ONE_ICS=$G/ics REF_CKPT=$G/mpi/ckpt REF_ICS=$G/ics OUT_DIR=runs/rehearsal/mem-diag-r1 \
-#     MPI_OFF="MVP_NOLOCAL=1" scripts/run/mpi_lane.sh --run bash scripts/run/memory_diag_vista.sbatch
+#     MPI_OFF="MVP_NOLOCAL=1" scripts/run/mpi_lane.sh --run \
+#     bash scripts/run/memory_diag_vista.sbatch
 #
-# Wall: one ~16 min (1065471's 512^3 run took 965 s); each mpi arm copies a generation, loads
+# Wall: one ~16 min (a 512^3 run takes ~965 s); each mpi arm copies a generation, loads
 # it (~1.5 min) and runs 10 steps at ~127 s (2048^3 on 2 gh), ~25 min; with the guards ~75 min,
 # 3 h requested. Node 1 idles through `one`.
 

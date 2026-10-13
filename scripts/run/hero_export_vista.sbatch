@@ -6,8 +6,9 @@
 #SBATCH -t 05:00:00
 #SBATCH -o d7g-hero-export-%j.log
 # The portable (x, v) export of an evolved realization's final checkpoint (c-hero, 4096^3,
-# unless PRESET says otherwise), and nothing else. The checkpoint is the engine's own T9 encoding; this writes it as two
-# plain float32 .npy arrays (~1.65 TB) that any halo finder or analysis code can mmap.
+# unless PRESET says otherwise), and nothing else. The checkpoint is the engine's own T9
+# encoding; this writes it as two plain float32 .npy arrays (~1.65 TB) that any halo finder
+# or analysis code can mmap.
 # Independent of the card job (hero_card_vista.sbatch): same checkpoint, neither reads the
 # other's output, so they may run concurrently or in either order.
 #

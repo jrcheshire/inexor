@@ -21,7 +21,9 @@
 # CPU NUMA node, so the numbers compare with that job's.
 #
 # Requires INEXOR_RUNS (run root), DISCO_SRC (disco-mocks checkout) and INEXOR_SRC or
-# submission from the inexor checkout. The account is passed with `sbatch -A`:
+# submission from the inexor checkout. Optional: CHUNKS_cdev8 ("262144"), CHUNKS_cdev ("all
+# 4194304 1048576"), CHUNKS_cgh64 ("all 16777216 4194304 1048576"): DISCO-DJ chunk sizes in
+# particles, "all" = no chunking. The account is passed with `sbatch -A`:
 #   INEXOR_RUNS=$SCRATCH/inexor_runs DISCO_SRC=$HOME/src/disco-mocks \
 #     sbatch -A <account> scripts/compare/gh_same_ics_vista.sbatch
 #

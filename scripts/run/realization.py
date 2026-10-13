@@ -914,13 +914,13 @@ def build_parser():
                          "same seed is an UNRELATED realization")
     ap.add_argument("--a-init", type=float, default=A_INIT,
                     help="starting scale factor, for ICs and the step grid alike "
-                         "(default 0.1, z = 9). Loading ICs made at "
-                         "another epoch is refused")
+                         "(default 0.1, z = 9). Loading ICs made at another epoch is "
+                         "refused")
     ap.add_argument("--coarse-match-order", type=int, default=3, choices=(2, 3),
                     help="assignment order the coarse match factor divides out. "
                          "The coarse arm paints TSC, so 3 (default) is correct; 2 "
-                         "(CIC) is the legacy arm. In the checkpoint fingerprint when not 2, so arms "
-                         "cannot cross-resume")
+                         "(CIC) is the legacy arm. In the checkpoint fingerprint when not "
+                         "2, so arms cannot cross-resume")
     ap.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"),
                     help="second-order growth for the 2LPT ICs and the BullFrog "
                          "weights: the LCDM ODE solution (default) or the legacy EdS "

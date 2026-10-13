@@ -30,8 +30,8 @@
 #   1024^3    inexor first; then DISCO-DJ export and evolve single, expected to fail on the
 #             card (~280 B/p measured, ~300 GB against 96 GB); last, so a host-side failure
 #             there costs nothing else.
-# Wall, estimated: guards + smoke ~5 min; 256^3 ~10; 512^3 ~20; inexor 1024^3 ~80 (1024785:
-# 1:21 with ICs and card); DISCO-DJ 1024^3 ~5. ~2.3 h; 3 h requested.
+# Wall: guards + smoke ~5 min; 256^3 ~10; 512^3 ~20; inexor 1024^3 ~80 (1:21 measured with
+# ICs and card); DISCO-DJ 1024^3 ~5. ~2.3 h; 3 h requested.
 
 set -u
 export PATH="$HOME/.pixi/bin:$PATH"

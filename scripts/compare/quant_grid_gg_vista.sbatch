@@ -14,11 +14,12 @@
 #     240 steps from z = 9 (the 2LPT start-truncation comparison)
 #   cdev8-L128 (1.0 Mpc/h spacing): (9, 120), (19, 120), (49, 240), engine and ref
 #
-# The inexor checkout's gpu env is used through its python directly with JAX_PLATFORMS=cpu,
-# never through `pixi run`, so this job cannot reinstall an env other jobs share.
+# Requires OUT_DIR (outputs under OUT_DIR/job-<id>) and INEXOR_SRC or submission from the
+# inexor checkout, whose gpu env is used through its python with JAX_PLATFORMS=cpu, never
+# through `pixi run`, so this job cannot reinstall an env other jobs share.
 #   OUT_DIR=$SCRATCH/inexor_runs/quant-grid sbatch -A <account> \
-#     scripts/compare/quant_grid_gg_vista.sbatch   (from the inexor checkout, or set INEXOR_SRC)
-# Expected wall ~2 h (longest leg: engine, 240 steps from z = 49).
+#     scripts/compare/quant_grid_gg_vista.sbatch
+# Wall ~2 h (longest leg: engine, 240 steps from z = 49).
 
 set -u
 SRC=${INEXOR_SRC:-$SLURM_SUBMIT_DIR}

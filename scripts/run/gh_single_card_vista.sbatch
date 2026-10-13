@@ -12,13 +12,12 @@
 # as every other preset). A run that fails gets no card and the next step count still runs.
 #
 # Requires INEXOR_RUNS (run root; outputs under $INEXOR_RUNS/d8-gh-<preset>-<job>/k<K>) and
-# INEXOR_SRC or submission from the inexor checkout. Optional: PRESET, KS (120; step counts,
-# space-separated), SLACK, ALLOC_MARGIN, ARENA_FRAC, PK_TABLE (a tabulated linear P(k) from
-# scripts/run/camb_linear_pk.py instead of EH98), N_FINE (fine mesh cells per side instead of
-# the preset's, the tile buffer re-derived to hold the split; ICs, runs and cards all take it),
-# REBUILD_ENV=1 (reinstall the gpu env from the
-# lock first; it is also reinstalled when it fails to import, as after a scratch purge). The
-# account is passed with `sbatch -A`:
+# INEXOR_SRC or submission from the inexor checkout. Optional: PRESET (c-1024), KS (120; step
+# counts, space-separated), SLACK (0.10), ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), PK_TABLE (a
+# tabulated linear P(k) from scripts/run/camb_linear_pk.py instead of EH98), N_FINE (fine mesh
+# cells per side instead of the preset's; ICs, runs and cards all take it), REBUILD_ENV=1
+# (reinstall the gpu env from the lock first; `gpu_env.sh`). The account is passed with
+# `sbatch -A`:
 #   INEXOR_RUNS=$SCRATCH/inexor_runs sbatch -A <account> scripts/run/gh_single_card_vista.sbatch
 #   sbatch -A <account> -t <wall> --export=ALL,PRESET=c-gh,SLACK=0.05,ALLOC_MARGIN=0.05 ...
 # The step-count ladder at 512^3 in 256 Mpc/h (one IC set, five schedules):
@@ -32,12 +31,10 @@
 # HBM, so the preflight compares against the CPU NUMA node alone and the process is bound
 # to it (--membind 0).
 #
-# Wall (cgh64 ladder), estimated: ~8 s/step on one GH200 (gh 1029876's 512^3 run), 460
-# steps ~1 h, plus five cards (~1-2 min each) and the ICs: ~1.5-2 h central, 4 h requested.
-# Wall (c-1024), estimated: ~35-45 s/step (4096^3 on four GB200s scaled by volume, one
-# card for four, and GH200 vs GB200 tile force), 120 steps ~70-90 min; ICs ~5 min, pytest
-# ~2, checkpoints ~1, card ~5. ~1.5-2 h central; 4 h requested since small-N fixed costs
-# are unmeasured. USR1 900 s before the wall triggers driver stack dumps.
+# Wall (cgh64 ladder): ~8 s/step on one GH200 at 512^3, 460 steps ~1 h, plus five cards
+# (~1-2 min each) and the ICs: ~1.5-2 h. Wall (c-1024), estimated from 4096^3 on four GB200s
+# scaled by volume: ~35-45 s/step, 120 steps ~70-90 min, plus ICs, checkpoints and card
+# ~10 min; 4 h requested. USR1 900 s before the wall triggers driver stack dumps.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }

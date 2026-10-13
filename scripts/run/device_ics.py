@@ -426,7 +426,7 @@ def main():
     p.add_argument("--n", type=int, default=4096)
     p.add_argument("--nb", type=int, default=256)
     p.add_argument("--y-blocks", type=int, default=1,
-                   help="y-block units per destination slab (bitwise any count)")
+                   help="y-block units per destination slab (bitwise the same at any count)")
     p.add_argument("--out", required=True)
     p.add_argument("--tmp", default=None)
     p = sub.add_parser("project")
