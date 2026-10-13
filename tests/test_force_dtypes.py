@@ -540,6 +540,7 @@ def test_the_two_engine_knobs_move_independently():
     assert geom["fdtype"] == "float64", "the fine arm followed the coarse knob"
 
 
+@pytest.mark.slow
 def test_the_engine_reports_the_dtypes_it_actually_used():
     """The run summary reads dtypes off the arrays rather than echoing the config, which
     could not catch a knob that did not apply."""

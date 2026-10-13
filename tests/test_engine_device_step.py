@@ -89,6 +89,7 @@ LANES = {
 
 
 @pytest.mark.parametrize("lane", sorted(LANES))
+@pytest.mark.slow
 def test_each_device_lane_is_bitwise_the_host_engine_with_receipts(lane, monkeypatch):
     from inexor.device import paint as dpaint
     from inexor.device import tile as dtile

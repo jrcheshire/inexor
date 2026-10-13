@@ -42,7 +42,8 @@ jobs:
           locked: true
           cache: true
           environments: default
-      - run: pixi run test
+      # the tests marked slow run in the full local `pixi run test`
+      - run: pixi run test-fast
 
   test-ranks:
     if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft

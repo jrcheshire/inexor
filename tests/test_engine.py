@@ -241,6 +241,7 @@ def test_the_capacity_ladder_bounds_both_padding_and_shape_count():
         assert n == rungs, f"a half-open octave should cost {rungs} shapes, got {n}"
 
 
+@pytest.mark.slow
 def test_quantizing_the_capacity_shape_is_bitwise_neutral():
     """Padding `cap` is bitwise neutral on evolved state: padded rows are masked (integer
     paint weight exactly zero, no row mixing, results sliced back). Compares cap_rungs=1
@@ -270,6 +271,7 @@ def test_quantizing_the_capacity_shape_is_bitwise_neutral():
     assert np.array_equal(a[4], b[4]), "velocity scale differs"
 
 
+@pytest.mark.slow
 def test_the_run_visits_few_shapes_and_they_never_decrease():
     """A run's cap shapes are few (at most half the steps) and non-decreasing."""
     from inexor.integrate import a_grid, bullfrog_float_coeffs, bullfrog_table
@@ -321,6 +323,7 @@ def _pad_shapes_of_a_run(cfg, co, seed=0):
     return seen, out, st
 
 
+@pytest.mark.slow
 def test_the_coarse_chunk_pad_collapses_to_a_small_shape_family():
     """The pad ladder collapses the run's pad shapes: no more than the
     `ceil(rungs * log2(hi/lo)) + 1` rungs the ladder offers over the pad range, and fewer
@@ -353,6 +356,7 @@ def test_the_coarse_chunk_pad_collapses_to_a_small_shape_family():
     )
 
 
+@pytest.mark.slow
 def test_the_pad_ladder_knob_restores_the_churn_and_moves_no_bit():
     """`pad_ladder=False` restores the per-step pad churn while evolving bit-identical state,
     so a memory A/B between the arms compares the same engine. `cap` stays laddered in both
@@ -657,6 +661,7 @@ def _coeffs(k=6):
     return bullfrog_float_coeffs(bullfrog_table(a_grid(0.1, 1.0, k, "log"), Cosmology()))
 
 
+@pytest.mark.slow
 def test_resumed_run_is_bitwise_the_uninterrupted_one(tmp_path):
     """Six steps straight through equal six steps resumed from the step-3 checkpoint, row for
     row. Both arms get the full schedule (`fused_drifts` makes `coeffs[:3]` a different
@@ -688,6 +693,7 @@ def _slab_bytes(gen_dir):
             if f != "manifest.json"}
 
 
+@pytest.mark.slow
 def test_a_snapshot_is_bitwise_the_end_of_the_truncated_schedule(tmp_path):
     """A snapshot at step 3 of 6 drifts only step 3's trailing half, so its state is the end of
     a run over `coeffs[:3]` byte for byte; its manifest marks it and records its epoch."""
@@ -713,6 +719,7 @@ def test_a_snapshot_is_bitwise_the_end_of_the_truncated_schedule(tmp_path):
     assert engine.synchronized(prov)
 
 
+@pytest.mark.slow
 def test_snapshots_compose_across_resumed_segments(tmp_path):
     """Snapshots at steps 2 and 4 with checkpoints every 2: run straight through, or as three
     resumed segments, the snapshots and the final checkpoint are the same bytes (each snapshot
@@ -877,6 +884,7 @@ def test_load_checkpoint_refuses_when_nothing_is_complete(tmp_path):
         engine.load_checkpoint(d, _cfg(), _coeffs(2))
 
 
+@pytest.mark.slow
 def test_a_run_split_into_segments_is_bitwise_the_uninterrupted_one(tmp_path):
     """Three `stop_at` + `resume` segments of two steps, each reloading from disk, equal six
     steps straight through row for row (how a run longer than a queue limit executes).

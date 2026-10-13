@@ -120,6 +120,7 @@ def test_the_device_backend_beside_a_tile_pool_still_runs_the_device_pass():
     assert all(o["tile_workers"] == 2 for o in out_d)
 
 
+@pytest.mark.slow
 def test_a_device_backend_run_split_and_resumed_is_bitwise_the_uninterrupted_one(tmp_path):
     co = _coeffs(4)
     ref = _state(_cfg(migrate_backend="device"), with_ids=False)
