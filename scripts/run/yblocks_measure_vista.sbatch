@@ -56,7 +56,7 @@ if [ "${REHEARSAL:-0}" = 1 ]; then
   export PATH="$STUBS:$PATH"
   MEMBIND_CHECK=() MACHINE=(--allow-cpu)
 else
-  [ "$SLURM_JOB_PARTITION" = gb ] || { echo "FATAL: gb only (4 B200 per node)"; exit 1; }
+  [ "$SLURM_JOB_PARTITION" = gb ] || { echo "FATAL: gb only (four GB200 per node)"; exit 1; }
   command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
   export XLA_PYTHON_CLIENT_PREALLOCATE=false
   export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async

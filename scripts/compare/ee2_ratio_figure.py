@@ -5,7 +5,7 @@
         python scripts/compare/ee2_ratio_figure.py RUN_A/realization_pk.json \
         RUN_B/realization_pk.json --cosmology RUN_A/export.json \
         --labels '0.25 Mpc/h fine cell' '0.125 Mpc/h fine cell' \
-        -o figures/inexor_over_ee2.png"
+        -o runs/figures/inexor_over_ee2.png"
 
 euclidemu2 is pip-only, and its wheel needs `gsl` in the env to load.
 
@@ -28,6 +28,7 @@ ICs differ by both bands' scatter.
 
 import argparse
 import json
+import os
 
 import numpy as np
 
@@ -116,6 +117,7 @@ def main():
     ax.legend(frameon=False, fontsize=8.5, loc="lower left")
     ax.grid(alpha=0.25, lw=0.6)
     fig.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     fig.savefig(args.out, dpi=args.dpi, bbox_inches="tight")
     print(f"-> {args.out}")
 

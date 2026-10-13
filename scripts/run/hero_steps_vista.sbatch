@@ -30,8 +30,8 @@
 # 590-667 s (later epochs are slower) = 6.6-7.4 h; 2 checkpoints x ~16 min. ~8.2-9.0 h
 # central; 11 h requested against the 12 h MaxWall.
 #
-# Host memory is bound to the CPU sockets (`numactl --membind=0,1`); the previous 40-step
-# hero run peaked at 951 GB of 1026. USR1 900 s before the wall triggers driver stack dumps.
+# Host memory is bound to the CPU sockets (`numactl --membind=0,1`); a 40-step segment
+# peaks at ~951 GB of 1026. USR1 900 s before the wall triggers driver stack dumps.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }

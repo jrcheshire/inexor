@@ -2,7 +2,7 @@
 
     pixi exec --spec python=3.12 --spec camb --spec matplotlib --spec numpy --spec scipy \
         -- python scripts/compare/pk_boost_reference.py RUN/realization_pk.json \
-        --cosmology RUN/export.json -o figures/hero_pk_boost.png
+        --cosmology RUN/export.json -o runs/figures/pk_boost.png
 
 Run through `pixi exec`, not the project env: camb is a one-off reference, not an
 engine dependency, and adding it would move `pixi.lock`. EuclidEmulator2 is used if
@@ -27,6 +27,7 @@ or `--cosmology`; there is no default.
 
 import argparse
 import json
+import os
 
 import numpy as np
 from scipy.signal import fftconvolve
@@ -205,7 +206,7 @@ def main():
                          "header has one). Required unless the card does -- there "
                          "is no default, because a reference built at the wrong "
                          "parameters looks exactly like a discrepancy")
-    ap.add_argument("-o", "--out", default="figures/hero_pk_boost.png")
+    ap.add_argument("-o", "--out", default="runs/figures/pk_boost.png")
     ap.add_argument("--no-ee2", action="store_true",
                     help="skip EuclidEmulator2 even if it imports")
     ap.add_argument("--dpi", type=int, default=200)
@@ -313,6 +314,7 @@ def main():
     bx.legend(frameon=False, fontsize=9, loc=args.legend_loc)
 
     fig.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     fig.savefig(args.out, dpi=args.dpi, bbox_inches="tight")
     print(f"-> {args.out}")
 

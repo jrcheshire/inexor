@@ -1,4 +1,4 @@
-"""DISCO-DJ on our ICs, scored with our P(k) card: does a single-mesh PM share the deficit?
+"""DISCO-DJ evolved from inexor's initial particles, scored with inexor's P(k) card.
 
 Four phases, each in the env it needs; they exchange one npz each.
 
@@ -9,7 +9,7 @@ Four phases, each in the env it needs; they exchange one npz each.
 
     pixi run python scripts/compare/disco_crosscheck.py export --config cgh64 \
         --ic-dir IC --k-steps 120 --out W/disco_in.npz
-    pixi run --manifest-path ~/src/disco-mocks/pixi.toml -e gpu \
+    pixi run --manifest-path $DISCO_SRC/pixi.toml -e gpu \
         python scripts/compare/disco_crosscheck.py evolve --in W/disco_in.npz \
         --n-mesh 1024 --out W/disco_out.npz
     pixi run python scripts/compare/disco_crosscheck.py card --in W/disco_out.npz \
