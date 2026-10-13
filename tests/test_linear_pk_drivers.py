@@ -80,13 +80,14 @@ def device_run(table, tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def snapshot_run(device_run):
-    """Three steps of 40 from the same ICs with a snapshot at z = 7.9 (step 2 of this
-    schedule, a = 0.1 x 10^(2/40)) and a checkpoint at step 3."""
+    """Three steps of 40 from the same ICs with a snapshot at z = 10 (step 2 of this
+    schedule, which starts at the ICs' a = 0.08: a = 0.08 x 12.5^(2/40), z = 10.017) and a
+    checkpoint at step 3."""
     d = device_run
     common = ["--preset", PRESET, "--cards", "1", "--beat", "600"]
     _run([DRIVER, "run", *common, "--workdir", str(d / "ics"), "--k-steps", "40", *LAYOUT,
           "--checkpoint-dir", str(d / "snap-ckpt"), "--checkpoint-every", "3",
-          "--snapshot-z", "7.9", "--snapshot-dir", str(d / "snaps"),
+          "--snapshot-z", "10", "--snapshot-dir", str(d / "snaps"),
           "--card", str(d / "snap-run.json"), "--stop-at", "3"])
     return d
 
@@ -129,10 +130,10 @@ def test_fine_dtype_reaches_the_run_and_its_products_must_name_it(device_run):
     _run([DRIVER, "card", *prod, "--fine-dtype", "float32", "--card", str(d / "f32-card.json"),
           "--out", str(d / "f32-pk.json")])
     assert json.load(open(d / "f32-pk.json"))["step"] == 1
-    # no --a-init: the device driver's schedule starts at the default a = 0.1
+    # the device run started at the ICs' epoch, which the CPU driver is told explicitly
     cpu = [REALIZATION, "card", "--config", PRESET, "--tile-workers", "1",
            "--workdir", str(d / "f32"), "--k-steps", "40", *LAYOUT, "--min-weight", "1",
-           "--allow-partial"]
+           "--allow-partial", "--a-init", A_INIT]
     p = _run(cpu, ok=False)
     assert p.returncode != 0 and "different configuration" in p.stdout + p.stderr
     _run(cpu + ["--fine-dtype", "float32"])
