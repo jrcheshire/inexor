@@ -154,11 +154,11 @@ KERNEL_ON_CARDS = {
 
 # Per-GPU terms live through some phases only; every other resident term is live for the whole
 # run. MEASURED on the cards: memory in use between phases is the coarse kernel parts, plus the
-# coarse force from the solve through the migrate (c-1024 on 4 GB200: 0.13 / 0.55 GB a card,
+# coarse force from the solve through the tile loop (c-1024 on 4 GB200: 0.13 / 0.55 GB a card,
 # job 1048248), and the allocator reuses a phase's memory in the next.
 AFTER_LOOP = "after_loop"
 DEVICE_HELD = {
-    "coarse_force_resident": ("coarse_solve", "tile_loop", AFTER_LOOP),
+    "coarse_force_resident": ("coarse_solve", "tile_loop"),
     "tile_kernels": ("tile_loop",),
     "slab_window": ("tile_loop",),
 }

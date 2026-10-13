@@ -283,6 +283,34 @@ def test_a_compiled_run_split_and_resumed_is_bitwise_the_uninterrupted_one(tmp_p
 # ------------------------------------------------------------------ refusals
 
 
+def test_the_coarse_force_is_released_before_the_migrate():
+    """The card-resident coarse force serves the tile loop only: alive at `tile_loop_end`,
+    gone by the end of the fused migrate + repack."""
+    import gc
+
+    cfg = _cfg(coarse_backend="device", tile_backend="device", migrate_backend="device")
+    assert cfg.fused_pass and cfg.tile_window
+    st = _state(cfg)
+    coeff, c_drift = _step_inputs(cfg, _coeffs(1))
+
+    def n_force():
+        gc.collect()
+        return sum(1 for a in jax.live_arrays()
+                   if a.ndim == 3 and a.shape[1:] == (N_COARSE, N_COARSE)
+                   and a.dtype == cfg.np_coarse_dtype)
+
+    base, seen = n_force(), {}
+
+    def ph(name):
+        if name in ("tile_loop_end", "migrate"):
+            seen[name] = n_force()
+
+    out = engine.step(st, cfg, coeff, c_drift, phase=ph, repack_due=True)
+    assert out["repack"] is not None, "the fused pass did not run"
+    assert seen["tile_loop_end"] >= base + 3, "vacuous: no force meshes found on the card"
+    assert seen["migrate"] == base, "the coarse force is still held through the migrate"
+
+
 def test_validate_refuses_the_lanes_that_cannot_apply():
     with pytest.raises(ValueError, match="coarse_backend"):
         _cfg(coarse_backend="gpu").validate()

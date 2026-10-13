@@ -1367,8 +1367,9 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
 
     # kept so the phase trace has a stable shape (nothing accumulates across the loop)
     ph("tile_loop_end")
-    # the neighbours' slabs serve the tile windows only; the migrate does not read them
-    view = None
+    # the neighbours' slabs and the coarse force serve the tile loop only; the migrate does
+    # not read them
+    view = g_coarse = None
 
     if n_owned != st.n_particles:
         raise AssertionError(
