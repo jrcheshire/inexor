@@ -17,6 +17,10 @@ dependencies = [
   "numpy>=1.24",
 ]
 
+[project.urls]
+Repository = "https://github.com/jrcheshire/inexor"
+Documentation = "https://github.com/jrcheshire/inexor/tree/main/docs"
+
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
 
