@@ -10,7 +10,7 @@ license = "BSD-3-Clause"
 # importlib.metadata. Static on purpose: pixi reads this metadata to solve foreign-platform
 # envs (linux-aarch64 for Vista), and `dynamic = ["version"]` would make it run hatchling
 # with an interpreter it cannot have ("no compatible Python interpreter").
-version = "0.0.1.dev0"
+version = "0.1.0"
 
 dependencies = [
   "jax>=0.10",
