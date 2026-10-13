@@ -149,11 +149,12 @@ def test_driver_products_at_two_ranks_are_the_one_rank_products(one_rank_run, on
 
 
 def test_the_cards_export_carries_the_host_cli_crc(one_rank_run, one_rank_products, tmp_path):
-    """`python -m inexor.export` decodes on the host at the checkpoint's recorded epoch."""
+    """`python -m inexor.export` decodes on the host at the checkpoint's recorded epoch (step 6
+    of 40, so --allow-partial, as the cards export was made)."""
     gen = max((one_rank_run / "ckpt").glob("gen*"),
               key=lambda g: json.load(open(g / "manifest.json"))["provenance"]["step"])
-    p = subprocess.run([sys.executable, "-m", "inexor.export", str(gen), str(tmp_path / "host")],
-                       capture_output=True, text=True, timeout=600, env=ENV)
+    p = subprocess.run([sys.executable, "-m", "inexor.export", str(gen), str(tmp_path / "host"),
+                        "--allow-partial"], capture_output=True, text=True, timeout=600, env=ENV)
     assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
     host = json.load(open(tmp_path / "host" / "export.json"))
     cards = json.load(open(one_rank_products / "export" / "export.json"))
