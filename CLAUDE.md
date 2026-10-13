@@ -19,6 +19,8 @@ User documentation is in `docs/`; start with `docs/getting_started.md`.
 - `scripts/run/` -- drivers (`realization.py` CPU lane: ics / run / export / card;
   `device_run.py` GPU lane; `device_ics.py`) and Slurm job scripts.
 - `scripts/compare/` -- the DISCO-DJ cross-check and the EE2/CAMB boost comparison.
+- `scripts/validation/` -- the paper's validation measurements (force accuracy, high-k P(k),
+  IC checks, velocities against DISCO-DJ); see its README.
 - `tests/` -- pytest.
 - `runs/` and `data/` are gitignored outputs.
 
