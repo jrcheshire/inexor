@@ -155,7 +155,7 @@ for K in $KS; do
   mkdir -p "$PROD"
   run_leg "run-k$K" \
     $BIND pixi run -e gpu python $DRIVER run --preset "$PRESET" --workdir "$ICS" --cards 1 \
-      --card $CARDS/${TAG}_k${K}_run.json --k-steps $K --stop-at $K --timed-all --numa-maps \
+      --card $CARDS/${TAG}_k${K}_run.json --k-steps $K --stop-at $K --timed-every 5 \
       $MEMBIND --beat 60 --slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA" \
       --checkpoint-dir "$CKPT" --checkpoint-every $K
   rc_run=$?

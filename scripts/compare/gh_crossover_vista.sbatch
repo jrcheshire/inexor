@@ -130,7 +130,7 @@ inexor_size () {
     --scratch "$RUNS" $MEMBIND $LAYOUT
   leg "$P-inexor-run" ipy $MT --out "$T/$P-inexor-run.jsonl" -- \
     $DEV run --preset "$P" --workdir "$ICS" --cards 1 --card "$W/run.json" --k-steps $K \
-    --stop-at $K --timed-last $MEMBIND --beat 60 $LAYOUT \
+    --stop-at $K --timed-every 5 $MEMBIND --beat 60 $LAYOUT \
     --checkpoint-dir "$CKPT" --checkpoint-every $K
   ln -sfn "$CKPT" "$PROD/ckpt"
   soft "$P-inexor-card" icpu scripts/run/realization.py card --config "$P" --workdir "$PROD" \

@@ -139,7 +139,7 @@ ranks () {
   local arm=$1 ckpt=$2; shift 2
   on_ranks "$CARDS/${TAG}_${arm}_s${FROM}_r@RANK@" "" "${MPIPATH[@]}" \
     "$PY" -m mpi4py "$DRIVER" run --preset "$PRESET" --workdir "$REF_ICS" --cards "$N_CARDS" \
-    --k-steps "$K" --stop-at "$TO" --expect-step "$FROM" --timed-all --beat 60 \
+    --k-steps "$K" --stop-at "$TO" --expect-step "$FROM" --timed-every 5 --beat 60 \
     "${MEMBIND_CHECK[@]}" "${LAYOUT[@]}" --y-blocks "$Y_BLOCKS" \
     --checkpoint-every $((TO - FROM)) --card "$CARDS/${TAG}_${arm}_s${FROM}.json" \
     --checkpoint-dir "$ckpt" --comm mpi --comm-timeout 1800 "$@"

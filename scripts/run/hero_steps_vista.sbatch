@@ -161,7 +161,7 @@ run_leg pytest-gpu \
     "tests/test_engine.py::test_a_resumed_segment_writes_first_to_the_generation_it_did_not_load" \
   || { echo "FATAL: the timing gates failed on the GPU"; exit 1; }
 
-DIAG="--timed-all --numa-maps"
+DIAG="--timed-every 5"
 
 # the smoke: the same driver and instruments at 32^3
 run_leg smoke-ics \
