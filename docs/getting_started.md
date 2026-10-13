@@ -20,6 +20,14 @@ pixi install -e gpu --locked     # gpu env: CUDA 12 JAX, mpi4py, MPICH (linux-64
   GPU (a login node, for example), set `CONDA_OVERRIDE_CUDA=12`:
   `CONDA_OVERRIDE_CUDA=12 pixi install -e gpu --locked`.
 - Run ad-hoc commands with `pixi run --frozen ...` so the lock file is never rewritten.
+- Without pixi, `pip install .` works too (Python >= 3.11, jax >= 0.10, numpy >= 2, scipy);
+  `pixi.lock` pins the versions the tests and the paper's runs used.
+
+**Hardware.** The CPU lane runs anywhere JAX does. The GPU lane has run on NVIDIA Grace Hopper
+(GH200) and Grace Blackwell (GB200) nodes, where host memory is attached to the GPU over
+NVLink-C2C. It uses ordinary host-device copies, so it does not depend on that link; on an x86
+node with PCIe-attached H100s the gpu env runs and host-to-GPU streaming measured about 7x slower
+than on a GH200, but the engine itself has not been run there.
   Add `-e gpu` to use the GPU env.
 - On a node without a GPU, anything run in the `gpu` env needs `JAX_PLATFORMS=cpu`.
 

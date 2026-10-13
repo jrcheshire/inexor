@@ -24,6 +24,9 @@ pixi install --locked            # CPU JAX (osx-arm64, linux-64, linux-aarch64)
 pixi install -e gpu --locked     # CUDA 12 JAX (linux-64, linux-aarch64)
 ```
 
+`pip install .` also works. The GPU lane has been run on GH200 and GB200 nodes; see
+[docs/getting_started.md](docs/getting_started.md#install) for versions and hardware.
+
 ## A first run
 
 A complete 128^3 realization in a 64 Mpc/h box on a laptop CPU, one process per phase (a few
