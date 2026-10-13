@@ -116,11 +116,10 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     `st.n_bricks` (`tile_loop_windowed(census=c_drift)`, summed over cards).
     `brick_slack`, `max_staged_slabs`, `timings`, `device_budget_bytes` and
     `devices` as in the two passes. Same mutations as the two passes in sequence.
-    `comm`, with a node-local `st` (every rank calls this): `census_counts` is this rank's
-    tile loop's census (`census_across_ranks` completes it), and the pass runs across ranks
-    as the device migrate does; `st.n_particles` becomes the rank's new count.
-    `y_blocks`: the brick-y ranges each slab's visit is cut into (`decomp.y_blocks`; None =
-    whole slabs); bitwise any cut.
+    With `comm` and a node-local `st` (every rank calls this), `census_counts` is this rank's
+    census (`census_across_ranks` completes it) and `st.n_particles` becomes the rank's count.
+    `y_blocks`: brick-y ranges per slab visit (`decomp.y_blocks`; None = whole slabs); bitwise
+    any cut.
 
     Returns `(migrate_stats, repack_stats)`: the migrate's stats dict with its
     `migrate_device` receipt (plus `fused`), and the repack's dict with a

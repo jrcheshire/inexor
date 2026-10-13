@@ -1,26 +1,19 @@
-"""The exchange interface between ranks (one process per node), and two implementations.
+"""The exchange interface between ranks (one process per node), and its implementations.
 
-`Comm` carries every inter-rank exchange: small collectives on picklable objects (`barrier`,
-`bcast`, `allgather`, `allreduce`) and buffer exchanges on contiguous numpy arrays
-(`Sendrecv`, `Alltoallv`) with mpi4py's semantics: the receiver preallocates, sizes must
-match, and messages between a pair arrive in the order sent. Call it from the rank's main
-thread only.
+`Comm` carries every inter-rank exchange: collectives on picklable objects (`barrier`, `bcast`,
+`allgather`, `allreduce`) and buffer exchanges on contiguous numpy arrays (`Sendrecv`,
+`Alltoallv`) with mpi4py's semantics: the receiver preallocates, sizes must match, and messages
+between a pair arrive in the order sent. Call it from the rank's main thread only.
 
-- `SerialComm`: one rank; a send to itself is a copy. The single-node run.
-- `LoopbackComm`: ranks as threads of one process (`run_loopback`), so N-rank gates run in
-  pytest. Receives copy, so aliasing cannot hide a missing exchange.
+- `SerialComm`: one rank; a send to itself is a copy.
+- `LoopbackComm`: ranks as threads of one process (`run_loopback`), for N-rank tests. Receives
+  copy, so aliasing cannot hide a missing exchange.
 - `MPIComm`: one process per node over mpi4py, every wait polled against a watchdog.
 
-`exchange_neighbours` moves named arrays to the left and right ranks of the x ring, the
-exchange the step's ghost slabs, ghost planes and migrate hand-off use.
-
-`allreduce` is an allgather folded in rank order in every implementation, so a float sum is
-deterministic and the same on every rank and every implementation. `Alltoallv` is a pairwise
-exchange in `chunk_bytes` pieces (M0 measured 40-72 GB/s at 4-256 MiB between gb nodes and
-2-3 GB/s into fresh buffers), built on `Sendrecv`.
-
-Every rank keeps a ledger of its exchanges (`take_ledger`): calls, bytes sent to other ranks
-and seconds per public operation, and the seconds spent blocked waiting on other ranks.
+`allreduce` is an allgather folded in rank order, so a float sum is deterministic and identical
+on every rank and implementation. `Alltoallv` is a pairwise exchange in `chunk_bytes` pieces
+(measured 40-72 GB/s at 4-256 MiB between Vista GB200 nodes, 2-3 GB/s into fresh buffers).
+Every rank keeps a ledger of its exchanges (`take_ledger`).
 """
 
 from __future__ import annotations
@@ -368,9 +361,9 @@ def run_loopback(n, fn, timeout=60.0, chunk_bytes=DEFAULT_CHUNK_BYTES):
 
 
 def allreduce_shapes(comm, shapes):
-    """A dict of compiled-shape ints maximized over ranks, so every rank compiles the programs
-    one rank would (every rank passes the same keys, in the same order). The key order is
-    kept, since the shapes are recorded in checkpoints. Unchanged on one rank or `comm` None."""
+    """`shapes` (compiled-shape ints) maximized over ranks, so every rank compiles the same
+    programs. Every rank passes the same keys in the same order; the order is kept because the
+    shapes are recorded in checkpoints. Unchanged on one rank or `comm` None."""
     if comm is None or comm.size == 1:
         return dict(shapes)
     keys = list(shapes)
@@ -378,17 +371,13 @@ def allreduce_shapes(comm, shapes):
     return {k: int(v) for k, v in zip(keys, top)}
 
 def exchange_neighbours(comm, to_left, to_right):
-    """Send the named arrays `to_left` to the left rank of the x ring and `to_right` to the
-    right one; returns `(from_left, from_right)`: what the left rank sent right and what the
-    right rank sent left, as fresh arrays.
+    """Send the named numpy arrays `to_left` / `to_right` to the left / right rank of the x
+    ring; return `(from_left, from_right)`, fresh arrays of what each neighbour sent this rank.
 
-    `to_left` / `to_right` map names to numpy arrays (sent C-contiguous; a name may be absent
-    on some ranks, or different on every rank). Every rank must call this, in the same order.
-    The names, dtypes and shapes are allgathered first; then the i-th name (sorted) of each
-    side moves in two `Alltoallv` calls, one per direction, so the call count is the largest
-    per-rank name count, not the union over ranks, and at two ranks (each rank both
-    neighbours of the other) the directions never mix. On one rank everything is sent to
-    itself as a copy; the step's callers skip it there.
+    Every rank must call this, in the same order; a name may be absent or differ per rank.
+    Names, dtypes and shapes are allgathered first, then the i-th name (sorted) of each side
+    moves in two `Alltoallv` calls, one per direction, so at two ranks (each both neighbours of
+    the other) the directions never mix. On one rank everything is a self-copy.
     """
     n, r = comm.size, comm.rank
     left, right = (r - 1) % n, (r + 1) % n

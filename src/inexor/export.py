@@ -315,16 +315,15 @@ def write_particle_parts(
     """Write `st` as one part of a multi-part `(x, v)` export (format `inexor-particles-2`).
 
     Every rank calls this with its node-local state (one rank: the whole state). A rank's
-    rows start at the exclusive scan of the ranks' particle counts, and its owned bricks are
-    contiguous (x-major slabs), so the parts concatenated in rank order are
-    `write_particles`'s arrays byte for byte, and the header's whole-array crc32 is theirs.
+    rows start at the exclusive scan of the ranks' counts and its owned bricks are contiguous
+    x-major slabs, so the parts in rank order are `write_particles`'s arrays byte for byte.
 
     `decode` is "host" (`decode_bricks` over groups of `chunk_bricks`, default 1024) or
     "cards" (`device.export.export_chunks` on `devices`, chunks of `chunk_bricks`, default
     the coarse paint's); the two write the same bytes. `chunks` overrides both: an iterable
     of `(slots, x, v)` in brick order over the state's own bricks, already in output units.
-    `a`, `cosmo`, `dtype`, `timings` and `progress` as `write_particles`. `expect_total`
-    (e.g. the checkpoint's count) is checked against the ranks' sum on rank 0.
+    `a`, `cosmo`, `dtype`, `timings` and `progress` as `write_particles`. `expect_total` (the
+    checkpoint's count) is checked against the ranks' sum on rank 0.
 
     Rank 0 removes the header before any part is written and writes it after every part has
     closed, so its presence marks a complete export. Returns the header on every rank.

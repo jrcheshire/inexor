@@ -17,8 +17,9 @@ input is the slab's keepers, then its sources' emigrants in `sorted({(d + o) % n
 A staged slab keeps its eject output until its own insert, then its emigrants alone.
 `device_budget_bytes` refuses a slab whose estimated footprint (held arrays plus the
 kernels' per-padded-row bytes) exceeds it. Row buffers use each kernel's `_padded`, emigrant
-and spill rows `_small_ladder`, other shapes `forces.capacity_shape`. The window is `w_cap` rows uploaded as a view of the
-host state (copied only where it would run off the end); rows past the slab are never read.
+and spill rows `_small_ladder`, other shapes `forces.capacity_shape`. The window is `w_cap`
+rows uploaded as a view of the host state (copied only where it would run off the end); rows
+past the slab are never read.
 Every device-to-host read goes through `_host`, counted in `READS`.
 
 With several cards (`devices=`), card k owns a contiguous run of slabs: it first ejects its
@@ -887,16 +888,14 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
     """Every unit's eject and insert on the cards: the part of
     `drift_and_migrate_device` before its arena replay, shared with the fused
     migrate + repack. `insert` and `keep_window` as in `_sweep`; `before_sweep(ctx)`
-    runs after the boundary ejects and before any card inserts. `y_blocks` are the brick-y
-    ranges each x-slab is cut into (`decomp.y_blocks`; None = whole slabs). Returns the pass
-    context (reach, cards, blocks, per-slab emigrant counts and reach, per-slab insert
-    results for the replay, the receipt's terms).
+    runs after the boundary ejects and before any card inserts. `y_blocks` as in
+    `drift_and_migrate_device`. Returns the pass context (reach, cards, blocks, per-slab
+    emigrant counts and reach, per-slab insert results for the replay, the receipt's terms).
 
-    Across ranks (`comm`; a node-local `st`, every rank calls this): the reach is the max
-    over ranks, the r slabs next to each end send their pre-pass scales to the neighbour
-    (the inserts read their source bricks' scales), the first and last cards' boundary
-    ejects send emigrant-only copies to the neighbour ranks, and each rank reports what its
-    inserts took from the neighbours' slabs (`foreign_consumed`, for their replay)."""
+    Across ranks (`comm`): the reach is maxed over ranks; each end's r slabs send their
+    pre-pass scales (inserts read their source bricks' scales) and emigrant-only copies of
+    their boundary ejects to the neighbour ranks; each rank reports what its inserts took from
+    the neighbours' slabs (`foreign_consumed`, for their replay)."""
     from concurrent.futures import ThreadPoolExecutor
 
     from .. import state as _state
@@ -1141,11 +1140,10 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
     default device); `migrate_device` then also reports
     `cards`, `slabs_per_card`, `cross_card_segments` / `_bytes` and `fallback`.
 
-    `comm`, with a node-local `st` (every rank calls this): the pass across ranks
-    (`_device_pass`); `st.n_particles` becomes the rank's new count.
-
-    `y_blocks`: the brick-y ranges each slab's work is cut into (`decomp.y_blocks`; None =
-    whole slabs); bitwise any cut. The receipt's `window_*_slabs` then count units.
+    `comm`, with a node-local `st` (every rank calls this): the pass across ranks;
+    `st.n_particles` becomes the rank's new count. `y_blocks`: brick-y ranges per slab
+    (`decomp.y_blocks`; None = whole slabs), bitwise any cut; the receipt's `window_*_slabs`
+    then count units.
     """
     from .. import state as _state
 

@@ -23,10 +23,8 @@ array computed in the program (CPU XLA turns a scalar or broadcast divisor into 
 reciprocal multiply); rows are gathered in the host's concatenation order and sorted
 stably; maxima are exact.
 
-INPUTS. u_x, u_y, u_z are host fields sliced by global plane (`u[g0:g1]`, a run inside
-one source slab) and v is three readers (`read_slab`); each is uploaded per plane chunk, so
-a card holds only the kept source rows and one unit's program. `cards` are
-`card_slab_ranges` dicts (the destination slabs and device of each card).
+Inputs are uploaded per plane chunk, so a card holds only the kept source rows and one unit's
+program.
 """
 
 from __future__ import annotations
@@ -139,12 +137,11 @@ def emit_t9_slabs_cards(workdir, cards, ux, uy, uz, v_ro, t9, n, box, nb, dt, wi
     """Emit every T9 slab file from card-side work; `icgen._emit_t9_slabs`' contract.
 
     `cards` are `card_slab_ranges` dicts (destination slabs [lo, hi) and device per card);
-    `ux`, `uy`, `uz` host fields sliced by global plane; `v_ro` three readers. Each slab is
-    encoded in `y_blocks` units (bitwise any count). Returns `(written, n_total)` with
-    `written` in slab order. `timings`, if a dict, receives summed per-card seconds:
-    `upload_s`, `source_s`, `dest_s`, `write_s`. `complete=False` emits only the cards' own
-    slabs and skips the whole-box checks (one rank's share, or the production-shape memory
-    leg).
+    `ux`, `uy`, `uz` host fields sliced by global plane (`u[g0:g1]`); `v_ro` three readers
+    (`read_slab`). Each slab is encoded in `y_blocks` units (bitwise any count). Returns
+    `(written, n_total)` with `written` in slab order. `timings`, if a dict, receives summed
+    per-card seconds: `upload_s`, `source_s`, `dest_s`, `write_s`. `complete=False` emits only
+    the cards' own slabs and skips the whole-box checks (one rank's share).
     """
     import jax
     import jax.numpy as jnp
