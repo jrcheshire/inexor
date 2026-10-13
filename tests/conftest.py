@@ -27,17 +27,3 @@ def pytest_runtest_setup(item):
             "bit-equality assertion on a GPU backend without XLA deterministic ops "
             "(f32 scatter-add is nondeterministic) -- run `pixi run test-det`"
         )
-
-
-def pytest_collection_modifyitems(config, items):
-    """`INEXOR_TEST_SHARD=i/n` keeps every n-th collected test starting at the i-th (1-based),
-    so n CI jobs split one run; collection order is deterministic, so the shards partition it."""
-    shard = os.environ.get("INEXOR_TEST_SHARD")
-    if not shard:
-        return
-    i, n = (int(x) for x in shard.split("/"))
-    if not 1 <= i <= n:
-        raise pytest.UsageError(f"INEXOR_TEST_SHARD={shard}: need 1 <= i <= n")
-    keep = [t for k, t in enumerate(items) if k % n == i - 1]
-    config.hook.pytest_deselected(items=[t for k, t in enumerate(items) if k % n != i - 1])
-    items[:] = keep
