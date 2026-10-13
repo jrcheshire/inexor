@@ -108,6 +108,19 @@ def _git_commit():
                           capture_output=True, text=True).stdout.strip()
 
 
+def _geometry(args):
+    """The preset `engine_config` takes: `args.preset`, or with `--n-fine` its geometry at that
+    fine mesh, the tile buffer re-derived to hold the split (`realization._geom`, as the CPU
+    driver's --n-fine)."""
+    if not getattr(args, "n_fine", None):
+        return args.preset
+    from realization import _geom
+
+    g = _geom(args.preset, n_fine=args.n_fine)
+    return dict(n_part=g["n_part"], box=g["L"], n_fine=g["n_fine"], n_coarse=g["n_coarse"],
+                tile=g["tile"], buf=g["buf"])
+
+
 def _start_epoch(args, checkpoint_dir=None):
     """The schedule's a_init: the ICs' recorded epoch for a run from `args.workdir`, else the
     checkpoint's (`source.a_init`). A record that predates the field means A_INIT. An explicit
@@ -1071,7 +1084,7 @@ def cmd_run(args):
         devs = jax.devices()
         if len(devs) < args.cards:
             raise RuntimeError(f"{len(devs)} jax devices, {args.cards} asked")
-        ec = engine_config(args.preset, coarse_backend="device", tile_backend="device",
+        ec = engine_config(_geometry(args), coarse_backend="device", tile_backend="device",
                            migrate_backend="device", device_cards=args.cards, tile_workers=1,
                            device_y_blocks=args.y_blocks, brick_slack=args.slack,
                            fine_dtype=args.fine_dtype,
@@ -1084,7 +1097,8 @@ def cmd_run(args):
         slabs = decomp.slabs if multi else None
         card["ranks"] = dict(rank=rank, n_ranks=decomp.n_ranks, slabs=list(decomp.slabs),
                              comm=args.comm, comm_timeout=args.comm_timeout)
-        card["config"] = dict(tile_window=ec.tile_window, fused_pass=ec.fused_pass,
+        card["config"] = dict(n_fine=ec.n_fine, b_fine=ec.b_fine,
+                              tile_window=ec.tile_window, fused_pass=ec.fused_pass,
                               device_cards=ec.device_cards, y_blocks=ec.device_y_blocks,
                               checkpoint_dir=ec.checkpoint_dir,
                               coarse_dtype=ec.coarse_dtype, fine_dtype=ec.fine_dtype)
@@ -1321,7 +1335,7 @@ def _product(args, kind):
         if len(devs) < args.cards:
             raise RuntimeError(f"{len(devs)} jax devices, {args.cards} asked")
         devs = devs[:args.cards]
-        ec = engine_config(args.preset, coarse_backend="device", tile_backend="device",
+        ec = engine_config(_geometry(args), coarse_backend="device", tile_backend="device",
                            migrate_backend="device", device_cards=args.cards, tile_workers=1,
                            brick_slack=args.slack, fine_dtype=args.fine_dtype)
         ec.validate()
@@ -1582,6 +1596,10 @@ def main(argv=None):
                             "float64); fingerprinted, so products of a run must pass the same")
         p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"),
                        help="the second-order growth the ICs must have been generated with")
+        p.add_argument("--n-fine", type=int, default=None,
+                       help="fine mesh cells per side instead of the preset's, the tile buffer "
+                            "re-derived to hold the split (as realization.py --n-fine); the ICs "
+                            "must be made with the same, and products of the run must pass it")
         p.add_argument("--a-init", type=float, default=None,
                        help="the schedule's starting scale factor. Default: the ICs' recorded "
                             "epoch (from ICs) or the checkpoint's (resume); refused if given "
@@ -1699,6 +1717,10 @@ def main(argv=None):
                        help="precision of the fine tiles, their FFTs and the kick (production: "
                             "float64); fingerprinted, so products of a run must pass the same")
         p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"))
+        p.add_argument("--n-fine", type=int, default=None,
+                       help="fine mesh cells per side instead of the preset's, the tile buffer "
+                            "re-derived to hold the split (as realization.py --n-fine); the ICs "
+                            "must be made with the same, and products of the run must pass it")
         p.add_argument("--a-init", type=float, default=None,
                        help="the run's starting scale factor (fingerprinted). Default: the "
                             "checkpoint's; refused if given and different")

@@ -14,13 +14,18 @@
 # Requires INEXOR_RUNS (run root; outputs under $INEXOR_RUNS/d8-gh-<preset>-<job>/k<K>) and
 # INEXOR_SRC or submission from the inexor checkout. Optional: PRESET, KS (120; step counts,
 # space-separated), SLACK, ALLOC_MARGIN, ARENA_FRAC, PK_TABLE (a tabulated linear P(k) from
-# scripts/run/camb_linear_pk.py instead of EH98), REBUILD_ENV=1 (reinstall the gpu env from the
+# scripts/run/camb_linear_pk.py instead of EH98), N_FINE (fine mesh cells per side instead of
+# the preset's, the tile buffer re-derived to hold the split; ICs, runs and cards all take it),
+# REBUILD_ENV=1 (reinstall the gpu env from the
 # lock first; it is also reinstalled when it fails to import, as after a scratch purge). The
 # account is passed with `sbatch -A`:
 #   INEXOR_RUNS=$SCRATCH/inexor_runs sbatch -A <account> scripts/run/gh_single_card_vista.sbatch
 #   sbatch -A <account> -t <wall> --export=ALL,PRESET=c-gh,SLACK=0.05,ALLOC_MARGIN=0.05 ...
 # The step-count ladder at 512^3 in 256 Mpc/h (one IC set, five schedules):
 #   INEXOR_RUNS=$SCRATCH/inexor_runs PRESET=cgh64 KS="40 60 80 120 160" \
+#     sbatch -A <account> scripts/run/gh_single_card_vista.sbatch
+# The same at half the fine cell (0.125 Mpc/h), 120 steps:
+#   INEXOR_RUNS=$SCRATCH/inexor_runs PRESET=cgh64 N_FINE=2048 KS=120 \
 #     sbatch -A <account> scripts/run/gh_single_card_vista.sbatch
 #
 # A GH200 host is ~116 GB of LPDDR with a hard cliff; MemAvailable also counts the card's
@@ -66,7 +71,7 @@ WORK=$RUNS/d8-gh-$PRESET-$SLURM_JOB_ID
 ICS=$WORK/ics
 CARDS=runs/v2
 mkdir -p "$CARDS"
-TAG=d8gh_${PRESET}_$SLURM_JOB_ID
+TAG=d8gh_${PRESET}${N_FINE:+_nf$N_FINE}_$SLURM_JOB_ID
 GPU_CSV=$CARDS/${TAG}_gpu.csv
 MEM_CSV=$CARDS/${TAG}_mem.csv
 DRIVER=scripts/run/device_run.py
@@ -74,10 +79,11 @@ BIND="numactl --membind=0"
 MEMBIND="--membind-nodes 0"
 CPU="env JAX_PLATFORMS=cpu"
 LAYOUT="--slack $SLACK --alloc-margin $ALLOC_MARGIN --arena-frac $ARENA"
+NF=${N_FINE:+--n-fine $N_FINE}
 mkdir -p "$WORK"
 
 echo "=== $(hostname): commit $(git rev-parse --short HEAD), job $SLURM_JOB_ID, $(date) ==="
-echo "=== $PRESET, K in $KS, slack $SLACK, alloc_margin $ALLOC_MARGIN, arena_frac $ARENA ==="
+echo "=== $PRESET${N_FINE:+ at n_fine $N_FINE}, K in $KS, slack $SLACK, alloc_margin $ALLOC_MARGIN, arena_frac $ARENA ==="
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || echo "no nvidia-smi"
 free -g | head -2
 numactl --hardware | head -6
@@ -140,12 +146,12 @@ run_leg pytest-gpu \
 
 run_leg ics \
   $BIND pixi run -e gpu python scripts/run/realization.py ics --config "$PRESET" \
-    --workdir "$ICS" --generator device ${PK_TABLE:+--pk-table "$PK_TABLE"} \
+    --workdir "$ICS" --generator device ${PK_TABLE:+--pk-table "$PK_TABLE"} $NF \
   || { echo "FATAL: the IC generation failed"; exit 1; }
 
 run_leg preflight \
   $BIND pixi run -e gpu python $DRIVER preflight --preset "$PRESET" --workdir "$ICS" --cards 1 \
-    --card $CARDS/${TAG}_preflight.json --scratch "$RUNS" $MEMBIND \
+    --card $CARDS/${TAG}_preflight.json --scratch "$RUNS" $MEMBIND $NF \
     --slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA" \
   || { echo "FATAL: preflight refused"; exit 1; }
 
@@ -156,7 +162,7 @@ for K in $KS; do
   run_leg "run-k$K" \
     $BIND pixi run -e gpu python $DRIVER run --preset "$PRESET" --workdir "$ICS" --cards 1 \
       --card $CARDS/${TAG}_k${K}_run.json --k-steps $K --stop-at $K --timed-every 5 \
-      $MEMBIND --beat 60 --slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA" \
+      $MEMBIND $NF --beat 60 --slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA" \
       --checkpoint-dir "$CKPT" --checkpoint-every $K
   rc_run=$?
   run_leg "summarize-k$K" \
@@ -168,7 +174,7 @@ for K in $KS; do
   ln -sfn "$CKPT" "$PROD/ckpt"
   run_leg "card-k$K" \
     $CPU $BIND pixi run -e gpu python scripts/run/realization.py card --config "$PRESET" \
-      --workdir "$PROD" --k-steps $K $LAYOUT --heartbeat 60 --tile-workers 8 --card-pool
+      --workdir "$PROD" --k-steps $K $LAYOUT $NF --heartbeat 60 --tile-workers 8 --card-pool
   [ -f "$PROD/realization_pk.json" ] && cp "$PROD/realization_pk.json" $CARDS/${TAG}_k${K}_pk.json
 done
 

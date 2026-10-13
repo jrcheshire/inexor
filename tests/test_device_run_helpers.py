@@ -249,3 +249,29 @@ def test_the_schedule_starts_at_the_ics_or_checkpoints_epoch(tmp_path):
     args.a_init = 0.1
     with pytest.raises(SystemExit, match="another epoch"):
         start(args, str(tmp_path / "ck"))
+
+
+def test_n_fine_gives_the_cpu_drivers_geometry():
+    """`--n-fine` builds the configuration the CPU driver's --n-fine does (the buffer re-derived
+    to hold the split), and without it the preset stands."""
+    import argparse
+    import importlib.util
+    import sys
+
+    from inexor.plan import engine_config
+
+    drv = _driver()
+    run = os.path.join(os.path.dirname(DRIVER), "realization.py")
+    sys.path.insert(0, os.path.dirname(DRIVER))
+    spec = importlib.util.spec_from_file_location("realization_geom", run)
+    real = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real)
+
+    assert drv._geometry(argparse.Namespace(preset="cgh64", n_fine=None)) == "cgh64"
+    got = engine_config(drv._geometry(argparse.Namespace(preset="cgh64", n_fine=2048)))
+    g = real._geom("cgh64", n_fine=2048)
+    want = engine_config(dict(n_part=g["n_part"], box=g["L"], n_fine=g["n_fine"],
+                              n_coarse=g["n_coarse"], tile=g["tile"], buf=g["buf"]))
+    base = engine_config("cgh64")
+    assert (got.n_fine, got.b_fine) == (want.n_fine, want.b_fine) == (2048, 2 * base.b_fine)
+    assert got.r_s == base.r_s and got.n_coarse == base.n_coarse
