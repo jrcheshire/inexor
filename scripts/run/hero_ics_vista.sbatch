@@ -37,6 +37,9 @@ export JAX_COMPILATION_CACHE_DIR=$SCRATCH/inexor-xla-cache
 export XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=900
 unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
+# the shared env guard: census + imports, else a rebuild through a fresh cache
+. scripts/run/gpu_env.sh
+ensure_gpu_env "$PWD" || { echo "FATAL: no working gpu env"; exit 1; }
 
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 HERO=${IC_DIR:-${HERO_IC_DIR:?set IC_DIR to the directory the ICs are written to}}

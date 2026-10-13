@@ -103,7 +103,10 @@ clean_checkout () {
 }
 leg checkout-inexor clean_checkout "$INEXOR"
 leg checkout-disco clean_checkout "$DISCO"
-leg env-inexor bash -c "cd '$INEXOR' && pixi install --locked -e gpu"
+# the shared guard: census + imports, else a rebuild through a fresh cache, under the lock the
+# other GPU jobs on this checkout take
+. "$INEXOR/scripts/run/gpu_env.sh"
+leg env-inexor ensure_gpu_env "$INEXOR"
 leg env-disco bash -c "cd '$DISCO' && pixi install -e gpu && pixi run -e gpu setup-gpu"
 leg checkout-inexor-after-install clean_checkout "$INEXOR"
 leg gate-disco dpy -c "

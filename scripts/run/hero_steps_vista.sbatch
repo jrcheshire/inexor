@@ -48,6 +48,9 @@ export INEXOR_LOAD_TRACE=1
 export JAX_LOG_COMPILES=1
 unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
+# the shared env guard: census + imports, else a rebuild through a fresh cache
+. scripts/run/gpu_env.sh
+ensure_gpu_env "$PWD" || { echo "FATAL: no working gpu env"; exit 1; }
 
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 HERO=${HERO_IC_DIR:?set HERO_IC_DIR to the IC directory}
