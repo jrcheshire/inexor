@@ -8522,8 +8522,9 @@ packages:
 - pypi: ./
   name: inexor
   requires_dist:
-  - jax>=0.4.30
-  - numpy>=1.24
+  - jax>=0.10
+  - numpy>=2.0
+  - scipy>=1.13
   - pytest ; extra == 'dev'
   - ruff ; extra == 'dev'
   requires_python: '>=3.11'
