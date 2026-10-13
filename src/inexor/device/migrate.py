@@ -167,6 +167,49 @@ def _arange(n, dev):
     return fn(jax.device_put(np.int64(0), dev))
 
 
+def _row_bufs(cap, has_ids, dev, with_src=True):
+    """Zero row buffers `(dest, off, w, ids[, src])` at `cap` rows on `dev`, built by one
+    program per shape set (zeros made one array at a time compile one program each, at every
+    new `cap`). `ids` is None without ids."""
+    import jax
+    import jax.numpy as jnp
+
+    cap = int(cap)
+
+    def make():
+        @jax.jit
+        def bufs(z):
+            def zero(shape, dtype):
+                return jnp.broadcast_to(z.astype(dtype), shape)
+
+            out = (zero((cap,), jnp.int64), zero((cap, 3), jnp.uint8),
+                   zero((cap, 3), jnp.int16), zero((cap,), jnp.int32) if has_ids else None)
+            return out + (zero((cap,), jnp.int64),) if with_src else out
+
+        return bufs
+
+    fn = _program(("row_bufs", cap, bool(has_ids), bool(with_src)), make)
+    return fn(_put(np.int64(0), dev))
+
+
+def _insert_prologue(cap_i):
+    """`(real, s_old)` for an insert's compacted rows: the first `n_in` of `cap_i` are real,
+    each with its source brick's scale (1.0 on padding)."""
+
+    def make():
+        import jax
+        import jax.numpy as jnp
+
+        @jax.jit
+        def prologue(b_src, scales, n_in):
+            real = jnp.arange(cap_i, dtype=jnp.int64) < n_in
+            return real, jnp.where(real, scales[b_src], 1.0)
+
+        return prologue
+
+    return _program(("insert_prologue", int(cap_i)), make)
+
+
 #: Device-to-host reads by phase.
 READS: dict = {}
 _READS_LOCK = threading.Lock()
@@ -596,9 +639,7 @@ def _insert_on_card(st, v, reach, staged, scales_dev, clock, budget, dev=None, b
 
     cap_i = insert_jax._padded(n_in)
     budget.check(f"inserting unit {v}", 0, INSERT_B_PER_PADDED_ROW, cap_i)
-    bufs = (_zeros(cap_i, jnp.int64, dev), _zeros((cap_i, 3), jnp.uint8, dev),
-            _zeros((cap_i, 3), jnp.int16, dev),
-            _zeros(cap_i, jnp.int32, dev) if has_ids else None, _zeros(cap_i, jnp.int64, dev))
+    bufs = _row_bufs(cap_i, has_ids, dev)
     base = 0
     for e, lo, hi, is_keep in segs:
         src_brick = e["dest"] // p3 if is_keep else e["src"]
@@ -608,8 +649,7 @@ def _insert_on_card(st, v, reach, staged, scales_dev, clock, budget, dev=None, b
                    _put(base, dev, jnp.int64))
         base += hi - lo
     b_dest, b_off, b_w, b_ids, b_src = bufs
-    real = _arange(cap_i, dev) < n_in
-    s_old = jnp.where(real, scales_dev[b_src], 1.0)
+    real, s_old = _insert_prologue(cap_i)(b_src, scales_dev, _put(n_in, dev, jnp.int64))
     clock.mark("insert: compact inputs", b_dest, b_off, b_w, b_ids, s_old, real)
 
     fn = _insert_kernel(p3, n_b, cap_i, has_ids)
@@ -644,10 +684,7 @@ def _spills(st, out, nw, ns, cap_i, dev):
         return spills, None
     # gather onto the ladder: a slice sized by the spill count would compile per slab
     cap_s = _small_ladder(ns)
-    sbufs = (_zeros(cap_s, jnp.int64, dev), _zeros((cap_s, 3), jnp.uint8, dev),
-             _zeros((cap_s, 3), jnp.int16, dev),
-             _zeros(cap_s, jnp.int32, dev) if has_ids else None,
-             _zeros(cap_s, jnp.int64, dev))
+    sbufs = _row_bufs(cap_s, has_ids, dev)
     take = _put_program(cap_i, cap_s, has_ids)
     g_dest, g_off, g_w, g_ids, _ = take(sbufs, out["dest"], out["off"], out["w"], out["ids"],
                                         out["dest"], _put(nw, dev, jnp.int64),
@@ -708,9 +745,7 @@ def _emigrants_only(e, has_ids, dev=None):
         return dict(dest=None, off=None, w=None, ids=None, src=None, cap=0, n_keep=0,
                     n_rows=0, rr=e["rr"], to=e["to"])
     cap_e = _small_ladder(n_emig)
-    bufs = (_zeros(cap_e, jnp.int64, dev), _zeros((cap_e, 3), jnp.uint8, dev),
-            _zeros((cap_e, 3), jnp.int16, dev),
-            _zeros(cap_e, jnp.int32, dev) if has_ids else None, _zeros(cap_e, jnp.int64, dev))
+    bufs = _row_bufs(cap_e, has_ids, dev)
     put = _put_program(e["cap"], cap_e, has_ids)
     dest, off, w, ids, src = put(bufs, e["dest"], e["off"], e["w"], e["ids"], e["src"],
                                  _put(e["n_keep"], dev, jnp.int64),

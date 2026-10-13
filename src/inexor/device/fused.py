@@ -201,9 +201,7 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
         a_cap = _m._small_ladder(ns)
         w_cap = _m._ladder(span + a_cap)
         if rows is None:
-            rows = (_m._zeros(a_cap, jnp.int64, dev), _m._zeros((a_cap, 3), jnp.uint8, dev),
-                    _m._zeros((a_cap, 3), jnp.int16, dev),
-                    _m._zeros(a_cap, jnp.int32, dev) if has_ids else None)
+            rows = _m._row_bufs(a_cap, has_ids, dev, with_src=False)
         prep = _block_inputs_program(cap_i, a_cap, w_cap, n_b, p3, has_ids)
         (off_win, w_win, ids_win, occ, live, row_offsets, ar_offsets, ar_bucket,
          members) = prep(out["pos"], out["off"], out["w"], out["ids"], out["occupancy"], *rows,
