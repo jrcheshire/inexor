@@ -71,8 +71,8 @@ What survives a failure:
   outside this process, so an OOM kill or a hang cannot silence them; `summarize`
   lines them up against the boundaries recorded here.
 
-`D7_FAIL_AT=<phase>` raises at that boundary, to exercise the failure path (with
-`D7_FAIL_RANK=<r>`, on that rank only).
+`INEXOR_FAIL_AT=<phase>` raises at that boundary, to exercise the failure path (with
+`INEXOR_FAIL_RANK=<r>`, on that rank only).
 """
 
 from __future__ import annotations
@@ -190,7 +190,7 @@ def proc_memory():
     """This process's resident memory by kind, bytes: `PROC_MEM_KEYS` from
     /proc/self/status. Locked (VmLck) and pinned (VmPin) pages are the ones reclaim
     cannot take. {} off Linux."""
-    status = _proc_kv(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "status"),
+    status = _proc_kv(os.path.join(os.environ.get("INEXOR_PROC_SELF", "/proc/self"), "status"),
                       1024)
     return {k: status[k] for k in PROC_MEM_KEYS if k in status}
 
@@ -214,7 +214,7 @@ def vmstat():
     job's alone). Monotone, so a phase's value is a difference. {} off Linux."""
     out = {}
     try:
-        with open(os.environ.get("D7_VMSTAT", "/proc/vmstat")) as fh:
+        with open(os.environ.get("INEXOR_VMSTAT", "/proc/vmstat")) as fh:
             for line in fh:
                 parts = line.split()
                 if len(parts) != 2 or not parts[1].isdigit():
@@ -242,7 +242,7 @@ def numa_memory():
     without (a GB200's HBM appears as CPU-less nodes, and `MemAvailable` sums both, which
     hides the CPU-side limit), plus `detail[node]` = the `NODE_KEYS` fields.
     MemFree excludes page cache; FilePages is the cache. None off Linux."""
-    root = os.environ.get("D7_NUMA_ROOT", "/sys/devices/system/node")
+    root = os.environ.get("INEXOR_NUMA_ROOT", "/sys/devices/system/node")
     if not os.path.isdir(root):
         return None
     cpu, gpu, detail = {}, {}, {}
@@ -276,7 +276,7 @@ def numa_maps():
     and the caller records its seconds). None where unreadable."""
     out = {}
     try:
-        with open(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "numa_maps")) as fh:
+        with open(os.path.join(os.environ.get("INEXOR_PROC_SELF", "/proc/self"), "numa_maps")) as fh:
             for line in fh:
                 toks = line.split()
                 page = 4096
@@ -301,7 +301,7 @@ def memory_policy():
     `numactl --membind`, so the policy has to be read here."""
     out = {}
     try:
-        with open(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "numa_maps")) as fh:
+        with open(os.path.join(os.environ.get("INEXOR_PROC_SELF", "/proc/self"), "numa_maps")) as fh:
             for line in fh:
                 toks = line.split()
                 if len(toks) > 1:
@@ -428,7 +428,7 @@ class Monitor:
         self._vm_last = vmstat()
         self._stop = threading.Event()
         self._beat_s = float(beat_s)
-        self._thread = threading.Thread(target=self._beat_loop, daemon=True, name="d7-beat")
+        self._thread = threading.Thread(target=self._beat_loop, daemon=True, name="inexor-beat")
         # every card's allocator bytes and host RSS, sampled between boundaries: a boundary's
         # `peak` is the process's running maximum and cannot say which phase set it, so
         # `card_phase_peak` / `rss_phase_peak` are the largest samples since the previous
@@ -438,7 +438,7 @@ class Monitor:
         self._rss_max = None
         self.card_sample_errors = 0
         self._card_thread = (threading.Thread(target=self._card_loop, daemon=True,
-                                              name="d7-cards")
+                                              name="inexor-cards")
                              if self._card_sample_s > 0 else None)
 
     def start(self):
@@ -544,7 +544,7 @@ class Monitor:
         if self.hwm_resets:
             reset_hwm()
         if self.fail_at and name == self.fail_at:
-            raise RuntimeError(f"D7_FAIL_AT={name}: the failure path, exercised on purpose")
+            raise RuntimeError(f"INEXOR_FAIL_AT={name}: the failure path, exercised on purpose")
 
     def _beat_loop(self):
         while not self._stop.wait(self._beat_s):
@@ -637,7 +637,7 @@ def smaps_summary(top=8):
     caller records its seconds. None where unreadable."""
     maps = []
     try:
-        with open(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "smaps")) as fh:
+        with open(os.path.join(os.environ.get("INEXOR_PROC_SELF", "/proc/self"), "smaps")) as fh:
             fields = dict((v, k) for k, v in SMAPS_KEYS)
             cur = None
             for line in fh:
@@ -869,7 +869,7 @@ def _planner(preset, cards, slack, arena, alloc_margin=0.10, n_nodes=1, host_gb=
 
 
 def _base_card(kind, args):
-    return dict(card=f"inexor-d7-{kind}-1", preset=args.preset, workdir=args.workdir,
+    return dict(card=f"inexor-device-{kind}-1", preset=args.preset, workdir=args.workdir,
                 commit=_git_commit(), host=os.uname().nodename,
                 job=os.environ.get("SLURM_JOB_ID"), started=time.time(),
                 env={k: v for k, v in os.environ.items()
@@ -1069,8 +1069,8 @@ def cmd_run(args):
         # here, not after the run: the writer removes a manifest it finds
         raise SystemExit(f"FATAL: checkpoint probe dir {args.ckpt_probe_dir} is not empty")
     rank = 0 if comm is None else comm.rank
-    fail_rank = os.environ.get("D7_FAIL_RANK")
-    fail_at = (os.environ.get("D7_FAIL_AT")
+    fail_rank = os.environ.get("INEXOR_FAIL_RANK")
+    fail_at = (os.environ.get("INEXOR_FAIL_AT")
                if fail_rank is None or int(fail_rank) == rank else None)
     mon = Monitor(args.card, card, beat_s=args.beat, fail_at=fail_at,
                   with_numa_maps=args.numa_maps, card_sample_s=args.card_sample_ms / 1000.0,
@@ -1235,8 +1235,8 @@ def cmd_ics(args):
     _signals(args.card)
     card = _base_card("ics", args)
     rank = 0 if comm is None else comm.rank
-    fail_rank = os.environ.get("D7_FAIL_RANK")
-    fail_at = (os.environ.get("D7_FAIL_AT")
+    fail_rank = os.environ.get("INEXOR_FAIL_RANK")
+    fail_at = (os.environ.get("INEXOR_FAIL_AT")
                if fail_rank is None or int(fail_rank) == rank else None)
     mon = Monitor(args.card, card, beat_s=args.beat, fail_at=fail_at)
     try:
@@ -1332,8 +1332,8 @@ def _product(args, kind):
     _signals(args.card)
     card = _base_card(kind, args)
     rank = 0 if comm is None else comm.rank
-    fail_rank = os.environ.get("D7_FAIL_RANK")
-    fail_at = (os.environ.get("D7_FAIL_AT")
+    fail_rank = os.environ.get("INEXOR_FAIL_RANK")
+    fail_at = (os.environ.get("INEXOR_FAIL_AT")
                if fail_rank is None or int(fail_rank) == rank else None)
     mon = Monitor(args.card, card, beat_s=args.beat, fail_at=fail_at)
     try:

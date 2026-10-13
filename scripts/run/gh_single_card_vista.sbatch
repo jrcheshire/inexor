@@ -1,17 +1,17 @@
 #!/bin/bash
-#SBATCH -J d8-gh-1card
+#SBATCH -J inexor-gh-1card
 #SBATCH -p gh
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 04:00:00
-#SBATCH -o d8-gh-1card-%j.log
+#SBATCH -o inexor-gh-1card-%j.log
 #SBATCH --signal=B:USR1@900
 # Realizations on ONE GH200: device-generated LCDM ICs, then one run per step count in KS
 # from those ICs on the single-card device lane (each checkpointed once, at its end), and
 # each run's P(k) card. PRESET defaults to c-1024 (1024^3 in 512 Mpc/h, the same resolution
 # as every other preset). A run that fails gets no card and the next step count still runs.
 #
-# Requires INEXOR_RUNS (run root; outputs under $INEXOR_RUNS/d8-gh-<preset>-<job>/k<K>) and
+# Requires INEXOR_RUNS (run root; outputs under $INEXOR_RUNS/gh-1card-<preset>-<job>/k<K>) and
 # INEXOR_SRC or submission from the inexor checkout. Optional: PRESET (c-1024), KS (120; step
 # counts, space-separated), SLACK (0.10), ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), PK_TABLE (a
 # tabulated linear P(k) from scripts/run/camb_linear_pk.py instead of EH98), N_FINE (fine mesh
@@ -64,11 +64,11 @@ for K in $KS; do
   [[ "$K" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: KS holds '$K', not a step count"; exit 1; }
 done
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
-WORK=$RUNS/d8-gh-$PRESET-$SLURM_JOB_ID
+WORK=$RUNS/gh-1card-$PRESET-$SLURM_JOB_ID
 ICS=$WORK/ics
-CARDS=runs/v2
+CARDS=runs/cards
 mkdir -p "$CARDS"
-TAG=d8gh_${PRESET}${N_FINE:+_nf$N_FINE}_$SLURM_JOB_ID
+TAG=gh1card_${PRESET}${N_FINE:+_nf$N_FINE}_$SLURM_JOB_ID
 GPU_CSV=$CARDS/${TAG}_gpu.csv
 MEM_CSV=$CARDS/${TAG}_mem.csv
 DRIVER=scripts/run/device_run.py

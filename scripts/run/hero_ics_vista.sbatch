@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH -J d8-hero-ics
+#SBATCH -J inexor-hero-ics
 #SBATCH -p gb
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 03:00:00
-#SBATCH -o d8-hero-ics-%j.log
+#SBATCH -o inexor-hero-ics-%j.log
 # A preset's ICs (LCDM second-order growth) by the device generator on four GB200s, into a
 # new directory. Legs:
 #   1. preflight: devices, scratch space, planner verdicts (a refusal stops the job);
@@ -45,7 +45,7 @@ RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 HERO=${IC_DIR:-${HERO_IC_DIR:?set IC_DIR to the directory the ICs are written to}}
 PRESET=${PRESET:-c-hero}
 NEED_GB=${NEED_GB:-1500}
-CARDS=runs/v2
+CARDS=runs/cards
 mkdir -p "$CARDS"
 TAG=d8_ics_$SLURM_JOB_ID
 GPU_LOG=$CARDS/${TAG}_gpu.csv

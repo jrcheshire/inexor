@@ -17,7 +17,7 @@
 #         as the multi-node jobs run (arm `base`), and with MPI_OFF in every rank's environment
 #         (arm `off`), both with --smaps and the probes. The two checkpoints must be equal: MPI
 #         settings do not change the numbers.
-# Every leg's output is also in OUT_DIR/job-<id>/legs/, its cards in runs/v2/.
+# Every leg's output is also in OUT_DIR/job-<id>/legs/, its cards in runs/cards/.
 #
 # Requires INEXOR_RUNS, ONE_ICS, REF_CKPT (two generations at different steps), REF_ICS (its
 # ICs), OUT_DIR, MPI_OFF (space-separated VAR=value), and INEXOR_SRC or submission from the
@@ -97,7 +97,7 @@ STOP=$((FROM + STEPS))
 WORK=$OUT_DIR/job-$SLURM_JOB_ID
 # shellcheck disable=SC2034  # read by job_lib.sh
 LEG_DIR=$WORK/legs
-CARDS=$SRC/runs/v2
+CARDS=$SRC/runs/cards
 TAG=memdiag_$SLURM_JOB_ID
 LAYOUT=(--slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA")
 PROBES=(--smaps --cache-probe --trim-probe)

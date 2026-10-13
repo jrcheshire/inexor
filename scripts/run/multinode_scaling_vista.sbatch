@@ -91,7 +91,7 @@ K=$(manifest_field "$REF_CKPT/$OLD" "m['provenance']['n_steps']")
 WORK=$OUT_DIR/job-$SLURM_JOB_ID
 # shellcheck disable=SC2034  # read by job_lib.sh
 LEG_DIR=$WORK/legs
-CARDS=$SRC/runs/v2
+CARDS=$SRC/runs/cards
 TAG=mnscale_${PRESET}_$SLURM_JOB_ID
 LAYOUT=(--slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA")
 mkdir -p "$WORK" "$CARDS"

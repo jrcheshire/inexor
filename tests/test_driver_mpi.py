@@ -2,7 +2,7 @@
 
 ICs for `cdev8-tile32` from `realization.py ics`; the driver runs the first 6 steps of a
 40-step schedule with a checkpoint every 3 under `mpiexec -n N` (one card per rank), and
-every checkpoint file at N = 2 and 4 must equal N = 1's. `D7_FAIL_AT` on rank 1 ends the
+every checkpoint file at N = 2 and 4 must equal N = 1's. `INEXOR_FAIL_AT` on rank 1 ends the
 whole launch. The card and the export of the step-6 checkpoint at 2 ranks equal 1 rank's
 (the card in every field; the export's parts concatenated, with the same crc32), and the
 export decoded on the cards carries the host CLI export's crc32. Skipped where mpi4py or
@@ -86,9 +86,9 @@ def test_driver_checkpoints_are_the_one_rank_bytes(ics, one_rank, tmp_path, n):
 
 
 def test_a_failing_rank_ends_the_launch(ics, tmp_path):
-    p, wall = _launch(2, ics, tmp_path, env=dict(D7_FAIL_AT="tile_loop", D7_FAIL_RANK="1"))
+    p, wall = _launch(2, ics, tmp_path, env=dict(INEXOR_FAIL_AT="tile_loop", INEXOR_FAIL_RANK="1"))
     assert p.returncode != 0
-    assert "D7_FAIL_AT=tile_loop" in p.stdout + p.stderr
+    assert "INEXOR_FAIL_AT=tile_loop" in p.stdout + p.stderr
     assert wall < 600.0
 
 

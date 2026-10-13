@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH -J d8-hero-k120
+#SBATCH -J inexor-hero-steps
 #SBATCH -p gb
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 11:00:00
-#SBATCH -o d8-hero-k120-%j.log
+#SBATCH -o inexor-hero-steps-%j.log
 #SBATCH --signal=B:USR1@900
 # The 4096^3 realization on the 120-step schedule, run as three 40-step segments because
 # 120 steps do not fit gb's 12 h MaxWall. One script, three submissions, each chained
@@ -60,7 +60,7 @@ WORK=$REAL/job-$SLURM_JOB_ID
 CKPT=$REAL/hero-ckpt
 : "${EXPECT_STEP:?pass EXPECT_STEP (0, 40 or 80) with --export}"
 : "${SEG_STOP:?pass SEG_STOP (40, 80 or 120) with --export}"
-CARDS=runs/v2
+CARDS=runs/cards
 mkdir -p "$CARDS"
 TAG=d8_${SLURM_JOB_ID}_s${EXPECT_STEP}-${SEG_STOP}
 GPU_CSV=$CARDS/${TAG}_gpu.csv

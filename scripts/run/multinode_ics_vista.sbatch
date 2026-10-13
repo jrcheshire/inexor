@@ -76,7 +76,7 @@ N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 WORK=$(dirname "$IC_DIR")/$(basename "$IC_DIR")-job-$SLURM_JOB_ID
 # shellcheck disable=SC2034  # read by job_lib.sh
 LEG_DIR=$WORK/legs
-CARDS=$SRC/runs/v2
+CARDS=$SRC/runs/cards
 TAG=mnics_${PRESET}_$SLURM_JOB_ID
 GEN=(--seed "$SEED" --a-init "$A_INIT" --f-nl "$F_NL" --window "$WINDOW"
      --y-blocks "$Y_BLOCKS" --batch-planes "$BATCH_PLANES")

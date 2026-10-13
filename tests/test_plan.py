@@ -727,8 +727,7 @@ def _device_host(capsys, preset, cards, kernel="cards"):
 
 
 def test_the_host_phases_match_the_4096_run_they_price(capsys):
-    """c-hero on four GB200s (job 1003657, `runs/v2/d7b_1003657_hero.json`, the planner's
-    default knobs): each code-derived phase's host transient above that phase's closing RSS
+    """c-hero on four GB200s (a recorded 4096^3 run card, the planner's default knobs): each code-derived phase's host transient above that phase's closing RSS
     is within 10% of the measured one, and the resident is at most 5% under the RSS floor
     after the first step (844.6-865.4 GB), and never over it. That run held the coarse kernel
     on the host.
@@ -744,7 +743,7 @@ def test_the_host_phases_match_the_4096_run_they_price(capsys):
 
 
 def test_the_process_baseline_closes_the_single_gh200_floor(capsys):
-    """One GH200 (job 1029876): the priced resident, measured baseline included, is within 5%
+    """One GH200 (a recorded run): the priced resident, measured baseline included, is within 5%
     of the RSS after step 1 at both sizes (5.885 GB at cgh64, 17.237 at c-1024), never over.
     That run held the coarse kernel on the host."""
     for preset, floor in (("cgh64", 5.885), ("c-1024", 17.237)):
@@ -1141,7 +1140,7 @@ def test_card_phases_are_maxed_not_summed():
 
 
 def test_ic_stages_one_node_price_under_the_measured_c_gh_ics():
-    """c-gh ICs on one gb node (job 1045956, four GB200s) measured a 108.1 GB host peak; the
+    """c-gh ICs on one gb node (four GB200s) measured a 108.1 GB host peak; the
     stage table is a lower bound on it."""
     host, _card, _disk = plan.ic_device_stages(2048, n_gpus=4, nb=128)
     assert max(host.values()) <= 108.1e9

@@ -134,7 +134,7 @@ def test_smaps_sums_resident_memory_by_mapping_kind(tmp_path, monkeypatch):
     and the largest mappings are listed with their names."""
     drv = _driver()
     (tmp_path / "smaps").write_text(_SMAPS)
-    monkeypatch.setenv("D7_PROC_SELF", str(tmp_path))
+    monkeypatch.setenv("INEXOR_PROC_SELF", str(tmp_path))
     sm = drv.smaps_summary(top=3)
     kb = 1024
     k = sm["kinds"]
@@ -170,7 +170,7 @@ def test_the_cache_probe_empties_the_program_caches_and_records_each_stage(tmp_p
 
     drv = _driver()
     (tmp_path / "smaps").write_text(_SMAPS)
-    monkeypatch.setenv("D7_PROC_SELF", str(tmp_path))
+    monkeypatch.setenv("INEXOR_PROC_SELF", str(tmp_path))
     mig = importlib.import_module("inexor.device.migrate")
     mig._PROGRAMS[("probe-test",)] = object()
     mon = drv.Monitor(str(tmp_path / "card.json"), {}, with_smaps=True)

@@ -700,7 +700,7 @@ def test_narrowing_the_kernel_build_alone_does_not_narrow_the_kernel():
     assert _name(fac) == "float64", "the prefactor inherits k2_true's f64, by design"
     assert _name((fac / k2_safe) * ikx) == "complex128", (
         "f64 * complex64 promotes to complex128: narrowing kernel_grids alone leaves a "
-        "c128 kernel, which re-promotes an f32 delta at the kernel multiply. M-v2-4 S2 "
+        "c128 kernel, which re-promotes an f32 delta at the kernel multiply. The kernel build "
         "narrows the real prefactor (fac / k2_safe) instead -- do not remove that cast."
     )
 

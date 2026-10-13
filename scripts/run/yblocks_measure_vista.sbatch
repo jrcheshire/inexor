@@ -11,7 +11,7 @@
 # checkpoints must equal the 1-block run's byte for byte, manifests compared without their
 # window shape (gate_any_cut); a mismatch reruns 1 and that count under
 # --xla_gpu_deterministic_ops=true, to tell nondeterminism from a dependence on the cut. The
-# run cards (runs/v2/<TAG>_<preset>_y<n>.json, per-phase card and host peaks, --timed-all)
+# run cards (runs/cards/<TAG>_<preset>_y<n>.json, per-phase card and host peaks, --timed-all)
 # and samplers price the planner's per-unit terms.
 #
 # Requires INEXOR_RUNS and INEXOR_SRC (or submission from the checkout). Optional: PRESETS
@@ -85,7 +85,7 @@ DRIVER=$SRC/scripts/run/device_run.py
 WORK=$RUNS/yblocks-$SLURM_JOB_ID
 # shellcheck disable=SC2034  # read by job_lib.sh
 LEG_DIR=$WORK/legs
-CARDS=$SRC/runs/v2
+CARDS=$SRC/runs/cards
 TAG=yblocks_$SLURM_JOB_ID
 mkdir -p "$WORK" "$CARDS"
 

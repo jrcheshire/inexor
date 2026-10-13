@@ -358,7 +358,7 @@ Reading the run card:
 
 Every `device_run.py` subcommand writes its own card to `--card` (across ranks, one per rank:
 `--card run.json` becomes `run.rank<r>.json`), rewritten atomically at every phase boundary, so a killed job
-leaves a card up to its last boundary. Card id `inexor-d7-{kind}-1`. Common fields: `preset`,
+leaves a card up to its last boundary. Card id `inexor-device-{kind}-1`. Common fields: `preset`,
 `workdir`, `commit`, `host`, `job` (`SLURM_JOB_ID`), `started` (epoch seconds), `env` (every
 `XLA_*`, `JAX_*`, `INEXOR_*` variable), `ranks`, `finished` (absent if the process did not
 finish) and, after an exception, `failure` (the error, traceback, every card's full allocator
