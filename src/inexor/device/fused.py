@@ -116,11 +116,10 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     `st.n_bricks` (`tile_loop_windowed(census=c_drift)`, summed over cards).
     `brick_slack`, `max_staged_slabs`, `timings`, `device_budget_bytes` and
     `devices` as in the two passes. Same mutations as the two passes in sequence.
-    `comm`, with a node-local `st` (every rank calls this): `census_counts` is this rank's
-    tile loop's census (`census_across_ranks` completes it), and the pass runs across ranks
-    as the device migrate does; `st.n_particles` becomes the rank's new count.
-    `y_blocks`: the brick-y ranges each slab's visit is cut into (`decomp.y_blocks`; None =
-    whole slabs); bitwise any cut.
+    With `comm` and a node-local `st` (every rank calls this), `census_counts` is this rank's
+    census (`census_across_ranks` completes it) and `st.n_particles` becomes the rank's count.
+    `y_blocks`: brick-y ranges per slab visit (`decomp.y_blocks`; None = whole slabs); bitwise
+    any cut.
 
     Returns `(migrate_stats, repack_stats)`: the migrate's stats dict with its
     `migrate_device` receipt (plus `fused`), and the repack's dict with a
@@ -201,9 +200,7 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
         a_cap = _m._small_ladder(ns)
         w_cap = _m._ladder(span + a_cap)
         if rows is None:
-            rows = (_m._zeros(a_cap, jnp.int64, dev), _m._zeros((a_cap, 3), jnp.uint8, dev),
-                    _m._zeros((a_cap, 3), jnp.int16, dev),
-                    _m._zeros(a_cap, jnp.int32, dev) if has_ids else None)
+            rows = _m._row_bufs(a_cap, has_ids, dev, with_src=False)
         prep = _block_inputs_program(cap_i, a_cap, w_cap, n_b, p3, has_ids)
         (off_win, w_win, ids_win, occ, live, row_offsets, ar_offsets, ar_bucket,
          members) = prep(out["pos"], out["off"], out["w"], out["ids"], out["occupancy"], *rows,

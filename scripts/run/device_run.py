@@ -71,8 +71,8 @@ What survives a failure:
   outside this process, so an OOM kill or a hang cannot silence them; `summarize`
   lines them up against the boundaries recorded here.
 
-`D7_FAIL_AT=<phase>` raises at that boundary, to exercise the failure path (with
-`D7_FAIL_RANK=<r>`, on that rank only).
+`INEXOR_FAIL_AT=<phase>` raises at that boundary, to exercise the failure path (with
+`INEXOR_FAIL_RANK=<r>`, on that rank only).
 """
 
 from __future__ import annotations
@@ -108,10 +108,45 @@ def _git_commit():
                           capture_output=True, text=True).stdout.strip()
 
 
+def _geometry(args):
+    """The preset `engine_config` takes: `args.preset`, or with `--n-fine` its geometry at that
+    fine mesh, the tile buffer re-derived to hold the split (`realization._geom`, as the CPU
+    driver's --n-fine)."""
+    if not getattr(args, "n_fine", None):
+        return args.preset
+    from realization import _geom
+
+    g = _geom(args.preset, n_fine=args.n_fine)
+    return dict(n_part=g["n_part"], box=g["L"], n_fine=g["n_fine"], n_coarse=g["n_coarse"],
+                tile=g["tile"], buf=g["buf"])
+
+
+def _start_epoch(args, checkpoint_dir=None):
+    """The schedule's a_init: the ICs' recorded epoch for a run from `args.workdir`, else the
+    checkpoint's (`source.a_init`). A record without the field means A_INIT. An explicit
+    `--a-init` must agree: the ICs carry their epoch in the displacements and velocities."""
+    from _instruments import A_INIT
+    from inexor import engine, icgen
+
+    if checkpoint_dir is None:
+        with open(os.path.join(args.workdir, icgen.MANIFEST)) as fh:
+            have, where = json.load(fh).get("a_init"), f"the ICs in {args.workdir}"
+    else:
+        prov = engine.newest_checkpoint_provenance(checkpoint_dir) or {}
+        have, where = (prov.get("source") or {}).get("a_init"), \
+            f"the checkpoints in {checkpoint_dir}"
+    have = A_INIT if have is None else float(have)
+    if args.a_init is not None and abs(float(args.a_init) - have) > 1e-12 * have:
+        raise SystemExit(f"{where} start at a = {have!r}; --a-init {args.a_init!r} would evolve "
+                         "them from another epoch")
+    return have
+
+
 def _write_json(path, obj):
     tmp = f"{path}.tmp"
+    # one-shot dumps with no indent is the C encoder; the card is rewritten at every boundary
     with open(tmp, "w") as fh:
-        json.dump(obj, fh, indent=1, default=str)
+        fh.write(json.dumps(obj, default=str))
     os.replace(tmp, path)
 
 
@@ -155,7 +190,7 @@ def proc_memory():
     """This process's resident memory by kind, bytes: `PROC_MEM_KEYS` from
     /proc/self/status. Locked (VmLck) and pinned (VmPin) pages are the ones reclaim
     cannot take. {} off Linux."""
-    status = _proc_kv(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "status"),
+    status = _proc_kv(os.path.join(os.environ.get("INEXOR_PROC_SELF", "/proc/self"), "status"),
                       1024)
     return {k: status[k] for k in PROC_MEM_KEYS if k in status}
 
@@ -179,7 +214,7 @@ def vmstat():
     job's alone). Monotone, so a phase's value is a difference. {} off Linux."""
     out = {}
     try:
-        with open(os.environ.get("D7_VMSTAT", "/proc/vmstat")) as fh:
+        with open(os.environ.get("INEXOR_VMSTAT", "/proc/vmstat")) as fh:
             for line in fh:
                 parts = line.split()
                 if len(parts) != 2 or not parts[1].isdigit():
@@ -207,7 +242,7 @@ def numa_memory():
     without (a GB200's HBM appears as CPU-less nodes, and `MemAvailable` sums both, which
     hides the CPU-side limit), plus `detail[node]` = the `NODE_KEYS` fields.
     MemFree excludes page cache; FilePages is the cache. None off Linux."""
-    root = os.environ.get("D7_NUMA_ROOT", "/sys/devices/system/node")
+    root = os.environ.get("INEXOR_NUMA_ROOT", "/sys/devices/system/node")
     if not os.path.isdir(root):
         return None
     cpu, gpu, detail = {}, {}, {}
@@ -241,7 +276,7 @@ def numa_maps():
     and the caller records its seconds). None where unreadable."""
     out = {}
     try:
-        with open(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "numa_maps")) as fh:
+        with open(os.path.join(os.environ.get("INEXOR_PROC_SELF", "/proc/self"), "numa_maps")) as fh:
             for line in fh:
                 toks = line.split()
                 page = 4096
@@ -266,7 +301,7 @@ def memory_policy():
     `numactl --membind`, so the policy has to be read here."""
     out = {}
     try:
-        with open(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "numa_maps")) as fh:
+        with open(os.path.join(os.environ.get("INEXOR_PROC_SELF", "/proc/self"), "numa_maps")) as fh:
             for line in fh:
                 toks = line.split()
                 if len(toks) > 1:
@@ -393,18 +428,17 @@ class Monitor:
         self._vm_last = vmstat()
         self._stop = threading.Event()
         self._beat_s = float(beat_s)
-        self._thread = threading.Thread(target=self._beat_loop, daemon=True, name="d7-beat")
-        # every card's allocator bytes in use, sampled between boundaries: the boundary
-        # records' `peak` is the process's running maximum, so it cannot say which phase
-        # set it; `card_phase_peak` is the largest sample since the previous boundary.
-        # The same loop samples host RSS (`rss_phase_peak`): the kernel's VmHWM has read
-        # 0.3-0.4 GB below a 20 ms RSS sampler during a tile-program recompile.
+        self._thread = threading.Thread(target=self._beat_loop, daemon=True, name="inexor-beat")
+        # every card's allocator bytes and host RSS, sampled between boundaries: a boundary's
+        # `peak` is the process's running maximum and cannot say which phase set it, so
+        # `card_phase_peak` / `rss_phase_peak` are the largest samples since the previous
+        # boundary (the kernel's VmHWM can read below a fast RSS sampler)
         self._card_sample_s = float(card_sample_s)
         self._card_max = None
         self._rss_max = None
         self.card_sample_errors = 0
         self._card_thread = (threading.Thread(target=self._card_loop, daemon=True,
-                                              name="d7-cards")
+                                              name="inexor-cards")
                              if self._card_sample_s > 0 else None)
 
     def start(self):
@@ -510,7 +544,7 @@ class Monitor:
         if self.hwm_resets:
             reset_hwm()
         if self.fail_at and name == self.fail_at:
-            raise RuntimeError(f"D7_FAIL_AT={name}: the failure path, exercised on purpose")
+            raise RuntimeError(f"INEXOR_FAIL_AT={name}: the failure path, exercised on purpose")
 
     def _beat_loop(self):
         while not self._stop.wait(self._beat_s):
@@ -603,7 +637,7 @@ def smaps_summary(top=8):
     caller records its seconds. None where unreadable."""
     maps = []
     try:
-        with open(os.path.join(os.environ.get("D7_PROC_SELF", "/proc/self"), "smaps")) as fh:
+        with open(os.path.join(os.environ.get("INEXOR_PROC_SELF", "/proc/self"), "smaps")) as fh:
             fields = dict((v, k) for k, v in SMAPS_KEYS)
             cur = None
             for line in fh:
@@ -810,7 +844,7 @@ def _y_blocks(value):
 
 
 def _planner(preset, cards, slack, arena, alloc_margin=0.10, n_nodes=1, host_gb=1026.0,
-             device_gb=199.0, y_blocks=None, fine_dtype="float64"):
+             device_gb=199.0, y_blocks=None, fine_dtype="float64", n_fine=None):
     cmd = [sys.executable, "-m", "inexor.plan", "--preset", preset, "--backend", "device",
            "--n-gpus", str(cards), "--host-gb", f"{host_gb:g}", "--device-gb", f"{device_gb:g}",
            "--arena-frac", str(arena), "--slack", str(slack),
@@ -818,6 +852,8 @@ def _planner(preset, cards, slack, arena, alloc_margin=0.10, n_nodes=1, host_gb=
            "--fine-dtype", fine_dtype]
     if n_nodes != 1:
         cmd += ["--n-nodes", str(n_nodes)]
+    if n_fine:
+        cmd += ["--n-fine", str(n_fine)]
     out = subprocess.run(cmd, capture_output=True, text=True,
                          env=dict(os.environ, PYTHONPATH=os.path.join(REPO, "src"))).stdout
 
@@ -833,7 +869,7 @@ def _planner(preset, cards, slack, arena, alloc_margin=0.10, n_nodes=1, host_gb=
 
 
 def _base_card(kind, args):
-    return dict(card=f"inexor-d7-{kind}-1", preset=args.preset, workdir=args.workdir,
+    return dict(card=f"inexor-device-{kind}-1", preset=args.preset, workdir=args.workdir,
                 commit=_git_commit(), host=os.uname().nodename,
                 job=os.environ.get("SLURM_JOB_ID"), started=time.time(),
                 env={k: v for k, v in os.environ.items()
@@ -884,6 +920,11 @@ def cmd_preflight(args):
         refusals.append(f"manifest holds {man['n_particles']} particles")
     if len(man["files"]) != int(man["bricks_per_side"]):
         refusals.append(f"{len(man['files'])} slab files for {man['bricks_per_side']} slabs")
+    # the epoch the run would start at, refused against a conflicting --a-init
+    try:
+        card["manifest"]["a_init"] = _start_epoch(args)
+    except SystemExit as e:
+        refusals.append(str(e))
     # a manifest without the field predates it and was generated with EdS D2
     card["manifest"]["growth2"] = man.get("growth2", "eds")
     if card["manifest"]["growth2"] != args.growth2:
@@ -892,7 +933,7 @@ def cmd_preflight(args):
 
     plan = _planner(args.preset, args.cards, args.slack, args.arena_frac, args.alloc_margin,
                     n_nodes=args.n_nodes, host_gb=args.host_gb, device_gb=args.device_gb,
-                    y_blocks=args.y_blocks, fine_dtype=args.fine_dtype)
+                    y_blocks=args.y_blocks, fine_dtype=args.fine_dtype, n_fine=args.n_fine)
     card["planner"] = plan
     _rss, _hwm, avail = host_memory()
     nm = numa_memory()
@@ -1028,8 +1069,8 @@ def cmd_run(args):
         # here, not after the run: the writer removes a manifest it finds
         raise SystemExit(f"FATAL: checkpoint probe dir {args.ckpt_probe_dir} is not empty")
     rank = 0 if comm is None else comm.rank
-    fail_rank = os.environ.get("D7_FAIL_RANK")
-    fail_at = (os.environ.get("D7_FAIL_AT")
+    fail_rank = os.environ.get("INEXOR_FAIL_RANK")
+    fail_at = (os.environ.get("INEXOR_FAIL_AT")
                if fail_rank is None or int(fail_rank) == rank else None)
     mon = Monitor(args.card, card, beat_s=args.beat, fail_at=fail_at,
                   with_numa_maps=args.numa_maps, card_sample_s=args.card_sample_ms / 1000.0,
@@ -1049,7 +1090,7 @@ def cmd_run(args):
         devs = jax.devices()
         if len(devs) < args.cards:
             raise RuntimeError(f"{len(devs)} jax devices, {args.cards} asked")
-        ec = engine_config(args.preset, coarse_backend="device", tile_backend="device",
+        ec = engine_config(_geometry(args), coarse_backend="device", tile_backend="device",
                            migrate_backend="device", device_cards=args.cards, tile_workers=1,
                            device_y_blocks=args.y_blocks, brick_slack=args.slack,
                            fine_dtype=args.fine_dtype,
@@ -1062,7 +1103,8 @@ def cmd_run(args):
         slabs = decomp.slabs if multi else None
         card["ranks"] = dict(rank=rank, n_ranks=decomp.n_ranks, slabs=list(decomp.slabs),
                              comm=args.comm, comm_timeout=args.comm_timeout)
-        card["config"] = dict(tile_window=ec.tile_window, fused_pass=ec.fused_pass,
+        card["config"] = dict(n_fine=ec.n_fine, b_fine=ec.b_fine,
+                              tile_window=ec.tile_window, fused_pass=ec.fused_pass,
                               device_cards=ec.device_cards, y_blocks=ec.device_y_blocks,
                               checkpoint_dir=ec.checkpoint_dir,
                               coarse_dtype=ec.coarse_dtype, fine_dtype=ec.fine_dtype)
@@ -1074,7 +1116,9 @@ def cmd_run(args):
         mon.start()
 
         cosmo = _cosmo()
-        co, a_steps = _coeffs(cosmo, args.k_steps, growth2=args.growth2)
+        a_init = _start_epoch(args, args.checkpoint_dir if args.expect_step else None)
+        card["a_init"] = a_init
+        co, a_steps = _coeffs(cosmo, args.k_steps, a_init=a_init, growth2=args.growth2)
         snaps = snapshot_steps_for(args.snapshot_z, a_steps) if args.snapshot_z else []
         snap_steps = [x for _, x, _ in snaps]
         card["snapshots"] = [dict(z=z, step=x, z_step=zx) for z, x, zx in snaps]
@@ -1131,7 +1175,7 @@ def cmd_run(args):
         # the ICs' linear P(k), if tabulated, rides along into every checkpoint
         epoch = (a_steps, cosmo, None if linear_pk is None else linear_pk.record())
         ic_prov = icgen.read_manifest(args.workdir).get("provenance") or {}
-        source = dict(ics=ics, ics_provenance={k: ic_prov[k] for k in (
+        source = dict(ics=ics, a_init=a_init, ics_provenance={k: ic_prov[k] for k in (
             "generator", "commit", "host", "when") if k in ic_prov})
         out = engine.run(st, ec, co, phase=mon, resume=resume, stop_at=args.stop_at,
                          collect=collect, timed_steps=timed, epoch=epoch,
@@ -1191,8 +1235,8 @@ def cmd_ics(args):
     _signals(args.card)
     card = _base_card("ics", args)
     rank = 0 if comm is None else comm.rank
-    fail_rank = os.environ.get("D7_FAIL_RANK")
-    fail_at = (os.environ.get("D7_FAIL_AT")
+    fail_rank = os.environ.get("INEXOR_FAIL_RANK")
+    fail_at = (os.environ.get("INEXOR_FAIL_AT")
                if fail_rank is None or int(fail_rank) == rank else None)
     mon = Monitor(args.card, card, beat_s=args.beat, fail_at=fail_at)
     try:
@@ -1288,8 +1332,8 @@ def _product(args, kind):
     _signals(args.card)
     card = _base_card(kind, args)
     rank = 0 if comm is None else comm.rank
-    fail_rank = os.environ.get("D7_FAIL_RANK")
-    fail_at = (os.environ.get("D7_FAIL_AT")
+    fail_rank = os.environ.get("INEXOR_FAIL_RANK")
+    fail_at = (os.environ.get("INEXOR_FAIL_AT")
                if fail_rank is None or int(fail_rank) == rank else None)
     mon = Monitor(args.card, card, beat_s=args.beat, fail_at=fail_at)
     try:
@@ -1297,7 +1341,7 @@ def _product(args, kind):
         if len(devs) < args.cards:
             raise RuntimeError(f"{len(devs)} jax devices, {args.cards} asked")
         devs = devs[:args.cards]
-        ec = engine_config(args.preset, coarse_backend="device", tile_backend="device",
+        ec = engine_config(_geometry(args), coarse_backend="device", tile_backend="device",
                            migrate_backend="device", device_cards=args.cards, tile_workers=1,
                            brick_slack=args.slack, fine_dtype=args.fine_dtype)
         ec.validate()
@@ -1310,7 +1354,9 @@ def _product(args, kind):
         mon.start()
 
         cosmo = _cosmo()
-        co, a_steps = _coeffs(cosmo, args.k_steps, growth2=args.growth2)
+        a_init = _start_epoch(args, args.checkpoint_dir)
+        card["a_init"] = a_init
+        co, a_steps = _coeffs(cosmo, args.k_steps, a_init=a_init, growth2=args.growth2)
         # before the (long) load: products need positions and velocities at one epoch
         head = engine.newest_checkpoint_provenance(args.checkpoint_dir)
         if (head is not None and not engine.synchronized(head, args.k_steps)
@@ -1546,8 +1592,8 @@ def main(argv=None):
         p.add_argument("--cards", type=int, default=4)
         p.add_argument("--y-blocks", type=_y_blocks, default=None,
                        help="split each x-slab's card work into this many y-blocks "
-                            "(EngineConfig.device_y_blocks); bitwise any count. Default "
-                            "auto: units no larger than a 4096^3 x-slab")
+                            "(EngineConfig.device_y_blocks); bitwise the same at any count. "
+                            "Default auto: units no larger than a 4096^3 x-slab")
         p.add_argument("--slack", type=float, default=0.10)
         p.add_argument("--alloc-margin", type=float, default=0.10)
         p.add_argument("--arena-frac", type=float, default=0.01)
@@ -1556,6 +1602,14 @@ def main(argv=None):
                             "float64); fingerprinted, so products of a run must pass the same")
         p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"),
                        help="the second-order growth the ICs must have been generated with")
+        p.add_argument("--n-fine", type=int, default=None,
+                       help="fine mesh cells per side instead of the preset's, the tile buffer "
+                            "re-derived to hold the split (as realization.py --n-fine); the ICs "
+                            "must be made with the same, and products of the run must pass it")
+        p.add_argument("--a-init", type=float, default=None,
+                       help="the schedule's starting scale factor. Default: the ICs' recorded "
+                            "epoch (from ICs) or the checkpoint's (resume); refused if given "
+                            "and different")
     pf = sub.choices["preflight"]
     pf.add_argument("--scratch", default=os.environ.get("SCRATCH", "/tmp"))
     pf.add_argument("--host-margin", type=float, default=0.95,
@@ -1642,8 +1696,8 @@ def main(argv=None):
     pi.add_argument("--batch-planes", type=int, default=16,
                     help="planes per rank in each plane <-> pencil exchange")
     pi.add_argument("--y-blocks", type=_y_blocks, default=None,
-                    help="y-block units per destination slab in the emission (bitwise any). "
-                         "Default auto: units no larger than a 4096^3 x-slab")
+                    help="y-block units per destination slab in the emission (bitwise the "
+                         "same at any count). Default auto: units no larger than a 4096^3 x-slab")
     pi.add_argument("--membind-nodes", default=None)
     pi.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
     pi.add_argument("--comm", default="serial", choices=("serial", "mpi"))
@@ -1669,11 +1723,18 @@ def main(argv=None):
                        help="precision of the fine tiles, their FFTs and the kick (production: "
                             "float64); fingerprinted, so products of a run must pass the same")
         p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"))
+        p.add_argument("--n-fine", type=int, default=None,
+                       help="fine mesh cells per side instead of the preset's, the tile buffer "
+                            "re-derived to hold the split (as realization.py --n-fine); the ICs "
+                            "must be made with the same, and products of the run must pass it")
+        p.add_argument("--a-init", type=float, default=None,
+                       help="the run's starting scale factor (fingerprinted). Default: the "
+                            "checkpoint's; refused if given and different")
         p.add_argument("--beat", type=float, default=60.0, help="heartbeat seconds")
         p.add_argument("--comm", default="serial", choices=("serial", "mpi"))
         p.add_argument("--comm-timeout", type=float, default=1800.0)
         p.add_argument("--allow-partial", action="store_true",
-                       help="a checkpoint that is neither the last step nor a snapshot "
+                       help="accept a checkpoint that is neither the last step nor a snapshot "
                             "(positions half a step past its epoch)")
     pc = sub.choices["card"]
     pc.add_argument("--out", required=True, help="the P(k) card JSON (rank 0 writes it)")

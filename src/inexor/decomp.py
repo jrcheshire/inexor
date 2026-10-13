@@ -3,7 +3,7 @@
 A rank (one process per node) owns a contiguous run of tile planes, and with them the brick
 x-slabs and coarse x-planes underneath; its cards split that run again. The spectrum is split
 by y-pencils, per rank and then per card. Every range is a `ooc_fft.partition_units` split, so
-at one rank the card ranges are exactly the ones the single-node step has always used.
+at one rank the card ranges equal the single-node step's.
 
 Node count is execution policy: nothing here enters a checkpoint fingerprint.
 """
@@ -21,9 +21,8 @@ class Decomp:
 
     Build with `Decomp.build(cfg, ...)`. Plane, slab and pencil ranges are half-open global
     indices. `pad` is the buffer brick slabs a tile window reads past its core on each side
-    (the ghost slabs a rank receives from each neighbour). Consumers: `engine.step` (tile
-    planes per card, coarse shard ranges, per-rank membership, ghost slabs) and the resident
-    coarse kernel (spectrum pencils per card).
+    (the ghost slabs a rank receives from each neighbour). Consumers: `engine.step` and the
+    resident coarse kernel.
     """
 
     n_ranks: int
@@ -147,9 +146,8 @@ def y_blocks(tiles_side, bricks_per_tile, n_y):
     a run of whole tile rows (`partition_units` over the tile rows), covering [0, nb).
 
     A unit is (x-slab, y-block). Bricks are numbered x, then y, then z, so a unit is one
-    contiguous run of bricks (`unit_bricks`) and of slots. The tile window, the destination
-    census, the device migrate and the fused repack all use this cut. One block is the whole
-    slab. Execution policy: nothing here enters a checkpoint fingerprint.
+    contiguous run of bricks (`unit_bricks`) and of slots. The tile window, destination census,
+    device migrate and fused repack all use this cut. Execution policy: not fingerprinted.
     """
     s, bpt, n_y = int(tiles_side), int(bricks_per_tile), int(n_y)
     if not 1 <= n_y <= s:
@@ -168,8 +166,6 @@ def auto_y_blocks(slab_rows, rows_per_side):
     `slab_rows`: particle rows in one x-slab (n_part^3 / brick slabs). `rows_per_side`: the
     y rows the slab is cut along, split by `partition_units(rows_per_side, n_y, 1)` (tile rows
     for the step's `y_blocks`, brick rows for the IC emission). Capped at `rows_per_side`.
-    Consumers: `EngineConfig.device_y_blocks` and `icgen.generate_t9_slabs_device` when their
-    count is None.
     """
     side = int(rows_per_side)
     for n_y in range(1, side + 1):

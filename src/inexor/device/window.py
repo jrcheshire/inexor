@@ -155,14 +155,11 @@ def stage_window(st, slabs, shapes, device=None, index=None):
     arena residents of the runs' bricks in ascending slot, padded to `shapes["arena"]`.
     Returns the device arrays (`off`, `w`, `arena_bucket`; the tile program donates `w`)
     and the host maps `rebase_plan` and the write-back read. Refuses a window past its
-    shapes. `index` is `migrate.pass_arena_index` of the state (computed if None).
+    shapes. `index` is `migrate.pass_arena_index` of the state (computed if None). `st` may
+    be a `device.ghost.SlabView`: ghost runs stage `w` as zeros, residents after the owned ones.
 
-    Each run goes up as a host view `capacity_shape(its rows)` long (copied only where it
-    would run off the array); rows past the run are overwritten by the next, which is why
-    `window_shapes` leaves room for the largest pad.
-
-    `st` may be a `device.ghost.SlabView`: runs of slabs another rank owns are then staged
-    from its ghost copies (their `w` as zeros), their residents after the owned ones.
+    Each run goes up as a host view `capacity_shape(its rows)` long; rows past the run are
+    overwritten by the next, which is why `window_shapes` leaves room for the largest pad.
     """
     import jax
 
@@ -376,17 +373,15 @@ def _census_plane(st, win, wd, vs, plane, per, c_drift, ar_index, acc, device, b
 def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
                        coarse_shard=None, device=None, write_host=True, census=None,
                        timings=None, y_blocks=1):
-    """`tile.tile_loop_device` over tile planes, one window on the card at a time. Bitwise
-    that loop at any `y_blocks`; see the module docstring.
+    """`tile.tile_loop_device` over tile planes, one window on the card at a time; bitwise that
+    loop at any `y_blocks` (see the module docstring).
 
-    `shapes` is `tile.tile_step_shapes` plus `window` from `window_shapes` (at the same
-    `y_blocks`). `planes` selects tile planes (default all, in x order); each plane runs
-    every tile of `members` with that x index, block by block. `st` may be a
-    `device.ghost.SlabView`, whose ghost slabs the windows and decode plans read; everything
-    written is owned. Per (plane, block) the stencil guards are resolved and the owned count
-    checked against the particles stored in its core bricks BEFORE its rows return to the
-    host. `coarse_shard` and `device` as in `tile_loop_device`; multi-card use is one thread
-    per card, each with its own planes.
+    `shapes` is `tile.tile_step_shapes` plus `window` from `window_shapes` (same `y_blocks`).
+    `planes` selects tile planes (default all, in x order); each runs every tile of `members`
+    with that x index, block by block. `st` may be a `device.ghost.SlabView`; everything
+    written is owned. Each (plane, block) resolves its stencil guards and checks its owned
+    count against its core bricks BEFORE its rows return to the host. `coarse_shard` and
+    `device` as in `tile_loop_device`; multi-card use is one thread per card.
 
     `timings`, if a dict, accumulates synced wall per part of a plane (`window:
     stage`, `window: tiles`, `window: guards`, `window: census`, `window: write-back`)

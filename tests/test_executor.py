@@ -71,6 +71,7 @@ def _assert_states_identical(s1, s2):
     assert int((s1.ids != s2.ids).sum()) == 0, "ids diverged between executors"
 
 
+@pytest.mark.slow
 def test_the_pool_executor_is_bitwise_the_serial_loop():
     """W=2 equals serial over a K=3 run with a repack every step (copy-back at every boundary)."""
     s1, out1 = _run(1)
@@ -83,6 +84,7 @@ def test_the_pool_executor_is_bitwise_the_serial_loop():
     assert out2[-1]["pool"]["workers"] == 2
 
 
+@pytest.mark.slow
 def test_the_pool_executor_identity_with_a_resident_arena():
     """Pool identity with arena residents live across every step boundary.
 
@@ -484,6 +486,7 @@ def test_memfd_is_not_silently_downgraded():
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.slow
 def test_the_pool_is_bitwise_the_serial_loop_on_either_backend(backend, monkeypatch):
     """Pool (W=4) is bitwise serial on each backing store."""
     monkeypatch.setenv("INEXOR_SHM_BACKEND", backend)

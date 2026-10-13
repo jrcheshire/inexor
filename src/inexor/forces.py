@@ -421,7 +421,7 @@ def coarse_kernel_parts(n_mesh, box_size, which, r_s=None, match=None, clip=None
     and folding it into `pref` would reassociate and move bits.
 
     `cards`, a list of `(y_lo, y_hi, device)`, keeps each card's y rows resident on that card
-    instead (`pref` and `mf` are then None and `cards` holds `dict(lo, hi, device, pref, mf)`):
+    (`pref` and `mf` are then None and `cards` holds `dict(lo, hi, device, pref, mf)`):
     each block is built on the host (`coarse_kernel_block`), placed, and freed before the next, so
     the host peak is one block's. Only the folded factorized solve on those cards can use them.
     """
@@ -1135,10 +1135,10 @@ class TileForce:
     """The per-tile short force from `make_tile_force_fn`.
 
     `one_tile(u, live, owned) -> (g, live & owned, n_out)` runs a jitted program with the
-    kernels compiled in as constants. `one_tile.with_kernels(u, live, owned, kernels)` is the
-    unjitted function taking them as an argument, for compiled programs that would otherwise
-    embed a copy each (`device.tile` places `one_tile.kernels`, the numpy kernels, on each card
-    once per tile loop instead). `kernels` is `(pref, ikx, iky, ikz)` from `split_prefactor`.
+    kernels compiled in as constants. `one_tile.with_kernels(u, live, owned, kernels)` takes
+    them as an argument, so compiled programs do not each embed a copy (`device.tile` places
+    `one_tile.kernels`, numpy, on each card once per tile loop). `kernels` is
+    `(pref, ikx, iky, ikz)` from `split_prefactor`.
     """
 
     def __init__(self, short_force, kernels):

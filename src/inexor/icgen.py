@@ -455,28 +455,24 @@ def generate_t9_slabs_device(
     `_emit_t9_slabs`; bitwise-identical slabs on the CPU backend).
 
     Across ranks (`comm`; every rank calls this with its own `devices` and the same shared
-    `workdir`): rank r owns destination brick slabs `partition_units(nb, n_ranks, 1)[r]`,
-    their particle x-planes, and y-pencils `partition_units(n, n_ranks, pencil_batch)[r]`
-    of every spectrum. Plane <-> pencil exchanges go in batches of `batch_planes`
-    (`ooc_fft.forward_planes_to_pencils` / `inverse_pencils_to_planes`); V is staged in
-    shared files, so a rank reads its neighbours' halo planes from disk; U_x is held on
-    the cards and U_y / U_z on the host with `window` brick slabs of halo. Rank 0 writes
-    the manifest once every rank has emitted. The files are byte for byte the one-rank
-    files at any rank and card count (the manifest adds `n_ranks`); one rank runs the
-    same code with no exchange. Across ranks only `noise="device"` and
-    `emission="cards"` are supported.
+    `workdir`): rank r owns destination brick slabs `partition_units(nb, n_ranks, 1)[r]`, their
+    x-planes, and y-pencils `partition_units(n, n_ranks, pencil_batch)[r]` of every spectrum.
+    Plane <-> pencil exchanges go in batches of `batch_planes`; V is staged in shared files, so
+    a rank reads its neighbours' halo planes from disk. Rank 0 writes the manifest once every
+    rank has emitted. The files are byte for byte the one-rank files at any rank and card count
+    (the manifest adds `n_ranks`). Across ranks only `noise="device"` and `emission="cards"`
+    are supported.
 
-    U_y and U_z (and U_x, moved off the cards before the emission) keep their own planes in
-    a spent spectrum's bytes. `emit_y_blocks` encodes each destination slab in that many
-    y-blocks on the cards (`device.emit`; same bytes at any count, recorded in the manifest
-    when > 1), which bounds a card's emission memory by a slab's y-block, not the slab; None
-    takes `decomp.auto_y_blocks` over the brick rows.
+    `emit_y_blocks` encodes each destination slab in that many y-blocks on the cards
+    (`device.emit`; same bytes at any count, recorded in the manifest when > 1), bounding a
+    card's emission memory by one y-block; None takes `decomp.auto_y_blocks` over the brick rows.
     Differences from the host path: kernels are applied on the device inside the axis-0 pass;
     the phi round trip is skipped at f_NL = 0; the 2LPT source is
     1/2 (delta^2 - sum phi_ii^2) - sum_{i<j} phi_ij^2 (using sum phi_ii = -delta); U and V are
     inverted from k-space combinations; V is staged to disk, U_x kept on devices, U_y/U_z on
-    host (peak ~3 fields). Not bitwise the host generator. Requires jax_enable_x64 (kernels
-    are built in float64; fields stay `fdtype`).
+    host with `window` brick slabs of halo, in spent spectra's bytes (peak ~3 fields). Not
+    bitwise the host generator. Requires jax_enable_x64 (kernels are built in float64; fields
+    stay `fdtype`).
     """
     import jax
 
@@ -675,7 +671,7 @@ def generate_t9_slabs_device(
     vmax = comm.allreduce(max(vmax_card), "max")
     _lap("velocities", t0)
 
-    # U = D1 psi1 - D2 psi2: x on the devices for now, y and z on the host (with halo)
+    # U = D1 psi1 - D2 psi2: x on the devices until the emission, y and z on the host (with halo)
     t0 = time.perf_counter()
     ooc_fft.kspace_pass_device([(D1, spec), (-D2, spec2)], n, box, out=spec, transform=False,
                                **pkw)
@@ -1136,10 +1132,9 @@ def write_t9_slabs(st, workdir, provenance=None, drop_ids=False, timings=None,
     manifest, so the directory cannot load.
 
     `comm` (`comm.Comm`, default `SerialComm`): every rank calls this with its node-local
-    state, and the ranks' slabs must tile the box in rank order. Rank 0 removes the old
-    manifest, then (after a barrier) each rank writes its own slabs, and rank 0 writes the
-    manifest once every rank has finished. A rank that raises aborts the others, so no
-    manifest is written. The files are the same bytes at any rank count. Returns the manifest
+    state; the ranks' slabs must tile the box in rank order. Rank 0 removes the old manifest
+    and, once every rank has written its slabs, writes the new one; a rank that raises aborts
+    the others, so no manifest is written. Same bytes at any rank count. Returns the manifest
     on every rank.
     """
     if st.ids is not None and not drop_ids:

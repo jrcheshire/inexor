@@ -361,22 +361,30 @@ def test_device_split_is_bitwise_identical_to_one_device(field32, w):
 
 
 def test_a_misaligned_split_really_does_move_bits():
-    """A split that strands a size-1 batch moves bits, so `partition_units`' alignment rule
+    """A split that strands a short batch moves bits, so `partition_units`' alignment rule
     guards something.
 
-    jax's batch-size dependence is not monotone (CPU, N=64: plane_batch 1, 2, 3 each differ,
-    4 and 8 agree), so some misaligned cuts happen not to bite. This one moved 1,062 f32 words.
+    jax's batch-size dependence is backend-specific and not monotone (macOS arm64 CPU, N=64:
+    plane_batch 1, 2, 3 each differ, 4 and 8 agree; a 1 | 15 cut at batch 2 moved 1,062 f32
+    words), so several cuts are tried. On a backend where none moves a bit the rule guards
+    nothing there, and the test says so by skipping.
     """
-    n, t, pb = 64, 16, 2
+    n, t = 64, 16
     planes = np.stack([ooc_fft.plane_noise(n, i, np.float32, 3) for i in range(t)])
-    whole = ooc_fft.rfft2_planes_device(planes, plane_batch=pb)
-    mis = np.empty_like(whole)
-    ooc_fft.rfft2_planes_device(planes[:1], plane_batch=pb, out=mis[:1])
-    ooc_fft.rfft2_planes_device(planes[1:], plane_batch=pb, out=mis[1:])
-    n_diff = int((whole.view(np.float32) != mis.view(np.float32)).sum())
-    assert n_diff > 0, (
-        "a split that strands a size-1 batch did NOT move bits, so the "
-        "alignment rule in partition_units is guarding nothing on this backend")
+    tried = []
+    for pb in (2, 3, 4):
+        whole = ooc_fft.rfft2_planes_device(planes, plane_batch=pb)
+        for cut in sorted({1, pb + 1, t - 1}):
+            mis = np.empty_like(whole)
+            ooc_fft.rfft2_planes_device(planes[:cut], plane_batch=pb, out=mis[:cut])
+            ooc_fft.rfft2_planes_device(planes[cut:], plane_batch=pb, out=mis[cut:])
+            n_diff = int((whole.view(np.float32) != mis.view(np.float32)).sum())
+            if n_diff:
+                return
+            tried.append(f"batch {pb} cut {cut}")
+    pytest.skip("no misaligned split moved a bit on this backend (" + ", ".join(tried)
+                + "): its batched FFT does not depend on the batch here, so the alignment "
+                "rule in partition_units guards nothing on it")
 
 
 @pytest.mark.parametrize("w", [1, 2])

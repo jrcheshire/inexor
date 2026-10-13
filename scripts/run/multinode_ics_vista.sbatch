@@ -8,17 +8,18 @@
 #SBATCH -o inexor-mn-ics-%j.log
 #SBATCH --signal=B:USR1@600
 # Device ICs across the nodes, one rank per node on gh (one GH200) or gb (four GB200)
-# (`device_run.py ics --comm mpi`): every rank generates its own brick slabs into the shared IC_DIR, rank 0 writes the
-# manifest.
+# (`device_run.py ics --comm mpi`): every rank generates its own brick slabs into the shared
+# IC_DIR; rank 0 writes the manifest.
 #
-# Guards first (the MPI launch line on every node, a dying rank ends the launch; both fatal). With SMALL_PRESET, a byte check before the production generation: that
-# preset's ICs on one rank (node 0) and on every rank must be the same files (slab bytes,
-# manifest minus provenance, timings and rank / card / y-block counts); a mismatch stops the
-# job. Then PRESET's ICs into IC_DIR, and a check that the manifest holds the preset's
-# particle count in its slab count.
+# Guards first (the MPI launch line on every node, a dying rank ends the launch; both fatal).
+# With SMALL_PRESET, a byte check before the production generation: that preset's ICs on one
+# rank (node 0) and on every rank must be the same files (slab bytes, manifest minus
+# provenance, timings and rank / card / y-block counts); a mismatch stops the job. Then
+# PRESET's ICs into IC_DIR, and a check that the manifest holds the preset's particle count
+# in its slab count.
 #
 # Every leg has a silence limit and no time limit but the wall; a failed leg stops the job.
-# Each leg's output is also in IC_DIR/../<name>-job-<id>/legs/.
+# Each leg's output is also in <IC_DIR>-job-<id>/legs/.
 #
 # Requires INEXOR_RUNS, IC_DIR (a new directory: one holding a manifest is refused), and
 # INEXOR_SRC or submission from the checkout. Optional: PRESET (c-gh), SEED (0), A_INIT
@@ -33,14 +34,15 @@
 #
 # REHEARSAL=1 runs the same legs on a laptop CPU at cdev8-tile32 (a = 0.08, whose
 # displacements fit that box's one-slab window):
-#   REHEARSAL=1 INEXOR_RUNS=runs/rehearsal IC_DIR=runs/rehearsal/ics-r1/ics SMALL_PRESET=cdev8-tile32 \
-#     scripts/run/mpi_lane.sh --run bash scripts/run/multinode_ics_vista.sbatch
+#   REHEARSAL=1 INEXOR_RUNS=runs/rehearsal IC_DIR=runs/rehearsal/ics-r1/ics \
+#     SMALL_PRESET=cdev8-tile32 scripts/run/mpi_lane.sh --run \
+#     bash scripts/run/multinode_ics_vista.sbatch
 # PLANT_MISMATCH=1 gives the small check's every-rank leg another seed, so its gate must stop
 # the job; PLANT_LEG_FAIL=1 gives the first rank leg an unknown XLA flag, which aborts every
 # rank.
 #
-# Wall (c-gh on 2 gh): the 2048^3 ICs took 7.0 min on one gb node's four GB200s (1045956),
-# mostly the emission's uploads and writes; on two GH200s ~15-30 min, plus the c-1024 check
+# Wall (c-gh on 2 gh): the 2048^3 ICs take 7.0 min on one gb node's four GB200s, mostly the
+# emission's uploads and writes; on two GH200s ~15-30 min, plus the c-1024 check
 # (~5 min) and ~15 min of guards: ~1 h at most, 2 h requested.
 
 export PATH="$HOME/.pixi/bin:$PATH"
@@ -74,7 +76,7 @@ N_RANKS=${SLURM_NTASKS:-${N_RANKS:-2}}
 WORK=$(dirname "$IC_DIR")/$(basename "$IC_DIR")-job-$SLURM_JOB_ID
 # shellcheck disable=SC2034  # read by job_lib.sh
 LEG_DIR=$WORK/legs
-CARDS=$SRC/runs/v2
+CARDS=$SRC/runs/cards
 TAG=mnics_${PRESET}_$SLURM_JOB_ID
 GEN=(--seed "$SEED" --a-init "$A_INIT" --f-nl "$F_NL" --window "$WINDOW"
      --y-blocks "$Y_BLOCKS" --batch-planes "$BATCH_PLANES")

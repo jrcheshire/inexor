@@ -2,7 +2,7 @@
 
     pixi exec --spec python=3.12 --spec camb --spec matplotlib --spec numpy --spec scipy \
         -- python scripts/compare/pk_boost_reference.py RUN/realization_pk.json \
-        --cosmology RUN/export.json -o figures/hero_pk_boost.png
+        --cosmology RUN/export.json -o runs/figures/pk_boost.png
 
 Run through `pixi exec`, not the project env: camb is a one-off reference, not an
 engine dependency, and adding it would move `pixi.lock`. EuclidEmulator2 is used if
@@ -27,6 +27,7 @@ or `--cosmology`; there is no default.
 
 import argparse
 import json
+import os
 
 import numpy as np
 from scipy.signal import fftconvolve
@@ -37,8 +38,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 SHORT = {"ee2": "EE2", "mead2020": "HMcode", "takahashi": "halofit"}
 # quoted accuracies drawn as the ratio panel's band: EE2 1% for 0.01 <= k <= 10 h/Mpc,
-# z <= 3 (Knabenhans et al. 2021, arXiv:2010.11288); HMcode2020 2.5% (the band this
-# script has always drawn for it)
+# z <= 3 (Knabenhans et al. 2021, arXiv:2010.11288); HMcode2020 2.5%
 ACCURACY = {"ee2": 0.01, "mead2020": 0.025}
 
 
@@ -108,7 +108,7 @@ def card_bin_modes(summary):
 
     Mirrors `inexor.summary.binned_power_partials`: |k| = sqrt((kx^2 + ky^2) + kz^2) with
     k_i = 2 pi * fftfreq, digitized against the card's edges (the binner's default, 64 bins
-    to half the coarse Nyquist, for cards that predate `k_edges`). A shell on an edge is
+    to half the coarse Nyquist, for a card without `k_edges`). A shell on an edge is
     split vector by vector with that same float expression, so rounding sends each mode
     where the card sent it. Refuses unless every bin's count equals the card's `n_modes`.
     """
@@ -206,7 +206,7 @@ def main():
                          "header has one). Required unless the card does -- there "
                          "is no default, because a reference built at the wrong "
                          "parameters looks exactly like a discrepancy")
-    ap.add_argument("-o", "--out", default="figures/hero_pk_boost.png")
+    ap.add_argument("-o", "--out", default="runs/figures/pk_boost.png")
     ap.add_argument("--no-ee2", action="store_true",
                     help="skip EuclidEmulator2 even if it imports")
     ap.add_argument("--dpi", type=int, default=200)
@@ -314,6 +314,7 @@ def main():
     bx.legend(frameon=False, fontsize=9, loc=args.legend_loc)
 
     fig.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     fig.savefig(args.out, dpi=args.dpi, bbox_inches="tight")
     print(f"-> {args.out}")
 

@@ -9,7 +9,7 @@ Examples:
   python -m inexor.plan --preset cdev
   python -m inexor.plan --preset c-gh --host-gb 116
   python -m inexor.plan --n-part 2048 --box 1024 --n-fine 4096 --n-coarse 1024 \
-      --tile 256 --buf 32 --host-gb 237 --disk-gb 2000
+      --tile 256 --buf 32 --host-gb 237
 """
 
 import argparse
@@ -46,6 +46,17 @@ RATIFIED = dict(
     alpha=1.0,                # r_s / coarse_cell
 )
 BUCKET_CELLS = 2
+
+
+def preset_geometry(preset, n_fine=None):
+    """`PRESETS[preset]` with `n_fine` replacing the fine mesh and the tile buffer (in fine cells)
+    scaled with it, so the buffer keeps its physical width and the split its truncation error:
+    the drivers' --n-fine."""
+    g = dict(PRESETS[preset])
+    if n_fine is not None and int(n_fine) != int(g["n_fine"]):
+        g["buf"] = int(round(g["buf"] * int(n_fine) / g["n_fine"]))
+        g["n_fine"] = int(n_fine)
+    return g
 
 
 def engine_config(preset, **overrides):
@@ -153,12 +164,12 @@ KERNEL_ON_CARDS = {
 
 
 # Per-GPU terms live through some phases only; every other resident term is live for the whole
-# run. MEASURED on the cards: memory in use between phases is the coarse kernel parts, plus the
-# coarse force from the solve through the migrate (c-1024 on 4 GB200: 0.13 / 0.55 GB a card,
-# job 1048248), and the allocator reuses a phase's memory in the next.
+# run. MEASURED on the cards: memory in use between phases is the coarse kernel parts plus the
+# coarse force from the solve through the tile loop (0.13 / 0.55 GB a card at c-1024 on four
+# GB200), and the allocator reuses a phase's memory in the next.
 AFTER_LOOP = "after_loop"
 DEVICE_HELD = {
-    "coarse_force_resident": ("coarse_solve", "tile_loop", AFTER_LOOP),
+    "coarse_force_resident": ("coarse_solve", "tile_loop"),
     "tile_kernels": ("tile_loop",),
     "slab_window": ("tile_loop",),
 }
@@ -209,10 +220,10 @@ REPACK_DEVICE_B_PER_SLAB_ROW = 70
 # `device.fused.migrate_repack_device`: device peak bytes per slab row (particles per x-slab)
 # by unit fraction (a y-block's share of the slab), keyed 1/y. MEASURED as the first drift's
 # card peak above the bytes in use before it, smallest card and run taken: y 1 at c-hero on
-# 4 GB200 (1024783; c-gh on gh 1045958, c-1024 on 1 gh 1043437 and cgh64 / c-1024 on 4 GB200
-# 1048248 read 211.8-224.9); y 2 and 4 at cgh64 and y 8 at c-1024, on 4 GB200 (1048248; the
-# other preset reads within 2%). The same at 1 and 4 cards and from 512^3 to 4096^3. Rounded
-# down, so each stays under its measurement.
+# four GB200 (c-gh on GH200 nodes, c-1024 on one GH200, and cgh64 / c-1024 on four GB200 read
+# 211.8-224.9); y 2 and 4 at cgh64 and y 8 at c-1024 on four GB200 (the other preset within
+# 2%). The same at 1 and 4 cards and from 512^3 to 4096^3. Rounded down, so each stays under
+# its measurement.
 FUSED_DEVICE_B_PER_SLAB_ROW_BY_UNIT = {1.0: 206.8, 0.5: 166.2, 0.25: 129.7, 0.125: 102.3}
 
 
@@ -234,24 +245,23 @@ def fused_device_rate(u):
     return v0 + (v1 - v0) * (u - u0) / (u1 - u0), how
 
 # Host bytes of the compiled device programs, per node, keyed by (tile size, cards per node);
-# `_per_node` prices an unmeasured pair. Compiling the step's programs leaves host memory in use
-# for the rest of the run (live, not freed-but-cached: `malloc_trim` at the end of a 4096^3 run
-# returned 0.3 of 820 GB, job 1003657), and a capacity rung (`capacity_shape`) compiles and
-# keeps more. One rung is priced: every measured 120-step run climbed at least one. MEASURED
-# from run cards' `boundaries[]` (rss at a phase's end, hwm its peak), smallest taken, with the
-# persistent compilation cache the job scripts set (without it a 256 rung measured 3.6 GB,
-# 1029876); every rung measurement predates the superseded-program drop (`_tile_kernel`,
-# 00a193e):
+# `_per_node` prices an unmeasured pair. Compiled programs hold host memory for the rest of the
+# run (live, not freed-but-cached: `malloc_trim` at the end of a 4096^3 run returned 0.3 of
+# 820 GB), and a capacity rung (`capacity_shape`) compiles and keeps more. One rung is priced:
+# every measured 120-step run climbed at least one. MEASURED from run cards' `boundaries[]`
+# (rss at a phase's end, hwm its peak), smallest taken, with the persistent compilation cache
+# the job scripts set (without it a 256 rung measured 3.6 GB). The rung terms were measured
+# with the superseded smaller-cap programs held, which `_tile_kernel` releases:
 # - held from the first step: rss at step 2's first phase minus the planner's resident.
-#   (256, 1): 0.63-1.66 GB (c-gh on 2-16 gh, jobs 1063862, 1063389, 1045958). (512, 1):
-#   13.35-13.49 (c-hero on 16 gh, 1057032). (512, 4): 27.2-38.0 (c-8192 on 8 gb, 1054104).
+#   (256, 1): 0.63-1.66 GB (c-gh on 2-16 GH200 nodes). (512, 1): 13.35-13.49 (c-hero on 16
+#   GH200 nodes). (512, 4): 27.2-38.0 (c-8192 on 8 GB200 nodes).
 # - the tile loop's compile transient: its peak at a compiling step above the RSS it started
-#   from, less a non-compiling step's. (256, 1): 4.91-5.00 at a rung (1045958 step 75),
-#   3.59-6.01 at a first step. (512, 1): 21.32-21.49 at the rung, 21.57-21.67 at the first
-#   step (1057032). (512, 4): 24.5-51.2 at a first step (1054104).
-# - held from a rung on: step r+1's first-phase rss minus step r-1's. (256, 1): 1.72 (1045958).
-#   (512, 1): 9.22-9.44 (1057032). (512, 4): 0.51-0.89 per card on an earlier code version
-#   (c-hero on 4 GB200, 1024784), the only measurement.
+#   from, less a non-compiling step's. (256, 1): 4.91-5.00 at a rung, 3.59-6.01 at a first
+#   step. (512, 1): 21.32-21.49 at the rung, 21.57-21.67 at the first step. (512, 4):
+#   24.5-51.2 at a first step.
+# - held from a rung on: step r+1's first-phase rss minus step r-1's. (256, 1): 1.72.
+#   (512, 1): 9.22-9.44. (512, 4): 0.51-0.89 per card (c-hero on four GB200, an older build),
+#   the only measurement.
 HELD_COMPILED_HOST = {(256, 1): 0.63 * GB, (512, 1): 13.35 * GB, (512, 4): 27.2 * GB}
 TILE_COMPILE_SPIKE_HOST = {(256, 1): 3.59 * GB, (512, 1): 21.32 * GB, (512, 4): 24.5 * GB}
 HELD_RUNG_HOST = {(256, 1): 1.72 * GB, (512, 1): 9.22 * GB, (512, 4): 4 * 0.51 * GB}
@@ -271,9 +281,9 @@ def _per_node(table, tile, cards):
 
 # The device-lane process's host floor beyond the priced state (CUDA context, jaxlib, XLA's
 # host pools), keyed by cards per node. MEASURED: 4.265 / 4.281 GB on one GH200 at cgh64 /
-# c-1024 (job 1029876, RSS after step 1 minus the priced resident; the smaller is taken, so
-# the resident stays a lower bound); <= 3.2 GB on four GB200
-# (the 32^3 smoke's host peak, job 1027664). Other card counts take the larger.
+# c-1024 (RSS after step 1 minus the priced resident; the smaller is taken, so the resident
+# stays a lower bound); <= 3.2 GB on four GB200 (the 32^3 smoke's host peak). Other card
+# counts take the larger.
 PROCESS_BASELINE_BY_CARDS = {1: 4.26 * GB, 4: 3.2 * GB}
 
 
@@ -310,7 +320,8 @@ def _print_load_and_ic(args, ec, t9, n, rows, arena, shared, share=1.0):
     try:
         from .ooc_fft import plan_bytes
 
-        ic = plan_bytes(args.n_part, np.dtype(args.coarse_dtype), "derivative")
+        # the host IC generator runs in single precision whatever the coarse mesh's dtype
+        ic = plan_bytes(args.n_part, np.dtype(np.float32), "derivative")
         print(f"\nIC STAGE (out-of-core, 'derivative' policy): peak "
               f"{_fmt(ic['peak'])}")
     except Exception as exc:  # pragma: no cover - informational only
@@ -335,12 +346,11 @@ def ic_device_stages(n, n_gpus=4, fdtype=np.float32, nb=None, slab=32, window=1,
     charged roughly, page cache not at all). `png` charges the f_NL != 0 phi round trip;
     `emission` prices stage 6 for `device.emit` ("cards") or `icgen._emit_t9_slabs` ("host").
 
-    `n_nodes` > 1 prices the busiest rank of a run across nodes (`n_gpus` cards each): its
-    y-pencils of each spectrum, its x-planes, U_y / U_z with `window` brick slabs of halo
-    either side, and one batch of `batch_planes` planes in flight in a plane <-> pencil
-    exchange (sent and received). Host bytes are per node; the disk table is the shared total.
-    U_x, U_y and U_z keep a rank's own planes in spent spectra's bytes (halo planes apart);
-    `emit_y_blocks` prices the card emission's destination program per y-block unit.
+    `n_nodes` > 1 prices the busiest rank across nodes (`n_gpus` cards each): its y-pencils of
+    each spectrum, its x-planes, U_y / U_z with `window` brick slabs of halo either side, and
+    one batch of `batch_planes` planes in flight each way in a plane <-> pencil exchange. Host
+    bytes are per node; the disk table is the shared total. `emit_y_blocks` prices the card
+    emission per y-block unit.
     """
     from .ooc_fft import partition_units
 
@@ -428,16 +438,13 @@ def device_budget(ec, *, n, n_gpus, row_bytes=9, paint_chunk_bricks=None, fused=
 
     Returns `(resident, transient, phases, worst_phase, slabs, host_mesh, after_loop)`.
     `resident` and `transient` are the term inventories. `phases` maps each phase, and
-    `AFTER_LOOP`, to its live set beyond the whole-run terms: its transients plus the
-    `DEVICE_HELD` terms live in it. The card's allocator returns memory between phases
-    (memory in use falls back to the whole-run terms, measured), so `worst_phase` is the
-    largest in-step or once-per-run phase, not their sum. `after_loop` holds the
-    migrate/repack pass terms (they do not coexist: max). `host_mesh` holds "host"-placed
-    terms for the host table. `paint_chunk_bricks` None = `device.paint.default_chunk_bricks`.
-    `fused` prices the fused migrate + repack, whose census runs one unit's eject inside the
-    tile loop. `kernel`: where the coarse kernel parts live (`device_placement`). Slab-sized
-    terms follow `ec.device_y_blocks`: the window holds a y-block plus its buffer bricks, the
-    census and the fused pass's work one unit.
+    `AFTER_LOOP`, to its live set beyond the whole-run terms (its transients plus the
+    `DEVICE_HELD` terms live in it); the card's allocator returns memory between phases
+    (measured), so `worst_phase` is the largest phase, not their sum. `after_loop` holds the
+    migrate/repack terms (max: they do not coexist); `host_mesh` the "host"-placed terms.
+    `paint_chunk_bricks` None = `device.paint.default_chunk_bricks`. `fused` prices the fused
+    migrate + repack. `kernel`: where the coarse kernel parts live (`device_placement`).
+    Slab-sized terms follow `ec.device_y_blocks`.
     """
     placement = device_placement(kernel)
 
@@ -586,8 +593,7 @@ def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
     add("tile_loop", "tile programs compiled, first step or a capacity rung (MEASURED)",
         _per_node(TILE_COMPILE_SPIKE_HOST, ec.n_tile, n_gpus))
     # The lead drift's own host transient is not charged: above its closing RSS it measured
-    # 0-12 GB at c-hero (1024783, 1024784, 1027664), 0.6 GB at c-gh on 2 nodes (1045958) and
-    # 0 at c-1024 for y-blocks 1-8 (1048248).
+    # 0-12 GB at c-hero, 0.6 GB at c-gh on 2 nodes and 0 at c-1024 for y-blocks 1-8.
     # Before the first step the loader has written the n particle rows only; the slack rows
     # are first touched by migrate inserts, the lead drift's included (so crediting it the
     # whole slack keeps it a lower bound).
@@ -597,9 +603,9 @@ def device_host_phases(ec, *, n, state, step, host_mesh, n_gpus, fused=True):
     return resident, phases
 
 
-# Measured cross-card migrate hand-off at c-hero on four GB200 (job 1003657, steps 1-4, reach
-# 1): 0.84-1.06 GB per step over 8 card-to-card segments, i.e. <= 0.49 B per slab row per
-# segment. A node boundary is the same cut, so it is priced per slab row at this rate.
+# Measured cross-card migrate hand-off at c-hero on four GB200 (steps 1-4, reach 1): 0.84-1.06
+# GB per step over 8 card-to-card segments, i.e. <= 0.49 B per slab row per segment. A node
+# boundary is the same cut, so it is priced per slab row at this rate.
 HANDOFF_B_PER_SLAB_ROW_PER_SEGMENT = 0.49
 def multinode_terms(ec, *, n, n_nodes, t9, reach=1):
     """Host bytes per node that exist only across nodes, and bytes sent per node per step.
@@ -610,7 +616,7 @@ def multinode_terms(ec, *, n, n_nodes, t9, reach=1):
     transposes (`ooc_fft`: each node holds its y-pencils of the spectrum and work, 1/N, and
     one component's back-transpose receive at a time), the census and scales boundary
     exchanges, and the migrate hand-off at its measured card-to-card rate. Derived from the
-    code, not yet measured on a cluster. Returns `(phases, sent)`: phase -> {term: bytes} as
+    code, not measured. Returns `(phases, sent)`: phase -> {term: bytes} as
     in `device_host_phases`, and term -> bytes each node sends per step.
     """
     from .device.paint import ACC_GHOST_HI, ACC_GHOST_LO
@@ -971,11 +977,12 @@ def main(argv=None):
                          "keeps its worker count")
     ap.add_argument("--slabs", type=int, default=128,
                     help="T9 slab files the ICs were written as (c-gh: 128)")
-    ap.add_argument("--disk-gb", type=float, default=None, help="scratch budget for IC staging")
     args = ap.parse_args(argv)
 
     if args.preset:
-        for k, v in PRESETS[args.preset].items():
+        # --n-fine without --buf scales the buffer with it, as the drivers do
+        geom = preset_geometry(args.preset, n_fine=args.n_fine if args.buf is None else None)
+        for k, v in geom.items():
             if getattr(args, k.replace("-", "_")) is None:
                 setattr(args, k.replace("-", "_"), v)
     if args.buf is None:

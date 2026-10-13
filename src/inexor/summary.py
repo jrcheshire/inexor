@@ -375,13 +375,12 @@ def pk_summary_card_cards(
 ):
     """`pk_summary_card` with the paint and the transform on the cards, across ranks.
 
-    Every rank calls this with its node-local state (or one rank with the whole state):
-    `device.paint.coarse_delta_cards` paints the rank's coarse planes on `devices`,
-    `ooc_fft.forward_card_planes_to_pencils` returns its y-pencils of the spectrum, each rank
-    bins its own pencils (`binned_power_partials`) and the partials are allgathered and
-    combined exactly. The card is bitwise the same at any rank and card count, and every rank
-    returns it. Against `pk_summary_card` the density is bitwise; the spectrum differs at the
-    FFT's rounding (`transform: "cards"`). Shot noise uses the particle count over all ranks.
+    Every rank calls this with its node-local state (or one rank with the whole state): it
+    paints its coarse planes on `devices` (`device.paint.coarse_delta_cards`), transforms to its
+    y-pencils (`ooc_fft.forward_card_planes_to_pencils`) and bins them (`binned_power_partials`);
+    the partials are allgathered and combined exactly, so every rank returns the same card at
+    any rank and card count. Against `pk_summary_card` the density is bitwise and the spectrum
+    differs at the FFT's rounding (`transform: "cards"`). Shot noise uses the total count.
 
     `phase(name)`, if given, is called after "card_paint", "card_transform" and "card_bin".
     Other arguments as `pk_summary_card`.

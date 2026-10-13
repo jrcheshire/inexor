@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH -J d7f-hero-card
+#SBATCH -J inexor-hero-card
 #SBATCH -p gb
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 08:00:00
-#SBATCH -o d7f-hero-card-%j.log
+#SBATCH -o inexor-hero-card-%j.log
 # The P(k) card of an evolved realization's final checkpoint (c-hero, 4096^3, unless
 # PRESET says otherwise), and nothing else.
 # The export reads the same checkpoint independently (hero_export_vista.sbatch), so it
@@ -56,6 +56,9 @@ export JAX_COMPILATION_CACHE_DIR=$SCRATCH/inexor-xla-cache
 export INEXOR_LOAD_TRACE=1
 unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
+# the shared env guard: census + imports, else a rebuild through a fresh cache
+. scripts/run/gpu_env.sh
+ensure_gpu_env "$PWD" || { echo "FATAL: no working gpu env"; exit 1; }
 
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 CKPT=${CKPT_DIR:-${SRC_RUN:+$SRC_RUN/hero-ckpt}}
@@ -64,12 +67,12 @@ PRESET=${PRESET:-c-hero}
 export PRESET
 K_STEPS=${K_STEPS:?set K_STEPS to the schedule length}
 export K_STEPS
-WORK=$RUNS/d7f-$SLURM_JOB_ID
+WORK=$RUNS/hero-card-$SLURM_JOB_ID
 PROD=${PROD_DIR:?set PROD_DIR to the product directory}
-CARDS=runs/v2
+CARDS=runs/cards
 mkdir -p "$CARDS"
 DRIVER=scripts/run/device_run.py
-TAG=d7f_$SLURM_JOB_ID
+TAG=hero_card_$SLURM_JOB_ID
 MEM_CSV=$CARDS/${TAG}_mem.csv
 BIND="numactl --membind=0,1"
 # `_require_cpu` refuses unless jax's first device is CPU. Scoped per leg, not exported:

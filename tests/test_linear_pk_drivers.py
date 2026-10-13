@@ -80,13 +80,14 @@ def device_run(table, tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def snapshot_run(device_run):
-    """Three steps of 40 from the same ICs with a snapshot at z = 7.9 (step 2 of this
-    schedule, a = 0.1 x 10^(2/40)) and a checkpoint at step 3."""
+    """Three steps of 40 from the same ICs with a snapshot at z = 10 (step 2 of this
+    schedule, which starts at the ICs' a = 0.08: a = 0.08 x 12.5^(2/40), z = 10.017) and a
+    checkpoint at step 3."""
     d = device_run
     common = ["--preset", PRESET, "--cards", "1", "--beat", "600"]
     _run([DRIVER, "run", *common, "--workdir", str(d / "ics"), "--k-steps", "40", *LAYOUT,
           "--checkpoint-dir", str(d / "snap-ckpt"), "--checkpoint-every", "3",
-          "--snapshot-z", "7.9", "--snapshot-dir", str(d / "snaps"),
+          "--snapshot-z", "10", "--snapshot-dir", str(d / "snaps"),
           "--card", str(d / "snap-run.json"), "--stop-at", "3"])
     return d
 
@@ -129,10 +130,10 @@ def test_fine_dtype_reaches_the_run_and_its_products_must_name_it(device_run):
     _run([DRIVER, "card", *prod, "--fine-dtype", "float32", "--card", str(d / "f32-card.json"),
           "--out", str(d / "f32-pk.json")])
     assert json.load(open(d / "f32-pk.json"))["step"] == 1
-    # no --a-init: the device driver's schedule starts at the default a = 0.1
+    # the device run started at the ICs' epoch, which the CPU driver is told explicitly
     cpu = [REALIZATION, "card", "--config", PRESET, "--tile-workers", "1",
            "--workdir", str(d / "f32"), "--k-steps", "40", *LAYOUT, "--min-weight", "1",
-           "--allow-partial"]
+           "--allow-partial", "--a-init", A_INIT]
     p = _run(cpu, ok=False)
     assert p.returncode != 0 and "different configuration" in p.stdout + p.stderr
     _run(cpu + ["--fine-dtype", "float32"])
@@ -179,3 +180,20 @@ def test_pk_table_is_refused_outside_ics(table, tmp_path):
     p = _run([REALIZATION, "run", "--config", PRESET, "--workdir", str(tmp_path),
               "--pk-table", path], ok=False)
     assert p.returncode != 0 and "--pk-table is an `ics` option" in p.stderr
+
+
+def test_a_cpu_lane_checkpoint_carries_its_epoch_to_the_device_products(tmp_path):
+    """The CPU driver records its schedule's a_init with its checkpoints, so the GPU driver's
+    products of a run started at a = 0.08 use that schedule rather than refusing the
+    fingerprint; an explicit conflicting --a-init is refused."""
+    common = ["--config", PRESET, "--tile-workers", "1", "--a-init", A_INIT, *LAYOUT]
+    _run([REALIZATION, "ics", *common, "--workdir", str(tmp_path)])
+    _run([REALIZATION, "run", *common, "--workdir", str(tmp_path), "--k-steps", "40",
+          "--stop-at", "1", "--checkpoint-every", "1"])
+    prod = [DRIVER, "card", "--preset", PRESET, "--cards", "1", "--beat", "600",
+            "--checkpoint-dir", str(tmp_path / "ckpt"), "--k-steps", "40", "--expect-step", "1",
+            *LAYOUT, "--min-weight", "1", "--allow-partial", "--out", str(tmp_path / "pk.json")]
+    _run(prod + ["--card", str(tmp_path / "c0.json")])
+    assert json.load(open(tmp_path / "pk.json"))["step"] == 1
+    p = _run(prod + ["--card", str(tmp_path / "c1.json"), "--a-init", "0.1"], ok=False)
+    assert p.returncode != 0 and "another epoch" in p.stdout + p.stderr

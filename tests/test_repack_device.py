@@ -118,8 +118,11 @@ def test_repeated_migrate_and_repack_steps_stay_bitwise_without_ids(x64):
 
 
 def test_the_device_repack_proves_it_ran_and_reports_its_receipt(x64):
-    from inexor.device import repack
+    from inexor.device import migrate, repack
 
+    # programs this call compiles: drop any a previous test in this process compiled
+    for key in [k for k in migrate._PROGRAMS if k[0] == "repack"]:
+        del migrate._PROGRAMS[key]
     st = _state(n_part=16, nb=4, box=8.0)
     before = repack.CALLS
     out = repack.repack_device(st, brick_slack=0.1)

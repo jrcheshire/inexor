@@ -6,12 +6,12 @@
 #SBATCH -t 02:30:00
 #SBATCH -o inexor-yblocks-%j.log
 #SBATCH --signal=B:USR1@600
-# The y-block cut on one gb node (4 B200): per preset, device ICs once, then the same steps
+# The y-block cut on one gb node (four GB200): per preset, device ICs once, then the same steps
 # at every y-block count, each from the ICs into its own checkpoint dir. Every count's
 # checkpoints must equal the 1-block run's byte for byte, manifests compared without their
 # window shape (gate_any_cut); a mismatch reruns 1 and that count under
 # --xla_gpu_deterministic_ops=true, to tell nondeterminism from a dependence on the cut. The
-# run cards (runs/v2/<TAG>_<preset>_y<n>.json, per-phase card and host peaks, --timed-all)
+# run cards (runs/cards/<TAG>_<preset>_y<n>.json, per-phase card and host peaks, --timed-all)
 # and samplers price the planner's per-unit terms.
 #
 # Requires INEXOR_RUNS and INEXOR_SRC (or submission from the checkout). Optional: PRESETS
@@ -56,7 +56,7 @@ if [ "${REHEARSAL:-0}" = 1 ]; then
   export PATH="$STUBS:$PATH"
   MEMBIND_CHECK=() MACHINE=(--allow-cpu)
 else
-  [ "$SLURM_JOB_PARTITION" = gb ] || { echo "FATAL: gb only (4 B200 per node)"; exit 1; }
+  [ "$SLURM_JOB_PARTITION" = gb ] || { echo "FATAL: gb only (four GB200 per node)"; exit 1; }
   command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
   export XLA_PYTHON_CLIENT_PREALLOCATE=false
   export XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
@@ -85,7 +85,7 @@ DRIVER=$SRC/scripts/run/device_run.py
 WORK=$RUNS/yblocks-$SLURM_JOB_ID
 # shellcheck disable=SC2034  # read by job_lib.sh
 LEG_DIR=$WORK/legs
-CARDS=$SRC/runs/v2
+CARDS=$SRC/runs/cards
 TAG=yblocks_$SLURM_JOB_ID
 mkdir -p "$WORK" "$CARDS"
 

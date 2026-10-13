@@ -445,6 +445,7 @@ def _reload_and_rewrite(src, co, n_ranks, out, torn=None):
 
 
 @pytest.mark.parametrize("n_ranks", [1, 2, 4, 8])
+@pytest.mark.slow
 def test_an_n_rank_checkpoint_is_the_one_rank_bytes(ckpt, n_ranks, tmp_path):
     import os
 
@@ -474,6 +475,7 @@ def test_every_rank_takes_rank_zeros_generation(ckpt, tmp_path):
 
 @pytest.mark.parametrize("n_w", [1, 2, 4])
 @pytest.mark.parametrize("n_r", [1, 2, 4, 8])
+@pytest.mark.slow
 def test_a_checkpoint_from_n_ranks_resumes_on_m(ckpt, n_w, n_r, tmp_path):
     src, co = ckpt
     a, b = str(tmp_path / "a"), str(tmp_path / "b")

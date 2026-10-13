@@ -308,8 +308,8 @@ EOF_PY
 }
 
 # same_ics A B: two IC generations (manifest present) with the same slab files byte for byte
-# and the same manifest except what a rank, card or y-block count and the run record
-# (provenance, timings, n_devices, n_ranks, emission_y_blocks, stage_cleanup)
+# and the same manifest apart from the run record and what a rank, card or y-block count
+# changes (provenance, timings, n_devices, n_ranks, emission_y_blocks, stage_cleanup)
 same_ics () {
   "${PY:-python3}" - "$1" "$2" <<'EOF_PY'
 import json, os, sys

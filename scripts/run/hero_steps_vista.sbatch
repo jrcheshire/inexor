@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH -J d8-hero-k120
+#SBATCH -J inexor-hero-steps
 #SBATCH -p gb
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 11:00:00
-#SBATCH -o d8-hero-k120-%j.log
+#SBATCH -o inexor-hero-steps-%j.log
 #SBATCH --signal=B:USR1@900
 # The 4096^3 realization on the 120-step schedule, run as three 40-step segments because
 # 120 steps do not fit gb's 12 h MaxWall. One script, three submissions, each chained
@@ -30,8 +30,8 @@
 # 590-667 s (later epochs are slower) = 6.6-7.4 h; 2 checkpoints x ~16 min. ~8.2-9.0 h
 # central; 11 h requested against the 12 h MaxWall.
 #
-# Host memory is bound to the CPU sockets (`numactl --membind=0,1`); the previous 40-step
-# hero run peaked at 951 GB of 1026. USR1 900 s before the wall triggers driver stack dumps.
+# Host memory is bound to the CPU sockets (`numactl --membind=0,1`); a 40-step segment
+# peaks at ~951 GB of 1026. USR1 900 s before the wall triggers driver stack dumps.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }
@@ -48,6 +48,9 @@ export INEXOR_LOAD_TRACE=1
 export JAX_LOG_COMPILES=1
 unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
+# the shared env guard: census + imports, else a rebuild through a fresh cache
+. scripts/run/gpu_env.sh
+ensure_gpu_env "$PWD" || { echo "FATAL: no working gpu env"; exit 1; }
 
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 HERO=${HERO_IC_DIR:?set HERO_IC_DIR to the IC directory}
@@ -57,7 +60,7 @@ WORK=$REAL/job-$SLURM_JOB_ID
 CKPT=$REAL/hero-ckpt
 : "${EXPECT_STEP:?pass EXPECT_STEP (0, 40 or 80) with --export}"
 : "${SEG_STOP:?pass SEG_STOP (40, 80 or 120) with --export}"
-CARDS=runs/v2
+CARDS=runs/cards
 mkdir -p "$CARDS"
 TAG=d8_${SLURM_JOB_ID}_s${EXPECT_STEP}-${SEG_STOP}
 GPU_CSV=$CARDS/${TAG}_gpu.csv
@@ -161,7 +164,7 @@ run_leg pytest-gpu \
     "tests/test_engine.py::test_a_resumed_segment_writes_first_to_the_generation_it_did_not_load" \
   || { echo "FATAL: the timing gates failed on the GPU"; exit 1; }
 
-DIAG="--timed-all --numa-maps"
+DIAG="--timed-every 5"
 
 # the smoke: the same driver and instruments at 32^3
 run_leg smoke-ics \

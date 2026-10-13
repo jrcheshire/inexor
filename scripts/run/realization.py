@@ -594,9 +594,11 @@ def cmd_run(args):
     # `epoch` is stored with the checkpoints so `python -m inexor.export` can
     # write km/s from a bare checkpoint directory without this driver's a-grid, and
     # a card can take the ICs' linear P(k) from them
+    # `source.a_init` lets the GPU driver's products and resumes read the schedule's start
     out = engine.run(st, ec, co, phase=ph, resume=resume, stop_at=stop,
                      collect=stats.append, allocator=allocator,
-                     epoch=(a_steps, cosmo, None if linear_pk is None else linear_pk.record()))
+                     epoch=(a_steps, cosmo, None if linear_pk is None else linear_pk.record()),
+                     source=dict(ics=os.path.realpath(args.workdir), a_init=float(args.a_init)))
     wall = time.perf_counter() - t0
     # `clear_refs` resets ru_maxrss along with VmHWM (both read `mm->hiwater_rss`),
     # so under tracing the run's peak is only available as `PhaseTracer.run_peak`
@@ -914,13 +916,13 @@ def build_parser():
                          "same seed is an UNRELATED realization")
     ap.add_argument("--a-init", type=float, default=A_INIT,
                     help="starting scale factor, for ICs and the step grid alike "
-                         "(default 0.1, z = 9). Loading ICs made at "
-                         "another epoch is refused")
+                         "(default 0.1, z = 9). Loading ICs made at another epoch is "
+                         "refused")
     ap.add_argument("--coarse-match-order", type=int, default=3, choices=(2, 3),
                     help="assignment order the coarse match factor divides out. "
                          "The coarse arm paints TSC, so 3 (default) is correct; 2 "
-                         "(CIC) is the legacy arm. In the checkpoint fingerprint when not 2, so arms "
-                         "cannot cross-resume")
+                         "(CIC) is the legacy arm. In the checkpoint fingerprint when not "
+                         "2, so arms cannot cross-resume")
     ap.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"),
                     help="second-order growth for the 2LPT ICs and the BullFrog "
                          "weights: the LCDM ODE solution (default) or the legacy EdS "

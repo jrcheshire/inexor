@@ -7,19 +7,23 @@
 #SBATCH -o mpi-probe-%j.log
 #SBATCH --signal=B:USR1@1500
 # Two-node MPI probe (`scripts/run/mpi_probe.py`): one rank per node under ibrun, host MPI from
-# the MVAPICH-Plus module (MPI_MODULE, default mvapich-plus/5.1.0, loaded on gcc/15.1.0 +
-# cuda/13.0). Its libmpi is libmpi.so.0, not the MPICH ABI the env's conda mpi4py links, so
-# the first leg builds mpi4py against the module into MPI4PY_DIR (once; reused after) and the
-# legs import it from there; the gpu env itself is untouched. Submit once per partition:
+# the MVAPICH-Plus module (loaded on gcc/15.1.0 + cuda/13.0). Its libmpi is libmpi.so.0, not
+# the MPICH ABI the env's conda mpi4py links, so the first leg builds mpi4py against the module
+# into MPI4PY_DIR (once; reused after); the gpu env itself is untouched.
+#
+# Requires INEXOR_SRC or submission from the checkout, and an installed gpu env. Optional:
+# INEXOR_RUNS ($SCRATCH/inexor_runs; output under mpi-probe-<partition>-<job>), MPI_MODULE
+# (mvapich-plus/5.1.0), MPI4PY_DIR (under $SCRATCH/inexor-mpi4py). Submit once per partition:
 #   INEXOR_SRC=$SCRATCH/src/inexor sbatch -A <account> -p gh scripts/run/mpi_probe_vista.sbatch
 #   INEXOR_SRC=$SCRATCH/src/inexor sbatch -A <account> -p gb scripts/run/mpi_probe_vista.sbatch
+#
 # Legs, in order: identity, bandwidth, signal, abort, kill; on gb also host-attrib (one node,
 # no MPI: the cgh64 device run's per-phase host allocations). The pre-wall USR1 fires ~5 min
 # in (1500 s before the 30 min wall). The trap stamps its time and forwards it twice, told
 # apart by lag: at once to the local mpiexec (ibrun launches ranks over ssh, so they are not
 # Slurm steps), and 30 s later with `scancel -s USR1` (job steps). Every leg records
 # receipts, so the signal is kept whichever leg it lands in.
-# Every leg prints `GATE <name> PASS|FAIL`; the job exits with the number of failed legs.
+# Every gated leg prints `GATE <name> PASS|FAIL`; the job exits with the number that failed.
 
 export PATH="$HOME/.pixi/bin:$PATH"
 command -v pixi >/dev/null || { echo "FATAL: pixi not on PATH"; exit 1; }

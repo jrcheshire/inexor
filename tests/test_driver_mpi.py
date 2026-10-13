@@ -2,7 +2,7 @@
 
 ICs for `cdev8-tile32` from `realization.py ics`; the driver runs the first 6 steps of a
 40-step schedule with a checkpoint every 3 under `mpiexec -n N` (one card per rank), and
-every checkpoint file at N = 2 and 4 must equal N = 1's. `D7_FAIL_AT` on rank 1 ends the
+every checkpoint file at N = 2 and 4 must equal N = 1's. `INEXOR_FAIL_AT` on rank 1 ends the
 whole launch. The card and the export of the step-6 checkpoint at 2 ranks equal 1 rank's
 (the card in every field; the export's parts concatenated, with the same crc32), and the
 export decoded on the cards carries the host CLI export's crc32. Skipped where mpi4py or
@@ -37,8 +37,8 @@ ENV = dict(os.environ, OMP_NUM_THREADS="1", JAX_PLATFORMS="cpu",
 def ics(tmp_path_factory):
     d = tmp_path_factory.mktemp("ics")
     # a slightly early start: at this box's 2 Mpc/h brick slabs the a = 0.1 displacements
-    # exceed the streamed generator's one-slab window (the driver's schedule still starts at
-    # 0.1; the epoch does not matter to a byte comparison between rank counts)
+    # exceed the streamed generator's one-slab window (the driver's schedule starts at the
+    # ICs' recorded epoch)
     p = subprocess.run([sys.executable, REALIZATION, "ics", "--config", PRESET, "--workdir",
                         str(d), "--tile-workers", "1", "--a-init", "0.08"],
                        capture_output=True, text=True, env=ENV, timeout=900)
@@ -86,9 +86,9 @@ def test_driver_checkpoints_are_the_one_rank_bytes(ics, one_rank, tmp_path, n):
 
 
 def test_a_failing_rank_ends_the_launch(ics, tmp_path):
-    p, wall = _launch(2, ics, tmp_path, env=dict(D7_FAIL_AT="tile_loop", D7_FAIL_RANK="1"))
+    p, wall = _launch(2, ics, tmp_path, env=dict(INEXOR_FAIL_AT="tile_loop", INEXOR_FAIL_RANK="1"))
     assert p.returncode != 0
-    assert "D7_FAIL_AT=tile_loop" in p.stdout + p.stderr
+    assert "INEXOR_FAIL_AT=tile_loop" in p.stdout + p.stderr
     assert wall < 600.0
 
 
@@ -149,11 +149,12 @@ def test_driver_products_at_two_ranks_are_the_one_rank_products(one_rank_run, on
 
 
 def test_the_cards_export_carries_the_host_cli_crc(one_rank_run, one_rank_products, tmp_path):
-    """`python -m inexor.export` decodes on the host at the checkpoint's recorded epoch."""
+    """`python -m inexor.export` decodes on the host at the checkpoint's recorded epoch (step 6
+    of 40, so --allow-partial, as the cards export was made)."""
     gen = max((one_rank_run / "ckpt").glob("gen*"),
               key=lambda g: json.load(open(g / "manifest.json"))["provenance"]["step"])
-    p = subprocess.run([sys.executable, "-m", "inexor.export", str(gen), str(tmp_path / "host")],
-                       capture_output=True, text=True, timeout=600, env=ENV)
+    p = subprocess.run([sys.executable, "-m", "inexor.export", str(gen), str(tmp_path / "host"),
+                        "--allow-partial"], capture_output=True, text=True, timeout=600, env=ENV)
     assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
     host = json.load(open(tmp_path / "host" / "export.json"))
     cards = json.load(open(one_rank_products / "export" / "export.json"))

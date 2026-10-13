@@ -9,8 +9,9 @@ round trip recovers the Gaussian field to FFT round-off.
 
 Host numpy through `ooc_fft`'s canonical factorization, so the monolithic conveniences here are
 bitwise the streamed generator at slab = N. Not differentiable (`colour_white` is the seam for a
-jnp twin). The IC encode does not live here; ic/lpt are pure float producers. The transfer is
-always EH98, even when P(k) comes from a CAMB table (which carries no T(k)).
+jnp twin). The IC encode does not live here; ic/lpt are pure float producers. The transfer in
+the f_NL Poisson factor is EH98, or with a tabulated P(k) T = sqrt(P / k^n_s) normalized at the
+table's smallest k (`cosmology.ic_k_table`).
 """
 
 import jax

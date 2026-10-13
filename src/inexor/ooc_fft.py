@@ -448,17 +448,15 @@ def forward_from_card_planes(shards, n_mesh, plane_batch=1, pencil_batch=1,
 def forward_card_planes_to_pencils(shards, n_mesh, x_parts, y_parts, comm=None, plane_batch=1,
                                    pencil_batch=1, timings=None, transfer="pageable",
                                    receipt=None):
-    """`forward_from_card_planes` across ranks: this rank's cards hold x-planes
-    `x_parts[rank]` of the field, and it returns y-pencils `y_parts[rank]` = [y0, y1) of the
-    spectrum with the axis-0 FFT done, shape (N, y1 - y0, N // 2 + 1).
+    """`forward_from_card_planes` across ranks: this rank's cards hold x-planes `x_parts[rank]`
+    of the field; returns its y-pencils `y_parts[rank]` = [y0, y1) of the spectrum after the
+    axis-0 FFT, shape (N, y1 - y0, N // 2 + 1).
 
     `x_parts` / `y_parts` are every rank's ranges in rank order, each tiling [0, N). Pass 1
-    writes each transformed plane's own y-block straight into the result and the other
-    ranks' blocks into send blocks; one `Alltoallv` delivers them into x-ranges of the
-    result, so nothing is copied into place. Pass 2 splits this rank's pencils over its
-    cards. Bitwise the one-rank spectrum's pencils (batches restart only on batch-aligned
-    boundaries; a transpose is a copy). One rank (`comm` None or of size 1) exchanges
-    nothing. `receipt`, if a dict, accumulates `forward_sent_bytes`; `timings` receives
+    writes each plane's own y-block into the result and the others into send blocks, which one
+    `Alltoallv` delivers in place; pass 2 splits this rank's pencils over its cards. Bitwise the
+    one-rank spectrum's pencils (batches restart only on aligned boundaries; a transpose is a
+    copy). `receipt`, if a dict, accumulates `forward_sent_bytes`; `timings` receives
     `pass1_s`, `transpose_s`, `pass2_s`. Every rank must call this.
     """
     import jax.numpy as jnp
@@ -704,11 +702,10 @@ def inverse_pencils_to_card_shards(work, n_mesh, shards, y_parts, comm=None, tim
     `work` holds this rank's y-pencils `y_parts[rank]` of the spectrum, shape
     (N, y1 - y0, M), and `shards` are this rank's cards' `(x0, nx, device)` plane ranges.
 
-    Every rank's ranges are allgathered; the planes each rank needs go to it as runs of
-    consecutive planes, sent as views of `work` (one `Alltoallv` per run index). Each plane
-    then reaches its card as the ranks' y-blocks in rank order, the own block read in place,
-    and is concatenated there (exact) before the `irfft2`. One rank exchanges nothing and
-    runs `inverse_to_card_shards` unchanged. `receipt`, if a dict, accumulates
+    Every rank's ranges are allgathered; the planes each rank needs go to it as runs sent as
+    views of `work` (one `Alltoallv` per run index), and each plane is concatenated on its card
+    from the ranks' y-blocks in rank order (exact) before the `irfft2`. One rank runs
+    `inverse_to_card_shards` unchanged. `receipt`, if a dict, accumulates
     `inverse_sent_bytes`; `timings` gains `transpose_s`. Every rank must call this.
     """
     n = int(n_mesh)
@@ -772,18 +769,16 @@ def forward_planes_to_pencils(plane_fn, n_mesh, cards, x_parts, y_parts, comm=No
     """A forward 3-D rfft across ranks from planes produced on the cards; this rank's y-pencils.
 
     `cards` are this rank's `(lo, hi, device)`, tiling its x-planes `x_parts[rank]`;
-    `plane_fn(g, device)` returns global plane g's 2-D spectrum on that device, shape (N, M)
-    or (1, N, M) (a noise draw's `rfft2`, a card shard's plane, an uploaded host plane).
-    Planes go out in batches of `batch_planes` per rank: each plane's own y-block lands in
-    the result, the others in one `Alltoallv` per batch, so the host transient is one batch,
-    not a slab of the spectrum. Then the axis-0 fft of this rank's pencils, with `kernel`
-    applied on the card (`kspace_pass_device(pencils=)`) or, with no kernel, the plain pass
-    (`fft_axis0_device_inplace`). Returns (N, y1 - y0, M) for `y_parts[rank]`.
+    `plane_fn(g, device)` returns global plane g's 2-D spectrum on that device, shape (N, M) or
+    (1, N, M). Planes go out in batches of `batch_planes` per rank: each plane's own y-block
+    lands in the result, the others in one `Alltoallv` per batch, so the host transient is one
+    batch. Then the axis-0 fft of this rank's pencils, with `kernel` applied on the card
+    (`kspace_pass_device(pencils=)`) or the plain pass. Returns (N, y1 - y0, M) for
+    `y_parts[rank]`.
 
-    Bitwise the single-process transforms (`noise_forward_cards`, `forward_from_card_planes`,
-    `forward_from_slabs_device`) whose `plane_fn` it is given: planes are transformed one at
-    a time, exchanges are copies, pencil batches restart only on aligned boundaries. Every
-    rank must call this.
+    Bitwise the single-process transform whose `plane_fn` it is given: planes are transformed
+    one at a time, exchanges are copies, pencil batches restart only on aligned boundaries.
+    Every rank must call this.
     """
     n = int(n_mesh)
     m = n // 2 + 1
@@ -868,13 +863,13 @@ def inverse_pencils_to_planes(work, n_mesh, cards, y_parts, consume, comm=None,
 
     `work` holds this rank's y-pencils `y_parts[rank]` AFTER the axis-0 inverse (shape
     (N, y1 - y0, M)); `cards` are `(x0, nx, device)`: card k needs global planes
-    `x0 .. x0 + nx - 1` (mod N; ranges may wrap, overlap, reach past the rank's own planes
-    and, with one card, hold a plane twice). The planes are gathered from every rank's pencils in batches of `batch_planes`
-    per rank (one `Alltoallv` each), concatenated on the card in rank order (exact) and
-    passed as `consume(k, i, g, spec_plane)`, `spec_plane` a (1, N, M) device array for
-    card k's i-th plane g. The consumer runs the `irfft2` (and whatever follows) itself, so
-    it can reuse the single-process program bit for bit. Planes are independent, so the
-    batch order cannot move a bit. Every rank must call this.
+    `x0 .. x0 + nx - 1` (mod N; ranges may wrap, overlap, reach past the rank's own planes and,
+    with one card, hold a plane twice). Planes are gathered from every rank's pencils in batches
+    of `batch_planes` per rank (one `Alltoallv` each), concatenated on the card in rank order
+    (exact) and passed as `consume(k, i, g, spec_plane)`, a (1, N, M) device array for card k's
+    i-th plane g. The consumer runs the `irfft2` itself, so it can reuse the single-process
+    program bit for bit; planes are independent, so batching cannot move a bit. Every rank
+    must call this.
     """
     import jax.numpy as jnp
 

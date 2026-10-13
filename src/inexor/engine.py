@@ -213,10 +213,9 @@ class EngineConfig:
         # Fold the coarse kernel multiply into the inverse's axis-0 pass rather than a separate
         # host traversal. Bitwise either way (same association); False is a comparison arm.
         self.coarse_fold_kernel = bool(coarse_fold_kernel)
-        # Keep the coarse kernel's real half-grids (`pref`, `mf`) resident on the cards, each
-        # card its y-pencil rows, instead of on the host sliced per block; bitwise either way.
-        # Tri-state as `device_tile_window` (applies to the folded solve into card shards);
-        # read `kernel_on_cards`.
+        # Keep the coarse kernel's real half-grids (`pref`, `mf`) on the cards, each card its
+        # y-pencil rows; bitwise either way. Tri-state as `device_tile_window` (applies to the
+        # folded solve into card shards); read `kernel_on_cards`.
         self.coarse_kernel_on_cards = (
             None if coarse_kernel_on_cards is None else bool(coarse_kernel_on_cards))
         # Assignment order the coarse match factor divides out. The coarse arm paints and
@@ -249,7 +248,7 @@ class EngineConfig:
     @property
     def device_y_blocks(self):
         """The y-block count: the constructor's, or for None `decomp.auto_y_blocks` (units no
-        larger than a 4096^3 x-slab) wherever the tile window or the device migrate runs, else 1."""
+        larger than a 4096^3 x-slab) wherever the tile window or device migrate runs, else 1."""
         if self._device_y_blocks is not None:
             return self._device_y_blocks
         if not (self.tile_window or self.migrate_backend == "device"):
@@ -391,7 +390,7 @@ class EngineConfig:
             # f32 also the f64 quotient before narrowing. Measured (tracemalloc, cdev8 and cdev):
             # peaks of 32.0 and 36.0 B per half-grid cell at f64 and f32
             tile_kernel_build_f64=w * phalf * 8 * (3 if fw == 8 else 4),
-            # retired: the kept prefactor IS `tile_kernels`; kept at zero so it stays visible
+            # zero: the kept prefactor is `tile_kernels`; listed so the term stays visible
             tile_kernel_pref=0,
             # --- fine, transient per tile
             tile_workspace=w * (pcells * (fw + 4 + 3 * fw) + phalf * 2 * fw),
@@ -1135,13 +1134,12 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
     `phase`, if given, is called with a boundary name after each phase, so a caller can take
     a per-phase high-water mark. It takes no payload and cannot perturb the step.
 
-    `decomp` (`decomp.Decomp`) says which tile planes this rank and each of its cards own
-    (default: from `comm`'s rank and size). `comm` (`comm.Comm`, default `SerialComm`) carries
-    every exchange across ranks: every rank calls `step` with its node-local state (its
-    `decomp.slabs`), in the production device lane (`rank_lane_refusal`), with a repack due.
-    `devices` are the rank's cards (default the first `cfg.device_cards` jax devices).
-    `stats["ranks"]` records the rank and each exchange's bytes (zeros on one rank), and under
-    `"comm"` the rank's exchange ledger since the previous step's record (`Comm.take_ledger`).
+    `decomp` (`decomp.Decomp`; default from `comm`'s rank and size) says which tile planes this
+    rank and its cards own. `comm` (`comm.Comm`, default `SerialComm`) carries every exchange
+    across ranks: every rank calls `step` with its node-local state (its `decomp.slabs`), in the
+    production device lane (`rank_lane_refusal`), with a repack due. `devices` are the rank's
+    cards (default the first `cfg.device_cards` jax devices). `stats["ranks"]` records the rank,
+    each exchange's bytes, and under `"comm"` the rank's ledger (`Comm.take_ledger`).
     """
     import jax.numpy as jnp
 
@@ -1367,8 +1365,9 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
 
     # kept so the phase trace has a stable shape (nothing accumulates across the loop)
     ph("tile_loop_end")
-    # the neighbours' slabs serve the tile windows only; the migrate does not read them
-    view = None
+    # the neighbours' slabs and the coarse force serve the tile loop only; the migrate does
+    # not read them
+    view = g_coarse = None
 
     if n_owned != st.n_particles:
         raise AssertionError(
@@ -1718,22 +1717,20 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
     full `coeffs` (a run over `coeffs[:n]` is a different trajectory, since drifts are fused
     across steps). With checkpointing on, `stop_at` must be a checkpoint boundary.
 
-    `epoch = (a_steps, cosmo[, linear_pk])` is read only by checkpoints (`epoch_record`), so an
-    export can convert velocities to km/s, and a card take the ICs' tabulated P(k), from the
+    `epoch = (a_steps, cosmo[, linear_pk])` is recorded by checkpoints (`epoch_record`) so an
+    export can convert velocities to km/s, and a card use the ICs' tabulated P(k), from the
     directory alone. `source`, a JSON-able dict naming the run's ICs, is recorded in every
     checkpoint's provenance. `timed_steps` names absolute steps
     whose device passes, separate repack and checkpoint are timed into `stats["timings"]`.
 
-    `snapshot_steps` (absolute steps in 1..K-1, with `snapshot_dir`) write a snapshot at the
-    end of each: that step drifts only its trailing half, the synchronized state is written
-    as `snapshot_dir/step<NNNN>/gen0` (checkpoint format, marked `snapshot`), and the next
-    step's leading half runs as its own pass before any regular checkpoint (`drift_plan`).
-    They are recorded in the run's checkpoints and fingerprint, so a resume must name them.
+    `snapshot_steps` (absolute steps in 1..K-1, with `snapshot_dir`): each such step drifts
+    only its trailing half, writes the synchronized state as `snapshot_dir/step<NNNN>/gen0`
+    (checkpoint format, marked `snapshot`), then runs the next step's leading half as its own
+    pass (`drift_plan`). They enter the fingerprint, so a resume must name them.
 
-    Across ranks (`comm`; `decomp` defaults from its rank and size), every rank runs this
-    with its node-local state (`load_checkpoint(comm=, slabs=)` or `icgen.load_slot_state(
-    slabs=)`), in the production device lane, and the checkpoints are written by all ranks
-    together; their bytes do not depend on the rank count. `devices` are the rank's cards.
+    Across ranks (`comm`; `decomp` defaults from its rank and size), every rank runs this with
+    its node-local state in the production device lane; checkpoints are written by all ranks
+    together and their bytes do not depend on the rank count. `devices` are the rank's cards.
     """
     from .decomp import Decomp
 
@@ -1755,6 +1752,11 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
             f"the checkpoint was written by a run with snapshots at "
             f"{sorted(resume.get('snapshot_steps', []))}, this one asks for {snapshot_steps}: "
             "snapshots split drifts, so the segments would not compose into one trajectory")
+    if resume is not None and resume.get("snapshot"):
+        raise ValueError(
+            f"the checkpoint at step {resume['step']} is a snapshot: its positions sit on the "
+            "step boundary, not at the midpoint a resume continues from, and the run would "
+            "write over it; resume from the run's own checkpoint_dir")
     ph = phase if phase is not None else _no_phase
     ckpt_on = bool(cfg.checkpoint_dir) and cfg.checkpoint_every > 0
     if ckpt_on and st.ids is not None:

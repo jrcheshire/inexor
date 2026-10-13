@@ -30,8 +30,8 @@
 #   1024^3    inexor first; then DISCO-DJ export and evolve single, expected to fail on the
 #             card (~280 B/p measured, ~300 GB against 96 GB); last, so a host-side failure
 #             there costs nothing else.
-# Wall, estimated: guards + smoke ~5 min; 256^3 ~10; 512^3 ~20; inexor 1024^3 ~80 (1024785:
-# 1:21 with ICs and card); DISCO-DJ 1024^3 ~5. ~2.3 h; 3 h requested.
+# Wall: guards + smoke ~5 min; 256^3 ~10; 512^3 ~20; inexor 1024^3 ~80 (1:21 measured with
+# ICs and card); DISCO-DJ 1024^3 ~5. ~2.3 h; 3 h requested.
 
 set -u
 export PATH="$HOME/.pixi/bin:$PATH"
@@ -103,7 +103,10 @@ clean_checkout () {
 }
 leg checkout-inexor clean_checkout "$INEXOR"
 leg checkout-disco clean_checkout "$DISCO"
-leg env-inexor bash -c "cd '$INEXOR' && pixi install --locked -e gpu"
+# the shared guard: census + imports, else a rebuild through a fresh cache, under the lock the
+# other GPU jobs on this checkout take
+. "$INEXOR/scripts/run/gpu_env.sh"
+leg env-inexor ensure_gpu_env "$INEXOR"
 leg env-disco bash -c "cd '$DISCO' && pixi install -e gpu && pixi run -e gpu setup-gpu"
 leg checkout-inexor-after-install clean_checkout "$INEXOR"
 leg gate-disco dpy -c "
@@ -130,7 +133,7 @@ inexor_size () {
     --scratch "$RUNS" $MEMBIND $LAYOUT
   leg "$P-inexor-run" ipy $MT --out "$T/$P-inexor-run.jsonl" -- \
     $DEV run --preset "$P" --workdir "$ICS" --cards 1 --card "$W/run.json" --k-steps $K \
-    --stop-at $K --timed-last $MEMBIND --beat 60 $LAYOUT \
+    --stop-at $K --timed-every 5 $MEMBIND --beat 60 $LAYOUT \
     --checkpoint-dir "$CKPT" --checkpoint-every $K
   ln -sfn "$CKPT" "$PROD/ckpt"
   soft "$P-inexor-card" icpu scripts/run/realization.py card --config "$P" --workdir "$PROD" \

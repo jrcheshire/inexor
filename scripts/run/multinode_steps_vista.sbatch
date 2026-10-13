@@ -8,8 +8,9 @@
 #SBATCH -o inexor-mn-steps-%j.log
 #SBATCH --signal=B:USR1@900
 # One realization stepped across the nodes, one rank per node on gh (one GH200) or gb (four
-# GB200), from ICs made elsewhere (multinode_ics_vista.sbatch, hero_ics_vista.sbatch), with checkpoints in REAL_DIR/ckpt. A lost job is
-# resubmitted with EXPECT_STEP at its newest checkpoint.
+# GB200), from ICs made elsewhere (multinode_ics_vista.sbatch, hero_ics_vista.sbatch), with
+# checkpoints in REAL_DIR/ckpt. A lost job is resubmitted with EXPECT_STEP at its newest
+# checkpoint.
 #
 # Before the steps: the MPI launch line on every node (an MPI start and a rank that dies at
 # once, which must end the launch), the planner at 1 and N nodes, and the preflight against
@@ -30,18 +31,20 @@
 # CONTROL_ICS (its ICs); PRESET (c-gh), K (120), EXPECT_STEP (0), STOP (K), EVERY (20),
 # Y_BLOCKS (auto; the production run, preflight and planner, not the control),
 # CONTROL_PRESET (c-1024), SLACK / ALLOC_MARGIN (0.10), ARENA_FRAC (0.01), QUIET_S (600),
-# PROD_DIR (not under REAL_DIR/ckpt) with WITH_EXPORT (1), TIMED (--timed-all; e.g.
-# "--timed-every 5" leaves the steps between untimed), SNAPSHOT_Z (e.g. "2,1,0.5":
-# synchronized snapshots at the nearest steps, in REAL_DIR/snapshots/step<NNNN>; with
-# PROD_DIR each gets the products job too, into PROD_DIR/step<NNNN>).
+# PROD_DIR (not under REAL_DIR/ckpt) with WITH_EXPORT (1), TIMED ("--timed-every 5": every
+# fifth step synchronized for its sub-phase timers, the rest untimed), SNAPSHOT_Z (e.g.
+# "2,1,0.5": synchronized snapshots at the nearest steps, in REAL_DIR/snapshots/step<NNNN>;
+# with PROD_DIR each gets the products job too, into PROD_DIR/step<NNNN>).
 #   R=$SCRATCH/inexor_runs; INEXOR_RUNS=$R IC_DIR=$R/c-gh-ics REAL_DIR=$R/c-gh-r1 \
-#     CONTROL_REF=$R/mn-gate-c-1024-1043437/mpi/ckpt CONTROL_ICS=$R/mn-gate-c-1024-1043437/ics \
+#     CONTROL_REF=$R/mn-gate-c-1024-<job>/mpi/ckpt CONTROL_ICS=$R/mn-gate-c-1024-<job>/ics \
 #     sbatch -A <account> scripts/run/multinode_steps_vista.sbatch
-# 8192^3 on 8 gb nodes, 40 steps to z = 0 (~7-7.5 h; no control: c-1024 cannot split over
-# 32 GPUs):
+# 8192^3 on 8 gb nodes, 40 steps to z = 0 in two jobs of 20 (~1090 s/step: 40 steps do not
+# fit gb's 12 h wall; no control: c-1024 cannot split over 32 GPUs), the second with the card
+# and export:
 #   INEXOR_RUNS=$R IC_DIR=$R/c-8192-ics REAL_DIR=$R/c-8192-k40 PRESET=c-8192 K=40 EVERY=20 \
-#     sbatch -A <account> -p gb -N 8 -n 8 -t 11:00:00 \
+#     ALLOC_MARGIN=0.02 STOP=20 sbatch -A <account> -p gb -N 8 -n 8 -t 12:00:00 \
 #     scripts/run/multinode_steps_vista.sbatch
+#   ... then the same with EXPECT_STEP=20 STOP=40 PROD_DIR=$R/c-8192-k40-product
 # 4096^3 on 16 gh nodes, 40 steps from the 4096^3 ICs, then card and export (2 y-blocks: at
 # auto's 1 the planner puts a card at 1.02x of 96 GB):
 #   INEXOR_RUNS=$R IC_DIR=$R/c-hero-lcdm-r1 REAL_DIR=$R/c-hero-gh16-k40 PRESET=c-hero K=40 \
@@ -51,14 +54,15 @@
 # REHEARSAL=1 runs the same legs on a laptop CPU at cdev8-tile32 (steps 0 -> 6 of 40), with
 # IC_DIR and CONTROL_REF from a rehearsal of the gate script:
 #   G=runs/rehearsal/mn-gate-cdev8-tile32-<tag>; REHEARSAL=1 INEXOR_RUNS=runs/rehearsal \
-#     IC_DIR=$G/ics CONTROL_REF=$G/mpi/ckpt CONTROL_ICS=$G/ics REAL_DIR=runs/rehearsal/steps-r1 \
-#     scripts/run/mpi_lane.sh --run bash scripts/run/multinode_steps_vista.sbatch
+#     IC_DIR=$G/ics CONTROL_REF=$G/mpi/ckpt CONTROL_ICS=$G/ics \
+#     REAL_DIR=runs/rehearsal/steps-r1 scripts/run/mpi_lane.sh --run \
+#     bash scripts/run/multinode_steps_vista.sbatch
 # PLANT_CONTROL_MISMATCH=1 flips one byte of the control copy before its resume, so the gate
 # must stop the job before production; PLANT_LEG_FAIL=1 gives the first rank leg an unknown
 # XLA flag, which aborts every rank at startup.
 #
-# Wall (c-gh on 2 gh): ~155-165 s/step from 8x 1043437's 19.2 s/step per rank at c-1024, so
-# 120 steps ~5.3 h, plus the load and 6 checkpoints (~6 min each) and ~40 min of guards and
+# Wall (c-gh on 2 gh): ~155-165 s/step (8x the 19.2 s/step per rank at c-1024), so 120
+# steps ~5.3 h, plus the load and 6 checkpoints (~6 min each) and ~40 min of guards and
 # control: ~6.5 h central, 12 h requested. USR1 900 s before the wall reaches every rank
 # through the local mpiexec and dumps every thread's stack.
 
@@ -91,7 +95,7 @@ PRESET=${PRESET:-c-gh} K=${K:-120} EXPECT_STEP=${EXPECT_STEP:-0} STOP=${STOP:-$K
 EVERY=${EVERY:-20} CONTROL_PRESET=${CONTROL_PRESET:-c-1024}
 SLACK=${SLACK:-0.10} ALLOC_MARGIN=${ALLOC_MARGIN:-0.10} ARENA=${ARENA:-${ARENA_FRAC:-0.01}}
 QUIET_S=${QUIET_S:-600} Y_BLOCKS=${Y_BLOCKS:-auto} WITH_EXPORT=${WITH_EXPORT:-1}
-TIMED=${TIMED:---timed-all}
+TIMED=${TIMED:---timed-every 5}
 SNAPSHOT_Z=${SNAPSHOT_Z:-}
 SNAPS=$REAL_DIR/snapshots
 SNAP_ARGS=()
@@ -118,7 +122,7 @@ fi
 WORK=$REAL_DIR/job-$SLURM_JOB_ID
 # shellcheck disable=SC2034  # read by job_lib.sh
 LEG_DIR=$WORK/legs
-CARDS=$SRC/runs/v2
+CARDS=$SRC/runs/cards
 TAG=mnsteps_${PRESET}_$SLURM_JOB_ID
 LAYOUT=(--slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA")
 mkdir -p "$WORK" "$CARDS"

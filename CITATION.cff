@@ -11,5 +11,6 @@ authors:
     given-names: James
     email: cheshire@caltech.edu
     affiliation: California Institute of Technology
+repository-code: "https://github.com/jrcheshire/inexor"
 version: 0.0.1.dev0
 license: BSD-3-Clause

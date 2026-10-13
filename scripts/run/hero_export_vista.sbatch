@@ -1,13 +1,14 @@
 #!/bin/bash
-#SBATCH -J d7g-hero-export
+#SBATCH -J inexor-hero-export
 #SBATCH -p gb
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 05:00:00
-#SBATCH -o d7g-hero-export-%j.log
+#SBATCH -o inexor-hero-export-%j.log
 # The portable (x, v) export of an evolved realization's final checkpoint (c-hero, 4096^3,
-# unless PRESET says otherwise), and nothing else. The checkpoint is the engine's own T9 encoding; this writes it as two
-# plain float32 .npy arrays (~1.65 TB) that any halo finder or analysis code can mmap.
+# unless PRESET says otherwise), and nothing else. The checkpoint is the engine's own T9
+# encoding; this writes it as two plain float32 .npy arrays (~1.65 TB) that any halo finder
+# or analysis code can mmap.
 # Independent of the card job (hero_card_vista.sbatch): same checkpoint, neither reads the
 # other's output, so they may run concurrently or in either order.
 #
@@ -43,6 +44,9 @@ export JAX_COMPILATION_CACHE_DIR=$SCRATCH/inexor-xla-cache
 export INEXOR_LOAD_TRACE=1
 unset JAX_PLATFORMS
 unset CUDA_VISIBLE_DEVICES
+# the shared env guard: census + imports, else a rebuild through a fresh cache
+. scripts/run/gpu_env.sh
+ensure_gpu_env "$PWD" || { echo "FATAL: no working gpu env"; exit 1; }
 
 RUNS=${INEXOR_RUNS:?set INEXOR_RUNS to the run root, e.g. $SCRATCH/inexor_runs}
 CKPT=${CKPT_DIR:-${SRC_RUN:+$SRC_RUN/hero-ckpt}}
@@ -51,12 +55,12 @@ PRESET=${PRESET:-c-hero}
 export PRESET
 K_STEPS=${K_STEPS:?set K_STEPS to the schedule length}
 export K_STEPS
-WORK=$RUNS/d7g-$SLURM_JOB_ID
+WORK=$RUNS/hero-export-$SLURM_JOB_ID
 PROD=${PROD_DIR:?set PROD_DIR to the product directory}
-CARDS=runs/v2
+CARDS=runs/cards
 mkdir -p "$CARDS"
 DRIVER=scripts/run/device_run.py
-TAG=d7g_$SLURM_JOB_ID
+TAG=hero_export_$SLURM_JOB_ID
 MEM_CSV=$CARDS/${TAG}_mem.csv
 BIND="numactl --membind=0,1"
 CPU="env JAX_PLATFORMS=cpu"

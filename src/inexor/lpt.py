@@ -1,7 +1,8 @@
 """Lagrangian perturbation theory: displacements and particle ICs from a density mesh.
 
-Host numpy throughout, on the out-of-core FFT layer. Sign convention: Psi = +grad lap^-1 delta,
-so div Psi1 = -delta0 (opposite potential sign to the textbook 2LPT form), giving
+Host numpy throughout, on the out-of-core FFT layer. Psi1 = (i k / k^2) delta0 = -grad phi1 with
+lap phi1 = delta0, so div Psi1 = -delta0, and Psi2 = -grad phi2 likewise; with D2 < 0 the
+displacement is the textbook 2LPT form x = q - D1 grad phi1 + D2 grad phi2 (Scoccimarro 1998):
 
     x   = q + D1 Psi1 - D2 Psi2                     (D2 = -(3/7) D1^2 in EdS)
     v_D = dx/dD1 = Psi1 - (D2 f2)/(D1 f1) Psi2       (= Psi1 + (6/7) D1 Psi2 in EdS)

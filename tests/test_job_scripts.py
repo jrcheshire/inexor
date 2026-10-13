@@ -457,6 +457,7 @@ def test_the_scaling_job_refuses_inputs_it_cannot_use(tmp_path, env, says):
 
 @pytest.mark.parametrize("steps,refused", [((100, 120), False), ((120, None), True),
                                             ((120, 120), True)])
+@pytest.mark.slow
 def test_the_scaling_job_needs_two_generations_at_different_steps(tmp_path, steps, refused):
     for g, step in zip(("gen0", "gen1"), steps):
         if step is not None:
@@ -500,6 +501,7 @@ def test_the_memory_diag_job_refuses_inputs_it_cannot_use(tmp_path, env, says):
 
 @pytest.mark.parametrize("steps,refused", [("", False), ("10", False), ("20", False),
                                             ("7", True), ("30", True), ("0", True)])
+@pytest.mark.slow
 def test_the_memory_diag_segment_must_end_on_a_checkpoint(tmp_path, steps, refused):
     """From the reference's step-100 generation of a 120-step run: 10 steps by default; a
     count whose end is not a multiple of it, or past the run, is refused before any leg."""

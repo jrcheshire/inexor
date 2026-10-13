@@ -134,7 +134,7 @@ def test_smaps_sums_resident_memory_by_mapping_kind(tmp_path, monkeypatch):
     and the largest mappings are listed with their names."""
     drv = _driver()
     (tmp_path / "smaps").write_text(_SMAPS)
-    monkeypatch.setenv("D7_PROC_SELF", str(tmp_path))
+    monkeypatch.setenv("INEXOR_PROC_SELF", str(tmp_path))
     sm = drv.smaps_summary(top=3)
     kb = 1024
     k = sm["kinds"]
@@ -170,7 +170,7 @@ def test_the_cache_probe_empties_the_program_caches_and_records_each_stage(tmp_p
 
     drv = _driver()
     (tmp_path / "smaps").write_text(_SMAPS)
-    monkeypatch.setenv("D7_PROC_SELF", str(tmp_path))
+    monkeypatch.setenv("INEXOR_PROC_SELF", str(tmp_path))
     mig = importlib.import_module("inexor.device.migrate")
     mig._PROGRAMS[("probe-test",)] = object()
     mon = drv.Monitor(str(tmp_path / "card.json"), {}, with_smaps=True)
@@ -181,3 +181,103 @@ def test_the_cache_probe_empties_the_program_caches_and_records_each_stage(tmp_p
     assert set(out["entries"]) == {f"{m}.{a}" for m, a in drv.PROGRAM_CACHES}
     assert out["entries"]["inexor.device.migrate._PROGRAMS"] >= 1
     assert not mig._PROGRAMS
+
+
+def test_the_run_card_is_written_by_the_c_encoder(tmp_path, monkeypatch):
+    """The card is rewritten whole at every boundary and heartbeat, so it goes through the C
+    encoder (json's pure-Python one costs ~0.15 s per write at a 120-step card); the file
+    reads back as the object, non-JSON values as their str."""
+    import json
+    import json.encoder
+
+    from pathlib import Path
+
+    real, calls = json.encoder.c_make_encoder, []
+    assert real is not None, "this python's json has no C encoder"
+
+    def spy(*a):
+        calls.append(1)
+        return real(*a)
+
+    monkeypatch.setattr(json.encoder, "c_make_encoder", spy)
+    card = dict(steps=[dict(step=k, hwm=1.5 * k) for k in range(3)], path=Path("/x"))
+    out = tmp_path / "card.json"
+    _driver()._write_json(str(out), card)
+    assert calls, "the card went through the pure-Python encoder"
+    assert json.loads(out.read_text()) == dict(card, path="/x")
+    assert not os.path.exists(f"{out}.tmp")
+
+
+def test_the_schedule_starts_at_the_ics_or_checkpoints_epoch(tmp_path):
+    """`run` from ICs starts the schedule at the ICs' recorded a_init, a resume or a product
+    at the checkpoint's (`source.a_init`); records without the field mean a = 0.1. An explicit
+    --a-init that disagrees is refused: the ICs carry their epoch in D and f."""
+    import argparse
+    import json
+
+    import pytest
+
+    start = _driver()._start_epoch
+
+    def ics(name, **man):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "manifest.json").write_text(json.dumps(man))
+        return argparse.Namespace(workdir=str(d), a_init=None)
+
+    early, old = ics("early", a_init=0.08), ics("old")
+    assert start(early) == 0.08
+    assert start(old) == 0.1
+    early.a_init = 0.1
+    with pytest.raises(SystemExit, match="another epoch"):
+        start(early)
+    early.a_init = 0.08
+    assert start(early) == 0.08
+
+    def ckpt(name, step, **source):
+        d = tmp_path / name / "gen0"
+        d.mkdir(parents=True)
+        prov = dict(kind="inexor-checkpoint", step=step)
+        if source:
+            prov["source"] = source
+        (d / "manifest.json").write_text(json.dumps(dict(provenance=prov)))
+        return str(d.parent)
+
+    args = argparse.Namespace(workdir=None, a_init=None)
+    assert start(args, ckpt("ck", 3, a_init=0.08)) == 0.08
+    assert start(args, ckpt("ck_old", 3)) == 0.1
+    args.a_init = 0.1
+    with pytest.raises(SystemExit, match="another epoch"):
+        start(args, str(tmp_path / "ck"))
+
+
+def test_n_fine_gives_the_cpu_drivers_geometry():
+    """`--n-fine` builds the configuration the CPU driver's --n-fine does (the buffer re-derived
+    to hold the split), and without it the preset stands."""
+    import argparse
+    import importlib.util
+    import sys
+
+    from inexor.plan import engine_config
+
+    drv = _driver()
+    run = os.path.join(os.path.dirname(DRIVER), "realization.py")
+    sys.path.insert(0, os.path.dirname(DRIVER))
+    spec = importlib.util.spec_from_file_location("realization_geom", run)
+    real = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real)
+
+    assert drv._geometry(argparse.Namespace(preset="cgh64", n_fine=None)) == "cgh64"
+    got = engine_config(drv._geometry(argparse.Namespace(preset="cgh64", n_fine=2048)))
+    g = real._geom("cgh64", n_fine=2048)
+    want = engine_config(dict(n_part=g["n_part"], box=g["L"], n_fine=g["n_fine"],
+                              n_coarse=g["n_coarse"], tile=g["tile"], buf=g["buf"]))
+    base = engine_config("cgh64")
+    assert (got.n_fine, got.b_fine) == (want.n_fine, want.b_fine) == (2048, 2 * base.b_fine)
+    assert got.r_s == base.r_s and got.n_coarse == base.n_coarse
+    # the planner's --n-fine prices the same buffer
+    from inexor.plan import preset_geometry
+
+    for preset, nf in (("cgh64", 2048), ("cdev8", 512), ("c-hero", 16384)):
+        assert preset_geometry(preset, nf)["buf"] == real._geom(preset, n_fine=nf)["buf"]
+    assert preset_geometry("cgh64") == preset_geometry("cgh64", 1024)

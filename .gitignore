@@ -8,9 +8,10 @@ __pycache__/
 dist/
 build/
 
-# data artifacts / run outputs (hash-record big artifacts in PROVENANCE instead)
+# run outputs, generated inputs and local figures
 data/
 runs/
+figures/
 
 # OS
 .DS_Store

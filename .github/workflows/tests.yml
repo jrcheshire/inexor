@@ -1,0 +1,60 @@
+# Lint and tests on pull requests into main: on open, on every push to the PR, on reopen, and
+# when a draft is marked ready for review. Draft PRs are skipped, and nothing runs on pushes to
+# main: a merge lands commits a PR run already tested (require branches to be up to date before
+# merging, in the branch protection rule, so that holds).
+name: tests
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+# a newer push to the same PR cancels the run in progress
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.0
+        with:
+          pixi-version: v0.81.0
+          locked: true
+          cache: true
+          environments: default
+      - run: pixi run lint
+
+  test:
+    if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.0
+        with:
+          pixi-version: v0.81.0
+          locked: true
+          cache: true
+          environments: default
+      # the tests marked slow run in the full local `pixi run test`
+      - run: pixi run test-fast
+
+  test-ranks:
+    if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.0
+        with:
+          pixi-version: v0.81.0
+          locked: true
+          cache: true
+          environments: default
+      - run: pixi run test-ranks

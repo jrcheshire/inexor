@@ -17,8 +17,8 @@ stats. The last line is a summary: wall, exit code, `VmHWM`, each device's
 over the samples (byte-seconds). Peaks come from the kernel's and the allocator's counters,
 not from the samples, which can miss a short spike. Child processes are not counted.
 
-Used by `gh_crossover_vista.sbatch` around each cost leg of both codes, so both are measured
-by the same instrument.
+Used by `gh_crossover_vista.sbatch` and `gh_same_ics_vista.sbatch` around each cost leg of
+both codes, so both are measured by the same instrument.
 """
 
 import argparse

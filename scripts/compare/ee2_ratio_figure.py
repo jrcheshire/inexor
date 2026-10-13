@@ -2,21 +2,19 @@
 
     pixi exec --spec python=3.12 --spec camb --spec matplotlib --spec numpy --spec scipy \
         --spec gsl --spec pip -- bash -c "pip install -q euclidemu2; \
-        python scripts/compare/ee2_ratio_figure.py RUN_A/realization_pk.json RUN_B/realization_pk.json \
-        --cosmology RUN_A/export.json \
+        python scripts/compare/ee2_ratio_figure.py RUN_A/realization_pk.json \
+        RUN_B/realization_pk.json --cosmology RUN_A/export.json \
         --labels '0.25 Mpc/h fine cell' '0.125 Mpc/h fine cell' \
-        -o figures/inexor_over_ee2.png"
+        -o runs/figures/inexor_over_ee2.png"
 
 euclidemu2 is pip-only, and its wheel needs `gsl` in the env to load.
 
 Plots P_inexor / P_EE2 for up to three cards, with P_EE2 = P_lin,CAMB x B_EE2 averaged over
-each card bin's own lattice modes (`pk_boost_reference.card_bin_modes`), the average the card
-takes of its own P. Both sides are bin averages: EE2 at a bin's mean k instead would leave the
-BAO wiggles (each bin spans ~40% of a period) as a +-1-2% zigzag. The bins are rebuilt from
-the card's mesh and edges, and a card whose mode counts are not reproduced is refused.
-P_lin is CAMB's (EE2's own is a CLASS solve) at the A_s that matches the cosmology's sigma8;
-a card whose ICs were EH98 shows EH98's linear-spectrum difference from CAMB where its P is
-still linear. EE2 is evaluated at each card's own k and redshift, so cards from different boxes may be
+each card bin's own lattice modes (`pk_boost_reference.card_bin_modes`), as the card averages
+its own P; EE2 at a bin's mean k would leave the BAO as a +-1-2% zigzag. A card whose mode
+counts are not reproduced is refused. P_lin is CAMB's at the A_s that matches the cosmology's
+sigma8; a card from EH98 ICs shows EH98's difference from CAMB where its P is still linear.
+EE2 is evaluated at each card's own k and redshift, so cards from different boxes may be
 overlaid; all must share the `--cosmology`. Two kinds of band around unity:
   - +-1 sigma Gaussian sample variance of ONE realization, sqrt(2 / n_modes) per bin,
     one band per distinct k grid (from its first card's mode counts), in that card's
@@ -30,6 +28,7 @@ ICs differ by both bands' scatter.
 
 import argparse
 import json
+import os
 
 import numpy as np
 
@@ -118,6 +117,7 @@ def main():
     ax.legend(frameon=False, fontsize=8.5, loc="lower left")
     ax.grid(alpha=0.25, lw=0.6)
     fig.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     fig.savefig(args.out, dpi=args.dpi, bbox_inches="tight")
     print(f"-> {args.out}")
 

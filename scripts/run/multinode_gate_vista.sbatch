@@ -18,10 +18,10 @@
 # job stops with every checkpoint kept. Otherwise segment 2 resumes all three to STOP and
 # compares the last two generations. The job exits with the number of failed gates and legs.
 #
-# Before the runs: the run legs' own launch line on every node (a
-# JAX start, an MPI start, and a rank that dies at once, which must end the launch), then on
-# node 0 and the CPU backend the kernel-block and rank-gate tests (all fatal) and the real-MPI
-# tests against the module's MPI (recorded, not fatal).
+# Before the runs: the run legs' own launch line on every node (a JAX start, an MPI start,
+# and a rank that dies at once, which must end the launch), then on node 0 and the CPU backend
+# the kernel-block and rank-gate tests (all fatal) and the real-MPI tests against the module's
+# MPI (recorded, not fatal).
 #
 # A leg is killed once its output (a run leg's: the driver's 60 s heartbeat) has been silent;
 # nothing else bounds a leg but the wall. A failed run leg stops the job, and the gate fails
@@ -41,7 +41,7 @@
 # fire; PLANT_LEG_FAIL=1 gives the first run leg an unknown XLA flag, which aborts every rank
 # at startup, to see the job stop.
 #
-# Wall (c-1024), from the one-GH200 run 1029876: ICs 105 s, 34 s/step median (late steps
+# Wall (c-1024), from a one-GH200 run: ICs 105 s, 34 s/step median (late steps
 # 38-46 s), checkpoint 15 s. Refs ~13 min + ~62 min; mpi unmeasured, at most the refs' time.
 # ~2.4 h central with the guards; 6 h requested. Run-leg caps: 0 -> 20 in 2600 s, 20 -> 120
 # in 10600 s. USR1 900 s before the wall reaches every rank through the local mpiexec and
@@ -73,7 +73,7 @@ WORK=$RUNS/mn-gate-$PRESET-$SLURM_JOB_ID
 ICS=$WORK/ics
 # shellcheck disable=SC2034  # read by job_lib.sh
 LEG_DIR=$WORK/legs
-CARDS=$SRC/runs/v2
+CARDS=$SRC/runs/cards
 TAG=mngate_${PRESET}_$SLURM_JOB_ID
 LAYOUT=(--slack "$SLACK" --alloc-margin "$ALLOC_MARGIN" --arena-frac "$ARENA")
 mkdir -p "$WORK" "$CARDS"
