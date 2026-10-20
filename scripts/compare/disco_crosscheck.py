@@ -96,10 +96,14 @@ def cmd_export(args):
     pk_path = os.path.join(out_dir, "pk_eh98.txt")
     np.savetxt(pk_path, np.column_stack([k, P]), fmt="%.18e",
                header="k [h/Mpc]   P(k) [(Mpc/h)^3]  z=0  inexor EH98 sigma8-normalized")
+    # the step boundaries the engine's `run --snapshot-z` would snapshot at, by the same rule
+    from device_run import snapshot_steps_for
+
+    snaps = {f"{z:g}": s for z, s, _ in snapshot_steps_for(args.snapshot_z, a_steps)}
     _save(args.out, x=x, v_d=v, a_steps=np.asarray(a_steps, np.float64),
           meta=dict(config=args.config, n_part=g["n_part"], box_size=g["L"],
                     ic_dir=args.ic_dir, k_steps=args.k_steps, a_init=float(a_steps[0]),
-                    growth2=args.growth2, pk_file=pk_path,
+                    growth2=args.growth2, pk_file=pk_path, snapshot_steps=snaps,
                     disco_cosmo=_disco_cosmo(cosmo)))
     return 0
 
@@ -118,11 +122,21 @@ def cmd_evolve(args):
         raise SystemExit(f"{args.inp} carries no disco_cosmo; re-run export")
     n_part, L = int(meta["n_part"]), float(meta["box_size"])
     a_steps = d["a_steps"]
-    a_i, a_f = float(a_steps[0]), float(a_steps[-1])
+    stop = len(a_steps) - 1
+    if args.stop_z is not None:
+        snaps = meta.get("snapshot_steps", {})
+        if f"{args.stop_z:g}" not in snaps:
+            raise SystemExit(f"--stop-z {args.stop_z:g} is not among the export's snapshot "
+                             f"redshifts {sorted(snaps)}; re-run export with --snapshot-z")
+        stop = int(snaps[f"{args.stop_z:g}"])
+    # BullFrog steps depend only on their own interval: the first `stop` steps of the grid
+    # are the trajectory the engine snapshots at that boundary
+    a_run = a_steps[:stop + 1]
+    a_i, a_f = float(a_run[0]), float(a_run[-1])
     if args.chunk_size is not None and (args.chunk_size <= 0 or n_part**3 % args.chunk_size):
         raise SystemExit(f"--chunk-size {args.chunk_size} must divide {n_part}^3 particles")
     print(f"== evolve DISCO-DJ: {n_part}^3 particles, L={L}, PM mesh {args.n_mesh}^3, "
-          f"{len(a_steps) - 1} BullFrog steps a={a_i:.4f}->{a_f:.4f}, "
+          f"{stop} of {len(a_steps) - 1} BullFrog steps a={a_i:.4f}->{a_f:.4f}, "
           f"precision {args.precision}, chunk_size {args.chunk_size}, "
           f"backend {jax.devices()[0].platform}", flush=True)
 
@@ -136,7 +150,7 @@ def cmd_evolve(args):
     del d
     t0 = time.perf_counter()
     X, P, _ = dj.run_nbody(
-        a_i, a_f, len(a_steps) - 1, time_var=a_steps, stepper="bullfrog", method="pm",
+        a_i, a_f, stop, time_var=a_run, stepper="bullfrog", method="pm",
         res_pm=args.n_mesh, worder=2, antialias=0, grad_kernel_order=0,
         laplace_kernel_order=0, deconvolve=False, chunk_size=args.chunk_size,
         convert_to_numpy=True,
@@ -152,7 +166,7 @@ def cmd_evolve(args):
     print(f"  evolve wall {wall:.1f} s (compile included), device peak "
           f"{'n/a' if peak is None else f'{peak / 1e9:.1f} GB'}", flush=True)
     meta.update(n_mesh=args.n_mesh, precision=args.precision, evolve_wall_s=wall,
-                device_peak_bytes=peak, chunk_size=args.chunk_size,
+                device_peak_bytes=peak, chunk_size=args.chunk_size, stop_step=stop, a_out=a_f,
                 code="discodj", settings="DISCO-DJ: worder=2, ik grad/laplace, "
                 "no deconvolution, no antialias, bullfrog")
     _save(args.out, x=X, v_d=V, a_steps=a_steps, meta=meta)
@@ -238,8 +252,9 @@ def cmd_card(args, rest):
                          brick_slack=rargs.slack, alloc_margin=rargs.alloc_margin,
                          arena_frac=rargs.arena_frac)
     st.check()
+    a_out = float(d["meta"].get("a_out", 1.0))
     t0 = time.perf_counter()
-    card = summary.pk_summary_card(st, ec, cosmo, 1.0, slab=rargs.slab,
+    card = summary.pk_summary_card(st, ec, cosmo, a_out, slab=rargs.slab,
                                    min_weight=rargs.min_weight, edges=None,
                                    progress=R._heartbeat(rargs), pool=None)
     wall = time.perf_counter() - t0
@@ -247,7 +262,7 @@ def cmd_card(args, rest):
     os.makedirs(rargs.workdir, exist_ok=True)
     with open(out, "w") as fh:
         json.dump(dict(card="inexor-disco-crosscheck-pk-1", source=d["meta"],
-                       wall_s=wall, a_out=1.0, summary=card), fh, indent=1)
+                       wall_s=wall, a_out=a_out, summary=card), fh, indent=1)
     print(f"== card of {args.inp}: {card['n_bins']} bins, wall {wall:.1f} s -> {out}",
           flush=True)
     return 0
@@ -267,6 +282,10 @@ def main():
     e.add_argument("--k-steps", type=int, required=True)
     e.add_argument("--a-init", type=float, default=0.1)
     e.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"))
+    e.add_argument("--snapshot-z", default=[], metavar="Z,Z,...",
+                   type=lambda t: [float(x) for x in t.split(",") if x.strip()],
+                   help="record the step boundaries `device_run.py run --snapshot-z` would "
+                        "snapshot at, for `evolve --stop-z`")
     e.add_argument("--out", required=True)
     v = sub.add_parser("evolve")
     v.add_argument("--in", dest="inp", required=True)
@@ -276,6 +295,9 @@ def main():
     v.add_argument("--chunk-size", type=int, default=None,
                    help="particles DISCO-DJ paints and interpolates at once (its run_nbody "
                         "chunk_size; must divide the particle count). Default: all at once")
+    v.add_argument("--stop-z", type=float, default=None,
+                   help="stop at the export's snapshot step for this redshift (export "
+                        "--snapshot-z) instead of the end of the grid")
     v.add_argument("--out", required=True)
     m = sub.add_parser("evolve-mono")
     m.add_argument("--in", dest="inp", required=True)

@@ -17,7 +17,7 @@ import sys
 
 import numpy as np
 
-# Preset geometries. The fine cell is fixed across the ladder; presets differ in volume.
+# Preset geometries. The fine cell is fixed across the main ladder; presets differ in volume.
 PRESETS = {
     "smoke": dict(n_part=32, box=32.0, n_fine=64, n_coarse=16, tile=16, buf=8),
     "cdev8": dict(n_part=128, box=64.0, n_fine=256, n_coarse=64, tile=64, buf=32),
@@ -29,6 +29,11 @@ PRESETS = {
     "c-gh": dict(n_part=2048, box=1024.0, n_fine=4096, n_coarse=1024, tile=256, buf=32),
     "c-hero": dict(n_part=4096, box=2048.0, n_fine=8192, n_coarse=2048, tile=512, buf=32),
     "c-8192": dict(n_part=8192, box=4096.0, n_fine=16384, n_coarse=4096, tile=512, buf=32),
+    # The same meshes in half the box: 0.25 Mpc/h spacing, 0.125 Mpc/h fine cell. Identical
+    # in cell units (split, buffer, codec), so only the clustering per cell differs.
+    "cdev-L64": dict(n_part=256, box=64.0, n_fine=512, n_coarse=128, tile=256, buf=32),
+    "cgh64-L128": dict(n_part=512, box=128.0, n_fine=1024, n_coarse=256, tile=256, buf=32),
+    "c-hero-L1024": dict(n_part=4096, box=1024.0, n_fine=8192, n_coarse=2048, tile=512, buf=32),
 }
 
 GB = 1e9
