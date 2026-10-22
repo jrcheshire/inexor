@@ -100,10 +100,11 @@ soft () {  # records rc and continues; returns it
 ipy () { (cd "$INEXOR" && $BIND pixi run --frozen -e gpu python "$@"); }
 icpu () { (cd "$INEXOR" && JAX_PLATFORMS=cpu $BIND pixi run --frozen -e gpu python "$@"); }
 dpy () { (cd "$INEXOR" && $BIND pixi run --frozen --manifest-path "$DISCO/pixi.toml" -e gpu python "$@"); }
-# FoF env: kdcount is pip-only (a C extension), in a throwaway pixi env
+# FoF env: kdcount is pip-only (a C extension), in a throwaway pixi env. CC/CXX are unset so
+# the build uses the env's own gcc, not the module's (nvc rejects gcc's flags)
 hpy () {
-  (cd "$INEXOR" && pixi exec --spec python=3.12 --spec numpy --spec scipy --spec pip \
-    --spec c-compiler -- bash -c 'pip install -q kdcount && exec python -I "$@"' _ "$@")
+  (cd "$INEXOR" && env -u CC -u CXX pixi exec --spec python=3.12 --spec numpy --spec scipy \
+    --spec pip --spec c-compiler -- bash -c 'pip install -q kdcount && exec python -I "$@"' _ "$@")
 }
 
 # ---- guards
