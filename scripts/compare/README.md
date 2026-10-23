@@ -182,6 +182,23 @@ INEXOR_RUNS=<run root> DISCO_SRC=<DISCO-DJ project> \
   periodic self-test; guards and smoke stop the job on failure, later legs record their
   exit code and continue. `ARENA_FRAC` (default 0.05) sets the runs' spare arena.
 
+### gh_halo_disco_steps_vista.sbatch
+
+DISCO-DJ's step and start-epoch arms at inexor's fine cell (`cgh64-L128`, 1024^3 mesh), on the
+ICs of a finished `gh_halo_check_vista.sbatch` run: 160 and 240 steps from z = 9, 160 from
+z = 19. With that run's 120-step DISCO-DJ arm they match every inexor arm step for step.
+
+```bash
+INEXOR_RUNS=<run root> DISCO_SRC=<DISCO-DJ project> HALO_WORK=<halo-check work dir> \
+    sbatch -A <account> scripts/compare/gh_halo_disco_steps_vista.sbatch
+```
+
+- Each arm stops at the snapshot steps (`evolve --stop-z`), with a z = 0 card; FoF runs on
+  every state and catalogs go to `$WORK/halos/cgh64-L128-disco-<arm>-m1024-z<Z>.npz`, named
+  as the halo check's.
+- Guards (checkouts, envs, pinned versions, the ICs) stop the job on failure; later legs record
+  their exit code and continue.
+
 ## halo_compare.py
 
 Friends-of-friends (kdcount, periodic, linking length b x mean spacing) on one evolved
