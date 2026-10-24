@@ -199,6 +199,20 @@ INEXOR_RUNS=<run root> DISCO_SRC=<DISCO-DJ project> HALO_WORK=<halo-check work d
 - Guards (checkouts, envs, pinned versions, the ICs) stop the job on failure; later legs record
   their exit code and continue.
 
+### quant_grid_halo_gg_vista.sbatch
+
+`quant_grid.py` at `cdev8-L32` (128^3 in 32 Mpc/h, `cgh64-L128` in every resolution knob) on
+one gg node, for halos: seeds 0-3 x 120 / 240 steps from z = 9 x arms `engine`, `ref`, `refx`,
+`refv`, plus `refxv` at 240 steps, seed 0; 33 legs of 4 cores at once.
+
+```bash
+OUT_DIR=<out root> sbatch -A <account> scripts/compare/quant_grid_halo_gg_vista.sbatch
+```
+
+- Each leg writes its card and its final positions (`--save-x`) under `OUT_DIR/job-<id>/`
+  (`<tag>.json`, `x/<tag>/`); `halo_compare.py find` reads `x/<tag>` directly.
+- The job exits non-zero unless every leg returns 0 and writes its positions.
+
 ## halo_compare.py
 
 Friends-of-friends (kdcount, periodic, linking length b x mean spacing) on one evolved

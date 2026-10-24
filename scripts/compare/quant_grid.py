@@ -17,11 +17,15 @@ axes, and the fraction below q/2) and the kick in velocity codes (median, fracti
 a code), the quantities that set the bias.
 
     python scripts/compare/quant_grid.py --config cdev8 --a-init 0.1 --k 120 --arm engine \
-        --out OUT.json
+        --out OUT.json [--seed 0] [--save-x DIR]
+
+`--save-x DIR` also writes the final positions as `DIR/x.npy` + `DIR/export.json`, the export
+layout `halo_compare.py find` reads.
 
 Configs: `cdev8` (128^3 in 64 Mpc/h: 0.5 Mpc/h spacing, 0.25 fine cell, the production
-resolution) and `cdev8-L128` (128^3 in 128 Mpc/h: 1.0 spacing, 0.5 fine cell). Every arm runs
-in float64; ICs are 2LPT with the LCDM growth from seed 0. CPU backend.
+resolution), `cdev8-L128` (128^3 in 128 Mpc/h: 1.0 spacing, 0.5 fine cell) and `cdev8-L32`
+(128^3 in 32 Mpc/h: 0.25 spacing, 0.125 fine cell; `cgh64-L128` in every resolution knob).
+Every arm runs in float64; ICs are 2LPT with the LCDM growth from `--seed`. CPU backend.
 """
 
 import argparse
@@ -37,8 +41,9 @@ CONFIGS = {
     "smoke": dict(n_part=32, L=32.0, n_fine=64, n_coarse=16),
     "cdev8": dict(n_part=128, L=64.0, n_fine=256, n_coarse=64),
     "cdev8-L128": dict(n_part=128, L=128.0, n_fine=256, n_coarse=64),
+    "cdev8-L32": dict(n_part=128, L=32.0, n_fine=256, n_coarse=64),
 }
-A_FINAL, SPACING, SEED = 1.0, "log", 0
+A_FINAL, SPACING = 1.0, "log"
 SLACK, ARENA = 0.20, 0.10   # layout carries no physics; room for large late steps from z = 49
 MATCH_ORDER, INT16_MAX = 3, 32767.0
 
@@ -70,14 +75,14 @@ def schedule(a_init, k):
     return bullfrog_float_coeffs(bullfrog_table(a_steps, Cosmology())), a_steps
 
 
-def initial_conditions(g, a_init):
+def initial_conditions(g, a_init, seed):
     import jax
 
     from inexor.config import Cosmology
     from inexor.ic import linear_density
     from inexor.lpt import lpt_ics
 
-    d0 = linear_density(jax.random.PRNGKey(SEED), g["n_part"], g["L"], Cosmology(), f_NL=0.0,
+    d0 = linear_density(jax.random.PRNGKey(seed), g["n_part"], g["L"], Cosmology(), f_NL=0.0,
                         fdtype=np.float64)
     x, v = lpt_ics(d0, g["L"], a_init, Cosmology(), order=2, fdtype=np.float64)
     return np.asarray(x, np.float64), np.asarray(v, np.float64)
@@ -217,6 +222,19 @@ def run_float(g, ec, co, x, v, quant, long_paint="int"):
     return x, stats
 
 
+def save_positions(d, x, g, rec):
+    """Final positions in the export layout `halo_compare.py find` reads."""
+    from inexor.config import Cosmology
+
+    os.makedirs(d, exist_ok=True)
+    np.save(os.path.join(d, "x.npy"), np.mod(np.asarray(x, np.float64), g["L"]))
+    head = dict(box_size=g["L"], n_part=g["n_part"], a=A_FINAL,
+                cosmology=dict(Omega_m=Cosmology().Omega_m), files=dict(x="x.npy"),
+                provenance={k: rec[k] for k in ("config", "arm", "seed", "a_init", "k_steps")})
+    with open(os.path.join(d, "export.json"), "w") as fh:
+        json.dump(head, fh)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--config", default="cdev8", choices=sorted(CONFIGS))
@@ -225,7 +243,9 @@ def main():
     ap.add_argument("--arm", required=True, choices=("engine", "ref", "refx", "refv", "refxv"))
     ap.add_argument("--long-paint", default="int", choices=("int", "f64"),
                     help="float arms: the coarse arm's paint (the engine paints integers)")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--save-x", metavar="DIR", help="also write the final positions here")
     args = ap.parse_args()
 
     import jax
@@ -234,8 +254,9 @@ def main():
     g = geometry(args.config)
     ec = engine_config(g)
     co, _ = schedule(args.a_init, args.k)
-    x, v = initial_conditions(g, args.a_init)
-    print(f"[quant-grid] {args.config} a_init={args.a_init} K={args.k} arm={args.arm} "
+    x, v = initial_conditions(g, args.a_init, args.seed)
+    print(f"[quant-grid] {args.config} seed={args.seed} a_init={args.a_init} K={args.k} "
+          f"arm={args.arm} "
           f"tile={g['tile']} buf={g['buf']} backend={jax.default_backend()}", flush=True)
     t0 = time.perf_counter()
     if args.arm == "engine":
@@ -246,11 +267,13 @@ def main():
     k, p = power_spectrum(xf, g["n_fine"], g["L"], g["n_part"] ** 3)
     rec = dict(config=args.config, geometry=g, a_init=args.a_init, k_steps=args.k,
                arm=args.arm, long_paint=args.long_paint, coarse_match_order=MATCH_ORDER,
-               seed=SEED, wall_s=wall,
+               seed=args.seed, wall_s=wall,
                k_centres=np.asarray(k).tolist(), p=np.asarray(p).tolist(), **stats)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as fh:
         json.dump(rec, fh)
+    if args.save_x:
+        save_positions(args.save_x, xf, g, rec)
     print(f"  wall {wall:.1f} s -> {args.out}", flush=True)
 
 
