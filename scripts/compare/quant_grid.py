@@ -11,6 +11,9 @@ One arm per process; each writes a JSON card (P(k) on the fine mesh plus the arm
              after every kick (scale = the brick's largest |v| component / 32767)
     refxv    both; reproduces `engine` up to the engine's own bookkeeping, which checks the
              two emulations
+    refxs    refx with every drift rounded stochastically: floor(i + dx/q + u), u in [0, 1)
+             hashed from the integer position before the drift, the step and the axis
+             (layout-independent, unbiased per step); the ICs round to nearest as in refx
 
 The float arms also record, per step, the drift in quanta (median |dx|/q over particles and
 axes, and the fraction below q/2) and the kick in velocity codes (median, fraction below half
@@ -167,6 +170,22 @@ def run_engine(g, ec, co, x, v):
     return np.concatenate([st.decode_brick(b)[1] for b in range(st.n_bricks)]), {}
 
 
+_P = np.array([0x9E3779B97F4A7C15, 0xC2B2AE3D27D4EB4F, 0x165667B19E3779F9], np.uint64)
+
+
+def dither(i, step):
+    """u in [0, 1) per particle and axis from lattice indices `i` (n, 3) and the step number:
+    a splitmix64 finalizer over the position key, so it depends on neither order nor seed."""
+    with np.errstate(over="ignore"):
+        key = np.bitwise_xor.reduce(i.astype(np.uint64) * _P, axis=1)[:, None]
+        z = key ^ ((np.uint64(step) * np.uint64(3) + np.arange(1, 4, dtype=np.uint64))
+                   * np.uint64(0xD6E8FEB86659FD93))
+        z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        z = z ^ (z >> np.uint64(31))
+    return (z >> np.uint64(11)).astype(np.float64) * 2.0**-53
+
+
 def run_float(g, ec, co, x, v, quant, long_paint="int"):
     """`engine.float_run_bullfrog_sync`'s shape, with the codecs named in `quant` emulated."""
     import jax.numpy as jnp
@@ -207,6 +226,10 @@ def run_float(g, ec, co, x, v, quant, long_paint="int"):
         a = np.abs(dx).ravel() / q
         stats["drift_med_q"].append(float(np.median(a)))
         stats["drift_frac_below_half_q"].append(float(np.mean(a < 0.5)))
+        if "s" in quant:
+            i = np.rint(xx / q).astype(np.int64)
+            u = dither(np.mod(i, levels), len(stats["drift_med_q"]))
+            return np.mod(np.floor(i + dx / q + u).astype(np.int64), levels).astype(np.float64) * q
         xx = np.mod(xx + dx, L)
         return lattice(xx) if "x" in quant else xx
 
@@ -240,7 +263,7 @@ def main():
     ap.add_argument("--config", default="cdev8", choices=sorted(CONFIGS))
     ap.add_argument("--a-init", type=float, default=0.1)
     ap.add_argument("--k", type=int, required=True)
-    ap.add_argument("--arm", required=True, choices=("engine", "ref", "refx", "refv", "refxv"))
+    ap.add_argument("--arm", required=True, choices=("engine", "ref", "refx", "refv", "refxv", "refxs"))
     ap.add_argument("--long-paint", default="int", choices=("int", "f64"),
                     help="float arms: the coarse arm's paint (the engine paints integers)")
     ap.add_argument("--seed", type=int, default=0)

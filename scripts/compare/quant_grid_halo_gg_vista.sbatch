@@ -12,6 +12,8 @@
 #   seeds 0-3 x K = 120 / 240 from z = 9 x arms engine / ref / refx / refv; refxv at K = 240,
 #   seed 0 (the emulation check). Each leg writes its card and its final positions
 #   (`--save-x`, the export layout `halo_compare.py find` reads).
+#   SEEDS, ARMS and EXTRA ("seed K arm" legs; empty for none) override that grid, e.g.
+#   ARMS=refxs EXTRA= for the stochastic-rounding arm alone.
 #
 # Requires OUT_DIR (outputs under OUT_DIR/job-<id>: <tag>.json cards, x/<tag>/ positions) and
 # INEXOR_SRC or submission from the inexor checkout, whose gpu env is used through its python
@@ -27,6 +29,9 @@ SRC=${INEXOR_SRC:-$SLURM_SUBMIT_DIR}
 OUT=${OUT_DIR:?set OUT_DIR, e.g. $SCRATCH/inexor_runs/quant-grid-halo}/job-${SLURM_JOB_ID:-local}
 PY=${PY:-$SRC/.pixi/envs/gpu/bin/python3.14}
 CFG=${CFG:-cdev8-L32}
+SEEDS=${SEEDS:-0 1 2 3}
+ARMS=${ARMS:-engine ref refx refv}
+EXTRA=${EXTRA-0 240 refxv}
 mkdir -p "$OUT/legs" "$OUT/x"
 export JAX_PLATFORMS=cpu PYTHONUNBUFFERED=1
 unset XLA_FLAGS CUDA_VISIBLE_DEVICES
@@ -38,12 +43,12 @@ nproc
   || { echo "FATAL: the env does not import on CPU"; exit 1; }
 
 legs=()
-for seed in 0 1 2 3; do
+for seed in $SEEDS; do
   for k in 120 240; do
-    for arm in engine ref refx refv; do legs+=("$seed $k $arm"); done
+    for arm in $ARMS; do legs+=("$seed $k $arm"); done
   done
 done
-legs+=("0 240 refxv")
+[ -n "$EXTRA" ] && legs+=("$EXTRA")
 echo "${#legs[@]} legs"
 
 i=0

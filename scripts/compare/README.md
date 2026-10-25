@@ -212,6 +212,8 @@ OUT_DIR=<out root> sbatch -A <account> scripts/compare/quant_grid_halo_gg_vista.
 - Each leg writes its card and its final positions (`--save-x`) under `OUT_DIR/job-<id>/`
   (`<tag>.json`, `x/<tag>/`); `halo_compare.py find` reads `x/<tag>` directly.
 - The job exits non-zero unless every leg returns 0 and writes its positions.
+- `SEEDS`, `ARMS` and `EXTRA` (one "seed K arm" leg; empty for none) override the grid:
+  `ARMS=refxs EXTRA=` runs the stochastic-rounding arm alone (8 legs).
 
 ## halo_compare.py
 
