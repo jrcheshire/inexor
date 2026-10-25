@@ -43,6 +43,7 @@ rather than the whole run. Checkpoints always go to `<workdir>/ckpt`.
 | `--n-part`, `--n-fine`, `--n-coarse`, `--buf` | preset | all | resolution overrides; the geometry and split error terms are printed. `--n-fine` re-derives the tile buffer unless `--buf` is given. All are fingerprinted, so `run`, `card` and `export` of one realization must pass the same values as its `ics` |
 | `--fine-dtype` | `float64` | run, card, export | precision of the fine tiles, their FFTs and the kick (fingerprinted) |
 | `--coarse-match-order` | 3 | all | assignment order the coarse match factor divides out (fingerprinted when not 2) |
+| `--drift-rounding` | `stochastic` | all | how drifts land on the position lattice; `nearest` is the v0.1.0 rule (fingerprinted when stochastic, so the card and export of a v0.1.0 run pass `nearest`) |
 | `--tile-workers` | 16 | run, card | worker processes. More than 1 means a pooled run, with the state in shared memory |
 | `--slack`, `--arena-frac` | 0.20, 0.20 | run, card, export | allocation layout used when a state is loaded |
 | `--alloc-margin` | 0.10 | run, card, export | allocation margin used when a state is loaded |
@@ -158,6 +159,7 @@ Flags of `preflight` and `run`:
 | `--y-blocks` | auto | cut each x-slab's card work into this many y-blocks (see below) |
 | `--slack`, `--alloc-margin`, `--arena-frac` | 0.10, 0.10, 0.01 | allocation layout |
 | `--fine-dtype` | `float64` | precision of the fine tiles (fingerprinted) |
+| `--drift-rounding` | `stochastic` | how drifts land on the position lattice; `nearest` is the v0.1.0 rule (fingerprinted when stochastic) |
 | `--growth2` | `lcdm` | must match the ICs |
 | `--n-fine` | preset | fine mesh cells per side, the tile buffer re-derived (as `realization.py --n-fine`); the ICs must be made with the same, and the run's card and export must pass it |
 | `--a-init` | the ICs' or checkpoint's | refused if given and different |

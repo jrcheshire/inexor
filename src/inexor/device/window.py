@@ -322,7 +322,8 @@ def _census_programs(n_bricks, nb2, cap):
             _program(("census_add", n_bricks, cap), make_add))
 
 
-def _census_plane(st, win, wd, vs, plane, per, c_drift, ar_index, acc, device, block=None):
+def _census_plane(st, win, wd, vs, plane, per, c_drift, ar_index, acc, device, block=None,
+                  dither_key=None):
     """Count the destination bricks of (tile plane `plane`, brick-y `block`)'s core bricks
     into `acc`, one core unit (slab x block) at a time. Returns (acc, slabs with rows)."""
     import jax
@@ -362,7 +363,7 @@ def _census_plane(st, win, wd, vs, plane, per, c_drift, ar_index, acc, device, b
         scales_d = sl(vs, migrate._put(ix["lo_b"], device, jnp.int64))
         dest, *_rest = migrate._eject_rows(
             st, ix, c_drift, wd["off"], wd["w"], ids_win, ar_rows, migrate._put(starts, device),
-            scales_d, rows_win, no_clock, device)
+            scales_d, rows_win, no_clock, device, dither_key=dither_key)
         _rest = None
         acc = add(acc, dest, migrate._put(ix["n_rows"], device, jnp.int64),
                   migrate._put(p3, device, jnp.int64))
@@ -372,7 +373,7 @@ def _census_plane(st, win, wd, vs, plane, per, c_drift, ar_index, acc, device, b
 
 def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
                        coarse_shard=None, device=None, write_host=True, census=None,
-                       timings=None, y_blocks=1):
+                       timings=None, y_blocks=1, census_key=None):
     """`tile.tile_loop_device` over tile planes, one window on the card at a time; bitwise that
     loop at any `y_blocks` (see the module docstring).
 
@@ -389,7 +390,8 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
 
     `census`, if given, is the step's fused drift `c_drift` (see the module docstring).
     It adds `census_counts` (int64 per brick, this call's core slabs
-    only) and `census_slabs`.
+    only) and `census_slabs`. `census_key` is that drift's `dither_key`
+    (`SlotState._eject_slab`), so the census counts the destinations the migrate will use.
 
     Returns `n_owned`, `n_out`, `tiles_run`, `planes_run`, `vel_scale_kick_max`
     and the window receipts `wrapped`, `window_live_rows_max`, `residents_staged`,
@@ -493,7 +495,8 @@ def tile_loop_windowed(st, one_tile, C, g_coarse, members, shapes, planes=None,
         clock.mark("window: guards")
         if census is not None:
             census_acc, got = _census_plane(st, win, wd, vs, i, per, float(census),
-                                            ar_index, census_acc, device, block=block)
+                                            ar_index, census_acc, device, block=block,
+                                            dither_key=census_key)
             census_slabs.update(got)
             census_units += len(got)
             clock.mark("window: census", census_acc)

@@ -143,6 +143,7 @@ class EngineConfig:
         coarse_match_order=3,
         coarse_kernel_on_cards=None,
         device_y_blocks=None,
+        drift_rounding="stochastic",
     ):
         self.box_size = float(box_size)
         self.n_part = int(n_part)
@@ -162,6 +163,10 @@ class EngineConfig:
         self.brick_slack = float(brick_slack)
         self.repack_every = int(repack_every)
         self.eject_kernel = str(eject_kernel)
+        # How a drift lands on the T9 lattice: "stochastic" (floor(x/q + dx/q + u), u hashed
+        # from the pre-drift lattice index and the drift's key; unbiased per drift) or
+        # "nearest" (the v0.1.0 rounding, which holds back particles drifting < q/2 per step).
+        self.drift_rounding = str(drift_rounding)
         self.migrate_eject_inflight = (
             None if migrate_eject_inflight is None else int(migrate_eject_inflight))
         # Independent on purpose, so each moves one error term: the coarse mesh grows with the
@@ -503,6 +508,9 @@ class EngineConfig:
             check_tsc_paint_headroom(self.n_total, self.frac_bits)
         if self.tile_workers < 1:
             raise ValueError(f"tile_workers must be >= 1, got {self.tile_workers}")
+        if self.drift_rounding not in ("stochastic", "nearest"):
+            raise ValueError(
+                f"drift_rounding must be 'stochastic' or 'nearest', got {self.drift_rounding!r}")
         if self.migrate_pooled is True and self.tile_workers < 2:
             # an explicit True must not silently run serial (None = auto may)
             raise ValueError(
@@ -1030,24 +1038,33 @@ def apply_result(st, res):
     st.vel_scale[res["run_bricks"]] = res["run_scales"]
 
 
-def _migrate_pass(st, cfg, c_drift, pool, timings=None, comm=None, devices=None):
+def _dither_key(cfg, n):
+    """The `dither_key` of a run's drift number `n` (None under nearest rounding). `run`
+    numbers drifts as the lead drift 0, step k's drift k + 1 and the drift after a snapshot at
+    step k (k + 1) + 2^32, so keys are unique per drift and a resume regenerates them."""
+    return None if cfg.drift_rounding == "nearest" else int(n)
+
+
+def _migrate_pass(st, cfg, c_drift, pool, timings=None, comm=None, devices=None,
+                  dither_key=None):
     """Route the step's migrate (and the lead drift) to host serial, host pooled or device.
 
     Returns the pass's stats dict (the device pass adds a `migrate_device` receipt). Across
-    ranks (`comm`) only the device pass has a path; `devices` are the rank's cards."""
+    ranks (`comm`) only the device pass has a path; `devices` are the rank's cards.
+    `dither_key` is the drift's rounding (`SlotState._eject_slab`)."""
     if cfg.migrate_backend == "device":
         from .device.migrate import drift_and_migrate_device
 
         return drift_and_migrate_device(
             st, c_drift, device_budget_bytes=cfg.migrate_device_budget_bytes,
             devices=_cards(cfg) if devices is None else devices, timings=timings, comm=comm,
-            y_blocks=cfg.y_block_ranges)
+            y_blocks=cfg.y_block_ranges, dither_key=dither_key)
     if pool is not None and cfg.migrate_pooled is not False:
         return drift_and_migrate_pooled(
             st, c_drift, pool, kernel=cfg.eject_kernel, window=cfg.migrate_window,
-            eject_inflight=cfg.migrate_eject_inflight,
+            eject_inflight=cfg.migrate_eject_inflight, dither_key=dither_key,
         )
-    return drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel)
+    return drift_and_migrate(st, c_drift, kernel=cfg.eject_kernel, dither_key=dither_key)
 
 
 def _repack_pass(st, cfg, timings=None, devices=None):
@@ -1109,11 +1126,14 @@ def _require_rank_slabs(st, comm, decomp, what):
 
 def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_shape=0,
          phase=None, tile_force=None, pool=None, coarse_parts=None, device_shapes=None,
-         repack_due=False, timings=None, decomp=None, comm=None, devices=None):
+         repack_due=False, timings=None, decomp=None, comm=None, devices=None,
+         dither_key=None):
     """One drift-synchronized BullFrog step. Mutates `st`; returns diagnostics.
 
     `coeff = (alpha, beta_over_Dmid)` from `bullfrog_float_coeffs` columns 1-2; `c_drift` is
-    this step's fused drift. `census=True` enables the coarse decode census.
+    this step's fused drift and `dither_key` its rounding (`SlotState._eject_slab`; None:
+    nearest); `run` passes the key `cfg.drift_rounding` calls for (`_dither_key`).
+    `census=True` enables the coarse decode census.
     `tile_force` (`(one_tile, geom)` from `make_tile_force_fn`) and `coarse_parts`
     (`forces.coarse_kernel_parts`) are built once by `run`; standalone calls build their own.
     `cap_shape` / `pad_shape` / `device_shapes` carry the previous step's shapes so they stay
@@ -1307,7 +1327,7 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
                 return tile_loop_windowed(
                     view, one_tile, C, None, members, wshapes, planes=range(a, b),
                     coarse_shard=g_coarse[k], device=None if devs is None else devs[k],
-                    census=float(c_drift) if fused_now else None,
+                    census=float(c_drift) if fused_now else None, census_key=dither_key,
                     timings=None if timings is None else tile_timings[k], y_blocks=n_y)
 
             if devs is None:
@@ -1395,11 +1415,11 @@ def step(st, cfg, coeff, c_drift, collect=None, census=False, cap_shape=0, pad_s
         stats, repack_stats = migrate_repack_device(
             st, c_drift, census_counts, brick_slack=cfg.brick_slack,
             device_budget_bytes=cfg.migrate_device_budget_bytes, devices=devs,
-            timings=mt, comm=comm, y_blocks=cfg.y_block_ranges)
+            timings=mt, comm=comm, y_blocks=cfg.y_block_ranges, dither_key=dither_key)
     else:
         stats = _migrate_pass(st, cfg, c_drift, pool,
                               None if timings is None else timings.setdefault("migrate", {}),
-                              comm=comm, devices=devs)
+                              comm=comm, devices=devs, dither_key=dither_key)
     # Receipts that each knob applied, present on every step (0 / None when inactive).
     stats["migrate_repack_fused"] = fused_now
     stats["census_slabs"] = (int(sum(lp.get("census_slabs", 0) for lp in loops))
@@ -1533,6 +1553,9 @@ def checkpoint_fingerprint(cfg, coeffs, snapshot_steps=()):
     # only when != 2, so order-2 fingerprints are unchanged
     if getattr(cfg, "coarse_match_order", 2) != 2:
         fp["coarse_match_order"] = cfg.coarse_match_order
+    # only when stochastic, so nearest-rounding (v0.1.0) fingerprints are unchanged
+    if getattr(cfg, "drift_rounding", "nearest") != "nearest":
+        fp["drift_rounding"] = cfg.drift_rounding
     h.update(json.dumps(fp, sort_keys=True).encode())
     h.update(np.ascontiguousarray(coeffs, dtype=np.float64).tobytes())
     if snapshot_steps:
@@ -1814,7 +1837,8 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
         # Lead half-drift onto the first midpoint; skipped on resume (the checkpoint is past
         # it). The boundary fires either way.
         if resume is None:
-            _migrate_pass(st, cfg, lead, pool, comm=comm, devices=devs)
+            _migrate_pass(st, cfg, lead, pool, comm=comm, devices=devs,
+                          dither_key=_dither_key(cfg, 0))
         ph("lead_drift")
         out = []
         # buffer shapes carried across steps and only grown, so few shapes are compiled
@@ -1857,7 +1881,7 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                          phase=phase, tile_force=tile_force, pool=pool,
                          coarse_parts=coarse_parts, device_shapes=device_shapes,
                          repack_due=repack_due, timings=timings, decomp=decomp, comm=comm,
-                         devices=devs)
+                         devices=devs, dither_key=_dither_key(cfg, k + 1))
             cap_shape = int(stats["cap"])
             pad_shape = int(stats["coarse_pad"])
             device_shapes = stats["device_shapes"]
@@ -1879,7 +1903,8 @@ def run(st, cfg, coeffs, collect=None, census=False, phase=None, resume=None,
                     snapshot_dir=os.path.join(snapshot_dir, f"step{k + 1:04d}"),
                 )
                 ph("snapshot")
-                _migrate_pass(st, cfg, after[k], pool, comm=comm, devices=devs)
+                _migrate_pass(st, cfg, after[k], pool, comm=comm, devices=devs,
+                              dither_key=_dither_key(cfg, k + 1 + 2**32))
                 # repacked as after any step: bricks sized for the pre-drift state would
                 # overflow the next step's migrate into the arena and grow its shapes
                 if cfg.repack_every:

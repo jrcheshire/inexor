@@ -242,6 +242,7 @@ drivers do).
 | `coarse_dtype` | `"float64"` | coarse mesh dtype, `float32` or `float64` (production: `float32`) |
 | `fine_dtype` | `"float64"` | fine tile mesh dtype |
 | `coarse_match_order` | 3 | 2 or 3; see Schedule and physics |
+| `drift_rounding` | `"stochastic"` | how a drift lands on the position lattice: `"stochastic"` (unbiased, keyed on lattice index and drift) or `"nearest"` (the v0.1.0 rule; reproduces v0.1.0 runs) |
 | `frac_bits` | 12 | fixed-point fraction bits of the integer paint |
 | `chunk_bricks` | 64 | bricks per coarse-paint chunk (host) |
 | `brick_slack` | 0.10 | spare capacity per brick (used by the repack and by a load that is not given one) |
@@ -299,7 +300,9 @@ a-grid and K):
 
 `box_size, n_part, n_fine, n_coarse, n_tile, b_fine, alpha, paint_short, paint_long,
 frac_bits, coarse_dtype, fine_dtype, cap_rungs, pad_ladder, paint_subblock`, plus
-`coarse_match_order` when it is not 2, plus the run's snapshot steps when it has any.
+`coarse_match_order` when it is not 2, plus `drift_rounding` when it is stochastic, plus the
+run's snapshot steps when it has any. A v0.1.0 checkpoint therefore resumes only under
+`drift_rounding="nearest"`.
 
 Execution policy (workers, pooling, eject kernel, backends, y-blocks), layout
 (`brick_slack`, `chunk_bricks`, `repack_every`) and checkpoint settings are excluded and may

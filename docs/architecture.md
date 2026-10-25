@@ -164,8 +164,14 @@ density only; their velocities are never used.
 
 **Drift and migrate** (`state.drift_and_migrate`). Positions are bucket-relative, so a drift
 is a re-homing. `_eject_slab` drifts one x-slab of bricks in the integer lattice domain,
-`i_new = mod(rint(x/q + c v/q), n_levels)`, and splits its rows into keepers and
-emigrants, still coded at their source brick's scale. `_insert_slab` writes a slab once
+`i_new = mod(floor(x/q + c v/q + u), n_levels)`, and splits its rows into keepers and
+emigrants, still coded at their source brick's scale. The dither `u` in [0, 1)
+(`state.dither`) hashes the pre-drift lattice index, the axis and the drift's key (lead
+drift 0, step k's drift k + 1, the drift after a snapshot at step k (k + 1) + 2^32), so the
+rounding is unbiased per drift and depends on no row order, layout or rank. Rounding to
+nearest instead (`drift_rounding="nearest"`, `rint(x/q + c v/q)`, the v0.1.0 rule) holds
+back every particle that drifts less than q/2 in a step, which biases P(k) low for early
+starts and many steps and makes small halos lighter as the step count grows. `_insert_slab` writes a slab once
 every slab that can reach it has been ejected: per brick it takes the new scale over
 keepers plus immigrants, re-expresses every row at it in one rounding, stable-sorts by
 bucket (`_write_brick`), and spills past the allocation into the lowest free arena rows.
@@ -438,7 +444,7 @@ writes the generation it did not load.
 The provenance carries a **fingerprint** (`checkpoint_fingerprint`): a hash of the config
 fields that move numbers (`_FINGERPRINTED`: geometry, `alpha`, paints, `frac_bits`, mesh
 dtypes, the buffer-shape knobs `cap_rungs`, `pad_ladder`, `paint_subblock`, and
-`coarse_match_order`), the BullFrog coefficients as bytes (so cosmology, a-grid and step
+`coarse_match_order`, and `drift_rounding` when it is stochastic), the BullFrog coefficients as bytes (so cosmology, a-grid and step
 count are covered) and the snapshot steps. A resume under a different fingerprint is
 refused. Not fingerprinted: the execution policy of the pool and the migrate (worker, card,
 rank and y-block counts, `migrate_backend`, the fused pass) and the layout (`brick_slack`,

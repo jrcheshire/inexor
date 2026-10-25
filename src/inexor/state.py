@@ -21,6 +21,9 @@ from dataclasses import dataclass
 import numpy as np
 
 from .codec import (
+    DITHER_AXIS_MUL,
+    DITHER_KEY_MUL,
+    DITHER_MIX,
     INT16_MAX,
     LEVELS_PER_BUCKET,
     assert_int16_range,
@@ -241,6 +244,22 @@ def reconcile_velocity_scale(tile_scales):
     return float(s.max()) if len(s) else 1.0
 
 
+def dither(i, key):
+    """The stochastic-rounding offsets u in [0, 1), float64 (n, 3), for pre-drift lattice
+    indices `i` (int, (n, 3), in [0, n_levels)) and the drift's `key` (see `codec.DITHER_*`).
+    The numpy reference; `eject_jax` implements the same hash independently."""
+    u64 = np.uint64
+    with np.errstate(over="ignore"):
+        h = np.bitwise_xor.reduce(
+            np.asarray(i, dtype=np.int64).astype(u64) * np.array(DITHER_AXIS_MUL, dtype=u64),
+            axis=1)[:, None]
+        z = h ^ ((u64(key) * u64(3) + np.arange(1, 4, dtype=u64)) * u64(DITHER_KEY_MUL))
+        z = (z ^ (z >> u64(30))) * u64(DITHER_MIX[0])
+        z = (z ^ (z >> u64(27))) * u64(DITHER_MIX[1])
+        z = z ^ (z >> u64(31))
+    return (z >> u64(11)).astype(np.float64) * 2.0**-53
+
+
 def brick_reach(st, c_drift, vel_scale=None):
     """Upper bound on the bricks a particle can cross per axis during this drift. O(1).
 
@@ -265,7 +284,8 @@ def occupancy_total(occ):
     return int(np.sum(occ, dtype=np.int64))
 
 
-def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert_kernel="numpy"):
+def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert_kernel="numpy",
+                      dither_key=None):
     """Advance every particle by `c_drift * v` and re-home it, in one slab-scheduled pass.
 
     Drift and migration are inseparable once positions are bucket-relative. Every slab is
@@ -277,7 +297,8 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert
 
     `kernel` / `insert_kernel` select numpy or jax for `_eject_slab` / `_insert_slab`. Both
     default to "numpy" (unlike `EngineConfig`, which the engine always passes) because
-    `tests/test_eject_jax.py` uses the bare call as its numpy reference arm.
+    `tests/test_eject_jax.py` uses the bare call as its numpy reference arm. `dither_key`
+    selects the drift's rounding (`SlotState._eject_slab`).
 
     Returns a stats dict (arena overflow, scales, reach bound and realized, peak staging).
     """
@@ -295,7 +316,8 @@ def drift_and_migrate(st, c_drift, max_staged_slabs=None, kernel="numpy", insert
     consumed = {}  # emig rows an insert actually took, per source slab
     n_over, peak_staged, realized_reach = 0, 0, 0
     for s in range(nb):
-        staged[s], emig[s] = st._eject_slab(s, c_drift, scales, kernel=kernel)
+        staged[s], emig[s] = st._eject_slab(s, c_drift, scales, kernel=kernel,
+                                            dither_key=dither_key)
         consumed[s] = 0
         # the realized x-reach, reported beside the bound
         if len(emig[s]["dest"]):
@@ -467,7 +489,7 @@ def _replay_arena_pass(st, reach, r, r_raw, c_drift, scales, n_emig, rr_by_slab,
 
 
 def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
-                             max_staged_slabs=None, eject_inflight=None):
+                             max_staged_slabs=None, eject_inflight=None, dither_key=None):
     """`drift_and_migrate` on the worker pool, bitwise the serial pass.
 
     Workers eject and insert whole slabs, writing brick payloads straight into shared
@@ -484,6 +506,7 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
     `eject_inflight`: max concurrent ejects (>= 1, never deadlocks). An eject materializes
     its whole slab privately (~35-129 B/row) while an insert reads scratch views, so
     bounding ejects caps host memory without shrinking the pool.
+    `dither_key`: the drift's rounding, as in `drift_and_migrate`.
     """
     if eject_inflight is not None and int(eject_inflight) < 1:
         raise ValueError(
@@ -499,7 +522,8 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
     r = min(r_raw, nb // 2)
     reach = range(-r, r + 1)
     if 2 * r + 1 >= nb:
-        out = drift_and_migrate(st, c_drift, max_staged_slabs=max_staged_slabs, kernel=kernel)
+        out = drift_and_migrate(st, c_drift, max_staged_slabs=max_staged_slabs, kernel=kernel,
+                                dither_key=dither_key)
         out["migrate_pool"] = dict(workers=0, fallback="all-to-all reach")
         return out
     k_min = min(nb, 4 * r + 2)
@@ -520,7 +544,7 @@ def drift_and_migrate_pooled(st, c_drift, pool, kernel="numpy", window=None,
         if len(keys):
             arena_slab = np.bincount((keys // p3) // (nb * nb), minlength=nb)
     slot_rows = int((occ_slab + arena_slab).max())
-    pool.stage_migrate(c_drift, kernel, r, slot_rows, K)
+    pool.stage_migrate(c_drift, kernel, r, slot_rows, K, dither_key=dither_key)
 
     # backpressure: an eject needs a free slot; a slab's slot frees once every destination
     # its emig can feed has been inserted
@@ -1197,7 +1221,7 @@ class SlotState:
         nb = self.bricks_per_side
         return int(bx) * nb * nb, (int(bx) + 1) * nb * nb
 
-    def _eject_slab_jax(self, bx, c_drift, scales, release_arena=True):
+    def _eject_slab_jax(self, bx, c_drift, scales, release_arena=True, dither_key=None):
         """`_eject_slab` with the drift and keep/leave partition compiled (`eject_jax`).
 
         Same contract, return value and mutations; gated elementwise against the numpy path
@@ -1247,7 +1271,7 @@ class SlotState:
             self.t9, self.bricks_per_side,
             np.concatenate(offs), np.concatenate(bijks), np.concatenate(ws),
             np.concatenate(ids_l) if ids_l else None,
-            np.concatenate(sc_l), c_drift, np.concatenate(bid_l),
+            np.concatenate(sc_l), c_drift, np.concatenate(bid_l), dither_key=dither_key,
         )
         keep = dict(dest=dest[:n_keep], off=off_new[:n_keep], w=w_out[:n_keep],
                     ids=None if ids_out is None else ids_out[:n_keep])
@@ -1256,7 +1280,8 @@ class SlotState:
                     src=src_out[n_keep:].astype(np.int32))
         return keep, emig
 
-    def _eject_slab(self, bx, c_drift, scales, kernel="numpy", release_arena=True):
+    def _eject_slab(self, bx, c_drift, scales, kernel="numpy", release_arena=True,
+                    dither_key=None):
         """Drift one slab's particles and split them into keepers and leavers.
 
         Writes no payload back (only releases the slab's arena rows, unless
@@ -1264,11 +1289,16 @@ class SlotState:
         double drift is impossible. Returns (keep, emig): dicts of flat `dest` (flat bucket
         ordinal), `off`, `w` (still at the source brick's scale), `ids`, and `src` on emig.
 
+        `dither_key` None rounds each drift to the nearest lattice level; an int rounds it
+        stochastically, `floor(x/q + dx/q + u)` with `u = dither(i, dither_key)` (unbiased per
+        drift; the key must be unique per drift of a run).
+
         `kernel="jax"` routes to `_eject_slab_jax`. This numpy path is the reference it is
         gated against, so it must not be conditionally modified.
         """
         if kernel == "jax":
-            return self._eject_slab_jax(bx, c_drift, scales, release_arena=release_arena)
+            return self._eject_slab_jax(bx, c_drift, scales, release_arena=release_arena,
+                                        dither_key=dither_key)
         if kernel != "numpy":
             raise ValueError(f"unknown eject kernel {kernel!r}; expected 'numpy' or 'jax'")
         lo_b, hi_b = self.slab_bricks(bx)
@@ -1292,9 +1322,16 @@ class SlotState:
             # Drift in the integer lattice domain: the wrap is exactly modular there, and a small
             # step cannot be absorbed by a large coordinate.
             q = self.t9.quantum
-            i_new = np.mod(
-                np.rint(x / q + (float(c_drift) * v) / q).astype(np.int64), self.t9.n_levels
-            )
+            if dither_key is None:
+                i_new = np.mod(
+                    np.rint(x / q + (float(c_drift) * v) / q).astype(np.int64), self.t9.n_levels
+                )
+            else:
+                u = dither(np.mod(np.rint(x / q).astype(np.int64), self.t9.n_levels), dither_key)
+                i_new = np.mod(
+                    np.floor(x / q + (float(c_drift) * v) / q + u).astype(np.int64),
+                    self.t9.n_levels,
+                )
             b_ijk = i_new // LEVELS_PER_BUCKET
             off_new = (i_new - b_ijk * LEVELS_PER_BUCKET).astype(np.uint8)
             dest = _bucket_flat_brick_major(b_ijk, self.t9, self.bricks_per_side)

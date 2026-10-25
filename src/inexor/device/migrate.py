@@ -428,14 +428,15 @@ def _write_program(cap_i, w_cap, has_ids):
 
 # These share `eject_jax._CACHE` / `insert_jax._CACHE` and their key and `_build`
 # signatures: a change to either must land in both files.
-def _eject_kernel(t9, nb, cap, has_ids):
+def _eject_kernel(t9, nb, cap, has_ids, dither=False):
     from .. import eject_jax
 
-    key = (int(t9.n_buckets_side), float(t9.quantum), int(nb), int(cap), has_ids)
+    key = (int(t9.n_buckets_side), float(t9.quantum), int(nb), int(cap), has_ids, dither)
     with _PROGRAM_LOCK:
         fn = eject_jax._CACHE.get(key)
         if fn is None:
-            fn = eject_jax._CACHE[key] = eject_jax._build(t9, int(nb), int(cap), has_ids)
+            fn = eject_jax._CACHE[key] = eject_jax._build(t9, int(nb), int(cap), has_ids,
+                                                          dither)
     return fn
 
 
@@ -491,12 +492,15 @@ def _unit_index(st, lo_b, hi_b, ar_slots, ar_bricks):
 
 
 def _eject_rows(st, ix, c_drift, off_win, w_win, ids_win, ar_rows, starts_rel, scales_d, w_cap,
-                clock, dev):
+                clock, dev, dither_key=None):
     """The rows program and the eject kernel on `dev` for one slab indexed by `ix`
     (`_slab_index`), against a window whose rows `starts_rel` are relative to and
     whose residents are `ar_rows`. `scales_d` is the slab's per-brick scales on
-    `dev`. Returns the kernel's outputs."""
+    `dev`; `dither_key` the drift's rounding (`SlotState._eject_slab`). Returns the
+    kernel's outputs."""
     import jax.numpy as jnp
+
+    from ..eject_jax import drift_key
 
     nb, p3 = int(st.bricks_per_side), int(st.buckets_per_brick)
     per = int(st.t9.n_buckets_side) // nb
@@ -513,8 +517,8 @@ def _eject_rows(st, ix, c_drift, off_win, w_win, ids_win, ar_rows, starts_rel, s
         _put(ix["n_rows"], dev, jnp.int64), _put(lo_b, dev, jnp.int64))
     index_dev = None
     clock.mark("eject: rows program", off, bijk, w, ids, scale, brick, real)
-    fn = _eject_kernel(st.t9, nb, cap, has_ids)
-    out = fn(off, bijk, w, ids, scale, float(c_drift), brick, real)
+    fn = _eject_kernel(st.t9, nb, cap, has_ids, dither_key is not None)
+    out = fn(off, bijk, w, ids, scale, float(c_drift), drift_key(dither_key), brick, real)
     # the row buffers are the kernel's input only; release them before staging
     off = bijk = w = ids = scale = brick = real = None
     clock.mark("eject: kernel", *out)
@@ -563,7 +567,7 @@ def _upload_unit(st, lo_b, hi_b, ar_slots, ar_bricks, clock, dev=None, block=Fal
 
 
 def _eject_unit(st, u, blocks, c_drift, scales, ar_slots, ar_bricks, clock, budget, dev=None,
-                pre=None, keep_window=True):
+                pre=None, keep_window=True, dither_key=None):
     """Upload unit `u = (slab, block)`'s window to `dev` (or take `pre`, an `_upload_unit`),
     build its rows and eject them. Returns the staged unit; `keep_window=False` releases the
     window with the rows, for a caller whose insert does not write into it."""
@@ -587,7 +591,8 @@ def _eject_unit(st, u, blocks, c_drift, scales, ar_slots, ar_bricks, clock, budg
     starts_d = _put(np.asarray(st.brick_start[lo_b:hi_b], dtype=np.int64) - s0, dev)
     scales_d = _put(np.asarray(scales[lo_b:hi_b], dtype=np.float64), dev)
     dest, off_new, w_out, ids_out, src_out, n_keep = _eject_rows(
-        st, ix, c_drift, off_win, w_win, ids_win, ar_rows, starts_d, scales_d, w_cap, clock, dev)
+        st, ix, c_drift, off_win, w_win, ids_win, ar_rows, starts_d, scales_d, w_cap, clock, dev,
+        dither_key=dither_key)
     ar_rows = starts_d = scales_d = None
     if not keep_window:
         off_win = w_win = ids_win = None
@@ -767,7 +772,7 @@ def _moved(e, dev):
 
 
 def _sweep(st, lo, hi, reach, c_drift, scales, ar_slots, ar_bricks, dev, staged, ejected,
-           clock, budget, insert=None, card=None, keep_window=True, blocks=None):
+           clock, budget, insert=None, card=None, keep_window=True, blocks=None, dither_key=None):
     """One card's pass over the units of its own slabs [lo, hi), in ascending brick order,
     using any units already in `staged` (its boundary ejects, the neighbours' emigrants) as
     they are. A unit inserts once every unit of `_sources` is staged. `insert(st, v, reach,
@@ -787,7 +792,7 @@ def _sweep(st, lo, hi, reach, c_drift, scales, ar_slots, ar_bricks, dev, staged,
         if u not in ejected:
             staged[u] = _eject_unit(st, u, blocks, c_drift, scales, ar_slots, ar_bricks, clock,
                                     budget, dev, pre=card["pre"].pop(u, None),
-                                    keep_window=keep_window)
+                                    keep_window=keep_window, dither_key=dither_key)
             ejected[u] = (staged[u]["n_rows"] - staged[u]["n_keep"], staged[u]["rr"],
                           staged[u]["direct"])
         for v in own:
@@ -884,10 +889,12 @@ def _unpack_emigrants(parcel, dev):
     return out
 
 def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=None,
-                 insert=None, keep_window=True, before_sweep=None, comm=None, y_blocks=None):
+                 insert=None, keep_window=True, before_sweep=None, comm=None, y_blocks=None,
+                 dither_key=None):
     """Every unit's eject and insert on the cards: the part of
     `drift_and_migrate_device` before its arena replay, shared with the fused
-    migrate + repack. `insert` and `keep_window` as in `_sweep`; `before_sweep(ctx)`
+    migrate + repack. `insert`, `keep_window` and `dither_key` as in `_sweep` and
+    `drift_and_migrate_device`; `before_sweep(ctx)`
     runs after the boundary ejects and before any card inserts. `y_blocks` as in
     `drift_and_migrate_device`. Returns the pass context (reach, cards, blocks, per-slab
     emigrant counts and reach, per-slab insert results for the replay, the receipt's terms).
@@ -978,7 +985,8 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
                 for j in range(n_y):
                     u = (s, j)
                     e = _eject_unit(st, u, blocks, c_drift, scales, ar_slots, ar_bricks,
-                                    clocks[k], budgets[k], devs[k], keep_window=keep_window)
+                                    clocks[k], budgets[k], devs[k], keep_window=keep_window,
+                                    dither_key=dither_key)
                     staged[k][u] = e
                     ejected[k][u] = (e["n_rows"] - e["n_keep"], e["rr"], e["direct"])
                     out[u] = _emigrants_only(e, has_ids, devs[k])
@@ -1027,7 +1035,8 @@ def _device_pass(st, c_drift, timings=None, device_budget_bytes=None, devices=No
     swept = run(lambda k: _sweep(st, parts[k][0], parts[k][1], reach, c_drift, scales,
                                  ar_slots, ar_bricks, devs[k], staged[k], ejected[k],
                                  clocks[k], budgets[k], insert=insert, card=cards[k],
-                                 keep_window=keep_window, blocks=blocks))
+                                 keep_window=keep_window, blocks=blocks,
+                                 dither_key=dither_key))
     unit_res, unit_ejected, n_direct = {}, {}, 0
     for k in range(W):
         unit_res.update(swept[k][0])
@@ -1121,7 +1130,8 @@ def conserve(st, ctx, n_after, what):
 
 
 def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
-                             device_budget_bytes=None, devices=None, comm=None, y_blocks=None):
+                             device_budget_bytes=None, devices=None, comm=None, y_blocks=None,
+                             dither_key=None):
     """`state.drift_and_migrate` with every slab's row work on the device.
 
     Same contract, mutations and stats dict (plus a `migrate_device` receipt), bitwise
@@ -1143,12 +1153,12 @@ def drift_and_migrate_device(st, c_drift, max_staged_slabs=None, timings=None,
     `comm`, with a node-local `st` (every rank calls this): the pass across ranks;
     `st.n_particles` becomes the rank's new count. `y_blocks`: brick-y ranges per slab
     (`decomp.y_blocks`; None = whole slabs), bitwise any cut; the receipt's `window_*_slabs`
-    then count units.
+    then count units. `dither_key`: the drift's rounding (`SlotState._eject_slab`).
     """
     from .. import state as _state
 
     ctx = _device_pass(st, c_drift, timings=timings, device_budget_bytes=device_budget_bytes,
-                       devices=devices, comm=comm, y_blocks=y_blocks)
+                       devices=devices, comm=comm, y_blocks=y_blocks, dither_key=dither_key)
     rep = _state._replay_arena_pass(
         st, ctx["reach"], ctx["r"], ctx["r_raw"], c_drift, ctx["scales"], n_emig=ctx["n_emig"],
         rr_by_slab=ctx["rr_by_slab"], insert_res=ctx["insert_res"],
