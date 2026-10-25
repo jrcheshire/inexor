@@ -527,7 +527,8 @@ def _worker_migrate_eject(arg):
     t0 = time.perf_counter()
     calls0 = eject_jax.CALLS
     keep, emig = st._eject_slab(
-        s, M["c_drift"], scr["mig_scales"], kernel=M["kernel"], release_arena=False
+        s, M["c_drift"], scr["mig_scales"], kernel=M["kernel"], release_arena=False,
+        dither_key=M["dither_key"],
     )
     nk, ne = len(keep["dest"]), len(emig["dest"])
     cap = scr["mig_dest"].shape[1]
@@ -879,13 +880,14 @@ class TilePool:
         self._mig_views = {}
         self._mig_shape = None
 
-    def stage_migrate(self, c_drift, kernel, r, slot_rows, window):
+    def stage_migrate(self, c_drift, kernel, r, slot_rows, window, dither_key=None):
         """Publish one migrate pass: scratch window, scales snapshot, header.
 
         Scratch is sized per pass (slab capacities change with `repack`) and recreated only when
         it must grow; `mig_id` tells workers to re-attach. The `vel_scale` snapshot is taken
         before dispatch because inserts rewrite the live array while later ejects must decode
-        at pre-pass scales (as in the serial `drift_and_migrate`)."""
+        at pre-pass scales (as in the serial `drift_and_migrate`). `dither_key` is the drift's
+        rounding (`SlotState._eject_slab`)."""
         has_ids = self.st.ids is not None
         K, R = int(window), int(slot_rows)
         n_bricks = int(np.atleast_1d(self.st.vel_scale).shape[0])
@@ -913,6 +915,7 @@ class TilePool:
         self._M = dict(
             step=self._step, arena_base=int(self.st.arena_base),
             c_drift=float(c_drift), kernel=str(kernel), reach_r=int(r),
+            dither_key=None if dither_key is None else int(dither_key),
             has_ids=has_ids, mig_id=self._mig_id,
             mig_handles={k: s.handle for k, s in self._mig_segs.items()},
             mig_shapes={k: v.shape for k, v in self._mig_views.items()},

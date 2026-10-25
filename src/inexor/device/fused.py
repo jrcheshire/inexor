@@ -109,7 +109,7 @@ def census_across_ranks(st, counts, c_drift, comm):
 
 def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_staged_slabs=None,
                           timings=None, device_budget_bytes=None, devices=None, comm=None,
-                          y_blocks=None):
+                          y_blocks=None, dither_key=None):
     """`drift_and_migrate_device` followed by `repack_device`, in one pass per slab.
 
     `census_counts` is the per-brick post-migrate membership, int64 over
@@ -119,7 +119,8 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     With `comm` and a node-local `st` (every rank calls this), `census_counts` is this rank's
     census (`census_across_ranks` completes it) and `st.n_particles` becomes the rank's count.
     `y_blocks`: brick-y ranges per slab visit (`decomp.y_blocks`; None = whole slabs); bitwise
-    any cut.
+    any cut. `dither_key`: the drift's rounding (`SlotState._eject_slab`); the census must
+    have been taken with the same key.
 
     Returns `(migrate_stats, repack_stats)`: the migrate's stats dict with its
     `migrate_device` receipt (plus `fused`), and the repack's dict with a
@@ -264,7 +265,8 @@ def migrate_repack_device(st, c_drift, census_counts, brick_slack=0.10, max_stag
     card_ar = _m.pass_arena_index(st)
     ctx = _m._device_pass(st, c_drift, timings=timings, device_budget_bytes=device_budget_bytes,
                           devices=devices, insert=insert, keep_window=False,
-                          before_sweep=before_sweep, comm=comm, y_blocks=y_blocks)
+                          before_sweep=before_sweep, comm=comm, y_blocks=y_blocks,
+                          dither_key=dither_key)
     clock = ctx["clocks"][0]
 
     # the migrate's census, arena-full refusal and stats, exactly as the device

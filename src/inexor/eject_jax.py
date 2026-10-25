@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .codec import LEVELS_PER_BUCKET
+from .codec import DITHER_AXIS_MUL, DITHER_KEY_MUL, DITHER_MIX, LEVELS_PER_BUCKET
 
 PAD_RUNGS_PER_OCTAVE = 12
 
@@ -56,7 +56,22 @@ def require_x64():
         )
 
 
-def _build(t9, nb, n_pad, has_ids):
+def _dither(i, key):
+    """jax twin of `state.dither`, written independently: u in [0, 1) per row and axis from
+    lattice indices `i` (int64, (n, 3)) and the drift's `key` (uint64 scalar)."""
+    import jax.numpy as jnp
+
+    a = i.astype(jnp.uint64) * jnp.asarray(np.array(DITHER_AXIS_MUL, dtype=np.uint64))
+    h = (a[:, 0] ^ a[:, 1] ^ a[:, 2])[:, None]
+    axis = jnp.asarray(np.arange(1, 4, dtype=np.uint64))
+    z = h ^ ((key * np.uint64(3) + axis) * np.uint64(DITHER_KEY_MUL))
+    z = (z ^ (z >> np.uint64(30))) * np.uint64(DITHER_MIX[0])
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(DITHER_MIX[1])
+    z = z ^ (z >> np.uint64(31))
+    return (z >> np.uint64(11)).astype(jnp.float64) * 2.0**-53
+
+
+def _build(t9, nb, n_pad, has_ids, dither=False):
     import jax
     import jax.numpy as jnp
 
@@ -67,7 +82,7 @@ def _build(t9, nb, n_pad, has_ids):
     nbi = int(nb)
 
     @jax.jit
-    def kernel(off, bijk, w, ids, scale, c_drift, brick_id, real):
+    def kernel(off, bijk, w, ids, scale, c_drift, key, brick_id, real):
         # built inside the trace; outside it would be a constant baked into the executable
         idx_all = jnp.arange(n_pad, dtype=jnp.int64)
         # the drift, in the integer domain; expression shape identical to
@@ -75,7 +90,12 @@ def _build(t9, nb, n_pad, has_ids):
         i = bijk * LEVELS_PER_BUCKET + off.astype(jnp.int64)
         x = i.astype(jnp.float64) * q
         v = w.astype(jnp.float64) * scale
-        i_new = jnp.mod(jnp.round(x / q + (c_drift * v) / q).astype(jnp.int64), n_levels)
+        if dither:
+            u = _dither(i, key)
+            i_new = jnp.mod(jnp.floor(x / q + (c_drift * v) / q + u).astype(jnp.int64),
+                            n_levels)
+        else:
+            i_new = jnp.mod(jnp.round(x / q + (c_drift * v) / q).astype(jnp.int64), n_levels)
         b_ijk = i_new // LEVELS_PER_BUCKET
         off_new = (i_new - b_ijk * LEVELS_PER_BUCKET).astype(jnp.uint8)
         brick = b_ijk // per
@@ -105,8 +125,16 @@ def _build(t9, nb, n_pad, has_ids):
     return kernel
 
 
-def eject_rows(t9, nb, off, bijk, w, ids, scale, c_drift, brick_id):
+def drift_key(dither_key):
+    """The kernel's `key` argument: the drift's dither key as a uint64 scalar (0 when
+    rounding to nearest, where the kernel ignores it)."""
+    return np.uint64(0 if dither_key is None else int(dither_key))
+
+
+def eject_rows(t9, nb, off, bijk, w, ids, scale, c_drift, brick_id, dither_key=None):
     """Drift + re-home + global stable partition for one slab's rows.
+
+    `dither_key` selects the drift's rounding as in `SlotState._eject_slab` (None: nearest).
 
     Rows must arrive in brick-major order (which is how `_eject_slab` walks
     them). Returns `(dest, off_new, w_out, ids_out, src_out, n_keep)` where
@@ -121,10 +149,11 @@ def eject_rows(t9, nb, off, bijk, w, ids, scale, c_drift, brick_id):
     n = int(len(off))
     n_pad = _padded(n)
     has_ids = ids is not None
-    key = (int(t9.n_buckets_side), float(t9.quantum), int(nb), n_pad, has_ids)
+    dither = dither_key is not None
+    key = (int(t9.n_buckets_side), float(t9.quantum), int(nb), n_pad, has_ids, dither)
     fn = _CACHE.get(key)
     if fn is None:
-        fn = _CACHE[key] = _build(t9, nb, n_pad, has_ids)
+        fn = _CACHE[key] = _build(t9, nb, n_pad, has_ids, dither)
 
     pad = n_pad - n
 
@@ -144,6 +173,7 @@ def eject_rows(t9, nb, off, bijk, w, ids, scale, c_drift, brick_id):
         jnp.asarray(_pad(ids, 0)) if has_ids else None,
         jnp.asarray(_pad(scale, 1.0)),
         float(c_drift),
+        drift_key(dither_key),
         # -1 matches no brick
         jnp.asarray(_pad(brick_id, -1)),
         jnp.asarray(real),
