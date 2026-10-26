@@ -10,6 +10,8 @@ directory and a run directory.
 | `disco_crosscheck_gh_vista.sbatch` | that cross-check as one Vista job |
 | `gh_crossover_vista.sbatch` | wall time and memory of both codes on one GH200, 256^3 to 1024^3 |
 | `gh_same_ics_vista.sbatch` | both codes at 512^3 from the same ICs: DISCO-DJ's particle chunking, inexor's fine-mesh precision, and the inputs of the velocity comparison |
+| `gh_halo_check_vista.sbatch` | FoF halos at 0.25 Mpc/h spacing on one GH200: inexor's step and start-epoch arms, DISCO-DJ at the same and at half the force cell, z = 0 and snapshot redshifts |
+| `halo_compare.py` | FoF on an evolved state (`find`) and two catalogs compared (`compare`): abundance, matched halos, halo bias |
 | `memtrace.py` | host and card memory sampler both codes' cost legs run under |
 | `pk_boost_reference.py` | P(k) cards against CAMB HMcode2020, halofit and EuclidEmulator2 |
 | `ee2_ratio_figure.py` | P(k) cards over EuclidEmulator2, with sample-variance bands |
@@ -40,11 +42,15 @@ separate process in the environment it needs; consecutive phases exchange one `.
 - **`export`:** `--config`, `--ic-dir`, `--k-steps`, `--out` required; `--a-init`
   (default 0.1) and `--growth2` (`lcdm`, default, or `eds`) must match the ICs' manifest,
   which it checks. The a-grid and coefficients are the realization driver's.
+  `--snapshot-z Z,Z,...` records the step boundary `device_run.py run --snapshot-z` takes for
+  each redshift (`snapshot_steps` in `meta`).
 - **`evolve`:** `--in`, `--n-mesh`, `--out` required; `--precision double` (default) or
   `single`; `--chunk-size N`, the particles DISCO-DJ paints and interpolates at once (must
   divide the particle count; default all at once). DISCO-DJ settings: CIC (`worder=2`), ik
   gradient and Laplacian, no deconvolution, no antialiasing, BullFrog on the exported a-grid,
-  momentum `v_d * Fplus(a)`.
+  momentum `v_d * Fplus(a)`. `--stop-z Z` stops at the export's snapshot step for `Z` (the
+  first steps of the same grid; each BullFrog step's coefficients depend only on its own
+  interval), and records `stop_step` and `a_out`; an unrecorded `Z` is refused.
 - **`evolve-mono`:** `--in`, `--n-mesh`, `--out`. `forces.force_global(which="mono",
   assign="cic")` on one float64 mesh, stepped with `engine.float_run_bullfrog_sync` and the
   engine's BullFrog coefficients: it differs from the engine only in the force split. It
@@ -53,8 +59,8 @@ separate process in the environment it needs; consecutive phases exchange one `.
   `scripts/run/realization.py card`'s parser (`--config`, `--k-steps`, `--workdir`,
   `--coarse-match-order`, `--slack`, `--alloc-margin`, `--arena-frac`, `--slab`,
   `--min-weight`, the geometry overrides `--n-fine`, `--buf`, `--n-coarse`, `--n-part`). It
-  rebuilds a `SlotState` from the particles and runs `summary.pk_summary_card` at
-  `a_out = 1.0` with default bins.
+  rebuilds a `SlotState` from the particles and runs `summary.pk_summary_card` at the
+  state's `a_out` (1.0 unless the evolve stopped early) with default bins.
 
 ```bash
 pixi run --frozen python scripts/compare/disco_crosscheck.py export --config cgh64 \
@@ -151,6 +157,89 @@ INEXOR_RUNS=<run root> DISCO_SRC=<DISCO-DJ project> \
   `$WORK/cgh64/disco-chunk-all.npz`.
 - Guards and inexor run legs stop the job on failure; cards, exports and DISCO-DJ legs
   record their exit code and continue. A smoke at `cdev8` runs every leg type first.
+
+### gh_halo_check_vista.sbatch
+
+FoF halos at 0.25 Mpc/h particle spacing (0.125 Mpc/h fine cell) on one GH200, at z = 0 and
+the snapshot redshifts `SNAPZ` (default `2.2,1,0.5`):
+
+```bash
+INEXOR_RUNS=<run root> DISCO_SRC=<DISCO-DJ project> \
+    sbatch -A <account> scripts/compare/gh_halo_check_vista.sbatch
+```
+
+- **`cgh64-L128`** (512^3 in 128 Mpc/h, `c-hero-L1024` in every resolution knob): inexor from
+  z = 9 ICs at 120, 160 and 240 steps and from z = 19 ICs at 160; DISCO-DJ from the z = 9 ICs
+  at 120 steps on a 1024^3 mesh (inexor's fine cell).
+- **`cdev-L64`** (256^3 in 64 Mpc/h): inexor at 120 steps; DISCO-DJ at 120 steps on 512^3 and
+  1024^3 meshes (the same and half the cell) and at 240 steps on 1024^3.
+- Every inexor arm snapshots (`run --snapshot-z`) and exports each epoch, with a z = 0 card;
+  DISCO-DJ stops at the same steps (`evolve --stop-z`). FoF (`halo_compare.py find`, b = 0.2,
+  256^3 matter mesh) runs on every state, three at a time; catalogs go to
+  `$WORK/halos/<preset>-<arm>-z<Z>.npz`. `halo_compare.py compare` on pairs is left to the
+  reader.
+- A `cdev8` smoke with one snapshot runs every leg type first, including a compare and the
+  periodic self-test; guards and smoke stop the job on failure, later legs record their
+  exit code and continue. `ARENA_FRAC` (default 0.05) sets the runs' spare arena.
+
+### gh_halo_disco_steps_vista.sbatch
+
+DISCO-DJ's step and start-epoch arms at inexor's fine cell (`cgh64-L128`, 1024^3 mesh), on the
+ICs of a finished `gh_halo_check_vista.sbatch` run: 160 and 240 steps from z = 9, 160 from
+z = 19. With that run's 120-step DISCO-DJ arm they match every inexor arm step for step.
+
+```bash
+INEXOR_RUNS=<run root> DISCO_SRC=<DISCO-DJ project> HALO_WORK=<halo-check work dir> \
+    sbatch -A <account> scripts/compare/gh_halo_disco_steps_vista.sbatch
+```
+
+- Each arm stops at the snapshot steps (`evolve --stop-z`), with a z = 0 card; FoF runs on
+  every state and catalogs go to `$WORK/halos/cgh64-L128-disco-<arm>-m1024-z<Z>.npz`, named
+  as the halo check's.
+- Guards (checkouts, envs, pinned versions, the ICs) stop the job on failure; later legs record
+  their exit code and continue.
+
+### quant_grid_halo_gg_vista.sbatch
+
+`quant_grid.py` at `cdev8-L32` (128^3 in 32 Mpc/h, `cgh64-L128` in every resolution knob) on
+one gg node, for halos: seeds 0-3 x 120 / 240 steps from z = 9 x arms `engine`, `ref`, `refx`,
+`refv`, plus `refxv` at 240 steps, seed 0; 33 legs of 4 cores at once.
+
+```bash
+OUT_DIR=<out root> sbatch -A <account> scripts/compare/quant_grid_halo_gg_vista.sbatch
+```
+
+- Each leg writes its card and its final positions (`--save-x`) under `OUT_DIR/job-<id>/`
+  (`<tag>.json`, `x/<tag>/`); `halo_compare.py find` reads `x/<tag>` directly.
+- The job exits non-zero unless every leg returns 0 and writes its positions.
+- `SEEDS`, `ARMS` and `EXTRA` (one "seed K arm" leg; empty for none) override the grid:
+  `ARMS=refxs EXTRA=` runs the stochastic-rounding arm alone (8 legs).
+
+## halo_compare.py
+
+Friends-of-friends (kdcount, periodic, linking length b x mean spacing) on one evolved
+state, and two such catalogs compared. kdcount is pip-only, so both subcommands run in a
+throwaway env:
+
+```bash
+pixi exec --spec python=3.12 --spec numpy --spec scipy --spec pip --spec c-compiler -- \
+    bash -c 'pip install -q kdcount && python -I scripts/compare/halo_compare.py find \
+    RUN/prod/export --out W/inexor.npz'
+```
+
+- **`find SRC --out CAT.npz`**: `SRC` is an inexor export directory (format
+  `inexor-particles-1`) or a `disco_crosscheck.py evolve` npz. Writes the groups with at least
+  `--n-floor` (10) members, their counts and minimum-image COMs, and the matter CIC density
+  on an `--n-mesh` (256) mesh, with the epoch, box, `m_p` and timings. `--shift` finds on
+  positions moved by L/2 and moves the outputs back.
+- **`compare A.npz B.npz [--labels A B] [--out JSON]`**: refuses catalogs of different
+  geometry, linking length, mesh or epoch. Per particle-count bin (20, 50, 150, 500, 1500):
+  counts and their ratio; mutual-nearest COM matches within `--match-r` (2) R_200m of the
+  larger halo, with the match fractions and the matched count ratio; the matter power ratio;
+  and, for k <= 0.5 h/Mpc, each catalog's halo bias P_hm/P_mm, their ratio and the
+  cross-correlation of the two halo fields. CIC windows are not deconvolved; the ratios
+  cancel them. A plain and a `--shift` catalog of one state compare identical.
+- Cost at 512^3: FoF ~2 min on one core, ~21 GB peak.
 
 ## memtrace.py
 
