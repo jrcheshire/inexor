@@ -1094,6 +1094,7 @@ def cmd_run(args):
                            migrate_backend="device", device_cards=args.cards, tile_workers=1,
                            device_y_blocks=args.y_blocks, brick_slack=args.slack,
                            fine_dtype=args.fine_dtype,
+                           drift_rounding=getattr(args, "drift_rounding", "stochastic"),
                            checkpoint_dir=args.checkpoint_dir if args.checkpoint_every else None,
                            checkpoint_every=args.checkpoint_every)
         ec.validate()
@@ -1343,7 +1344,8 @@ def _product(args, kind):
         devs = devs[:args.cards]
         ec = engine_config(_geometry(args), coarse_backend="device", tile_backend="device",
                            migrate_backend="device", device_cards=args.cards, tile_workers=1,
-                           brick_slack=args.slack, fine_dtype=args.fine_dtype)
+                           brick_slack=args.slack, fine_dtype=args.fine_dtype,
+                           drift_rounding=getattr(args, "drift_rounding", "stochastic"))
         ec.validate()
         decomp = Decomp.build(ec, n_ranks=1 if comm is None else comm.size, rank=rank)
         slabs = decomp.slabs if multi else None
@@ -1600,6 +1602,10 @@ def main(argv=None):
         p.add_argument("--fine-dtype", default="float64", choices=("float64", "float32"),
                        help="precision of the fine tiles, their FFTs and the kick (production: "
                             "float64); fingerprinted, so products of a run must pass the same")
+        p.add_argument("--drift-rounding", default="stochastic", choices=("stochastic", "nearest"),
+                       help="how drifts land on the position lattice (EngineConfig.drift_rounding); "
+                            "nearest is the v0.1.0 rule. Fingerprinted when stochastic, so "
+                            "products of a v0.1.0 run must pass nearest")
         p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"),
                        help="the second-order growth the ICs must have been generated with")
         p.add_argument("--n-fine", type=int, default=None,
@@ -1722,6 +1728,10 @@ def main(argv=None):
         p.add_argument("--fine-dtype", default="float64", choices=("float64", "float32"),
                        help="precision of the fine tiles, their FFTs and the kick (production: "
                             "float64); fingerprinted, so products of a run must pass the same")
+        p.add_argument("--drift-rounding", default="stochastic", choices=("stochastic", "nearest"),
+                       help="how drifts land on the position lattice (EngineConfig.drift_rounding); "
+                            "nearest is the v0.1.0 rule. Fingerprinted when stochastic, so "
+                            "products of a v0.1.0 run must pass nearest")
         p.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"))
         p.add_argument("--n-fine", type=int, default=None,
                        help="fine mesh cells per side instead of the preset's, the tile buffer "

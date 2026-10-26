@@ -317,6 +317,7 @@ def _engine_config(g, args, checkpoint_dir):
         # the library default
         coarse_match_order=getattr(args, "coarse_match_order", 3),
         fine_dtype=getattr(args, "fine_dtype", "float64"),
+        drift_rounding=getattr(args, "drift_rounding", "stochastic"),
     )
     ec.validate()
     return ec
@@ -923,6 +924,11 @@ def build_parser():
                          "The coarse arm paints TSC, so 3 (default) is correct; 2 "
                          "(CIC) is the legacy arm. In the checkpoint fingerprint when not "
                          "2, so arms cannot cross-resume")
+    ap.add_argument("--drift-rounding", default="stochastic", choices=("stochastic", "nearest"),
+                    help="how drifts land on the position lattice "
+                         "(EngineConfig.drift_rounding); nearest is the v0.1.0 rule. In the "
+                         "checkpoint fingerprint when stochastic, so the card and export of a "
+                         "v0.1.0 run must pass nearest")
     ap.add_argument("--growth2", default="lcdm", choices=("lcdm", "eds"),
                     help="second-order growth for the 2LPT ICs and the BullFrog "
                          "weights: the LCDM ODE solution (default) or the legacy EdS "

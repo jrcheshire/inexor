@@ -64,11 +64,12 @@ def test_only_orders_two_and_three_are_accepted():
 
 def test_the_order_two_fingerprint_is_the_pre_knob_one():
     """The order-2 fingerprint equals the hash without the knob, so existing order-2
-    checkpoints resume at order 2 and are refused under the order-3 default."""
+    checkpoints resume at order 2 and are refused under the order-3 default. Nearest drift
+    rounding: the stochastic default enters the hash on its own."""
     import hashlib
     import json
 
-    cfg = _cfg(coarse_match_order=2)
+    cfg = _cfg(coarse_match_order=2, drift_rounding="nearest")
     co = np.linspace(0.0, 1.0, 7)
     h = hashlib.sha256()
     h.update(json.dumps({k: getattr(cfg, k) for k in _FINGERPRINTED}, sort_keys=True).encode())

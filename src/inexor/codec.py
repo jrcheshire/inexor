@@ -24,6 +24,13 @@ def rint_i(z):
 
 LEVELS_PER_BUCKET = 256  # one uint8 per axis
 INT16_MAX = 32767
+# Stochastic drift rounding: u in [0, 1) per particle and axis is a splitmix64 finalizer over
+# the pre-drift lattice index (i_x, i_y, i_z) and the drift's key, so it depends on neither row
+# order, layout nor rank. `state._eject_slab` (numpy) and `eject_jax` (jax) implement it
+# independently from these constants.
+DITHER_AXIS_MUL = (0x9E3779B97F4A7C15, 0xC2B2AE3D27D4EB4F, 0x165667B19E3779F9)
+DITHER_KEY_MUL = 0xD6E8FEB86659FD93
+DITHER_MIX = (0xBF58476D1CE4E5B9, 0x94D049BB133111EB)
 ID_MAX_N_SIDE = 1290  # 1290^3 < 2^31-1 <= 1291^3: the int32 id refusal
 
 
